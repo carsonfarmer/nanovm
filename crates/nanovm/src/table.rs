@@ -23,7 +23,8 @@ pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && !s.starts_with('.')
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 struct Entry {
@@ -117,7 +118,12 @@ impl Node {
 
     /// Routes one request to its object's actor, starting the actor if the
     /// object isn't live, and waits for the response.
-    pub async fn dispatch(self: &Arc<Self>, app: &str, id: &str, req: http::Request<Bytes>) -> http::Response<RespBody> {
+    pub async fn dispatch(
+        self: &Arc<Self>,
+        app: &str,
+        id: &str,
+        req: http::Request<Bytes>,
+    ) -> http::Response<RespBody> {
         let Some(app) = self.apps.get(app) else {
             return error_response(404, "no-such-app", app);
         };
@@ -125,7 +131,11 @@ impl Node {
             return error_response(400, "bad-object-id", "object ids are [A-Za-z0-9_.-]{1,128}");
         }
         let (reply, rx) = oneshot::channel();
-        let job = Job { req, reply, enqueued: Instant::now() };
+        let job = Job {
+            req,
+            reply,
+            enqueued: Instant::now(),
+        };
         if let Err(resp) = self.enqueue(app, id, job) {
             return resp;
         }
@@ -144,7 +154,11 @@ impl Node {
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.metrics.rejected_busy.fetch_add(1, Relaxed);
                     let max = app.cfg.limits.max_queue;
-                    return Err(error_response(503, "object-busy", &format!("queue full ({max} waiting)")));
+                    return Err(error_response(
+                        503,
+                        "object-busy",
+                        &format!("queue full ({max} waiting)"),
+                    ));
                 }
                 Err(mpsc::error::TrySendError::Closed(j)) => {
                     objects.remove(&key);
@@ -155,12 +169,26 @@ impl Node {
         if objects.len() >= self.cfg.max_live_objects && !self.evict_lru(&mut objects) {
             self.metrics.rejected_capacity.fetch_add(1, Relaxed);
             let max = self.cfg.max_live_objects;
-            return Err(error_response(503, "node-at-capacity", &format!("{max} live objects, none idle")));
+            return Err(error_response(
+                503,
+                "node-at-capacity",
+                &format!("{max} live objects, none idle"),
+            ));
         }
-        let shared = Arc::new(ObjShared::new(app.name.clone(), id, self.next_gen.fetch_add(1, Relaxed)));
+        let shared = Arc::new(ObjShared::new(
+            app.name.clone(),
+            id,
+            self.next_gen.fetch_add(1, Relaxed),
+        ));
         let (tx, rx) = mpsc::channel(app.cfg.limits.max_queue.max(1));
         tx.try_send(job).ok().expect("fresh queue has room");
-        objects.insert(key, Entry { tx, shared: shared.clone() });
+        objects.insert(
+            key,
+            Entry {
+                tx,
+                shared: shared.clone(),
+            },
+        );
         drop(objects);
         tokio::spawn(object::run(self.clone(), app.clone(), shared, rx));
         Ok(())
@@ -178,7 +206,8 @@ impl Node {
             Some(k) => {
                 let e = objects.remove(&k).unwrap();
                 self.metrics.evicted_lru.fetch_add(1, Relaxed);
-                self.metrics.event("evicted-lru", &e.shared.app, &e.shared.id, "node at max_live_objects");
+                self.metrics
+                    .event("evicted-lru", &e.shared.app, &e.shared.id, "node at max_live_objects");
                 true
             }
             None => false,
@@ -197,7 +226,11 @@ impl Node {
         if objects.get(&key).is_some_and(|e| Arc::ptr_eq(&e.shared, shared)) {
             objects.remove(&key);
             let now = now_ns();
-            if shared.last_poison.lock().is_some_and(|(_, t)| now.saturating_sub(t) < KILL_SHOW_NS) {
+            if shared
+                .last_poison
+                .lock()
+                .is_some_and(|(_, t)| now.saturating_sub(t) < KILL_SHOW_NS)
+            {
                 let mut kills = self.recent_kills.lock();
                 if kills.len() == 4096 {
                     kills.pop_front();
@@ -221,12 +254,18 @@ impl Node {
             .map(|e| {
                 let s = &e.shared;
                 let c = s.phase().0.as_str().as_bytes()[0];
-                let hot = s.last_poison.lock().is_some_and(|(_, t)| now.saturating_sub(t) < KILL_SHOW_NS);
+                let hot = s
+                    .last_poison
+                    .lock()
+                    .is_some_and(|(_, t)| now.saturating_sub(t) < KILL_SHOW_NS);
                 (s.generation, if hot { c.to_ascii_uppercase() } else { c })
             })
             .collect();
         let mut kills = self.recent_kills.lock();
-        while kills.front().is_some_and(|(_, t)| now.saturating_sub(*t) >= KILL_SHOW_NS) {
+        while kills
+            .front()
+            .is_some_and(|(_, t)| now.saturating_sub(*t) >= KILL_SHOW_NS)
+        {
             kills.pop_front();
         }
         all.extend(kills.iter().map(|(g, _)| (*g, b'X')));

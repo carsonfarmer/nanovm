@@ -259,13 +259,20 @@ pub struct ObjState {
 
 impl WasiView for ObjState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
 }
 
 impl WasiHttpView for ObjState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
-        WasiHttpCtxView { ctx: &mut self.http, table: &mut self.table, hooks: &mut self.hooks }
+        WasiHttpCtxView {
+            ctx: &mut self.http,
+            table: &mut self.table,
+            hooks: &mut self.hooks,
+        }
     }
 }
 
@@ -314,8 +321,20 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
 
     let quota = QuotaGuard::new(
         vec![
-            Quota::scan("/data", &data_dir, limits.data_mb << 20, limits.max_files, limits.max_file_mb << 20)?,
-            Quota::scan("/tmp", &tmp_dir, limits.tmp_mb << 20, limits.max_files, limits.max_file_mb << 20)?,
+            Quota::scan(
+                "/data",
+                &data_dir,
+                limits.data_mb << 20,
+                limits.max_files,
+                limits.max_file_mb << 20,
+            )?,
+            Quota::scan(
+                "/tmp",
+                &tmp_dir,
+                limits.tmp_mb << 20,
+                limits.max_files,
+                limits.max_file_mb << 20,
+            )?,
         ],
         node.metrics.clone(),
         app.name.clone(),
@@ -336,7 +355,11 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
             app: app.name.clone(),
             object: shared.id.clone(),
         },
-        limiter: MemLimiter { max_bytes: (limits.memory_mb << 20) as usize, used: 0, denied: false },
+        limiter: MemLimiter {
+            max_bytes: (limits.memory_mb << 20) as usize,
+            used: 0,
+            denied: false,
+        },
         shared: shared.clone(),
         cpu_budget_ns: limits.cpu_ms * 1_000_000,
         cpu_exceeded: false,
@@ -413,9 +436,12 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
             Err(e) => {
                 drop(slot);
                 node.metrics.instantiate_failures.fetch_add(1, Relaxed);
-                node.metrics.event("instantiate-failed", &app.name, &shared.id, format!("{e:#}"));
+                node.metrics
+                    .event("instantiate-failed", &app.name, &shared.id, format!("{e:#}"));
                 if let Ok(job) = rx.try_recv() {
-                    let _ = job.reply.send(error_response(503, "instantiate-failed", &format!("{e:#}")));
+                    let _ = job
+                        .reply
+                        .send(error_response(503, "instantiate-failed", &format!("{e:#}")));
                 }
                 shared.set_phase(Phase::Cold);
                 if node.try_retire(&shared, &rx) {
@@ -473,16 +499,27 @@ async fn serve(
                 shared.begin_request();
                 metrics.requests.fetch_add(1, Relaxed);
                 let abort = Arc::new(AtomicBool::new(false));
-                *pending.lock() = Some(Pending { reply: Some(job.reply), abort: abort.clone() });
+                *pending.lock() = Some(Pending {
+                    reply: Some(job.reply),
+                    abort: abort.clone(),
+                });
 
                 let (parts, body) = job.req.into_parts();
                 let req = http::Request::from_parts(parts, Full::new(body));
-                let (req, req_io) = acc.with(|mut s| wasmtime_wasi_http::p3::Request::from_http(&mut s.data_mut().hooks, req));
+                let (req, req_io) =
+                    acc.with(|mut s| wasmtime_wasi_http::p3::Request::from_http(&mut s.data_mut().hooks, req));
 
                 let resp = match svc.handle(acc, req).await? {
                     Ok(res) => {
                         let res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
-                        res.map(|b| GuardedBody { inner: b, remaining: max_resp, abort }.boxed_unsync())
+                        res.map(|b| {
+                            GuardedBody {
+                                inner: b,
+                                remaining: max_resp,
+                                abort,
+                            }
+                            .boxed_unsync()
+                        })
                     }
                     Err(code) => error_response(500, "guest-error", &format!("{code:?}")),
                 };
@@ -578,7 +615,10 @@ fn classify(store: &Store<ObjState>, e: &wasmtime::Error) -> Exit {
     }
     if st.limiter.denied {
         let mb = st.limiter.max_bytes >> 20;
-        return Exit::Poisoned(Poison::Memory, with_tail(format!("tried to grow linear memory past {mb}MiB")));
+        return Exit::Poisoned(
+            Poison::Memory,
+            with_tail(format!("tried to grow linear memory past {mb}MiB")),
+        );
     }
     let text = format!("{e:?}");
     if e.downcast_ref::<ResourceTableError>().is_some() || text.contains("resource table has no free keys") {

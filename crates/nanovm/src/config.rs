@@ -126,10 +126,8 @@ impl NodeConfig {
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let mut cfg: NodeConfig =
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut cfg: NodeConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         // Relative paths are relative to the config file.
         let base = path.parent().unwrap_or(Path::new("."));
         cfg.resolve(base);

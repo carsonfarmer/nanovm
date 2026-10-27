@@ -13,11 +13,16 @@ use nanovm::table::Node;
 use serde_json::Value;
 
 fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
 }
 
 fn guest(name: &str) -> PathBuf {
-    let p = repo().join("guests/target/wasm32-wasip2/release").join(format!("{name}.wasm"));
+    let p = repo()
+        .join("guests/target/wasm32-wasip2/release")
+        .join(format!("{name}.wasm"));
     assert!(p.exists(), "{} is missing: run scripts/build-guests.sh", p.display());
     p
 }
@@ -112,9 +117,17 @@ async fn call(node: &Arc<Node>, method: &str, app: &str, id: &str, path: &str, b
     let t0 = Instant::now();
     let resp = node.dispatch(app, id, req).await;
     let status = resp.status().as_u16();
-    let error = resp.headers().get("x-nanovm-error").map(|v| v.to_str().unwrap().to_string());
+    let error = resp
+        .headers()
+        .get("x-nanovm-error")
+        .map(|v| v.to_str().unwrap().to_string());
     let body = resp.into_body().collect().await.unwrap().to_bytes();
-    Resp { status, error, body: String::from_utf8_lossy(&body).into(), elapsed: t0.elapsed() }
+    Resp {
+        status,
+        error,
+        body: String::from_utf8_lossy(&body).into(),
+        elapsed: t0.elapsed(),
+    }
 }
 
 async fn get(node: &Arc<Node>, app: &str, id: &str, path: &str) -> Resp {
@@ -132,7 +145,10 @@ async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
 
 /// Waits until every live object is idle, so LRU eviction has a candidate.
 async fn settle(node: &Arc<Node>) {
-    eventually("objects to go idle", || node.objects(usize::MAX).1.keys().all(|p| *p == "idle")).await;
+    eventually("objects to go idle", || {
+        node.objects(usize::MAX).1.keys().all(|p| *p == "idle")
+    })
+    .await;
 }
 
 // ---- persistence and isolation ----------------------------------------
@@ -175,7 +191,10 @@ async fn app_dir_is_readable() {
     let node = node("app_dir_is_readable", 8, 60_000);
     let r = get(&node, "counter", "s", "/static").await;
     assert_eq!(r.status, 200, "{}", r.body);
-    assert_eq!(r.body, std::fs::read_to_string(repo().join("demo/static/hello.txt")).unwrap());
+    assert_eq!(
+        r.body,
+        std::fs::read_to_string(repo().join("demo/static/hello.txt")).unwrap()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -248,7 +267,12 @@ async fn killed(node: &Arc<Node>, id: &str, path: &str, status: u16, reason: &st
     let before = get(node, "hostile", id, "/").await;
     assert_eq!(before.status, 200);
     let r = get(node, "hostile", id, path).await;
-    assert_eq!((r.status, r.error.as_deref()), (status, Some(reason)), "{path}: {}", r.body);
+    assert_eq!(
+        (r.status, r.error.as_deref()),
+        (status, Some(reason)),
+        "{path}: {}",
+        r.body
+    );
     let after = get(node, "hostile", id, "/").await;
     assert_eq!(after.status, 200);
     assert_eq!(after.json()["hits"], 1, "{path}: instance was replaced");
@@ -290,7 +314,11 @@ async fn cpu_kill_does_not_poison_next_instance() {
 async fn wall_clock_limit() {
     let node = node("wall_clock_limit", 8, 60_000);
     let r = killed(&node, "slow", "/sleep?ms=60000", 504, "timeout").await;
-    assert!(r.elapsed >= Duration::from_millis(1000) && r.elapsed < Duration::from_millis(2500), "took {:?}", r.elapsed);
+    assert!(
+        r.elapsed >= Duration::from_millis(1000) && r.elapsed < Duration::from_millis(2500),
+        "took {:?}",
+        r.elapsed
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -361,7 +389,11 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
     lat.sort();
     let p99 = lat[lat.len() * 99 / 100];
     assert!(lat.len() > 200, "canary only got {} requests through", lat.len());
-    assert!(p99 < Duration::from_millis(50), "canary p99 {p99:?} with {} hogs", 4 * cores);
+    assert!(
+        p99 < Duration::from_millis(50),
+        "canary p99 {p99:?} with {} hogs",
+        4 * cores
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -396,17 +428,27 @@ async fn file_count_limit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tmp_quota_and_wipe() {
     let node = node("tmp_quota_and_wipe", 8, 60_000);
-    assert_eq!(get(&node, "hostile", "t", "/fill?mount=tmp&mb=4&name=a").await.status, 200);
+    assert_eq!(
+        get(&node, "hostile", "t", "/fill?mount=tmp&mb=4&name=a").await.status,
+        200
+    );
     let r = get(&node, "hostile", "t", "/fill?mount=tmp&mb=1&name=b").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "insufficient-space");
     // A new instance gets an empty /tmp.
     assert_eq!(get(&node, "hostile", "t", "/panic").await.status, 500);
-    assert_eq!(get(&node, "hostile", "t", "/fill?mount=tmp&mb=4&name=a").await.status, 200);
+    assert_eq!(
+        get(&node, "hostile", "t", "/fill?mount=tmp&mb=4&name=a").await.status,
+        200
+    );
     // and the old one's scratch directory is gone from the host.
     let scratch = node.cfg.data_dir.join("tmp/hostile");
     eventually("old scratch dir removed", || {
-        std::fs::read_dir(&scratch).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("t.")).count() == 1
+        std::fs::read_dir(&scratch)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("t."))
+            .count()
+            == 1
     })
     .await;
 }
@@ -414,7 +456,10 @@ async fn tmp_quota_and_wipe() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rename_quota_accounting() {
     let node = node("rename_quota_accounting", 8, 60_000);
-    assert_eq!(get(&node, "hostile", "r", "/fill?mount=tmp&mb=4&name=a").await.status, 200);
+    assert_eq!(
+        get(&node, "hostile", "r", "/fill?mount=tmp&mb=4&name=a").await.status,
+        200
+    );
     // Renaming a file onto itself is a no-op and must not credit the quota.
     let r = get(&node, "hostile", "r", "/rename?mount=tmp&from=a&n=10").await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -475,9 +520,19 @@ async fn no_rename_across_mounts() {
 #[tokio::test(flavor = "multi_thread")]
 async fn egress_unlisted_host_denied() {
     let node = node("egress_unlisted_host_denied", 8, 60_000);
-    let r = get(&node, "hostile", "n", "/fetch?url=http://169.254.169.254/latest/meta-data/").await;
+    let r = get(
+        &node,
+        "hostile",
+        "n",
+        "/fetch?url=http://169.254.169.254/latest/meta-data/",
+    )
+    .await;
     assert_eq!(r.status, 502, "{}", r.body);
-    assert!(r.json()["denied"].as_str().unwrap().contains("HttpRequestDenied"), "{}", r.body);
+    assert!(
+        r.json()["denied"].as_str().unwrap().contains("HttpRequestDenied"),
+        "{}",
+        r.body
+    );
     assert!(node.metrics.egress_denied.load(Relaxed) >= 1);
 }
 
@@ -489,7 +544,11 @@ async fn egress_listed_name_resolving_to_loopback_denied() {
     let port = listener.local_addr().unwrap().port();
     let r = get(&node, "hostile", "n", &format!("/fetch?url=http://localhost:{port}/")).await;
     assert_eq!(r.status, 502, "{}", r.body);
-    assert!(r.json()["denied"].as_str().unwrap().contains("DestinationIpProhibited"), "{}", r.body);
+    assert!(
+        r.json()["denied"].as_str().unwrap().contains("DestinationIpProhibited"),
+        "{}",
+        r.body
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -584,7 +643,10 @@ async fn raw(addr: std::net::SocketAddr, head: &str, body: &[u8]) -> (u16, Strin
     let _ = s.read_to_end(&mut out).await;
     let text = String::from_utf8_lossy(&out).to_string();
     let status = text.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
     (status, body)
 }
 
@@ -595,22 +657,45 @@ async fn http_front_end() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(nanovm::server::serve(node.clone(), listener));
 
-    let (status, body) = raw(addr, "GET /counter/web/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", b"").await;
+    let (status, body) = raw(
+        addr,
+        "GET /counter/web/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        b"",
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(r#""object":"web""#), "{body}");
 
-    let (status, _) = raw(addr, "GET /counter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", b"").await;
+    let (status, _) = raw(
+        addr,
+        "GET /counter HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        b"",
+    )
+    .await;
     assert_eq!(status, 404);
 
     let big = vec![b'x'; 2 << 20];
-    let head = format!("POST /counter/web/kv/big HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", big.len());
+    let head = format!(
+        "POST /counter/web/kv/big HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        big.len()
+    );
     let (status, _) = raw(addr, &head, &big).await;
     assert_eq!(status, 413);
 
-    let (status, body) = raw(addr, "GET /_nanovm/stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", b"").await;
+    let (status, body) = raw(
+        addr,
+        "GET /_nanovm/stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        b"",
+    )
+    .await;
     assert_eq!(status, 200);
     assert!(body.contains("\"live_objects\""), "{body}");
 
-    let (status, _) = raw(addr, "POST /_nanovm/demo/spawn HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", b"").await;
+    let (status, _) = raw(
+        addr,
+        "POST /_nanovm/demo/spawn HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        b"",
+    )
+    .await;
     assert_eq!(status, 404, "demo endpoints are off unless enabled");
 }

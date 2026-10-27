@@ -4,9 +4,7 @@
 use std::collections::HashMap;
 
 use wasip3::filesystem::preopens;
-use wasip3::filesystem::types::{
-    Descriptor, DescriptorFlags, ErrorCode as FsError, OpenFlags, PathFlags,
-};
+use wasip3::filesystem::types::{Descriptor, DescriptorFlags, ErrorCode as FsError, OpenFlags, PathFlags};
 use wasip3::http::types::{ErrorCode, Fields, Method, Request, Response};
 use wasip3::{wit_future, wit_stream};
 
@@ -60,7 +58,12 @@ pub async fn read_req(request: Request) -> Req {
     let (body_rx, _trailers) = Request::consume_body(request, result_rx);
     let body = body_rx.collect().await;
     drop(result_tx);
-    Req { method, path, query, body }
+    Req {
+        method,
+        path,
+        query,
+        body,
+    }
 }
 
 fn percent_decode(s: &str) -> String {

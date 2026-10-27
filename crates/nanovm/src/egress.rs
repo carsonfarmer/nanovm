@@ -75,7 +75,9 @@ impl EgressPolicy {
 
 fn split_host_port(s: &str) -> anyhow::Result<(&str, Option<u16>)> {
     if let Some(rest) = s.strip_prefix('[') {
-        let (h, tail) = rest.split_once(']').ok_or_else(|| anyhow::anyhow!("bad egress entry {s:?}"))?;
+        let (h, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow::anyhow!("bad egress entry {s:?}"))?;
         let port = match tail.strip_prefix(':') {
             Some(p) => Some(p.parse()?),
             None => None,
@@ -211,7 +213,9 @@ async fn send(
         Err(_) => return Err(Error::ConnectionTimeout),
     };
     let io: Box<dyn Stream> = if tls {
-        let roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.into() };
+        let roots = rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+        };
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
             .map_err(|_| Error::TlsProtocolError)?
@@ -301,7 +305,20 @@ mod tests {
 
     #[test]
     fn ip_filter() {
-        for bad in ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "fe80::1", "fd00::1", "::ffff:127.0.0.1", "64:ff9b::7f00:1"] {
+        for bad in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::7f00:1",
+        ] {
             assert!(!is_global(bad.parse().unwrap()), "{bad}");
         }
         for good in ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {

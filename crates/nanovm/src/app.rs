@@ -55,19 +55,17 @@ pub fn check_imports(engine: &Engine, component: &Component) -> anyhow::Result<(
             bail!("import `{name}` is not permitted");
         }
     }
-    if !ty.exports(engine).any(|(name, _)| name.starts_with("wasi:http/handler@0.3")) {
+    if !ty
+        .exports(engine)
+        .any(|(name, _)| name.starts_with("wasi:http/handler@0.3"))
+    {
         bail!("component does not export wasi:http/handler@0.3");
     }
     Ok(())
 }
 
 impl App {
-    pub fn load(
-        engine: &Engine,
-        linker: &Linker<ObjState>,
-        node: &NodeConfig,
-        cfg: &AppConfig,
-    ) -> anyhow::Result<App> {
+    pub fn load(engine: &Engine, linker: &Linker<ObjState>, node: &NodeConfig, cfg: &AppConfig) -> anyhow::Result<App> {
         let cache = node.data_dir.join("cache");
         let component = crate::engine::load_component(engine, &cfg.component, &cache)
             .with_context(|| format!("app {:?}", cfg.name))?;
@@ -77,8 +75,7 @@ impl App {
             .and_then(ServicePre::new)
             .map_err(anyhow::Error::from)
             .with_context(|| format!("linking app {:?}", cfg.name))?;
-        let egress = EgressPolicy::parse(&cfg.limits.egress)
-            .with_context(|| format!("app {:?} egress", cfg.name))?;
+        let egress = EgressPolicy::parse(&cfg.limits.egress).with_context(|| format!("app {:?} egress", cfg.name))?;
         let static_dir = match &cfg.static_dir {
             Some(d) if !d.is_dir() => bail!("app {:?}: static_dir {} is not a directory", cfg.name, d.display()),
             // Reads through a shared directory fd don't interfere: every

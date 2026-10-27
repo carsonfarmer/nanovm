@@ -90,8 +90,13 @@ pub enum Poison {
 }
 
 impl Poison {
-    pub const ALL: [Poison; 5] =
-        [Poison::Cpu, Poison::Memory, Poison::Timeout, Poison::Trap, Poison::ResourceTable];
+    pub const ALL: [Poison; 5] = [
+        Poison::Cpu,
+        Poison::Memory,
+        Poison::Timeout,
+        Poison::Trap,
+        Poison::ResourceTable,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -194,7 +199,11 @@ pub fn rss_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
         let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-        let pages: u64 = statm.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let pages: u64 = statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

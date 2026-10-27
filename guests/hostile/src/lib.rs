@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use util::wasip3;
-use util::{js, json, read_req, text, FdFlags, OFlags, Req};
+use util::{FdFlags, OFlags, Req, js, json, read_req, text};
 use wasip3::filesystem::types::PathFlags;
 use wasip3::http::types::{ErrorCode, Fields, Method, Request, Response, Scheme};
 use wasip3::wit_future;
@@ -166,13 +166,25 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                     Ok(b) => format!("LEAKED {} bytes", b.len()),
                     Err(e) => util::fs_err(&e),
                 };
-                results.push(format!("{{\"mount\":{},\"path\":{},\"result\":{}}}", js(mount), js(path), js(&r)));
+                results.push(format!(
+                    "{{\"mount\":{},\"path\":{},\"result\":{}}}",
+                    js(mount),
+                    js(path),
+                    js(&r)
+                ));
             }
             // Symlink pointing outside, then follow it.
             let data = util::mount("/data").unwrap();
-            let sl = data.symlink_at("/etc/passwd".to_string(), "evil-link".to_string()).await;
+            let sl = data
+                .symlink_at("/etc/passwd".to_string(), "evil-link".to_string())
+                .await;
             let follow = match data
-                .open_at(PathFlags::SYMLINK_FOLLOW, "evil-link".to_string(), OFlags::empty(), FdFlags::READ)
+                .open_at(
+                    PathFlags::SYMLINK_FOLLOW,
+                    "evil-link".to_string(),
+                    OFlags::empty(),
+                    FdFlags::READ,
+                )
                 .await
             {
                 Ok(_) => "OPENED".to_string(),
@@ -181,7 +193,10 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             let _ = data.unlink_file_at("evil-link".to_string()).await;
             results.push(format!(
                 "{{\"symlink\":{},\"follow\":{}}}",
-                js(&match sl { Ok(()) => "created".into(), Err(e) => util::fs_err(&e) }),
+                js(&match sl {
+                    Ok(()) => "created".into(),
+                    Err(e) => util::fs_err(&e),
+                }),
                 js(&follow)
             ));
             let leaked = results.iter().any(|r| r.contains("LEAKED") || r.contains("OPENED"));
@@ -214,12 +229,19 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
 
         // Outbound HTTP to an arbitrary URL.
         "/fetch" => {
-            let url = req.q("url").unwrap_or("http://169.254.169.254/latest/meta-data/").to_string();
+            let url = req
+                .q("url")
+                .unwrap_or("http://169.254.169.254/latest/meta-data/")
+                .to_string();
             let method = req.q("method").unwrap_or("GET").to_string();
             match fetch(&url, &method).await {
                 Ok((status, body)) => json(
                     200,
-                    format!("{{\"status\":{status},\"bytes\":{},\"body\":{}}}", body.len(), js(&String::from_utf8_lossy(&body[..body.len().min(200)]))),
+                    format!(
+                        "{{\"status\":{status},\"bytes\":{},\"body\":{}}}",
+                        body.len(),
+                        js(&String::from_utf8_lossy(&body[..body.len().min(200)]))
+                    ),
                 ),
                 Err(e) => json(502, format!("{{\"denied\":{}}}", js(&format!("{e:?}")))),
             }
@@ -239,7 +261,10 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
 }
 
 fn fs_fail(written: u64, e: &util::FsErrorCode) -> Result<Response, ErrorCode> {
-    json(507, format!("{{\"written\":{written},\"error\":{}}}", js(&util::fs_err(e))))
+    json(
+        507,
+        format!("{{\"written\":{written},\"error\":{}}}", js(&util::fs_err(e))),
+    )
 }
 
 async fn fetch(url: &str, method: &str) -> Result<(u16, Vec<u8>), ErrorCode> {

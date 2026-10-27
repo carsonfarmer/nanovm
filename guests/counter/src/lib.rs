@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use util::wasip3;
-use util::{js, json, read_req, text, Req};
+use util::{Req, js, json, read_req, text};
 use wasip3::http::types::{ErrorCode, Request, Response};
 
 wasip3::http::service::export!(Counter);
@@ -29,9 +29,7 @@ async fn count() -> u64 {
 }
 
 fn valid_key(k: &str) -> bool {
-    !k.is_empty()
-        && k.len() <= 64
-        && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !k.is_empty() && k.len() <= 64 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 async fn route(req: Req, hits: u64) -> Result<Response, ErrorCode> {

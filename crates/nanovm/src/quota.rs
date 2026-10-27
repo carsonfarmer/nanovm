@@ -19,16 +19,15 @@ use std::task::{Context, Poll};
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 use wasmtime::component::{
-    Access, Accessor, FutureReader, HasData, Linker, Resource, Source, StreamConsumer, StreamReader,
-    StreamResult,
+    Access, Accessor, FutureReader, HasData, Linker, Resource, Source, StreamConsumer, StreamReader, StreamResult,
 };
 use wasmtime::{AsContextMut, StoreContextMut};
 use wasmtime_wasi::filesystem::{Descriptor, WasiFilesystem, WasiFilesystemCtxView, WasiFilesystemView};
+use wasmtime_wasi::p3::bindings::filesystem::preopens;
 use wasmtime_wasi::p3::bindings::filesystem::types::{
     self, Advice, DescriptorFlags, DescriptorStat, DescriptorType, DirectoryEntry, ErrorCode, Filesize,
     HostDescriptorWithStore, MetadataHashValue, NewTimestamp, OpenFlags, PathFlags,
 };
-use wasmtime_wasi::p3::bindings::filesystem::preopens;
 use wasmtime_wasi::p3::filesystem::{FilesystemError, FilesystemResult};
 use wasmtime_wasi::{FsPerms, OpenMode};
 
@@ -67,7 +66,14 @@ impl Quota {
         max_files: u64,
         max_file_bytes: u64,
     ) -> std::io::Result<Quota> {
-        let mut q = Quota { mount, max_bytes, max_files, max_file_bytes, bytes: 0, files: 0 };
+        let mut q = Quota {
+            mount,
+            max_bytes,
+            max_files,
+            max_file_bytes,
+            bytes: 0,
+            files: 0,
+        };
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir)? {
@@ -152,13 +158,23 @@ impl QuotaGuard {
         if allowed_end <= at && !buf.is_empty() {
             return Err(if end > quota.max_file_bytes && quota.max_file_bytes <= room {
                 let max = quota.max_file_bytes >> 20;
-                q.deny(m, ErrorCode::FileTooLarge, format!("file would exceed max_file_mb ({max} MiB)"))
+                q.deny(
+                    m,
+                    ErrorCode::FileTooLarge,
+                    format!("file would exceed max_file_mb ({max} MiB)"),
+                )
             } else {
                 let max = quota.max_bytes >> 20;
-                q.deny(m, ErrorCode::InsufficientSpace, format!("write refused, {max} MiB quota full"))
+                q.deny(
+                    m,
+                    ErrorCode::InsufficientSpace,
+                    format!("write refused, {max} MiB quota full"),
+                )
             });
         }
-        let n = file.write_at(&buf[..(allowed_end - at) as usize], at).map_err(|_| ErrorCode::Io)?;
+        let n = file
+            .write_at(&buf[..(allowed_end - at) as usize], at)
+            .map_err(|_| ErrorCode::Io)?;
         let after = before.max(at + n as u64);
         q.mounts[m].bytes += after - before;
         Ok(n)
@@ -171,11 +187,19 @@ impl QuotaGuard {
         if size > before {
             if size > quota.max_file_bytes {
                 let max = quota.max_file_bytes >> 20;
-                return Err(q.deny(m, ErrorCode::FileTooLarge, format!("set-size past max_file_mb ({max} MiB)")));
+                return Err(q.deny(
+                    m,
+                    ErrorCode::FileTooLarge,
+                    format!("set-size past max_file_mb ({max} MiB)"),
+                ));
             }
             if quota.bytes + (size - before) > quota.max_bytes {
                 let max = quota.max_bytes >> 20;
-                return Err(q.deny(m, ErrorCode::InsufficientSpace, format!("set-size refused, {max} MiB quota")));
+                return Err(q.deny(
+                    m,
+                    ErrorCode::InsufficientSpace,
+                    format!("set-size refused, {max} MiB quota"),
+                ));
             }
         }
         file.set_len(size).map_err(|_| ErrorCode::Io)?;
@@ -261,10 +285,7 @@ fn is_file(st: &DescriptorStat) -> bool {
 }
 
 /// The writable file behind `fd` if it lives on a quota'd mount.
-fn quota_file(
-    s: &mut ObjState,
-    fd: &Resource<Descriptor>,
-) -> Option<(QuotaGuard, usize, Arc<std::fs::File>)> {
+fn quota_file(s: &mut ObjState, fd: &Resource<Descriptor>) -> Option<(QuotaGuard, usize, Arc<std::fs::File>)> {
     let quota = s.quota.clone();
     let m = quota.mount_of(fd)?;
     let view = s.filesystem();
@@ -293,7 +314,10 @@ impl preopens::Host for QuotaView<'_> {
     fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
         let mut dirs = preopens::Host::get_directories(&mut self.0.filesystem())?;
         if let Some(app) = self.0.app_dir.clone() {
-            dirs.push((self.0.filesystem().table.push(Descriptor::Dir(app))?, "/app".to_string()));
+            dirs.push((
+                self.0.filesystem().table.push(Descriptor::Dir(app))?,
+                "/app".to_string(),
+            ));
         }
         let mut q = self.0.quota.0.lock();
         for (fd, path) in &dirs {
@@ -319,8 +343,20 @@ fn write_stream(
         };
     };
     let (tx, rx) = oneshot::channel();
-    data.pipe(&mut store, QuotaWriter { file, at, mount, quota, result: Some(tx) })?;
-    FutureReader::new(&mut store, async move { wasmtime::error::Ok(rx.await.unwrap_or(Ok(()))) })
+    data.pipe(
+        &mut store,
+        QuotaWriter {
+            file,
+            at,
+            mount,
+            quota,
+            result: Some(tx),
+        },
+    )?;
+    FutureReader::new(
+        &mut store,
+        async move { wasmtime::error::Ok(rx.await.unwrap_or(Ok(()))) },
+    )
 }
 
 struct QuotaWriter {
@@ -380,7 +416,11 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        WasiFilesystem::read_via_stream(Access::<ObjState, WasiFilesystem>::new(store.as_context_mut(), fs), fd, offset)
+        WasiFilesystem::read_via_stream(
+            Access::<ObjState, WasiFilesystem>::new(store.as_context_mut(), fs),
+            fd,
+            offset,
+        )
     }
 
     fn write_via_stream(
@@ -421,14 +461,15 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         WasiFilesystem::get_flags(&stock(store), fd).await
     }
 
-    async fn get_type(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-    ) -> FilesystemResult<DescriptorType> {
+    async fn get_type(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<DescriptorType> {
         WasiFilesystem::get_type(&stock(store), fd).await
     }
 
-    async fn set_size(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>, size: Filesize) -> FilesystemResult<()> {
+    async fn set_size(
+        store: &Accessor<ObjState, Self>,
+        fd: Resource<Descriptor>,
+        size: Filesize,
+    ) -> FilesystemResult<()> {
         match store.with(|mut s| quota_file(s.data_mut(), &fd)) {
             Some((quota, m, file)) => Ok(quota.set_size(m, &file, size)?),
             None => WasiFilesystem::set_size(&stock(store), fd, size).await,
@@ -514,7 +555,9 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
     ) -> FilesystemResult<()> {
         let quota = guard(store);
         if let Some(m) = quota.mount_of(&fd).or(quota.mount_of(&new_fd)) {
-            return Err(quota.refuse(m, ErrorCode::NotPermitted, "hard links are not permitted").into());
+            return Err(quota
+                .refuse(m, ErrorCode::NotPermitted, "hard links are not permitted")
+                .into());
         }
         WasiFilesystem::link_at(&stock(store), fd, old_path_flags, old_path, new_fd, new_path).await
     }
@@ -617,7 +660,9 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
     ) -> FilesystemResult<()> {
         let quota = guard(store);
         if let Some(m) = quota.mount_of(&fd) {
-            return Err(quota.refuse(m, ErrorCode::NotPermitted, "symlinks are not permitted").into());
+            return Err(quota
+                .refuse(m, ErrorCode::NotPermitted, "symlinks are not permitted")
+                .into());
         }
         WasiFilesystem::symlink_at(&stock(store), fd, old_path, new_path).await
     }

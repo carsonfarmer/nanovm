@@ -33,7 +33,10 @@ pub async fn serve(node: Arc<Node>, listener: TcpListener) -> anyhow::Result<()>
                 let node = node.clone();
                 async move { Ok::<_, Infallible>(handle(node, req).await) }
             });
-            let _ = http1::Builder::new().keep_alive(true).serve_connection(TokioIo::new(sock), svc).await;
+            let _ = http1::Builder::new()
+                .keep_alive(true)
+                .serve_connection(TokioIo::new(sock), svc)
+                .await;
         });
     }
 }
@@ -65,11 +68,19 @@ async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {
     let body = match Limited::new(body, limit).collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
-            return error_response(413, "request-too-large", &format!("max_request_body_kb is {}", limit >> 10));
+            return error_response(
+                413,
+                "request-too-large",
+                &format!("max_request_body_kb is {}", limit >> 10),
+            );
         }
         Err(e) => return error_response(400, "bad-request-body", &e.to_string()),
     };
-    let host = parts.headers.get(http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost");
+    let host = parts
+        .headers
+        .get(http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("localhost");
     parts.uri = match format!("http://{host}{pq}").parse() {
         Ok(u) => u,
         Err(_) => return error_response(400, "bad-uri", &pq),
@@ -126,11 +137,16 @@ async fn admin(node: &Arc<Node>, path: &str, req: &Request<Incoming>) -> Respons
         }
         "/events" => ok_json(json!(node.metrics.events_since(num("since", 0)))),
         "/grid" => ok_json(json!({ "cells": node.grid(), "max": node.cfg.max_live_objects })),
-        "/demo/spawn" | "/demo/hammer" | "/demo/storm" if !node.cfg.demo => error_response(404, "demo-disabled", "set demo = true"),
+        "/demo/spawn" | "/demo/hammer" | "/demo/storm" if !node.cfg.demo => {
+            error_response(404, "demo-disabled", "set demo = true")
+        }
         "/demo/spawn" if req.method() == Method::POST => {
             // `n` fresh objects, one request each: measures cold starts.
             let app = q.get("app").cloned().unwrap_or("counter".into());
-            let prefix = q.get("prefix").cloned().unwrap_or_else(|| format!("s{}", node.next_seq()));
+            let prefix = q
+                .get("prefix")
+                .cloned()
+                .unwrap_or_else(|| format!("s{}", node.next_seq()));
             let n = num("n", 10_000);
             let conc = num("concurrency", 256);
             ok_json(load(node, &app, n, conc, "GET", "/", move |i| format!("{prefix}-{i}")).await)
@@ -144,7 +160,12 @@ async fn admin(node: &Arc<Node>, path: &str, req: &Request<Incoming>) -> Respons
             let conc = num("concurrency", 256);
             let method = q.get("method").cloned().unwrap_or("GET".into());
             let path = q.get("path").cloned().unwrap_or("/".into());
-            ok_json(load(node, &app, n, conc, &method, &path, move |i| format!("{prefix}-{}", i % objects)).await)
+            ok_json(
+                load(node, &app, n, conc, &method, &path, move |i| {
+                    format!("{prefix}-{}", i % objects)
+                })
+                .await,
+            )
         }
         "/demo/storm" if req.method() == Method::POST => {
             let rounds = num("rounds", 10).clamp(1, 100);
@@ -178,12 +199,23 @@ async fn storm(node: &Arc<Node>, rounds: u64) -> serde_json::Value {
         .map(|(r, &(name, path))| {
             let node = node.clone();
             tokio::spawn(async move {
-                let req = Request::get(format!("http://localhost{path}")).body(Bytes::new()).unwrap();
+                let req = Request::get(format!("http://localhost{path}"))
+                    .body(Bytes::new())
+                    .unwrap();
                 let t = Instant::now();
                 let resp = node.dispatch("hostile", &format!("storm-{name}-{r}"), req).await;
                 let status = resp.status().as_u16();
-                let host = resp.headers().get("x-nanovm-error").and_then(|h| h.to_str().ok()).map(String::from);
-                let body = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                let host = resp
+                    .headers()
+                    .get("x-nanovm-error")
+                    .and_then(|h| h.to_str().ok())
+                    .map(String::from);
+                let body = resp
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|b| b.to_bytes())
+                    .unwrap_or_default();
                 (name, status, host, body, t.elapsed())
             })
         })
@@ -191,7 +223,9 @@ async fn storm(node: &Arc<Node>, rounds: u64) -> serde_json::Value {
     let mut out: Vec<serde_json::Value> = Vec::new();
     let mut by_name: HashMap<&str, (HashMap<u16, u64>, Option<String>, String, f64)> = HashMap::new();
     for t in tasks {
-        let Ok((name, status, host, body, took)) = t.await else { continue };
+        let Ok((name, status, host, body, took)) = t.await else {
+            continue;
+        };
         let e = by_name.entry(name).or_default();
         *e.0.entry(status).or_default() += 1;
         e.3 = e.3.max(took.as_secs_f64() * 1e3);
@@ -239,7 +273,11 @@ async fn load(
                     if i >= n {
                         return out;
                     }
-                    let req = Request::builder().method(method.clone()).uri(&uri).body(Bytes::new()).unwrap();
+                    let req = Request::builder()
+                        .method(method.clone())
+                        .uri(&uri)
+                        .body(Bytes::new())
+                        .unwrap();
                     let t = Instant::now();
                     let resp = node.dispatch(&app, &object(i), req).await;
                     let status = resp.status().as_u16();
@@ -263,7 +301,11 @@ async fn load(
     }
     let mut lat: Vec<u32> = results.iter().map(|r| r.1).collect();
     lat.sort_unstable();
-    let pct = |p: f64| lat.get(((lat.len() as f64 * p) as usize).min(lat.len().saturating_sub(1))).copied().unwrap_or(0);
+    let pct = |p: f64| {
+        lat.get(((lat.len() as f64 * p) as usize).min(lat.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(0)
+    };
     json!({
         "n": n,
         "concurrency": conc,
@@ -287,23 +329,28 @@ async fn load(
 fn stats(node: &Node) -> serde_json::Value {
     let m = &node.metrics;
     let (_, phases) = node.objects(0);
-    let poisons: serde_json::Map<String, serde_json::Value> =
-        Poison::ALL.iter().map(|p| (p.as_str().to_string(), json!(m.poisons[*p as usize].load(Relaxed)))).collect();
-    let status: serde_json::Map<String, serde_json::Value> =
-        (1..6).map(|i| (format!("{i}xx"), json!(m.status[i].load(Relaxed)))).collect();
+    let poisons: serde_json::Map<String, serde_json::Value> = Poison::ALL
+        .iter()
+        .map(|p| (p.as_str().to_string(), json!(m.poisons[*p as usize].load(Relaxed))))
+        .collect();
+    let status: serde_json::Map<String, serde_json::Value> = (1..6)
+        .map(|i| (format!("{i}xx"), json!(m.status[i].load(Relaxed))))
+        .collect();
     let apps: Vec<_> = node
         .apps
         .values()
-        .map(|a| json!({ "name": &*a.name, "limits": {
-            "memory_mb": a.cfg.limits.memory_mb,
-            "cpu_ms": a.cfg.limits.cpu_ms,
-            "request_timeout_ms": a.cfg.limits.request_timeout_ms,
-            "data_mb": a.cfg.limits.data_mb,
-            "tmp_mb": a.cfg.limits.tmp_mb,
-            "max_files": a.cfg.limits.max_files,
-            "max_resources": a.cfg.limits.max_resources,
-            "egress": a.cfg.limits.egress,
-        }}))
+        .map(|a| {
+            json!({ "name": &*a.name, "limits": {
+                "memory_mb": a.cfg.limits.memory_mb,
+                "cpu_ms": a.cfg.limits.cpu_ms,
+                "request_timeout_ms": a.cfg.limits.request_timeout_ms,
+                "data_mb": a.cfg.limits.data_mb,
+                "tmp_mb": a.cfg.limits.tmp_mb,
+                "max_files": a.cfg.limits.max_files,
+                "max_resources": a.cfg.limits.max_resources,
+                "egress": a.cfg.limits.egress,
+            }})
+        })
         .collect();
     json!({
         "uptime_ms": node.started.elapsed().as_millis() as u64,

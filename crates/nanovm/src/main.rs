@@ -15,7 +15,9 @@ async fn main() -> anyhow::Result<()> {
     let listen = cfg.listen.clone();
     let t0 = std::time::Instant::now();
     let node = Node::new(cfg)?;
-    let listener = tokio::net::TcpListener::bind(&listen).await.with_context(|| format!("binding {listen}"))?;
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("binding {listen}"))?;
     let mut apps: Vec<_> = node.apps.keys().cloned().collect();
     apps.sort();
     eprintln!(

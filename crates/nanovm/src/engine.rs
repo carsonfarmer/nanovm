@@ -85,14 +85,20 @@ pub fn preflight(cfg: &NodeConfig) -> anyhow::Result<()> {
 
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit and returns the result.
 fn raise_nofile() -> anyhow::Result<u64> {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: `lim` is a valid out-pointer for getrlimit/setrlimit.
     unsafe {
         anyhow::ensure!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0, "getrlimit failed");
         // macOS rejects values above OPEN_MAX even when the hard limit is
         // RLIM_INFINITY, so fall back to the current limit there.
         if lim.rlim_cur < lim.rlim_max {
-            let want = libc::rlimit { rlim_cur: lim.rlim_max, rlim_max: lim.rlim_max };
+            let want = libc::rlimit {
+                rlim_cur: lim.rlim_max,
+                rlim_max: lim.rlim_max,
+            };
             if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
                 lim.rlim_cur = lim.rlim_max;
             }
