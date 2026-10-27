@@ -52,7 +52,7 @@ async fn route(req: Req, hits: u64) -> Result<Response, ErrorCode> {
         }
         ("POST", "/incr") => {
             let n = count().await + 1;
-            match util::write_file("/data", "count", n.to_string().into_bytes()).await {
+            match util::write_file_atomic("/data", "count", n.to_string().into_bytes()).await {
                 Ok(()) => json(200, format!("{{\"count\":{n},\"instance_hits\":{hits}}}")),
                 Err(e) => json(507, format!("{{\"error\":{}}}", js(&util::fs_err(&e)))),
             }
@@ -83,7 +83,7 @@ async fn kv(method: &str, key: &str, body: Vec<u8>) -> Result<Response, ErrorCod
             Ok(b) => util::respond(200, "application/octet-stream", b),
             Err(e) => text(404, util::fs_err(&e)),
         },
-        "PUT" | "POST" => match util::write_file("/data", &path, body).await {
+        "PUT" | "POST" => match util::write_file_atomic("/data", &path, body).await {
             Ok(()) => text(204, ""),
             Err(e) => json(507, format!("{{\"error\":{}}}", js(&util::fs_err(&e)))),
         },

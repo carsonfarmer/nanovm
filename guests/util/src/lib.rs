@@ -174,6 +174,16 @@ pub async fn write_file(mount: &str, path: &str, data: Vec<u8>) -> Result<(), Fs
     write_all(&fd, data, 0).await
 }
 
+/// Replaces `path` atomically: writes a temporary sibling, then renames it
+/// over `path`. A kill mid-write leaves the old contents (and at worst a
+/// stray `.tmp` file), never a torn or empty file.
+pub async fn write_file_atomic(mount_path: &str, path: &str, data: Vec<u8>) -> Result<(), FsError> {
+    let tmp = format!("{path}.tmp");
+    write_file(mount_path, &tmp, data).await?;
+    let dir = mount(mount_path).ok_or(FsError::NoEntry)?;
+    dir.rename_at(tmp, dir, path.to_string()).await
+}
+
 pub async fn append_file(mount: &str, path: &str, data: Vec<u8>) -> Result<(), FsError> {
     let fd = open(
         mount,
