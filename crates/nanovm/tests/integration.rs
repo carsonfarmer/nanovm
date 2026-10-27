@@ -25,6 +25,11 @@ fn guest(name: &str) -> PathBuf {
 /// A node with the `counter` and `hostile` apps and its own data directory.
 /// The compile cache is shared between tests.
 fn node(test: &str, max_live: usize, counter_idle_ms: u64) -> Arc<Node> {
+    node_with(test, max_live, counter_idle_ms, 100)
+}
+
+/// Like `node`, with the hostile app's CPU budget set to `hostile_cpu_ms`.
+fn node_with(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: u64) -> Arc<Node> {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let dir = root.join("nodes").join(test);
     let _ = std::fs::remove_dir_all(&dir);
@@ -59,7 +64,7 @@ fn node(test: &str, max_live: usize, counter_idle_ms: u64) -> Arc<Node> {
         static_dir = "{statics}"
         [app.limits]
         memory_mb = 32
-        cpu_ms = 100
+        cpu_ms = {hostile_cpu_ms}
         request_timeout_ms = 1000
         post_return_timeout_ms = 500
         data_mb = 8
@@ -165,7 +170,7 @@ async fn objects_do_not_share_volumes() {
 async fn app_dir_is_readable() {
     let node = node("app_dir_is_readable", 8, 60_000);
     let r = get(&node, "counter", "s", "/static").await;
-    assert_eq!(r.status, 200);
+    assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.body, std::fs::read_to_string(repo().join("demo/static/hello.txt")).unwrap());
 }
 
@@ -191,7 +196,7 @@ async fn one_request_at_a_time_per_object() {
     });
     for r in futures::future::join_all(reqs).await {
         let r = r.unwrap();
-        assert_eq!(r.status, 200);
+        assert_eq!(r.status, 200, "{}", r.body);
         assert_eq!(r.json()["max_active"], 1);
     }
 }
@@ -315,7 +320,8 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
             let (node, stop) = (node.clone(), stop.clone());
             tokio::spawn(async move {
                 while !stop.load(Relaxed) {
-                    assert_eq!(get(&node, "hostile", &format!("hog{i}"), "/spin").await.error.as_deref(), Some("cpu"));
+                    let r = get(&node, "hostile", &format!("hog{i}"), "/spin").await;
+                    assert_eq!(r.error.as_deref(), Some("cpu"), "{}", r.body);
                 }
             })
         })
@@ -351,16 +357,18 @@ async fn grid_marks_killed_objects() {
 async fn file_size_limit() {
     let node = node("file_size_limit", 8, 60_000);
     let r = get(&node, "hostile", "f", "/fill?mount=data&mb=100").await;
-    assert_eq!(r.status, 507);
+    assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["written"], 4 << 20);
     assert_eq!(r.json()["error"], "file-too-large");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_count_limit() {
-    let node = node("file_count_limit", 8, 60_000);
+    // 200 creates run inline and count against the CPU budget, which on a
+    // loaded small host can pass 100 ms; this test is about the file count.
+    let node = node_with("file_count_limit", 8, 60_000, 1_000);
     let r = get(&node, "hostile", "f", "/files?mount=tmp").await;
-    assert_eq!(r.status, 507);
+    assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["created"], 200);
     assert_eq!(r.json()["error"], "quota");
 }
@@ -370,7 +378,7 @@ async fn tmp_quota_and_wipe() {
     let node = node("tmp_quota_and_wipe", 8, 60_000);
     assert_eq!(get(&node, "hostile", "t", "/fill?mount=tmp&mb=4&name=a").await.status, 200);
     let r = get(&node, "hostile", "t", "/fill?mount=tmp&mb=1&name=b").await;
-    assert_eq!(r.status, 507);
+    assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "insufficient-space");
     // A new instance gets an empty /tmp.
     assert_eq!(get(&node, "hostile", "t", "/panic").await.status, 500);
@@ -421,7 +429,7 @@ async fn data_quota_survives_restart() {
 async fn app_dir_is_read_only() {
     let node = node("app_dir_is_read_only", 8, 60_000);
     let r = get(&node, "hostile", "w", "/write-app").await;
-    assert_eq!(r.status, 507);
+    assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "not-permitted");
     assert!(!repo().join("demo/static/pwned.txt").exists());
 }
@@ -448,7 +456,7 @@ async fn no_rename_across_mounts() {
 async fn egress_unlisted_host_denied() {
     let node = node("egress_unlisted_host_denied", 8, 60_000);
     let r = get(&node, "hostile", "n", "/fetch?url=http://169.254.169.254/latest/meta-data/").await;
-    assert_eq!(r.status, 502);
+    assert_eq!(r.status, 502, "{}", r.body);
     assert!(r.json()["denied"].as_str().unwrap().contains("HttpRequestDenied"), "{}", r.body);
     assert!(node.metrics.egress_denied.load(Relaxed) >= 1);
 }
@@ -460,7 +468,7 @@ async fn egress_listed_name_resolving_to_loopback_denied() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let r = get(&node, "hostile", "n", &format!("/fetch?url=http://localhost:{port}/")).await;
-    assert_eq!(r.status, 502);
+    assert_eq!(r.status, 502, "{}", r.body);
     assert!(r.json()["denied"].as_str().unwrap().contains("DestinationIpProhibited"), "{}", r.body);
 }
 
