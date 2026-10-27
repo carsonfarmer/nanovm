@@ -94,7 +94,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 29 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 30 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -117,6 +117,9 @@ The tests cover:
 - **Pool exhaustion under churn.** An LRU-evicted object's store lives until its actor next runs, so live stores could outnumber `max_live_objects`, and a new object could find the pool full.
   - Now every store holds one of `max_live_objects` slots, released only after the store is dropped. A new object waits until an evicted object's pool slot is actually free, and instantiation never sees a full pool.
   - `churn_past_capacity_never_fails` checks the peak number of live stores. Without the slots, it sees 25 live stores against a limit of 16.
+- **Renaming a file onto itself erased its quota usage.** `rename_at` credited the size of an existing target, but renaming a file onto itself is a POSIX no-op. Repeating it zeroed the mount's byte and file counts, so a guest could write past its quota.
+  - The fix compares the file identity of the source and the target, and credits only a real replacement.
+  - `rename_quota_accounting` checks both cases: the self-rename credits nothing, and a rename over another file still frees its space.
 - **Filesystem calls queued on one mutex.** wasmtime-wasi sends every filesystem call through tokio's `spawn_blocking`, which has a single lock. Under 256 concurrent writers it collapsed throughput 10×.
   - The fix is `allow_blocking_current_thread(true)`, which runs small local-disk calls inline and charges them to the object's CPU budget. It has to be set before the preopens, which capture it.
   - Result: concurrent `/incr` went from 3K/s to 27K/s, and warm GETs got 1.6× faster.

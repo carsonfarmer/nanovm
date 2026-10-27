@@ -586,11 +586,19 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         let Some(m) = to else {
             return WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await;
         };
-        // Renaming over an existing entry frees it.
-        let replaced = WasiFilesystem::stat_at(&inner, dup(&new_fd), PathFlags::empty(), new_path.clone())
-            .await
-            .ok()
-            .map(|st| if is_file(&st) { st.size } else { 0 });
+        // Renaming over an existing entry frees it, unless both paths name the
+        // same file: POSIX makes that a no-op, and crediting it would let a
+        // guest zero its usage by renaming a file onto itself.
+        let old_id = WasiFilesystem::metadata_hash_at(&inner, dup(&fd), PathFlags::empty(), old_path.clone()).await;
+        let new_id = WasiFilesystem::metadata_hash_at(&inner, dup(&new_fd), PathFlags::empty(), new_path.clone()).await;
+        let same = matches!((&old_id, &new_id), (Ok(a), Ok(b)) if (a.lower, a.upper) == (b.lower, b.upper));
+        let replaced = match same {
+            true => None,
+            false => WasiFilesystem::stat_at(&inner, dup(&new_fd), PathFlags::empty(), new_path.clone())
+                .await
+                .ok()
+                .map(|st| if is_file(&st) { st.size } else { 0 }),
+        };
         WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await?;
         if let Some(bytes) = replaced {
             quota.adjust(m, -(bytes as i64), -1);

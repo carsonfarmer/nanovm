@@ -188,13 +188,14 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             json(if leaked { 200 } else { 403 }, format!("[{}]", results.join(",")))
         }
 
-        // Rename a file onto itself `n` times (POSIX: a no-op).
-        "/rename-self" => {
+        // Rename `from` to `to` (default: onto itself, a POSIX no-op) `n` times.
+        "/rename" => {
             let mount = format!("/{}", req.q("mount").unwrap_or("tmp"));
-            let name = req.q("name").unwrap_or("fill.bin").to_string();
+            let from = req.q("from").unwrap_or("fill.bin").to_string();
+            let to = req.q("to").unwrap_or(&from).to_string();
             let dir = util::mount(&mount).unwrap();
             for i in 0..req.q_u64("n", 1) {
-                if let Err(e) = dir.rename_at(name.clone(), dir, name.clone()).await {
+                if let Err(e) = dir.rename_at(from.clone(), dir, to.clone()).await {
                     return json(507, format!("{{\"renamed\":{i},\"error\":{}}}", js(&util::fs_err(&e))));
                 }
             }

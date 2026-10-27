@@ -45,7 +45,7 @@ fn node(test: &str, max_live: usize, counter_idle_ms: u64) -> Arc<Node> {
         static_dir = "{statics}"
         [app.limits]
         memory_mb = 16
-        cpu_ms = 50
+        cpu_ms = 500 # generous: oversubscribed CI hosts inflate the wall-time budget; CPU kills are tested on `hostile`
         request_timeout_ms = 2000
         idle_timeout_ms = {counter_idle_ms}
         data_mb = 1
@@ -384,15 +384,20 @@ async fn tmp_quota_and_wipe() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn rename_onto_itself_frees_nothing() {
-    let node = node("rename_onto_itself_frees_nothing", 8, 60_000);
+async fn rename_quota_accounting() {
+    let node = node("rename_quota_accounting", 8, 60_000);
     assert_eq!(get(&node, "hostile", "r", "/fill?mount=tmp&mb=4&name=a").await.status, 200);
-    let r = get(&node, "hostile", "r", "/rename-self?mount=tmp&name=a&n=10").await;
+    // Renaming a file onto itself is a no-op and must not credit the quota.
+    let r = get(&node, "hostile", "r", "/rename?mount=tmp&from=a&n=10").await;
     assert_eq!(r.status, 200, "{}", r.body);
-    // /tmp is still full: a no-op rename must not credit the quota.
     let r = get(&node, "hostile", "r", "/fill?mount=tmp&mb=1&name=b").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "insufficient-space");
+    // Renaming the empty `b` over `a` does free a's 4 MiB.
+    let r = get(&node, "hostile", "r", "/rename?mount=tmp&from=b&to=a").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = get(&node, "hostile", "r", "/fill?mount=tmp&mb=4&name=c").await;
+    assert_eq!(r.status, 200, "{}", r.body);
 }
 
 #[tokio::test(flavor = "multi_thread")]
