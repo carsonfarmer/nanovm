@@ -291,7 +291,10 @@ impl types::HostDescriptor for QuotaView<'_> {
 
 impl preopens::Host for QuotaView<'_> {
     fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
-        let dirs = preopens::Host::get_directories(&mut self.0.filesystem())?;
+        let mut dirs = preopens::Host::get_directories(&mut self.0.filesystem())?;
+        if let Some(app) = self.0.app_dir.clone() {
+            dirs.push((self.0.filesystem().table.push(Descriptor::Dir(app))?, "/app".to_string()));
+        }
         let mut q = self.0.quota.0.lock();
         for (fd, path) in &dirs {
             if let Some(m) = q.mounts.iter().position(|m| m.mount == path) {

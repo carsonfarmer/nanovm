@@ -242,6 +242,8 @@ pub struct ObjState {
     cpu_budget_ns: u64,
     cpu_exceeded: bool,
     stderr: LogTail,
+    /// The app's shared `/app` preopen; see `App::static_dir`.
+    pub app_dir: Option<wasmtime_wasi::filesystem::Dir>,
     pub quota: QuotaGuard,
     _tmp: TmpDir,
     _live: LiveGuard,
@@ -294,9 +296,6 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
     // budget. Through `spawn_blocking` they all contend on the blocking
     // pool's one mutex. Preopens capture this, so it must come first.
     b.allow_blocking_current_thread(true);
-    if let Some(dir) = &app.static_dir {
-        b.preopened_dir(dir, "/app", FsPerms::ReadOnly)?;
-    }
     b.preopened_dir(&data_dir, "/data", FsPerms::ReadWrite)?;
     b.preopened_dir(&tmp_dir, "/tmp", FsPerms::ReadWrite)?;
     b.stdout(stderr.clone()).stderr(stderr.clone());
@@ -334,6 +333,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         cpu_budget_ns: limits.cpu_ms * 1_000_000,
         cpu_exceeded: false,
         stderr,
+        app_dir: app.static_dir.clone(),
         quota,
         _tmp: tmp,
         _live: LiveGuard(node.metrics.clone()),

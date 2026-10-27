@@ -2,12 +2,13 @@
 //! cached compile), checks the component's imports against the capabilities
 //! the node offers, and pre-links it so instantiation is cheap.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use wasmtime::Engine;
 use wasmtime::component::{Component, Linker};
+use wasmtime_wasi::filesystem::Dir;
+use wasmtime_wasi::{FsPerms, OpenMode};
 use wasmtime_wasi_http::p3::bindings::ServicePre;
 
 use crate::config::{AppConfig, NodeConfig};
@@ -33,7 +34,9 @@ pub struct App {
     pub cfg: AppConfig,
     pub pre: ServicePre<ObjState>,
     pub egress: Arc<EgressPolicy>,
-    pub static_dir: Option<PathBuf>,
+    /// `/app`, opened once and shared read-only by every object of the app,
+    /// so it costs one fd per app rather than one per live object.
+    pub static_dir: Option<Dir>,
 }
 
 pub fn linker(engine: &Engine) -> anyhow::Result<Linker<ObjState>> {
@@ -76,17 +79,22 @@ impl App {
             .with_context(|| format!("linking app {:?}", cfg.name))?;
         let egress = EgressPolicy::parse(&cfg.limits.egress)
             .with_context(|| format!("app {:?} egress", cfg.name))?;
-        if let Some(d) = &cfg.static_dir
-            && !d.is_dir()
-        {
-            bail!("app {:?}: static_dir {} is not a directory", cfg.name, d.display());
-        }
+        let static_dir = match &cfg.static_dir {
+            Some(d) if !d.is_dir() => bail!("app {:?}: static_dir {} is not a directory", cfg.name, d.display()),
+            // Reads through a shared directory fd don't interfere: every
+            // lookup is `*at` relative to it, and listing opens a fresh fd.
+            Some(d) => {
+                let fd = std::fs::File::open(d).with_context(|| format!("opening static_dir {}", d.display()))?;
+                Some(Dir::new(fd, FsPerms::ReadOnly, OpenMode::READ, true))
+            }
+            None => None,
+        };
         Ok(App {
             name: cfg.name.as_str().into(),
             cfg: cfg.clone(),
             pre,
             egress: Arc::new(egress),
-            static_dir: cfg.static_dir.clone(),
+            static_dir,
         })
     }
 }

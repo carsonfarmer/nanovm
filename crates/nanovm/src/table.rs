@@ -69,6 +69,7 @@ pub struct ObjInfo {
 
 impl Node {
     pub fn new(cfg: NodeConfig) -> anyhow::Result<Arc<Node>> {
+        crate::engine::preflight(&cfg)?;
         let engine = crate::engine::build(&cfg)?;
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
@@ -93,6 +94,17 @@ impl Node {
             seq: AtomicU64::new(1),
             recent_kills: Mutex::default(),
         }))
+    }
+
+    /// Releases every object and waits until all their stores are gone.
+    /// Each actor holds the node alive, so dropping the last outside handle
+    /// frees nothing until this has run.
+    pub async fn shutdown(&self) {
+        // Dropping each queue's sender lets its actor drain and exit.
+        self.objects.lock().clear();
+        while self.metrics.stores_live.load(Relaxed) > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     pub fn next_seq(&self) -> u64 {
