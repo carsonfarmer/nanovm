@@ -6,11 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use nanovm::config::NodeConfig;
+use nanovm::load::{Reply, request};
 use nanovm::table::Node;
-use serde_json::Value;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -94,44 +92,8 @@ fn node_cfg(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: u
     cfg
 }
 
-struct Resp {
-    status: u16,
-    /// `x-nanovm-error`: set when the host, not the guest, answered.
-    error: Option<String>,
-    body: String,
-    elapsed: Duration,
-}
-
-impl Resp {
-    fn json(&self) -> Value {
-        serde_json::from_str(&self.body).unwrap_or_else(|e| panic!("{e}: {}", self.body))
-    }
-}
-
-async fn call(node: &Arc<Node>, method: &str, app: &str, id: &str, path: &str, body: &str) -> Resp {
-    let req = http::Request::builder()
-        .method(method)
-        .uri(format!("http://localhost{path}"))
-        .body(Bytes::from(body.to_string()))
-        .unwrap();
-    let t0 = Instant::now();
-    let resp = node.dispatch(app, id, req).await;
-    let status = resp.status().as_u16();
-    let error = resp
-        .headers()
-        .get("x-nanovm-error")
-        .map(|v| v.to_str().unwrap().to_string());
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    Resp {
-        status,
-        error,
-        body: String::from_utf8_lossy(&body).into(),
-        elapsed: t0.elapsed(),
-    }
-}
-
-async fn get(node: &Arc<Node>, app: &str, id: &str, path: &str) -> Resp {
-    call(node, "GET", app, id, path, "").await
+async fn get(node: &Arc<Node>, app: &str, id: &str, path: &str) -> Reply {
+    request(node, "GET", app, id, path, "").await
 }
 
 /// Waits until `f` holds, for up to 2 s.
@@ -157,7 +119,7 @@ async fn settle(node: &Arc<Node>) {
 async fn volume_survives_eviction_memory_does_not() {
     let node = node("volume_survives_eviction", 2, 60_000);
     for n in 1..=3 {
-        let r = call(&node, "POST", "counter", "a", "/incr", "").await;
+        let r = request(&node, "POST", "counter", "a", "/incr", "").await;
         assert_eq!(r.status, 200, "{}", r.body);
         assert_eq!(r.json()["count"], n);
         assert_eq!(r.json()["instance_hits"], n);
@@ -177,12 +139,15 @@ async fn volume_survives_eviction_memory_does_not() {
 #[tokio::test(flavor = "multi_thread")]
 async fn objects_do_not_share_volumes() {
     let node = node("objects_do_not_share_volumes", 8, 60_000);
-    assert_eq!(call(&node, "PUT", "counter", "x", "/kv/k", "secret").await.status, 204);
+    assert_eq!(
+        request(&node, "PUT", "counter", "x", "/kv/k", "secret").await.status,
+        204
+    );
     let r = get(&node, "counter", "x", "/kv/k").await;
     assert_eq!((r.status, r.body.as_str()), (200, "secret"));
     let r = get(&node, "counter", "y", "/kv/k").await;
     assert_eq!(r.status, 404, "{}", r.body);
-    assert_eq!(call(&node, "DELETE", "counter", "x", "/kv/k", "").await.status, 204);
+    assert_eq!(request(&node, "DELETE", "counter", "x", "/kv/k", "").await.status, 204);
     assert_eq!(get(&node, "counter", "x", "/kv/k").await.status, 404);
 }
 
@@ -263,7 +228,7 @@ async fn full_queue_is_rejected() {
 
 /// Runs one attack, checks the host killed the instance with `reason`, and
 /// that the object comes back on a fresh instance.
-async fn killed(node: &Arc<Node>, id: &str, path: &str, status: u16, reason: &str) -> Resp {
+async fn killed(node: &Arc<Node>, id: &str, path: &str, status: u16, reason: &str) -> Reply {
     let before = get(node, "hostile", id, "/").await;
     assert_eq!(before.status, 200);
     let r = get(node, "hostile", id, path).await;

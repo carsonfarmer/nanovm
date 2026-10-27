@@ -410,7 +410,31 @@ impl StreamConsumer<ObjState> for QuotaWriter {
     }
 }
 
+/// Methods that need no quota check: forwarded to the stock implementation.
+macro_rules! delegate {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
+        async fn $name(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>, $($arg: $ty),*) -> $ret {
+            WasiFilesystem::$name(&stock(store), fd, $($arg),*).await
+        }
+    )*};
+}
+
 impl HostDescriptorWithStore<ObjState> for QuotaFs {
+    delegate! {
+        advise(offset: Filesize, length: Filesize, advice: Advice) -> FilesystemResult<()>;
+        sync_data() -> FilesystemResult<()>;
+        sync() -> FilesystemResult<()>;
+        get_flags() -> FilesystemResult<DescriptorFlags>;
+        get_type() -> FilesystemResult<DescriptorType>;
+        stat() -> FilesystemResult<DescriptorStat>;
+        stat_at(flags: PathFlags, path: String) -> FilesystemResult<DescriptorStat>;
+        set_times(atime: NewTimestamp, mtime: NewTimestamp) -> FilesystemResult<()>;
+        set_times_at(flags: PathFlags, path: String, atime: NewTimestamp, mtime: NewTimestamp) -> FilesystemResult<()>;
+        readlink_at(path: String) -> FilesystemResult<String>;
+        is_same_object(other: Resource<Descriptor>) -> wasmtime::Result<bool>;
+        metadata_hash() -> FilesystemResult<MetadataHashValue>;
+        metadata_hash_at(flags: PathFlags, path: String) -> FilesystemResult<MetadataHashValue>;
+    }
     fn read_via_stream(
         mut store: Access<ObjState, Self>,
         fd: Resource<Descriptor>,
@@ -440,31 +464,6 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         write_stream(store, fd, data, None)
     }
 
-    async fn advise(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        offset: Filesize,
-        length: Filesize,
-        advice: Advice,
-    ) -> FilesystemResult<()> {
-        WasiFilesystem::advise(&stock(store), fd, offset, length, advice).await
-    }
-
-    async fn sync_data(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
-        WasiFilesystem::sync_data(&stock(store), fd).await
-    }
-
-    async fn get_flags(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-    ) -> FilesystemResult<DescriptorFlags> {
-        WasiFilesystem::get_flags(&stock(store), fd).await
-    }
-
-    async fn get_type(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<DescriptorType> {
-        WasiFilesystem::get_type(&stock(store), fd).await
-    }
-
     async fn set_size(
         store: &Accessor<ObjState, Self>,
         fd: Resource<Descriptor>,
@@ -476,24 +475,11 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         }
     }
 
-    async fn set_times(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        data_access_timestamp: NewTimestamp,
-        data_modification_timestamp: NewTimestamp,
-    ) -> FilesystemResult<()> {
-        WasiFilesystem::set_times(&stock(store), fd, data_access_timestamp, data_modification_timestamp).await
-    }
-
     fn read_directory(
         mut store: Access<'_, ObjState, Self>,
         fd: Resource<Descriptor>,
     ) -> wasmtime::Result<(StreamReader<DirectoryEntry>, FutureReader<Result<(), ErrorCode>>)> {
         WasiFilesystem::read_directory(Access::<ObjState, WasiFilesystem>::new(store.as_context_mut(), fs), fd)
-    }
-
-    async fn sync(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
-        WasiFilesystem::sync(&stock(store), fd).await
     }
 
     async fn create_directory_at(
@@ -511,38 +497,6 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
             quota.adjust(m, 0, 1);
         }
         Ok(())
-    }
-
-    async fn stat(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<DescriptorStat> {
-        WasiFilesystem::stat(&stock(store), fd).await
-    }
-
-    async fn stat_at(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        path_flags: PathFlags,
-        path: String,
-    ) -> FilesystemResult<DescriptorStat> {
-        WasiFilesystem::stat_at(&stock(store), fd, path_flags, path).await
-    }
-
-    async fn set_times_at(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        path_flags: PathFlags,
-        path: String,
-        data_access_timestamp: NewTimestamp,
-        data_modification_timestamp: NewTimestamp,
-    ) -> FilesystemResult<()> {
-        WasiFilesystem::set_times_at(
-            &stock(store),
-            fd,
-            path_flags,
-            path,
-            data_access_timestamp,
-            data_modification_timestamp,
-        )
-        .await
     }
 
     async fn link_at(
@@ -591,14 +545,6 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         quota.adjust(m, -(freed as i64), created as i64);
         quota.track(&new, m);
         Ok(new)
-    }
-
-    async fn readlink_at(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        path: String,
-    ) -> FilesystemResult<String> {
-        WasiFilesystem::readlink_at(&stock(store), fd, path).await
     }
 
     async fn remove_directory_at(
@@ -684,29 +630,5 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         WasiFilesystem::unlink_file_at(&inner, fd, path).await?;
         quota.adjust(m, -(size as i64), -1);
         Ok(())
-    }
-
-    async fn is_same_object(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        other: Resource<Descriptor>,
-    ) -> wasmtime::Result<bool> {
-        WasiFilesystem::is_same_object(&stock(store), fd, other).await
-    }
-
-    async fn metadata_hash(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-    ) -> FilesystemResult<MetadataHashValue> {
-        WasiFilesystem::metadata_hash(&stock(store), fd).await
-    }
-
-    async fn metadata_hash_at(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        path_flags: PathFlags,
-        path: String,
-    ) -> FilesystemResult<MetadataHashValue> {
-        WasiFilesystem::metadata_hash_at(&stock(store), fd, path_flags, path).await
     }
 }

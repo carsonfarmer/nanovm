@@ -6,6 +6,7 @@ pub mod app;
 pub mod config;
 pub mod egress;
 pub mod engine;
+pub mod load;
 pub mod metrics;
 pub mod object;
 pub mod quota;

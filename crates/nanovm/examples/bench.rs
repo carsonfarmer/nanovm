@@ -6,12 +6,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use nanovm::config::NodeConfig;
+use nanovm::load::{Reply, Run, request};
 use nanovm::metrics::rss_bytes;
 use nanovm::table::Node;
 use serde_json::{Value, json};
@@ -73,126 +72,21 @@ fn node(name: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
     Node::new(cfg)
 }
 
-async fn once(node: &Arc<Node>, app: &str, id: &str, method: &str, path: &str) -> u16 {
-    once_err(node, app, id, method, path).await.0
+async fn once(node: &Arc<Node>, app: &str, id: &str, path: &str) -> Reply {
+    request(node, "GET", app, id, path, "").await
 }
 
-/// The status, plus the `x-nanovm-error` reason (or the status) on failure.
-async fn once_err(node: &Arc<Node>, app: &str, id: &str, method: &str, path: &str) -> (u16, Option<String>) {
-    let req = http::Request::builder()
-        .method(method)
-        .uri(format!("http://localhost{path}"))
-        .body(Bytes::new())
-        .unwrap();
-    let resp = node.dispatch(app, id, req).await;
-    let status = resp.status().as_u16();
-    let reason = (status != 200).then(|| {
-        let e = resp.headers().get("x-nanovm-error").and_then(|v| v.to_str().ok());
-        format!("{status} {}", e.unwrap_or("guest"))
-    });
-    let _ = resp.into_body().collect().await;
-    (status, reason)
-}
-
-struct Run {
-    elapsed: Duration,
-    /// Per-request latency in µs, sorted.
-    lat: Vec<u32>,
-    failed: usize,
-    /// Failure counts by status and `x-nanovm-error` reason.
-    reasons: std::collections::BTreeMap<String, usize>,
-}
-
-impl Run {
-    fn rps(&self) -> f64 {
-        self.lat.len() as f64 / self.elapsed.as_secs_f64()
-    }
-
-    fn pct(&self, q: f64) -> f64 {
-        let i = ((self.lat.len() as f64 * q).ceil() as usize).clamp(1, self.lat.len()) - 1;
-        self.lat[i] as f64 / 1000.0
-    }
-
-    fn json(&self) -> Value {
-        json!({
-            "requests": self.lat.len(),
-            "failed": self.failed,
-            "failure_reasons": self.reasons,
-            "elapsed_ms": self.elapsed.as_secs_f64() * 1e3,
-            "rps": self.rps().round(),
-            "p50_ms": self.pct(0.50),
-            "p99_ms": self.pct(0.99),
-            "p999_ms": self.pct(0.999),
-        })
-    }
-}
-
-/// `n` requests from `conc` workers; request `i` goes to object `id(i)`.
+#[allow(clippy::too_many_arguments)]
 async fn load(
     node: &Arc<Node>,
-    app: &'static str,
-    method: &'static str,
-    path: &'static str,
+    app: &str,
+    method: &str,
+    path: &str,
     n: usize,
     conc: usize,
     id: impl Fn(usize) -> String + Send + Sync + 'static,
 ) -> Run {
-    load_until(node, app, method, path, n, None, conc, id).await
-}
-
-/// Like `load`, but stops at `deadline` if that comes first.
-#[allow(clippy::too_many_arguments)]
-async fn load_until(
-    node: &Arc<Node>,
-    app: &'static str,
-    method: &'static str,
-    path: &'static str,
-    n: usize,
-    deadline: Option<Instant>,
-    conc: usize,
-    id: impl Fn(usize) -> String + Send + Sync + 'static,
-) -> Run {
-    let next = Arc::new(AtomicUsize::new(0));
-    let id = Arc::new(id);
-    let t0 = Instant::now();
-    let workers: Vec<_> = (0..conc)
-        .map(|_| {
-            let (node, next, id) = (node.clone(), next.clone(), id.clone());
-            tokio::spawn(async move {
-                let mut lat = Vec::with_capacity((n / conc + 1).min(1 << 20));
-                let mut failed = std::collections::BTreeMap::<String, usize>::new();
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= n || deadline.is_some_and(|d| Instant::now() >= d) {
-                        return (lat, failed);
-                    }
-                    let t = Instant::now();
-                    if let (_, Some(reason)) = once_err(&node, app, &id(i), method, path).await {
-                        *failed.entry(reason).or_default() += 1;
-                    }
-                    lat.push(t.elapsed().as_micros() as u32);
-                }
-            })
-        })
-        .collect();
-    let mut lat = Vec::new();
-    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
-    for w in workers {
-        let (l, f) = w.await.unwrap();
-        lat.extend(l);
-        for (k, v) in f {
-            *reasons.entry(k).or_default() += v;
-        }
-    }
-    let elapsed = t0.elapsed();
-    lat.sort_unstable();
-    let failed = reasons.values().sum();
-    Run {
-        elapsed,
-        lat,
-        failed,
-        reasons,
-    }
+    nanovm::load::run(node, app, method, path, n, None, conc, id).await
 }
 
 fn row(name: &str, r: &Run, note: &str) {
@@ -202,8 +96,8 @@ fn row(name: &str, r: &Run, note: &str) {
         r.pct(0.5),
         r.pct(0.99),
         r.pct(0.999),
-        if r.failed > 0 {
-            format!("FAILED {} {:?}  ", r.failed, r.reasons)
+        if r.failed() > 0 {
+            format!("FAILED {} {:?}  ", r.failed(), r.failures)
         } else {
             String::new()
         },
@@ -243,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- cold starts, then warm traffic on the same node ----
     let n = node("main", cold_n + 64)?;
-    once(&n, "counter", "warmup", "GET", "/").await;
+    once(&n, "counter", "warmup", "/").await;
     let rss0 = rss_bytes();
     let cold = load(&n, "counter", "GET", "/", cold_n, conc, |i| format!("o{i}")).await;
     let live = n.live_objects();
@@ -288,26 +182,15 @@ async fn main() -> anyhow::Result<()> {
     // ---- kill and recover ----
     let n = node("kill", 256)?;
     let kills = 300 / scale;
-    let mut lat = Vec::with_capacity(kills);
     let t0 = Instant::now();
-    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
+    let mut recover = Run::default();
     for i in 0..kills {
         let id = format!("k{}", i % 16);
-        once(&n, "hostile", &id, "GET", "/panic").await;
-        let t = Instant::now();
-        if let (_, Some(reason)) = once_err(&n, "hostile", &id, "GET", "/").await {
-            *reasons.entry(reason).or_default() += 1;
-        }
-        lat.push(t.elapsed().as_micros() as u32);
+        once(&n, "hostile", &id, "/panic").await;
+        recover.add(&once(&n, "hostile", &id, "/").await);
     }
-    lat.sort_unstable();
-    let failed = reasons.values().sum();
-    let recover = Run {
-        elapsed: t0.elapsed(),
-        lat,
-        failed,
-        reasons,
-    };
+    recover.elapsed = t0.elapsed();
+    recover.lat_us.sort_unstable();
     println!("\nkill and recover ({kills} traps, serial)");
     row("next request after a trap", &recover, "(fresh instance)");
     out.insert("recover".into(), recover.json());
@@ -342,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
     let objs = 100 / scale.min(10);
     load(&n, "counter", "GET", "/", objs, 64, |i| format!("v{i}")).await;
     let window = Duration::from_millis(if quick { 1000 } else { 3000 });
-    let base = load_until(
+    let base = nanovm::load::run(
         &n,
         "counter",
         "GET",
@@ -361,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 let paths = ["/spin", "/alloc?mb=1024", "/panic", "/leak"];
                 let mut k = 0;
                 while !stop.load(Relaxed) {
-                    once(&n, "hostile", &format!("a{a}"), "GET", paths[k % paths.len()]).await;
+                    once(&n, "hostile", &format!("a{a}"), paths[k % paths.len()]).await;
                     k += 1;
                 }
                 k
@@ -371,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
     // Let the attackers get going before measuring.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let killed0: u64 = n.metrics.poisons.iter().map(|p| p.load(Relaxed)).sum();
-    let under = load_until(
+    let under = nanovm::load::run(
         &n,
         "counter",
         "GET",

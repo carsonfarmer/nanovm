@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -17,6 +17,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::json;
 use tokio::net::TcpListener;
 
+use crate::load::{Run, request};
 use crate::metrics::{Poison, rss_bytes};
 use crate::object::{RespBody, error_response};
 use crate::table::Node;
@@ -147,17 +148,15 @@ async fn admin(node: &Arc<Node>, path: &str, req: &Request<Incoming>) -> Respons
                 .get("prefix")
                 .cloned()
                 .unwrap_or_else(|| format!("s{}", node.next_seq()));
-            let n = num("n", 10_000);
-            let conc = num("concurrency", 256);
+            let (n, conc) = (num("n", 10_000) as usize, num("concurrency", 256) as usize);
             ok_json(load(node, &app, n, conc, "GET", "/", move |i| format!("{prefix}-{i}")).await)
         }
         "/demo/hammer" if req.method() == Method::POST => {
             // `n` requests spread over `objects` existing objects: warm path.
             let app = q.get("app").cloned().unwrap_or("counter".into());
             let prefix = q.get("prefix").cloned().unwrap_or("warm".into());
-            let objects = num("objects", 100).max(1);
-            let n = num("n", 20_000);
-            let conc = num("concurrency", 256);
+            let objects = num("objects", 100).max(1) as usize;
+            let (n, conc) = (num("n", 20_000) as usize, num("concurrency", 256) as usize);
             let method = q.get("method").cloned().unwrap_or("GET".into());
             let path = q.get("path").cloned().unwrap_or("/".into());
             ok_json(
@@ -199,130 +198,68 @@ async fn storm(node: &Arc<Node>, rounds: u64) -> serde_json::Value {
         .map(|(r, &(name, path))| {
             let node = node.clone();
             tokio::spawn(async move {
-                let req = Request::get(format!("http://localhost{path}"))
-                    .body(Bytes::new())
-                    .unwrap();
-                let t = Instant::now();
-                let resp = node.dispatch("hostile", &format!("storm-{name}-{r}"), req).await;
-                let status = resp.status().as_u16();
-                let host = resp
-                    .headers()
-                    .get("x-nanovm-error")
-                    .and_then(|h| h.to_str().ok())
-                    .map(String::from);
-                let body = resp
-                    .into_body()
-                    .collect()
-                    .await
-                    .map(|b| b.to_bytes())
-                    .unwrap_or_default();
-                (name, status, host, body, t.elapsed())
+                (
+                    name,
+                    request(&node, "GET", "hostile", &format!("storm-{name}-{r}"), path, "").await,
+                )
             })
         })
         .collect();
-    let mut out: Vec<serde_json::Value> = Vec::new();
-    let mut by_name: HashMap<&str, (HashMap<u16, u64>, Option<String>, String, f64)> = HashMap::new();
+    let mut by_name: HashMap<&str, (Run, Option<String>, String)> = HashMap::new();
     for t in tasks {
-        let Ok((name, status, host, body, took)) = t.await else {
-            continue;
-        };
+        let Ok((name, reply)) = t.await else { continue };
         let e = by_name.entry(name).or_default();
-        *e.0.entry(status).or_default() += 1;
-        e.3 = e.3.max(took.as_secs_f64() * 1e3);
+        e.0.add(&reply);
         if e.2.is_empty() {
-            e.1 = host;
-            e.2 = String::from_utf8_lossy(&body[..body.len().min(1024)]).into_owned();
+            e.1 = reply.error;
+            e.2 = reply.body.chars().take(1024).collect();
         }
     }
-    for &(name, path) in STORM {
-        if let Some((status, killed_by, sample, max_ms)) = by_name.remove(name) {
-            out.push(json!({
-                "attack": name, "path": path, "status": status,
+    let out: Vec<_> = STORM
+        .iter()
+        .filter_map(|&(name, path)| {
+            let (run, killed_by, sample) = by_name.remove(name)?;
+            let max_ms = run.lat_us.iter().max().map_or(0.0, |&us| us as f64 / 1e3);
+            Some(json!({
+                "attack": name, "path": path, "status": run.status,
                 "killed_by": killed_by, "sample": sample, "max_ms": max_ms,
-            }));
-        }
-    }
+            }))
+        })
+        .collect();
     json!({ "rounds": rounds, "attacks": out, "elapsed_ms": t0.elapsed().as_secs_f64() * 1e3 })
 }
 
-/// Runs `n` requests through the node in-process (no sockets) from `conc`
-/// client tasks, and reports throughput, latency and memory per live object.
+/// Runs `n` requests through the node in-process (see [`crate::load`]) and
+/// reports throughput, latency and memory per live object.
 async fn load(
     node: &Arc<Node>,
     app: &str,
-    n: u64,
-    conc: u64,
+    n: usize,
+    conc: usize,
     method: &str,
     path: &str,
-    object: impl Fn(u64) -> String + Send + Sync + 'static,
+    object: impl Fn(usize) -> String + Send + Sync + 'static,
 ) -> serde_json::Value {
-    let rss0 = rss_bytes();
-    let live0 = node.metrics.stores_live.load(Relaxed);
-    let method: Method = method.parse().unwrap_or(Method::GET);
-    let next = Arc::new(AtomicU64::new(0));
-    let object = Arc::new(object);
-    let t0 = Instant::now();
-    let clients: Vec<_> = (0..conc.clamp(1, n.max(1)))
-        .map(|_| {
-            let (node, next, object, method) = (node.clone(), next.clone(), object.clone(), method.clone());
-            let (app, uri) = (app.to_string(), format!("http://localhost{path}"));
-            tokio::spawn(async move {
-                let mut out: Vec<(u16, u32)> = Vec::new();
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= n {
-                        return out;
-                    }
-                    let req = Request::builder()
-                        .method(method.clone())
-                        .uri(&uri)
-                        .body(Bytes::new())
-                        .unwrap();
-                    let t = Instant::now();
-                    let resp = node.dispatch(&app, &object(i), req).await;
-                    let status = resp.status().as_u16();
-                    let _ = resp.into_body().collect().await;
-                    out.push((status, t.elapsed().as_micros() as u32));
-                }
-            })
-        })
-        .collect();
-    let mut peak_rss = rss0;
-    let mut results = Vec::with_capacity(n as usize);
-    for c in clients {
-        results.extend(c.await.unwrap_or_default());
-        peak_rss = peak_rss.max(rss_bytes());
-    }
-    let elapsed = t0.elapsed();
-    let peak_live = node.metrics.stores_live.load(Relaxed);
-    let mut by_status: HashMap<u16, u64> = HashMap::new();
-    for (status, _) in &results {
-        *by_status.entry(*status).or_default() += 1;
-    }
-    let mut lat: Vec<u32> = results.iter().map(|r| r.1).collect();
-    lat.sort_unstable();
-    let pct = |p: f64| {
-        lat.get(((lat.len() as f64 * p) as usize).min(lat.len().saturating_sub(1)))
-            .copied()
-            .unwrap_or(0)
-    };
+    let (rss0, live0) = (rss_bytes(), node.metrics.stores_live.load(Relaxed));
+    let r = crate::load::run(node, app, method, path, n, None, conc, object).await;
+    let (rss1, live1) = (rss_bytes().max(rss0), node.metrics.stores_live.load(Relaxed));
+    let us = |q: f64| (r.pct(q) * 1e3).round() as u64;
+    let grown = (live1 - live0).max(0) as f64;
     json!({
         "n": n,
         "concurrency": conc,
-        "ok": results.iter().filter(|r| r.0 < 400).count(),
-        "status": by_status,
-        "elapsed_ms": elapsed.as_secs_f64() * 1e3,
-        "rps": n as f64 / elapsed.as_secs_f64(),
-        "p50_us": pct(0.5),
-        "p99_us": pct(0.99),
-        "max_us": lat.last().copied().unwrap_or(0),
+        "ok": r.status.iter().filter(|&(s, _)| *s < 400).map(|(_, c)| c).sum::<usize>(),
+        "status": r.status,
+        "elapsed_ms": r.elapsed.as_secs_f64() * 1e3,
+        "rps": n as f64 / r.elapsed.as_secs_f64(),
+        "p50_us": us(0.5),
+        "p99_us": us(0.99),
+        "max_us": r.lat_us.last().copied().unwrap_or(0),
         "live_before": live0,
-        "live_after": peak_live,
+        "live_after": live1,
         "rss_before_mb": rss0 as f64 / 1048576.0,
-        "rss_peak_mb": peak_rss as f64 / 1048576.0,
-        "rss_per_live_kb": if peak_live > live0 {
-            (peak_rss.saturating_sub(rss0)) as f64 / 1024.0 / (peak_live - live0) as f64
-        } else { 0.0 },
+        "rss_peak_mb": rss1 as f64 / 1048576.0,
+        "rss_per_live_kb": if grown > 0.0 { (rss1 - rss0) as f64 / 1024.0 / grown } else { 0.0 },
     })
 }
 
