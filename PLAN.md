@@ -17,7 +17,7 @@ The stack is wasmtime 50.0.0 with wasmtime-wasi 50 and wasmtime-wasi-http 50 (P3
 Done means:
 - `nanovm serve` hosts real guest components with every limit enforced.
 - `cargo test` proves each guarantee against hostile guests.
-- `nanovm-bench` prints cold-start, warm-latency, throughput and density numbers.
+- `examples/bench.rs` prints cold-start, warm-latency, throughput and density numbers.
 - A live dashboard demo shows thousands of objects alongside attack scenarios.
 
 ## Architecture
@@ -49,24 +49,25 @@ client ──HTTP──► nanovm (hyper 1, http1)
 nanovm/
   Cargo.toml                     host workspace
   crates/nanovm/
-    src/lib.rs                   pub API: Node::new(cfg), Node::handle(req), Node::stats()
-    src/config.rs                NodeConfig, AppConfig, Limits, EgressRule (TOML via serde)
+    src/lib.rs                   module list; the API is Node::new(cfg), Node::dispatch(app, id, req)
+    src/config.rs                NodeConfig, AppConfig, Limits (TOML via serde)
     src/engine.rs                Engine (pooling, epoch ticker), .cwasm cache, deserialize_file
     src/app.rs                   load component, validate imports, build Linker + ServicePre
-    src/object.rs                actor loop, phases, deadlines, limiter, poison, re-instantiate
-    src/table.rs                 ObjectTable: get-or-spawn, LRU eviction, idle exit handshake
-    src/fs.rs                    mount side map, MountQuota, shadowed fs functions, QuotaWriter
+    src/object.rs                actor loop, phases, deadlines, limiter, CPU accounting, heavy lanes, poison
+    src/table.rs                 Node: (app, id) -> actor, slot permits, LRU/idle eviction, retire handshake
+    src/quota.rs                 quota'd wasi:filesystem@0.3 host (QuotaFs), mount side map, QuotaWriter
     src/egress.rs                allowlist, IP classifier, resolver + connector, send_request
-    src/metrics.rs               atomic counters, log2 latency histograms, event ring buffer
-    src/server.rs                hyper front end, routing, control API, embedded dashboard
-    src/bin/nanovm.rs            `nanovm serve --config demo/nanovm.toml`
-    src/bin/nanovm-bench.rs      benchmark driver (in-process and over HTTP)
-    tests/*.rs                   integration tests against real guest components
+    src/metrics.rs               atomic counters, log2 latency histograms, event ring buffer, RSS
+    src/server.rs                hyper front end, routing, control API, embedded dashboard, demo load tools
+    src/main.rs                  `nanovm serve --config demo/nanovm.toml`
+    examples/bench.rs            in-process benchmark driver (no sockets)
+    tests/integration.rs         integration tests against real guest components
   guests/                        separate workspace, target wasm32-wasip2, cdylib + wasip3 0.9
     counter/                     benign DO: in-memory hits + persisted counter + kv in /data
     hostile/                     attack endpoints (see Tests)
+    util/                        shared request/response and wasip3 filesystem helpers
   dashboard/index.html           live demo UI (embedded via include_str!)
-  scripts/build-guests.sh        cargo build --target wasm32-wasip2 --release → artifacts/
+  scripts/build-guests.sh        cargo build --target wasm32-wasip2 --release → guests/target/wasm32-wasip2/release/
   demo/nanovm.toml, demo/demo.sh
 ```
 
@@ -82,8 +83,8 @@ nanovm/
 
   With the default 4 GiB reservation, each memory slot takes about 4 GiB of virtual address space. Density mode uses a small reservation instead (for example 128 MiB). It costs explicit bounds checks but gives roughly 100k slots. The benchmark measures both modes.
 - **Precompiled cache:** components are precompiled to `.cwasm`, keyed by content hash plus `precompile_compatibility_hash`. They are loaded with `Component::deserialize_file`, which is required for copy-on-write memory images on macOS; Linux uses memfd.
-- **Deploy-time validation:** a component is rejected if `component_type().imports()` contains anything outside the allowed set. Allowed: wasi cli/clocks/random/io at 0.2; wasi cli/clocks/random/filesystem at 0.3; wasi:http types/client at 0.3. Not allowed: sockets in either version, or `wasi:http/outgoing-handler`. The error names the offending import.
-- **WASI 0.2 filesystem:** Rust guests built for wasm32-wasip2 reach 0.2 imports through std. If `wasi:filesystem@0.2.x` is imported, `get-directories` is shadowed to return `[]`, so `std::fs` sees no mounts. All file I/O must go through the quota'd 0.3 API. Quota support for 0.2 is a follow-up.
+- **Deploy-time validation (`ALLOWED_IMPORTS` in app.rs):** a component is rejected if `component_type().imports()` contains anything outside these prefixes: `wasi:io/`, `wasi:clocks/`, `wasi:random/`, `wasi:cli/` (any version), `wasi:filesystem/{types,preopens}@0.3`, `wasi:http/{types,client}@0.3`. It must also export `wasi:http/handler@0.3`. Sockets, the WASI 0.2 filesystem, `wasi:http/outgoing-handler` and custom imports are all refused, and the error names the offending import.
+- **WASI 0.2 filesystem:** refused at load (above). Rust guests built for wasm32-wasip2 must use the wasip3 filesystem API (see `guests/util`), not `std::fs`, which imports the 0.2 filesystem. Quota support for 0.2 is a follow-up.
 - `ServicePre::new(linker.instantiate_pre(&component))` is built once per app and cloned for each instantiation.
 
 ## Object actor (src/object.rs)
@@ -92,8 +93,7 @@ nanovm/
   ```
   store.run_concurrent(async |acc| loop {
     recv request
-    → build p3::Request::new(method, Some(scheme), authority_from_Host, pq,
-                             FieldMap::new_immutable, None, capped_body)
+    → p3::Request::from_http(hooks, req)
     → svc.handle(acc, req)
     → res.into_http(..)
     → wrap body
@@ -101,7 +101,7 @@ nanovm/
     → poll_fn(poll_no_interesting_tasks)        // strict serial
   })
   ```
-  We don't use `from_http`, because in 50.0.0 it drops authority and Host.
+  `from_http` takes scheme and authority from the URI only, so `server.rs` rebuilds the URI as `http://{Host}{path}` before dispatch. The request body is collected (capped at `max_request_body_kb`) before it reaches the actor.
 - **Deadlines:** the run_concurrent future is wrapped in an outer `poll_fn` that reads a shared `(phase, since)`. On expiry it drops the future and the Store. Upstream documents timeouts inside run_concurrent as unreliable.
 
   | Phase | Deadline | On expiry |
@@ -110,16 +110,13 @@ nanovm/
   | `PostReturn` | `post_return_timeout` | the streaming body is aborted with an error frame, so a truncated response doesn't look complete |
   | `Idle` | `idle_timeout` | clean eviction |
 - **CPU budget:**
-  - A 1 ms epoch ticker thread runs, and each Store has `epoch_deadline_callback`.
-  - Each callback charges one tick to the current request and returns `Yield(1)`, so a spinning guest still yields to tokio.
-  - Past `cpu_ms`, the callback returns an `Err(CpuBudgetExceeded)` trap.
+  - The outer `poll_fn` times every poll of the store's event loop and charges it to the current request. That covers guest code and inline filesystem calls; it is wall time, so it inflates when the host is oversubscribed.
+  - An epoch ticker thread runs every `epoch_tick_ms` (default 5 ms). Each Store's `epoch_deadline_callback` checks the charge including the poll in progress, and past `cpu_ms` returns an `Err(CpuExceeded)` trap.
+  - Otherwise it returns `Yield(1)`, so a spinning guest still yields to tokio.
+  - **Heavy lanes:** once a request has used 10 ms (`HEAVY_AFTER_NS`), the callback returns `YieldCustom`, which waits for one of `heavy_lanes` permits before the guest runs again. The permit is handed back at every tick. This stops CPU hogs from yielding straight back onto every worker.
   - The Store is per object and serves one request at a time, so per-store accounting is per-request accounting.
 - **Memory:** a custom `ResourceLimiter` holds the total across *all* linear memories of the object; upstream `StoreLimits` is per memory. Growing past it returns `Err(MemoryLimitExceeded)`. Table elements, instance count and table count are also capped.
-- **Other per-store caps:**
-  - `ResourceTable::set_max_capacity`
-  - `Store::set_max_component_handles`
-  - `concurrent_resource_table()` capacity
-  - `WasiHttpCtx::set_field_size_limit`
+- **Other per-store caps:** `ResourceTable::set_max_capacity(max_resources)`. Header field size uses the `WasiHttpCtx` default (128 KiB).
 - **Poisoning:**
   - Any `Err` from run_concurrent poisons the Store upstream, so we drop it.
   - The pending reply gets 500 or 504 with an `x-nanovm-error` reason: `cpu`, `memory`, `timeout`, `trap`, `resource-table`.
@@ -132,12 +129,14 @@ nanovm/
 - **Send path:** clone the sender under the lock, then send. If the channel is closed (the actor just exited), respawn and retry once.
 - **Idle exit handshake:** the actor takes the lock, confirms its mailbox is empty, then removes its entry and exits.
 - **Capacity:** the table holds at most `max_live_objects` objects. A new object past that evicts the LRU *idle* object: its entry is removed, so its actor drains and exits. If nothing is idle, the request gets 503 `node-at-capacity`.
-  - An evicted store lives until its actor next runs. So every store holds one of `max_live_objects` slots, released only after the store is dropped, and the pool has room for all of them. A new object waits for a slot instead of finding the pool full.
+  - An evicted store lives until its actor next runs. So every store holds one of `max_live_objects` slots (`Node::slots`), acquired before `new_store` and released only after the store is dropped, and the pool has room for all of them. A new object waits for a slot instead of finding the pool full. `churn_past_capacity_never_fails` guards this through `stores_peak`.
 - **Full mailbox:** 503 with `x-nanovm-error: busy`.
 
-## Quota'd filesystem (src/fs.rs)
+## Quota'd filesystem (src/quota.rs)
 
-The stock wasmtime-wasi P3 filesystem is linked, then `linker.allow_shadowing(true)` overrides only the functions that mutate, on `wasi:filesystem/types@0.3.0`. Research confirmed that shadowing replaces the exact key, and that the flag has to be set before `linker.instance()`. No fork is needed.
+`quota.rs` links its own `wasi:filesystem/{types,preopens}@0.3` host, `QuotaFs`, in place of the stock one (no linker shadowing). Every function delegates to the stock `WasiFilesystem` implementation through `Accessor::with_getter`; the ones that can consume bytes or directory entries on a quota'd mount are checked first. No fork is needed.
+
+`allow_blocking_current_thread(true)` is set on the `WasiCtxBuilder` before the preopens (which capture it), so small filesystem calls run inline and are charged to the CPU budget instead of queueing on tokio's `spawn_blocking` mutex.
 
 - **Preopens:** three calls to `preopened_dir(host, guest, FsPerms)`:
   - `/app` read-only, shared per app (`apps/<app>/static`)
@@ -145,14 +144,15 @@ The stock wasmtime-wasi P3 filesystem is linked, then `linker.allow_shadowing(tr
   - `/data` read-write, at `data/<app>/<object>`
 - **Mount side map:** `rep → MountId`, filled in by the shadowed `preopens.get-directories` and `open-at`. Those are the only two places a Descriptor is created, and descriptors don't store paths.
 - **`MountQuota`:** a mutex around `{bytes, files}` plus limits `{max_file_size, max_total_bytes, max_file_count}`. `/data` is walked at mount time; `/tmp` starts empty.
-- **Writes:** `write-via-stream` and `append-via-stream` use our `QuotaWriter: StreamConsumer`. It follows upstream's structure: one 8 KiB `spawn_blocking` write in flight. The quota check happens inside the blocking closure under the lock, followed by `write_at`, so partial writes behave like POSIX.
-  - Going over the total quota returns `ErrorCode::Quota`.
-  - Going over the per-file limit returns `FileTooLarge`.
+- **Writes:** `write-via-stream` and `append-via-stream` use our `QuotaWriter: StreamConsumer`, which writes inline: the quota check and `write_at` happen under the quota lock, writing as much as the budget allows, so a filler sees a short write and then an error, as on a full disk.
+  - Going over the mount's byte quota returns `insufficient-space`.
+  - Going over the per-file limit returns `file-too-large`.
+  - Going over the entry limit returns `quota`.
   - When dropped before a result is sent, it sends `Ok(())`.
-- **Pre-checked:** `open-at` with CREATE or TRUNCATE, `create-directory-at`, `symlink-at`, `set-size`.
-- **Credited back:** `unlink-file-at`, `remove-directory-at`, and `rename-at` when it replaces an existing target.
+- **Pre-checked:** `open-at` with CREATE (entry count) or TRUNCATE (credits the old size), `create-directory-at`, `set-size`.
+- **Credited back:** `unlink-file-at`, `remove-directory-at`, and `rename-at` when it replaces a *different* existing file. A rename onto the same file (compared by `metadata_hash_at`) is a POSIX no-op and credits nothing.
 - **Denied:**
-  - `link-at` on metered mounts, so shared inodes don't have to be tracked.
+  - `link-at` and `symlink-at` on metered mounts, so shared inodes and link targets don't have to be tracked.
   - Cross-mount `rename-at` and `link-at` return `CrossDevice`.
   - Writes to `/app` return `ReadOnly`.
 - **Everything else** delegates to `<WasiFilesystem as HostDescriptorWithStore<T>>::*`.
@@ -162,16 +162,16 @@ The stock wasmtime-wasi P3 filesystem is linked, then `linker.allow_shadowing(tr
 ## Egress (src/egress.rs)
 
 `WasiHttpHooks::send_request` is the single choke point for outbound requests, and we override it.
-1. **Allowlist:** checked against `uri.host()`, `port_u16()`, scheme and method (never the raw authority). Entries look like `https://api.example.com`, `https://*.example.com:8443` or `http://host [GET,POST]`. No match returns `HttpRequestDenied`.
+1. **Allowlist:** checked against `uri.host()` and `port_u16()` (never the raw authority). Entries are `host`, `host:port`, `*.suffix[:port]` or an IP literal. Scheme and method are not matched yet. No match returns `HttpRequestDenied`.
 2. **Concurrency:** a per-object semaphore. The permit is held inside the returned I/O future. When exhausted, the request fails with `ConnectionLimitReached`.
 3. **DNS:** `lookup_host` under a timeout. Every non-public address is dropped; if none remain, the request fails with `DestinationIpProhibited`. Dropped ranges:
    - loopback, RFC1918, CGNAT, link-local (including 169.254.169.254)
    - ULA, multicast, unspecified, documentation and benchmark ranges
    - IPv4-mapped and NAT64 forms of all of these
 
-   `allow_loopback` exists for tests only.
-4. **Connect** to the resolved `SocketAddr`, which defeats DNS rebinding. TLS uses one shared rustls config with webpki roots, and the handshake gets its own timeout (upstream has none). The client is hyper http1, with our own timeouts overriding any the guest sets.
-5. **Body caps:** a cap on the upstream response body, and a cap on the outgoing request body.
+   An IP-literal allowlist entry bypasses the filter, since the operator named the address explicitly. Every resolved address must be public; a name that mixes in a private address is treated as rebinding.
+4. **Connect** to the resolved `SocketAddr`, which defeats DNS rebinding. TLS uses rustls with webpki roots (the config is currently rebuilt per request). The client is hyper http1. Guest-set connect and first-byte timeouts are capped at 10 s and 30 s.
+5. **Not yet done:** a timeout on the TLS handshake itself, a between-bytes timeout and a size cap on the upstream response body. Today these are bounded only by the request's wall-clock deadline.
 6. **Sockets:** wasi sockets stay denied by default, and `inherit_network()` is never called.
 
 ## Limits (per app, in each `[[app]]`'s `[app.limits]`)
@@ -179,7 +179,7 @@ The stock wasmtime-wasi P3 filesystem is linked, then `linker.allow_shadowing(tr
 | Knob | Default | Enforced by |
 |---|---|---|
 | `memory_mb` | 64 | custom ResourceLimiter (all memories) + pool `max_memory_size` |
-| `cpu_ms` per request | 200 | epoch callback tick count |
+| `cpu_ms` per request | 200 | wall time inside store polls, checked by the epoch callback |
 | `request_timeout_ms` / `post_return_timeout_ms` / `idle_timeout_ms` | 5000 / 5000 / 30000 | outer deadline wrapper |
 | `max_request_body_kb` / `max_response_body_kb` | 1024 / 8192 | body wrappers |
 | `tmp_mb` / `data_mb` / `max_files` / `max_file_mb` | 16 / 64 / 1000 / 16 | MountQuota |
@@ -188,7 +188,7 @@ The stock wasmtime-wasi P3 filesystem is linked, then `linker.allow_shadowing(tr
 | `max_resources` | 10000 | ResourceTable + component handles |
 | `egress` | `[]` (deny all) | allowlist |
 
-Node-level settings: `max_live_objects`, `memory_reservation_mb`, `listen`, `data_dir`, `epoch_tick_ms`, `heavy_lanes` (cores that requests past 10 ms of CPU may occupy at once; default half the cores).
+Node-level settings: `max_live_objects` (1000), `memory_reservation_mb` (128), `listen` (127.0.0.1:8080), `data_dir` (nanovm-data), `epoch_tick_ms` (5), `heavy_lanes` (cores that requests past 10 ms of CPU may occupy at once; 0 means half the cores), `demo` (enables the load-generation endpoints; must be off in production), `dashboard`.
 
 ## Guests (guests/, wasm32-wasip2 + wasip3 0.9 + `async-spawn`)
 
@@ -207,7 +207,7 @@ Node-level settings: `max_live_objects`, `memory_reservation_mb`, `listen`, `dat
   - `/concurrency`: reports the maximum overlap observed
   - `/echo`
 
-## Tests (crates/nanovm/tests/, real components)
+## Tests (crates/nanovm/tests/integration.rs, real components)
 
 Each test spins up a `Node` in-process with small limits.
 - **Basics:** routing, `NANOVM_OBJECT_ID`, in-memory state persists within an instance, objects are independent of each other.
@@ -216,19 +216,17 @@ Each test spins up a `Node` in-process with small limits.
 - **CPU:** `/spin` is killed at roughly `cpu_ms`, with 500 `cpu`. The latency of a concurrently running neighbor object stays low.
 - **Wall clock:** `/sleep` longer than the timeout returns 504. The next request is served by a fresh instance.
 - **Durability:** `incr` ×3, force an eviction, `GET` shows 3 and the in-memory count reset. Usage on `/data` is restored after a restart.
-- **Quota:** filling `/tmp` and `/data` returns `quota`. `/files` returns `quota`, `/bigfile` returns `file-too-large`, `/write-app` returns `read-only`, `/escape` is denied, and `/cross-rename` returns `cross-device`. Deleting files frees their quota.
-- **Egress:** an allowed request to a local test server succeeds (loopback allowed). Denied cases:
-  - a host not on the list
-  - `localhost` with loopback disallowed (IP prohibited)
-  - the IP 169.254.169.254 (prohibited)
-  - a disallowed method
-- **Resources:**
-  - `/leak` past `max_resources` traps and poisons the object; the object recovers.
-  - Process RSS stays flat over 20k `GET /` requests to one object.
+- **Quota:** filling `/tmp` or `/data` returns `insufficient-space`, `/files` returns `quota`, `/fill` past the file cap returns `file-too-large`, `/write-app` is refused, `/escape` (`..`, absolute paths, symlinks) is denied, and `/cross-rename` returns `cross-device`. `/data` usage is rescanned after a restart. Renaming a file onto itself credits nothing, while a rename over another file frees it.
+- **Egress:**
+  - a host not on the list (`169.254.169.254`, `HttpRequestDenied`)
+  - an allowlisted name (`localhost`) resolving to loopback, with a listener present (`DestinationIpProhibited`)
+  - an allowed request to `https://example.com` succeeds (ignored by default: needs the internet)
+- **Resources:** `/leak` past `max_resources` traps and poisons the object; the object recovers.
 - **Capacity:** with `max_live` objects full, a new object evicts the LRU idle one.
-- **Validation:** a component importing sockets is rejected at deploy time.
+- **Validation:** a component importing sockets is rejected at deploy time. *(Not written yet.)*
+- **Leaks:** RSS and open fds stay flat over long runs and churn. *(Not written yet.)*
 
-## Benchmarks (`nanovm-bench`)
+## Benchmarks (`examples/bench.rs`)
 
 `cargo run --release -p nanovm --example bench -- [--quick] [--json out.json]`. Results are printed as a table; `--json` also saves them. The latest results are in [README.md](README.md).
 1. Compile time and `.cwasm` load time.
@@ -279,6 +277,6 @@ All nine steps are done. [README.md](README.md) has the results and the bugs the
 
 ## Risks
 
-- P3 in wasmtime 50 is experimental, so API rough edges are likely; workarounds stay local to `object.rs` and `fs.rs`.
+- P3 in wasmtime 50 is experimental, so API rough edges are likely; workarounds stay local to `object.rs` and `quota.rs`.
 - `poll_no_interesting_tasks` ignores spawned guest threads, so `post_return_timeout` is the backstop.
 - How much virtual address space macOS allows limits density with 4 GiB slots; the benchmark will report it.
