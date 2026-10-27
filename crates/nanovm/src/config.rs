@@ -33,9 +33,6 @@ pub struct NodeConfig {
     /// Enables `/_nanovm/demo/*` load-generation endpoints.
     #[serde(default)]
     pub demo: bool,
-    /// Directory served at `/_nanovm/` (the dashboard).
-    #[serde(default)]
-    pub dashboard: Option<PathBuf>,
     #[serde(default, rename = "app")]
     pub apps: Vec<AppConfig>,
 }
@@ -67,8 +64,8 @@ pub struct Limits {
     pub idle_timeout_ms: u64,
     pub max_request_body_kb: u64,
     pub max_response_body_kb: u64,
-    pub tmp_mb: u64,
-    pub data_mb: u64,
+    /// Disk budget shared by `/data` and `/tmp`.
+    pub disk_mb: u64,
     pub max_files: u64,
     pub max_file_mb: u64,
     pub max_queue: usize,
@@ -89,8 +86,7 @@ impl Default for Limits {
             idle_timeout_ms: 30_000,
             max_request_body_kb: 1024,
             max_response_body_kb: 8192,
-            tmp_mb: 16,
-            data_mb: 64,
+            disk_mb: 64,
             max_files: 1000,
             max_file_mb: 16,
             max_queue: 64,
@@ -142,9 +138,6 @@ impl NodeConfig {
             }
         };
         fix(&mut self.data_dir);
-        if let Some(d) = &mut self.dashboard {
-            fix(d);
-        }
         for app in &mut self.apps {
             fix(&mut app.component);
             if let Some(d) = &mut app.static_dir {

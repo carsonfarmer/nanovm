@@ -1,14 +1,14 @@
-//! Disk quotas for an object's writable mounts (`/data` and `/tmp`).
+//! The disk budget of an object's writable mounts (`/data` and `/tmp`).
 //!
 //! wasmtime-wasi enforces read-only vs read-write but has no notion of space,
 //! so this module links its own `wasi:filesystem@0.3` host that wraps the
 //! stock one. Every call is delegated, except that calls which can consume
-//! bytes or directory entries on a quota'd mount are checked against that
-//! mount's budget first, and writes go through a counting stream consumer.
-//! Hard links, symlinks and renames across mounts are refused on quota'd
-//! mounts so the accounting stays exact.
+//! bytes or directory entries are checked against the object's budget first,
+//! and writes go through a counting stream consumer. Both writable mounts
+//! share one budget; `/app` is read-only, so the stock host refuses every
+//! mutation there before any usage changes. Hard links and symlinks are
+//! refused so the accounting stays exact.
 
-use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::pin::Pin;
@@ -31,6 +31,7 @@ use wasmtime_wasi::p3::bindings::filesystem::types::{
 use wasmtime_wasi::p3::filesystem::{FilesystemError, FilesystemResult};
 use wasmtime_wasi::{FsPerms, OpenMode};
 
+use crate::config::Limits;
 use crate::metrics::Metrics;
 use crate::object::ObjState;
 
@@ -41,73 +42,22 @@ pub fn add_to_linker(linker: &mut Linker<ObjState>) -> wasmtime::Result<()> {
     wasmtime_wasi::p3::cli::add_to_linker(linker)?;
     wasmtime_wasi::p3::clocks::add_to_linker(linker)?;
     wasmtime_wasi::p3::random::add_to_linker(linker)?;
-    types::add_to_linker::<_, QuotaFs>(linker, view)?;
-    preopens::add_to_linker::<_, QuotaFs>(linker, view)?;
+    types::add_to_linker::<_, QuotaFs>(linker, |s| QuotaView(s))?;
+    preopens::add_to_linker::<_, QuotaFs>(linker, |s| QuotaView(s))?;
     Ok(())
 }
 
-/// Budget and usage of one writable mount.
-pub struct Quota {
-    mount: &'static str,
+/// Disk budget and usage of one instance, shared with its in-flight write
+/// streams.
+#[derive(Clone)]
+pub struct QuotaGuard(Arc<Mutex<Inner>>);
+
+struct Inner {
     max_bytes: u64,
     max_files: u64,
     max_file_bytes: u64,
     bytes: u64,
     files: u64,
-}
-
-impl Quota {
-    /// Measures what's already on disk under `root`, so a persistent volume
-    /// starts each instance with its real usage.
-    pub fn scan(
-        mount: &'static str,
-        root: &Path,
-        max_bytes: u64,
-        max_files: u64,
-        max_file_bytes: u64,
-    ) -> std::io::Result<Quota> {
-        let mut q = Quota {
-            mount,
-            max_bytes,
-            max_files,
-            max_file_bytes,
-            bytes: 0,
-            files: 0,
-        };
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir)? {
-                let entry = entry?;
-                let md = entry.metadata()?;
-                q.files += 1;
-                if md.is_dir() {
-                    stack.push(entry.path());
-                } else if md.is_file() {
-                    q.bytes += md.len();
-                }
-            }
-        }
-        Ok(q)
-    }
-}
-
-#[derive(Clone, Copy, Debug, serde::Serialize)]
-pub struct Usage {
-    pub mount: &'static str,
-    pub bytes: u64,
-    pub max_bytes: u64,
-    pub files: u64,
-    pub max_files: u64,
-}
-
-/// Quota state of one instance, shared with its in-flight write streams.
-#[derive(Clone)]
-pub struct QuotaGuard(Arc<Mutex<Inner>>);
-
-struct Inner {
-    mounts: Vec<Quota>,
-    /// Which quota'd mount each open descriptor lives on, by resource rep.
-    fds: HashMap<u32, usize>,
     denials: u64,
     metrics: Arc<Metrics>,
     app: Arc<str>,
@@ -115,133 +65,111 @@ struct Inner {
 }
 
 impl QuotaGuard {
-    pub fn new(mounts: Vec<Quota>, metrics: Arc<Metrics>, app: Arc<str>, object: Arc<str>) -> Self {
-        QuotaGuard(Arc::new(Mutex::new(Inner {
-            mounts,
-            fds: HashMap::new(),
+    /// A budget whose starting usage is what's already under `volume`, so a
+    /// persistent volume starts each instance with its real usage.
+    pub fn new(
+        volume: &Path,
+        limits: &Limits,
+        metrics: Arc<Metrics>,
+        app: Arc<str>,
+        object: Arc<str>,
+    ) -> std::io::Result<Self> {
+        let (mut bytes, mut files) = (0, 0);
+        let mut stack = vec![volume.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let (path, md) = entry.and_then(|e| Ok((e.path(), e.metadata()?)))?;
+                files += 1;
+                if md.is_dir() {
+                    stack.push(path);
+                } else if md.is_file() {
+                    bytes += md.len();
+                }
+            }
+        }
+        Ok(QuotaGuard(Arc::new(Mutex::new(Inner {
+            max_bytes: limits.disk_mb << 20,
+            max_files: limits.max_files,
+            max_file_bytes: limits.max_file_mb << 20,
+            bytes,
+            files,
             denials: 0,
             metrics,
             app,
             object,
-        })))
-    }
-
-    pub fn usage(&self) -> Vec<Usage> {
-        let q = self.0.lock();
-        q.mounts
-            .iter()
-            .map(|m| Usage {
-                mount: m.mount,
-                bytes: m.bytes,
-                max_bytes: m.max_bytes,
-                files: m.files,
-                max_files: m.max_files,
-            })
-            .collect()
-    }
-
-    fn mount_of(&self, fd: &Resource<Descriptor>) -> Option<usize> {
-        self.0.lock().fds.get(&fd.rep()).copied()
+        }))))
     }
 
     /// Writes as much of `buf` at `at` (or the end of the file) as the
-    /// mount's budget allows, so a filler sees a short write and then
+    /// budget allows, so a filler sees a short write and then
     /// `insufficient-space`, as it would on a full disk.
-    fn write(&self, m: usize, file: &std::fs::File, at: Option<u64>, buf: &[u8]) -> Result<usize, ErrorCode> {
+    fn write(&self, file: &std::fs::File, at: Option<u64>, buf: &[u8]) -> Result<usize, ErrorCode> {
         let before = file.metadata().map_err(|_| ErrorCode::Io)?.len();
         let at = at.unwrap_or(before);
         let end = at.checked_add(buf.len() as u64).ok_or(ErrorCode::Overflow)?;
         let mut q = self.0.lock();
-        let quota = &q.mounts[m];
-        let room = before + quota.max_bytes.saturating_sub(quota.bytes);
-        let allowed_end = end.min(room).min(quota.max_file_bytes.max(before));
+        let room = before + q.max_bytes.saturating_sub(q.bytes);
+        let allowed_end = end.min(room).min(q.max_file_bytes.max(before));
         if allowed_end <= at && !buf.is_empty() {
-            return Err(if end > quota.max_file_bytes && quota.max_file_bytes <= room {
-                let max = quota.max_file_bytes >> 20;
-                q.deny(
-                    m,
-                    ErrorCode::FileTooLarge,
-                    format!("file would exceed max_file_mb ({max} MiB)"),
-                )
-            } else {
-                let max = quota.max_bytes >> 20;
-                q.deny(
-                    m,
-                    ErrorCode::InsufficientSpace,
-                    format!("write refused, {max} MiB quota full"),
-                )
-            });
+            return Err(q.too_big(end, room));
         }
         let n = file
             .write_at(&buf[..(allowed_end - at) as usize], at)
             .map_err(|_| ErrorCode::Io)?;
-        let after = before.max(at + n as u64);
-        q.mounts[m].bytes += after - before;
+        q.bytes += before.max(at + n as u64) - before;
         Ok(n)
     }
 
-    fn set_size(&self, m: usize, file: &std::fs::File, size: u64) -> Result<(), ErrorCode> {
+    fn set_size(&self, file: &std::fs::File, size: u64) -> Result<(), ErrorCode> {
         let before = file.metadata().map_err(|_| ErrorCode::Io)?.len();
         let mut q = self.0.lock();
-        let quota = &q.mounts[m];
-        if size > before {
-            if size > quota.max_file_bytes {
-                let max = quota.max_file_bytes >> 20;
-                return Err(q.deny(
-                    m,
-                    ErrorCode::FileTooLarge,
-                    format!("set-size past max_file_mb ({max} MiB)"),
-                ));
-            }
-            if quota.bytes + (size - before) > quota.max_bytes {
-                let max = quota.max_bytes >> 20;
-                return Err(q.deny(
-                    m,
-                    ErrorCode::InsufficientSpace,
-                    format!("set-size refused, {max} MiB quota"),
-                ));
-            }
+        let room = before + q.max_bytes.saturating_sub(q.bytes);
+        if size > before && (size > q.max_file_bytes || size > room) {
+            return Err(q.too_big(size, room));
         }
         file.set_len(size).map_err(|_| ErrorCode::Io)?;
-        let quota = &mut q.mounts[m];
-        quota.bytes = (quota.bytes + size).saturating_sub(before);
+        q.bytes = (q.bytes + size).saturating_sub(before);
         Ok(())
     }
 
-    fn check_new_entry(&self, m: usize) -> Result<(), ErrorCode> {
+    fn check_new_entry(&self) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
-        let quota = &q.mounts[m];
-        if quota.files >= quota.max_files {
-            let max = quota.max_files;
-            return Err(q.deny(m, ErrorCode::Quota, format!("entry limit reached ({max} files)")));
+        if q.files >= q.max_files {
+            let what = format!("entry limit reached ({} files)", q.max_files);
+            return Err(q.deny(ErrorCode::Quota, what));
         }
         Ok(())
     }
 
-    fn refuse(&self, m: usize, code: ErrorCode, what: &str) -> ErrorCode {
-        self.0.lock().deny(m, code, what.to_string())
+    fn refuse(&self, code: ErrorCode, what: &str) -> FilesystemError {
+        self.0.lock().deny(code, what.to_string()).into()
     }
 
-    fn adjust(&self, m: usize, bytes: i64, files: i64) {
+    fn adjust(&self, bytes: i64, files: i64) {
         let mut q = self.0.lock();
-        let quota = &mut q.mounts[m];
-        quota.bytes = quota.bytes.saturating_add_signed(bytes);
-        quota.files = quota.files.saturating_add_signed(files);
-    }
-
-    fn track(&self, fd: &Resource<Descriptor>, m: usize) {
-        self.0.lock().fds.insert(fd.rep(), m);
+        q.bytes = q.bytes.saturating_add_signed(bytes);
+        q.files = q.files.saturating_add_signed(files);
     }
 }
 
 impl Inner {
-    fn deny(&mut self, m: usize, code: ErrorCode, what: String) -> ErrorCode {
+    /// The error for growing a file to `end` when only `room` bytes fit.
+    fn too_big(&mut self, end: u64, room: u64) -> ErrorCode {
+        if end > self.max_file_bytes && self.max_file_bytes <= room {
+            let what = format!("file would exceed max_file_mb ({} MiB)", self.max_file_bytes >> 20);
+            self.deny(ErrorCode::FileTooLarge, what)
+        } else {
+            let what = format!("write refused, {} MiB disk quota full", self.max_bytes >> 20);
+            self.deny(ErrorCode::InsufficientSpace, what)
+        }
+    }
+
+    fn deny(&mut self, code: ErrorCode, what: String) -> ErrorCode {
         self.metrics.fs_denied.fetch_add(1, Relaxed);
         self.denials += 1;
         // A guest retrying in a loop shouldn't flood the event log.
         if self.denials == 1 || self.denials.is_multiple_of(1000) {
-            let detail = format!("{}: {what}", self.mounts[m].mount);
-            self.metrics.event("fs-denied", &self.app, &self.object, detail);
+            self.metrics.event("fs-denied", &self.app, &self.object, what);
         }
         code
     }
@@ -255,16 +183,16 @@ impl HasData for QuotaFs {
 
 pub struct QuotaView<'a>(&'a mut ObjState);
 
-fn view(s: &mut ObjState) -> QuotaView<'_> {
-    QuotaView(s)
-}
-
 fn fs(s: &mut ObjState) -> WasiFilesystemCtxView<'_> {
     s.filesystem()
 }
 
 fn stock(a: &Accessor<ObjState, QuotaFs>) -> Accessor<ObjState, WasiFilesystem> {
     a.with_getter::<WasiFilesystem>(fs)
+}
+
+fn stock_access<'a>(store: &'a mut Access<'_, ObjState, QuotaFs>) -> Access<'a, ObjState, WasiFilesystem> {
+    Access::<ObjState, WasiFilesystem>::new(store.as_context_mut(), fs)
 }
 
 fn guard(a: &Accessor<ObjState, QuotaFs>) -> QuotaGuard {
@@ -276,22 +204,25 @@ fn dup(fd: &Resource<Descriptor>) -> Resource<Descriptor> {
     Resource::new_borrow(fd.rep())
 }
 
-fn no_entry(e: &FilesystemError) -> bool {
-    matches!(e.downcast_ref(), Some(ErrorCode::NoEntry))
+/// Bytes held by the entry at `path` (0 unless a regular file), or `None` if
+/// nothing is there.
+async fn entry_size(inner: &Accessor<ObjState, WasiFilesystem>, fd: &Resource<Descriptor>, path: &str) -> Option<u64> {
+    let st = WasiFilesystem::stat_at(inner, dup(fd), PathFlags::empty(), path.to_string()).await;
+    st.ok().map(|st| {
+        if matches!(st.type_, DescriptorType::RegularFile) {
+            st.size
+        } else {
+            0
+        }
+    })
 }
 
-fn is_file(st: &DescriptorStat) -> bool {
-    matches!(st.type_, DescriptorType::RegularFile)
-}
-
-/// The writable file behind `fd` if it lives on a quota'd mount.
-fn quota_file(s: &mut ObjState, fd: &Resource<Descriptor>) -> Option<(QuotaGuard, usize, Arc<std::fs::File>)> {
+/// The writable file behind `fd`, if any.
+fn writable_file(s: &mut ObjState, fd: &Resource<Descriptor>) -> Option<(QuotaGuard, Arc<std::fs::File>)> {
     let quota = s.quota.clone();
-    let m = quota.mount_of(fd)?;
-    let view = s.filesystem();
-    match view.table.get(fd) {
+    match s.filesystem().table.get(fd) {
         Ok(Descriptor::File(f)) if f.perms == FsPerms::ReadWrite && f.open_mode.contains(OpenMode::WRITE) => {
-            Some((quota, m, f.file.clone()))
+            Some((quota, f.file.clone()))
         }
         _ => None,
     }
@@ -305,7 +236,6 @@ impl types::Host for QuotaView<'_> {
 
 impl types::HostDescriptor for QuotaView<'_> {
     fn drop(&mut self, fd: Resource<Descriptor>) -> wasmtime::Result<()> {
-        self.0.quota.0.lock().fds.remove(&fd.rep());
         types::HostDescriptor::drop(&mut self.0.filesystem(), fd)
     }
 }
@@ -319,12 +249,6 @@ impl preopens::Host for QuotaView<'_> {
                 "/app".to_string(),
             ));
         }
-        let mut q = self.0.quota.0.lock();
-        for (fd, path) in &dirs {
-            if let Some(m) = q.mounts.iter().position(|m| m.mount == path) {
-                q.fds.insert(fd.rep(), m);
-            }
-        }
         Ok(dirs)
     }
 }
@@ -335,11 +259,11 @@ fn write_stream(
     data: StreamReader<u8>,
     at: Option<u64>,
 ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-    let Some((quota, mount, file)) = quota_file(store.data_mut(), &fd) else {
-        let inner = Access::<ObjState, WasiFilesystem>::new(store.as_context_mut(), fs);
+    let Some((quota, file)) = writable_file(store.data_mut(), &fd) else {
+        // Not writable: let the stock host produce the right error.
         return match at {
-            Some(offset) => WasiFilesystem::write_via_stream(inner, fd, data, offset),
-            None => WasiFilesystem::append_via_stream(inner, fd, data),
+            Some(offset) => WasiFilesystem::write_via_stream(stock_access(&mut store), fd, data, offset),
+            None => WasiFilesystem::append_via_stream(stock_access(&mut store), fd, data),
         };
     };
     let (tx, rx) = oneshot::channel();
@@ -348,7 +272,6 @@ fn write_stream(
         QuotaWriter {
             file,
             at,
-            mount,
             quota,
             result: Some(tx),
         },
@@ -362,22 +285,15 @@ fn write_stream(
 struct QuotaWriter {
     file: Arc<std::fs::File>,
     at: Option<u64>,
-    mount: usize,
     quota: QuotaGuard,
     result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
 }
 
-impl QuotaWriter {
-    fn close(&mut self, res: Result<(), ErrorCode>) {
-        if let Some(tx) = self.result.take() {
-            let _ = tx.send(res);
-        }
-    }
-}
-
 impl Drop for QuotaWriter {
     fn drop(&mut self) {
-        self.close(Ok(()));
+        if let Some(tx) = self.result.take() {
+            let _ = tx.send(Ok(()));
+        }
     }
 }
 
@@ -393,8 +309,7 @@ impl StreamConsumer<ObjState> for QuotaWriter {
     ) -> Poll<wasmtime::Result<StreamResult>> {
         let me = &mut *self;
         let mut src = src.as_direct(store);
-        let res = me.quota.write(me.mount, &me.file, me.at, src.remaining());
-        match res {
+        match me.quota.write(&me.file, me.at, src.remaining()) {
             Ok(n) => {
                 src.mark_read(n);
                 if let Some(at) = &mut me.at {
@@ -403,7 +318,9 @@ impl StreamConsumer<ObjState> for QuotaWriter {
                 Poll::Ready(Ok(StreamResult::Completed))
             }
             Err(code) => {
-                me.close(Err(code));
+                if let Some(tx) = me.result.take() {
+                    let _ = tx.send(Err(code));
+                }
                 Poll::Ready(Ok(StreamResult::Dropped))
             }
         }
@@ -435,16 +352,20 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         metadata_hash() -> FilesystemResult<MetadataHashValue>;
         metadata_hash_at(flags: PathFlags, path: String) -> FilesystemResult<MetadataHashValue>;
     }
+
     fn read_via_stream(
         mut store: Access<ObjState, Self>,
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        WasiFilesystem::read_via_stream(
-            Access::<ObjState, WasiFilesystem>::new(store.as_context_mut(), fs),
-            fd,
-            offset,
-        )
+        WasiFilesystem::read_via_stream(stock_access(&mut store), fd, offset)
+    }
+
+    fn read_directory(
+        mut store: Access<'_, ObjState, Self>,
+        fd: Resource<Descriptor>,
+    ) -> wasmtime::Result<(StreamReader<DirectoryEntry>, FutureReader<Result<(), ErrorCode>>)> {
+        WasiFilesystem::read_directory(stock_access(&mut store), fd)
     }
 
     fn write_via_stream(
@@ -469,17 +390,10 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         fd: Resource<Descriptor>,
         size: Filesize,
     ) -> FilesystemResult<()> {
-        match store.with(|mut s| quota_file(s.data_mut(), &fd)) {
-            Some((quota, m, file)) => Ok(quota.set_size(m, &file, size)?),
+        match store.with(|mut s| writable_file(s.data_mut(), &fd)) {
+            Some((quota, file)) => Ok(quota.set_size(&file, size)?),
             None => WasiFilesystem::set_size(&stock(store), fd, size).await,
         }
-    }
-
-    fn read_directory(
-        mut store: Access<'_, ObjState, Self>,
-        fd: Resource<Descriptor>,
-    ) -> wasmtime::Result<(StreamReader<DirectoryEntry>, FutureReader<Result<(), ErrorCode>>)> {
-        WasiFilesystem::read_directory(Access::<ObjState, WasiFilesystem>::new(store.as_context_mut(), fs), fd)
     }
 
     async fn create_directory_at(
@@ -488,32 +402,20 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         path: String,
     ) -> FilesystemResult<()> {
         let quota = guard(store);
-        let m = quota.mount_of(&fd);
-        if let Some(m) = m {
-            quota.check_new_entry(m)?;
-        }
+        quota.check_new_entry()?;
         WasiFilesystem::create_directory_at(&stock(store), fd, path).await?;
-        if let Some(m) = m {
-            quota.adjust(m, 0, 1);
-        }
+        quota.adjust(0, 1);
         Ok(())
     }
 
-    async fn link_at(
+    async fn remove_directory_at(
         store: &Accessor<ObjState, Self>,
         fd: Resource<Descriptor>,
-        old_path_flags: PathFlags,
-        old_path: String,
-        new_fd: Resource<Descriptor>,
-        new_path: String,
+        path: String,
     ) -> FilesystemResult<()> {
-        let quota = guard(store);
-        if let Some(m) = quota.mount_of(&fd).or(quota.mount_of(&new_fd)) {
-            return Err(quota
-                .refuse(m, ErrorCode::NotPermitted, "hard links are not permitted")
-                .into());
-        }
-        WasiFilesystem::link_at(&stock(store), fd, old_path_flags, old_path, new_fd, new_path).await
+        WasiFilesystem::remove_directory_at(&stock(store), fd, path).await?;
+        guard(store).adjust(0, -1);
+        Ok(())
     }
 
     async fn open_at(
@@ -524,41 +426,22 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         open_flags: OpenFlags,
         flags: DescriptorFlags,
     ) -> FilesystemResult<Resource<Descriptor>> {
-        let inner = stock(store);
-        let quota = guard(store);
-        let Some(m) = quota.mount_of(&fd) else {
-            return WasiFilesystem::open_at(&inner, fd, path_flags, path, open_flags, flags).await;
-        };
+        let (inner, quota) = (stock(store), guard(store));
         let (mut created, mut freed) = (false, 0);
         if open_flags.intersects(OpenFlags::CREATE | OpenFlags::TRUNCATE) {
-            match WasiFilesystem::stat_at(&inner, dup(&fd), path_flags, path.clone()).await {
-                Ok(st) if open_flags.contains(OpenFlags::TRUNCATE) && is_file(&st) => freed = st.size,
-                Ok(_) => {}
-                Err(e) if no_entry(&e) && open_flags.contains(OpenFlags::CREATE) => {
-                    quota.check_new_entry(m)?;
+            match entry_size(&inner, &fd, &path).await {
+                Some(size) if open_flags.contains(OpenFlags::TRUNCATE) => freed = size,
+                Some(_) => {}
+                None if open_flags.contains(OpenFlags::CREATE) => {
+                    quota.check_new_entry()?;
                     created = true;
                 }
-                Err(_) => {}
+                None => {}
             }
         }
         let new = WasiFilesystem::open_at(&inner, fd, path_flags, path, open_flags, flags).await?;
-        quota.adjust(m, -(freed as i64), created as i64);
-        quota.track(&new, m);
+        quota.adjust(-(freed as i64), created as i64);
         Ok(new)
-    }
-
-    async fn remove_directory_at(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        path: String,
-    ) -> FilesystemResult<()> {
-        let quota = guard(store);
-        let m = quota.mount_of(&fd);
-        WasiFilesystem::remove_directory_at(&stock(store), fd, path).await?;
-        if let Some(m) = m {
-            quota.adjust(m, 0, -1);
-        }
-        Ok(())
     }
 
     async fn rename_at(
@@ -568,49 +451,23 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         new_fd: Resource<Descriptor>,
         new_path: String,
     ) -> FilesystemResult<()> {
-        let inner = stock(store);
-        let quota = guard(store);
-        let (from, to) = (quota.mount_of(&fd), quota.mount_of(&new_fd));
-        if from != to {
-            let m = from.or(to).unwrap();
-            return Err(quota.refuse(m, ErrorCode::CrossDevice, "rename across mounts").into());
-        }
-        let Some(m) = to else {
-            return WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await;
-        };
+        let (inner, quota) = (stock(store), guard(store));
         // Renaming over an existing entry frees it, unless both paths name the
         // same file: POSIX makes that a no-op, and crediting it would let a
         // guest zero its usage by renaming a file onto itself.
-        let old_id = WasiFilesystem::metadata_hash_at(&inner, dup(&fd), PathFlags::empty(), old_path.clone()).await;
-        let new_id = WasiFilesystem::metadata_hash_at(&inner, dup(&new_fd), PathFlags::empty(), new_path.clone()).await;
-        let same = matches!((&old_id, &new_id), (Ok(a), Ok(b)) if (a.lower, a.upper) == (b.lower, b.upper));
-        let replaced = match same {
-            true => None,
-            false => WasiFilesystem::stat_at(&inner, dup(&new_fd), PathFlags::empty(), new_path.clone())
-                .await
-                .ok()
-                .map(|st| if is_file(&st) { st.size } else { 0 }),
+        let id = async |fd: &Resource<Descriptor>, path: &str| {
+            let h = WasiFilesystem::metadata_hash_at(&inner, dup(fd), PathFlags::empty(), path.to_string()).await;
+            h.ok().map(|h| (h.lower, h.upper))
+        };
+        let replaced = match id(&new_fd, &new_path).await {
+            Some(target) if id(&fd, &old_path).await != Some(target) => entry_size(&inner, &new_fd, &new_path).await,
+            _ => None,
         };
         WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await?;
         if let Some(bytes) = replaced {
-            quota.adjust(m, -(bytes as i64), -1);
+            quota.adjust(-(bytes as i64), -1);
         }
         Ok(())
-    }
-
-    async fn symlink_at(
-        store: &Accessor<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        old_path: String,
-        new_path: String,
-    ) -> FilesystemResult<()> {
-        let quota = guard(store);
-        if let Some(m) = quota.mount_of(&fd) {
-            return Err(quota
-                .refuse(m, ErrorCode::NotPermitted, "symlinks are not permitted")
-                .into());
-        }
-        WasiFilesystem::symlink_at(&stock(store), fd, old_path, new_path).await
     }
 
     async fn unlink_file_at(
@@ -618,17 +475,30 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         fd: Resource<Descriptor>,
         path: String,
     ) -> FilesystemResult<()> {
-        let inner = stock(store);
-        let quota = guard(store);
-        let Some(m) = quota.mount_of(&fd) else {
-            return WasiFilesystem::unlink_file_at(&inner, fd, path).await;
-        };
-        let size = WasiFilesystem::stat_at(&inner, dup(&fd), PathFlags::empty(), path.clone())
-            .await
-            .map(|st| if is_file(&st) { st.size } else { 0 })
-            .unwrap_or(0);
+        let (inner, quota) = (stock(store), guard(store));
+        let size = entry_size(&inner, &fd, &path).await.unwrap_or(0);
         WasiFilesystem::unlink_file_at(&inner, fd, path).await?;
-        quota.adjust(m, -(size as i64), -1);
+        quota.adjust(-(size as i64), -1);
         Ok(())
+    }
+
+    async fn link_at(
+        store: &Accessor<ObjState, Self>,
+        _fd: Resource<Descriptor>,
+        _old_flags: PathFlags,
+        _old_path: String,
+        _new_fd: Resource<Descriptor>,
+        _new_path: String,
+    ) -> FilesystemResult<()> {
+        Err(guard(store).refuse(ErrorCode::NotPermitted, "hard links are not permitted"))
+    }
+
+    async fn symlink_at(
+        store: &Accessor<ObjState, Self>,
+        _fd: Resource<Descriptor>,
+        _old_path: String,
+        _new_path: String,
+    ) -> FilesystemResult<()> {
+        Err(guard(store).refuse(ErrorCode::NotPermitted, "symlinks are not permitted"))
     }
 }

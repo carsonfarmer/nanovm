@@ -50,8 +50,7 @@ fn node(name: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
         memory_mb = 16
         cpu_ms = 50
         idle_timeout_ms = 600000
-        data_mb = 1
-        tmp_mb = 1
+        disk_mb = 1
         max_queue = 1024
 
         [[app]]

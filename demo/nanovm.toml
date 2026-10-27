@@ -5,7 +5,6 @@ max_live_objects = 20000
 memory_reservation_mb = 64
 epoch_tick_ms = 5
 demo = true
-dashboard = "../dashboard"
 
 [[app]]
 name = "counter"
@@ -17,8 +16,7 @@ memory_mb = 16
 cpu_ms = 50
 request_timeout_ms = 2000
 idle_timeout_ms = 60000
-data_mb = 1
-tmp_mb = 1
+disk_mb = 1
 max_files = 100
 max_file_mb = 1
 
@@ -33,8 +31,7 @@ cpu_ms = 100
 request_timeout_ms = 2000
 post_return_timeout_ms = 1000
 idle_timeout_ms = 60000
-data_mb = 8
-tmp_mb = 4
+disk_mb = 8
 max_files = 200
 max_file_mb = 4
 max_resources = 2000

@@ -1,22 +1,20 @@
 //! The node: loaded apps, and the table mapping `(app, object-id)` to the
 //! single actor that owns that object.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use serde::Serialize;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use wasmtime::Engine;
 
 use crate::app::App;
 use crate::config::NodeConfig;
-use crate::metrics::{Metrics, now_ns};
+use crate::metrics::Metrics;
 use crate::object::{self, Job, ObjShared, Phase, RespBody, error_response};
-use crate::quota::Usage;
 
 /// App and object names: `[A-Za-z0-9_.-]{1,128}`, not starting with `.`.
 pub fn valid_name(s: &str) -> bool {
@@ -43,29 +41,7 @@ pub struct Node {
     /// One permit per live store, released only after the store is dropped.
     pub slots: Arc<Semaphore>,
     objects: Mutex<HashMap<(Arc<str>, Arc<str>), Entry>>,
-    next_gen: AtomicU64,
     seq: AtomicU64,
-    /// Generations of objects retired after a kill, for `grid`.
-    recent_kills: Mutex<VecDeque<(u64, u64)>>,
-}
-
-/// How long `grid` keeps showing a killed object.
-const KILL_SHOW_NS: u64 = 3_000_000_000;
-
-#[derive(Serialize)]
-pub struct ObjInfo {
-    pub app: Arc<str>,
-    pub id: Arc<str>,
-    pub phase: &'static str,
-    pub phase_ms: u64,
-    pub requests: u64,
-    pub instantiations: u64,
-    pub poisons: u64,
-    pub cpu_us: u64,
-    pub idle_ms: u64,
-    pub last_poison: Option<&'static str>,
-    pub last_poison_ago_ms: Option<u64>,
-    pub disk: Vec<Usage>,
 }
 
 impl Node {
@@ -91,9 +67,7 @@ impl Node {
             heavy,
             slots,
             objects: Mutex::default(),
-            next_gen: AtomicU64::new(1),
             seq: AtomicU64::new(1),
-            recent_kills: Mutex::default(),
         }))
     }
 
@@ -175,11 +149,7 @@ impl Node {
                 &format!("{max} live objects, none idle"),
             ));
         }
-        let shared = Arc::new(ObjShared::new(
-            app.name.clone(),
-            id,
-            self.next_gen.fetch_add(1, Relaxed),
-        ));
+        let shared = Arc::new(ObjShared::new(app.name.clone(), id));
         let (tx, rx) = mpsc::channel(app.cfg.limits.max_queue.max(1));
         tx.try_send(job).ok().expect("fresh queue has room");
         objects.insert(
@@ -200,7 +170,7 @@ impl Node {
         let victim = objects
             .iter()
             .filter(|(_, e)| e.shared.phase().0 == Phase::Idle)
-            .min_by_key(|(_, e)| e.shared.last_used_ns.load(Relaxed))
+            .min_by_key(|(_, e)| e.shared.phase().1)
             .map(|(k, _)| k.clone());
         match victim {
             Some(k) => {
@@ -225,88 +195,16 @@ impl Node {
         let key = (shared.app.clone(), shared.id.clone());
         if objects.get(&key).is_some_and(|e| Arc::ptr_eq(&e.shared, shared)) {
             objects.remove(&key);
-            let now = now_ns();
-            if shared
-                .last_poison
-                .lock()
-                .is_some_and(|(_, t)| now.saturating_sub(t) < KILL_SHOW_NS)
-            {
-                let mut kills = self.recent_kills.lock();
-                if kills.len() == 4096 {
-                    kills.pop_front();
-                }
-                kills.push_back((shared.generation, now));
-            }
         }
         true
     }
 
-    /// One char per live object, oldest first: the initial of its phase
-    /// (`c`old, `s`tarting, `i`dle, `h`andling, `p`ost-return), uppercased if
-    /// it was poisoned in the last 3 s, plus `X` for objects retired after a
-    /// kill in the last 3 s. Cheap enough to poll with 20k objects.
-    pub fn grid(&self) -> String {
-        let now = now_ns();
-        let mut all: Vec<(u64, u8)> = self
-            .objects
-            .lock()
-            .values()
-            .map(|e| {
-                let s = &e.shared;
-                let c = s.phase().0.as_str().as_bytes()[0];
-                let hot = s
-                    .last_poison
-                    .lock()
-                    .is_some_and(|(_, t)| now.saturating_sub(t) < KILL_SHOW_NS);
-                (s.generation, if hot { c.to_ascii_uppercase() } else { c })
-            })
-            .collect();
-        let mut kills = self.recent_kills.lock();
-        while kills
-            .front()
-            .is_some_and(|(_, t)| now.saturating_sub(*t) >= KILL_SHOW_NS)
-        {
-            kills.pop_front();
+    /// How many live objects are in each phase.
+    pub fn phases(&self) -> HashMap<&'static str, usize> {
+        let mut phases = HashMap::new();
+        for e in self.objects.lock().values() {
+            *phases.entry(e.shared.phase().0.as_str()).or_default() += 1;
         }
-        all.extend(kills.iter().map(|(g, _)| (*g, b'X')));
-        drop(kills);
-        all.sort_unstable_by_key(|x| x.0);
-        all.into_iter().map(|x| x.1 as char).collect()
-    }
-
-    /// The most recently used live objects, newest first.
-    pub fn objects(&self, limit: usize) -> (Vec<ObjInfo>, HashMap<&'static str, usize>) {
-        let now = now_ns();
-        let all: Vec<Arc<ObjShared>> = self.objects.lock().values().map(|e| e.shared.clone()).collect();
-        let mut phases: HashMap<&'static str, usize> = HashMap::new();
-        for s in &all {
-            *phases.entry(s.phase().0.as_str()).or_default() += 1;
-        }
-        let mut all = all;
-        all.sort_unstable_by_key(|s| std::cmp::Reverse(s.last_used_ns.load(Relaxed)));
-        all.truncate(limit);
-        let ms = |ns: u64| ns / 1_000_000;
-        let infos = all
-            .iter()
-            .map(|s| {
-                let (phase, since) = s.phase();
-                let last = *s.last_poison.lock();
-                ObjInfo {
-                    app: s.app.clone(),
-                    id: s.id.clone(),
-                    phase: phase.as_str(),
-                    phase_ms: ms(now.saturating_sub(since)),
-                    requests: s.requests.load(Relaxed),
-                    instantiations: s.instantiations.load(Relaxed),
-                    poisons: s.poisons.load(Relaxed),
-                    cpu_us: s.cpu_total_ns.load(Relaxed) / 1000,
-                    idle_ms: ms(now.saturating_sub(s.last_used_ns.load(Relaxed))),
-                    last_poison: last.map(|(p, _)| p.as_str()),
-                    last_poison_ago_ms: last.map(|(_, t)| ms(now.saturating_sub(t))),
-                    disk: s.quota.lock().as_ref().map(|q| q.usage()).unwrap_or_default(),
-                }
-            })
-            .collect();
-        (infos, phases)
+        phases
     }
 }

@@ -120,24 +120,12 @@ async fn admin(node: &Arc<Node>, path: &str, req: &Request<Incoming>) -> Respons
             .header("location", "/_nanovm/")
             .body(full(""))
             .unwrap(),
-        "/" | "/index.html" => {
-            let html = match &node.cfg.dashboard {
-                Some(dir) => std::fs::read_to_string(dir.join("index.html")).unwrap_or_else(|_| DASHBOARD.into()),
-                None => DASHBOARD.into(),
-            };
-            Response::builder()
-                .header("content-type", "text/html; charset=utf-8")
-                .header("cache-control", "no-store")
-                .body(full(html))
-                .unwrap()
-        }
+        "/" | "/index.html" => Response::builder()
+            .header("content-type", "text/html; charset=utf-8")
+            .body(full(DASHBOARD))
+            .unwrap(),
         "/stats" => ok_json(stats(node)),
-        "/objects" => {
-            let (objs, _) = node.objects(num("limit", 200) as usize);
-            ok_json(json!(objs))
-        }
         "/events" => ok_json(json!(node.metrics.events_since(num("since", 0)))),
-        "/grid" => ok_json(json!({ "cells": node.grid(), "max": node.cfg.max_live_objects })),
         "/demo/spawn" | "/demo/hammer" | "/demo/storm" if !node.cfg.demo => {
             error_response(404, "demo-disabled", "set demo = true")
         }
@@ -264,7 +252,7 @@ async fn load(
 }
 
 fn stats(node: &Node) -> serde_json::Value {
-    let (_, phases) = node.objects(0);
+    let phases = node.phases();
     let apps: Vec<_> = node
         .apps
         .values()

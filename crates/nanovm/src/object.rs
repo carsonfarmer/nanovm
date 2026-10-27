@@ -26,7 +26,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 use crate::app::App;
 use crate::egress::EgressHooks;
 use crate::metrics::{Poison, now_ns};
-use crate::quota::{Quota, QuotaGuard};
+use crate::quota::QuotaGuard;
 use crate::table::Node;
 
 /// CPU a request may use before it has to share the node's heavy lanes.
@@ -65,42 +65,32 @@ impl Phase {
     }
 }
 
-/// State of an object visible outside its actor (the table, the dashboard,
-/// and the epoch callback, which runs while the actor's future is borrowed).
+/// State of an object visible outside its actor (the table, and the epoch
+/// callback, which runs while the actor's future is borrowed).
 #[derive(Default)]
 pub struct ObjShared {
     pub app: Arc<str>,
     pub id: Arc<str>,
-    pub generation: u64,
     phase: AtomicU8,
+    /// When the current phase began; for an idle object, its last use.
     since_ns: AtomicU64,
-    pub requests: AtomicU64,
-    pub poisons: AtomicU64,
-    pub instantiations: AtomicU64,
     /// Guest CPU charged to the current request.
     cpu_accum_ns: AtomicU64,
     /// Start of the in-progress poll of the store, if any.
     poll_start_ns: AtomicU64,
-    pub cpu_total_ns: AtomicU64,
-    pub last_used_ns: AtomicU64,
-    pub last_poison: Mutex<Option<(Poison, u64)>>,
-    /// Disk usage of the current (or last) instance, for the dashboard.
-    pub quota: Mutex<Option<QuotaGuard>>,
     /// The heavy lane this object's request holds until its next yield.
     lane: Mutex<Option<OwnedSemaphorePermit>>,
 }
 
 impl ObjShared {
-    pub fn new(app: Arc<str>, id: &str, generation: u64) -> Self {
+    pub fn new(app: Arc<str>, id: &str) -> Self {
         let now = now_ns();
         ObjShared {
             app,
             id: id.into(),
-            generation,
             phase: AtomicU8::new(Phase::Cold as u8),
             since_ns: now.into(),
             poll_start_ns: now.into(),
-            last_used_ns: now.into(),
             ..Default::default()
         }
     }
@@ -119,7 +109,6 @@ impl ObjShared {
         let now = now_ns();
         self.since_ns.store(now, Relaxed);
         self.phase.store(p as u8, Relaxed);
-        self.last_used_ns.store(now, Relaxed);
     }
 
     /// Starts a fresh CPU charge for instantiating a new instance. Without
@@ -131,7 +120,6 @@ impl ObjShared {
     }
 
     fn begin_request(&self) {
-        self.requests.fetch_add(1, Relaxed);
         self.cpu_accum_ns.store(0, Relaxed);
         self.poll_start_ns.store(now_ns(), Relaxed);
         self.set_phase(Phase::Handling);
@@ -162,8 +150,9 @@ impl ResourceLimiter for MemLimiter {
         Ok(true)
     }
 
-    fn table_growing(&mut self, _current: usize, desired: usize, _max: Option<usize>) -> wasmtime::Result<bool> {
-        Ok(desired <= 20_000)
+    // Table growth is capped by the pool's `table_elements`.
+    fn table_growing(&mut self, _current: usize, _desired: usize, _max: Option<usize>) -> wasmtime::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -268,7 +257,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         .data_dir
         .join("tmp")
         .join(&*app.name)
-        .join(format!("{}.{}.{}", shared.id, shared.generation, n));
+        .join(format!("{}.{n}", shared.id));
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(&tmp_dir)?;
     let tmp = TmpDir(tmp_dir.clone());
@@ -286,33 +275,18 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
     b.preopened_dir(&data_dir, "/data", FsPerms::ReadWrite)?;
     b.preopened_dir(&tmp_dir, "/tmp", FsPerms::ReadWrite)?;
     b.stdout(stderr.clone()).stderr(stderr.clone());
-    b.allow_tcp(false).allow_udp(false).allow_ip_name_lookup(false);
 
     let mut table = ResourceTable::new();
     table.set_max_capacity(limits.max_resources);
 
+    // `/tmp` was just created, so only the persistent volume holds usage.
     let quota = QuotaGuard::new(
-        vec![
-            Quota::scan(
-                "/data",
-                &data_dir,
-                limits.data_mb << 20,
-                limits.max_files,
-                limits.max_file_mb << 20,
-            )?,
-            Quota::scan(
-                "/tmp",
-                &tmp_dir,
-                limits.tmp_mb << 20,
-                limits.max_files,
-                limits.max_file_mb << 20,
-            )?,
-        ],
+        &data_dir,
+        limits,
         node.metrics.clone(),
         app.name.clone(),
         shared.id.clone(),
-    );
-    *shared.quota.lock() = Some(quota.clone());
+    )?;
 
     let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
     node.metrics.stores_peak.fetch_max(live, Relaxed);
@@ -402,44 +376,30 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
             anyhow::Ok((store, svc))
         }
         .await;
-        let (store, svc) = match started {
-            Ok(x) => x,
+        match started {
+            Ok((store, svc)) => {
+                node.metrics.instantiations.fetch_add(1, Relaxed);
+                node.metrics.instantiate.record(t0.elapsed());
+                match serve(&node, &app, &shared, store, svc, &mut rx).await {
+                    Exit::Closed => return,
+                    Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
+                    Exit::Poisoned(p, detail) => {
+                        node.metrics.poison(p);
+                        node.metrics.event(p.as_str(), &app.name, &shared.id, detail);
+                    }
+                }
+            }
             Err(e) => {
-                drop(slot);
+                let e = format!("{e:#}");
                 node.metrics.instantiate_failures.fetch_add(1, Relaxed);
-                node.metrics
-                    .event("instantiate-failed", &app.name, &shared.id, format!("{e:#}"));
+                node.metrics.event("instantiate-failed", &app.name, &shared.id, &*e);
                 if let Ok(job) = rx.try_recv() {
-                    let _ = job
-                        .reply
-                        .send(error_response(503, "instantiate-failed", &format!("{e:#}")));
+                    let _ = job.reply.send(error_response(503, "instantiate-failed", &e));
                 }
-                shared.set_phase(Phase::Cold);
-                if node.try_retire(&shared, &rx) {
-                    return;
-                }
-                continue;
-            }
-        };
-        node.metrics.instantiations.fetch_add(1, Relaxed);
-        node.metrics.instantiate.record(t0.elapsed());
-        shared.instantiations.fetch_add(1, Relaxed);
-
-        let exit = serve(&node, &app, &shared, store, svc, &mut rx).await;
-        drop(slot);
-        shared.set_phase(Phase::Cold);
-        match exit {
-            Exit::Closed => return,
-            Exit::Idle => {
-                node.metrics.evicted_idle.fetch_add(1, Relaxed);
-            }
-            Exit::Poisoned(p, detail) => {
-                node.metrics.poison(p);
-                shared.poisons.fetch_add(1, Relaxed);
-                *shared.last_poison.lock() = Some((p, now_ns()));
-                node.metrics.event(p.as_str(), &app.name, &shared.id, detail);
             }
         }
+        drop(slot);
+        shared.set_phase(Phase::Cold);
         if node.try_retire(&shared, &rx) {
             return;
         }
@@ -525,7 +485,6 @@ async fn serve(
             let t1 = now_ns();
             let start = shared.poll_start_ns.load(Relaxed);
             shared.cpu_accum_ns.fetch_add(t1.saturating_sub(start), Relaxed);
-            shared.cpu_total_ns.fetch_add(t1 - t0, Relaxed);
             node.metrics.guest_cpu_ns.fetch_add(t1 - t0, Relaxed);
             if let Poll::Ready(r) = poll {
                 return Poll::Ready(Ok(r.and_then(|r| r)));
@@ -564,16 +523,12 @@ async fn serve(
         pending.abort.store(true, Relaxed);
         if let Some(tx) = pending.reply.take() {
             let status = if *p == Poison::Timeout { 504 } else { 500 };
-            metrics_status(node, status);
+            node.metrics.status(status);
             let _ = tx.send(error_response(status, p.as_str(), detail));
         }
     }
     drop(store);
     exit
-}
-
-fn metrics_status(node: &Node, status: u16) {
-    node.metrics.status(status);
 }
 
 fn classify(store: &Store<ObjState>, e: &wasmtime::Error) -> Exit {
@@ -591,8 +546,7 @@ fn classify(store: &Store<ObjState>, e: &wasmtime::Error) -> Exit {
             with_tail(format!("tried to grow linear memory past {mb}MiB")),
         );
     }
-    let text = format!("{e:?}");
-    if e.downcast_ref::<ResourceTableError>().is_some() || text.contains("resource table has no free keys") {
+    if e.downcast_ref::<ResourceTableError>().is_some() {
         return Exit::Poisoned(Poison::ResourceTable, "resource table full".into());
     }
     if let Some(trap) = e.downcast_ref::<Trap>() {

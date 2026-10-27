@@ -4,12 +4,10 @@
 //! endpoints or private ranges). The connection goes to the address that was
 //! checked, never re-resolved.
 
-use std::future::{Future, poll_fn};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::{Pin, pin};
-use std::sync::Arc;
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering::Relaxed;
-use std::task::{Poll, ready};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use http::uri::Scheme;
@@ -106,8 +104,7 @@ pub fn is_global(ip: IpAddr) -> bool {
                 || (s[0] & 0xffc0) == 0xfe80 // link local
                 || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
                 || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64
-                || s[0] == 0x2002 // 6to4
-                || v6 == Ipv6Addr::UNSPECIFIED)
+                || s[0] == 0x2002) // 6to4
         }
     }
 }
@@ -213,20 +210,9 @@ async fn send(
         Err(_) => return Err(Error::ConnectionTimeout),
     };
     let io: Box<dyn Stream> = if tls {
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.into(),
-        };
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .map_err(|_| Error::TlsProtocolError)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
         let name = rustls::pki_types::ServerName::try_from(host.to_string())?;
-        let s = tokio_rustls::TlsConnector::from(Arc::new(config))
-            .connect(name, tcp)
-            .await
-            .map_err(Error::Tls)?;
-        Box::new(s)
+        let tls = tokio::time::timeout(connect_timeout, TLS.connect(name, tcp));
+        Box::new(tls.await.map_err(|_| Error::ConnectionTimeout)?.map_err(Error::Tls)?)
     } else {
         Box::new(tcp)
     };
@@ -243,39 +229,35 @@ async fn send(
         .build()
         .map_err(|_| Error::HttpRequestUriInvalid)?;
 
-    let send = async move {
-        tokio::time::timeout(first_byte_timeout, sender.send_request(req))
-            .await
-            .map_err(|_| Error::ConnectionReadTimeout)?
-            .map_err(Error::from)
-    };
-    // Drive the connection while waiting for the response head.
-    let mut send = pin!(send);
-    let mut conn = Some(conn);
-    let res = poll_fn(|cx| match send.as_mut().poll(cx) {
-        Poll::Ready(r) => Poll::Ready(r),
-        Poll::Pending => {
-            let Some(c) = conn.as_mut() else { return Poll::Pending };
-            let r = ready!(Pin::new(c).poll(cx));
-            conn = None;
-            match r {
-                Ok(()) => send.as_mut().poll(cx),
-                Err(e) => Poll::Ready(Err(Error::from(e))),
-            }
-        }
-    })
-    .await?;
-
+    // The connection runs as its own task; it ends once the request and
+    // response bodies are done or dropped.
+    let conn = tokio::spawn(conn);
+    let res = tokio::time::timeout(first_byte_timeout, sender.send_request(req))
+        .await
+        .map_err(|_| Error::ConnectionReadTimeout)??;
     let res = res.map(|b| b.map_err(Error::from).boxed_unsync());
     let io: IoFuture = Box::new(async move {
         let _permit = permit;
-        match conn {
-            Some(c) => c.await.map_err(Error::from),
-            None => Ok(()),
-        }
+        conn.await
+            .map_err(|_| Error::ConnectionTerminated)?
+            .map_err(Error::from)
     });
     Ok((res, io))
 }
+
+/// One TLS client config for every request: building it parses the whole
+/// webpki root store.
+static TLS: LazyLock<tokio_rustls::TlsConnector> = LazyLock::new(|| {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+    };
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+});
 
 trait Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static> Stream for T {}

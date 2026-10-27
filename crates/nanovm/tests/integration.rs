@@ -60,8 +60,7 @@ fn node_cfg(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: u
         cpu_ms = 500 # generous: oversubscribed CI hosts inflate the wall-time budget; CPU kills are tested on `hostile`
         request_timeout_ms = 2000
         idle_timeout_ms = {counter_idle_ms}
-        data_mb = 1
-        tmp_mb = 1
+        disk_mb = 1
         max_files = 100
         max_file_mb = 1
 
@@ -74,8 +73,7 @@ fn node_cfg(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: u
         cpu_ms = {hostile_cpu_ms}
         request_timeout_ms = 1000
         post_return_timeout_ms = 500
-        data_mb = 8
-        tmp_mb = 4
+        disk_mb = 8
         max_files = 200
         max_file_mb = 4
         max_resources = 2000
@@ -107,10 +105,7 @@ async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
 
 /// Waits until every live object is idle, so LRU eviction has a candidate.
 async fn settle(node: &Arc<Node>) {
-    eventually("objects to go idle", || {
-        node.objects(usize::MAX).1.keys().all(|p| *p == "idle")
-    })
-    .await;
+    eventually("objects to go idle", || node.phases().keys().all(|p| *p == "idle")).await;
 }
 
 // ---- persistence and isolation ----------------------------------------
@@ -361,13 +356,6 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn grid_marks_killed_objects() {
-    let node = node("grid_marks_killed_objects", 8, 60_000);
-    assert_eq!(get(&node, "hostile", "g", "/panic").await.status, 500);
-    eventually("an X cell", || node.grid().contains('X')).await;
-}
-
 // ---- filesystem layout and quotas -------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
@@ -391,21 +379,26 @@ async fn file_count_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn tmp_quota_and_wipe() {
-    let node = node("tmp_quota_and_wipe", 8, 60_000);
-    assert_eq!(
-        get(&node, "hostile", "t", "/fill?mount=tmp&mb=4&name=a").await.status,
-        200
-    );
-    let r = get(&node, "hostile", "t", "/fill?mount=tmp&mb=1&name=b").await;
+async fn disk_quota_and_tmp_wipe() {
+    let node = node("disk_quota_and_tmp_wipe", 8, 60_000);
+    let fill = async |name: &str, mount: &str, mb: u32| {
+        get(
+            &node,
+            "hostile",
+            "t",
+            &format!("/fill?mount={mount}&mb={mb}&name={name}"),
+        )
+        .await
+    };
+    // /tmp and /data share one 8 MiB budget.
+    assert_eq!(fill("a", "tmp", 4).await.status, 200);
+    assert_eq!(fill("b", "data", 4).await.status, 200);
+    let r = fill("c", "tmp", 1).await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "insufficient-space");
-    // A new instance gets an empty /tmp.
+    // A new instance gets an empty /tmp, which frees its share.
     assert_eq!(get(&node, "hostile", "t", "/panic").await.status, 500);
-    assert_eq!(
-        get(&node, "hostile", "t", "/fill?mount=tmp&mb=4&name=a").await.status,
-        200
-    );
+    assert_eq!(fill("a", "tmp", 4).await.status, 200);
     // and the old one's scratch directory is gone from the host.
     let scratch = node.cfg.data_dir.join("tmp/hostile");
     eventually("old scratch dir removed", || {
@@ -421,20 +414,20 @@ async fn tmp_quota_and_wipe() {
 #[tokio::test(flavor = "multi_thread")]
 async fn rename_quota_accounting() {
     let node = node("rename_quota_accounting", 8, 60_000);
-    assert_eq!(
-        get(&node, "hostile", "r", "/fill?mount=tmp&mb=4&name=a").await.status,
-        200
-    );
+    for name in ["a", "b"] {
+        let r = get(&node, "hostile", "r", &format!("/fill?mount=tmp&mb=4&name={name}")).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
     // Renaming a file onto itself is a no-op and must not credit the quota.
     let r = get(&node, "hostile", "r", "/rename?mount=tmp&from=a&n=10").await;
     assert_eq!(r.status, 200, "{}", r.body);
-    let r = get(&node, "hostile", "r", "/fill?mount=tmp&mb=1&name=b").await;
+    let r = get(&node, "hostile", "r", "/fill?mount=tmp&mb=1&name=c").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "insufficient-space");
-    // Renaming the empty `b` over `a` does free a's 4 MiB.
-    let r = get(&node, "hostile", "r", "/rename?mount=tmp&from=b&to=a").await;
+    // Renaming `c` (empty, from the refused fill) over `a` frees a's 4 MiB.
+    let r = get(&node, "hostile", "r", "/rename?mount=tmp&from=c&to=a").await;
     assert_eq!(r.status, 200, "{}", r.body);
-    let r = get(&node, "hostile", "r", "/fill?mount=tmp&mb=4&name=c").await;
+    let r = get(&node, "hostile", "r", "/fill?mount=tmp&mb=4&name=d").await;
     assert_eq!(r.status, 200, "{}", r.body);
 }
 
@@ -473,11 +466,14 @@ async fn sandbox_escapes_blocked() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn no_rename_across_mounts() {
-    let node = node("no_rename_across_mounts", 8, 60_000);
+async fn rename_across_mounts_keeps_one_budget() {
+    let node = node("rename_across_mounts_keeps_one_budget", 8, 60_000);
     let r = get(&node, "hostile", "r", "/cross-rename").await;
-    assert_eq!(r.status, 507, "{}", r.body);
-    assert_eq!(r.json()["error"], "cross-device");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(node.cfg.data_dir.join("objects/hostile/r/x.txt").exists());
+    // The moved file is still counted once: 8 MiB minus its byte still fit.
+    let r = get(&node, "hostile", "r", "/fill?mount=data&mb=4&name=a").await;
+    assert_eq!(r.status, 200, "{}", r.body);
 }
 
 // ---- egress -----------------------------------------------------------
@@ -499,6 +495,40 @@ async fn egress_unlisted_host_denied() {
         r.body
     );
     assert!(node.metrics.egress_denied.load(Relaxed) >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_allowed_request_round_trips() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // An IP-literal allowlist entry is the operator's explicit choice, so it
+    // passes the public-IP filter; this exercises the whole send path.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = s.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /hello HTTP/1.1"));
+        s.write_all(b"HTTP/1.1 201 Created\r\ncontent-length: 5\r\n\r\nhello")
+            .await
+            .unwrap();
+    });
+    let mut cfg = node_cfg("egress_allowed_request_round_trips", 8, 60_000, 100);
+    cfg.apps[1].limits.egress.push(format!("127.0.0.1:{port}"));
+    let node = Node::new(cfg).unwrap();
+    let r = get(
+        &node,
+        "hostile",
+        "n",
+        &format!("/fetch?url=http://127.0.0.1:{port}/hello"),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        (r.json()["status"].as_u64(), r.json()["body"].as_str()),
+        (Some(201), Some("hello"))
+    );
+    server.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -556,7 +586,7 @@ async fn at_capacity_with_no_idle_object() {
             tokio::spawn(async move { get(&node, "hostile", &format!("b{i}"), "/sleep?ms=500").await })
         })
         .collect();
-    eventually("both objects busy", || node.objects(8).1.get("handling") == Some(&2)).await;
+    eventually("both objects busy", || node.phases().get("handling") == Some(&2)).await;
     let r = get(&node, "counter", "late", "/").await;
     assert_eq!((r.status, r.error.as_deref()), (503, Some("node-at-capacity")));
     for b in busy {
