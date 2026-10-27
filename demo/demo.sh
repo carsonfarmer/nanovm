@@ -43,7 +43,7 @@ else
         sleep 0.1
     done
 fi
-echo "  dashboard: $URL/_nanovm/"
+echo "  stats: $URL/_nanovm/stats, events: $URL/_nanovm/events"
 
 # The canary: one benign object, pinged every 20 ms for the whole demo.
 CANARY=target/demo-canary.txt
@@ -109,7 +109,7 @@ sort -n -k2 "$CANARY" | awk '{n++; if ($1 != 200) bad++; t[n] = $2 * 1000}
 curl -s "$URL/_nanovm/stats" | jq -r '"  node: \(.live_objects) live objects, \(.instantiate.count) instantiations, \(.poisons | to_entries | map(select(.value > 0) | "\(.key) \(.value)") | join(", ")) killed"'
 
 if [ -n "$SERVER" ]; then
-    say "node still running: $URL/_nanovm/ (Ctrl-C to stop)"
+    say "node still running on $URL (Ctrl-C to stop)"
     trap 'kill $SERVER 2>/dev/null; exit' INT TERM EXIT
     wait $SERVER
 fi

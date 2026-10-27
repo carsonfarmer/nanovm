@@ -1,5 +1,5 @@
 //! HTTP/1.1 front end: `/{app}/{object}/{rest}` goes to the object, and
-//! `/_nanovm/*` serves the dashboard and its JSON API.
+//! `/_nanovm/stats` and `/_nanovm/events` serve the node's metrics and event log.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -17,8 +17,6 @@ use tokio::net::TcpListener;
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
 use crate::table::Node;
-
-const DASHBOARD: &str = include_str!("../../../dashboard/index.html");
 
 pub async fn serve(node: Arc<Node>, listener: TcpListener) -> anyhow::Result<()> {
     loop {
@@ -97,10 +95,6 @@ fn full(b: impl Into<Bytes>) -> RespBody {
 async fn admin(node: &Arc<Node>, path: &str, req: &Request<Incoming>) -> Response<RespBody> {
     let since = req.uri().query().and_then(|q| q.strip_prefix("since=")?.parse().ok());
     match path {
-        "" | "/" | "/index.html" => Response::builder()
-            .header("content-type", "text/html; charset=utf-8")
-            .body(full(DASHBOARD))
-            .unwrap(),
         "/stats" => ok_json(stats(node)),
         "/events" => ok_json(json!(node.metrics.events_since(since.unwrap_or(0)))),
         _ => error_response(404, "not-found", path),

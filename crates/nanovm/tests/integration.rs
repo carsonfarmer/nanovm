@@ -272,6 +272,27 @@ async fn cpu_kill_does_not_poison_next_instance() {
     }
 }
 
+/// Regression: instantiation was charged wall time since its slot was
+/// acquired, including host work before the guest ran (scanning `/data`),
+/// so an epoch tick during start-up could kill a new instance that had
+/// used no CPU. Here the scan alone outlasts the 10 ms budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn start_up_is_charged_guest_cpu_not_host_work() {
+    let mut cfg = node_cfg("start_up_is_charged_guest_cpu", 8, 60_000, 10);
+    cfg.epoch_tick_ms = 1;
+    let vol = cfg.data_dir.join("objects/hostile/s");
+    std::fs::create_dir_all(&vol).unwrap();
+    for i in 0..20_000 {
+        std::fs::write(vol.join(format!("f{i}")), b"").unwrap();
+    }
+    let node = Node::new(cfg).unwrap();
+    for i in 0..30 {
+        let r = get(&node, "hostile", "s", "/").await;
+        assert_eq!(r.status, 200, "round {i}: {:?} {}", r.error, r.body);
+        assert_eq!(get(&node, "hostile", "s", "/panic").await.status, 500);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wall_clock_limit() {
     let node = node("wall_clock_limit", 8, 60_000);

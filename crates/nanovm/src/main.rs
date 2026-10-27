@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding {listen}"))?;
     eprintln!(
-        "nanovm: ready in {:.0?} on http://{listen}/ (dashboard: /_nanovm/)",
+        "nanovm: ready in {:.0?} on http://{listen}/ (stats: /_nanovm/stats)",
         t0.elapsed()
     );
     nanovm::server::serve(node, listener).await

@@ -22,7 +22,7 @@ The script:
 3. Pings a canary object throughout.
 4. Drives it over HTTP with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm requests, `/data` writes, and a storm of 110 simultaneous attacks.
 
-It leaves the node running. http://127.0.0.1:8080/_nanovm/ is a plain page showing the node's stats and event log.
+It leaves the node running. Its data APIs are `GET /_nanovm/stats` (counters and latency histograms, as JSON) and `GET /_nanovm/events?since=N` (kills, denials and evictions).
 
 Requests are routed as `/{app}/{object}/{path}`:
 
@@ -173,7 +173,6 @@ The tests cover:
 | `crates/nanovm/src/quota.rs` | Per-mount byte and file quotas over WASIp3 filesystem calls |
 | `crates/nanovm/src/egress.rs` | Allowlist plus resolved-IP filtering for outgoing HTTP |
 | `crates/nanovm/src/server.rs` | HTTP front end, `/_nanovm/stats` and `/_nanovm/events` |
-| `dashboard/index.html` | A plain page over the stats and event log |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
 | `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |
 

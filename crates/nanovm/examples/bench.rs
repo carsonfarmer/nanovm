@@ -201,7 +201,13 @@ async fn main() -> anyhow::Result<()> {
     drop(n);
 
     // ---- churn past capacity: every request evicts an idle object ----
-    let cap = 1_000 / scale;
+    // `--churn-cap N` sets the slot count, to measure eviction near a large cap.
+    let cap = args
+        .iter()
+        .position(|a| a == "--churn-cap")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| v.parse().expect("--churn-cap takes a number"))
+        .unwrap_or(1_000 / scale);
     let n = node("churn", cap)?;
     let churn = load(&n, "counter", "GET", "/", 20_000 / scale, 64, |i| format!("c{i}")).await;
     println!(

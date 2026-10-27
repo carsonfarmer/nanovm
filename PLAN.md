@@ -18,14 +18,14 @@ Done means:
 - `nanovm serve` hosts real guest components with every limit enforced.
 - `cargo test` proves each guarantee against hostile guests.
 - `examples/bench.rs` prints cold-start, warm-latency, throughput and density numbers.
-- `demo/demo.sh` drives thousands of objects and the attack storm over HTTP; `/_nanovm/` is a plain stats and event page.
+- `demo/demo.sh` drives thousands of objects and the attack storm over HTTP. The node's only control surface is two JSON APIs, `/_nanovm/stats` and `/_nanovm/events`.
 
 ## Architecture
 
 ```
 client ──HTTP──► nanovm (hyper 1, http1)
                   │  data:    /{app}/{object}/{rest...}   (guest sees /{rest...})
-                  │  control: /_nanovm/ (dashboard), /_nanovm/stats, /_nanovm/events
+                  │  control: /_nanovm/stats, /_nanovm/events (JSON)
                   ▼
               ObjectTable  (app, object) → ObjectHandle { mailbox tx, last_used, state }
                   │  on miss: spawn actor; at max_live_objects, evict the LRU idle object first
@@ -58,7 +58,7 @@ nanovm/
     src/quota.rs                 quota'd wasi:filesystem@0.3 host (QuotaFs), per-object disk budget, QuotaWriter
     src/egress.rs                allowlist, IP classifier, resolver + connector, send_request
     src/metrics.rs               atomic counters, log2 latency histograms, event ring buffer, RSS
-    src/server.rs                hyper front end, routing, /_nanovm/{stats,events}, embedded dashboard
+    src/server.rs                hyper front end, routing, /_nanovm/{stats,events}
     src/main.rs                  `nanovm serve --config demo/nanovm.toml`
     examples/bench.rs            in-process benchmark driver (no sockets)
     tests/integration.rs         integration tests against real guest components
@@ -66,7 +66,6 @@ nanovm/
     counter/                     benign DO: in-memory hits + persisted counter + kv in /data
     hostile/                     attack endpoints (see Tests)
     util/                        shared request/response and wasip3 filesystem helpers
-  dashboard/index.html           plain stats/event page (embedded via include_str!)
   crates/nanovm/support/load.rs  in-process load generator, #[path]-included by bench and tests
   scripts/build-guests.sh        cargo build --target wasm32-wasip2 --release → guests/target/wasm32-wasip2/release/
   demo/nanovm.toml, demo/demo.sh
@@ -237,7 +236,7 @@ Each test spins up a `Node` in-process with small limits.
 
 ## Demo
 
-`demo/demo.sh` starts a node from `demo/nanovm.toml` (or uses one already on :8080) and drives it over HTTP with `curl --parallel`: per-object volumes and escapes, cold starts, warm requests, `/data` writes, and a storm of every hostile-guest attack at once, while a canary object is pinged throughout. `/_nanovm/` is a plain page over `/_nanovm/stats` and `/_nanovm/events`.
+`demo/demo.sh` starts a node from `demo/nanovm.toml` (or uses one already on :8080) and drives it over HTTP with `curl --parallel`: per-object volumes and escapes, cold starts, warm requests, `/data` writes, and a storm of every hostile-guest attack at once, while a canary object is pinged throughout.
 
 ## Order of work (in this session)
 

@@ -25,7 +25,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::app::App;
 use crate::egress::EgressHooks;
-use crate::metrics::{Poison, now_ns};
+use crate::metrics::{Metrics, Poison, now_ns};
 use crate::quota::QuotaGuard;
 use crate::table::Node;
 
@@ -112,8 +112,8 @@ impl ObjShared {
     }
 
     /// Starts a fresh CPU charge for instantiating a new instance. Without
-    /// it the charge left by a killed request (or the time spent waiting
-    /// for a slot) counted against the new instance's start-up.
+    /// it the charge left by a killed request counted against the new
+    /// instance's start-up.
     fn begin_start(&self) {
         self.cpu_accum_ns.store(0, Relaxed);
         self.poll_start_ns.store(now_ns(), Relaxed);
@@ -122,6 +122,24 @@ impl ObjShared {
     fn begin_request(&self) {
         self.begin_start();
         self.set_phase(Phase::Handling);
+    }
+
+    /// Drives `fut`, charging the time spent inside each poll (where guest
+    /// code runs) to the current request or start-up, never time spent
+    /// waiting to be scheduled.
+    async fn charged<F: Future>(&self, metrics: &Metrics, fut: F) -> F::Output {
+        let mut fut = pin!(fut);
+        poll_fn(|cx| {
+            let t0 = now_ns();
+            self.poll_start_ns.store(t0, Relaxed);
+            let poll = fut.as_mut().poll(cx);
+            // Re-read: a request that began during this poll reset the start.
+            let (t1, start) = (now_ns(), self.poll_start_ns.load(Relaxed));
+            self.cpu_accum_ns.fetch_add(t1.saturating_sub(start), Relaxed);
+            metrics.guest_cpu_ns.fetch_add(t1 - t0, Relaxed);
+            poll
+        })
+        .await
     }
 
     /// CPU charged to the current request, including the poll in progress.
@@ -364,7 +382,9 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         let t0 = Instant::now();
         let started = async {
             let mut store = new_store(&node, &app, &shared)?;
-            let svc = app.pre.instantiate_async(&mut store).await?;
+            let svc = shared
+                .charged(&node.metrics, app.pre.instantiate_async(&mut store))
+                .await?;
             anyhow::Ok((store, svc))
         }
         .await;
@@ -466,20 +486,14 @@ async fn serve(
     // runs outside the event loop because a guest spinning in a loop only
     // yields at epoch boundaries, never back into `inner`.
     let result: Result<wasmtime::Result<()>, Phase> = {
-        let mut fut = pin!(store.run_concurrent(inner));
+        let mut fut = pin!(shared.charged(&node.metrics, store.run_concurrent(inner)));
         let mut timer = pin!(tokio::time::sleep(Duration::from_secs(3600)));
         let mut armed = None;
         poll_fn(|cx| {
-            let t0 = now_ns();
-            shared.poll_start_ns.store(t0, Relaxed);
-            let poll = fut.as_mut().poll(cx);
-            let t1 = now_ns();
-            let start = shared.poll_start_ns.load(Relaxed);
-            shared.cpu_accum_ns.fetch_add(t1.saturating_sub(start), Relaxed);
-            node.metrics.guest_cpu_ns.fetch_add(t1 - t0, Relaxed);
-            if let Poll::Ready(r) = poll {
+            if let Poll::Ready(r) = fut.as_mut().poll(cx) {
                 return Poll::Ready(Ok(r.and_then(|r| r)));
             }
+            let t1 = now_ns();
             let (phase, since) = shared.phase();
             if armed != Some((phase, since)) {
                 let ms = match phase {
