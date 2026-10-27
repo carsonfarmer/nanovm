@@ -384,6 +384,18 @@ async fn tmp_quota_and_wipe() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rename_onto_itself_frees_nothing() {
+    let node = node("rename_onto_itself_frees_nothing", 8, 60_000);
+    assert_eq!(get(&node, "hostile", "r", "/fill?mount=tmp&mb=4&name=a").await.status, 200);
+    let r = get(&node, "hostile", "r", "/rename-self?mount=tmp&name=a&n=10").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    // /tmp is still full: a no-op rename must not credit the quota.
+    let r = get(&node, "hostile", "r", "/fill?mount=tmp&mb=1&name=b").await;
+    assert_eq!(r.status, 507, "{}", r.body);
+    assert_eq!(r.json()["error"], "insufficient-space");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn data_quota_survives_restart() {
     let node = node("data_quota_survives_restart", 8, 60_000);
     for name in ["a", "b"] {
