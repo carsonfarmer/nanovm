@@ -10,7 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use nanovm::config::NodeConfig;
-use nanovm::load::{Reply, Run, request};
+#[path = "../support/load.rs"]
+#[allow(dead_code)]
+mod load;
+
+use load::{Reply, Run, request};
 use nanovm::metrics::rss_bytes;
 use nanovm::table::Node;
 use serde_json::{Value, json};
@@ -85,7 +89,7 @@ async fn load(
     conc: usize,
     id: impl Fn(usize) -> String + Send + Sync + 'static,
 ) -> Run {
-    nanovm::load::run(node, app, method, path, n, None, conc, id).await
+    load::run(node, app, method, path, n, None, conc, id).await
 }
 
 fn row(name: &str, r: &Run, note: &str) {
@@ -142,14 +146,14 @@ async fn main() -> anyhow::Result<()> {
     let live = n.live_objects();
     let rss1 = rss_bytes();
     let per_obj_kb = rss1.saturating_sub(rss0) as f64 / live.max(1) as f64 / 1024.0;
-    let inst = n.metrics.instantiate.snapshot();
+    let inst = n.metrics.instantiate.quantile(0.5);
     println!("\ncold start ({cold_n} new objects, {conc} concurrent)");
     row("first request to a new object", &cold, "");
     println!(
         "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object · instantiate p50 ≤{} µs",
         "",
         rss1 as f64 / 1e6,
-        inst.p50_us
+        inst
     );
     out.insert(
         "cold".into(),
@@ -224,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     let objs = 100 / scale.min(10);
     load(&n, "counter", "GET", "/", objs, 64, |i| format!("v{i}")).await;
     let window = Duration::from_millis(if quick { 1000 } else { 3000 });
-    let base = nanovm::load::run(
+    let base = load::run(
         &n,
         "counter",
         "GET",
@@ -253,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
     // Let the attackers get going before measuring.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let killed0: u64 = n.metrics.poisons.iter().map(|p| p.load(Relaxed)).sum();
-    let under = nanovm::load::run(
+    let under = load::run(
         &n,
         "counter",
         "GET",

@@ -7,7 +7,11 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use nanovm::config::NodeConfig;
-use nanovm::load::{Reply, request};
+#[path = "../support/load.rs"]
+#[allow(dead_code)]
+mod load;
+
+use load::{Reply, request};
 use nanovm::table::Node;
 
 fn repo() -> PathBuf {
@@ -62,7 +66,6 @@ fn node_cfg(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: u
         idle_timeout_ms = {counter_idle_ms}
         disk_mb = 1
         max_files = 100
-        max_file_mb = 1
 
         [[app]]
         name = "hostile"
@@ -75,7 +78,6 @@ fn node_cfg(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: u
         post_return_timeout_ms = 500
         disk_mb = 8
         max_files = 200
-        max_file_mb = 4
         max_resources = 2000
         max_outbound_concurrency = 2
         egress = ["example.com", "localhost"]
@@ -225,7 +227,7 @@ async fn full_queue_is_rejected() {
 /// that the object comes back on a fresh instance.
 async fn killed(node: &Arc<Node>, id: &str, path: &str, status: u16, reason: &str) -> Reply {
     let before = get(node, "hostile", id, "/").await;
-    assert_eq!(before.status, 200);
+    assert_eq!(before.status, 200, "{:?} {}", before.error, before.body);
     let r = get(node, "hostile", id, path).await;
     assert_eq!(
         (r.status, r.error.as_deref()),
@@ -234,7 +236,7 @@ async fn killed(node: &Arc<Node>, id: &str, path: &str, status: u16, reason: &st
         r.body
     );
     let after = get(node, "hostile", id, "/").await;
-    assert_eq!(after.status, 200);
+    assert_eq!(after.status, 200, "{:?} {}", after.error, after.body);
     assert_eq!(after.json()["hits"], 1, "{path}: instance was replaced");
     r
 }
@@ -357,15 +359,6 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
 }
 
 // ---- filesystem layout and quotas -------------------------------------
-
-#[tokio::test(flavor = "multi_thread")]
-async fn file_size_limit() {
-    let node = node("file_size_limit", 8, 60_000);
-    let r = get(&node, "hostile", "f", "/fill?mount=data&mb=100").await;
-    assert_eq!(r.status, 507, "{}", r.body);
-    assert_eq!(r.json()["written"], 4 << 20);
-    assert_eq!(r.json()["error"], "file-too-large");
-}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn file_count_limit() {
@@ -688,9 +681,9 @@ async fn http_front_end() {
 
     let (status, _) = raw(
         addr,
-        "POST /_nanovm/demo/spawn HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "GET /_nanovm/nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         b"",
     )
     .await;
-    assert_eq!(status, 404, "demo endpoints are off unless enabled");
+    assert_eq!(status, 404);
 }

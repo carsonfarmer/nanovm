@@ -1,6 +1,6 @@
 //! In-process load: requests go straight into [`Node::dispatch`], with no
 //! sockets, so the numbers measure nanovm rather than a client. Shared by
-//! the demo endpoints, the benchmark and the tests.
+//! the benchmark and the tests (`#[path]`-included; not part of the node).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use http::Method;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 
-use crate::table::Node;
+use nanovm::table::Node;
 
 /// One response, fully read.
 pub struct Reply {

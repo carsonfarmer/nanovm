@@ -4,7 +4,6 @@ data_dir = "../nanovm-data"
 max_live_objects = 20000
 memory_reservation_mb = 64
 epoch_tick_ms = 5
-demo = true
 
 [[app]]
 name = "counter"
@@ -18,7 +17,6 @@ request_timeout_ms = 2000
 idle_timeout_ms = 60000
 disk_mb = 1
 max_files = 100
-max_file_mb = 1
 
 [[app]]
 name = "hostile"
@@ -33,7 +31,6 @@ post_return_timeout_ms = 1000
 idle_timeout_ms = 60000
 disk_mb = 8
 max_files = 200
-max_file_mb = 4
 max_resources = 2000
 max_outbound_concurrency = 2
 # example.com is reachable; localtest.me is allowlisted but resolves to

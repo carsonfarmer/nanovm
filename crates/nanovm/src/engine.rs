@@ -89,19 +89,15 @@ fn raise_nofile() -> anyhow::Result<u64> {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: `lim` is a valid out-pointer for getrlimit/setrlimit.
+    // SAFETY: `lim` is a valid pointer for getrlimit/setrlimit. macOS
+    // rejects values above OPEN_MAX even when the hard limit is
+    // RLIM_INFINITY; then the soft limit simply stays where it was.
     unsafe {
         anyhow::ensure!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0, "getrlimit failed");
-        // macOS rejects values above OPEN_MAX even when the hard limit is
-        // RLIM_INFINITY, so fall back to the current limit there.
-        if lim.rlim_cur < lim.rlim_max {
-            let want = libc::rlimit {
-                rlim_cur: lim.rlim_max,
-                rlim_max: lim.rlim_max,
-            };
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &want) == 0 {
-                lim.rlim_cur = lim.rlim_max;
-            }
+        let soft = lim.rlim_cur;
+        lim.rlim_cur = lim.rlim_max;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+            lim.rlim_cur = soft;
         }
     }
     Ok(lim.rlim_cur as u64)
@@ -129,7 +125,7 @@ pub fn load_component(engine: &Engine, path: &Path, cache_dir: &Path) -> anyhow:
     let digest = Sha256::digest(&bytes);
     let mut h = DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut h);
-    let key = format!("{}-{:016x}.cwasm", hex(&digest[..16]), h.finish());
+    let key = format!("{digest:x}-{:016x}.cwasm", h.finish());
     let cached = cache_dir.join(key);
 
     if cached.exists() {
@@ -152,8 +148,4 @@ pub fn load_component(engine: &Engine, path: &Path, cache_dir: &Path) -> anyhow:
     std::fs::rename(&tmp, &cached)?;
     // SAFETY: as above.
     Ok(unsafe { Component::deserialize_file(engine, &cached)? })
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }

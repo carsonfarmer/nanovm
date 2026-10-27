@@ -18,12 +18,8 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
-    let mut apps: Vec<_> = node.apps.keys().cloned().collect();
-    apps.sort();
     eprintln!(
-        "nanovm: {} app(s) [{}] ready in {:.0?}, listening on http://{listen}/ (dashboard: http://{listen}/_nanovm/)",
-        apps.len(),
-        apps.join(", "),
+        "nanovm: ready in {:.0?} on http://{listen}/ (dashboard: /_nanovm/)",
         t0.elapsed()
     );
     nanovm::server::serve(node, listener).await

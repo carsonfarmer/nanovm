@@ -167,21 +167,18 @@ impl Node {
     /// Drops the table's handle on the least recently used idle object; its
     /// actor drains its queue and exits.
     fn evict_lru(&self, objects: &mut HashMap<(Arc<str>, Arc<str>), Entry>) -> bool {
-        let victim = objects
-            .iter()
-            .filter(|(_, e)| e.shared.phase().0 == Phase::Idle)
-            .min_by_key(|(_, e)| e.shared.phase().1)
-            .map(|(k, _)| k.clone());
-        match victim {
-            Some(k) => {
-                let e = objects.remove(&k).unwrap();
-                self.metrics.evicted_lru.fetch_add(1, Relaxed);
-                self.metrics
-                    .event("evicted-lru", &e.shared.app, &e.shared.id, "node at max_live_objects");
-                true
-            }
-            None => false,
-        }
+        let idle = objects.iter().filter_map(|(k, e)| match e.shared.phase() {
+            (Phase::Idle, since) => Some((since, k)),
+            _ => None,
+        });
+        let Some(k) = idle.min().map(|(_, k)| k.clone()) else {
+            return false;
+        };
+        let e = objects.remove(&k).unwrap();
+        self.metrics.evicted_lru.fetch_add(1, Relaxed);
+        self.metrics
+            .event("evicted-lru", &e.shared.app, &e.shared.id, "node at max_live_objects");
+        true
     }
 
     /// Called by an actor whose instance went away. If nothing is queued for

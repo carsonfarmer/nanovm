@@ -18,7 +18,7 @@ Done means:
 - `nanovm serve` hosts real guest components with every limit enforced.
 - `cargo test` proves each guarantee against hostile guests.
 - `examples/bench.rs` prints cold-start, warm-latency, throughput and density numbers.
-- A live dashboard demo shows thousands of objects alongside attack scenarios.
+- `demo/demo.sh` drives thousands of objects and the attack storm over HTTP; `/_nanovm/` is a plain stats and event page.
 
 ## Architecture
 
@@ -55,10 +55,10 @@ nanovm/
     src/app.rs                   load component, validate imports, build Linker + ServicePre
     src/object.rs                actor loop, phases, deadlines, limiter, CPU accounting, heavy lanes, poison
     src/table.rs                 Node: (app, id) -> actor, slot permits, LRU/idle eviction, retire handshake
-    src/quota.rs                 quota'd wasi:filesystem@0.3 host (QuotaFs), mount side map, QuotaWriter
+    src/quota.rs                 quota'd wasi:filesystem@0.3 host (QuotaFs), per-object disk budget, QuotaWriter
     src/egress.rs                allowlist, IP classifier, resolver + connector, send_request
     src/metrics.rs               atomic counters, log2 latency histograms, event ring buffer, RSS
-    src/server.rs                hyper front end, routing, control API, embedded dashboard, demo load tools
+    src/server.rs                hyper front end, routing, /_nanovm/{stats,events}, embedded dashboard
     src/main.rs                  `nanovm serve --config demo/nanovm.toml`
     examples/bench.rs            in-process benchmark driver (no sockets)
     tests/integration.rs         integration tests against real guest components
@@ -66,7 +66,8 @@ nanovm/
     counter/                     benign DO: in-memory hits + persisted counter + kv in /data
     hostile/                     attack endpoints (see Tests)
     util/                        shared request/response and wasip3 filesystem helpers
-  dashboard/index.html           live demo UI (embedded via include_str!)
+  dashboard/index.html           plain stats/event page (embedded via include_str!)
+  crates/nanovm/support/load.rs  in-process load generator, #[path]-included by bench and tests
   scripts/build-guests.sh        cargo build --target wasm32-wasip2 --release → guests/target/wasm32-wasip2/release/
   demo/nanovm.toml, demo/demo.sh
 ```
@@ -142,18 +143,16 @@ nanovm/
   - `/app` read-only, shared per app (`apps/<app>/static`)
   - `/tmp` read-write, at `scratch/<app>/<object>-<instance>`
   - `/data` read-write, at `data/<app>/<object>`
-- **Mount side map:** `rep → MountId`, filled in by the shadowed `preopens.get-directories` and `open-at`. Those are the only two places a Descriptor is created, and descriptors don't store paths.
-- **`MountQuota`:** a mutex around `{bytes, files}` plus limits `{max_file_size, max_total_bytes, max_file_count}`. `/data` is walked at mount time; `/tmp` starts empty.
+- **One budget per object:** `/data` and `/tmp` share `disk_mb` and `max_files`. `/app` is read-only, so the stock host refuses every mutation there before usage changes; no descriptor-to-mount bookkeeping is needed. `/data` is walked at instance start; `/tmp` starts empty.
 - **Writes:** `write-via-stream` and `append-via-stream` use our `QuotaWriter: StreamConsumer`, which writes inline: the quota check and `write_at` happen under the quota lock, writing as much as the budget allows, so a filler sees a short write and then an error, as on a full disk.
-  - Going over the mount's byte quota returns `insufficient-space`.
-  - Going over the per-file limit returns `file-too-large`.
+  - Going over the byte budget returns `insufficient-space`.
   - Going over the entry limit returns `quota`.
   - When dropped before a result is sent, it sends `Ok(())`.
 - **Pre-checked:** `open-at` with CREATE (entry count) or TRUNCATE (credits the old size), `create-directory-at`, `set-size`.
 - **Credited back:** `unlink-file-at`, `remove-directory-at`, and `rename-at` when it replaces a *different* existing file. A rename onto the same file (compared by `metadata_hash_at`) is a POSIX no-op and credits nothing.
 - **Denied:**
-  - `link-at` and `symlink-at` on metered mounts, so shared inodes and link targets don't have to be tracked.
-  - Cross-mount `rename-at` and `link-at` return `CrossDevice`.
+  - `link-at` and `symlink-at`, so shared inodes and link targets don't have to be tracked.
+  - Renames between `/tmp` and `/data` are allowed: both draw on the same budget.
   - Writes to `/app` return `ReadOnly`.
 - **Everything else** delegates to `<WasiFilesystem as HostDescriptorWithStore<T>>::*`.
 - **Counting:** logical `st_size`. Files, directories and symlinks all count toward the file limit.
@@ -182,13 +181,13 @@ nanovm/
 | `cpu_ms` per request | 200 | wall time inside store polls, checked by the epoch callback |
 | `request_timeout_ms` / `post_return_timeout_ms` / `idle_timeout_ms` | 5000 / 5000 / 30000 | outer deadline wrapper |
 | `max_request_body_kb` / `max_response_body_kb` | 1024 / 8192 | body wrappers |
-| `tmp_mb` / `data_mb` / `max_files` / `max_file_mb` | 16 / 64 / 1000 / 16 | MountQuota |
+| `disk_mb` / `max_files` | 64 / 1000 | QuotaGuard (shared by `/data` and `/tmp`) |
 | `max_queue` | 64 | bounded mailbox |
 | `max_outbound_concurrency` | 4 | egress semaphore |
 | `max_resources` | 10000 | ResourceTable + component handles |
 | `egress` | `[]` (deny all) | allowlist |
 
-Node-level settings: `max_live_objects` (1000), `memory_reservation_mb` (128), `listen` (127.0.0.1:8080), `data_dir` (nanovm-data), `epoch_tick_ms` (5), `heavy_lanes` (cores that requests past 10 ms of CPU may occupy at once; 0 means half the cores), `demo` (enables the load-generation endpoints; must be off in production), `dashboard`.
+Node-level settings: `max_live_objects` (1000), `memory_reservation_mb` (128), `listen` (127.0.0.1:8080), `data_dir` (nanovm-data), `epoch_tick_ms` (5), `heavy_lanes` (cores that requests past 10 ms of CPU may occupy at once; 0 means half the cores).
 
 ## Guests (guests/, wasm32-wasip2 + wasip3 0.9 + `async-spawn`)
 
@@ -216,7 +215,7 @@ Each test spins up a `Node` in-process with small limits.
 - **CPU:** `/spin` is killed at roughly `cpu_ms`, with 500 `cpu`. The latency of a concurrently running neighbor object stays low.
 - **Wall clock:** `/sleep` longer than the timeout returns 504. The next request is served by a fresh instance.
 - **Durability:** `incr` ×3, force an eviction, `GET` shows 3 and the in-memory count reset. Usage on `/data` is restored after a restart.
-- **Quota:** filling `/tmp` or `/data` returns `insufficient-space`, `/files` returns `quota`, `/fill` past the file cap returns `file-too-large`, `/write-app` is refused, `/escape` (`..`, absolute paths, symlinks) is denied, and `/cross-rename` returns `cross-device`. `/data` usage is rescanned after a restart. Renaming a file onto itself credits nothing, while a rename over another file frees it.
+- **Quota:** filling `/tmp` or `/data` returns `insufficient-space`, `/files` returns `quota`, `/write-app` is refused, `/escape` (`..`, absolute paths, symlinks) is denied, and `/cross-rename` (from `/tmp` to `/data`) succeeds and keeps one budget. `/data` usage is rescanned after a restart. Renaming a file onto itself credits nothing, while a rename over another file frees it.
 - **Egress:**
   - a host not on the list (`169.254.169.254`, `HttpRequestDenied`)
   - an allowlisted name (`localhost`) resolving to loopback, with a listener present (`DestinationIpProhibited`)
@@ -238,19 +237,7 @@ Each test spins up a `Node` in-process with small limits.
 
 ## Demo
 
-`nanovm serve --config demo/nanovm.toml`, then open `http://127.0.0.1:8080/_nanovm/` for a live dashboard. It shows:
-- live objects, instantiations, evictions and poisonings
-- requests per second, p50/p99, RSS
-- an event feed
-
-Buttons:
-- "spawn 10,000 objects"
-- "hammer one object"
-- attacks: memory bomb, infinite loop, disk filler, SSRF to metadata, path escape, handle leak
-
-A "neighbor" sparkline keeps pinging a benign object throughout to show it is unaffected.
-
-`demo/demo.sh` runs the same scenario from the terminal with curl.
+`demo/demo.sh` starts a node from `demo/nanovm.toml` (or uses one already on :8080) and drives it over HTTP with `curl --parallel`: per-object volumes and escapes, cold starts, warm requests, `/data` writes, and a storm of every hostile-guest attack at once, while a canary object is pinged throughout. `/_nanovm/` is a plain page over `/_nanovm/stats` and `/_nanovm/events`.
 
 ## Order of work (in this session)
 

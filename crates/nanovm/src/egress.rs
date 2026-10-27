@@ -44,15 +44,19 @@ impl EgressPolicy {
         let mut rules = Vec::new();
         for e in entries {
             let e = e.trim().to_ascii_lowercase();
-            let (host, port) = split_host_port(&e)?;
-            let host = if let Some(s) = host.strip_prefix("*.") {
-                HostPat::Suffix(format!(".{s}"))
-            } else if let Ok(ip) = host.parse::<IpAddr>() {
-                HostPat::Ip(ip)
-            } else {
-                HostPat::Exact(host.to_string())
+            let (wild, rest) = e.strip_prefix("*.").map_or((false, e.as_str()), |r| (true, r));
+            // `host`, `host:port` or `[v6]:port`.
+            let a: http::uri::Authority = rest.parse().map_err(|_| anyhow::anyhow!("bad egress entry {e:?}"))?;
+            let host = a.host().trim_start_matches('[').trim_end_matches(']');
+            let host = match host.parse::<IpAddr>() {
+                _ if wild => HostPat::Suffix(format!(".{host}")),
+                Ok(ip) => HostPat::Ip(ip),
+                Err(_) => HostPat::Exact(host.to_string()),
             };
-            rules.push(Rule { host, port });
+            rules.push(Rule {
+                host,
+                port: a.port_u16(),
+            });
         }
         Ok(EgressPolicy { rules })
     }
@@ -68,23 +72,6 @@ impl EgressPolicy {
                     HostPat::Ip(a) => ip == Some(*a),
                 }
         })
-    }
-}
-
-fn split_host_port(s: &str) -> anyhow::Result<(&str, Option<u16>)> {
-    if let Some(rest) = s.strip_prefix('[') {
-        let (h, tail) = rest
-            .split_once(']')
-            .ok_or_else(|| anyhow::anyhow!("bad egress entry {s:?}"))?;
-        let port = match tail.strip_prefix(':') {
-            Some(p) => Some(p.parse()?),
-            None => None,
-        };
-        return Ok((h, port));
-    }
-    match s.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') => Ok((h, Some(p.parse()?))),
-        _ => Ok((s, None)),
     }
 }
 
@@ -129,8 +116,7 @@ pub struct EgressHooks {
     pub policy: Arc<EgressPolicy>,
     pub sem: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
-    pub app: Arc<str>,
-    pub object: Arc<str>,
+    pub obj: Arc<crate::object::ObjShared>,
 }
 
 type IoFuture = Box<dyn Future<Output = Result<(), Error>> + Send>;
@@ -145,18 +131,15 @@ impl WasiHttpHooks for EgressHooks {
         let policy = self.policy.clone();
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
-        let (app, object) = (self.app.clone(), self.object.clone());
+        let obj = self.obj.clone();
         Box::new(async move {
-            let target = request.uri().to_string();
+            let target = request.uri().clone();
             let res = send(request, options, &policy, sem).await;
-            match &res {
-                Ok(_) => {
-                    metrics.egress_allowed.fetch_add(1, Relaxed);
-                }
-                Err(e) => {
-                    metrics.egress_denied.fetch_add(1, Relaxed);
-                    metrics.event("egress-denied", &app, &object, format!("{target} → {e}"));
-                }
+            if let Err(e) = &res {
+                metrics.egress_denied.fetch_add(1, Relaxed);
+                metrics.event("egress-denied", &obj.app, &obj.id, format!("{target} → {e}"));
+            } else {
+                metrics.egress_allowed.fetch_add(1, Relaxed);
             }
             res
         })

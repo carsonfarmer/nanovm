@@ -14,74 +14,44 @@ pub fn now_ns() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
-/// Log2-bucketed histogram of microseconds.
+/// Log2-bucketed histogram of microseconds (32 buckets reach 71 minutes).
+#[derive(Default)]
 pub struct Histogram {
-    buckets: [AtomicU64; 40],
+    buckets: [AtomicU64; 32],
     count: AtomicU64,
     sum_us: AtomicU64,
-}
-
-impl Default for Histogram {
-    fn default() -> Self {
-        Histogram {
-            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
-            count: AtomicU64::new(0),
-            sum_us: AtomicU64::new(0),
-        }
-    }
 }
 
 impl Histogram {
     pub fn record(&self, d: Duration) {
         let us = d.as_micros() as u64;
-        let b = (64 - us.leading_zeros()) as usize;
-        self.buckets[b.min(39)].fetch_add(1, Relaxed);
+        self.buckets[((64 - us.leading_zeros()) as usize).min(31)].fetch_add(1, Relaxed);
         self.count.fetch_add(1, Relaxed);
         self.sum_us.fetch_add(us, Relaxed);
     }
 
     /// Upper bound (µs) of the bucket holding quantile `q`.
     pub fn quantile(&self, q: f64) -> u64 {
-        let total = self.count.load(Relaxed);
-        if total == 0 {
-            return 0;
-        }
-        let target = ((total as f64) * q).ceil().max(1.0) as u64;
+        let target = ((self.count.load(Relaxed) as f64) * q).ceil().max(1.0) as u64;
         let mut seen = 0;
         for (i, b) in self.buckets.iter().enumerate() {
             seen += b.load(Relaxed);
             if seen >= target {
-                return if i == 0 { 1 } else { 1u64 << i };
+                return 1u64 << i;
             }
         }
-        u64::MAX
-    }
-
-    pub fn snapshot(&self) -> HistSnapshot {
-        let count = self.count.load(Relaxed);
-        HistSnapshot {
-            count,
-            mean_us: self.sum_us.load(Relaxed).checked_div(count).unwrap_or(0),
-            p50_us: self.quantile(0.50),
-            p99_us: self.quantile(0.99),
-            p999_us: self.quantile(0.999),
-        }
+        0
     }
 }
 
 impl Serialize for Histogram {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        self.snapshot().serialize(s)
+        let count = self.count.load(Relaxed);
+        let mean_us = self.sum_us.load(Relaxed).checked_div(count).unwrap_or(0);
+        let [p50_us, p99_us, p999_us] = [0.5, 0.99, 0.999].map(|q| self.quantile(q));
+        serde_json::json!({ "count": count, "mean_us": mean_us, "p50_us": p50_us, "p99_us": p99_us, "p999_us": p999_us })
+            .serialize(s)
     }
-}
-
-#[derive(Serialize, Clone, Copy)]
-pub struct HistSnapshot {
-    pub count: u64,
-    pub mean_us: u64,
-    pub p50_us: u64,
-    pub p99_us: u64,
-    pub p999_us: u64,
 }
 
 /// Why an object's instance was torn down.
@@ -124,7 +94,6 @@ pub struct Metrics {
     pub requests: AtomicU64,
     #[serde(serialize_with = "by_class")]
     pub status: [AtomicU64; 6],
-    pub instantiations: AtomicU64,
     pub instantiate_failures: AtomicU64,
     pub stores_live: AtomicI64,
     pub stores_peak: AtomicI64,

@@ -33,7 +33,7 @@ use wasmtime_wasi::{FsPerms, OpenMode};
 
 use crate::config::Limits;
 use crate::metrics::Metrics;
-use crate::object::ObjState;
+use crate::object::{ObjShared, ObjState};
 
 /// Links WASIp3 cli, clocks, random and the quota'd filesystem. Sockets are
 /// deliberately absent: the only network path is the egress-checked HTTP
@@ -55,25 +55,17 @@ pub struct QuotaGuard(Arc<Mutex<Inner>>);
 struct Inner {
     max_bytes: u64,
     max_files: u64,
-    max_file_bytes: u64,
     bytes: u64,
     files: u64,
     denials: u64,
     metrics: Arc<Metrics>,
-    app: Arc<str>,
-    object: Arc<str>,
+    obj: Arc<ObjShared>,
 }
 
 impl QuotaGuard {
     /// A budget whose starting usage is what's already under `volume`, so a
     /// persistent volume starts each instance with its real usage.
-    pub fn new(
-        volume: &Path,
-        limits: &Limits,
-        metrics: Arc<Metrics>,
-        app: Arc<str>,
-        object: Arc<str>,
-    ) -> std::io::Result<Self> {
+    pub fn new(volume: &Path, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>) -> std::io::Result<Self> {
         let (mut bytes, mut files) = (0, 0);
         let mut stack = vec![volume.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -90,13 +82,11 @@ impl QuotaGuard {
         Ok(QuotaGuard(Arc::new(Mutex::new(Inner {
             max_bytes: limits.disk_mb << 20,
             max_files: limits.max_files,
-            max_file_bytes: limits.max_file_mb << 20,
             bytes,
             files,
             denials: 0,
             metrics,
-            app,
-            object,
+            obj,
         }))))
     }
 
@@ -109,9 +99,9 @@ impl QuotaGuard {
         let end = at.checked_add(buf.len() as u64).ok_or(ErrorCode::Overflow)?;
         let mut q = self.0.lock();
         let room = before + q.max_bytes.saturating_sub(q.bytes);
-        let allowed_end = end.min(room).min(q.max_file_bytes.max(before));
+        let allowed_end = end.min(room);
         if allowed_end <= at && !buf.is_empty() {
-            return Err(q.too_big(end, room));
+            return Err(q.full());
         }
         let n = file
             .write_at(&buf[..(allowed_end - at) as usize], at)
@@ -124,8 +114,8 @@ impl QuotaGuard {
         let before = file.metadata().map_err(|_| ErrorCode::Io)?.len();
         let mut q = self.0.lock();
         let room = before + q.max_bytes.saturating_sub(q.bytes);
-        if size > before && (size > q.max_file_bytes || size > room) {
-            return Err(q.too_big(size, room));
+        if size > room {
+            return Err(q.full());
         }
         file.set_len(size).map_err(|_| ErrorCode::Io)?;
         q.bytes = (q.bytes + size).saturating_sub(before);
@@ -153,15 +143,9 @@ impl QuotaGuard {
 }
 
 impl Inner {
-    /// The error for growing a file to `end` when only `room` bytes fit.
-    fn too_big(&mut self, end: u64, room: u64) -> ErrorCode {
-        if end > self.max_file_bytes && self.max_file_bytes <= room {
-            let what = format!("file would exceed max_file_mb ({} MiB)", self.max_file_bytes >> 20);
-            self.deny(ErrorCode::FileTooLarge, what)
-        } else {
-            let what = format!("write refused, {} MiB disk quota full", self.max_bytes >> 20);
-            self.deny(ErrorCode::InsufficientSpace, what)
-        }
+    fn full(&mut self) -> ErrorCode {
+        let what = format!("write refused, {} MiB disk quota full", self.max_bytes >> 20);
+        self.deny(ErrorCode::InsufficientSpace, what)
     }
 
     fn deny(&mut self, code: ErrorCode, what: String) -> ErrorCode {
@@ -169,7 +153,7 @@ impl Inner {
         self.denials += 1;
         // A guest retrying in a loop shouldn't flood the event log.
         if self.denials == 1 || self.denials.is_multiple_of(1000) {
-            self.metrics.event("fs-denied", &self.app, &self.object, what);
+            self.metrics.event("fs-denied", &self.obj.app, &self.obj.id, what);
         }
         code
     }

@@ -55,12 +55,7 @@ pub fn check_imports(engine: &Engine, component: &Component) -> anyhow::Result<(
             bail!("import `{name}` is not permitted");
         }
     }
-    if !ty
-        .exports(engine)
-        .any(|(name, _)| name.starts_with("wasi:http/handler@0.3"))
-    {
-        bail!("component does not export wasi:http/handler@0.3");
-    }
+    // A missing `wasi:http/handler` export fails `ServicePre::new`, by name.
     Ok(())
 }
 

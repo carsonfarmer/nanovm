@@ -120,8 +120,7 @@ impl ObjShared {
     }
 
     fn begin_request(&self) {
-        self.cpu_accum_ns.store(0, Relaxed);
-        self.poll_start_ns.store(now_ns(), Relaxed);
+        self.begin_start();
         self.set_phase(Phase::Handling);
     }
 
@@ -280,13 +279,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
     table.set_max_capacity(limits.max_resources);
 
     // `/tmp` was just created, so only the persistent volume holds usage.
-    let quota = QuotaGuard::new(
-        &data_dir,
-        limits,
-        node.metrics.clone(),
-        app.name.clone(),
-        shared.id.clone(),
-    )?;
+    let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone())?;
 
     let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
     node.metrics.stores_peak.fetch_max(live, Relaxed);
@@ -298,8 +291,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
             policy: app.egress.clone(),
             sem: Arc::new(Semaphore::new(limits.max_outbound_concurrency)),
             metrics: node.metrics.clone(),
-            app: app.name.clone(),
-            object: shared.id.clone(),
+            obj: shared.clone(),
         },
         limiter: MemLimiter {
             max_bytes: (limits.memory_mb << 20) as usize,
@@ -378,7 +370,6 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         .await;
         match started {
             Ok((store, svc)) => {
-                node.metrics.instantiations.fetch_add(1, Relaxed);
                 node.metrics.instantiate.record(t0.elapsed());
                 match serve(&node, &app, &shared, store, svc, &mut rx).await {
                     Exit::Closed => return,
@@ -493,9 +484,8 @@ async fn serve(
             if armed != Some((phase, since)) {
                 let ms = match phase {
                     Phase::Idle => limits.idle_timeout_ms,
-                    Phase::Handling => limits.request_timeout_ms,
                     Phase::PostReturn => limits.post_return_timeout_ms,
-                    Phase::Starting | Phase::Cold => limits.request_timeout_ms,
+                    Phase::Handling | Phase::Starting | Phase::Cold => limits.request_timeout_ms,
                 };
                 let elapsed = Duration::from_nanos(t1.saturating_sub(since));
                 let left = Duration::from_millis(ms).saturating_sub(elapsed);

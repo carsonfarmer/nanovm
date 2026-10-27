@@ -2,42 +2,19 @@
 <meta charset="utf-8">
 <title>nanovm</title>
 <h1>nanovm</h1>
-<p>
-  <button data-demo="spawn?n=10000&concurrency=256">Spawn 10,000 objects</button>
-  <button data-demo="hammer?objects=1000&n=500000&concurrency=256&prefix=warm">Hammer 500,000 requests</button>
-  <button data-demo="storm?rounds=10">Storm: 110 attacks</button>
-</p>
-<pre id="result"></pre>
 <h2>Stats</h2>
 <pre id="stats"></pre>
 <h2>Events</h2>
 <pre id="events"></pre>
 <script>
-const api = (path, init) => fetch("/_nanovm" + path, { cache: "no-store", ...init }).then((r) => r.json());
+const api = (path) => fetch("/_nanovm" + path, { cache: "no-store" }).then((r) => r.json());
 let seq = 0;
 const log = [];
 
-for (const b of document.querySelectorAll("button")) {
-  b.onclick = async () => {
-    b.disabled = true;
-    document.getElementById("result").textContent = "running " + b.dataset.demo + " …";
-    const r = await api("/demo/" + b.dataset.demo, { method: "POST" }).catch((e) => ({ error: String(e) }));
-    const out = r.attacks
-      ? r.attacks.map((a) => `${a.attack.padEnd(16)} ${JSON.stringify(a.status).padEnd(12)} ${a.killed_by || ""} ${Math.round(a.max_ms)} ms`).join("\n")
-      : JSON.stringify(r, null, 2);
-    document.getElementById("result").textContent = out;
-    b.disabled = false;
-  };
-}
-
 async function tick() {
   const s = await api("/stats").catch(() => null);
-  if (s) {
-    const { apps, ...rest } = s;
-    document.getElementById("stats").textContent = JSON.stringify(rest, null, 2);
-  }
-  const evs = await api("/events?since=" + seq).catch(() => []);
-  for (const e of evs) {
+  if (s) document.getElementById("stats").textContent = JSON.stringify(s, null, 2);
+  for (const e of await api("/events?since=" + seq).catch(() => [])) {
     seq = e.seq;
     log.unshift(`${(e.t_ms / 1000).toFixed(1)}s ${e.kind} ${e.app}/${e.object}: ${e.detail.split("\n")[0]}`);
   }

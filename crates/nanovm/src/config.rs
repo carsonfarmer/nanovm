@@ -6,38 +6,46 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NodeConfig {
-    /// Address the HTTP front end listens on.
-    #[serde(default = "d_listen")]
-    pub listen: String,
-    /// Root for per-object volumes, scratch space and the compile cache.
-    #[serde(default = "d_data_dir")]
-    pub data_dir: PathBuf,
-    /// Upper bound on objects with a live instance; sizes the pooling allocator.
-    #[serde(default = "d_max_live")]
-    pub max_live_objects: usize,
-    /// Virtual address space reserved per linear memory. Every app's
-    /// `memory_mb` must fit inside it.
-    #[serde(default = "d_reservation")]
-    pub memory_reservation_mb: u64,
-    /// Epoch tick; the granularity of CPU-budget checks and guest yields.
-    #[serde(default = "d_tick")]
-    pub epoch_tick_ms: u64,
-    /// Requests that have used more than `HEAVY_AFTER` of CPU take turns on
-    /// this many cores, so short requests always find a free one. 0 means
-    /// half the cores.
-    #[serde(default)]
-    pub heavy_lanes: usize,
-    /// Enables `/_nanovm/demo/*` load-generation endpoints.
-    #[serde(default)]
-    pub demo: bool,
-    #[serde(default, rename = "app")]
-    pub apps: Vec<AppConfig>,
+/// Declares a config struct in which every field has a default, so the
+/// default is written once, next to the field.
+macro_rules! config {
+    ($(#[$m:meta])* pub struct $name:ident { $($(#[$fm:meta])* $f:ident: $t:ty = $d:expr,)* }) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Deserialize, serde::Serialize)]
+        #[serde(deny_unknown_fields, default)]
+        pub struct $name { $($(#[$fm])* pub $f: $t,)* }
+
+        impl Default for $name {
+            fn default() -> Self {
+                $name { $($f: $d.into(),)* }
+            }
+        }
+    };
 }
 
-#[derive(Debug, Clone, Deserialize)]
+config! {
+    pub struct NodeConfig {
+        /// Address the HTTP front end listens on.
+        listen: String = "127.0.0.1:8080",
+        /// Root for per-object volumes, scratch space and the compile cache.
+        data_dir: PathBuf = "nanovm-data",
+        /// Upper bound on objects with a live instance; sizes the pooling allocator.
+        max_live_objects: usize = 1000usize,
+        /// Virtual address space reserved per linear memory. Every app's
+        /// `memory_mb` must fit inside it.
+        memory_reservation_mb: u64 = 128u64,
+        /// Epoch tick; the granularity of CPU-budget checks and guest yields.
+        epoch_tick_ms: u64 = 5u64,
+        /// Requests that have used more than `HEAVY_AFTER` of CPU take turns on
+        /// this many cores, so short requests always find a free one. 0 means
+        /// half the cores.
+        heavy_lanes: usize = 0usize,
+        #[serde(rename = "app")]
+        apps: Vec<AppConfig> = Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub name: String,
@@ -53,64 +61,26 @@ pub struct AppConfig {
     pub limits: Limits,
 }
 
-/// Per-object limits. Every live object of an app gets its own copy.
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Limits {
-    pub memory_mb: u64,
-    pub cpu_ms: u64,
-    pub request_timeout_ms: u64,
-    pub post_return_timeout_ms: u64,
-    pub idle_timeout_ms: u64,
-    pub max_request_body_kb: u64,
-    pub max_response_body_kb: u64,
-    /// Disk budget shared by `/data` and `/tmp`.
-    pub disk_mb: u64,
-    pub max_files: u64,
-    pub max_file_mb: u64,
-    pub max_queue: usize,
-    pub max_outbound_concurrency: usize,
-    pub max_resources: usize,
-    /// Outbound HTTP allowlist: `host`, `host:port` or `*.suffix[:port]`.
-    /// Empty denies all egress.
-    pub egress: Vec<String>,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Limits {
-            memory_mb: 64,
-            cpu_ms: 200,
-            request_timeout_ms: 5_000,
-            post_return_timeout_ms: 5_000,
-            idle_timeout_ms: 30_000,
-            max_request_body_kb: 1024,
-            max_response_body_kb: 8192,
-            disk_mb: 64,
-            max_files: 1000,
-            max_file_mb: 16,
-            max_queue: 64,
-            max_outbound_concurrency: 4,
-            max_resources: 10_000,
-            egress: Vec::new(),
-        }
+config! {
+    /// Per-object limits. Every live object of an app gets its own copy.
+    pub struct Limits {
+        memory_mb: u64 = 64u64,
+        cpu_ms: u64 = 200u64,
+        request_timeout_ms: u64 = 5_000u64,
+        post_return_timeout_ms: u64 = 5_000u64,
+        idle_timeout_ms: u64 = 30_000u64,
+        max_request_body_kb: u64 = 1024u64,
+        max_response_body_kb: u64 = 8192u64,
+        /// Disk budget shared by `/data` and `/tmp`.
+        disk_mb: u64 = 64u64,
+        max_files: u64 = 1000u64,
+        max_queue: usize = 64usize,
+        max_outbound_concurrency: usize = 4usize,
+        max_resources: usize = 10_000usize,
+        /// Outbound HTTP allowlist: `host`, `host:port` or `*.suffix[:port]`.
+        /// Empty denies all egress.
+        egress: Vec<String> = Vec::new(),
     }
-}
-
-fn d_listen() -> String {
-    "127.0.0.1:8080".into()
-}
-fn d_data_dir() -> PathBuf {
-    "nanovm-data".into()
-}
-fn d_max_live() -> usize {
-    1000
-}
-fn d_reservation() -> u64 {
-    128
-}
-fn d_tick() -> u64 {
-    5
 }
 
 impl NodeConfig {
