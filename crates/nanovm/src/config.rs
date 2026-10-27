@@ -57,7 +57,7 @@ pub struct AppConfig {
 }
 
 /// Per-object limits. Every live object of an app gets its own copy.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Limits {
     pub memory_mb: u64,

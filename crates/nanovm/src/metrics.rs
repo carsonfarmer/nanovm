@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 /// Monotonic nanoseconds since process start.
 pub fn now_ns() -> u64 {
@@ -69,6 +69,12 @@ impl Histogram {
     }
 }
 
+impl Serialize for Histogram {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.snapshot().serialize(s)
+    }
+}
+
 #[derive(Serialize, Clone, Copy)]
 pub struct HistSnapshot {
     pub count: u64,
@@ -79,8 +85,7 @@ pub struct HistSnapshot {
 }
 
 /// Why an object's instance was torn down.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Poison {
     Cpu,
     Memory,
@@ -99,13 +104,7 @@ impl Poison {
     ];
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            Poison::Cpu => "cpu",
-            Poison::Memory => "memory",
-            Poison::Timeout => "timeout",
-            Poison::Trap => "trap",
-            Poison::ResourceTable => "resource-table",
-        }
+        ["cpu", "memory", "timeout", "trap", "resource-table"][self as usize]
     }
 }
 
@@ -119,14 +118,17 @@ pub struct Event {
     pub detail: String,
 }
 
-#[derive(Default)]
+/// Node-wide counters; serialized as-is into `/_nanovm/stats`.
+#[derive(Default, Serialize)]
 pub struct Metrics {
     pub requests: AtomicU64,
+    #[serde(serialize_with = "by_class")]
     pub status: [AtomicU64; 6],
     pub instantiations: AtomicU64,
     pub instantiate_failures: AtomicU64,
     pub stores_live: AtomicI64,
     pub stores_peak: AtomicI64,
+    #[serde(serialize_with = "by_poison")]
     pub poisons: [AtomicU64; 5],
     pub evicted_idle: AtomicU64,
     pub evicted_lru: AtomicU64,
@@ -135,10 +137,25 @@ pub struct Metrics {
     pub egress_allowed: AtomicU64,
     pub egress_denied: AtomicU64,
     pub fs_denied: AtomicU64,
+    #[serde(rename = "guest_cpu_ms", serialize_with = "as_ms")]
     pub guest_cpu_ns: AtomicU64,
     pub latency: Histogram,
     pub instantiate: Histogram,
+    #[serde(skip)]
     events: Mutex<EventLog>,
+}
+
+/// Status counts keyed `1xx`..`5xx`.
+fn by_class<S: Serializer>(v: &[AtomicU64; 6], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_map((1..6).map(|i| (format!("{i}xx"), v[i].load(Relaxed))))
+}
+
+fn by_poison<S: Serializer>(v: &[AtomicU64; 5], s: S) -> Result<S::Ok, S::Error> {
+    s.collect_map(Poison::ALL.iter().map(|p| (p.as_str(), v[*p as usize].load(Relaxed))))
+}
+
+fn as_ms<S: Serializer>(v: &AtomicU64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u64(v.load(Relaxed) / 1_000_000)
 }
 
 #[derive(Default)]

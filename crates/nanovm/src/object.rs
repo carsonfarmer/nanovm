@@ -44,37 +44,30 @@ pub struct Job {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
-    Starting = 0,
-    Idle = 1,
-    Handling = 2,
-    PostReturn = 3,
-    Cold = 4,
+    Starting,
+    Idle,
+    Handling,
+    PostReturn,
+    Cold,
 }
 
 impl Phase {
-    fn from_u8(v: u8) -> Phase {
-        match v {
-            0 => Phase::Starting,
-            1 => Phase::Idle,
-            2 => Phase::Handling,
-            3 => Phase::PostReturn,
-            _ => Phase::Cold,
-        }
-    }
+    const ALL: [Phase; 5] = [
+        Phase::Starting,
+        Phase::Idle,
+        Phase::Handling,
+        Phase::PostReturn,
+        Phase::Cold,
+    ];
 
     pub fn as_str(self) -> &'static str {
-        match self {
-            Phase::Starting => "starting",
-            Phase::Idle => "idle",
-            Phase::Handling => "handling",
-            Phase::PostReturn => "post-return",
-            Phase::Cold => "cold",
-        }
+        ["starting", "idle", "handling", "post-return", "cold"][self as usize]
     }
 }
 
 /// State of an object visible outside its actor (the table, the dashboard,
 /// and the epoch callback, which runs while the actor's future is borrowed).
+#[derive(Default)]
 pub struct ObjShared {
     pub app: Arc<str>,
     pub id: Arc<str>,
@@ -105,22 +98,18 @@ impl ObjShared {
             id: id.into(),
             generation,
             phase: AtomicU8::new(Phase::Cold as u8),
-            since_ns: AtomicU64::new(now),
-            requests: AtomicU64::new(0),
-            poisons: AtomicU64::new(0),
-            instantiations: AtomicU64::new(0),
-            cpu_accum_ns: AtomicU64::new(0),
-            poll_start_ns: AtomicU64::new(now),
-            cpu_total_ns: AtomicU64::new(0),
-            last_used_ns: AtomicU64::new(now),
-            last_poison: Mutex::new(None),
-            quota: Mutex::new(None),
-            lane: Mutex::new(None),
+            since_ns: now.into(),
+            poll_start_ns: now.into(),
+            last_used_ns: now.into(),
+            ..Default::default()
         }
     }
 
     pub fn phase(&self) -> (Phase, u64) {
-        (Phase::from_u8(self.phase.load(Relaxed)), self.since_ns.load(Relaxed))
+        (
+            Phase::ALL[self.phase.load(Relaxed) as usize],
+            self.since_ns.load(Relaxed),
+        )
     }
 
     fn set_phase(&self, p: Phase) {
@@ -187,11 +176,8 @@ const LOG_TAIL: usize = 2048;
 
 impl LogTail {
     pub fn text(&self) -> String {
-        let buf = self.0.lock();
-        let (a, b) = buf.as_slices();
-        let mut v = a.to_vec();
-        v.extend_from_slice(b);
-        String::from_utf8_lossy(&v).trim().to_string()
+        let buf: Vec<u8> = self.0.lock().iter().copied().collect();
+        String::from_utf8_lossy(&buf).trim().to_string()
     }
 }
 
@@ -232,14 +218,6 @@ impl Drop for TmpDir {
     }
 }
 
-struct LiveGuard(Arc<crate::metrics::Metrics>);
-
-impl Drop for LiveGuard {
-    fn drop(&mut self) {
-        self.0.stores_live.fetch_sub(1, Relaxed);
-    }
-}
-
 pub struct ObjState {
     wasi: WasiCtx,
     table: ResourceTable,
@@ -254,7 +232,12 @@ pub struct ObjState {
     pub app_dir: Option<wasmtime_wasi::filesystem::Dir>,
     pub quota: QuotaGuard,
     _tmp: TmpDir,
-    _live: LiveGuard,
+}
+
+impl Drop for ObjState {
+    fn drop(&mut self) {
+        self.hooks.metrics.stores_live.fetch_sub(1, Relaxed);
+    }
 }
 
 impl WasiView for ObjState {
@@ -275,17 +258,6 @@ impl WasiHttpView for ObjState {
         }
     }
 }
-
-#[derive(Debug)]
-struct CpuExceeded;
-
-impl std::fmt::Display for CpuExceeded {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("cpu budget exceeded")
-    }
-}
-
-impl std::error::Error for CpuExceeded {}
 
 fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
     let limits = &app.cfg.limits;
@@ -367,7 +339,6 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         app_dir: app.static_dir.clone(),
         quota,
         _tmp: tmp,
-        _live: LiveGuard(node.metrics.clone()),
     };
 
     let mut store = Store::new(&node.engine, state);
@@ -378,7 +349,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         let used = st.shared.cpu_used_ns();
         if used > st.cpu_budget_ns {
             st.cpu_exceeded = true;
-            return Err(wasmtime::Error::new(CpuExceeded));
+            return Err(wasmtime::format_err!("cpu budget exceeded"));
         }
         // Hand back the lane at every tick so heavy requests take turns.
         st.shared.lane.lock().take();
@@ -609,7 +580,7 @@ fn classify(store: &Store<ObjState>, e: &wasmtime::Error) -> Exit {
     let st = store.data();
     let tail = st.stderr.text();
     let with_tail = |msg: String| if tail.is_empty() { msg } else { format!("{msg}\n{tail}") };
-    if st.cpu_exceeded || e.downcast_ref::<CpuExceeded>().is_some() {
+    if st.cpu_exceeded {
         let ms = st.cpu_budget_ns / 1_000_000;
         return Exit::Poisoned(Poison::Cpu, format!("used more than {ms}ms of CPU in one request"));
     }

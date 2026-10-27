@@ -18,7 +18,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use crate::load::{Run, request};
-use crate::metrics::{Poison, rss_bytes};
+use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
 use crate::table::Node;
 
@@ -264,55 +264,26 @@ async fn load(
 }
 
 fn stats(node: &Node) -> serde_json::Value {
-    let m = &node.metrics;
     let (_, phases) = node.objects(0);
-    let poisons: serde_json::Map<String, serde_json::Value> = Poison::ALL
-        .iter()
-        .map(|p| (p.as_str().to_string(), json!(m.poisons[*p as usize].load(Relaxed))))
-        .collect();
-    let status: serde_json::Map<String, serde_json::Value> = (1..6)
-        .map(|i| (format!("{i}xx"), json!(m.status[i].load(Relaxed))))
-        .collect();
     let apps: Vec<_> = node
         .apps
         .values()
-        .map(|a| {
-            json!({ "name": &*a.name, "limits": {
-                "memory_mb": a.cfg.limits.memory_mb,
-                "cpu_ms": a.cfg.limits.cpu_ms,
-                "request_timeout_ms": a.cfg.limits.request_timeout_ms,
-                "data_mb": a.cfg.limits.data_mb,
-                "tmp_mb": a.cfg.limits.tmp_mb,
-                "max_files": a.cfg.limits.max_files,
-                "max_resources": a.cfg.limits.max_resources,
-                "egress": a.cfg.limits.egress,
-            }})
-        })
+        .map(|a| json!({ "name": &*a.name, "limits": a.cfg.limits }))
         .collect();
-    json!({
-        "uptime_ms": node.started.elapsed().as_millis() as u64,
-        "rss_mb": rss_bytes() as f64 / 1048576.0,
-        "live_objects": node.live_objects(),
-        "max_live_objects": node.cfg.max_live_objects,
-        "stores_live": m.stores_live.load(Relaxed),
-        "stores_peak": m.stores_peak.load(Relaxed),
-        "phases": phases,
-        "requests": m.requests.load(Relaxed),
-        "status": status,
-        "instantiations": m.instantiations.load(Relaxed),
-        "instantiate_failures": m.instantiate_failures.load(Relaxed),
-        "poisons": poisons,
-        "evicted_idle": m.evicted_idle.load(Relaxed),
-        "evicted_lru": m.evicted_lru.load(Relaxed),
-        "rejected_busy": m.rejected_busy.load(Relaxed),
-        "rejected_capacity": m.rejected_capacity.load(Relaxed),
-        "egress_allowed": m.egress_allowed.load(Relaxed),
-        "egress_denied": m.egress_denied.load(Relaxed),
-        "fs_denied": m.fs_denied.load(Relaxed),
-        "guest_cpu_ms": m.guest_cpu_ns.load(Relaxed) / 1_000_000,
-        "latency": m.latency.snapshot(),
-        "instantiate": m.instantiate.snapshot(),
-        "apps": apps,
-        "demo": node.cfg.demo,
-    })
+    let mut v = serde_json::to_value(&*node.metrics).expect("metrics serialize");
+    v.as_object_mut().unwrap().extend(
+        json!({
+            "uptime_ms": node.started.elapsed().as_millis() as u64,
+            "rss_mb": rss_bytes() as f64 / 1048576.0,
+            "live_objects": node.live_objects(),
+            "max_live_objects": node.cfg.max_live_objects,
+            "phases": phases,
+            "apps": apps,
+            "demo": node.cfg.demo,
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    v
 }
