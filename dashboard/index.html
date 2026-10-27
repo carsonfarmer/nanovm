@@ -1,0 +1,813 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanovm node</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f3f2ee;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --ring: rgba(11,11,11,0.10);
+  --s1: #2a78d6;           /* handling / primary series */
+  --s1-wash: rgba(42,120,214,0.10);
+  --s3: #1baf7a;           /* starting */
+  --s7: #6250d6;           /* post-return */
+  --idle: #c9c8bf;
+  --slot: #ecebe6;
+  --good: #0ca30c;
+  --good-text: #006300;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --btn: #0b0b0b;
+  --btn-ink: #fcfcfb;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #222220;
+    --ink: #f0efec;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --ring: rgba(255,255,255,0.10);
+    --s1: #3987e5;
+    --s1-wash: rgba(57,135,229,0.14);
+    --s3: #199e70;
+    --s7: #9085e9;
+    --idle: #4a4a46;
+    --slot: #232321;
+    --good-text: #0ca30c;
+    --btn: #f0efec;
+    --btn-ink: #1a1a19;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-2: #222220;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --ring: rgba(255,255,255,0.10);
+  --s1: #3987e5;
+  --s1-wash: rgba(57,135,229,0.14);
+  --s3: #199e70;
+  --s7: #9085e9;
+  --idle: #4a4a46;
+  --slot: #232321;
+  --good-text: #0ca30c;
+  --btn: #f0efec;
+  --btn-ink: #1a1a19;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1320px; margin: 0 auto; padding: 20px 24px 48px; }
+header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+header h1 { font-size: 20px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+header .sub { color: var(--ink-2); }
+header .right { margin-left: auto; color: var(--muted); display: flex; gap: 14px; align-items: center; font-variant-numeric: tabular-nums; }
+.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--good); display: inline-block; margin-right: 6px; box-shadow: 0 0 0 0 var(--good); }
+.pulse.on { animation: pulse 1.6s ease-out infinite; }
+.pulse.off { background: var(--critical); }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(12,163,12,0.5); } 100% { box-shadow: 0 0 0 8px rgba(12,163,12,0); } }
+@media (prefers-reduced-motion: reduce) { .pulse.on { animation: none; } }
+.card {
+  background: var(--surface);
+  border-radius: 12px;
+  box-shadow: 0 0 0 1px var(--ring);
+  padding: 16px 18px;
+  min-width: 0;
+}
+.card h2 { font-size: 13px; font-weight: 600; margin: 0 0 2px; }
+.card .hint { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
+.kpis { display: grid; grid-template-columns: minmax(280px, 1.25fr) repeat(4, minmax(150px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.tile .label { color: var(--ink-2); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 620; letter-spacing: -0.01em; margin-top: 2px; white-space: nowrap; }
+.tile .value small { font-size: 14px; font-weight: 500; color: var(--ink-2); margin-left: 3px; }
+.tile .foot { color: var(--muted); font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.hero .value { font-size: 52px; line-height: 1.05; }
+.meter { height: 6px; border-radius: 3px; background: var(--s1-wash); margin-top: 12px; overflow: hidden; }
+.meter > div { height: 100%; background: var(--s1); border-radius: 3px; width: 0; transition: width .3s ease; }
+.row2 { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(320px, 1fr); gap: 12px; margin-bottom: 12px; }
+#map { width: 100%; height: 300px; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; color: var(--ink-2); font-size: 12px; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; background: var(--c); }
+.legend .crit::before { content: "✕"; color: #fff; font-size: 8px; line-height: 10px; text-align: center; font-weight: 700; }
+.actions { display: flex; flex-direction: column; gap: 10px; }
+.action { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; padding: 10px 0; border-top: 1px solid var(--grid); }
+.action:first-of-type { border-top: 0; padding-top: 0; }
+.action .t { font-weight: 600; font-size: 13px; }
+.action .d { color: var(--muted); font-size: 12px; grid-column: 1; }
+.action .r { grid-column: 1 / -1; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; min-height: 0; }
+.action .r b { color: var(--ink); font-weight: 600; }
+button {
+  font: inherit; font-size: 13px; font-weight: 600;
+  border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer;
+  background: var(--btn); color: var(--btn-ink);
+  grid-row: 1 / span 2; grid-column: 2;
+}
+button:hover { opacity: .88; }
+button:disabled { opacity: .45; cursor: progress; }
+button:focus-visible, .chip:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; grid-column: 1 / -1; margin-top: 6px; }
+.chip {
+  font: inherit; font-size: 12px; font-weight: 500; padding: 5px 10px; border-radius: 999px; cursor: pointer;
+  background: var(--surface-2); color: var(--ink); border: 0; box-shadow: inset 0 0 0 1px var(--ring);
+}
+.chip:hover { background: var(--grid); }
+.charts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+.chart .now { font-size: 22px; font-weight: 620; margin: 2px 0 6px; white-space: nowrap; }
+.chart .now small { font-size: 13px; font-weight: 500; color: var(--ink-2); margin-left: 3px; }
+.chart svg { width: 100%; height: 120px; display: block; overflow: visible; touch-action: none; }
+.chart .axis text, .chart .ticks text { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.tip {
+  position: fixed; pointer-events: none; z-index: 10; display: none;
+  background: var(--surface); color: var(--ink); border-radius: 8px; padding: 7px 10px; font-size: 12px;
+  box-shadow: 0 0 0 1px var(--ring), 0 6px 20px rgba(0,0,0,.14); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.tip b { font-size: 14px; font-weight: 650; display: block; }
+.tip .k { color: var(--ink-2); }
+.row3 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 12px; margin-bottom: 12px; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+th { text-align: left; color: var(--muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+td { padding: 6px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+.sample { color: var(--ink-2); max-width: 340px; overflow-wrap: anywhere; }
+.status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-weight: 600; }
+.status i { font-style: normal; width: 16px; height: 16px; border-radius: 50%; display: inline-grid; place-items: center; font-size: 10px; color: #fff; font-weight: 800; }
+.st-crit i { background: var(--critical); }
+.st-warn i { background: var(--warning); color: #3a2a00; }
+.st-good i { background: var(--good); }
+.st-info i { background: var(--muted); }
+#events { max-height: 360px; overflow: auto; }
+#events .ev { display: grid; grid-template-columns: 62px 132px 1fr; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--grid); font-size: 12.5px; align-items: start; }
+#events .ev .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+#events .ev .who { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#events .ev .det { color: var(--ink-2); overflow-wrap: anywhere; grid-column: 2 / -1; font-size: 12px; }
+#events .ev .x { color: var(--muted); font-weight: 500; }
+.empty { color: var(--muted); font-size: 12.5px; padding: 18px 0; }
+.tabs { display: flex; gap: 2px; margin-left: auto; }
+.tabs button { grid-row: auto; grid-column: auto; background: transparent; color: var(--ink-2); font-weight: 500; padding: 4px 9px; font-size: 12px; }
+.tabs button[aria-pressed="true"] { background: var(--surface-2); color: var(--ink); box-shadow: inset 0 0 0 1px var(--ring); }
+.cardhead { display: flex; align-items: flex-start; gap: 12px; }
+#console { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; background: var(--surface-2); border-radius: 8px; padding: 10px 12px; max-height: 150px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); margin-top: 10px; display: none; grid-column: 1 / -1; }
+#console .ok { color: var(--good-text); }
+#console .bad { color: var(--critical); }
+.limits td:first-child { font-weight: 600; }
+@media (max-width: 1100px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpis .hero { grid-column: 1 / -1; }
+  .row2, .row3 { grid-template-columns: minmax(0, 1fr); }
+  .charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  .wrap { padding: 14px 16px 40px; }
+  .charts { grid-template-columns: minmax(0, 1fr); }
+  .hero .value { font-size: 44px; }
+  #events .ev { grid-template-columns: 56px 1fr; }
+  #events .ev .who { grid-column: 2; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>nanovm</h1>
+    <span class="sub">wasmtime 50 · WASIp3 HTTP · one live instance per object</span>
+    <span class="right"><span><span class="pulse on" id="pulse"></span><span id="conn">live</span></span><span id="uptime">—</span><span id="apps">—</span></span>
+  </header>
+
+  <section class="kpis" aria-label="Node summary">
+    <div class="card tile hero">
+      <div class="label">Live objects</div>
+      <div class="value" id="k-live">—</div>
+      <div class="meter" aria-hidden="true"><div id="k-live-meter"></div></div>
+      <div class="foot" id="k-live-foot">of — slots</div>
+    </div>
+    <div class="card tile">
+      <div class="label">Memory</div>
+      <div class="value" id="k-rss">—</div>
+      <div class="foot" id="k-rss-foot">process RSS</div>
+    </div>
+    <div class="card tile">
+      <div class="label">Throughput</div>
+      <div class="value" id="k-rps">—</div>
+      <div class="foot" id="k-rps-foot">— requests total</div>
+    </div>
+    <div class="card tile">
+      <div class="label">Canary latency</div>
+      <div class="value" id="k-canary">—</div>
+      <div class="foot" id="k-canary-foot">a well-behaved neighbor, polled from this page</div>
+    </div>
+    <div class="card tile">
+      <div class="label">Instances killed</div>
+      <div class="value" id="k-kills">—</div>
+      <div class="foot" id="k-kills-foot">—</div>
+    </div>
+  </section>
+
+  <section class="row2">
+    <div class="card">
+      <div class="cardhead">
+        <div>
+          <h2>Object map</h2>
+          <p class="hint" id="map-hint">Every slot the node can hold. Each filled cell is one isolated wasm instance with its own memory, CPU budget and filesystem.</p>
+        </div>
+      </div>
+      <canvas id="map" role="img" aria-label="Grid of live objects colored by phase"></canvas>
+      <div class="legend" id="map-legend">
+        <span style="--c: var(--idle)">Idle <b id="lg-i">0</b></span>
+        <span style="--c: var(--s1)">Handling <b id="lg-h">0</b></span>
+        <span style="--c: var(--s3)">Starting <b id="lg-s">0</b></span>
+        <span style="--c: var(--s7)">Post-return <b id="lg-p">0</b></span>
+        <span class="crit" style="--c: var(--critical)">Killed in the last 3 s <b id="lg-x">0</b></span>
+        <span style="--c: var(--slot)">Empty slot</span>
+      </div>
+    </div>
+
+    <div class="card actions">
+      <div>
+        <h2>Try it</h2>
+        <p class="hint">Load runs inside the node (no sockets), so the numbers measure nanovm, not curl.</p>
+      </div>
+      <div class="action">
+        <div class="t">Spawn 10,000 objects</div>
+        <div class="d">10k new object ids, one request each: 10k cold starts.</div>
+        <button id="b-spawn">Spawn</button>
+        <div class="r" id="r-spawn"></div>
+      </div>
+      <div class="action">
+        <div class="t">Hammer 500,000 requests</div>
+        <div class="d">Spread over 1,000 warm objects, 256 in flight.</div>
+        <button id="b-hammer">Hammer</button>
+        <div class="r" id="r-hammer"></div>
+      </div>
+      <div class="action">
+        <div class="t">Unleash the storm</div>
+        <div class="d">110 attacks at once from untrusted guests: 10 of each kind below.</div>
+        <button id="b-storm">Storm</button>
+        <div class="r" id="r-storm"></div>
+      </div>
+      <div class="action">
+        <div class="t">One attack at a time</div>
+        <div class="d">Sent from this page to <span class="mono">/hostile/solo/…</span></div>
+        <div class="chips" id="chips"></div>
+        <div id="console" aria-live="polite"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="charts" aria-label="Last 60 seconds">
+    <div class="card chart" id="c-live"></div>
+    <div class="card chart" id="c-rps"></div>
+    <div class="card chart" id="c-canary"></div>
+    <div class="card chart" id="c-rss"></div>
+  </section>
+
+  <section class="card" style="margin-bottom:12px">
+    <h2>Containment report</h2>
+    <p class="hint" id="storm-hint">Run the storm to see how every attack ended.</p>
+    <div id="storm-table"><div class="empty">No storm yet.</div></div>
+  </section>
+
+  <section class="row3">
+    <div class="card">
+      <h2>Event log</h2>
+      <p class="hint">Kills, denials and evictions, newest first. Bursts of the same kind are folded.</p>
+      <div id="events"><div class="empty">Nothing has happened yet.</div></div>
+    </div>
+    <div class="card">
+      <h2>Per-object limits</h2>
+      <p class="hint">Set per app in <span class="mono">nanovm.toml</span>; every object gets its own copy.</p>
+      <div id="limits"></div>
+    </div>
+  </section>
+</div>
+<div class="tip" id="tip" role="tooltip"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const API = "/_nanovm";
+const WINDOW_S = 60, TICK_MS = 500;
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// ---------- formatting ----------
+const fmtInt = (n) => Math.round(n).toLocaleString("en-US");
+function compact(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
+  if (n >= 1e4) return (n / 1e3).toFixed(0) + "K";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(Math.round(n));
+}
+function fmtMs(ms) {
+  if (ms == null || !isFinite(ms)) return "—";
+  if (ms < 1) return ms.toFixed(2) + " ms";
+  if (ms < 10) return ms.toFixed(1) + " ms";
+  return Math.round(ms) + " ms";
+}
+function fmtUs(us) { return fmtMs(us / 1000); }
+function fmtDur(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + "s up";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m " + (s % 60) + "s up";
+  return Math.floor(m / 60) + "h " + (m % 60) + "m up";
+}
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") e.className = v; else if (k === "style") e.style.cssText = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) e.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return e;
+}
+function setText(id, s) { const e = $(id); if (e.textContent !== s) e.textContent = s; }
+function setValue(id, num, unit) {
+  const e = $(id); e.replaceChildren(document.createTextNode(num));
+  if (unit) e.append(el("small", {}, unit));
+}
+
+// ---------- state ----------
+const series = { t: [], live: [], rps: [], canary: [], rss: [] };
+let last = null, lastStats = null, perObjKb = null, eventSeq = 0, events = [];
+let canaryWindow = [];
+
+// ---------- canary: real HTTP from this page to a well-behaved object ----------
+async function canary() {
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/counter/canary/", { cache: "no-store" });
+    await r.arrayBuffer();
+    const ms = performance.now() - t0;
+    canaryWindow.push({ t: Date.now(), ms, ok: r.ok });
+  } catch { canaryWindow.push({ t: Date.now(), ms: NaN, ok: false }); }
+  const cutoff = Date.now() - WINDOW_S * 1000;
+  while (canaryWindow.length && canaryWindow[0].t < cutoff) canaryWindow.shift();
+}
+setInterval(canary, 250);
+
+// ---------- charts ----------
+function makeChart(id, title, unit, fmt, opts = {}) {
+  const root = $(id);
+  const head = el("div", { class: "cardhead" },
+    el("div", {}, el("h2", {}, title), el("div", { class: "hint", style: "margin:0" }, opts.hint || "last 60 seconds")),
+    el("div", { class: "tabs" },
+      el("button", { "aria-pressed": "true", "data-v": "chart" }, "Chart"),
+      el("button", { "aria-pressed": "false", "data-v": "table" }, "Table")));
+  const now = el("div", { class: "now" }, "—");
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", title + " over the last 60 seconds");
+  svg.setAttribute("tabindex", "0");
+  const tableBox = el("div", { style: "display:none; max-height:150px; overflow:auto" });
+  root.append(head, now, svg, tableBox);
+  head.querySelectorAll(".tabs button").forEach((b) => b.addEventListener("click", () => {
+    const table = b.dataset.v === "table";
+    head.querySelectorAll(".tabs button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    svg.style.display = table ? "none" : ""; tableBox.style.display = table ? "" : "none";
+    c.draw();
+  }));
+  const c = { root, svg, now, tableBox, key: opts.key, fmt, unit, hover: null };
+  function pt(evt) {
+    const r = svg.getBoundingClientRect();
+    return { x: evt.clientX - r.left, w: r.width };
+  }
+  svg.addEventListener("pointermove", (e) => { const p = pt(e); hoverAll(p.x / p.w, e.clientX, e.clientY); });
+  svg.addEventListener("pointerleave", () => hoverAll(null));
+  svg.addEventListener("focus", () => { const r = svg.getBoundingClientRect(); hoverAll(1, r.right - 40, r.top + 20); });
+  svg.addEventListener("blur", () => hoverAll(null));
+  c.draw = function () {
+    const vals = series[c.key];
+    const n = vals.length;
+    const cur = n ? vals[n - 1] : null;
+    now.replaceChildren(document.createTextNode(cur == null || !isFinite(cur) ? "—" : fmt(cur)));
+    if (c.unit) now.append(el("small", {}, c.unit));
+    if (tableBox.style.display !== "none") {
+      const rows = [];
+      for (let i = n - 1; i >= Math.max(0, n - 30); i -= 2) {
+        rows.push(el("tr", {}, el("td", {}, "−" + ((series.t[n - 1] - series.t[i]) / 1000).toFixed(0) + " s"),
+          el("td", { class: "num" }, isFinite(vals[i]) ? fmt(vals[i]) + (c.unit ? " " + c.unit : "") : "—")));
+      }
+      tableBox.replaceChildren(el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Time"), el("th", { class: "num" }, title))), el("tbody", {}, ...rows)));
+      return;
+    }
+    const W = svg.clientWidth || 260, H = 120, padL = 0, padR = 34, padT = 6, padB = 18;
+    const pw = W - padL - padR, ph = H - padT - padB;
+    const finite = vals.filter((v) => isFinite(v));
+    let max = Math.max(opts.minMax || 1, ...finite);
+    const step = niceStep(max / 3);
+    max = Math.ceil(max / step) * step;
+    const tNow = series.t[n - 1] || Date.now();
+    const x = (t) => padL + pw * (1 - (tNow - t) / (WINDOW_S * 1000));
+    const y = (v) => padT + ph * (1 - v / max);
+    let grid = "", ticks = "";
+    for (let v = 0; v <= max + 1e-9; v += step) {
+      grid += `<line x1="${padL}" x2="${padL + pw}" y1="${y(v)}" y2="${y(v)}" stroke="${v === 0 ? "var(--axis)" : "var(--grid)"}" stroke-width="1" shape-rendering="crispEdges"/>`;
+      ticks += `<text x="${W - 2}" y="${y(v) + 3.5}" text-anchor="end">${compact(v)}</text>`;
+    }
+    let d = "", area = "", started = false, firstX = 0, lastX = 0;
+    for (let i = 0; i < n; i++) {
+      const v = vals[i];
+      if (!isFinite(v)) { started = false; continue; }
+      const X = x(series.t[i]).toFixed(1), Y = y(v).toFixed(1);
+      if (!started) { d += `M${X},${Y}`; if (!area) { area = `M${X},${y(0)}L${X},${Y}`; firstX = X; } else area += `L${X},${Y}`; started = true; }
+      else { d += `L${X},${Y}`; area += `L${X},${Y}`; }
+      lastX = X;
+    }
+    if (area) area += `L${lastX},${y(0)}Z`;
+    let marks = "", lastLabelX = -Infinity;
+    for (const m of markers) {
+      if (m.t < tNow - WINDOW_S * 1000) continue;
+      const X = x(m.t);
+      marks += `<line x1="${X}" x2="${X}" y1="${padT}" y2="${padT + ph}" stroke="var(--muted)" stroke-width="1" opacity=".55"/>`;
+      // Labels need room; a marker too close to the last one stays a bare line.
+      if (X - lastLabelX > 44) {
+        const right = X > padL + pw - 44;
+        marks += `<text x="${right ? X - 3 : X + 3}" y="${padT + 9}" text-anchor="${right ? "end" : "start"}" fill="var(--muted)" font-size="10">${esc(m.label)}</text>`;
+        lastLabelX = X;
+      }
+    }
+    let hov = "";
+    if (c.hover != null && n) {
+      const i = c.hover;
+      if (isFinite(vals[i])) {
+        const X = x(series.t[i]), Y = y(vals[i]);
+        hov = `<line x1="${X}" x2="${X}" y1="${padT}" y2="${padT + ph}" stroke="var(--ink-2)" stroke-width="1"/>` +
+          `<circle cx="${X}" cy="${Y}" r="6" fill="var(--surface)"/><circle cx="${X}" cy="${Y}" r="4" fill="var(--s1)"/>`;
+      }
+    }
+    const endDot = n && isFinite(cur) ? `<circle cx="${x(tNow)}" cy="${y(cur)}" r="6" fill="var(--surface)"/><circle cx="${x(tNow)}" cy="${y(cur)}" r="4" fill="var(--s1)"/>` : "";
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+    svg.innerHTML = `<g>${grid}</g><g class="ticks">${ticks}</g>${marks}` +
+      (area ? `<path d="${area}" fill="var(--s1-wash)"/>` : "") +
+      (d ? `<path d="${d}" fill="none" stroke="var(--s1)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>` : "") +
+      endDot + hov +
+      `<g class="axis"><text x="${padL}" y="${H - 3}">−60s</text><text x="${padL + pw}" y="${H - 3}" text-anchor="end">now</text></g>`;
+  };
+  return c;
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch])); }
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (raw <= m * p) return m * p;
+  return 10 * p;
+}
+const markers = [];
+const charts = [
+  makeChart("c-live", "Live objects", "", (v) => fmtInt(v), { key: "live", minMax: 10 }),
+  makeChart("c-rps", "Requests per second", "", (v) => compact(v), { key: "rps", minMax: 10 }),
+  makeChart("c-canary", "Canary latency", "ms", (v) => v < 10 ? v.toFixed(1) : Math.round(v).toString(), { key: "canary", minMax: 2, hint: "worst round trip per 0.5 s, from this page" }),
+  makeChart("c-rss", "Process memory", "MB", (v) => fmtInt(v), { key: "rss", minMax: 100, hint: "resident set size" }),
+];
+const tip = $("tip");
+function hoverAll(frac, cx, cy) {
+  const n = series.t.length;
+  if (frac == null || !n) { charts.forEach((c) => { c.hover = null; c.draw(); }); tip.style.display = "none"; return; }
+  const tNow = series.t[n - 1];
+  const tAt = tNow - (1 - Math.max(0, Math.min(1, frac / (1 - 34 / 260 * 0)))) * WINDOW_S * 1000;
+  let best = 0, bd = Infinity;
+  for (let i = 0; i < n; i++) { const dd = Math.abs(series.t[i] - tAt); if (dd < bd) { bd = dd; best = i; } }
+  charts.forEach((c) => { c.hover = best; c.draw(); });
+  tip.replaceChildren(
+    el("div", { class: "k" }, "−" + ((tNow - series.t[best]) / 1000).toFixed(1) + " s"),
+    ...charts.map((c) => el("div", {}, el("span", { style: "display:inline-block;width:10px;height:2px;background:var(--s1);vertical-align:3px;margin-right:6px" }),
+      el("b", { style: "display:inline;font-size:13px" }, isFinite(series[c.key][best]) ? c.fmt(series[c.key][best]) + (c.unit ? " " + c.unit : "") : "—"),
+      el("span", { class: "k" }, "  " + c.root.querySelector("h2").textContent))));
+  tip.style.display = "block";
+  const tw = tip.offsetWidth;
+  tip.style.left = Math.min(window.innerWidth - tw - 8, cx + 14) + "px";
+  tip.style.top = (cy + 14) + "px";
+}
+
+// ---------- object map ----------
+const map = $("map");
+const PHASE = { i: "--idle", h: "--s1", s: "--s3", p: "--s7", c: "--idle" };
+function drawMap(cells, max) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = map.clientWidth, H = map.clientHeight;
+  if (map.width !== Math.round(W * dpr) || map.height !== Math.round(H * dpr)) { map.width = Math.round(W * dpr); map.height = Math.round(H * dpr); }
+  const ctx = map.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  // Pick the largest cell pitch that fits every slot.
+  let pitch = Math.floor(Math.sqrt((W * H) / max));
+  while (pitch > 2 && Math.floor(W / pitch) * Math.floor(H / pitch) < max) pitch--;
+  pitch = Math.max(2, Math.min(pitch, 24));
+  const cols = Math.floor(W / pitch);
+  const gap = pitch >= 3 ? 1 : 0;
+  const size = pitch - gap;
+  const colors = {};
+  for (const [k, v] of Object.entries(PHASE)) colors[k] = css(v);
+  const slot = css("--slot"), crit = css("--critical");
+  const counts = { i: 0, h: 0, s: 0, p: 0, x: 0 };
+  ctx.fillStyle = slot;
+  for (let k = cells.length; k < max; k++) ctx.fillRect((k % cols) * pitch, Math.floor(k / cols) * pitch, size, size);
+  let curColor = null;
+  const busy = [], killed = [];
+  for (let k = 0; k < cells.length; k++) {
+    const ch = cells[k];
+    const lower = ch.toLowerCase();
+    const hot = ch !== lower;
+    const col = hot ? crit : (colors[lower] || colors.i);
+    if (hot) { counts.x++; killed.push(k); }
+    else {
+      const key = lower === "c" ? "i" : lower;
+      counts[key] = (counts[key] || 0) + 1;
+      if (key !== "i") busy.push(k);
+    }
+    if (col !== curColor) { ctx.fillStyle = col; curColor = col; }
+    ctx.fillRect((k % cols) * pitch, Math.floor(k / cols) * pitch, size, size);
+  }
+  // Tiny cells hide the interesting few, so draw them again, bigger, on top.
+  const blob = (list, grow) => {
+    for (const k of list) {
+      ctx.fillStyle = k < cells.length && cells[k] !== cells[k].toLowerCase() ? crit : colors[cells[k]] || colors.i;
+      ctx.fillRect((k % cols) * pitch - grow, Math.floor(k / cols) * pitch - grow, size + 2 * grow, size + 2 * grow);
+    }
+  };
+  if (pitch < 8) {
+    ctx.globalAlpha = 0.9;
+    blob(busy, Math.ceil(pitch / 2));
+    blob(killed, pitch);
+    ctx.globalAlpha = 1;
+  }
+  for (const k of ["i", "h", "s", "p", "x"]) setText("lg-" + k, fmtInt(counts[k]));
+  map._layout = { pitch, cols, n: cells.length };
+}
+map.addEventListener("pointermove", async (e) => {
+  const L = map._layout; if (!L) return;
+  const r = map.getBoundingClientRect();
+  const col = Math.floor((e.clientX - r.left) / L.pitch), row = Math.floor((e.clientY - r.top) / L.pitch);
+  const k = row * L.cols + col;
+  tip.replaceChildren(el("b", {}, k < L.n ? "Object " + fmtInt(k + 1) : "Slot " + fmtInt(k + 1) + " · empty"),
+    el("div", { class: "k" }, k < L.n ? "phase: " + phaseName(lastCells[k]) : "free for a new object"));
+  tip.style.display = "block";
+  tip.style.left = Math.min(window.innerWidth - tip.offsetWidth - 8, e.clientX + 14) + "px";
+  tip.style.top = (e.clientY + 14) + "px";
+});
+map.addEventListener("pointerleave", () => { tip.style.display = "none"; });
+function phaseName(ch) {
+  if (!ch) return "—";
+  if (ch === "X") return "killed and retired";
+  const n = { i: "idle", h: "handling", s: "starting", p: "post-return", c: "cold" }[ch.toLowerCase()] || ch;
+  return ch !== ch.toLowerCase() ? n + ", killed in the last 3 s" : n;
+}
+let lastCells = "", lastMax = 20000;
+
+// ---------- polling ----------
+async function getJSON(path, init) {
+  const r = await fetch(API + path, { cache: "no-store", ...init });
+  if (!r.ok) throw new Error(path + " " + r.status);
+  return r.json();
+}
+async function tick() {
+  let s;
+  try { s = await getJSON("/stats"); setConn(true); } catch { setConn(false); return; }
+  const now = Date.now();
+  const rps = last ? Math.max(0, (s.requests - last.requests) / ((now - last.at) / 1000)) : 0;
+  last = { at: now, requests: s.requests };
+  lastStats = s;
+  // Worst canary round trip in the last tick.
+  const recent = canaryWindow.filter((c) => c.t > now - TICK_MS - 50 && isFinite(c.ms)).map((c) => c.ms);
+  const canaryWorst = recent.length ? Math.max(...recent) : NaN;
+  series.t.push(now); series.live.push(s.stores_live); series.rps.push(rps); series.canary.push(canaryWorst); series.rss.push(s.rss_mb);
+  while (series.t.length && series.t[0] < now - WINDOW_S * 1000) for (const k in series) series[k].shift();
+  while (markers.length && markers[0].t < now - WINDOW_S * 1000) markers.shift();
+
+  // KPIs
+  setText("k-live", fmtInt(s.stores_live));
+  $("k-live-meter").style.width = Math.min(100, (100 * s.stores_live) / s.max_live_objects) + "%";
+  setText("k-live-foot", `of ${fmtInt(s.max_live_objects)} slots · ${fmtInt(s.instantiations)} cold starts so far · p50 ${fmtUs(s.instantiate.p50_us)} each`);
+  setValue("k-rss", fmtInt(s.rss_mb), "MB");
+  setText("k-rss-foot", perObjKb != null ? `${Math.round(perObjKb)} KB per object (last spawn)` : "process RSS · spawn to measure per object");
+  setValue("k-rps", compact(rps), "req/s");
+  const peak = Math.max(0, ...series.rps);
+  setText("k-rps-foot", `peak ${compact(peak)}/s in 60 s · ${fmtInt(s.requests)} total · p99 ${fmtUs(s.latency.p99_us)}`);
+  const cw = canaryWindow.filter((c) => isFinite(c.ms)).map((c) => c.ms).sort((a, b) => a - b);
+  if (cw.length) {
+    setValue("k-canary", cw[Math.floor(cw.length / 2)] < 10 ? cw[Math.floor(cw.length / 2)].toFixed(1) : String(Math.round(cw[Math.floor(cw.length / 2)])), "ms");
+    const failed = canaryWindow.filter((c) => !c.ok).length;
+    setText("k-canary-foot", `median of ${cw.length} in 60 s · p99 ${fmtMs(cw[Math.min(cw.length - 1, Math.floor(cw.length * 0.99))])}` + (failed ? ` · ${failed} failed` : " · none failed"));
+  }
+  const kills = Object.values(s.poisons).reduce((a, b) => a + b, 0);
+  setText("k-kills", fmtInt(kills));
+  const parts = Object.entries(s.poisons).filter(([, v]) => v > 0).map(([k, v]) => `${v} ${k}`);
+  const denied = s.fs_denied + s.egress_denied;
+  setText("k-kills-foot", (parts.length ? parts.join(" · ") : "none yet") + ` · ${fmtInt(denied)} fs/egress denials`);
+  setText("uptime", fmtDur(s.uptime_ms));
+  setText("apps", s.apps.map((a) => a.name).sort().join(" + "));
+  charts.forEach((c) => c.draw());
+  if (!limitsDrawn) drawLimits(s.apps);
+}
+function setConn(ok) {
+  $("pulse").className = "pulse " + (ok ? "on" : "off");
+  setText("conn", ok ? "live" : "disconnected");
+}
+async function tickMap() {
+  try {
+    const g = await getJSON("/grid");
+    lastCells = g.cells; lastMax = g.max;
+    drawMap(g.cells, g.max);
+  } catch {}
+}
+async function tickEvents() {
+  try {
+    const evs = await getJSON("/events?since=" + eventSeq);
+    if (!evs.length) return;
+    eventSeq = evs[evs.length - 1].seq;
+    for (const e of evs) {
+      // Fold into a recent entry of the same kind and app from the same burst.
+      const j = events.slice(0, 16).findIndex((x) => x.kind === e.kind && x.app === e.app && e.t_ms - x.t_ms < 3000);
+      if (j >= 0) {
+        const x = events.splice(j, 1)[0];
+        x.n++; x.t_ms = e.t_ms; x.objects.add(e.object); x.object = e.object;
+        events.unshift(x);
+        continue;
+      }
+      events.unshift({ ...e, n: 1, objects: new Set([e.object]) });
+    }
+    events = events.slice(0, 60);
+    drawEvents();
+  } catch {}
+}
+const KIND = {
+  cpu: ["st-crit", "✕", "killed: CPU"],
+  memory: ["st-crit", "✕", "killed: memory"],
+  timeout: ["st-crit", "✕", "killed: timeout"],
+  trap: ["st-crit", "✕", "killed: trap"],
+  "resource-table": ["st-crit", "✕", "killed: handles"],
+  "fs-denied": ["st-warn", "!", "fs denied"],
+  "egress-denied": ["st-warn", "!", "egress denied"],
+  "evicted-lru": ["st-info", "–", "evicted (LRU)"],
+  "instantiate-failed": ["st-warn", "!", "start failed"],
+};
+function drawEvents() {
+  const box = $("events");
+  if (!events.length) return;
+  const nowMs = lastStats ? lastStats.uptime_ms : 0;
+  box.replaceChildren(...events.map((e) => {
+    const [cls, icon, label] = KIND[e.kind] || ["st-info", "·", e.kind];
+    const ago = Math.max(0, (nowMs - e.t_ms) / 1000);
+    return el("div", { class: "ev" },
+      el("span", { class: "t" }, ago < 60 ? ago.toFixed(0) + "s ago" : Math.floor(ago / 60) + "m ago"),
+      el("span", { class: "status " + cls }, el("i", { "aria-hidden": "true" }, icon), label),
+      el("span", { class: "who" }, e.app + "/" + e.object,
+        e.objects.size > 1 ? el("span", { class: "x" }, ` +${fmtInt(e.objects.size - 1)} others`) : e.n > 1 ? el("span", { class: "x" }, "  ×" + fmtInt(e.n)) : null),
+      el("span", { class: "det" }, e.detail.split("\n")[0].slice(0, 220)));
+  }));
+}
+let limitsDrawn = false;
+function drawLimits(apps) {
+  limitsDrawn = true;
+  apps = apps.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const rows = [["memory_mb", "Linear memory", " MiB"], ["cpu_ms", "CPU per request", " ms"], ["request_timeout_ms", "Wall clock per request", " ms"], ["data_mb", "/data volume (kept)", " MiB"], ["tmp_mb", "/tmp scratch (wiped)", " MiB"], ["max_files", "Files", ""], ["max_resources", "Host handles", ""]];
+  const body = rows.map(([k, label, u]) => el("tr", {}, el("td", {}, label), ...apps.map((a) => el("td", { class: "num" }, fmtInt(a.limits[k]) + u))));
+  body.push(el("tr", {}, el("td", {}, "Outbound hosts"), ...apps.map((a) => el("td", { class: "num" }, a.limits.egress.length ? a.limits.egress.join(", ") : "none"))));
+  $("limits").replaceChildren(el("div", { style: "overflow-x:auto" }, el("table", { class: "limits" },
+    el("thead", {}, el("tr", {}, el("th", {}, "Limit"), ...apps.map((a) => el("th", { class: "num" }, a.name)))),
+    el("tbody", {}, ...body))));
+}
+
+// ---------- actions ----------
+function busy(btn, on, label) { btn.disabled = on; btn.textContent = on ? "Running…" : label; }
+function mark(label) { markers.push({ t: Date.now(), label }); }
+$("b-spawn").addEventListener("click", async () => {
+  const b = $("b-spawn"); busy(b, true); mark("spawn");
+  try {
+    const r = await getJSON("/demo/spawn?n=10000&concurrency=256", { method: "POST" });
+    perObjKb = r.rss_per_live_kb || perObjKb;
+    const ok = r.status["200"] || 0;
+    $("r-spawn").replaceChildren("", el("b", {}, fmtInt(r.n) + " cold starts in " + fmtInt(r.elapsed_ms) + " ms"),
+      ` · ${compact(r.rps)}/s · ${Math.round(r.rss_per_live_kb)} KB per object · p50 ${fmtUs(r.p50_us)} · p99 ${fmtUs(r.p99_us)}` + (ok < r.n ? ` · ${fmtInt(r.n - ok)} refused` : " · all 200"));
+  } catch (e) { $("r-spawn").textContent = String(e); }
+  busy(b, false, "Spawn");
+});
+$("b-hammer").addEventListener("click", async () => {
+  const b = $("b-hammer"); busy(b, true); mark("hammer");
+  try {
+    const r = await getJSON("/demo/hammer?objects=1000&n=500000&concurrency=256&prefix=warm", { method: "POST" });
+    const ok = r.status["200"] || 0;
+    $("r-hammer").replaceChildren(el("b", {}, compact(r.rps) + " req/s"),
+      ` · ${fmtInt(r.n)} in ${fmtInt(r.elapsed_ms)} ms · p50 ${fmtUs(r.p50_us)} · p99 ${fmtUs(r.p99_us)}` + (ok < r.n ? ` · ${fmtInt(r.n - ok)} non-200` : " · all 200"));
+  } catch (e) { $("r-hammer").textContent = String(e); }
+  busy(b, false, "Hammer");
+});
+const VERDICT = {
+  memory: "Killed at the 32 MiB memory cap",
+  cpu: "Killed at the 100 ms CPU budget",
+  timeout: "Killed at the 2 s wall-clock deadline",
+  trap: "Panic trapped; instance discarded",
+  "resource-table": "Killed at 2,000 host handles",
+  "disk-bytes": "Write refused past the 4 MiB file cap",
+  "disk-files": "Create refused at 200 files",
+  "write-app": "/app is read-only",
+  escape: "Every path outside the sandbox refused",
+  "egress-metadata": "Cloud metadata address not on the allowlist",
+  "egress-loopback": "Allowlisted name resolved to loopback: refused",
+};
+$("b-storm").addEventListener("click", async () => {
+  const b = $("b-storm"); busy(b, true); mark("storm");
+  try {
+    const r = await getJSON("/demo/storm?rounds=10", { method: "POST" });
+    const total = r.attacks.reduce((a, x) => a + Object.values(x.status).reduce((p, q) => p + q, 0), 0);
+    const leaked = r.attacks.filter((a) => a.status["200"]).length;
+    $("r-storm").replaceChildren(el("b", {}, `${total} attacks, ${leaked ? leaked + " got through" : "all contained"}`), ` in ${fmtInt(r.elapsed_ms)} ms · watch the canary`);
+    setText("storm-hint", `${r.rounds} of each attack, all at once, each on its own object. ${fmtInt(r.elapsed_ms)} ms total.`);
+    const rows = r.attacks.map((a) => {
+      const codes = Object.entries(a.status).map(([k, v]) => `${v}× ${k}`).join(", ");
+      const contained = !a.status["200"];
+      return el("tr", {},
+        el("td", {}, el("code", {}, a.path)),
+        el("td", {}, el("span", { class: "status " + (contained ? "st-good" : "st-crit") }, el("i", { "aria-hidden": "true" }, contained ? "✓" : "✕"), contained ? "contained" : "LEAKED"),
+          el("div", { style: "color:var(--ink-2);font-size:12px;margin-top:2px" }, VERDICT[a.attack] || a.killed_by || "")),
+        el("td", { class: "num" }, codes),
+        el("td", { class: "num" }, fmtMs(a.max_ms)),
+        el("td", { class: "sample mono" }, sampleText(a)));
+    });
+    $("storm-table").replaceChildren(el("div", { style: "overflow-x:auto" }, el("table", {},
+      el("thead", {}, el("tr", {}, el("th", {}, "Attack"), el("th", {}, "Outcome"), el("th", { class: "num" }, "Status"), el("th", { class: "num" }, "Slowest"), el("th", {}, "What the guest saw"))),
+      el("tbody", {}, ...rows))));
+  } catch (e) { $("r-storm").textContent = String(e); }
+  busy(b, false, "Storm");
+});
+function sampleText(a) {
+  try {
+    const j = JSON.parse(a.sample);
+    if (Array.isArray(j)) return j.map((x) => x.result || ("symlink " + x.symlink + ", follow " + x.follow)).join(" · ");
+    if (j.error && j.detail) return j.detail.split("\n")[0];
+    if (j.denied) return j.denied.replace("ErrorCode::", "");
+    return Object.entries(j).map(([k, v]) => k + " " + v).join(", ");
+  } catch {
+    // Truncated JSON: the first line of its detail is still the story.
+    const m = /"detail"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(a.sample);
+    return m ? m[1].split("\\n")[0].replace(/\\"/g, '"').slice(0, 200) : a.sample.slice(0, 160);
+  }
+}
+const ATTACKS = [
+  ["Allocate 1 GiB", "/alloc?mb=1024"],
+  ["Spin forever", "/spin"],
+  ["Sleep 60 s", "/sleep?ms=60000"],
+  ["Panic", "/panic"],
+  ["Leak 1M handles", "/leak?n=1000000"],
+  ["Fill the disk", "/fill?mount=data&mb=1024"],
+  ["Make files", "/files?mount=tmp"],
+  ["Escape the sandbox", "/escape"],
+  ["Cloud metadata", "/fetch?url=http://169.254.169.254/latest/meta-data/"],
+  ["Rebind to loopback", "/fetch?url=http://localtest.me:8080/_nanovm/stats"],
+  ["Allowed fetch", "/fetch?url=https://example.com/"],
+  ["Who am I", "/"],
+];
+const con = $("console");
+for (const [label, path] of ATTACKS) {
+  const c = el("button", { class: "chip" }, label);
+  c.style.gridRow = "auto"; c.style.gridColumn = "auto";
+  c.addEventListener("click", async () => {
+    mark(label.split(" ")[0].toLowerCase());
+    con.style.display = "block";
+    const t0 = performance.now();
+    const line = el("div", {}, "→ " + path + "  …");
+    con.prepend(line);
+    try {
+      const r = await fetch("/hostile/solo" + path, { cache: "no-store" });
+      const body = await r.text();
+      const ms = performance.now() - t0;
+      const why = r.headers.get("x-nanovm-error");
+      line.replaceChildren(el("span", { class: r.ok ? "ok" : "bad" }, `${r.status}${why ? " " + why : ""}`), `  ${path}  ${fmtMs(ms)}\n   ${body.split("\n")[0].slice(0, 260)}`);
+    } catch (e) { line.textContent = "✕ " + path + " " + e; }
+  });
+  $("chips").append(c);
+}
+
+// ---------- loops ----------
+tick(); tickMap(); tickEvents();
+setInterval(tick, TICK_MS);
+setInterval(tickMap, 500);
+setInterval(tickEvents, 1000);
+window.addEventListener("resize", () => { drawMap(lastCells, lastMax); charts.forEach((c) => c.draw()); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => drawMap(lastCells, lastMax));
+</script>
+</body>
+</html>

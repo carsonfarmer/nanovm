@@ -1,0 +1,5 @@
+/target/
+/guests/target/
+# Node state from demo runs: the .cwasm cache, volumes and scratch.
+/nanovm-data/
+.DS_Store

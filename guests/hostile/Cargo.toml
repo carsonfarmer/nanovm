@@ -1,0 +1,11 @@
+[package]
+name = "hostile"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasip3.workspace = true
+util.workspace = true

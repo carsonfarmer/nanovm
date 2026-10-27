@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["util", "counter", "hostile"]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+wasip3 = { version = "0.9.0", features = ["async-spawn"] }
+util = { path = "util" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+debug = false

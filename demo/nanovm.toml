@@ -1,0 +1,44 @@
+# nanovm demo node: one benign app and one hostile app on the same host.
+listen = "127.0.0.1:8080"
+data_dir = "../nanovm-data"
+max_live_objects = 20000
+memory_reservation_mb = 64
+epoch_tick_ms = 5
+demo = true
+dashboard = "../dashboard"
+
+[[app]]
+name = "counter"
+component = "../guests/target/wasm32-wasip2/release/counter.wasm"
+static_dir = "static"
+
+[app.limits]
+memory_mb = 16
+cpu_ms = 50
+request_timeout_ms = 2000
+idle_timeout_ms = 60000
+data_mb = 1
+tmp_mb = 1
+max_files = 100
+max_file_mb = 1
+
+[[app]]
+name = "hostile"
+component = "../guests/target/wasm32-wasip2/release/hostile.wasm"
+static_dir = "static"
+
+[app.limits]
+memory_mb = 32
+cpu_ms = 100
+request_timeout_ms = 2000
+post_return_timeout_ms = 1000
+idle_timeout_ms = 60000
+data_mb = 8
+tmp_mb = 4
+max_files = 200
+max_file_mb = 4
+max_resources = 2000
+max_outbound_concurrency = 2
+# example.com is reachable; localtest.me is allowlisted but resolves to
+# 127.0.0.1, so the resolved-IP filter must still refuse it.
+egress = ["example.com", "localtest.me"]
