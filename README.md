@@ -87,6 +87,37 @@ Density at 10,000 live objects is 157 KB RSS per object. Instantiation p50 is at
 - **File-reading GETs are bounded by macOS.** A GET that reads an existing `/data` file runs at about 113K/s. A plain C loop of `openat`/`pread`/`close` on 14 threads manages only about 88K/s on this Mac, because macOS `openat` doesn't scale across cores. Linux path lookup does scale, so measure this on Linux.
 - **RSS.** macOS RSS doesn't fully drop after eviction, so per-object RSS is better measured on Linux.
 
+### Linux
+
+The same benchmark on a 4-core Intel Xeon (2.1 GHz) cloud sandbox, a Firecracker microVM with no `/dev/kvm`, using `--cold 9000` because the sandbox caps fds at 20,000:
+
+| Scenario | Linux, 4 cores | Mac, 14 cores |
+|---|---|---|
+| Cold start, 256 concurrent | 5.9K/s, p50 39 ms (9,000 objects) | 16.9K/s, p50 15 ms (10,000) |
+| RSS per live object | **87 KB** | 157 KB |
+| Warm GET, 1,000 objects, 256 concurrent | 69K/s, p50 3.5 ms | 327K/s, p50 0.35 ms |
+| Warm GET, one client, one object | 11.1K/s, p50 0.075 ms | 71K/s, p50 0.01 ms |
+| `POST /incr`, 256 concurrent | 6.9K/s | 27K/s |
+| `POST /incr`, one client, one object | 1.7K/s, p50 0.56 ms | 12.0K/s, p50 0.08 ms |
+| First request after a trap | 0.8K/s, p50 0.68 ms | 3.8K/s, p50 0.19 ms |
+| Churn, 20,000 objects through 1,000 slots | 2.7K/s | 11.8K/s |
+| Neighbours, 100 objects | 79K/s, p99 3.2 ms | 389K/s, p99 0.81 ms |
+| ...with 16 attackers looping | 31K/s (39%), p99 5.5 ms | 154K/s (40%), p99 2.4 ms |
+
+Every scenario completed with 0 failed requests. `demo/demo.sh` against a 9,400-object node contained all 110 attacks in 2.1 s, with 0 canary failures.
+
+- **Per core, throughput is roughly on par with the Mac.** The exception is single-client latency. In this VM a cross-core thread wakeup round trip costs 21.5 µs, against 2.3 µs on one core (measured with a futex ping-pong). Each request crosses threads twice, from the caller to the object's actor and back. That is a cost of this nested-virtualisation sandbox, so measure it again on a regular cloud VM.
+- **Linux path lookup scales.** `scripts/openbench.c` (`openat` + `pread` + `close`) does 595K/s on 1 thread and 1.26M/s on 4. The Mac managed 88K/s on 14 threads, so the Mac's file-reading-GET ceiling was macOS.
+- **`/incr` is slow here.** It costs 0.56 ms per request even serially. Reads are fast, so the cost is in creating, truncating and renaming files on this VM's ext4. Not yet profiled.
+
+### Host requirements on Linux
+
+`Node::new` checks these at startup and refuses to start, naming the fix, rather than failing requests at runtime:
+
+- **File descriptors:** each live object holds 2 (`/data` and `/tmp`; `/app` is shared per app). The check needs about `2 × max_live_objects + 1024`. The node raises its soft limit to the hard limit itself; the demo's 20,000 objects need `ulimit -n` of at least 41,088.
+- **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 20,000 needs `sysctl -w vm.max_map_count=164352` or more.
+- **Don't run with `RUST_BACKTRACE` set.** wasmtime then captures a stack backtrace for every guest-visible error. That includes routine ones, like reading a file that doesn't exist yet. With it set, warm throughput across 1,000 objects fell from 63K/s to 23K/s.
+
 ## Tests
 
 ```bash
@@ -94,7 +125,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 30 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 31 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -120,6 +151,12 @@ The tests cover:
 - **Renaming a file onto itself erased its quota usage.** `rename_at` credited the size of an existing target, but renaming a file onto itself is a POSIX no-op. Repeating it zeroed the mount's byte and file counts, so a guest could write past its quota.
   - The fix compares the file identity of the source and the target, and credits only a real replacement.
   - `rename_quota_accounting` checks both cases: the self-rename credits nothing, and a rename over another file still frees its space.
+- **Objects ran out of fds at a third of capacity on Linux.** Each live object held three directory fds, so a 20,000 fd limit capped the node near 6,600 objects. Every cold start after that failed with `EMFILE`. The Mac's higher fd limit hid it.
+  - `/app` is now one fd per app, shared read-only, and startup checks the fd and mapping limits.
+- **A CPU kill could kill the next instance at birth.** The CPU charge was reset only when a request began. Re-instantiation after a CPU kill started with the old charge already over budget, so an epoch tick during instantiation killed the new instance (a rare 503 `instantiate-failed`). A new object was also charged its time waiting for a slot.
+  - Each instantiation now starts a fresh charge. `cpu_kill_does_not_poison_next_instance` fails on its first round without the fix.
+- **The counter could lose its count.** `/incr` truncated `/data/count` and rewrote it in place, so a kill in between left an empty file that read back as 0. Guest writes to `/data` now go to a temporary file that is renamed into place (`util::write_file_atomic`).
+- **The benchmark leaked nodes between scenarios.** Actors hold their node alive, so each scenario inherited the previous one's objects and fds. `Node::shutdown` now releases them.
 - **Filesystem calls queued on one mutex.** wasmtime-wasi sends every filesystem call through tokio's `spawn_blocking`, which has a single lock. Under 256 concurrent writers it collapsed throughput 10×.
   - The fix is `allow_blocking_current_thread(true)`, which runs small local-disk calls inline and charges them to the object's CPU budget. It has to be set before the preopens, which capture it.
   - Result: concurrent `/incr` went from 3K/s to 27K/s, and warm GETs got 1.6× faster.
