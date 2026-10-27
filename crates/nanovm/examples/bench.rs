@@ -2,7 +2,7 @@
 //! churn past capacity, and neighbour latency under attack.
 //!
 //!     scripts/build-guests.sh
-//!     cargo run --release --example bench [-- --quick] [-- --json out.json]
+//!     cargo run --release --example bench [-- --quick] [-- --json out.json] [-- --cold N]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -67,6 +67,11 @@ fn node(name: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
 }
 
 async fn once(node: &Arc<Node>, app: &str, id: &str, method: &str, path: &str) -> u16 {
+    once_err(node, app, id, method, path).await.0
+}
+
+/// The status, plus the `x-nanovm-error` reason (or the status) on failure.
+async fn once_err(node: &Arc<Node>, app: &str, id: &str, method: &str, path: &str) -> (u16, Option<String>) {
     let req = http::Request::builder()
         .method(method)
         .uri(format!("http://localhost{path}"))
@@ -74,8 +79,12 @@ async fn once(node: &Arc<Node>, app: &str, id: &str, method: &str, path: &str) -
         .unwrap();
     let resp = node.dispatch(app, id, req).await;
     let status = resp.status().as_u16();
+    let reason = (status != 200).then(|| {
+        let e = resp.headers().get("x-nanovm-error").and_then(|v| v.to_str().ok());
+        format!("{status} {}", e.unwrap_or("guest"))
+    });
     let _ = resp.into_body().collect().await;
-    status
+    (status, reason)
 }
 
 struct Run {
@@ -83,6 +92,8 @@ struct Run {
     /// Per-request latency in µs, sorted.
     lat: Vec<u32>,
     failed: usize,
+    /// Failure counts by status and `x-nanovm-error` reason.
+    reasons: std::collections::BTreeMap<String, usize>,
 }
 
 impl Run {
@@ -99,6 +110,7 @@ impl Run {
         json!({
             "requests": self.lat.len(),
             "failed": self.failed,
+            "failure_reasons": self.reasons,
             "elapsed_ms": self.elapsed.as_secs_f64() * 1e3,
             "rps": self.rps().round(),
             "p50_ms": self.pct(0.50),
@@ -141,15 +153,15 @@ async fn load_until(
             let (node, next, id) = (node.clone(), next.clone(), id.clone());
             tokio::spawn(async move {
                 let mut lat = Vec::with_capacity((n / conc + 1).min(1 << 20));
-                let mut failed = 0;
+                let mut failed = std::collections::BTreeMap::<String, usize>::new();
                 loop {
                     let i = next.fetch_add(1, Relaxed);
                     if i >= n || deadline.is_some_and(|d| Instant::now() >= d) {
                         return (lat, failed);
                     }
                     let t = Instant::now();
-                    if once(&node, app, &id(i), method, path).await != 200 {
-                        failed += 1;
+                    if let (_, Some(reason)) = once_err(&node, app, &id(i), method, path).await {
+                        *failed.entry(reason).or_default() += 1;
                     }
                     lat.push(t.elapsed().as_micros() as u32);
                 }
@@ -157,15 +169,18 @@ async fn load_until(
         })
         .collect();
     let mut lat = Vec::new();
-    let mut failed = 0;
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
     for w in workers {
         let (l, f) = w.await.unwrap();
         lat.extend(l);
-        failed += f;
+        for (k, v) in f {
+            *reasons.entry(k).or_default() += v;
+        }
     }
     let elapsed = t0.elapsed();
     lat.sort_unstable();
-    Run { elapsed, lat, failed }
+    let failed = reasons.values().sum();
+    Run { elapsed, lat, failed, reasons }
 }
 
 fn row(name: &str, r: &Run, note: &str) {
@@ -175,7 +190,7 @@ fn row(name: &str, r: &Run, note: &str) {
         r.pct(0.5),
         r.pct(0.99),
         r.pct(0.999),
-        if r.failed > 0 { format!("FAILED {}  ", r.failed) } else { String::new() },
+        if r.failed > 0 { format!("FAILED {} {:?}  ", r.failed, r.reasons) } else { String::new() },
     );
 }
 
@@ -185,7 +200,14 @@ async fn main() -> anyhow::Result<()> {
     let quick = args.iter().any(|a| a == "--quick");
     let json_out = args.iter().position(|a| a == "--json").and_then(|i| args.get(i + 1)).cloned();
     let scale = if quick { 10 } else { 1 };
-    let cold_n = 10_000 / scale;
+    // `--cold N` overrides the cold-start count, for hosts whose fd limit
+    // can't hold 10k live objects (see `engine::preflight`).
+    let cold_n = args
+        .iter()
+        .position(|a| a == "--cold")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| v.parse().expect("--cold takes a number"))
+        .unwrap_or(10_000 / scale);
     let warm_objects = 1_000 / scale;
     let warm_n = 500_000 / scale;
     let conc = 256;
@@ -231,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
     out.insert("warm_serial".into(), serial.json());
     out.insert("warm_incr".into(), incr.json());
     out.insert("warm_incr_serial".into(), incr1.json());
+    n.shutdown().await;
     drop(n);
 
     // ---- kill and recover ----
@@ -238,21 +261,23 @@ async fn main() -> anyhow::Result<()> {
     let kills = 300 / scale;
     let mut lat = Vec::with_capacity(kills);
     let t0 = Instant::now();
-    let mut failed = 0;
+    let mut reasons = std::collections::BTreeMap::<String, usize>::new();
     for i in 0..kills {
         let id = format!("k{}", i % 16);
         once(&n, "hostile", &id, "GET", "/panic").await;
         let t = Instant::now();
-        if once(&n, "hostile", &id, "GET", "/").await != 200 {
-            failed += 1;
+        if let (_, Some(reason)) = once_err(&n, "hostile", &id, "GET", "/").await {
+            *reasons.entry(reason).or_default() += 1;
         }
         lat.push(t.elapsed().as_micros() as u32);
     }
     lat.sort_unstable();
-    let recover = Run { elapsed: t0.elapsed(), lat, failed };
+    let failed = reasons.values().sum();
+    let recover = Run { elapsed: t0.elapsed(), lat, failed, reasons };
     println!("\nkill and recover ({kills} traps, serial)");
     row("next request after a trap", &recover, "(fresh instance)");
     out.insert("recover".into(), recover.json());
+    n.shutdown().await;
     drop(n);
 
     // ---- churn past capacity: every request evicts an idle object ----
@@ -261,8 +286,12 @@ async fn main() -> anyhow::Result<()> {
     let churn = load(&n, "counter", "GET", "/", 20_000 / scale, 64, |i| format!("c{i}")).await;
     println!("\nchurn ({} new objects through {cap} slots, 64 concurrent)", 20_000 / scale);
     row("new object + LRU eviction", &churn, "");
+    for e in n.metrics.events_since(0).iter().filter(|e| e.kind == "instantiate-failed").take(3) {
+        println!("    instantiate-failed: {}", e.detail);
+    }
     println!("  {:<34} {} evicted", "", n.metrics.evicted_lru.load(Relaxed));
     out.insert("churn".into(), churn.json());
+    n.shutdown().await;
     drop(n);
 
     // ---- neighbours under attack ----
