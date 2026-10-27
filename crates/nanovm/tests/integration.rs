@@ -30,6 +30,10 @@ fn node(test: &str, max_live: usize, counter_idle_ms: u64) -> Arc<Node> {
 
 /// Like `node`, with the hostile app's CPU budget set to `hostile_cpu_ms`.
 fn node_with(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: u64) -> Arc<Node> {
+    Node::new(node_cfg(test, max_live, counter_idle_ms, hostile_cpu_ms)).unwrap()
+}
+
+fn node_cfg(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: u64) -> NodeConfig {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let dir = root.join("nodes").join(test);
     let _ = std::fs::remove_dir_all(&dir);
@@ -82,7 +86,7 @@ fn node_with(test: &str, max_live: usize, counter_idle_ms: u64, hostile_cpu_ms: 
     );
     let cfg: NodeConfig = toml::from_str(&text).unwrap();
     cfg.validate().unwrap();
-    Node::new(cfg).unwrap()
+    cfg
 }
 
 struct Resp {
@@ -264,6 +268,22 @@ async fn cpu_limit() {
     let r = killed(&node, "cpu", "/spin", 500, "cpu").await;
     // 100 ms budget: killed well before the 1 s wall-clock limit.
     assert!(r.elapsed < Duration::from_millis(800), "took {:?}", r.elapsed);
+}
+
+/// Regression: CPU charged to the killed request used to carry over into the
+/// next instantiation, so an epoch tick during it killed the new instance
+/// at birth (503 instantiate-failed). A 1 ms tick makes that tick likely.
+#[tokio::test(flavor = "multi_thread")]
+async fn cpu_kill_does_not_poison_next_instance() {
+    let mut cfg = node_cfg("cpu_kill_does_not_poison_next_instance", 8, 60_000, 100);
+    cfg.epoch_tick_ms = 1;
+    let node = Node::new(cfg).unwrap();
+    for i in 0..60 {
+        let r = get(&node, "hostile", "k", "/spin").await;
+        assert_eq!(r.error.as_deref(), Some("cpu"), "{}", r.body);
+        let r = get(&node, "hostile", "k", "/").await;
+        assert_eq!(r.status, 200, "round {i}: {:?} {}", r.error, r.body);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

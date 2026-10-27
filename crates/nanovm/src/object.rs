@@ -133,6 +133,14 @@ impl ObjShared {
         self.last_used_ns.store(now, Relaxed);
     }
 
+    /// Starts a fresh CPU charge for instantiating a new instance. Without
+    /// it the charge left by a killed request (or the time spent waiting
+    /// for a slot) counted against the new instance's start-up.
+    fn begin_start(&self) {
+        self.cpu_accum_ns.store(0, Relaxed);
+        self.poll_start_ns.store(now_ns(), Relaxed);
+    }
+
     fn begin_request(&self) {
         self.requests.fetch_add(1, Relaxed);
         self.cpu_accum_ns.store(0, Relaxed);
@@ -392,6 +400,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         // runs, so a new object waits here until that store is gone rather
         // than finding the pool full.
         let slot = node.slots.clone().acquire_owned().await.expect("slots is never closed");
+        shared.begin_start();
         let t0 = Instant::now();
         let started = async {
             let mut store = new_store(&node, &app, &shared)?;
