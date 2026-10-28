@@ -1,0 +1,7 @@
+{
+  "limits": {
+    "memory_mb": 32, "cpu_ms": 100, "request_timeout_ms": 2000, "post_return_timeout_ms": 1000,
+    "idle_timeout_ms": 60000, "disk_mb": 8, "max_files": 200, "max_resources": 2000, "max_outbound_concurrency": 2,
+    "egress": ["example.com", "localtest.me"]
+  }
+}

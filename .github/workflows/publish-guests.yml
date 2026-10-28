@@ -1,0 +1,54 @@
+# Publishes the test guests as signed nanovm apps: one OCI artifact each on
+# ghcr.io (an application/wasm layer plus the guest's nanovm.json as the
+# config blob, versioned 1.0.<run number>), with a GitHub artifact
+# attestation (a Sigstore bundle, signed with this workflow's short-lived
+# identity) pushed next to it. The integration tests verify these.
+name: publish-guests
+
+on:
+  push:
+    branches: [main]
+    paths: [guests/**, .github/workflows/publish-guests.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        guest: [counter, hostile]
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/nanovm-${{ matrix.guest }}
+      VERSION: 1.0.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - run: scripts/build-guests.sh
+      - uses: oras-project/setup-oras@v1
+      - run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - id: push
+        working-directory: guests
+        run: |
+          cp target/wasm32-wasip2/release/${{ matrix.guest }}.wasm app.wasm
+          oras push "$IMAGE:$VERSION" \
+            --artifact-type application/vnd.nanovm.app.v1+json \
+            --config ${{ matrix.guest }}/nanovm.json:application/vnd.nanovm.config.v1+json \
+            --annotation "org.opencontainers.image.version=$VERSION" \
+            --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            app.wasm:application/wasm \
+            --format go-template='{{.digest}}' > digest.txt
+          echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - run: echo "$IMAGE:$VERSION@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
