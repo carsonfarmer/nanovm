@@ -1,7 +1,8 @@
 # nanovm demo node: one benign app and one hostile app on the same host.
 listen = "127.0.0.1:8080"
 data_dir = "../nanovm-data"
-max_live_objects = 20000
+# Per app: each app runs in its own jailed worker process.
+max_live_objects = 8000
 memory_reservation_mb = 64
 epoch_tick_ms = 5
 

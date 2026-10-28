@@ -1,0 +1,204 @@
+//! The jail a worker puts itself in before it compiles or runs any guest
+//! code: its own uid, Landlock confining the filesystem to the app's own
+//! directories, and a seccomp allowlist without sockets, exec or namespaces.
+//! It is entered while the process still has one thread, so every thread
+//! started later inherits it.
+
+use std::path::PathBuf;
+
+/// What a worker may touch.
+pub struct Jail {
+    /// Run as this uid and gid (set when the supervisor is root).
+    pub uid: Option<u32>,
+    pub read_write: Vec<PathBuf>,
+    pub read_only: Vec<PathBuf>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Jail {
+    /// Off Linux the worker runs unjailed; the process split still holds.
+    pub fn enter(self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Jail {
+    pub fn enter(self) -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        use landlock::{
+            ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
+        };
+
+        // SAFETY: plain syscalls on this process's own credentials.
+        unsafe {
+            if let Some(id) = self.uid {
+                ensure!(libc::setgroups(0, std::ptr::null()) == 0, "setgroups failed");
+                ensure!(libc::setresgid(id, id, id) == 0, "setresgid({id}) failed");
+                ensure!(libc::setresuid(id, id, id) == 0, "setresuid({id}) failed");
+            }
+            // Changing uid clears the parent-death signal, so it is set here
+            // rather than before exec; a supervisor already gone means init
+            // adopted us.
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            ensure!(libc::getppid() != 1, "supervisor exited");
+        }
+
+        let abi = ABI::V6;
+        let status = Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))?
+            .scope(Scope::from_all(abi))?
+            .create()?
+            .add_rules(path_beneath_rules(&self.read_write, AccessFs::from_all(abi)))?
+            .add_rules(path_beneath_rules(&self.read_only, AccessFs::from_read(abi)))?
+            // Also sets no_new_privs.
+            .restrict_self()
+            .context("landlock")?;
+        ensure!(status.ruleset != RulesetStatus::NotEnforced, "this kernel does not enforce Landlock");
+
+        let filter: seccompiler::BpfProgram = seccomp_filter()?.try_into()?;
+        seccompiler::apply_filter(&filter).context("seccomp")?;
+        Ok(())
+    }
+}
+
+/// The syscalls Wasmtime, tokio, the WASI filesystem host and the h2
+/// connections to the supervisor make (traced over the integration tests).
+/// Anything else fails with `ENOSYS`, which also sends glibc's thread
+/// creation from `clone3` back to `clone`, whose flags can be checked.
+#[cfg(target_os = "linux")]
+fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
+    use seccompiler::{SeccompAction, SeccompCmpArgLen::*, SeccompCmpOp::*, SeccompCondition as Cond, SeccompRule};
+
+    let mut allow: Vec<i64> = vec![
+        // memory
+        libc::SYS_brk,
+        libc::SYS_munmap,
+        libc::SYS_mremap,
+        libc::SYS_madvise,
+        libc::SYS_membarrier,
+        libc::SYS_memfd_create,
+        // threads, signals, time
+        libc::SYS_futex,
+        libc::SYS_set_robust_list,
+        libc::SYS_set_tid_address,
+        libc::SYS_rseq,
+        libc::SYS_sched_yield,
+        libc::SYS_sched_getaffinity,
+        libc::SYS_gettid,
+        libc::SYS_getpid,
+        libc::SYS_getuid,
+        libc::SYS_geteuid,
+        libc::SYS_getgid,
+        libc::SYS_getegid,
+        libc::SYS_rt_sigaction,
+        libc::SYS_rt_sigprocmask,
+        libc::SYS_rt_sigreturn,
+        libc::SYS_sigaltstack,
+        libc::SYS_clock_gettime,
+        libc::SYS_clock_getres,
+        libc::SYS_clock_nanosleep,
+        // The kernel resumes a sleep interrupted by a signal through this.
+        libc::SYS_restart_syscall,
+        libc::SYS_nanosleep,
+        libc::SYS_getrandom,
+        libc::SYS_uname,
+        libc::SYS_exit,
+        libc::SYS_exit_group,
+        // event loop and the two inherited sockets
+        libc::SYS_epoll_create1,
+        libc::SYS_epoll_ctl,
+        libc::SYS_epoll_pwait,
+        libc::SYS_eventfd2,
+        libc::SYS_ppoll,
+        libc::SYS_sendto,
+        libc::SYS_recvfrom,
+        libc::SYS_sendmsg,
+        libc::SYS_recvmsg,
+        libc::SYS_shutdown,
+        libc::SYS_getsockopt,
+        libc::SYS_getsockname,
+        libc::SYS_getpeername,
+        // files, confined by Landlock
+        libc::SYS_read,
+        libc::SYS_write,
+        libc::SYS_readv,
+        libc::SYS_writev,
+        libc::SYS_pread64,
+        libc::SYS_pwrite64,
+        libc::SYS_preadv,
+        libc::SYS_pwritev,
+        libc::SYS_lseek,
+        libc::SYS_close,
+        libc::SYS_fcntl,
+        libc::SYS_openat,
+        libc::SYS_openat2,
+        libc::SYS_fstat,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+        libc::SYS_faccessat2,
+        libc::SYS_getdents64,
+        libc::SYS_mkdirat,
+        libc::SYS_unlinkat,
+        libc::SYS_renameat2,
+        libc::SYS_readlinkat,
+        libc::SYS_ftruncate,
+        libc::SYS_fsync,
+        libc::SYS_fdatasync,
+        libc::SYS_utimensat,
+    ];
+    #[cfg(target_arch = "x86_64")]
+    allow.extend([
+        libc::SYS_epoll_wait,
+        libc::SYS_poll,
+        libc::SYS_access,
+        libc::SYS_mkdir,
+        libc::SYS_rename,
+        libc::SYS_renameat,
+        libc::SYS_unlink,
+        libc::SYS_rmdir,
+        libc::SYS_stat,
+        libc::SYS_lstat,
+        libc::SYS_open,
+        libc::SYS_readlink,
+    ]);
+    let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = allow.into_iter().map(|s| (s, vec![])).collect();
+    let rule = |conds: Vec<Cond>| SeccompRule::new(conds);
+
+    // Never writable and executable at once.
+    let wx = (libc::PROT_WRITE | libc::PROT_EXEC) as u64;
+    let prot = || -> anyhow::Result<Vec<SeccompRule>> {
+        [0, libc::PROT_WRITE as u64, libc::PROT_EXEC as u64]
+            .into_iter()
+            .map(|v| Ok(rule(vec![Cond::new(2, Dword, MaskedEq(wx), v)?])?))
+            .collect()
+    };
+    rules.insert(libc::SYS_mmap, prot()?);
+    rules.insert(libc::SYS_mprotect, prot()?);
+    // Threads only: no new processes.
+    let thread = libc::CLONE_THREAD as u64;
+    rules.insert(libc::SYS_clone, vec![rule(vec![Cond::new(0, Qword, MaskedEq(thread), thread)?])?]);
+    // Thread names.
+    rules.insert(
+        libc::SYS_prctl,
+        vec![
+            rule(vec![Cond::new(0, Dword, Eq, libc::PR_SET_NAME as u64)?])?,
+            rule(vec![Cond::new(0, Dword, Eq, libc::PR_GET_NAME as u64)?])?,
+        ],
+    );
+    // Reading limits, never raising them.
+    rules.insert(libc::SYS_prlimit64, vec![rule(vec![Cond::new(2, Qword, Eq, 0)?])?]);
+    // tokio's signal driver wakes itself through a local socketpair, which
+    // reaches nothing outside the process.
+    rules.insert(libc::SYS_socketpair, vec![rule(vec![Cond::new(0, Dword, Eq, libc::AF_UNIX as u64)?])?]);
+    // abort() signals only this process.
+    let pid = std::process::id() as u64;
+    rules.insert(libc::SYS_tgkill, vec![rule(vec![Cond::new(0, Dword, Eq, pid)?])?]);
+
+    Ok(seccompiler::SeccompFilter::new(
+        rules,
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        SeccompAction::Allow,
+        std::env::consts::ARCH.try_into()?,
+    )?)
+}

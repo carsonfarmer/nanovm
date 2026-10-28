@@ -40,6 +40,13 @@ config! {
         /// this many cores, so short requests always find a free one. 0 means
         /// half the cores.
         heavy_lanes: usize = 0usize,
+        /// When the supervisor runs as root, app `i`'s worker runs as uid and
+        /// gid `jail_uid_base + i`.
+        jail_uid_base: u32 = 200_000u32,
+        /// A delegated cgroup v2 directory, with the memory, cpu and pids
+        /// controllers enabled for its children. Each worker is placed in
+        /// `<cgroup>/<app>` with that app's `[app.worker]` limits.
+        cgroup: Option<PathBuf> = None::<PathBuf>,
         #[serde(rename = "app")]
         apps: Vec<AppConfig> = Vec::new(),
     }
@@ -59,6 +66,18 @@ pub struct AppConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub limits: Limits,
+    #[serde(default)]
+    pub worker: WorkerLimits,
+}
+
+config! {
+    /// Limits on an app's whole worker process, applied through its cgroup.
+    /// 0 leaves a limit unset.
+    pub struct WorkerLimits {
+        memory_mb: u64 = 0u64,
+        cpus: f64 = 0.0f64,
+        pids: u64 = 0u64,
+    }
 }
 
 config! {
@@ -89,6 +108,12 @@ impl NodeConfig {
             0 => std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),
             n => n,
         }
+    }
+
+    /// An app's writable directories: object volumes, scratch space and its
+    /// compile cache.
+    pub fn app_dirs(&self, app: &str) -> [PathBuf; 3] {
+        ["objects", "tmp", "cache"].map(|d| self.data_dir.join(d).join(app))
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {

@@ -112,8 +112,28 @@ fn is_global_v4(ip: Ipv4Addr) -> bool {
         || o[0] >= 240)
 }
 
+/// A worker's connection to its supervisor, which makes the worker's
+/// outbound requests on its behalf.
+pub type Upstream = hyper::client::conn::http2::SendRequest<WasiBody>;
+
+/// Where an app's outbound requests go.
+#[derive(Clone)]
+pub enum Route {
+    /// Checked and sent from this process (in-process nodes: tests, bench).
+    Direct(Arc<EgressPolicy>),
+    /// Forwarded to the supervisor, which holds the policy (jailed workers).
+    Supervisor(Upstream),
+}
+
+/// Marks a supervisor's answer to a forwarded request: `ok`, or the name of
+/// the `Error` the request failed with. The supervisor strips any copy the
+/// upstream sent, so the worker can trust it.
+const VERDICT: &str = "x-nanovm-egress";
+const CONNECT_TIMEOUT: &str = "x-nanovm-connect-timeout-ms";
+const FIRST_BYTE_TIMEOUT: &str = "x-nanovm-first-byte-timeout-ms";
+
 pub struct EgressHooks {
-    pub policy: Arc<EgressPolicy>,
+    pub route: Route,
     pub sem: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
     pub obj: Arc<crate::object::ObjShared>,
@@ -128,13 +148,25 @@ impl WasiHttpHooks for EgressHooks {
         options: Option<RequestOptions>,
         _fut: Box<dyn Future<Output = Result<(), Error>> + Send>,
     ) -> Box<dyn Future<Output = Result<(http::Response<WasiBody>, IoFuture), Error>> + Send> {
-        let policy = self.policy.clone();
+        let route = self.route.clone();
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
         let obj = self.obj.clone();
         Box::new(async move {
             let target = request.uri().clone();
-            let res = send(request, options, &policy, sem).await;
+            let res = async {
+                let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
+                let (res, conn) = match route {
+                    Route::Direct(policy) => send(request, options, &policy).await?,
+                    Route::Supervisor(up) => forward(request, options, up).await?,
+                };
+                let io: IoFuture = Box::new(async move {
+                    let _permit = permit;
+                    conn.await
+                });
+                Ok((res, io))
+            }
+            .await;
             if let Err(e) = &res {
                 metrics.egress_denied.fetch_add(1, Relaxed);
                 metrics.event("egress-denied", &obj.app, &obj.id, format!("{target} → {e}"));
@@ -146,12 +178,91 @@ impl WasiHttpHooks for EgressHooks {
     }
 }
 
-async fn send(
-    mut req: http::Request<WasiBody>,
-    options: Option<RequestOptions>,
+type Sent = (http::Response<WasiBody>, futures::future::BoxFuture<'static, Result<(), Error>>);
+
+/// Hands a request to the supervisor and maps its verdict back to the error
+/// the guest would have seen from a direct send.
+async fn forward(mut req: http::Request<WasiBody>, options: Option<RequestOptions>, mut up: Upstream) -> Result<Sent, Error> {
+    let h = req.headers_mut();
+    for (name, d) in [
+        (CONNECT_TIMEOUT, options.and_then(|o| o.connect_timeout)),
+        (FIRST_BYTE_TIMEOUT, options.and_then(|o| o.first_byte_timeout)),
+    ] {
+        h.remove(name);
+        if let Some(d) = d {
+            h.insert(name, d.as_millis().to_string().parse().unwrap());
+        }
+    }
+    up.ready().await.map_err(|_| Error::ConnectionTerminated)?;
+    let mut res = up.send_request(req).await.map_err(|_| Error::ConnectionTerminated)?;
+    let verdict = res.headers_mut().remove(VERDICT);
+    match verdict.as_ref().map(|v| v.as_bytes()) {
+        Some(b"ok") => Ok((
+            res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync()),
+            Box::pin(async { Ok(()) }),
+        )),
+        Some(name) => Err(error_named(name)),
+        None => Err(Error::ConnectionTerminated),
+    }
+}
+
+/// The errors `send` returns that carry no payload, so they cross the
+/// process boundary by name. Anything else arrives as `ConnectionTerminated`.
+fn error_named(name: &[u8]) -> Error {
+    use Error::*;
+    [
+        HttpRequestDenied,
+        HttpRequestUriInvalid,
+        DestinationIpProhibited,
+        DestinationNotFound,
+        DnsTimeout,
+        ConnectionTimeout,
+        ConnectionReadTimeout,
+        ConnectionRefused,
+    ]
+    .into_iter()
+    .find(|e| format!("{e:?}").as_bytes() == name)
+    .unwrap_or(ConnectionTerminated)
+}
+
+/// The supervisor's side of [`forward`]: sends one request from a worker
+/// under that worker's app policy, and answers with the upstream response
+/// or the error, marked with [`VERDICT`].
+pub async fn serve_forwarded(
+    req: http::Request<hyper::body::Incoming>,
     policy: &EgressPolicy,
-    sem: Arc<Semaphore>,
-) -> Result<(http::Response<WasiBody>, IoFuture), Error> {
+) -> http::Response<WasiBody> {
+    let ms = |name| {
+        let v = req.headers().get(name)?.to_str().ok()?.parse().ok()?;
+        Some(Duration::from_millis(v))
+    };
+    let options = RequestOptions {
+        connect_timeout: ms(CONNECT_TIMEOUT),
+        first_byte_timeout: ms(FIRST_BYTE_TIMEOUT),
+        between_bytes_timeout: None,
+    };
+    let mut req = req.map(|b| b.map_err(Error::from).boxed_unsync());
+    req.headers_mut().remove(CONNECT_TIMEOUT);
+    req.headers_mut().remove(FIRST_BYTE_TIMEOUT);
+    match send(req, Some(options), policy).await {
+        Ok((mut res, _conn)) => {
+            res.headers_mut().insert(VERDICT, "ok".parse().unwrap());
+            res
+        }
+        Err(e) => {
+            let name = format!("{e:?}");
+            let name = name.split(['(', ' ', '{']).next().unwrap_or("ConnectionTerminated");
+            let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
+            *res.status_mut() = http::StatusCode::BAD_GATEWAY;
+            res.headers_mut().insert(VERDICT, name.parse().unwrap());
+            res
+        }
+    }
+}
+
+/// Checks `req` against `policy` and the IP filter, then sends it. The
+/// returned future finishes when the connection does.
+async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>, policy: &EgressPolicy) -> Result<Sent, Error> {
     let uri = req.uri().clone();
     let tls = uri.scheme() == Some(&Scheme::HTTPS);
     let host = uri.host().ok_or(Error::HttpRequestUriInvalid)?;
@@ -159,7 +270,6 @@ async fn send(
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
 
     let rule = policy.matches(host, port).ok_or(Error::HttpRequestDenied)?;
-    let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
 
     let addr = match (&rule.host, host.parse::<IpAddr>()) {
         (HostPat::Ip(ip), _) => SocketAddr::new(*ip, port),
@@ -218,14 +328,10 @@ async fn send(
     let res = tokio::time::timeout(first_byte_timeout, sender.send_request(req))
         .await
         .map_err(|_| Error::ConnectionReadTimeout)??;
-    let res = res.map(|b| b.map_err(Error::from).boxed_unsync());
-    let io: IoFuture = Box::new(async move {
-        let _permit = permit;
-        conn.await
-            .map_err(|_| Error::ConnectionTerminated)?
-            .map_err(Error::from)
-    });
-    Ok((res, io))
+    let mut res = res.map(|b| b.map_err(Error::from).boxed_unsync());
+    res.headers_mut().remove(VERDICT);
+    let conn = async move { conn.await.map_err(|_| Error::ConnectionTerminated)?.map_err(Error::from) };
+    Ok((res, Box::pin(conn)))
 }
 
 /// One TLS client config for every request: building it parses the whole

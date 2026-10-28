@@ -708,3 +708,300 @@ async fn http_front_end() {
     .await;
     assert_eq!(status, 404);
 }
+
+/// Starts a supervisor (one jailed worker per app) behind an HTTP listener.
+async fn supervised(test: &str) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+    let cfg = node_cfg(test, 8, 60_000, 100);
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
+    let sup = nanovm::supervisor::Supervisor::new(cfg, exe).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let s = sup.clone();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
+    (sup, addr)
+}
+
+async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
+    raw(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), b"").await
+}
+
+async fn stats_json(addr: std::net::SocketAddr) -> serde_json::Value {
+    let (status, body) = http_get(addr, "/_nanovm/stats").await;
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn supervised_workers_contain_attacks() {
+    let (_sup, addr) = supervised("supervised_workers_contain_attacks").await;
+
+    let (status, body) = http_get(addr, "/counter/s/").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""object":"s""#), "{body}");
+
+    for (path, error) in [
+        ("/hostile/s/alloc?mb=1024", r#""error":"memory""#),
+        ("/hostile/s/spin", r#""error":"cpu""#),
+        ("/hostile/s/panic", r#""error":"trap""#),
+        // The supervisor applies the allowlist and the IP filter.
+        ("/hostile/s/fetch?url=http://169.254.169.254/", "HttpRequestDenied"),
+        ("/hostile/s/fetch?url=http://localhost:9/", "DestinationIpProhibited"),
+        ("/hostile/s/escape", "not-permitted"),
+    ] {
+        let (_, body) = http_get(addr, path).await;
+        assert!(body.contains(error), "{path}: {body}");
+    }
+    // The worker survived all of it.
+    let (status, _) = http_get(addr, "/hostile/s/").await;
+    assert_eq!(status, 200);
+
+    let v = stats_json(addr).await;
+    assert_eq!(v["apps"]["hostile"]["egress_denied"], 2, "{v}");
+    for app in ["counter", "hostile"] {
+        let pid = v["workers"][app]["pid"].as_u64().unwrap();
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let field = |k: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(k))
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(field("Seccomp:"), "2", "{app}");
+        assert_eq!(field("NoNewPrivs:"), "1", "{app}");
+        if unsafe { libc::geteuid() } == 0 {
+            let uid: u32 = field("Uid:").parse().unwrap();
+            assert!(uid >= 200_000, "{app} runs as uid {uid}");
+        }
+    }
+    let (status, body) = http_get(addr, "/_nanovm/events?app=hostile&since=0").await;
+    assert_eq!(status, 200);
+    assert!(body.contains("egress-denied"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn killed_worker_is_restarted_and_keeps_its_volumes() {
+    let (_sup, addr) = supervised("killed_worker_is_restarted").await;
+    let incr = "POST /counter/k/incr HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    assert_eq!(raw(addr, incr, b"").await.0, 200);
+
+    let pid = stats_json(addr).await["workers"]["counter"]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let t0 = Instant::now();
+    while stats_json(addr).await["workers"]["counter"]["up"] == true {
+        assert!(t0.elapsed() < Duration::from_secs(2), "worker still up");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Neighbours are untouched.
+    assert_eq!(http_get(addr, "/hostile/k/").await.0, 200);
+
+    // The next request restarts it; `/data` survived.
+    let (status, body) = http_get(addr, "/counter/k/").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""count":1"#), "{body}");
+    let v = stats_json(addr).await;
+    assert_eq!(v["workers"]["counter"]["starts"], 2, "{v}");
+    assert_ne!(v["workers"]["counter"]["pid"].as_u64().unwrap(), pid);
+}
+
+/// Runs `jail_probe` in a child process (a jail cannot be left), then checks
+/// what the jail let it do.
+#[cfg(target_os = "linux")]
+#[test]
+fn jail_blocks_escapes() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("jail-probe");
+    let _ = std::fs::remove_dir_all(&dir);
+    for d in ["mine", "other"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    std::fs::write(dir.join("other/secret"), "s").unwrap();
+    if unsafe { libc::geteuid() } == 0 {
+        std::os::unix::fs::chown(dir.join("mine"), Some(200_099), Some(200_099)).unwrap();
+    }
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "jail_probe", "--nocapture", "--test-threads", "1"])
+        .env("NANOVM_JAIL_PROBE", &dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Stop and continue the probe during its final sleep, as a debugger or
+    // job control would: the kernel resumes the sleep via restart_syscall.
+    std::thread::sleep(Duration::from_millis(150));
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGSTOP);
+        std::thread::sleep(Duration::from_millis(20));
+        libc::kill(child.id() as i32, libc::SIGCONT);
+    }
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let results: std::collections::HashMap<&str, &str> = stdout
+        .lines()
+        .filter_map(|l| l.rsplit_once("probe ").map(|(_, r)| r))
+        .filter_map(|l| l.split_once('='))
+        .collect();
+    let expect = [
+        ("write_own_dir", "ok"),
+        ("thread", "ok"),
+        ("read_other_app", "denied"),
+        ("read_etc_passwd", "denied"),
+        ("list_root", "denied"),
+        ("tcp_socket", "denied"),
+        ("unix_socket", "denied"),
+        ("fork", "denied"),
+        ("exec", "denied"),
+        ("setuid_root", "denied"),
+        ("ptrace", "denied"),
+        ("kill_init", "denied"),
+        ("unshare", "denied"),
+        ("mmap_wx", "denied"),
+        ("raise_nofile", "denied"),
+        ("sleep_survives_stop", "ok"),
+    ];
+    for (k, v) in expect {
+        assert_eq!(results.get(k).copied(), Some(v), "{k}\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// The jailed half of `jail_blocks_escapes`; a no-op when run directly.
+#[cfg(target_os = "linux")]
+#[test]
+fn jail_probe() {
+    let Some(dir) = std::env::var_os("NANOVM_JAIL_PROBE").map(PathBuf::from) else {
+        return;
+    };
+    let root = unsafe { libc::geteuid() } == 0;
+    nanovm::jail::Jail {
+        uid: root.then_some(200_099),
+        read_write: vec![dir.join("mine")],
+        read_only: vec![],
+    }
+    .enter()
+    .unwrap();
+    let report = |name: &str, ok: bool| println!("probe {name}={}", if ok { "ok" } else { "denied" });
+    let sys = |r: i64| r >= 0;
+    report("write_own_dir", std::fs::write(dir.join("mine/f"), "x").is_ok());
+    report("thread", std::thread::spawn(|| 1).join().is_ok());
+    report("read_other_app", std::fs::read(dir.join("other/secret")).is_ok());
+    report("read_etc_passwd", std::fs::read("/etc/passwd").is_ok());
+    report("list_root", std::fs::read_dir("/").is_ok());
+    unsafe {
+        report("tcp_socket", sys(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) as i64));
+        report("unix_socket", sys(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) as i64));
+        let pid = libc::fork();
+        if pid == 0 {
+            libc::_exit(0);
+        }
+        report("fork", sys(pid as i64));
+        report("exec", std::process::Command::new("/bin/true").status().is_ok());
+        // Raw: glibc's setuid broadcasts to every thread of the test harness.
+        report("setuid_root", sys(libc::syscall(libc::SYS_setuid, 0)) && libc::getuid() == 0);
+        report("ptrace", sys(libc::ptrace(libc::PTRACE_ATTACH, 1, 0, 0)));
+        report("kill_init", sys(libc::kill(1, 0) as i64));
+        report("unshare", sys(libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) as i64));
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        report("mmap_wx", p != libc::MAP_FAILED);
+        let lim = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+        report("raise_nofile", sys(libc::setrlimit(libc::RLIMIT_NOFILE, &lim) as i64));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    report("sleep_survives_stop", true);
+}
+
+/// The supervisor ↔ worker connections live as long as the worker. h2 by
+/// default drops a connection after 1024 locally reset streams, which
+/// responses read only up to their Content-Length cause in normal use.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_connection_outlives_many_requests() {
+    let (_sup, addr) = supervised("worker_connection_outlives_many_requests").await;
+    let tasks: Vec<_> = (0..32)
+        .map(|t| {
+            tokio::spawn(async move {
+                let mut bad = 0;
+                for i in 0..400 {
+                    if http_get(addr, &format!("/counter/c{}/", (t + i) % 8)).await.0 != 200 {
+                        bad += 1;
+                    }
+                }
+                bad
+            })
+        })
+        .collect();
+    let mut bad = 0;
+    for t in tasks {
+        bad += t.await.unwrap();
+    }
+    assert_eq!(bad, 0);
+    assert_eq!(stats_json(addr).await["workers"]["counter"]["starts"], 1);
+}
+
+/// Each worker lands in `<cgroup>/<app>` with its `[app.worker]` limits.
+/// Runs wherever a writable cgroup v2 hierarchy is mounted; a limit is set
+/// only if its controller is enabled there.
+#[tokio::test(flavor = "multi_thread")]
+async fn workers_are_placed_in_their_cgroups() {
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let Some(mount) = mounts.lines().find_map(|l| {
+        let f: Vec<_> = l.split(' ').collect();
+        (f.get(2) == Some(&"cgroup2")).then(|| PathBuf::from(f[1]))
+    }) else {
+        eprintln!("skipped: no cgroup v2 hierarchy");
+        return;
+    };
+    let root = mount.join(format!("nanovm-test-{}", std::process::id()));
+    if std::fs::create_dir(&root).is_err() {
+        eprintln!("skipped: {} is not writable", mount.display());
+        return;
+    }
+    let controllers = std::fs::read_to_string(mount.join("cgroup.controllers")).unwrap_or_default();
+    let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory +pids");
+    let has = |c: &str| controllers.split_whitespace().any(|x| x == c);
+
+    let mut cfg = node_cfg("workers_are_placed_in_their_cgroups", 8, 60_000, 100);
+    cfg.cgroup = Some(root.clone());
+    cfg.apps[0].worker.memory_mb = if has("memory") { 512 } else { 0 };
+    cfg.apps[0].worker.pids = if has("pids") { 256 } else { 0 };
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
+    let sup = nanovm::supervisor::Supervisor::new(cfg, exe).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let s = sup.clone();
+    let server = tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
+
+    let v = stats_json(addr).await;
+    for app in ["counter", "hostile"] {
+        let pid = v["workers"][app]["pid"].as_u64().unwrap();
+        let procs = std::fs::read_to_string(root.join(app).join("cgroup.procs")).unwrap();
+        assert!(procs.lines().any(|p| p == pid.to_string()), "{app}: {procs}");
+    }
+    if has("memory") {
+        let max = std::fs::read_to_string(root.join("counter/memory.max")).unwrap();
+        assert_eq!(max.trim(), (512u64 << 20).to_string());
+    }
+    // The last supervisor handle goes with the server task; dropping it
+    // kills the workers, which leaves the cgroups empty.
+    server.abort();
+    let _ = server.await;
+    drop(sup);
+    for _ in 0..100 {
+        let _ = std::fs::remove_dir(root.join("counter"));
+        let _ = std::fs::remove_dir(root.join("hostile"));
+        if std::fs::remove_dir(&root).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

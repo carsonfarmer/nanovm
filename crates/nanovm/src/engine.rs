@@ -6,7 +6,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
-use anyhow::Context;
 use sha2::{Digest, Sha256};
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig};
@@ -103,34 +102,40 @@ fn raise_nofile() -> anyhow::Result<u64> {
     Ok(lim.rlim_cur as u64)
 }
 
-/// Advances the engine epoch every `tick` on a dedicated thread.
+/// Advances the engine epoch every `tick` on a dedicated thread. CPU budgets
+/// and guest yields depend on it, so if the thread ever dies the process
+/// aborts rather than run guests unlimited.
 pub fn start_ticker(engine: &Engine, tick: Duration) {
     let engine = engine.weak();
     std::thread::Builder::new()
         .name("nanovm-epoch".into())
         .spawn(move || {
-            while let Some(e) = engine.upgrade() {
-                e.increment_epoch();
-                drop(e);
-                std::thread::sleep(tick);
+            let ticked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                while let Some(e) = engine.upgrade() {
+                    e.increment_epoch();
+                    drop(e);
+                    std::thread::sleep(tick);
+                }
+            }));
+            if ticked.is_err() {
+                std::process::abort();
             }
         })
         .expect("spawn epoch thread");
 }
 
-/// Loads a component, reusing a precompiled artifact keyed by the component's
-/// hash and the engine's compatibility hash.
-pub fn load_component(engine: &Engine, path: &Path, cache_dir: &Path) -> anyhow::Result<Component> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let digest = Sha256::digest(&bytes);
+/// Compiles a component, reusing a precompiled artifact keyed by the
+/// component's hash and the engine's compatibility hash.
+pub fn load_component(engine: &Engine, bytes: &[u8], cache_dir: &Path) -> anyhow::Result<Component> {
+    let digest = Sha256::digest(bytes);
     let mut h = DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut h);
     let key = format!("{digest:x}-{:016x}.cwasm", h.finish());
     let cached = cache_dir.join(key);
 
     if cached.exists() {
-        // SAFETY: the cache directory is owned by this node and only ever
-        // written by `precompile_component` below.
+        // SAFETY: the cache directory belongs to this app and is only ever
+        // written by `precompile_component` below, in this app's process.
         match unsafe { Component::deserialize_file(engine, &cached) } {
             Ok(c) => return Ok(c),
             Err(_) => {
@@ -138,7 +143,7 @@ pub fn load_component(engine: &Engine, path: &Path, cache_dir: &Path) -> anyhow:
             }
         }
     }
-    let compiled = engine.precompile_component(&bytes)?;
+    let compiled = engine.precompile_component(bytes)?;
     std::fs::create_dir_all(cache_dir)?;
     // Unique per writer: nodes and apps may share a cache and race here, and
     // a reader must only ever see a complete file.

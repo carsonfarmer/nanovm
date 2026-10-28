@@ -43,7 +43,7 @@ else
         sleep 0.1
     done
 fi
-echo "  stats: $URL/_nanovm/stats, events: $URL/_nanovm/events"
+echo "  stats: $URL/_nanovm/stats, events: $URL/_nanovm/events?app=<app>"
 
 # The canary: one benign object, pinged every 20 ms for the whole demo.
 CANARY=target/demo-canary.txt
@@ -66,10 +66,12 @@ echo "  egress to example.com (allowlisted): $(curl -s "$URL/hostile/demo/fetch?
 echo "  egress to 169.254.169.254: $(curl -s "$URL/hostile/demo/fetch?url=http://169.254.169.254/latest/meta-data/" | jq -c .)"
 
 say "cold-starting 5,000 new objects"
-before=$(curl -s "$URL/_nanovm/stats" | jq .rss_mb)
+# RSS of the supervisor plus every app's worker.
+rss='def rss: [.rss_mb, .apps[].rss_mb] | add;'
+before=$(curl -s "$URL/_nanovm/stats" | jq "$rss rss")
 blast 5000 64 5000 "counter/s$$-%d/"
-curl -s "$URL/_nanovm/stats" | jq -r --argjson b "$before" \
-    '"  \(.live_objects) live objects, RSS \(.rss_mb | floor) MB, \((.rss_mb - $b) * 1024 / 5000 | floor) KB per new object"'
+curl -s "$URL/_nanovm/stats" | jq -r --argjson b "$before" "$rss"'
+    "  \([.apps[].live_objects] | add) live objects, RSS \(rss | floor) MB, \((rss - $b) * 1024 / 5000 | floor) KB per new object"'
 
 say "hammering 1,000 warm objects (50,000 requests)"
 blast 50000 64 1000 "counter/s$$-%d/"
@@ -106,7 +108,8 @@ say "the canary, pinged throughout"
 sort -n -k2 "$CANARY" | awk '{n++; if ($1 != 200) bad++; t[n] = $2 * 1000}
     END {printf "  %d requests over HTTP, %d not 200, p50 %.1f ms, p99 %.1f ms (curl per request)\n",
         n, bad, t[int(n * 0.5) + 1], t[int(n * 0.99) + 1]}'
-curl -s "$URL/_nanovm/stats" | jq -r '"  node: \(.live_objects) live objects, \(.instantiate.count) instantiations, \(.poisons | to_entries | map(select(.value > 0) | "\(.key) \(.value)") | join(", ")) killed"'
+curl -s "$URL/_nanovm/stats" | jq -r '.workers as $w | .apps | to_entries[] |
+    "  \(.key) worker (pid \($w[.key].pid), started \($w[.key].starts)×): \(.value.live_objects) live objects, \(.value.instantiate.count) instantiations, \(.value.poisons | to_entries | map(select(.value > 0) | "\(.key) \(.value)") | join(", ")) killed"'
 
 if [ -n "$SERVER" ]; then
     say "node still running on $URL (Ctrl-C to stop)"

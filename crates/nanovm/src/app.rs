@@ -12,7 +12,7 @@ use wasmtime_wasi::{FsPerms, OpenMode};
 use wasmtime_wasi_http::p3::bindings::ServicePre;
 
 use crate::config::{AppConfig, NodeConfig};
-use crate::egress::EgressPolicy;
+use crate::egress::{EgressPolicy, Route, Upstream};
 use crate::object::ObjState;
 
 /// Import prefixes a guest may use. Everything else (sockets, the WASIp2
@@ -33,7 +33,7 @@ pub struct App {
     pub name: Arc<str>,
     pub cfg: AppConfig,
     pub pre: ServicePre<ObjState>,
-    pub egress: Arc<EgressPolicy>,
+    pub egress: Route,
     /// `/app`, opened once and shared read-only by every object of the app,
     /// so it costs one fd per app rather than one per live object.
     pub static_dir: Option<Dir>,
@@ -60,9 +60,16 @@ pub fn check_imports(engine: &Engine, component: &Component) -> anyhow::Result<(
 }
 
 impl App {
-    pub fn load(engine: &Engine, linker: &Linker<ObjState>, node: &NodeConfig, cfg: &AppConfig) -> anyhow::Result<App> {
-        let cache = node.data_dir.join("cache");
-        let component = crate::engine::load_component(engine, &cfg.component, &cache)
+    pub fn load(
+        engine: &Engine,
+        linker: &Linker<ObjState>,
+        node: &NodeConfig,
+        cfg: &AppConfig,
+        wasm: &[u8],
+        upstream: Option<Upstream>,
+    ) -> anyhow::Result<App> {
+        let [_, _, cache] = node.app_dirs(&cfg.name);
+        let component = crate::engine::load_component(engine, wasm, &cache)
             .with_context(|| format!("app {:?}", cfg.name))?;
         check_imports(engine, &component).with_context(|| format!("app {:?}", cfg.name))?;
         let pre = linker
@@ -70,7 +77,12 @@ impl App {
             .and_then(ServicePre::new)
             .map_err(anyhow::Error::from)
             .with_context(|| format!("linking app {:?}", cfg.name))?;
-        let egress = EgressPolicy::parse(&cfg.limits.egress).with_context(|| format!("app {:?} egress", cfg.name))?;
+        let egress = match upstream {
+            Some(u) => Route::Supervisor(u),
+            None => Route::Direct(Arc::new(
+                EgressPolicy::parse(&cfg.limits.egress).with_context(|| format!("app {:?} egress", cfg.name))?,
+            )),
+        };
         let static_dir = match &cfg.static_dir {
             Some(d) if !d.is_dir() => bail!("app {:?}: static_dir {} is not a directory", cfg.name, d.display()),
             // Reads through a shared directory fd don't interfere: every
@@ -85,7 +97,7 @@ impl App {
             name: cfg.name.as_str().into(),
             cfg: cfg.clone(),
             pre,
-            egress: Arc::new(egress),
+            egress,
             static_dir,
         })
     }

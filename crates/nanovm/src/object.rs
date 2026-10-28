@@ -268,13 +268,9 @@ impl WasiHttpView for ObjState {
 fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
     let limits = &app.cfg.limits;
     let n = node.next_seq();
-    let data_dir = node.cfg.data_dir.join("objects").join(&*app.name).join(&*shared.id);
-    let tmp_dir = node
-        .cfg
-        .data_dir
-        .join("tmp")
-        .join(&*app.name)
-        .join(format!("{}.{n}", shared.id));
+    let [objects, tmp, _] = node.cfg.app_dirs(&app.name);
+    let data_dir = objects.join(&*shared.id);
+    let tmp_dir = tmp.join(format!("{}.{n}", shared.id));
     std::fs::create_dir_all(&data_dir)?;
     std::fs::create_dir_all(&tmp_dir)?;
     let tmp = TmpDir(tmp_dir.clone());
@@ -306,7 +302,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         table,
         http: WasiHttpCtx::new(),
         hooks: EgressHooks {
-            policy: app.egress.clone(),
+            route: app.egress.clone(),
             sem: Arc::new(Semaphore::new(limits.max_outbound_concurrency)),
             metrics: node.metrics.clone(),
             obj: shared.clone(),

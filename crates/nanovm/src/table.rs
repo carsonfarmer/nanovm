@@ -12,7 +12,10 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use wasmtime::Engine;
 
 use crate::app::App;
+use anyhow::Context;
+
 use crate::config::NodeConfig;
+use crate::egress::Upstream;
 use crate::metrics::Metrics;
 use crate::object::{self, Job, ObjShared, Phase, RespBody, error_response};
 
@@ -45,17 +48,34 @@ pub struct Node {
 }
 
 impl Node {
+    /// Builds a node from the components named in `cfg`, with direct egress.
     pub fn new(cfg: NodeConfig) -> anyhow::Result<Arc<Node>> {
+        let mut wasm = Vec::new();
+        for a in &cfg.apps {
+            wasm.push(std::fs::read(&a.component).with_context(|| format!("reading {}", a.component.display()))?);
+        }
+        Node::from_wasm(cfg, wasm, None)
+    }
+
+    /// Builds a node from component bytes, one per app in `cfg.apps`. With
+    /// `upstream`, guests' outbound requests go to the supervisor instead of
+    /// the network.
+    pub fn from_wasm(cfg: NodeConfig, wasm: Vec<Vec<u8>>, upstream: Option<Upstream>) -> anyhow::Result<Arc<Node>> {
         crate::engine::preflight(&cfg)?;
         let engine = crate::engine::build(&cfg)?;
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
         let mut apps = HashMap::new();
-        for a in &cfg.apps {
-            apps.insert(a.name.clone(), Arc::new(App::load(&engine, &linker, &cfg, a)?));
+        for (a, wasm) in cfg.apps.iter().zip(wasm) {
+            let app = App::load(&engine, &linker, &cfg, a, &wasm, upstream.clone())?;
+            apps.insert(a.name.clone(), Arc::new(app));
+            // Scratch from a previous run is garbage; volumes are kept. The
+            // directory itself stays: a jailed worker's Landlock rule names it.
+            let [_, tmp, _] = cfg.app_dirs(&a.name);
+            for e in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
         }
-        // Scratch from a previous run is garbage; volumes are kept.
-        let _ = std::fs::remove_dir_all(cfg.data_dir.join("tmp"));
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
         Ok(Arc::new(Node {
