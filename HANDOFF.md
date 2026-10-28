@@ -2,13 +2,14 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found).
 
-## State (2026-10-28)
+## State (2026-10-28, later)
 
-- **`main` (`227f8bd`) is current.** It has phase 1 (portable core), phase 2 (the Linux jail), and two simplification passes. Every branch is pushed; nothing is uncommitted.
-- **Next: phase 3, signed OCI deploys.** Three open decisions are waiting on the owner (see [Open questions](#open-questions-for-phase-3)). Don't build phase 3 until they're answered.
-- **Tests:** 41 integration tests pass (`cargo test --release -p nanovm`), plus 3 unit tests. One test is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, and this sandbox has no DNS or direct internet. The demo (`demo/demo.sh`) runs with 0 failures. `scripts/vm-test.sh` passes (cgroup tests and the jail probe, in a QEMU VM).
-- **Runtime size:** 3,362 lines (`crates/nanovm/src`, excluding `#[cfg(test)]`). It was 2,303 before the jail.
-- **Old branches** (`jail`, `simplify`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical; `main` contains everything.
+- **`main` is current.** It has phase 1 (portable core), phase 2 (the Linux jail), two simplification passes, and phase 3 (signed OCI deploys). Every branch is pushed; nothing is uncommitted.
+- **Next: phase 4, key-value** (`wasi:keyvalue` on `/data`, Q15), then alarms (Q17) and WebSockets (Q16). None has been started.
+- **Tests:** 43 integration tests pass, plus 3 unit tests. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io. The demo runs with 0 failures, and `scripts/vm-test.sh` passes.
+- **Runtime size:** 3,704 lines (2,303 before the jail; 3,362 before phase 3).
+- **The repo `carsonfarmer/nanovm` is now public**, so GitHub artifact attestations work. The packages `ghcr.io/carsonfarmer/nanovm-{counter,hostile}` are public. `publish-guests.yml` runs on pushes to `guests/**` and on `gh workflow run publish-guests.yml` (dispatch works through the proxy, and `gh run watch <id>` shows progress). Each run publishes version `1.0.<run number>`.
+- **Old branches** (`jail`, `simplify`, `oci`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical.
 
 ## What nanovm is
 
@@ -47,33 +48,13 @@ Decisions from the design interview (Q numbers as used in the conversation):
 
 Phases after this one ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value, 5 alarms, 6 WebSockets.
 
-## Open questions for phase 3
+## Phase 3 as built
 
-These were asked and are unanswered. Each has a recommended answer; "yes" from the owner accepts it.
-
-- **Q25. How to test signatures.** This sandbox reaches `ghcr.io` but not Sigstore's Fulcio, Rekor and TUF, or GitHub's OIDC endpoint, so nothing can be signed here.
-  - Recommended: add a GitHub Actions workflow to `carsonfarmer/nanovm` that builds the guests, pushes them to `ghcr.io/carsonfarmer/nanovm-<guest>` as public packages, and attaches GitHub attestations. Tests then verify the real chain, and the negative cases come for free (wrong identity, tampered digest, missing attestation, version below the floor).
-  - **This needs the owner's explicit OK**: it pushes a workflow and publishes public packages under their account.
-  - The alternative is a fake Sigstore inside the tests. It's much more code and never checks the real chain.
-- **Q26. Request protocol.** Recommended headers from the proxy:
-  - `nanovm-app: ghcr.io/org/app@sha256:…`
-  - `nanovm-trust: <issuer> <subject>`, comma-separated for several identities
-  - `nanovm-min-version: <semver>`
-
-  The version is the manifest's `org.opencontainers.image.version` annotation, covered by the signature. `/{app}/` in the path still names the app and its `/data`.
-- **Q27. Local `[[app]]` entries.** Recommended: keep them as operator-pinned local apps for development, the demo and tests, alongside registry apps. Otherwise every test and the demo depend on a registry.
-
-Research already done for phase 3:
-- **Crates:** `oci-client` 0.18 (anonymous pull of public GHCR works; `ghcr.io` answers 401 until a token is fetched) and `sigstore-verify` 0.15.1 (sigstore-rust, Apache-2.0).
-  - `Verifier::new(&TrustedRoot)` takes any trusted root, and `TrustedRoot::from_json(SIGSTORE_PRODUCTION_TRUSTED_ROOT)` is the embedded one.
-  - `IdentityMatcher` does exact matching, so also check the certificate's repo and workflow claims.
-  - Siblings: `sigstore-sign`, `sigstore-bundle`, `sigstore-trust-root` (all 0.15.1).
-- **Artifact layout:**
-  - `artifactType application/vnd.nanovm.app.v1+json`
-  - a config blob with limits and env, and an `application/wasm` layer
-  - the Sigstore bundle attached as a referrer
-  - the signature is over the manifest digest
-- **Where the work goes:** per Q24, the supervisor fetches and verifies, then passes bytes to the worker on stdin. The hook is in `Supervisor::start` ("this is where a fetched and verified artifact will come from"). Defend against downgrades with the per-app minimum version.
+The owner answered Q25–Q27 "yes", and chose to make the repo public rather than sign with cosign through public Sigstore from a private repo. The README's "Apps from a registry" and PLAN's "Phase 3" describe the result. Its pieces:
+- `registry.rs` pulls by digest and verifies with `sigstore-verify` against the embedded production trusted root, checking the version floor *before* any blob is fetched. It caches by digest under `data_dir/registry`.
+- The supervisor keeps a dynamic worker map, switches versions with a drain (one worker per app at a time), and gives each app the uid that owns its directory.
+- The tests' signer identity is `https://token.actions.githubusercontent.com` with subject `https://github.com/carsonfarmer/nanovm/.github/workflows/publish-guests.yml@refs/heads/main`.
+- The tests were mutation-checked: skipping verification, ignoring the floor, or not draining each makes a registry test fail.
 
 ## How to work with this owner
 
@@ -100,7 +81,7 @@ Research already done for phase 3:
 - **The fd limit is 20,000** and can't be raised (no `CAP_SYS_RESOURCE`). The demo uses `max_live_objects = 8000` per app, and the full benchmark needs `--quick`.
 - **Never run with `RUST_BACKTRACE` set** (`env -u RUST_BACKTRACE`). wasmtime captures a backtrace for every guest error, which costs about 3×.
 - **cgroup v2 here has only hugetlb**; memory, cpu and pids belong to cgroup v1. Use `scripts/vm-test.sh` (QEMU with software emulation, an Ubuntu kernel) to test cgroups. CPU-budget and latency tests fail under emulation, so the default set avoids them.
-- **No DNS and no direct internet**; outbound HTTPS goes through a proxy the egress code doesn't use. `ghcr.io` and github.com work through it, but sigstore.dev doesn't.
+- **No DNS and no direct internet**; outbound HTTPS goes through a proxy the egress code doesn't use. `ghcr.io`, github.com and `pkg-containers.githubusercontent.com` (where ghcr.io redirects blob downloads; the owner allowed it) work through it, but sigstore.dev doesn't. The registry client (`oci-client` over reqwest) honours the proxy and the system CA store.
 - **`pkill -f <pattern>` kills your own shell** if the pattern appears in the command line; use `pkill -x nanovm`.
 - **Waiting on the demo:** grep for `node still running`, not `Error`, because the output contains `ErrorCode::…`.
 - **Workers run as uid 200000+** when the supervisor is root. Anything they must reach (static dirs, data, the repo path) must be traversable by that uid; `/tmp/claude-0` (the scratchpad) is mode 700.
@@ -109,7 +90,7 @@ Research already done for phase 3:
 ## Layout pointers
 
 - `crates/nanovm/src`: the runtime.
-  - `supervisor.rs` (supervisor and worker entry), `link.rs`, `jail.rs`
+  - `supervisor.rs` (supervisor and worker entry), `registry.rs`, `link.rs`, `jail.rs`
   - `egress.rs` (`Route::Direct` in-process, `Route::Supervisor` jailed)
   - `object.rs`, `table.rs` (`Node`), `quota.rs`, `server.rs`, `config.rs`, `engine.rs`, `app.rs`, `metrics.rs`, `main.rs`
 - `crates/nanovm/tests/integration.rs`: the integration tests. Helpers: `node_cfg`, `supervised_with`, `http_get`, `test_cgroup`, `stalling_upstream`. `jail_probe` runs in a child process.

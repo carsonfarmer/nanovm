@@ -1241,15 +1241,22 @@ async fn registry_app_switches_versions_after_a_drain() {
     let (_sup, addr) = supervised("registry_app_switches_versions").await;
     let (old_app, new_app) = (old.1.clone(), new.1.clone());
 
-    assert_eq!(reg_get(addr, "/rh/w/fill?mount=data&mb=1", &old_app, SIGNER, None).await.0, 507);
-    let slow = tokio::spawn(async move { reg_get(addr, "/rh/s/sleep?ms=500", &old_app, SIGNER, None).await });
+    assert_eq!(reg_get(addr, "/rh/w/fill?mount=data&mb=1", &old_app, SIGNER, None).await.0, 200);
+    let slow = tokio::spawn(async move {
+        let r = reg_get(addr, "/rh/s/sleep?ms=1500", &old_app, SIGNER, None).await;
+        (r, Instant::now())
+    });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let t0 = Instant::now();
-    let (status, body) = reg_get(addr, "/rh/w/", &new_app, SIGNER, None).await;
-    assert_eq!(status, 200, "{body}");
-    let (slow_status, slow_body) = slow.await.unwrap();
+    // The new version sees the old one's volume: 1 of its 8 MiB is used.
+    let (status, body) = reg_get(addr, "/rh/w/fill?mount=data&mb=8&name=more.bin", &new_app, SIGNER, None).await;
+    let switched = Instant::now();
+    assert_eq!(status, 507, "{body}");
+    assert!(body.contains(&format!(r#""written":{}"#, 7 << 20)), "{body}");
+    let ((slow_status, slow_body), slow_done) = slow.await.unwrap();
     assert_eq!(slow_status, 200, "the old version's request finished: {slow_body}");
-    assert!(t0.elapsed() >= Duration::from_millis(300), "the switch waited for the drain");
+    // Two workers never serve the app at once: the new one answers only
+    // after the old one's last request is done.
+    assert!(switched > slow_done, "the new version answered while the old one was still serving");
     let v = stats_json(addr).await;
     assert_eq!(v["workers"]["rh"]["version"], new.0.to_string(), "{v}");
     assert_eq!(v["workers"]["rh"]["starts"], 2, "{v}");

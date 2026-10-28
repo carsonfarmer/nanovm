@@ -172,7 +172,7 @@ impl Registry {
                 let bundle = sigstore_types::Bundle::from_json(std::str::from_utf8(&json)?)?;
                 for (issuer, subject) in &r.trust {
                     let policy = VerificationPolicy::new(subject.as_str(), issuer.as_str());
-                    match self.verifier.verify(hash.clone(), &bundle, &policy) {
+                    match self.verifier.verify(hash, &bundle, &policy) {
                         Ok(_) => return Ok(()),
                         Err(e) => why = e.to_string(),
                     }

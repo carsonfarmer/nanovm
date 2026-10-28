@@ -309,9 +309,18 @@ client ─► proxy ─► supervisor (nanovm serve): no untrusted code
 - **Tests:** the hostile guest run through the supervisor. A jailed worker cannot open a socket, read another app's or the supervisor's files, or exec; egress policy is enforced by the supervisor; a killed worker is restarted.
 - **Cost (4-core sandbox, over HTTP with curl on the same cores):** about 0.1 ms more per request for one client, and about 25% less throughput at 64 in flight. In-process numbers are unchanged. README has the table.
 
+## Phase 3: signed OCI deploys (done)
+
+As in the target design, with these choices (README, "Apps from a registry", has the details):
+- Headers `nanovm-app` (ref@digest), `nanovm-trust` (`<issuer> <subject>`, comma-separated) and `nanovm-min-version`. The version is the manifest's `org.opencontainers.image.version`.
+- Verification happens before any blob is fetched. Bundles are fetched every time a worker starts (they are small, and whether one exists is the registry's current answer). Manifests and blobs are cached by digest.
+- One worker per app at a time. A version switch fetches and verifies the new version first, then drains the old worker, then starts the new one. That also makes fetches single-flight per app, so no separate single-flight map was needed.
+- A registry app's egress entries are its own (the public-IP filter still applies). Its numeric limits are clamped to `registry_limits`.
+- Local `[[app]]` entries stay, for development, the demo and tests (Q27).
+- CI (`publish-guests.yml`) publishes the test guests with GitHub artifact attestations. That needed the repo to be public: attestations aren't available on private user repos.
+
 ## Next phases
 
-3. Signed OCI deploys (stateless, digest per request, see Target design).
 4. Key-value (`wasi:keyvalue` on `/data`).
 5. Alarms.
 6. WebSockets.

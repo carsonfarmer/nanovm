@@ -101,6 +101,29 @@ The hop between the processes costs two extra cross-process round trips, about 3
 
 The in-process benchmark below measures the node inside a worker, and is unchanged.
 
+## Apps from a registry
+
+A local app comes from the node config (`[[app]]`, used by the demo and most tests). A registry app is named by the proxy, with each request:
+
+```
+nanovm-app: ghcr.io/org/app@sha256:…        # by digest only
+nanovm-trust: <issuer> <subject>[, …]        # whose signature is accepted
+nanovm-min-version: 1.4.0                    # optional floor
+```
+
+The node trusts these headers because only the proxy can reach it; the proxy must drop any a client sends. The node strips them before the guest sees the request. `/{app}/` in the path still names the app and its volumes, and the digests sent under one name are versions of one app.
+
+What happens on the first request for a digest:
+1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
+2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
+3. **Then the worker.** The app's limits are clamped to the operator's `registry_limits`, and its workers get `registry_worker`. The component goes to a fresh jailed worker, which compiles it.
+
+**Switching versions.** A request naming a digest the app's worker isn't running switches the app. The new version is fetched and verified while the old one keeps serving. The old worker then drains: no new requests, and in-flight ones (and their response bodies) finish, bounded by its longest request time. Only then does the new worker start. Both versions share the app's volumes, so an object is never live in two workers.
+
+**Uids.** An app's uid is the owner of its `objects/<app>` directory, or the next free one for a new app. It is stable across restarts and config changes, with no separate record.
+
+**Publishing.** [.github/workflows/publish-guests.yml](.github/workflows/publish-guests.yml) is the reference pipeline. CI builds each test guest, pushes it with `oras` (artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, version `1.0.<run>`), and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity. No key exists anywhere. A person can sign the same way from a laptop with `cosign` and a browser sign-in.
+
 ## Benchmarks
 
 ```bash
@@ -168,7 +191,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 41 integration tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 43 integration tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -187,6 +210,13 @@ The tests cover:
 - the jail, from a probe process inside it (`jail_blocks_escapes`): another app's files, `/etc`, sockets, fork, exec, setuid, ptrace, signals, namespaces, W+X memory and raising limits are all refused; a sleep survives a stop and continue
 - the same attacks through the supervisor and jailed workers, with egress enforced by the supervisor, including an allowed request whose upstream tries to forge the supervisor's verdict header
 - a killed worker restarted with its volumes intact, while its neighbour keeps serving
+- registry apps against the real, CI-signed guests on ghcr.io:
+  - a good signature runs
+  - a wrong identity, a wrong issuer, a version below the floor and an unknown digest are each refused, with the reason
+  - a local app can't be named from a registry, and the trust header is required
+  - switching versions lets the old worker's in-flight request finish before the new worker answers, on the same volumes
+
+  These skip, saying why, where ghcr.io can't be reached.
 - open response bodies counting against `max_outbound_concurrency`, in-process and through the supervisor
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.
@@ -243,6 +273,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `crates/nanovm/src/server.rs` | A node's HTTP surface: routing, `/_nanovm/stats` and `/_nanovm/events` |
 | `crates/nanovm/src/supervisor.rs` | The supervisor (front end, workers, egress on their behalf) and the worker's entry point |
 | `crates/nanovm/src/jail.rs` | uid, Landlock and seccomp, entered by a worker before any guest code |
+| `crates/nanovm/src/registry.rs` | Registry apps: pull by digest, Sigstore verification, version floor, digest cache |
 | `crates/nanovm/src/link.rs` | HTTP/1.1 over socketpairs passed across a control socket |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
 | `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |
