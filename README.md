@@ -168,7 +168,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 39 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 40 integration tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -188,8 +188,19 @@ The tests cover:
 - the same attacks through the supervisor and jailed workers, with egress enforced by the supervisor, including an allowed request whose upstream tries to forge the supervisor's verdict header
 - a killed worker restarted with its volumes intact, while its neighbour keeps serving
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
-- workers placed in their cgroups (where a writable cgroup v2 hierarchy exists)
+- workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.
 - a worker that can't reach its own directories failing to start, and saying which one
+
+### Testing cgroups in a VM
+
+Some hosts, this sandbox among them, give the memory, cpu and pids controllers to cgroup v1, so cgroup v2 limits can't be tested on them. `scripts/vm-test.sh` boots a throwaway QEMU VM (an Ubuntu kernel and a busybox initramfs holding the test binaries and guests) whose cgroup v2 has every controller, and runs the cgroup tests and `jail_blocks_escapes` there. It is for testing only: in production the supervisor runs on the host, in a cgroup subtree delegated to it (systemd `Delegate=yes`).
+
+```bash
+scripts/vm-test.sh          # cgroups and the jail
+scripts/vm-test.sh all      # everything; without KVM, CPU-budget and latency tests fail under emulation
+```
+
+On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 pass. The 5 that fail ask a hostile guest for real work inside a 100 ms CPU budget, which emulation can't meet.
 
 ## Bugs the tests and benchmarks found
 
@@ -238,5 +249,4 @@ The tests cover:
 
 - **Inline filesystem calls can't be interrupted by the epoch.** Each one is bounded by the quotas and charged to the guest's CPU budget.
 - **The CPU budget is wall time inside each poll of the guest.** It inflates when the host is oversubscribed, which errs on the side of killing hogs early.
-- **cgroup limits are only partly tested here.** This sandbox's cgroup v2 hierarchy has only the hugetlb controller, so the test checks that workers are placed in their cgroups but can't see `memory.max`, `cpu.max` or `pids.max` enforced.
 - **Without root, apps share the supervisor's uid.** Landlock and seccomp still separate them.

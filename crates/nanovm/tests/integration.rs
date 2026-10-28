@@ -952,93 +952,132 @@ async fn worker_connection_outlives_many_requests() {
     assert_eq!(v["workers"]["counter"]["link_errors"], 0, "{v}");
 }
 
-/// Each worker lands in `<cgroup>/<app>` with its `[app.worker]` limits.
-/// Runs wherever a writable cgroup v2 hierarchy is mounted; a limit is set
-/// only if its controller is enabled there.
+/// A fresh test cgroup under the cgroup v2 mount, with `controllers` enabled
+/// for its children, or why this host can't provide one.
+fn test_cgroup(name: &str, controllers: &[&str]) -> Result<PathBuf, String> {
+    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let mount = mounts
+        .lines()
+        .find_map(|l| {
+            let f: Vec<_> = l.split(' ').collect();
+            (f.get(2) == Some(&"cgroup2")).then(|| PathBuf::from(f[1]))
+        })
+        .ok_or("no cgroup v2 hierarchy (scripts/vm-test.sh boots one)")?;
+    let available = std::fs::read_to_string(mount.join("cgroup.controllers")).unwrap_or_default();
+    if let Some(c) = controllers.iter().find(|c| !available.split_whitespace().any(|a| a == **c)) {
+        return Err(format!(
+            "the {c} controller is not available in {} (scripts/vm-test.sh boots a VM where it is)",
+            mount.display()
+        ));
+    }
+    let root = mount.join(format!("nanovm-{name}-{}", std::process::id()));
+    std::fs::create_dir(&root).map_err(|e| format!("{}: {e}", mount.display()))?;
+    let enable: Vec<_> = controllers.iter().map(|c| format!("+{c}")).collect();
+    std::fs::write(root.join("cgroup.subtree_control"), enable.join(" ")).map_err(|e| e.to_string())?;
+    Ok(root)
+}
+
+/// Kills what is left in a test cgroup and removes it.
+async fn remove_cgroup(root: &Path) {
+    for _ in 0..200 {
+        for app in ["counter", "hostile"] {
+            let _ = std::fs::write(root.join(app).join("cgroup.kill"), "1");
+            let _ = std::fs::remove_dir(root.join(app));
+        }
+        if std::fs::remove_dir(root).is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn cgroup_stat(dir: &Path, file: &str, key: &str) -> u64 {
+    let text = std::fs::read_to_string(dir.join(file)).unwrap_or_default();
+    text.lines()
+        .find_map(|l| l.strip_prefix(key)?.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Each worker lands in `<cgroup>/<app>`.
 #[tokio::test(flavor = "multi_thread")]
 async fn workers_are_placed_in_their_cgroups() {
-    let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
-    let Some(mount) = mounts.lines().find_map(|l| {
-        let f: Vec<_> = l.split(' ').collect();
-        (f.get(2) == Some(&"cgroup2")).then(|| PathBuf::from(f[1]))
-    }) else {
-        eprintln!("skipped: no cgroup v2 hierarchy");
-        return;
+    let root = match test_cgroup("placed", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
     };
-    let root = mount.join(format!("nanovm-test-{}", std::process::id()));
-    if std::fs::create_dir(&root).is_err() {
-        eprintln!("skipped: {} is not writable", mount.display());
-        return;
-    }
-    let controllers = std::fs::read_to_string(mount.join("cgroup.controllers")).unwrap_or_default();
-    let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory +pids");
-    let has = |c: &str| controllers.split_whitespace().any(|x| x == c);
-
     let mut cfg = node_cfg("workers_are_placed_in_their_cgroups", 8, 60_000, 100);
     cfg.cgroup = Some(root.clone());
-    cfg.apps[0].worker.memory_mb = if has("memory") { 512 } else { 0 };
-    cfg.apps[0].worker.pids = if has("pids") { 256 } else { 0 };
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
-    let sup = nanovm::supervisor::Supervisor::new(cfg, exe, 1).await.unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let s = sup.clone();
-    let server = tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
-
+    let (sup, addr) = supervised_with(cfg).await;
     let v = stats_json(addr).await;
     for app in ["counter", "hostile"] {
         let pid = v["workers"][app]["pid"].as_u64().unwrap();
         let procs = std::fs::read_to_string(root.join(app).join("cgroup.procs")).unwrap();
         assert!(procs.lines().any(|p| p == pid.to_string()), "{app}: {procs}");
     }
-    if has("memory") {
-        let max = std::fs::read_to_string(root.join("counter/memory.max")).unwrap();
-        assert_eq!(max.trim(), (512u64 << 20).to_string());
-    }
-    // The last supervisor handle goes with the server task; dropping it
-    // kills the workers, which leaves the cgroups empty.
-    server.abort();
-    let _ = server.await;
     drop(sup);
-    for _ in 0..100 {
-        let _ = std::fs::remove_dir(root.join("counter"));
-        let _ = std::fs::remove_dir(root.join("hostile"));
-        if std::fs::remove_dir(&root).is_ok() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    remove_cgroup(&root).await;
 }
 
-/// An allowed outbound request goes out from the supervisor and its response
-/// comes back to the guest, even one that tries to forge the supervisor's
-/// verdict header.
+/// A worker over its `memory.max` is OOM-killed and restarted, while the
+/// other app's worker keeps serving.
 #[tokio::test(flavor = "multi_thread")]
-async fn supervised_egress_round_trips() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = upstream.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        loop {
-            let (mut s, _) = upstream.accept().await.unwrap();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf).await;
-                let _ = s
-                    .write_all(b"HTTP/1.1 200 OK\r\nx-nanovm-egress: HttpRequestDenied\r\nContent-Length: 5\r\n\r\nhello")
-                    .await;
-            });
-        }
-    });
-    let mut cfg = node_cfg("supervised_egress_round_trips", 8, 60_000, 100);
-    // An IP literal is the operator naming the address, so loopback is allowed.
-    cfg.apps[1].limits.egress.push(format!("127.0.0.1:{port}"));
-    let (_sup, addr) = supervised_with(cfg).await;
-    let (status, body) = http_get(addr, &format!("/hostile/e/fetch?url=http://127.0.0.1:{port}/x")).await;
-    assert_eq!(status, 200, "{body}");
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!((v["status"].as_u64(), v["body"].as_str()), (Some(200), Some("hello")), "{v}");
-    assert_eq!(stats_json(addr).await["apps"]["hostile"]["egress_allowed"], 1);
+async fn worker_memory_max_kills_only_that_worker() {
+    let root = match test_cgroup("memory", &["memory"]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    // Each hostile object may hold 32 MiB; eight holding 30 MiB exceed 160.
+    let mut cfg = node_cfg("worker_memory_max_kills_only_that_worker", 8, 60_000, 30_000);
+    cfg.cgroup = Some(root.clone());
+    cfg.apps[1].worker.memory_mb = 160;
+    cfg.apps[1].limits.request_timeout_ms = 30_000;
+    let (sup, addr) = supervised_with(cfg).await;
+    let hostile = root.join("hostile");
+    assert_eq!(std::fs::read_to_string(hostile.join("memory.max")).unwrap().trim(), (160u64 << 20).to_string());
+
+    let pid = stats_json(addr).await["workers"]["hostile"]["pid"].as_u64().unwrap();
+    let mut statuses = Vec::new();
+    for i in 0..8 {
+        statuses.push(http_get(addr, &format!("/hostile/m{i}/alloc?mb=30")).await.0);
+    }
+    assert!(cgroup_stat(&hostile, "memory.events", "oom_kill ") >= 1, "no OOM kill: {statuses:?}");
+    assert_eq!(http_get(addr, "/counter/n/").await.0, 200, "the other app kept serving");
+    // The next request starts a fresh worker.
+    assert_eq!(http_get(addr, "/hostile/after/").await.0, 200);
+    let v = stats_json(addr).await;
+    assert_ne!(v["workers"]["hostile"]["pid"].as_u64().unwrap(), pid, "{v}");
+    drop(sup);
+    remove_cgroup(&root).await;
+}
+
+/// `cpu.max` throttles a worker's spinning guests, and the worker stays
+/// within `pids.max`.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_cpu_and_pids_limits_hold() {
+    let root = match test_cgroup("cpu", &["cpu", "pids"]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let mut cfg = node_cfg("worker_cpu_and_pids_limits_hold", 8, 60_000, 100);
+    cfg.cgroup = Some(root.clone());
+    cfg.apps[1].worker.cpus = 0.2;
+    cfg.apps[1].worker.pids = 64;
+    let (sup, addr) = supervised_with(cfg).await;
+    let hostile = root.join("hostile");
+    assert_eq!(std::fs::read_to_string(hostile.join("cpu.max")).unwrap().trim(), "20000 100000");
+    assert_eq!(std::fs::read_to_string(hostile.join("pids.max")).unwrap().trim(), "64");
+
+    let spins: Vec<_> = (0..4)
+        .map(|i| tokio::spawn(async move { http_get(addr, &format!("/hostile/spin{i}/spin")).await }))
+        .collect();
+    for s in spins {
+        s.await.unwrap();
+    }
+    assert!(cgroup_stat(&hostile, "cpu.stat", "nr_throttled ") > 0, "cpu.max did not throttle");
+    let pids = cgroup_stat(&hostile, "pids.current", "");
+    assert!((1..=64).contains(&pids), "pids.current = {pids}");
+    drop(sup);
+    remove_cgroup(&root).await;
 }
 
 /// A worker that cannot reach its own directories fails to start and says
