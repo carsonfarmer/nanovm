@@ -10,7 +10,7 @@ The run model is shaped like Durable Objects:
 - In-memory state is lost when the instance is evicted.
 - Each object has its own persistent disk.
 
-Production targets Linux cloud VMs without KVM. This phase is the **portable core**, which runs natively on macOS and Linux. The Linux jail (seccomp, Landlock, cgroup v2, a process per tenant) comes later, behind a `Jail` trait.
+Production targets Linux cloud VMs without KVM. Phase 1 was the **portable core**, which runs natively on macOS and Linux. Phase 2 adds the Linux jail (a process per app with seccomp, Landlock and cgroup v2); see below.
 
 The stack is wasmtime 50.0.0 with wasmtime-wasi 50 and wasmtime-wasi-http 50 (P3 support enabled by default). P3 is marked experimental upstream, with no semver guarantees.
 
@@ -238,7 +238,7 @@ Each test spins up a `Node` in-process with small limits.
 
 `demo/demo.sh` starts a node from `demo/nanovm.toml` (or uses one already on :8080) and drives it over HTTP with `curl --parallel`: per-object volumes and escapes, cold starts, warm requests, `/data` writes, and a storm of every hostile-guest attack at once, while a canary object is pinged throughout.
 
-## Order of work (in this session)
+## Order of work (phase 1: portable core, done)
 
 All nine steps are done. [README.md](README.md) has the results and the bugs the tests and benchmarks found.
 
@@ -247,19 +247,77 @@ All nine steps are done. [README.md](README.md) has the results and the bugs the
 3. Limits, deadlines, poisoning and re-instantiation, with metrics.
 4. Quota'd filesystem.
 5. Egress.
-6. ObjectTable with LRU/idle eviction, control API, dashboard.
+6. ObjectTable with LRU/idle eviction and the control API.
 7. Integration tests.
 8. Benchmarks.
-9. Demo script, dashboard check in the browser, and results.
+9. Demo script and results.
 
-## Out of scope for this phase / follow-ups
+## Target design (agreed)
 
-- Linux jail (seccomp, Landlock, cgroup v2) and a worker process per tenant.
+The goal: one node, as fast and secure as we can make it, that runs untrusted WebAssembly apps as durable objects, deployable by anyone without handing out a long-lived secret. It is a solid single-node baseline to measure against before any clustering.
+
+- **Placement:** the node sits behind a trusted proxy on a private network. The proxy is the public HTTP(S) entry point (TLS, auth, route → digest); only the proxy-to-node hop is private. The node has no TLS and no auth of its own.
+- **Tenancy:** tenant = app. Routes stay `/{app}/{object}/{path}`. The node exposes only data APIs.
+- **Isolation, in layers:** Wasm with the per-object limits; one jailed worker process per app; a supervisor that holds no untrusted code and owns the network. A Wasm escape reaches one app's jail and nothing else.
+- **Deploy, stateless and keyless:**
+  - Apps are OCI artifacts (an `application/wasm` layer plus a config blob with limits and env), pulled anonymously and by digest only.
+  - They are signed with Sigstore keyless signing: GitHub artifact attestations from CI, or `cosign` with a browser OIDC sign-in on a laptop. No long-lived keys exist anywhere.
+  - The proxy sends, with every request, the manifest digest, the app's trust policy (a list of exact `{issuer, subject}` identities) and its minimum version.
+  - The node fetches on first use (single-flight per digest), verifies offline with `sigstore-verify` against the embedded trusted root, compiles inside the app's jail and caches by digest. It keeps no deploy state and has no deploy API.
+  - New requests go to the new version; objects on the old version drain and are evicted.
+  - Manifest limits are clamped to operator maximums.
+- **Features to add:**
+  - **WebSockets,** following tric's WebSocket-over-HTTP model: each event (`OPEN`/`TEXT`/`CLOSE`/`DISCONNECT`) is a normal bounded request to the object, and sockets outlive instances.
+    - The node itself speaks the protocol and handles channel publishing; no Pushpin process.
+    - Events are ordered per object. Channels are scoped per object. There is a per-object socket cap, and tric's size bounds apply.
+  - **Alarms:** one per object, set with the response header `x-nanovm-alarm: <unix-ms>` (`0` clears).
+    - The node persists the alarm and delivers it at least once, with backoff, as a `POST` carrying a host-only marker that is stripped from client requests.
+  - **Key-value:** a host-implemented `wasi:keyvalue` stored as files under `/data`. `wasi:filesystem` stays exposed.
+- **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
+- **Out of scope for now:** clustering, one-shot runs of agent-written code, dashboards, static signing keys.
+
+## Phase 2: the Linux jail (in progress)
+
+```
+client ─► proxy ─► supervisor (nanovm serve): no untrusted code
+                    │  HTTP/1 front end, routes /{app}/... to the app's worker
+                    │  per-app egress policy + public-IP filter + connect (the only network path)
+                    │  spawns and restarts workers, places each in its cgroup
+                    ├── fd 3: HTTP/2 over a socketpair ──► worker "a"  (nanovm worker)
+                    └── fd 4: HTTP/2 over a socketpair ◄── worker "a"  outbound requests
+                                                          one Node, one app; jailed:
+                                                          own uid · Landlock · seccomp · cgroup
+```
+
+- **Worker = one Node for one app.** The supervisor passes the app's config (JSON) and the component bytes on the worker's stdin. Later it passes bytes it has fetched and verified (Q24). The worker reads them, jails itself, and only then compiles and serves. Untrusted code never runs before the jail is in place.
+- **Jail (Linux), applied by the worker to itself before any thread starts:**
+  - **uid:** when the supervisor runs as root, each app gets its own uid (`jail_uid_base` + app index). The supervisor chowns the app's directories to that uid.
+  - **Landlock:** read-write access to the app's `objects/`, `tmp/` and `cache/` subtrees; read-only access to its `static_dir`; nothing else.
+  - **seccomp:** an allowlist of the syscalls Wasmtime, tokio and the filesystem host need. There is no `socket`, `connect`, `bind`, `execve`, `ptrace`, `mount` or namespace calls, `clone` only creates threads, and anything else fails with `EPERM`. With no way to make a socket, the worker has no network beyond the two it inherited.
+  - **no_new_privs** and `PR_SET_PDEATHSIG`, so a worker dies with its supervisor.
+- **Mount and network namespaces were dropped from the Q23 plan.** Landlock already confines the filesystem, and seccomp's lack of `socket` already removes the network, so namespaces would be redundant defence.
+- **cgroup v2 (supervisor):** when `cgroup` is set, each worker goes into `<cgroup>/<app>` before it is handed anything. `memory.max`, `cpu.max` and `pids.max` come from the app's `[app.worker]` section.
+- **Egress:** in a worker, `EgressHooks` forwards each outbound request to the supervisor on fd 4. The per-object connection semaphore stays in the worker. The supervisor applies the allowlist, DNS and IP filter, then connects. A denial comes back as the same `ErrorCode` the guest saw before.
+- **Failure:** a worker that dies takes down only its app. In-flight requests get `502 worker-down`, and the next request restarts the worker.
+- **Data APIs:**
+  - `/_nanovm/stats` returns the supervisor's view plus each worker's stats, keyed by app.
+  - `/_nanovm/events?app=<a>&since=` serves that worker's event log.
+- **In-process `Node`** stays the unit of the tests and benchmarks, and is what each worker runs. On macOS the same supervisor/worker topology runs without the Linux jail calls.
+- **Tests:** the hostile guest run through the supervisor. A jailed worker cannot open a socket, read another app's or the supervisor's files, or exec; egress policy is enforced by the supervisor; a killed worker is restarted.
+
+## Next phases
+
+3. Signed OCI deploys (stateless, digest per request, see Target design).
+4. Key-value (`wasi:keyvalue` on `/data`).
+5. Alarms.
+6. WebSockets.
+
+## Follow-ups
+
 - gVisor-systrap comparison.
 - Quota on the WASI 0.2 filesystem (shadowing p2 writes).
 - Wizer pre-initialisation (not published for 50.0.0, and it needs a custom init export).
 - Multi-node placement and leases.
-- A transactional key-value store per object.
 
 ## Risks
 
