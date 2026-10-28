@@ -1040,3 +1040,25 @@ async fn supervised_egress_round_trips() {
     assert_eq!((v["status"].as_u64(), v["body"].as_str()), (Some(200), Some("hello")), "{v}");
     assert_eq!(stats_json(addr).await["apps"]["hostile"]["egress_allowed"], 1);
 }
+
+/// A worker that cannot reach its own directories fails to start and says
+/// which one, rather than running with a jail rule silently dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreachable_static_dir_fails_the_start_by_name() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipped: needs root for a separate worker uid");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("private-static");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut cfg = node_cfg("unreachable_static_dir", 8, 60_000, 100);
+    cfg.apps[0].static_dir = Some(dir.clone());
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
+    let err = match nanovm::supervisor::Supervisor::new(cfg, exe, 1).await {
+        Ok(_) => panic!("started with an unreachable static_dir"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("private-static is not accessible"), "{err}");
+}

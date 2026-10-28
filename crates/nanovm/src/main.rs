@@ -10,8 +10,11 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [cmd, flag, path] if cmd == "serve" && flag == "--config" => serve(NodeConfig::load(&PathBuf::from(path))?),
-        // Started by the supervisor only.
-        [cmd] if cmd == "worker" => nanovm::supervisor::worker_main(),
+        // Started by the supervisor only, which reports the worker's last line.
+        [cmd] if cmd == "worker" => nanovm::supervisor::worker_main().map_err(|e| {
+            eprintln!("{e:#}");
+            std::process::exit(1)
+        }),
         _ => bail!("usage: nanovm serve --config <nanovm.toml>"),
     }
 }

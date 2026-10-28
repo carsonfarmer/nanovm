@@ -44,6 +44,11 @@ impl Jail {
             ensure!(libc::getppid() != 1, "supervisor exited");
         }
 
+        // The Landlock crate skips a path it cannot open; a worker that cannot
+        // reach its own directories should say so instead.
+        for p in self.read_write.iter().chain(&self.read_only) {
+            std::fs::File::open(p).with_context(|| format!("{} is not accessible to the worker", p.display()))?;
+        }
         let abi = ABI::V6;
         let status = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))?

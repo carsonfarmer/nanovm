@@ -25,7 +25,7 @@ use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::oneshot;
 
@@ -209,7 +209,11 @@ impl Supervisor {
         let (egress, worker_egress) = UnixStream::pair()?;
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
         let mut cmd = Command::new(&self.exe);
-        cmd.arg("worker").env_clear().stdin(Stdio::piped()).kill_on_drop(true);
+        cmd.arg("worker")
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         // SAFETY: only async-signal-safe calls between fork and exec. The
         // sockets are first moved above fd 4 so neither dup2 clobbers the
         // other, then dup2 puts them at 3 and 4 without close-on-exec.
@@ -242,6 +246,18 @@ impl Supervisor {
         stdin.write_all(&spec).await?;
         stdin.write_all(&wasm).await?;
         drop(stdin);
+
+        // The worker's stderr goes to ours, tagged with its app; the last line
+        // explains a worker that fails to start.
+        let last_words = Arc::new(Mutex::new(String::new()));
+        let (app, words) = (w.app.name.clone(), last_words.clone());
+        let mut lines = tokio::io::BufReader::new(child.stderr.take().expect("piped")).lines();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                eprintln!("nanovm[{app}]: {line}");
+                *words.lock() = line;
+            }
+        });
 
         // Watches the process; dropping `kill` (with the `Live`) kills it.
         let exited = Arc::new(AtomicBool::new(false));
@@ -276,10 +292,21 @@ impl Supervisor {
             res.into_body().collect().await?;
             anyhow::Ok(())
         });
-        match ready.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => bail!("worker did not start: {e:#}"),
-            Err(_) => bail!("worker did not answer within {START_TIMEOUT:?}"),
+        let failed = match ready.await {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("{e:#}")),
+            Err(_) => Some(format!("no answer within {START_TIMEOUT:?}")),
+        };
+        if let Some(e) = failed {
+            // Give an exiting worker the moment it needs to say why.
+            for _ in 0..100 {
+                if live.exited.load(Relaxed) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let words = last_words.lock().clone();
+            bail!("worker did not start ({e}): {words}");
         }
         *w.live.lock() = Some(live);
         w.starts.fetch_add(1, Relaxed);
