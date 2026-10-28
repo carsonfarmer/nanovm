@@ -1144,3 +1144,113 @@ async fn open_response_bodies_count_against_outbound_concurrency() {
     assert_eq!(v["held"], 2, "{body}");
     assert!(body.contains("ConnectionLimitReached"), "{body}");
 }
+
+// ---- registry apps -------------------------------------------------------
+//
+// These run against the guests CI publishes (.github/workflows/
+// publish-guests.yml) to ghcr.io, signed by GitHub artifact attestations, and
+// skip, saying why, where those can't be reached.
+
+const SIGNER: &str = "https://token.actions.githubusercontent.com \
+    https://github.com/carsonfarmer/nanovm/.github/workflows/publish-guests.yml@refs/heads/main";
+
+/// The published versions of guest `name`, oldest first, as
+/// `(version, ghcr.io/…@digest)`.
+async fn published(name: &str) -> Result<Vec<(semver::Version, String)>, String> {
+    use oci_client::{Reference, secrets::RegistryAuth};
+    let repo = format!("ghcr.io/carsonfarmer/nanovm-{name}");
+    let client = oci_client::Client::default();
+    let r: Reference = format!("{repo}:latest").parse().unwrap();
+    let tags = client
+        .list_tags(&r, &RegistryAuth::Anonymous, None, None)
+        .await
+        .map_err(|e| format!("can't list {repo}: {e}"))?;
+    let mut out = Vec::new();
+    for tag in tags.tags {
+        let Ok(v) = tag.parse::<semver::Version>() else { continue };
+        let r: Reference = format!("{repo}:{tag}").parse().unwrap();
+        let accept = [oci_client::manifest::OCI_IMAGE_MEDIA_TYPE];
+        let (_, digest) = client
+            .pull_manifest_raw(&r, &RegistryAuth::Anonymous, &accept)
+            .await
+            .map_err(|e| e.to_string())?;
+        out.push((v, format!("{repo}@{digest}")));
+    }
+    out.sort();
+    if out.is_empty() {
+        return Err(format!("nothing published at {repo}"));
+    }
+    Ok(out)
+}
+
+async fn reg_get(addr: std::net::SocketAddr, path: &str, app: &str, trust: &str, min: Option<&str>) -> (u16, String) {
+    let min = min.map(|m| format!("nanovm-min-version: {m}\r\n")).unwrap_or_default();
+    let head = format!(
+        "GET {path} HTTP/1.1\r\nHost: x\r\nnanovm-app: {app}\r\nnanovm-trust: {trust}\r\n{min}Connection: close\r\n\r\n"
+    );
+    raw(addr, &head, b"").await
+}
+
+/// A registry app runs from its signed artifact, and anything short of a
+/// trusted signature over that digest at an allowed version is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_apps_need_a_trusted_signature() {
+    let counter = match published("counter").await {
+        Ok(v) => v.last().unwrap().clone(),
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (_sup, addr) = supervised("registry_apps_need_a_trusted_signature").await;
+    let (version, app) = counter;
+
+    let (status, body) = reg_get(addr, "/rc/a/", &app, SIGNER, Some(&version.to_string())).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""app":"rc""#), "{body}");
+    let v = stats_json(addr).await;
+    assert_eq!(v["workers"]["rc"]["version"], version.to_string(), "{v}");
+
+    let wrong_subject = SIGNER.replace("publish-guests.yml", "other.yml");
+    let wrong_issuer = SIGNER.replace("token.actions", "evil");
+    let unsigned = app.rsplit_once('@').unwrap().0.to_string() + "@sha256:" + &"0".repeat(64);
+    let too_new = format!("{}.0.0", version.major + 1);
+    for (name, app, trust, min, why) in [
+        ("subject", app.as_str(), wrong_subject.as_str(), None, "not signed by a trusted identity"),
+        ("issuer", app.as_str(), wrong_issuer.as_str(), None, "not signed by a trusted identity"),
+        ("floor", app.as_str(), SIGNER, Some(too_new.as_str()), "below the minimum"),
+        ("digest", unsigned.as_str(), SIGNER, None, "loading"),
+    ] {
+        let (status, body) = reg_get(addr, &format!("/r-{name}/a/"), app, trust, min).await;
+        assert_eq!(status, 502, "{name}: {body}");
+        assert!(body.contains(why), "{name}: {body}");
+    }
+    // A local app can't be replaced from a registry; trust is required.
+    assert_eq!(reg_get(addr, "/counter/a/", &app, SIGNER, None).await.0, 409);
+    let head = format!("GET /rx/a/ HTTP/1.1\r\nHost: x\r\nnanovm-app: {app}\r\nConnection: close\r\n\r\n");
+    assert_eq!(raw(addr, &head, b"").await.0, 400);
+}
+
+/// Naming a new version switches the app: requests in flight on the old
+/// worker finish, the new worker serves the same volumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn registry_app_switches_versions_after_a_drain() {
+    let versions = match published("hostile").await {
+        Ok(v) if v.len() >= 2 => v,
+        Ok(_) => return eprintln!("skipped: needs two published versions of hostile"),
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (old, new) = (&versions[versions.len() - 2], &versions[versions.len() - 1]);
+    let (_sup, addr) = supervised("registry_app_switches_versions").await;
+    let (old_app, new_app) = (old.1.clone(), new.1.clone());
+
+    assert_eq!(reg_get(addr, "/rh/w/fill?mount=data&mb=1", &old_app, SIGNER, None).await.0, 507);
+    let slow = tokio::spawn(async move { reg_get(addr, "/rh/s/sleep?ms=500", &old_app, SIGNER, None).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t0 = Instant::now();
+    let (status, body) = reg_get(addr, "/rh/w/", &new_app, SIGNER, None).await;
+    assert_eq!(status, 200, "{body}");
+    let (slow_status, slow_body) = slow.await.unwrap();
+    assert_eq!(slow_status, 200, "the old version's request finished: {slow_body}");
+    assert!(t0.elapsed() >= Duration::from_millis(300), "the switch waited for the drain");
+    let v = stats_json(addr).await;
+    assert_eq!(v["workers"]["rh"]["version"], new.0.to_string(), "{v}");
+    assert_eq!(v["workers"]["rh"]["starts"], 2, "{v}");
+}
