@@ -20,10 +20,6 @@ use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
 use crate::table::Node;
 
-pub async fn serve(node: Arc<Node>, listener: TcpListener) -> anyhow::Result<()> {
-    serve_http1(listener, move |req| handle(node.clone(), req)).await
-}
-
 /// Serves HTTP/1.1 on every connection `listener` accepts.
 pub async fn serve_http1<F, Fut>(listener: TcpListener, f: F) -> anyhow::Result<()>
 where
@@ -86,7 +82,7 @@ pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBod
     node.dispatch(app, id, Request::from_parts(parts, body)).await
 }
 
-fn ok_json(v: serde_json::Value) -> Response<RespBody> {
+pub fn ok_json(v: serde_json::Value) -> Response<RespBody> {
     Response::builder()
         .header("content-type", "application/json")
         .header("cache-control", "no-store")

@@ -10,9 +10,11 @@
 //! a dialer keeps one pool per thread (see [`set_thread`]), so a connection
 //! is only used on the thread whose runtime drives it.
 
-use std::future::Future;
 use std::cell::Cell;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::future::Future;
+use std::io::{IoSlice, IoSliceMut};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -24,6 +26,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
+use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 use tokio::io::Interest;
 use tokio::net::UnixStream;
 
@@ -68,7 +71,7 @@ pub fn set_thread(i: usize) {
 
 /// The dialing end of a link.
 pub struct Dialer<B: Body + 'static> {
-    /// Non-blocking, and written without a runtime: any thread may dial.
+    /// Written without a runtime, so any thread may dial.
     ctl: std::os::unix::net::UnixStream,
     pools: Box<[Mutex<Vec<Conn<B>>>]>,
 }
@@ -79,12 +82,11 @@ where
     B::Error: Into<BoxError>,
 {
     /// A dialer with a pool for each of `threads` threads.
-    pub fn new(ctl: std::os::unix::net::UnixStream, threads: usize) -> anyhow::Result<Arc<Self>> {
-        ctl.set_nonblocking(true)?;
-        Ok(Arc::new(Dialer {
+    pub fn new(ctl: std::os::unix::net::UnixStream, threads: usize) -> Arc<Self> {
+        Arc::new(Dialer {
             ctl,
             pools: (0..threads.max(1)).map(|_| Mutex::default()).collect(),
-        }))
+        })
     }
 
     fn pool(&self) -> &Mutex<Vec<Conn<B>>> {
@@ -101,7 +103,7 @@ where
         // A busy peer (all threads instantiating, say) can fall behind on
         // its control socket; wait for it rather than fail the request.
         let start = std::time::Instant::now();
-        while let Err(e) = send_fd(&self.ctl, theirs.as_raw_fd()) {
+        while let Err(e) = send_fd(&self.ctl, theirs.as_fd()) {
             if e.kind() != std::io::ErrorKind::WouldBlock || start.elapsed() > DIAL_TIMEOUT {
                 return Err(e.into());
             }
@@ -118,13 +120,8 @@ where
     pub async fn send(self: &Arc<Self>, req: Request<B>) -> anyhow::Result<Response<LinkBody<B>>> {
         let mut c = self.checkout().await?;
         let mut sent = std::pin::pin!(c.tx.send_request(req));
-        let conn = &mut c.conn;
         let res = std::future::poll_fn(|cx| {
-            if let Some(cn) = conn
-                && Pin::new(cn).poll(cx).is_ready()
-            {
-                *conn = None;
-            }
+            c.poll_conn(cx);
             sent.as_mut().poll(cx)
         })
         .await?;
@@ -206,30 +203,12 @@ where
 }
 
 /// Sends `fd` without blocking the thread; see `checkout` for the retry.
-fn send_fd(ctl: &std::os::unix::net::UnixStream, fd: RawFd) -> std::io::Result<()> {
-    let mut byte = [0u8];
-    let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: 1,
-    };
-    let mut cmsg = [0u8; 64];
-    // SAFETY: `msg` points at `iov` and `cmsg`, both live for the call; the
-    // control buffer is large enough for one fd.
-    unsafe {
-        let mut msg: libc::msghdr = std::mem::zeroed();
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cmsg.as_mut_ptr().cast();
-        msg.msg_controllen = libc::CMSG_SPACE(4) as _;
-        let c = libc::CMSG_FIRSTHDR(&msg);
-        (*c).cmsg_level = libc::SOL_SOCKET;
-        (*c).cmsg_type = libc::SCM_RIGHTS;
-        (*c).cmsg_len = libc::CMSG_LEN(4) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(c).cast::<RawFd>(), fd);
-        if libc::sendmsg(ctl.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
+fn send_fd(ctl: &std::os::unix::net::UnixStream, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+    let fds = [fd];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut cmsg = SendAncillaryBuffer::new(&mut space);
+    cmsg.push(SendAncillaryMessage::ScmRights(&fds));
+    rustix::net::sendmsg(ctl, &[IoSlice::new(&[0])], &mut cmsg, SendFlags::DONTWAIT | SendFlags::NOSIGNAL)?;
     Ok(())
 }
 
@@ -237,38 +216,22 @@ fn send_fd(ctl: &std::os::unix::net::UnixStream, fd: RawFd) -> std::io::Result<(
 async fn recv_fd(ctl: &UnixStream) -> std::io::Result<Option<OwnedFd>> {
     loop {
         ctl.readable().await?;
-        match ctl.try_io(Interest::READABLE, || {
-            let mut byte = [0u8];
-            let mut iov = libc::iovec {
-                iov_base: byte.as_mut_ptr().cast(),
-                iov_len: 1,
-            };
-            let mut cmsg = [0u8; 64];
-            // SAFETY: as in `send_fd`; the kernel fills in at most
-            // `msg_controllen` bytes of `cmsg`.
-            unsafe {
-                let mut msg: libc::msghdr = std::mem::zeroed();
-                msg.msg_iov = &mut iov;
-                msg.msg_iovlen = 1;
-                msg.msg_control = cmsg.as_mut_ptr().cast();
-                msg.msg_controllen = cmsg.len() as _;
-                let n = libc::recvmsg(ctl.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC);
-                if n < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if n == 0 {
-                    return Ok(None);
-                }
-                let c = libc::CMSG_FIRSTHDR(&msg);
-                if c.is_null() || (*c).cmsg_type != libc::SCM_RIGHTS {
-                    return Err(std::io::Error::other("control message without an fd"));
-                }
-                let fd = std::ptr::read_unaligned(libc::CMSG_DATA(c).cast::<RawFd>());
-                Ok(Some(OwnedFd::from_raw_fd(fd)))
-            }
-        }) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            r => return r,
+        let received = ctl.try_io(Interest::READABLE, || {
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut cmsg = RecvAncillaryBuffer::new(&mut space);
+            let n = rustix::net::recvmsg(ctl, &mut [IoSliceMut::new(&mut [0])], &mut cmsg, RecvFlags::CMSG_CLOEXEC)?.bytes;
+            let fd = cmsg.drain().find_map(|m| match m {
+                RecvAncillaryMessage::ScmRights(mut fds) => fds.next(),
+                _ => None,
+            });
+            Ok((n, fd))
+        });
+        match received {
+            Ok((0, _)) => return Ok(None),
+            Ok((_, Some(fd))) => return Ok(Some(fd)),
+            Ok((_, None)) => return Err(std::io::Error::other("control message without an fd")),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e),
         }
     }
 }
@@ -283,18 +246,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn dials_wait_for_a_slow_acceptor() {
         let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let small: libc::c_int = 2048;
-        // SAFETY: setting an int socket option from a valid pointer.
-        unsafe {
-            libc::setsockopt(
-                ctl.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&small as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as _,
-            );
-        }
-        let dialer = Dialer::<Empty<Bytes>>::new(ctl, 1).unwrap();
+        let small = 2048;
+        rustix::net::sockopt::set_socket_send_buffer_size(&ctl, small).unwrap();
+        let dialer = Dialer::<Empty<Bytes>>::new(ctl, 1);
         let sends: Vec<_> = (0..64)
             .map(|_| {
                 let d = dialer.clone();

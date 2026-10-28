@@ -27,7 +27,7 @@ impl Jail {
     pub fn enter(self) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
         use landlock::{
-            ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope, path_beneath_rules,
+            ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
         };
 
         // SAFETY: plain syscalls on this process's own credentials.
@@ -44,18 +44,20 @@ impl Jail {
             ensure!(libc::getppid() != 1, "supervisor exited");
         }
 
-        // The Landlock crate skips a path it cannot open; a worker that cannot
-        // reach its own directories should say so instead.
-        for p in self.read_write.iter().chain(&self.read_only) {
-            std::fs::File::open(p).with_context(|| format!("{} is not accessible to the worker", p.display()))?;
-        }
+        // Built by hand: the crate's `path_beneath_rules` silently skips a
+        // path it cannot open, and a worker that cannot reach its own
+        // directories should say so.
         let abi = ABI::V6;
+        let rule = |p: &PathBuf, access| -> anyhow::Result<_> {
+            let fd = PathFd::new(p).with_context(|| format!("{} is not accessible to the worker", p.display()))?;
+            Ok(PathBeneath::new(fd, access))
+        };
         let status = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))?
             .scope(Scope::from_all(abi))?
             .create()?
-            .add_rules(path_beneath_rules(&self.read_write, AccessFs::from_all(abi)))?
-            .add_rules(path_beneath_rules(&self.read_only, AccessFs::from_read(abi)))?
+            .add_rules(self.read_write.iter().map(|p| rule(p, AccessFs::from_all(abi))))?
+            .add_rules(self.read_only.iter().map(|p| rule(p, AccessFs::from_read(abi))))?
             // Also sets no_new_privs.
             .restrict_self()
             .context("landlock")?;
@@ -67,8 +69,10 @@ impl Jail {
     }
 }
 
-/// The syscalls Wasmtime, tokio, the WASI filesystem host and the h2
-/// connections to the supervisor make (traced over the integration tests).
+/// The syscalls Wasmtime, tokio, the WASI filesystem host and the links to
+/// the supervisor make (traced on jailed workers through startup and the
+/// demo), plus the file calls `wasi:filesystem` can reach that the demo
+/// doesn't exercise.
 /// Anything else fails with `ENOSYS`, which also sends glibc's thread
 /// creation from `clone3` back to `clone`, whose flags can be checked.
 #[cfg(target_os = "linux")]
@@ -81,8 +85,8 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_munmap,
         libc::SYS_mremap,
         libc::SYS_madvise,
+        // Wasmtime flushes the instruction cache with this on aarch64.
         libc::SYS_membarrier,
-        libc::SYS_memfd_create,
         // threads, signals, time
         libc::SYS_futex,
         libc::SYS_set_robust_list,
@@ -92,10 +96,6 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_sched_getaffinity,
         libc::SYS_gettid,
         libc::SYS_getpid,
-        libc::SYS_getuid,
-        libc::SYS_geteuid,
-        libc::SYS_getgid,
-        libc::SYS_getegid,
         libc::SYS_rt_sigaction,
         libc::SYS_rt_sigprocmask,
         libc::SYS_rt_sigreturn,
@@ -105,9 +105,7 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_clock_nanosleep,
         // The kernel resumes a sleep interrupted by a signal through this.
         libc::SYS_restart_syscall,
-        libc::SYS_nanosleep,
         libc::SYS_getrandom,
-        libc::SYS_uname,
         libc::SYS_exit,
         libc::SYS_exit_group,
         // event loop and the two inherited sockets
@@ -115,15 +113,11 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_epoll_ctl,
         libc::SYS_epoll_pwait,
         libc::SYS_eventfd2,
-        libc::SYS_ppoll,
         libc::SYS_sendto,
         libc::SYS_recvfrom,
         libc::SYS_sendmsg,
         libc::SYS_recvmsg,
         libc::SYS_shutdown,
-        libc::SYS_getsockopt,
-        libc::SYS_getsockname,
-        libc::SYS_getpeername,
         // files, confined by Landlock
         libc::SYS_read,
         libc::SYS_write,
@@ -155,17 +149,10 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
     #[cfg(target_arch = "x86_64")]
     allow.extend([
         libc::SYS_epoll_wait,
-        libc::SYS_poll,
         libc::SYS_access,
         libc::SYS_mkdir,
         libc::SYS_rename,
         libc::SYS_renameat,
-        libc::SYS_unlink,
-        libc::SYS_rmdir,
-        libc::SYS_stat,
-        libc::SYS_lstat,
-        libc::SYS_open,
-        libc::SYS_readlink,
     ]);
     let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = allow.into_iter().map(|s| (s, vec![])).collect();
     let rule = |conds: Vec<Cond>| SeccompRule::new(conds);

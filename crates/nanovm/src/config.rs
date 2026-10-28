@@ -108,17 +108,11 @@ config! {
 
 impl NodeConfig {
     pub fn front_threads(&self) -> usize {
-        match self.front_threads {
-            0 => std::thread::available_parallelism().map_or(1, |n| (n.get() / 4).max(1)),
-            n => n,
-        }
+        or_cores_over(self.front_threads, 4)
     }
 
     pub fn heavy_lanes(&self) -> usize {
-        match self.heavy_lanes {
-            0 => std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),
-            n => n,
-        }
+        or_cores_over(self.heavy_lanes, 2)
     }
 
     /// An app's writable directories: object volumes, scratch space and its
@@ -171,5 +165,13 @@ impl NodeConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// `n`, or for 0 the number of cores divided by `div` (at least 1).
+fn or_cores_over(n: usize, div: usize) -> usize {
+    match n {
+        0 => std::thread::available_parallelism().map_or(1, |c| (c.get() / div).max(1)),
+        n => n,
     }
 }

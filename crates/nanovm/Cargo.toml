@@ -25,6 +25,7 @@ sha2 = "0.10"
 serde_json = "1"
 libc = "0.2"
 parking_lot = "0.12"
+rustix = { version = "1.1", features = ["net"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"

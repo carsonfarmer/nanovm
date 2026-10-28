@@ -1074,6 +1074,7 @@ dependencies = [
  "landlock",
  "libc",
  "parking_lot",
+ "rustix",
  "rustls",
  "seccompiler",
  "serde",

@@ -247,16 +247,17 @@ impl Supervisor {
         stdin.write_all(&wasm).await?;
         drop(stdin);
 
-        // The worker's stderr goes to ours, tagged with its app; the last line
-        // explains a worker that fails to start.
-        let last_words = Arc::new(Mutex::new(String::new()));
-        let (app, words) = (w.app.name.clone(), last_words.clone());
+        // The worker's stderr goes to ours, tagged with its app. It closes when
+        // the worker exits, and the last line explains a failed start.
+        let app = w.app.name.clone();
         let mut lines = tokio::io::BufReader::new(child.stderr.take().expect("piped")).lines();
-        tokio::spawn(async move {
+        let last_words = tokio::spawn(async move {
+            let mut last = String::new();
             while let Ok(Some(line)) = lines.next_line().await {
                 eprintln!("nanovm[{app}]: {line}");
-                *words.lock() = line;
+                last = line;
             }
+            last
         });
 
         // Watches the process; dropping `kill` (with the `Live`) kills it.
@@ -281,7 +282,7 @@ impl Supervisor {
         }));
 
         let live = Arc::new(Live {
-            link: Dialer::new(requests, self.threads)?,
+            link: Dialer::new(requests, self.threads),
             pid,
             exited,
             _kill: kill,
@@ -292,25 +293,19 @@ impl Supervisor {
             res.into_body().collect().await?;
             anyhow::Ok(())
         });
-        let failed = match ready.await {
-            Ok(Ok(())) => None,
-            Ok(Err(e)) => Some(format!("{e:#}")),
-            Err(_) => Some(format!("no answer within {START_TIMEOUT:?}")),
-        };
-        if let Some(e) = failed {
-            // Give an exiting worker the moment it needs to say why.
-            for _ in 0..100 {
-                if live.exited.load(Relaxed) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        let e = match ready.await {
+            Ok(Ok(())) => {
+                *w.live.lock() = Some(live);
+                w.starts.fetch_add(1, Relaxed);
+                return Ok(());
             }
-            let words = last_words.lock().clone();
-            bail!("worker did not start ({e}): {words}");
-        }
-        *w.live.lock() = Some(live);
-        w.starts.fetch_add(1, Relaxed);
-        Ok(())
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(_) => format!("no answer within {START_TIMEOUT:?}"),
+        };
+        // Give an exiting worker the moment it needs to say why (dropping
+        // `live` would kill it first).
+        let words = tokio::time::timeout(Duration::from_secs(1), last_words).await;
+        bail!("worker did not start ({e}): {}", words.ok().and_then(Result::ok).unwrap_or_default())
     }
 
     async fn stats(&self) -> Response<RespBody> {
@@ -334,17 +329,12 @@ impl Supervisor {
                 apps.insert(name.clone(), v);
             }
         }
-        let v = json!({
+        crate::server::ok_json(json!({
             "uptime_ms": self.started.elapsed().as_millis() as u64,
             "rss_mb": rss_bytes() as f64 / 1048576.0,
             "workers": workers,
             "apps": apps,
-        });
-        Response::builder()
-            .header("content-type", "application/json")
-            .header("cache-control", "no-store")
-            .body(http_body_util::Full::new(Bytes::from(v.to_string())).map_err(|e| match e {}).boxed_unsync())
-            .unwrap()
+        }))
     }
 }
 
@@ -435,7 +425,7 @@ pub fn worker_main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        let upstream = Dialer::new(upstream, 1)?;
+        let upstream = Dialer::new(upstream, 1);
         let node = Node::from_wasm(cfg, vec![wasm], Some(upstream))?;
         let requests = tokio::net::UnixStream::from_std(requests)?;
         link::serve(requests, move |req| crate::server::handle(node.clone(), req)).await

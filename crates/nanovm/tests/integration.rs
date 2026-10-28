@@ -664,7 +664,8 @@ async fn http_front_end() {
     let node = node("http_front_end", 8, 60_000);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(nanovm::server::serve(node.clone(), listener));
+    let n = node.clone();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| nanovm::server::handle(n.clone(), req)));
 
     let (status, body) = raw(
         addr,
@@ -1099,5 +1100,5 @@ async fn unreachable_static_dir_fails_the_start_by_name() {
         Ok(_) => panic!("started with an unreachable static_dir"),
         Err(e) => format!("{e:#}"),
     };
-    assert!(err.contains("private-static is not accessible"), "{err}");
+    assert!(err.contains("private-static") && err.contains("Permission denied"), "{err}");
 }
