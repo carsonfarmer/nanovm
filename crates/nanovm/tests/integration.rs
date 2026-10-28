@@ -711,9 +711,12 @@ async fn http_front_end() {
 
 /// Starts a supervisor (one jailed worker per app) behind an HTTP listener.
 async fn supervised(test: &str) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
-    let cfg = node_cfg(test, 8, 60_000, 100);
+    supervised_with(node_cfg(test, 8, 60_000, 100)).await
+}
+
+async fn supervised_with(cfg: NodeConfig) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
-    let sup = nanovm::supervisor::Supervisor::new(cfg, exe).await.unwrap();
+    let sup = nanovm::supervisor::Supervisor::new(cfg, exe, 1).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let s = sup.clone();
@@ -921,9 +924,8 @@ fn jail_probe() {
     report("sleep_survives_stop", true);
 }
 
-/// The supervisor ↔ worker connections live as long as the worker. h2 by
-/// default drops a connection after 1024 locally reset streams, which
-/// responses read only up to their Content-Length cause in normal use.
+/// Many requests through the supervisor reuse its links to the worker
+/// without errors or restarts.
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_connection_outlives_many_requests() {
     let (_sup, addr) = supervised("worker_connection_outlives_many_requests").await;
@@ -945,7 +947,9 @@ async fn worker_connection_outlives_many_requests() {
         bad += t.await.unwrap();
     }
     assert_eq!(bad, 0);
-    assert_eq!(stats_json(addr).await["workers"]["counter"]["starts"], 1);
+    let v = stats_json(addr).await;
+    assert_eq!(v["workers"]["counter"]["starts"], 1, "{v}");
+    assert_eq!(v["workers"]["counter"]["link_errors"], 0, "{v}");
 }
 
 /// Each worker lands in `<cgroup>/<app>` with its `[app.worker]` limits.
@@ -975,7 +979,7 @@ async fn workers_are_placed_in_their_cgroups() {
     cfg.apps[0].worker.memory_mb = if has("memory") { 512 } else { 0 };
     cfg.apps[0].worker.pids = if has("pids") { 256 } else { 0 };
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
-    let sup = nanovm::supervisor::Supervisor::new(cfg, exe).await.unwrap();
+    let sup = nanovm::supervisor::Supervisor::new(cfg, exe, 1).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let s = sup.clone();
@@ -1004,4 +1008,35 @@ async fn workers_are_placed_in_their_cgroups() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// An allowed outbound request goes out from the supervisor and its response
+/// comes back to the guest, even one that tries to forge the supervisor's
+/// verdict header.
+#[tokio::test(flavor = "multi_thread")]
+async fn supervised_egress_round_trips() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = upstream.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s
+                    .write_all(b"HTTP/1.1 200 OK\r\nx-nanovm-egress: HttpRequestDenied\r\nContent-Length: 5\r\n\r\nhello")
+                    .await;
+            });
+        }
+    });
+    let mut cfg = node_cfg("supervised_egress_round_trips", 8, 60_000, 100);
+    // An IP literal is the operator naming the address, so loopback is allowed.
+    cfg.apps[1].limits.egress.push(format!("127.0.0.1:{port}"));
+    let (_sup, addr) = supervised_with(cfg).await;
+    let (status, body) = http_get(addr, &format!("/hostile/e/fetch?url=http://127.0.0.1:{port}/x")).await;
+    assert_eq!(status, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((v["status"].as_u64(), v["body"].as_str()), (Some(200), Some("hello")), "{v}");
+    assert_eq!(stats_json(addr).await["apps"]["hostile"]["egress_allowed"], 1);
 }

@@ -8,7 +8,7 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 - Each app has an egress allowlist.
 - Memory is lost on eviction; `/data` survives eviction and restarts.
 
-This is the portable core. It runs natively on macOS and Linux. The Linux jail (seccomp, Landlock, cgroups, a process per tenant) is the next phase. [PLAN.md](PLAN.md) has the design.
+Each app runs in its own jailed worker process. A supervisor that runs no guest code owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
 ## Try it
 
@@ -22,7 +22,7 @@ The script:
 3. Pings a canary object throughout.
 4. Drives it over HTTP with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm requests, `/data` writes, and a storm of 110 simultaneous attacks.
 
-It leaves the node running. Its data APIs are `GET /_nanovm/stats` (counters and latency histograms, as JSON) and `GET /_nanovm/events?since=N` (kills, denials and evictions).
+It leaves the node running. Its data APIs are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (that app's kills, denials and evictions).
 
 Requests are routed as `/{app}/{object}/{path}`:
 
@@ -32,16 +32,18 @@ curl -XPOST http://127.0.0.1:8080/counter/alice/incr
 
 ## What a run of `demo/demo.sh` shows
 
-On the 4-core Linux sandbox, with a node capped at 9,400 objects (the sandbox's fd limit; see Host requirements). These numbers go through curl and the HTTP front end; the in-process numbers are under Benchmarks.
+On the 4-core Linux sandbox, with each app's worker capped at 8,000 objects (the sandbox's fd limit; see Host requirements). These numbers go through curl, which shares the 4 cores, and the HTTP front end; the in-process numbers are under Benchmarks. The second column is the same demo on the unjailed single-process node from before the jail, on the same machine.
 
-| Scenario | Result |
-|---|---|
-| 5,000 cold starts (64 in flight) | 3.8K/s, p50 14 ms, 85 KB RSS per new object |
-| 50,000 GETs over 1,000 warm objects | 24K/s, p50 1.3 ms |
-| 10,000 `POST /incr` (each one rewrites `/data/count`) | 7.2K/s |
-| One object, one client | 4.9K/s, p50 0.1 ms |
-| 110 attacks at once | All contained in 2.1 s; the 2 s wall-clock deadline sets the slowest |
-| Canary over HTTP, throughout | 0 failures |
+| Scenario | Jailed | Unjailed |
+|---|---|---|
+| 5,000 cold starts (64 in flight) | 3.7K/s, p50 14 ms, 89 KB RSS per new object | 4.0K/s, p50 14 ms, 87 KB |
+| 50,000 GETs over 1,000 warm objects | 19K/s, p50 2.2 ms | 27K/s, p50 1.2 ms |
+| 10,000 `POST /incr` (each one rewrites `/data/count`) | 6.7K/s | 7.3K/s |
+| One object, one client | 3.0K/s, p50 0.3 ms | 5.6K/s, p50 0.1 ms |
+| 110 attacks at once | All contained in 2.2 s; the 2 s wall-clock deadline sets the slowest | the same |
+| Canary over HTTP, throughout | 0 failures | 0 failures |
+
+Every request succeeded and each worker started once. The cost of the jail is the hop between the supervisor and the worker; see [What the jail costs](#what-the-jail-costs).
 
 Every attack in the storm, and how it ended:
 
@@ -58,6 +60,46 @@ Every attack in the storm, and how it ended:
 | `../` and symlink escapes | refused |
 | fetch cloud metadata (169.254.169.254) | denied (not on the allowlist) |
 | allowlisted name that resolves to 127.0.0.1 | denied by the resolved-IP check (in this sandbox, which has no DNS, it fails to resolve instead; the `localhost` integration test covers the IP check) |
+
+## The jail
+
+```
+client ─► proxy ─► supervisor (nanovm serve): runs no guest code
+                    │  HTTP/1.1 front end; routes /{app}/... to the app's worker
+                    │  makes every outbound request: allowlist, DNS, public-IP filter
+                    │  starts and restarts workers; places each in its cgroup
+                    ├── fd 3: links for requests ──► worker "counter"  (nanovm worker)
+                    └── fd 4: links for egress  ◄──  one Node for one app, jailed
+```
+
+A worker reads its config and component from stdin, then jails itself while it still has one thread, before it compiles or runs anything:
+
+- **Its own uid.** When the supervisor runs as root, app `i` runs as `jail_uid_base + i`, and its directories are chowned to it.
+- **Landlock.** It gets read-write access to the app's own `objects/`, `tmp/` and `cache/`, read-only access to its `static_dir`, and nothing else. Signals and abstract sockets are scoped to the sandbox.
+- **seccomp.** The allowlist holds only the syscalls Wasmtime, tokio and the filesystem host make, traced over the test suite:
+  - no `socket`, `connect`, `bind`, `execve`, `ptrace`, `mount` or namespace calls
+  - `clone` for threads only
+  - no memory that is writable and executable at once
+  - limits can be read, never raised
+
+  Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
+- **`no_new_privs`**, and the worker dies with its supervisor.
+- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker goes into `<cgroup>/<app>` with that app's `[app.worker]` memory, CPU and pids limits, before it is given anything.
+
+Mount and network namespaces were left out on purpose: Landlock already confines the filesystem, and with no `socket()` there is no network to remove.
+
+**Links.** The supervisor and a worker talk HTTP/1.1, one request at a time per connection, over socketpairs. The dialing side passes one end of each pair to the other over its control socket (`SCM_RIGHTS`) and keeps the connections it has made in a pool. A request runs inline in the task that sent it, at both ends: on this path every handoff between tasks is a thread wakeup, and those cost more than the HTTP framing. Each front-end thread (`front_threads`, a quarter of the cores by default) has its own runtime, listener and pool.
+
+A worker that dies takes only its app with it. In-flight requests get `502 worker-down`, and the next request starts a fresh worker. Volumes survive.
+
+### What the jail costs
+
+The hop between the processes costs two extra cross-process round trips, about 30–40 µs each in this VM, plus one more HTTP parse. On the 4-core sandbox:
+
+- One client sees about 0.1 ms more latency, the warm GET p50 above.
+- At 64 in flight, throughput is about 25% lower. The supervisor needs about a fifth of a request's CPU, and here it shares 4 cores with the worker and with curl.
+
+The in-process benchmark below measures the node inside a worker, and is unchanged.
 
 ## Benchmarks
 
@@ -112,10 +154,11 @@ Every scenario completed with 0 failed requests.
 
 ### Host requirements on Linux
 
-`Node::new` checks these at startup and refuses to start, naming the fix, rather than failing requests at runtime:
+Each worker checks these at startup and refuses to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
 
-- **File descriptors:** each live object holds 2 (`/data` and `/tmp`; `/app` is shared per app). The check needs about `2 × max_live_objects + 1024`. The node raises its soft limit to the hard limit itself; the demo's 20,000 objects need `ulimit -n` of at least 41,088.
-- **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 20,000 needs `sysctl -w vm.max_map_count=164352` or more.
+- **File descriptors:** each live object holds 2 (`/data` and `/tmp`; `/app` is shared per app). The check needs about `2 × max_live_objects + 1024`. The worker raises its soft limit to the hard limit itself, before it jails itself; the demo's 8,000 objects per app need `ulimit -n` of at least 17,088.
+- **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 8,000 needs `sysctl -w vm.max_map_count=68352` or more.
+- **The jail** needs Landlock (Linux 5.13+; signal scoping from 6.12) and seccomp. A separate uid per app needs the supervisor to run as root.
 - **Don't run with `RUST_BACKTRACE` set.** wasmtime then captures a stack backtrace for every guest-visible error. That includes routine ones, like reading a file that doesn't exist yet. With it set, warm throughput across 1,000 objects fell from 63K/s to 23K/s.
 
 ## Tests
@@ -125,7 +168,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 30 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 38 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -141,6 +184,11 @@ The tests cover:
 - LRU and idle eviction, and capacity limits
 - churn past capacity
 - the HTTP front end
+- the jail, from a probe process inside it (`jail_blocks_escapes`): another app's files, `/etc`, sockets, fork, exec, setuid, ptrace, signals, namespaces, W+X memory and raising limits are all refused; a sleep survives a stop and continue
+- the same attacks through the supervisor and jailed workers, with egress enforced by the supervisor, including an allowed request whose upstream tries to forge the supervisor's verdict header
+- a killed worker restarted with its volumes intact, while its neighbour keeps serving
+- many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
+- workers placed in their cgroups (where a writable cgroup v2 hierarchy exists)
 
 ## Bugs the tests and benchmarks found
 
@@ -162,6 +210,11 @@ The tests cover:
   - The fix is `allow_blocking_current_thread(true)`, which runs small local-disk calls inline and charges them to the object's CPU budget. It has to be set before the preopens, which capture it.
   - Result: concurrent `/incr` went from 3K/s to 27K/s, and warm GETs got 1.6× faster.
 
+- **A signal could switch off CPU limits in a worker.** Stopping and continuing a jailed worker (strace did it) interrupted the epoch thread's sleep. The kernel resumes such a sleep through `restart_syscall`, which the first seccomp allowlist lacked, so the epoch thread panicked and exited. Without it, CPU budgets and deadlines go unenforced. `restart_syscall` is now allowed, and the process aborts if the epoch thread ever dies. `jail_blocks_escapes` stops and continues its probe mid-sleep.
+- **HTTP/2 to the workers dropped every connection after 1,024 resets.** The first version used one HTTP/2 connection per worker. hyper's HTTP/1 front end stops reading a body once it has its Content-Length, which resets the HTTP/2 stream. h2 counts those over the connection's whole life and sends GOAWAY at 1,024. The demo saw it as a worker restarting 9 times. It was also slower: every request crossed a shared connection task in each process. Links replaced it.
+- **Pooled links weren't reused.** The same early stop meant a link's response body was dropped before it saw its end, so the connection was closed instead of returned to the pool. The profile showed a socket closed per request. A link now goes back to the pool as soon as its body reports `is_end_stream`.
+- **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
+
 ## Layout
 
 | Path | What it is |
@@ -172,7 +225,10 @@ The tests cover:
 | `crates/nanovm/src/table.rs` | The node: `(app, id)` → actor, LRU and idle eviction |
 | `crates/nanovm/src/quota.rs` | Per-mount byte and file quotas over WASIp3 filesystem calls |
 | `crates/nanovm/src/egress.rs` | Allowlist plus resolved-IP filtering for outgoing HTTP |
-| `crates/nanovm/src/server.rs` | HTTP front end, `/_nanovm/stats` and `/_nanovm/events` |
+| `crates/nanovm/src/server.rs` | A node's HTTP surface: routing, `/_nanovm/stats` and `/_nanovm/events` |
+| `crates/nanovm/src/supervisor.rs` | The supervisor (front end, workers, egress on their behalf) and the worker's entry point |
+| `crates/nanovm/src/jail.rs` | uid, Landlock and seccomp, entered by a worker before any guest code |
+| `crates/nanovm/src/link.rs` | HTTP/1.1 over socketpairs passed across a control socket |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
 | `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |
 
@@ -180,4 +236,5 @@ The tests cover:
 
 - **Inline filesystem calls can't be interrupted by the epoch.** Each one is bounded by the quotas and charged to the guest's CPU budget.
 - **The CPU budget is wall time inside each poll of the guest.** It inflates when the host is oversubscribed, which errs on the side of killing hogs early.
-- **There is no OS-level jail yet.** Isolation is wasmtime's, plus the host's capability checks.
+- **cgroup limits are only partly tested here.** This sandbox's cgroup v2 hierarchy has only the hugetlb controller, so the test checks that workers are placed in their cgroups but can't see `memory.max`, `cpu.max` or `pids.max` enforced.
+- **Without root, apps share the supervisor's uid.** Landlock and seccomp still separate them.

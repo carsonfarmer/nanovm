@@ -1,4 +1,6 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use nanovm::config::NodeConfig;
@@ -7,26 +9,54 @@ use nanovm::supervisor::Supervisor;
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
-        [cmd, flag, path] if cmd == "serve" && flag == "--config" => {
-            let cfg = NodeConfig::load(&PathBuf::from(path))?;
-            tokio::runtime::Runtime::new()?.block_on(serve(cfg))
-        }
+        [cmd, flag, path] if cmd == "serve" && flag == "--config" => serve(NodeConfig::load(&PathBuf::from(path))?),
         // Started by the supervisor only.
         [cmd] if cmd == "worker" => nanovm::supervisor::worker_main(),
         _ => bail!("usage: nanovm serve --config <nanovm.toml>"),
     }
 }
 
-async fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
-    let listen = cfg.listen.clone();
+/// Each front-end thread runs its own single-threaded runtime and accepts on
+/// its own `SO_REUSEPORT` listener, so a request is handled on one thread
+/// from accept to response, through that thread's connections to the worker.
+fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
+    let addr: SocketAddr = cfg.listen.parse().with_context(|| format!("listen = {:?}", cfg.listen))?;
+    let threads = cfg.front_threads();
     let t0 = std::time::Instant::now();
-    let sup = Supervisor::new(cfg, std::env::current_exe()?).await?;
-    let listener = tokio::net::TcpListener::bind(&listen)
-        .await
-        .with_context(|| format!("binding {listen}"))?;
-    eprintln!(
-        "nanovm: ready in {:.0?} on http://{listen}/ (stats: /_nanovm/stats)",
-        t0.elapsed()
-    );
+    let rt = runtime()?;
+    let sup = rt.block_on(Supervisor::new(cfg, std::env::current_exe()?, threads))?;
+    let first = rt.block_on(async { listener(addr) })?;
+    eprintln!("nanovm: ready in {:.0?} on http://{addr}/ (stats: /_nanovm/stats)", t0.elapsed());
+    for i in 1..threads {
+        let sup = sup.clone();
+        std::thread::Builder::new()
+            .name(format!("nanovm-front-{i}"))
+            .spawn(move || -> anyhow::Result<()> {
+                nanovm::link::set_thread(i);
+                let rt = runtime()?;
+                rt.block_on(async { front(sup, listener(addr)?).await })
+            })?;
+    }
+    // Thread 0 also runs the workers' reapers and egress links.
+    rt.block_on(front(sup, first))
+}
+
+fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread().enable_all().build()
+}
+
+fn listener(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    let sock = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    sock.set_reuseaddr(true)?;
+    sock.set_reuseport(true)?;
+    sock.bind(addr).with_context(|| format!("binding {addr}"))?;
+    Ok(sock.listen(1024)?)
+}
+
+async fn front(sup: Arc<Supervisor>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
     nanovm::server::serve_http1(listener, move |req| sup.clone().handle(req)).await
 }

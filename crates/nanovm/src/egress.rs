@@ -112,9 +112,9 @@ fn is_global_v4(ip: Ipv4Addr) -> bool {
         || o[0] >= 240)
 }
 
-/// A worker's connection to its supervisor, which makes the worker's
-/// outbound requests on its behalf.
-pub type Upstream = hyper::client::conn::http2::SendRequest<WasiBody>;
+/// A worker's link to its supervisor, which makes the worker's outbound
+/// requests on its behalf.
+pub type Upstream = Arc<crate::link::Dialer<WasiBody>>;
 
 /// Where an app's outbound requests go.
 #[derive(Clone)]
@@ -126,7 +126,7 @@ pub enum Route {
 }
 
 /// Marks a supervisor's answer to a forwarded request: `ok`, or the name of
-/// the `Error` the request failed with. The supervisor strips any copy the
+/// the `Error` the request failed with. Inserting it replaces any copy the
 /// upstream sent, so the worker can trust it.
 const VERDICT: &str = "x-nanovm-egress";
 const CONNECT_TIMEOUT: &str = "x-nanovm-connect-timeout-ms";
@@ -182,7 +182,7 @@ type Sent = (http::Response<WasiBody>, futures::future::BoxFuture<'static, Resul
 
 /// Hands a request to the supervisor and maps its verdict back to the error
 /// the guest would have seen from a direct send.
-async fn forward(mut req: http::Request<WasiBody>, options: Option<RequestOptions>, mut up: Upstream) -> Result<Sent, Error> {
+async fn forward(mut req: http::Request<WasiBody>, options: Option<RequestOptions>, up: Upstream) -> Result<Sent, Error> {
     let h = req.headers_mut();
     for (name, d) in [
         (CONNECT_TIMEOUT, options.and_then(|o| o.connect_timeout)),
@@ -193,8 +193,7 @@ async fn forward(mut req: http::Request<WasiBody>, options: Option<RequestOption
             h.insert(name, d.as_millis().to_string().parse().unwrap());
         }
     }
-    up.ready().await.map_err(|_| Error::ConnectionTerminated)?;
-    let mut res = up.send_request(req).await.map_err(|_| Error::ConnectionTerminated)?;
+    let mut res = up.send(req).await.map_err(|_| Error::ConnectionTerminated)?;
     let verdict = res.headers_mut().remove(VERDICT);
     match verdict.as_ref().map(|v| v.as_bytes()) {
         Some(b"ok") => Ok((
@@ -328,8 +327,7 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
     let res = tokio::time::timeout(first_byte_timeout, sender.send_request(req))
         .await
         .map_err(|_| Error::ConnectionReadTimeout)??;
-    let mut res = res.map(|b| b.map_err(Error::from).boxed_unsync());
-    res.headers_mut().remove(VERDICT);
+    let res = res.map(|b| b.map_err(Error::from).boxed_unsync());
     let conn = async move { conn.await.map_err(|_| Error::ConnectionTerminated)?.map_err(Error::from) };
     Ok((res, Box::pin(conn)))
 }

@@ -1,7 +1,7 @@
 //! The node's HTTP surface: `/{app}/{object}/{rest}` goes to the object, and
 //! `/_nanovm/stats` and `/_nanovm/events` serve the node's metrics and event
-//! log. In-process nodes serve HTTP/1.1 on TCP; a worker serves HTTP/2 to its
-//! supervisor over a socket.
+//! log. In-process nodes serve it on TCP; a worker serves it to its
+//! supervisor over a `link`.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -42,33 +42,6 @@ where
     }
 }
 
-/// Serves HTTP/2 on one private connection between a worker and its
-/// supervisor.
-pub async fn serve_h2<B, F, Fut>(io: tokio::net::UnixStream, f: F) -> anyhow::Result<()>
-where
-    B: http_body::Body<Data = Bytes> + Send + 'static,
-    B::Error: Into<crate::object::BoxError>,
-    F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
-    Fut: Future<Output = Response<B>> + Send + 'static,
-{
-    let svc = service_fn(move |req| {
-        let res = f(req);
-        async move { Ok::<_, Infallible>(res.await) }
-    });
-    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
-        .max_concurrent_streams(None)
-        .adaptive_window(true)
-        // h2 counts the streams it resets over the connection's whole life
-        // and drops the connection at 1024. Responses read only up to their
-        // Content-Length cause such resets in normal use; the only peer is
-        // the other end of the socketpair. (Rapid-reset protection is
-        // `max_pending_accept_reset_streams` and stays on.)
-        .max_local_error_reset_streams(None)
-        .serve_connection(TokioIo::new(io), svc)
-        .await?;
-    Ok(())
-}
-
 pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {
     let path = req.uri().path().to_string();
     if let Some(rest) = path.strip_prefix("/_nanovm") {
@@ -101,13 +74,10 @@ pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBod
         }
         Err(e) => return error_response(400, "bad-request-body", &e.to_string()),
     };
-    // HTTP/2 from a supervisor carries the host in the URI.
-    let authority = parts.uri.authority().map(|a| a.to_string());
     let host = parts
         .headers
         .get(http::header::HOST)
         .and_then(|h| h.to_str().ok())
-        .or(authority.as_deref())
         .unwrap_or("localhost");
     parts.uri = match format!("http://{host}{pq}").parse() {
         Ok(u) => u,

@@ -40,6 +40,10 @@ config! {
         /// this many cores, so short requests always find a free one. 0 means
         /// half the cores.
         heavy_lanes: usize = 0usize,
+        /// Threads serving the HTTP front end, each with its own runtime,
+        /// listener and connections to the workers. The supervisor needs about
+        /// a fifth of a request's CPU, so 0 means a quarter of the cores.
+        front_threads: usize = 0usize,
         /// When the supervisor runs as root, app `i`'s worker runs as uid and
         /// gid `jail_uid_base + i`.
         jail_uid_base: u32 = 200_000u32,
@@ -103,6 +107,13 @@ config! {
 }
 
 impl NodeConfig {
+    pub fn front_threads(&self) -> usize {
+        match self.front_threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| (n.get() / 4).max(1)),
+            n => n,
+        }
+    }
+
     pub fn heavy_lanes(&self) -> usize {
         match self.heavy_lanes {
             0 => std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),

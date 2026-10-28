@@ -3,10 +3,10 @@
 //! and makes every outbound request on the workers' behalf under their app's
 //! egress policy, so the network is reachable only from outside the jails.
 //!
-//! Each worker gets two socketpairs: on fd 3 the supervisor sends it requests
-//! over HTTP/2, and on fd 4 the worker sends the supervisor its guests'
-//! outbound requests. Its config and component arrive on stdin, read before
-//! the worker jails itself.
+//! Each worker gets two control sockets (see `link`): on fd 3 the supervisor
+//! hands it connections for requests, and on fd 4 the worker hands the
+//! supervisor connections for its guests' outbound requests. Its config and
+//! component arrive on stdin, read before the worker jails itself.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -15,7 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -23,29 +23,21 @@ use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
-use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+use tokio::sync::oneshot;
 
 use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
 use crate::jail::Jail;
+use crate::link::{self, Dialer};
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
 use crate::table::Node;
 
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
-
-/// A client for one end of a worker's socketpair; see `server::serve_h2`
-/// for why resets are not counted.
-fn h2_client() -> http2::Builder<TokioExecutor> {
-    let mut b = http2::Builder::new(TokioExecutor::new());
-    b.adaptive_window(true).max_local_error_reset_streams(None);
-    b
-}
 
 /// What a worker reads from stdin before the component bytes.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -62,6 +54,8 @@ const START_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct Supervisor {
     cfg: NodeConfig,
+    /// Front-end threads, each with its own pool of connections per worker.
+    threads: usize,
     /// The `nanovm` binary, run as `nanovm worker`.
     exe: PathBuf,
     workers: HashMap<String, Worker>,
@@ -72,18 +66,34 @@ struct Worker {
     index: u32,
     app: AppConfig,
     policy: Arc<EgressPolicy>,
-    tx: Mutex<Option<http2::SendRequest<Body>>>,
-    /// The running process. Locked while (re)starting, so starts are
-    /// single-flight; dropping a `Child` kills it.
-    child: tokio::sync::Mutex<Option<Child>>,
+    live: Mutex<Option<Arc<Live>>>,
+    /// Held while (re)starting, so starts are single-flight.
+    starting: tokio::sync::Mutex<()>,
     last_failure: Mutex<Option<Instant>>,
-    pid: AtomicU32,
     starts: AtomicU64,
+    /// Requests that failed between the supervisor and the worker.
+    link_errors: AtomicU64,
+}
+
+/// A running worker process.
+struct Live {
+    link: Arc<Dialer<Body>>,
+    pid: u32,
+    exited: Arc<AtomicBool>,
+    /// Dropping this kills the process.
+    _kill: oneshot::Sender<()>,
+}
+
+impl Worker {
+    fn live(&self) -> Option<Arc<Live>> {
+        self.live.lock().clone().filter(|l| !l.exited.load(Relaxed))
+    }
 }
 
 impl Supervisor {
     /// Starts a worker for every app; fails if any of them fails to start.
-    pub async fn new(cfg: NodeConfig, exe: PathBuf) -> anyhow::Result<Arc<Supervisor>> {
+    /// `threads` is the number of front-end threads that will call `handle`.
+    pub async fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
         let mut workers = HashMap::new();
         for (index, app) in cfg.apps.iter().enumerate() {
@@ -94,23 +104,23 @@ impl Supervisor {
                     index: index as u32,
                     app: app.clone(),
                     policy: Arc::new(policy),
-                    tx: Mutex::default(),
-                    child: Default::default(),
+                    live: Mutex::default(),
+                    starting: Default::default(),
                     last_failure: Mutex::default(),
-                    pid: AtomicU32::new(0),
                     starts: AtomicU64::new(0),
+                    link_errors: AtomicU64::new(0),
                 },
             );
         }
         let sup = Arc::new(Supervisor {
             cfg,
+            threads,
             exe,
             workers,
             started: Instant::now(),
         });
         for w in sup.workers.values() {
-            let mut child = w.child.lock().await;
-            sup.start(w, &mut child)
+            sup.start(w)
                 .await
                 .with_context(|| format!("starting the worker for app {:?}", w.app.name))?;
         }
@@ -140,41 +150,38 @@ impl Supervisor {
     }
 
     async fn forward(&self, w: &Worker, req: Request<Body>, pq: &str) -> Response<RespBody> {
-        let mut tx = match self.sender(w).await {
-            Ok(tx) => tx,
+        let live = match self.live(w).await {
+            Ok(l) => l,
             Err(res) => return res,
         };
         let (mut parts, body) = req.into_parts();
-        let host = parts
-            .headers
-            .get(http::header::HOST)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("localhost");
-        parts.uri = match format!("http://{host}{pq}").parse() {
+        parts.uri = match pq.parse() {
             Ok(u) => u,
             Err(_) => return error_response(400, "bad-uri", pq),
         };
-        match tx.send_request(Request::from_parts(parts, body)).await {
+        match live.link.send(Request::from_parts(parts, body)).await {
             Ok(res) => res.map(|b| b.map_err(Into::into).boxed_unsync()),
-            Err(e) => error_response(502, "worker-down", &e.to_string()),
+            Err(e) => {
+                w.link_errors.fetch_add(1, Relaxed);
+                error_response(502, "worker-down", &e.to_string())
+            }
         }
     }
 
-    /// The worker's connection, restarting the worker if it has died.
-    async fn sender(&self, w: &Worker) -> Result<http2::SendRequest<Body>, Response<RespBody>> {
-        let live = || w.tx.lock().as_ref().filter(|tx| !tx.is_closed()).cloned();
-        if let Some(tx) = live() {
-            return Ok(tx);
+    /// The running worker, restarting it if it has died.
+    async fn live(&self, w: &Worker) -> Result<Arc<Live>, Response<RespBody>> {
+        if let Some(l) = w.live() {
+            return Ok(l);
         }
-        let mut child = w.child.lock().await;
-        if let Some(tx) = live() {
-            return Ok(tx);
+        let _starting = w.starting.lock().await;
+        if let Some(l) = w.live() {
+            return Ok(l);
         }
         if w.last_failure.lock().is_some_and(|t| t.elapsed() < RESTART_BACKOFF) {
             return Err(error_response(503, "worker-restarting", &w.app.name));
         }
-        match self.start(w, &mut child).await {
-            Ok(()) => Ok(live().expect("just started")),
+        match self.start(w).await {
+            Ok(()) => Ok(w.live().expect("just started")),
             Err(e) => {
                 *w.last_failure.lock() = Some(Instant::now());
                 eprintln!("nanovm: worker for app {:?}: {e:#}", w.app.name);
@@ -185,9 +192,9 @@ impl Supervisor {
 
     /// Spawns `w`'s process, places it in its cgroup, hands it its config and
     /// component, and waits until it answers.
-    async fn start(&self, w: &Worker, child: &mut Option<Child>) -> anyhow::Result<()> {
+    async fn start(&self, w: &Worker) -> anyhow::Result<()> {
         // Kills the previous process, if any.
-        *child = None;
+        *w.live.lock() = None;
         let uid = (unsafe { libc::geteuid() } == 0).then(|| self.cfg.jail_uid_base + w.index);
         for d in self.cfg.app_dirs(&w.app.name) {
             std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
@@ -216,9 +223,9 @@ impl Supervisor {
                 Ok(())
             });
         }
-        let mut proc = cmd.spawn().with_context(|| format!("spawning {}", self.exe.display()))?;
+        let mut child = cmd.spawn().with_context(|| format!("spawning {}", self.exe.display()))?;
         drop((worker_requests, worker_egress));
-        let pid = proc.id().context("worker exited at once")?;
+        let pid = child.id().context("worker exited at once")?;
         if let Some(root) = &self.cfg.cgroup {
             place_in_cgroup(root, &w.app, pid)?;
         }
@@ -231,44 +238,50 @@ impl Supervisor {
             uid,
         })?;
         spec.push(b'\n');
-        let mut stdin = proc.stdin.take().expect("piped");
+        let mut stdin = child.stdin.take().expect("piped");
         stdin.write_all(&spec).await?;
         stdin.write_all(&wasm).await?;
         drop(stdin);
 
+        // Watches the process; dropping `kill` (with the `Live`) kills it.
+        let exited = Arc::new(AtomicBool::new(false));
+        let (kill, killed) = oneshot::channel::<()>();
+        let (app, gone) = (w.app.name.clone(), exited.clone());
+        tokio::spawn(async move {
+            tokio::select! {
+                status = child.wait() => eprintln!("nanovm: worker for app {app:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
+                _ = killed => {
+                    let _ = child.kill().await;
+                }
+            }
+            gone.store(true, Relaxed);
+        });
+
         let policy = w.policy.clone();
         egress.set_nonblocking(true)?;
-        let egress = tokio::net::UnixStream::from_std(egress)?;
-        tokio::spawn(crate::server::serve_h2(egress, move |req| {
+        tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, move |req| {
             let policy = policy.clone();
             async move { serve_forwarded(req, &policy).await }
         }));
 
-        requests.set_nonblocking(true)?;
-        let requests = tokio::net::UnixStream::from_std(requests)?;
-        let ready = tokio::time::timeout(START_TIMEOUT, async {
-            let (mut tx, conn) = h2_client().handshake(TokioIo::new(requests)).await?;
-            let app = w.app.name.clone();
-            tokio::spawn(async move {
-                if let Err(e) = conn.await {
-                    eprintln!("nanovm: worker for app {app:?}: {e:?}");
-                }
-            });
-            let res = tx.send_request(get("/_nanovm/stats")).await?;
-            anyhow::ensure!(res.status() == 200, "worker answered {}", res.status());
-            anyhow::Ok(tx)
+        let live = Arc::new(Live {
+            link: Dialer::new(requests, self.threads)?,
+            pid,
+            exited,
+            _kill: kill,
         });
-        let tx = match ready.await {
-            Ok(Ok(tx)) => tx,
-            Ok(Err(e)) => {
-                let status = proc.wait().await.map(|s| s.to_string()).unwrap_or_default();
-                bail!("worker exited ({status}): {e:#}");
-            }
+        let ready = tokio::time::timeout(START_TIMEOUT, async {
+            let res = live.link.send(get("/_nanovm/stats")).await?;
+            anyhow::ensure!(res.status() == 200, "worker answered {}", res.status());
+            res.into_body().collect().await?;
+            anyhow::Ok(())
+        });
+        match ready.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => bail!("worker did not start: {e:#}"),
             Err(_) => bail!("worker did not answer within {START_TIMEOUT:?}"),
-        };
-        *w.tx.lock() = Some(tx);
-        *child = Some(proc);
-        w.pid.store(pid, Relaxed);
+        }
+        *w.live.lock() = Some(live);
         w.starts.fetch_add(1, Relaxed);
         Ok(())
     }
@@ -277,13 +290,18 @@ impl Supervisor {
         let mut workers = serde_json::Map::new();
         let mut apps = serde_json::Map::new();
         for (name, w) in &self.workers {
-            let tx = w.tx.lock().as_ref().filter(|tx| !tx.is_closed()).cloned();
+            let live = w.live();
             workers.insert(
                 name.clone(),
-                json!({ "pid": w.pid.load(Relaxed), "starts": w.starts.load(Relaxed), "up": tx.is_some() }),
+                json!({
+                    "pid": live.as_ref().map(|l| l.pid),
+                    "starts": w.starts.load(Relaxed),
+                    "up": live.is_some(),
+                    "link_errors": w.link_errors.load(Relaxed),
+                }),
             );
-            if let Some(v) = match tx {
-                Some(mut tx) => get_json(&mut tx, "/_nanovm/stats").await,
+            if let Some(v) = match live {
+                Some(l) => get_json(&l.link, "/_nanovm/stats").await,
                 None => None,
             } {
                 apps.insert(name.clone(), v);
@@ -304,13 +322,14 @@ impl Supervisor {
 }
 
 fn get(pq: &str) -> Request<Body> {
-    Request::get(format!("http://worker{pq}"))
+    Request::get(pq)
+        .header(http::header::HOST, "worker")
         .body(Empty::new().map_err(|e| match e {}).boxed_unsync())
         .unwrap()
 }
 
-async fn get_json(tx: &mut http2::SendRequest<Body>, pq: &str) -> Option<Value> {
-    let res = tx.send_request(get(pq)).await.ok()?;
+async fn get_json(link: &Arc<Dialer<Body>>, pq: &str) -> Option<Value> {
+    let res = link.send(get(pq)).await.ok()?;
     let body = res.into_body().collect().await.ok()?.to_bytes();
     serde_json::from_slice(&body).ok()
 }
@@ -374,7 +393,6 @@ pub fn worker_main() -> anyhow::Result<()> {
     // else in this process owns them.
     let (requests, upstream) = unsafe { (UnixStream::from_raw_fd(3), UnixStream::from_raw_fd(4)) };
     requests.set_nonblocking(true)?;
-    upstream.set_nonblocking(true)?;
     // Raises the fd limit while that is still allowed.
     crate::engine::preflight(&cfg)?;
 
@@ -390,16 +408,9 @@ pub fn worker_main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        let upstream = tokio::net::UnixStream::from_std(upstream)?;
-        let (upstream, conn) = h2_client().handshake(TokioIo::new(upstream)).await?;
+        let upstream = Dialer::new(upstream, 1)?;
         let node = Node::from_wasm(cfg, vec![wasm], Some(upstream))?;
         let requests = tokio::net::UnixStream::from_std(requests)?;
-        let serve = crate::server::serve_h2(requests, move |req| crate::server::handle(node.clone(), req));
-        // Without its egress connection the worker can't do its job; exiting
-        // lets the supervisor start a fresh one.
-        tokio::select! {
-            r = serve => r,
-            r = conn => r.context("egress connection to the supervisor"),
-        }
+        link::serve(requests, move |req| crate::server::handle(node.clone(), req)).await
     })
 }

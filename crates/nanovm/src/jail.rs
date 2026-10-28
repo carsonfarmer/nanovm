@@ -188,6 +188,8 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
     );
     // Reading limits, never raising them.
     rules.insert(libc::SYS_prlimit64, vec![rule(vec![Cond::new(2, Qword, Eq, 0)?])?]);
+    // Making a received socket non-blocking (std uses this ioctl for it).
+    rules.insert(libc::SYS_ioctl, vec![rule(vec![Cond::new(1, Dword, Eq, libc::FIONBIO)?])?]);
     // tokio's signal driver wakes itself through a local socketpair, which
     // reaches nothing outside the process.
     rules.insert(libc::SYS_socketpair, vec![rule(vec![Cond::new(0, Dword, Eq, libc::AF_UNIX as u64)?])?]);

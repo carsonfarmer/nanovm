@@ -276,15 +276,15 @@ The goal: one node, as fast and secure as we can make it, that runs untrusted We
 - **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
 - **Out of scope for now:** clustering, one-shot runs of agent-written code, dashboards, static signing keys.
 
-## Phase 2: the Linux jail (in progress)
+## Phase 2: the Linux jail (done)
 
 ```
 client ─► proxy ─► supervisor (nanovm serve): no untrusted code
-                    │  HTTP/1 front end, routes /{app}/... to the app's worker
+                    │  HTTP/1 front end (front_threads), routes /{app}/... to the app's worker
                     │  per-app egress policy + public-IP filter + connect (the only network path)
                     │  spawns and restarts workers, places each in its cgroup
-                    ├── fd 3: HTTP/2 over a socketpair ──► worker "a"  (nanovm worker)
-                    └── fd 4: HTTP/2 over a socketpair ◄── worker "a"  outbound requests
+                    ├── fd 3: links for requests ──► worker "a"  (nanovm worker)
+                    └── fd 4: links for egress  ◄── worker "a"  outbound requests
                                                           one Node, one app; jailed:
                                                           own uid · Landlock · seccomp · cgroup
 ```
@@ -297,13 +297,17 @@ client ─► proxy ─► supervisor (nanovm serve): no untrusted code
   - **no_new_privs** and `PR_SET_PDEATHSIG`, so a worker dies with its supervisor.
 - **Mount and network namespaces were dropped from the Q23 plan.** Landlock already confines the filesystem, and seccomp's lack of `socket` already removes the network, so namespaces would be redundant defence.
 - **cgroup v2 (supervisor):** when `cgroup` is set, each worker goes into `<cgroup>/<app>` before it is handed anything. `memory.max`, `cpu.max` and `pids.max` come from the app's `[app.worker]` section.
-- **Egress:** in a worker, `EgressHooks` forwards each outbound request to the supervisor on fd 4. The per-object connection semaphore stays in the worker. The supervisor applies the allowlist, DNS and IP filter, then connects. A denial comes back as the same `ErrorCode` the guest saw before.
-- **Failure:** a worker that dies takes down only its app. In-flight requests get `502 worker-down`, and the next request restarts the worker.
+- **Links (`link.rs`), not HTTP/2.** Each direction is HTTP/1.1, one request per connection at a time, over socketpairs. The dialing side passes one end over a control socket with `SCM_RIGHTS` and pools the connections; a request runs inline in its own task at both ends.
+  - The first version used one HTTP/2 connection per worker. It was slower, because every request crossed a shared connection task in each process. It also died after 1,024 stream resets (see README).
+  - Each front-end thread has its own single-threaded runtime, `SO_REUSEPORT` listener and pool, so a request stays on one thread.
+- **Egress:** in a worker, `EgressHooks` forwards each outbound request to the supervisor over its egress link. The per-object connection semaphore stays in the worker. The supervisor applies the allowlist, DNS and IP filter, then connects. A denial comes back as the same `ErrorCode` the guest saw before.
+- **Failure:** a worker that dies takes down only its app. In-flight requests get `502 worker-down`, and the next request restarts the worker. A worker that fails to start isn't retried for 1 s. If the epoch thread ever dies, the worker aborts rather than run guests without CPU limits.
 - **Data APIs:**
   - `/_nanovm/stats` returns the supervisor's view plus each worker's stats, keyed by app.
   - `/_nanovm/events?app=<a>&since=` serves that worker's event log.
 - **In-process `Node`** stays the unit of the tests and benchmarks, and is what each worker runs. On macOS the same supervisor/worker topology runs without the Linux jail calls.
 - **Tests:** the hostile guest run through the supervisor. A jailed worker cannot open a socket, read another app's or the supervisor's files, or exec; egress policy is enforced by the supervisor; a killed worker is restarted.
+- **Cost (4-core sandbox, over HTTP with curl on the same cores):** about 0.1 ms more per request for one client, and about 25% less throughput at 64 in flight. In-process numbers are unchanged. README has the table.
 
 ## Next phases
 
