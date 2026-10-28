@@ -27,7 +27,7 @@ impl Jail {
     pub fn enter(self) -> anyhow::Result<()> {
         use anyhow::{Context, ensure};
         use landlock::{
-            ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+            ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
         };
 
         // SAFETY: plain syscalls on this process's own credentials.
@@ -54,7 +54,6 @@ impl Jail {
         };
         let status = Ruleset::default()
             .handle_access(AccessFs::from_all(abi))?
-            .scope(Scope::from_all(abi))?
             .create()?
             .add_rules(self.read_write.iter().map(|p| rule(p, AccessFs::from_all(abi))))?
             .add_rules(self.read_only.iter().map(|p| rule(p, AccessFs::from_read(abi))))?

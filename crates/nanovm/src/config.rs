@@ -63,7 +63,6 @@ pub struct AppConfig {
     /// Path to the wasip3 HTTP component.
     pub component: PathBuf,
     /// Host directory mounted read-only at `/app`.
-    #[serde(default)]
     pub static_dir: Option<PathBuf>,
     /// Extra environment variables visible to the guest.
     #[serde(default)]

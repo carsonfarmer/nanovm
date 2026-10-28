@@ -29,13 +29,24 @@ where
     loop {
         let (sock, _) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
-        let f = f.clone();
-        let svc = service_fn(move |req| {
-            let res = f(req);
-            async move { Ok::<_, Infallible>(res.await) }
-        });
-        tokio::spawn(http1::Builder::new().keep_alive(true).serve_connection(TokioIo::new(sock), svc));
+        serve_conn(sock, f.clone());
     }
+}
+
+/// Serves HTTP/1.1 on one connection, in its own task.
+pub fn serve_conn<I, F, Fut, B>(io: I, f: F)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Response<B>> + Send + 'static,
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<crate::object::BoxError>,
+{
+    let svc = service_fn(move |req| {
+        let res = f(req);
+        async move { Ok::<_, Infallible>(res.await) }
+    });
+    tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(io), svc));
 }
 
 pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {
@@ -79,7 +90,7 @@ pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBod
         Ok(u) => u,
         Err(_) => return error_response(400, "bad-uri", &pq),
     };
-    node.dispatch(app, id, Request::from_parts(parts, body)).await
+    node.dispatch(a, id, Request::from_parts(parts, body)).await
 }
 
 pub fn ok_json(v: serde_json::Value) -> Response<RespBody> {
@@ -104,25 +115,12 @@ async fn admin(node: &Arc<Node>, path: &str, req: &Request<Incoming>) -> Respons
 }
 
 fn stats(node: &Node) -> serde_json::Value {
-    let phases = node.phases();
-    let apps: Vec<_> = node
-        .apps
-        .values()
-        .map(|a| json!({ "name": &*a.name, "limits": a.cfg.limits }))
-        .collect();
     let mut v = serde_json::to_value(&*node.metrics).expect("metrics serialize");
-    v.as_object_mut().unwrap().extend(
-        json!({
-            "uptime_ms": node.started.elapsed().as_millis() as u64,
-            "rss_mb": rss_bytes() as f64 / 1048576.0,
-            "live_objects": node.live_objects(),
-            "max_live_objects": node.cfg.max_live_objects,
-            "phases": phases,
-            "apps": apps,
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
-    );
+    v["uptime_ms"] = json!(node.started.elapsed().as_millis() as u64);
+    v["rss_mb"] = json!(rss_bytes() as f64 / 1048576.0);
+    v["live_objects"] = json!(node.live_objects());
+    v["max_live_objects"] = json!(node.cfg.max_live_objects);
+    v["phases"] = json!(node.phases());
+    v["apps"] = node.apps.values().map(|a| json!({ "name": &*a.name, "limits": a.cfg.limits })).collect();
     v
 }

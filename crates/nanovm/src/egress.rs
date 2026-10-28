@@ -160,10 +160,16 @@ impl WasiHttpHooks for EgressHooks {
                     Route::Direct(policy) => send(request, options, &policy).await?,
                     Route::Supervisor(up) => forward(request, options, up).await?,
                 };
-                let io: IoFuture = Box::new(async move {
-                    let _permit = permit;
-                    conn.await
+                // The permit lives as long as the response body, so a guest
+                // holding bodies open holds that many connections.
+                let res = res.map(|b| {
+                    b.map_frame(move |f| {
+                        let _ = &permit;
+                        f
+                    })
+                    .boxed_unsync()
                 });
+                let io: IoFuture = Box::new(conn);
                 Ok((res, io))
             }
             .await;
@@ -231,8 +237,10 @@ pub async fn serve_forwarded(
     req: http::Request<hyper::body::Incoming>,
     policy: &EgressPolicy,
 ) -> http::Response<WasiBody> {
-    let ms = |name| {
-        let v = req.headers().get(name)?.to_str().ok()?.parse().ok()?;
+    let mut req = req.map(|b| b.map_err(Error::from).boxed_unsync());
+    // Taken off the request, so they never reach the upstream.
+    let mut ms = |name| {
+        let v = req.headers_mut().remove(name)?.to_str().ok()?.parse().ok()?;
         Some(Duration::from_millis(v))
     };
     let options = RequestOptions {
@@ -240,9 +248,6 @@ pub async fn serve_forwarded(
         first_byte_timeout: ms(FIRST_BYTE_TIMEOUT),
         between_bytes_timeout: None,
     };
-    let mut req = req.map(|b| b.map_err(Error::from).boxed_unsync());
-    req.headers_mut().remove(CONNECT_TIMEOUT);
-    req.headers_mut().remove(FIRST_BYTE_TIMEOUT);
     match send(req, Some(options), policy).await {
         Ok((mut res, _conn)) => {
             res.headers_mut().insert(VERDICT, "ok".parse().unwrap());

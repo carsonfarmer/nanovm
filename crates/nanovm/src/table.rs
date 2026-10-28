@@ -50,6 +50,7 @@ pub struct Node {
 impl Node {
     /// Builds a node from the components named in `cfg`, with direct egress.
     pub fn new(cfg: NodeConfig) -> anyhow::Result<Arc<Node>> {
+        crate::engine::preflight(&cfg)?;
         let mut wasm = Vec::new();
         for a in &cfg.apps {
             wasm.push(std::fs::read(&a.component).with_context(|| format!("reading {}", a.component.display()))?);
@@ -60,8 +61,9 @@ impl Node {
     /// Builds a node from component bytes, one per app in `cfg.apps`. With
     /// `upstream`, guests' outbound requests go to the supervisor instead of
     /// the network.
+    /// The caller has run `engine::preflight` (a jailed worker must, before
+    /// it jails itself).
     pub fn from_wasm(cfg: NodeConfig, wasm: Vec<Vec<u8>>, upstream: Option<Upstream>) -> anyhow::Result<Arc<Node>> {
-        crate::engine::preflight(&cfg)?;
         let engine = crate::engine::build(&cfg)?;
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
@@ -114,13 +116,10 @@ impl Node {
     /// object isn't live, and waits for the response.
     pub async fn dispatch(
         self: &Arc<Self>,
-        app: &str,
+        app: &Arc<App>,
         id: &str,
         req: http::Request<Bytes>,
     ) -> http::Response<RespBody> {
-        let Some(app) = self.apps.get(app) else {
-            return error_response(404, "no-such-app", app);
-        };
         if !valid_name(id) {
             return error_response(400, "bad-object-id", "object ids are [A-Za-z0-9_.-]{1,128}");
         }

@@ -15,7 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -39,14 +39,6 @@ use crate::table::Node;
 
 type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
-/// What a worker reads from stdin before the component bytes.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct WorkerSpec {
-    /// The node config with only this worker's app in `apps`.
-    node: NodeConfig,
-    uid: Option<u32>,
-}
-
 /// A worker that failed to start is not retried for this long.
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 /// Compiling a large component on first start can take a while.
@@ -67,9 +59,9 @@ struct Worker {
     app: AppConfig,
     policy: Arc<EgressPolicy>,
     live: Mutex<Option<Arc<Live>>>,
-    /// Held while (re)starting, so starts are single-flight.
-    starting: tokio::sync::Mutex<()>,
-    last_failure: Mutex<Option<Instant>>,
+    /// Held while (re)starting, so starts are single-flight; holds the time
+    /// of the last failed start.
+    starting: tokio::sync::Mutex<Option<Instant>>,
     starts: AtomicU64,
     /// Requests that failed between the supervisor and the worker.
     link_errors: AtomicU64,
@@ -79,14 +71,14 @@ struct Worker {
 struct Live {
     link: Arc<Dialer<Body>>,
     pid: u32,
-    exited: Arc<AtomicBool>,
-    /// Dropping this kills the process.
-    _kill: oneshot::Sender<()>,
+    /// Dropping this kills the process. It reads as closed once the process
+    /// is gone, because its watcher drops the receiver then.
+    kill: oneshot::Sender<()>,
 }
 
 impl Worker {
     fn live(&self) -> Option<Arc<Live>> {
-        self.live.lock().clone().filter(|l| !l.exited.load(Relaxed))
+        self.live.lock().clone().filter(|l| !l.kill.is_closed())
     }
 }
 
@@ -106,7 +98,6 @@ impl Supervisor {
                     policy: Arc::new(policy),
                     live: Mutex::default(),
                     starting: Default::default(),
-                    last_failure: Mutex::default(),
                     starts: AtomicU64::new(0),
                     link_errors: AtomicU64::new(0),
                 },
@@ -137,7 +128,9 @@ impl Supervisor {
                     return error_response(404, "no-such-app", "events take ?app=<name>&since=<seq>");
                 };
                 let pq = format!("/_nanovm/events?since={}", q.get("since").unwrap_or(&"0"));
-                return self.forward(w, req, &pq).await;
+                let (mut parts, body) = req.into_parts();
+                parts.uri = pq.parse().expect("a valid path");
+                return self.forward(w, Request::from_parts(parts, body)).await;
             }
             _ => {}
         }
@@ -145,21 +138,15 @@ impl Supervisor {
         let Some(w) = self.workers.get(app) else {
             return error_response(404, "no-such-app", app);
         };
-        let pq = req.uri().path_and_query().map_or("/", |p| p.as_str()).to_string();
-        self.forward(w, req, &pq).await
+        self.forward(w, req).await
     }
 
-    async fn forward(&self, w: &Worker, req: Request<Body>, pq: &str) -> Response<RespBody> {
+    async fn forward(&self, w: &Worker, req: Request<Body>) -> Response<RespBody> {
         let live = match self.live(w).await {
             Ok(l) => l,
             Err(res) => return res,
         };
-        let (mut parts, body) = req.into_parts();
-        parts.uri = match pq.parse() {
-            Ok(u) => u,
-            Err(_) => return error_response(400, "bad-uri", pq),
-        };
-        match live.link.send(Request::from_parts(parts, body)).await {
+        match live.link.send(req).await {
             Ok(res) => res.map(|b| b.map_err(Into::into).boxed_unsync()),
             Err(e) => {
                 w.link_errors.fetch_add(1, Relaxed);
@@ -173,17 +160,17 @@ impl Supervisor {
         if let Some(l) = w.live() {
             return Ok(l);
         }
-        let _starting = w.starting.lock().await;
+        let mut failed = w.starting.lock().await;
         if let Some(l) = w.live() {
             return Ok(l);
         }
-        if w.last_failure.lock().is_some_and(|t| t.elapsed() < RESTART_BACKOFF) {
+        if failed.is_some_and(|t| t.elapsed() < RESTART_BACKOFF) {
             return Err(error_response(503, "worker-restarting", &w.app.name));
         }
         match self.start(w).await {
             Ok(()) => Ok(w.live().expect("just started")),
             Err(e) => {
-                *w.last_failure.lock() = Some(Instant::now());
+                *failed = Some(Instant::now());
                 eprintln!("nanovm: worker for app {:?}: {e:#}", w.app.name);
                 Err(error_response(502, "worker-down", &format!("{e:#}")))
             }
@@ -234,13 +221,12 @@ impl Supervisor {
             place_in_cgroup(root, &w.app, pid)?;
         }
 
-        let mut spec = serde_json::to_vec(&WorkerSpec {
-            node: NodeConfig {
-                apps: vec![w.app.clone()],
-                ..self.cfg.clone()
-            },
-            uid,
-        })?;
+        // The worker's spec: the node config with only its app, and its uid.
+        let node = NodeConfig {
+            apps: vec![w.app.clone()],
+            ..self.cfg.clone()
+        };
+        let mut spec = serde_json::to_vec(&(node, uid))?;
         spec.push(b'\n');
         let mut stdin = child.stdin.take().expect("piped");
         stdin.write_all(&spec).await?;
@@ -261,9 +247,8 @@ impl Supervisor {
         });
 
         // Watches the process; dropping `kill` (with the `Live`) kills it.
-        let exited = Arc::new(AtomicBool::new(false));
         let (kill, killed) = oneshot::channel::<()>();
-        let (app, gone) = (w.app.name.clone(), exited.clone());
+        let app = w.app.name.clone();
         tokio::spawn(async move {
             tokio::select! {
                 status = child.wait() => eprintln!("nanovm: worker for app {app:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
@@ -271,7 +256,6 @@ impl Supervisor {
                     let _ = child.kill().await;
                 }
             }
-            gone.store(true, Relaxed);
         });
 
         let policy = w.policy.clone();
@@ -284,8 +268,7 @@ impl Supervisor {
         let live = Arc::new(Live {
             link: Dialer::new(requests, self.threads),
             pid,
-            exited,
-            _kill: kill,
+            kill,
         });
         let ready = tokio::time::timeout(START_TIMEOUT, async {
             let res = live.link.send(get("/_nanovm/stats")).await?;
@@ -322,10 +305,11 @@ impl Supervisor {
                     "link_errors": w.link_errors.load(Relaxed),
                 }),
             );
-            if let Some(v) = match live {
-                Some(l) => get_json(&l.link, "/_nanovm/stats").await,
-                None => None,
-            } {
+            if let Some(l) = live
+                && let Ok(res) = l.link.send(get("/_nanovm/stats")).await
+                && let Ok(body) = res.into_body().collect().await
+                && let Ok(v) = serde_json::from_slice::<Value>(&body.to_bytes())
+            {
                 apps.insert(name.clone(), v);
             }
         }
@@ -343,12 +327,6 @@ fn get(pq: &str) -> Request<Body> {
         .header(http::header::HOST, "worker")
         .body(Empty::new().map_err(|e| match e {}).boxed_unsync())
         .unwrap()
-}
-
-async fn get_json(link: &Arc<Dialer<Body>>, pq: &str) -> Option<Value> {
-    let res = link.send(get(pq)).await.ok()?;
-    let body = res.into_body().collect().await.ok()?.to_bytes();
-    serde_json::from_slice(&body).ok()
 }
 
 fn query(uri: &http::Uri) -> HashMap<&str, &str> {
@@ -402,21 +380,20 @@ pub fn worker_main() -> anyhow::Result<()> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let nl = input.iter().position(|&b| b == b'\n').context("no worker spec on stdin")?;
-    let spec: WorkerSpec = serde_json::from_slice(&input[..nl]).context("worker spec")?;
+    let (cfg, uid): (NodeConfig, Option<u32>) = serde_json::from_slice(&input[..nl]).context("worker spec")?;
     let wasm = input.split_off(nl + 1);
-    let cfg = spec.node;
     let app = cfg.apps.first().context("worker spec names no app")?;
     // SAFETY: the supervisor put these sockets at fds 3 and 4 and nothing
     // else in this process owns them.
     let (requests, upstream) = unsafe { (UnixStream::from_raw_fd(3), UnixStream::from_raw_fd(4)) };
     requests.set_nonblocking(true)?;
-    // Raises the fd limit while that is still allowed.
+    // Before the jail, which stops raising the fd limit and reading sysctls.
     crate::engine::preflight(&cfg)?;
 
     let mut read_only: Vec<PathBuf> = app.static_dir.iter().cloned().collect();
     read_only.push("/proc/self".into());
     Jail {
-        uid: spec.uid,
+        uid,
         read_write: cfg.app_dirs(&app.name).into(),
         read_only,
     }

@@ -191,13 +191,7 @@ where
     while let Some(fd) = recv_fd(&ctl).await? {
         let sock = std::os::unix::net::UnixStream::from(fd);
         sock.set_nonblocking(true)?;
-        let io = TokioIo::new(UnixStream::from_std(sock)?);
-        let f = f.clone();
-        let svc = hyper::service::service_fn(move |req| {
-            let res = f(req);
-            async move { Ok::<_, std::convert::Infallible>(res.await) }
-        });
-        tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(io, svc));
+        crate::server::serve_conn(UnixStream::from_std(sock)?, f.clone());
     }
     Ok(())
 }

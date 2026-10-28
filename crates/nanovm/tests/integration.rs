@@ -1102,3 +1102,45 @@ async fn unreachable_static_dir_fails_the_start_by_name() {
     };
     assert!(err.contains("private-static") && err.contains("Permission denied"), "{err}");
 }
+
+/// An upstream that answers with headers and the start of a large body,
+/// then stalls, so each response body stays open. Returns its port.
+async fn stalling_upstream() -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = upstream.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nstart").await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    port
+}
+
+/// `max_outbound_concurrency` (2 here) counts open response bodies, not just
+/// requests waiting for headers, both in-process and through the supervisor.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_response_bodies_count_against_outbound_concurrency() {
+    let port = stalling_upstream().await;
+    let path = format!("/hold?url=http://127.0.0.1:{port}/&n=3");
+    let mut cfg = node_cfg("open_bodies_in_process", 8, 60_000, 100);
+    cfg.apps[1].limits.egress.push(format!("127.0.0.1:{port}"));
+    let node = Node::new(cfg).unwrap();
+    let r = get(&node, "hostile", "h", &path).await;
+    assert_eq!(r.json()["held"], 2, "{}", r.body);
+    assert!(r.body.contains("ConnectionLimitReached"), "{}", r.body);
+
+    let mut cfg = node_cfg("open_bodies_supervised", 8, 60_000, 100);
+    cfg.apps[1].limits.egress.push(format!("127.0.0.1:{port}"));
+    let (_sup, addr) = supervised_with(cfg).await;
+    let (_, body) = http_get(addr, &format!("/hostile/h{path}")).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["held"], 2, "{body}");
+    assert!(body.contains("ConnectionLimitReached"), "{body}");
+}

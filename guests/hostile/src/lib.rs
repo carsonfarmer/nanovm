@@ -247,6 +247,25 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             }
         }
 
+        // Send `n` requests one after another, keeping every response body
+        // open and unread: each one holds an outbound connection.
+        "/hold" => {
+            let url = req.q("url").unwrap_or("http://example.com/").to_string();
+            let mut held = Vec::new();
+            for _ in 0..req.q_u64("n", 3) {
+                match send(&url, "GET").await {
+                    Ok(r) => held.push(r),
+                    Err(e) => {
+                        return json(
+                            200,
+                            format!("{{\"held\":{},\"denied\":{}}}", held.len(), js(&format!("{e:?}"))),
+                        );
+                    }
+                }
+            }
+            json(200, format!("{{\"held\":{}}}", held.len()))
+        }
+
         // Hold `n` host resources forever.
         "/leak" => {
             let n = req.q_u64("n", 1_000_000);
@@ -268,6 +287,16 @@ fn fs_fail(written: u64, e: &util::FsErrorCode) -> Result<Response, ErrorCode> {
 }
 
 async fn fetch(url: &str, method: &str) -> Result<(u16, Vec<u8>), ErrorCode> {
+    let response = send(url, method).await?;
+    let status = response.get_status_code();
+    let (result_tx, result_rx) = wit_future::new(|| Ok(()));
+    let (body_rx, _trailers) = Response::consume_body(response, result_rx);
+    let body = body_rx.collect().await;
+    drop(result_tx);
+    Ok((status, body))
+}
+
+async fn send(url: &str, method: &str) -> Result<Response, ErrorCode> {
     let (scheme, rest) = match url.split_once("://") {
         Some(("https", r)) => (Scheme::Https, r),
         Some(("http", r)) => (Scheme::Http, r),
@@ -291,11 +320,5 @@ async fn fetch(url: &str, method: &str) -> Result<(u16, Vec<u8>), ErrorCode> {
     let _ = request.set_scheme(Some(&scheme));
     let _ = request.set_authority(Some(authority));
     let _ = request.set_path_with_query(Some(path));
-    let response = wasip3::http::client::send(request).await?;
-    let status = response.get_status_code();
-    let (result_tx, result_rx) = wit_future::new(|| Ok(()));
-    let (body_rx, _trailers) = Response::consume_body(response, result_rx);
-    let body = body_rx.collect().await;
-    drop(result_tx);
-    Ok((status, body))
+    wasip3::http::client::send(request).await
 }

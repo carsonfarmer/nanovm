@@ -37,7 +37,10 @@ pub async fn request(node: &Arc<Node>, method: &str, app: &str, id: &str, path: 
         .uri(format!("http://localhost{path}"))
         .body(Bytes::from(body.to_string()))
         .unwrap();
-    let resp = node.dispatch(app, id, req).await;
+    let resp = match node.apps.get(app) {
+        Some(a) => node.dispatch(a, id, req).await,
+        None => nanovm::object::error_response(404, "no-such-app", app),
+    };
     let status = resp.status().as_u16();
     let error = resp
         .headers()
