@@ -21,13 +21,14 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         guest: [counter, hostile]
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/nanovm-${{ matrix.guest }}
       VERSION: 1.0.${{ github.run_number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
@@ -46,7 +47,7 @@ jobs:
             app.wasm:application/wasm \
             --format go-template='{{.digest}}' > digest.txt
           echo "digest=$(cat digest.txt)" >> "$GITHUB_OUTPUT"
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v3
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
