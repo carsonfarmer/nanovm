@@ -168,7 +168,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 38 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 39 integration tests, plus one that needs the internet and is ignored by default. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -189,6 +189,7 @@ The tests cover:
 - a killed worker restarted with its volumes intact, while its neighbour keeps serving
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
 - workers placed in their cgroups (where a writable cgroup v2 hierarchy exists)
+- a worker that can't reach its own directories failing to start, and saying which one
 
 ## Bugs the tests and benchmarks found
 
@@ -213,6 +214,7 @@ The tests cover:
 - **A signal could switch off CPU limits in a worker.** Stopping and continuing a jailed worker (strace did it) interrupted the epoch thread's sleep. The kernel resumes such a sleep through `restart_syscall`, which the first seccomp allowlist lacked, so the epoch thread panicked and exited. Without it, CPU budgets and deadlines go unenforced. `restart_syscall` is now allowed, and the process aborts if the epoch thread ever dies. `jail_blocks_escapes` stops and continues its probe mid-sleep.
 - **HTTP/2 to the workers dropped every connection after 1,024 resets.** The first version used one HTTP/2 connection per worker. hyper's HTTP/1 front end stops reading a body once it has its Content-Length, which resets the HTTP/2 stream. h2 counts those over the connection's whole life and sends GOAWAY at 1,024. The demo saw it as a worker restarting 9 times. It was also slower: every request crossed a shared connection task in each process. Links replaced it.
 - **Pooled links weren't reused.** The same early stop meant a link's response body was dropped before it saw its end, so the connection was closed instead of returned to the pool. The profile showed a socket closed per request. A link now goes back to the pool as soon as its body reports `is_end_stream`.
+- **A jail rule could vanish silently.** The Landlock crate skips a path it cannot open, so a `static_dir` the app's uid couldn't reach simply lost its rule. The worker then failed to load, and the supervisor killed it before it could print why. The jail now checks every path it grants, worker stderr is tagged into the supervisor's log, and a failed start reports the worker's last words.
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
 ## Layout
