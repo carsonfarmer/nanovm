@@ -51,6 +51,11 @@ config! {
         /// controllers enabled for its children. Each worker is placed in
         /// `<cgroup>/<app>` with that app's `[app.worker]` limits.
         cgroup: Option<PathBuf> = None::<PathBuf>,
+        /// The most a registry app gets: each of its limits is clamped to
+        /// these. Egress entries are the app's own.
+        registry_limits: Limits = Limits::default(),
+        /// Worker limits for every registry app.
+        registry_worker: WorkerLimits = WorkerLimits::default(),
         #[serde(rename = "app")]
         apps: Vec<AppConfig> = Vec::new(),
     }
@@ -105,6 +110,19 @@ config! {
     }
 }
 
+impl Limits {
+    /// `self` with every numeric limit capped at `max`'s.
+    pub fn clamped(&self, max: &Limits) -> Limits {
+        let (mut v, max) = (serde_json::json!(self), serde_json::json!(max));
+        for (k, x) in v.as_object_mut().expect("limits are a struct") {
+            if let (Some(a), Some(b)) = (x.as_u64(), max[k].as_u64()) {
+                *x = a.min(b).into();
+            }
+        }
+        serde_json::from_value(v).expect("same shape")
+    }
+}
+
 impl NodeConfig {
     pub fn front_threads(&self) -> usize {
         or_cores_over(self.front_threads, 4)
@@ -146,6 +164,13 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.registry_limits.memory_mb > self.memory_reservation_mb {
+            bail!(
+                "registry_limits.memory_mb {} exceeds memory_reservation_mb {}",
+                self.registry_limits.memory_mb,
+                self.memory_reservation_mb
+            );
+        }
         let mut seen = std::collections::HashSet::new();
         for app in &self.apps {
             if !crate::table::valid_name(&app.name) || app.name.starts_with('_') {

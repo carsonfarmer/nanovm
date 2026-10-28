@@ -11,6 +11,7 @@ pub mod link;
 pub mod metrics;
 pub mod object;
 pub mod quota;
+pub mod registry;
 pub mod server;
 pub mod supervisor;
 pub mod table;

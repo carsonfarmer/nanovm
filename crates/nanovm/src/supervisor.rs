@@ -3,6 +3,12 @@
 //! and makes every outbound request on the workers' behalf under their app's
 //! egress policy, so the network is reachable only from outside the jails.
 //!
+//! An app is local (from the node config) or comes from a registry, named
+//! per request by the proxy (`registry`). A request naming a digest the app's
+//! worker isn't running switches the app to it: the new version is fetched
+//! and verified, the old worker drains (no new requests; in-flight ones
+//! finish), and a fresh worker starts, so an object is never live in two.
+//!
 //! Each worker gets two control sockets (see `link`): on fd 3 the supervisor
 //! hands it connections for requests, and on fd 4 the worker hands the
 //! supervisor connections for its guests' outbound requests. Its config and
@@ -33,6 +39,8 @@ use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
 use crate::jail::Jail;
 use crate::link::{self, Dialer};
+use crate::registry::{APP_HEADER, AppRef, MIN_VERSION_HEADER, Registry, TRUST_HEADER};
+use crate::table::valid_name;
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
 use crate::table::Node;
@@ -50,14 +58,18 @@ pub struct Supervisor {
     threads: usize,
     /// The `nanovm` binary, run as `nanovm worker`.
     exe: PathBuf,
-    workers: HashMap<String, Worker>,
+    registry: Registry,
+    workers: Mutex<HashMap<String, Arc<Worker>>>,
+    /// Held while giving a new app its uid.
+    uids: Mutex<()>,
     started: Instant,
 }
 
 struct Worker {
-    index: u32,
-    app: AppConfig,
-    policy: Arc<EgressPolicy>,
+    name: String,
+    /// The app's config, for a local app; a registry app's comes with each
+    /// version.
+    local: Option<AppConfig>,
     live: Mutex<Option<Arc<Live>>>,
     /// Held while (re)starting, so starts are single-flight; holds the time
     /// of the last failed start.
@@ -67,87 +79,118 @@ struct Worker {
     link_errors: AtomicU64,
 }
 
-/// A running worker process.
+/// A running worker process. Every request to it, and every response body
+/// still being read, holds this; draining waits for them.
 struct Live {
     link: Arc<Dialer<Body>>,
     pid: u32,
+    /// The registry digest and version it runs (`None` for a local app).
+    digest: Option<String>,
+    version: Option<String>,
+    /// How long its longest request may take, to bound a drain.
+    drain: Duration,
     /// Dropping this kills the process. It reads as closed once the process
     /// is gone, because its watcher drops the receiver then.
     kill: oneshot::Sender<()>,
 }
 
 impl Worker {
+    fn new(name: &str, local: Option<AppConfig>) -> Arc<Worker> {
+        Arc::new(Worker {
+            name: name.to_string(),
+            local,
+            live: Mutex::default(),
+            starting: Default::default(),
+            starts: AtomicU64::new(0),
+            link_errors: AtomicU64::new(0),
+        })
+    }
+
     fn live(&self) -> Option<Arc<Live>> {
         self.live.lock().clone().filter(|l| !l.kill.is_closed())
     }
 }
 
 impl Supervisor {
-    /// Starts a worker for every app; fails if any of them fails to start.
-    /// `threads` is the number of front-end threads that will call `handle`.
+    /// Starts a worker for every local app; fails if any of them fails to
+    /// start. `threads` is the number of front-end threads that will call
+    /// `handle`.
     pub async fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
-        let mut workers = HashMap::new();
-        for (index, app) in cfg.apps.iter().enumerate() {
-            let policy = EgressPolicy::parse(&app.limits.egress).with_context(|| format!("app {:?} egress", app.name))?;
-            workers.insert(
-                app.name.clone(),
-                Worker {
-                    index: index as u32,
-                    app: app.clone(),
-                    policy: Arc::new(policy),
-                    live: Mutex::default(),
-                    starting: Default::default(),
-                    starts: AtomicU64::new(0),
-                    link_errors: AtomicU64::new(0),
-                },
-            );
-        }
+        let workers = cfg.apps.iter().map(|a| (a.name.clone(), Worker::new(&a.name, Some(a.clone())))).collect();
         let sup = Arc::new(Supervisor {
+            registry: Registry::new(cfg.data_dir.join("registry"))?,
             cfg,
             threads,
             exe,
-            workers,
+            workers: Mutex::new(workers),
+            uids: Mutex::default(),
             started: Instant::now(),
         });
-        for w in sup.workers.values() {
-            sup.start(w)
+        let local: Vec<_> = sup.workers.lock().values().cloned().collect();
+        for w in local {
+            sup.start(&w, None)
                 .await
-                .with_context(|| format!("starting the worker for app {:?}", w.app.name))?;
+                .with_context(|| format!("starting the worker for app {:?}", w.name))?;
         }
         Ok(sup)
     }
 
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
-        let req = req.map(|b| b.boxed_unsync());
+        let mut req = req.map(|b| b.boxed_unsync());
         match req.uri().path() {
             "/_nanovm/stats" => return self.stats().await,
             "/_nanovm/events" => {
                 let q: HashMap<_, _> = query(req.uri());
-                let Some(w) = q.get("app").and_then(|a| self.workers.get(*a)) else {
+                let Some(w) = q.get("app").and_then(|a| self.workers.lock().get(*a).cloned()) else {
                     return error_response(404, "no-such-app", "events take ?app=<name>&since=<seq>");
                 };
                 let pq = format!("/_nanovm/events?since={}", q.get("since").unwrap_or(&"0"));
                 let (mut parts, body) = req.into_parts();
                 parts.uri = pq.parse().expect("a valid path");
-                return self.forward(w, Request::from_parts(parts, body)).await;
+                return self.forward(&w, Request::from_parts(parts, body), None).await;
             }
             _ => {}
         }
-        let app = req.uri().path().trim_start_matches('/').split('/').next().unwrap_or("");
-        let Some(w) = self.workers.get(app) else {
-            return error_response(404, "no-such-app", app);
+        let want = match AppRef::from_headers(req.headers()) {
+            Ok(w) => w,
+            Err(e) => return error_response(400, "bad-app-ref", &format!("{e:#}")),
         };
-        self.forward(w, req).await
+        for h in [APP_HEADER, TRUST_HEADER, MIN_VERSION_HEADER] {
+            req.headers_mut().remove(h);
+        }
+        let app = req.uri().path().trim_start_matches('/').split('/').next().unwrap_or("");
+        let w = {
+            let mut workers = self.workers.lock();
+            match (workers.get(app), &want) {
+                (Some(w), Some(_)) if w.local.is_some() => {
+                    return error_response(409, "app-is-local", "a local app can't be named from a registry");
+                }
+                (Some(w), _) => w.clone(),
+                (None, Some(_)) if valid_name(app) && !app.starts_with('_') => {
+                    workers.entry(app.to_string()).or_insert_with(|| Worker::new(app, None)).clone()
+                }
+                (None, _) => return error_response(404, "no-such-app", app),
+            }
+        };
+        self.forward(&w, req, want.as_ref()).await
     }
 
-    async fn forward(&self, w: &Worker, req: Request<Body>) -> Response<RespBody> {
-        let live = match self.live(w).await {
+    async fn forward(&self, w: &Worker, req: Request<Body>, want: Option<&AppRef>) -> Response<RespBody> {
+        let live = match self.live(w, want).await {
             Ok(l) => l,
             Err(res) => return res,
         };
         match live.link.send(req).await {
-            Ok(res) => res.map(|b| b.map_err(Into::into).boxed_unsync()),
+            // The body holds the worker until it has been read; see `drain`.
+            Ok(res) => res.map(|b| {
+                b.map_frame(move |f| {
+                    let _ = &live;
+                    f
+                })
+                .map_err(Into::into)
+                .boxed_unsync()
+            }),
             Err(e) => {
                 w.link_errors.fetch_add(1, Relaxed);
                 error_response(502, "worker-down", &e.to_string())
@@ -155,42 +198,91 @@ impl Supervisor {
         }
     }
 
-    /// The running worker, restarting it if it has died.
-    async fn live(&self, w: &Worker) -> Result<Arc<Live>, Response<RespBody>> {
-        if let Some(l) = w.live() {
+    /// The worker running the version `want` names (any, if it names none),
+    /// starting or switching to it as needed.
+    async fn live(&self, w: &Worker, want: Option<&AppRef>) -> Result<Arc<Live>, Response<RespBody>> {
+        let wanted = || {
+            w.live()
+                .filter(|l| want.is_none_or(|r| l.digest.as_ref() == Some(&r.digest)))
+        };
+        if let Some(l) = wanted() {
             return Ok(l);
         }
         let mut failed = w.starting.lock().await;
-        if let Some(l) = w.live() {
+        if let Some(l) = wanted() {
             return Ok(l);
         }
         if failed.is_some_and(|t| t.elapsed() < RESTART_BACKOFF) {
-            return Err(error_response(503, "worker-restarting", &w.app.name));
+            return Err(error_response(503, "worker-restarting", &w.name));
         }
-        match self.start(w).await {
+        match self.start(w, want).await {
             Ok(()) => Ok(w.live().expect("just started")),
             Err(e) => {
                 *failed = Some(Instant::now());
-                eprintln!("nanovm: worker for app {:?}: {e:#}", w.app.name);
+                eprintln!("nanovm: worker for app {:?}: {e:#}", w.name);
                 Err(error_response(502, "worker-down", &format!("{e:#}")))
             }
         }
     }
 
-    /// Spawns `w`'s process, places it in its cgroup, hands it its config and
-    /// component, and waits until it answers.
-    async fn start(&self, w: &Worker) -> anyhow::Result<()> {
-        // Kills the previous process, if any.
-        *w.live.lock() = None;
-        let uid = (unsafe { libc::geteuid() } == 0).then(|| self.cfg.jail_uid_base + w.index);
-        for d in self.cfg.app_dirs(&w.app.name) {
+    /// The uid app `name` runs as when the supervisor is root: the owner of
+    /// its volumes if it has any, else the next free one. Ownership is the
+    /// record, so a uid survives restarts and config changes.
+    fn uid(&self, name: &str) -> anyhow::Result<Option<u32>> {
+        use std::os::unix::fs::MetadataExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return Ok(None);
+        }
+        let _one_at_a_time = self.uids.lock();
+        let base = self.cfg.jail_uid_base;
+        let objects = self.cfg.data_dir.join("objects");
+        let owner = |p: &Path| std::fs::metadata(p).ok().map(|m| m.uid()).filter(|&u| u >= base);
+        if let Some(uid) = owner(&objects.join(name)) {
+            return Ok(Some(uid));
+        }
+        let taken = std::fs::read_dir(&objects).into_iter().flatten().flatten();
+        let uid = taken.filter_map(|e| owner(&e.path())).max().map_or(base, |u| u + 1);
+        std::fs::create_dir_all(objects.join(name))?;
+        std::os::unix::fs::chown(objects.join(name), Some(uid), Some(uid))?;
+        Ok(Some(uid))
+    }
+
+    /// Gets the app version `want` names (or the local app), retires the
+    /// running worker, then spawns a new one, places it in its cgroup, hands
+    /// it its config and component, and waits until it answers.
+    async fn start(&self, w: &Worker, want: Option<&AppRef>) -> anyhow::Result<()> {
+        let (app, wasm, digest, version) = match (want, &w.local) {
+            (Some(r), _) => {
+                let p = self.registry.load(r).await.with_context(|| format!("loading {}", r.reference))?;
+                let app = AppConfig {
+                    name: w.name.clone(),
+                    component: PathBuf::new(),
+                    static_dir: None,
+                    env: p.spec.env,
+                    limits: p.spec.limits.clamped(&self.cfg.registry_limits),
+                    worker: self.cfg.registry_worker.clone(),
+                };
+                (app, p.wasm, Some(r.digest.clone()), Some(p.version.to_string()))
+            }
+            (None, Some(app)) => {
+                let wasm = std::fs::read(&app.component).with_context(|| format!("reading {}", app.component.display()))?;
+                (app.clone(), wasm, None, None)
+            }
+            (None, None) => bail!("requests for a registry app must name its version ({APP_HEADER})"),
+        };
+        let policy = EgressPolicy::parse(&app.limits.egress).context("egress")?;
+        let old = w.live.lock().take();
+        if let Some(old) = old {
+            drain(old).await;
+        }
+
+        let uid = self.uid(&w.name)?;
+        for d in self.cfg.app_dirs(&w.name) {
             std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
             if let Some(uid) = uid {
                 chown_tree(&d, uid)?;
             }
         }
-        // Read now; this is where a fetched and verified artifact will come from.
-        let wasm = std::fs::read(&w.app.component).with_context(|| format!("reading {}", w.app.component.display()))?;
 
         let (requests, worker_requests) = UnixStream::pair()?;
         let (egress, worker_egress) = UnixStream::pair()?;
@@ -218,12 +310,13 @@ impl Supervisor {
         drop((worker_requests, worker_egress));
         let pid = child.id().context("worker exited at once")?;
         if let Some(root) = &self.cfg.cgroup {
-            place_in_cgroup(root, &w.app, pid)?;
+            place_in_cgroup(root, &app, pid)?;
         }
 
         // The worker's spec: the node config with only its app, and its uid.
+        let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
         let node = NodeConfig {
-            apps: vec![w.app.clone()],
+            apps: vec![app],
             ..self.cfg.clone()
         };
         let mut spec = serde_json::to_vec(&(node, uid))?;
@@ -235,7 +328,7 @@ impl Supervisor {
 
         // The worker's stderr goes to ours, tagged with its app. It closes when
         // the worker exits, and the last line explains a failed start.
-        let app = w.app.name.clone();
+        let app = w.name.clone();
         let mut lines = tokio::io::BufReader::new(child.stderr.take().expect("piped")).lines();
         let last_words = tokio::spawn(async move {
             let mut last = String::new();
@@ -248,7 +341,7 @@ impl Supervisor {
 
         // Watches the process; dropping `kill` (with the `Live`) kills it.
         let (kill, killed) = oneshot::channel::<()>();
-        let app = w.app.name.clone();
+        let app = w.name.clone();
         tokio::spawn(async move {
             tokio::select! {
                 status = child.wait() => eprintln!("nanovm: worker for app {app:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
@@ -258,7 +351,7 @@ impl Supervisor {
             }
         });
 
-        let policy = w.policy.clone();
+        let policy = Arc::new(policy);
         egress.set_nonblocking(true)?;
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, move |req| {
             let policy = policy.clone();
@@ -268,6 +361,9 @@ impl Supervisor {
         let live = Arc::new(Live {
             link: Dialer::new(requests, self.threads),
             pid,
+            digest,
+            version,
+            drain,
             kill,
         });
         let ready = tokio::time::timeout(START_TIMEOUT, async {
@@ -294,12 +390,16 @@ impl Supervisor {
     async fn stats(&self) -> Response<RespBody> {
         let mut workers = serde_json::Map::new();
         let mut apps = serde_json::Map::new();
-        for (name, w) in &self.workers {
+        let all: Vec<_> = self.workers.lock().values().cloned().collect();
+        for w in all {
+            let name = w.name.clone();
             let live = w.live();
             workers.insert(
                 name.clone(),
                 json!({
                     "pid": live.as_ref().map(|l| l.pid),
+                    "digest": live.as_ref().and_then(|l| l.digest.clone()),
+                    "version": live.as_ref().and_then(|l| l.version.clone()),
                     "starts": w.starts.load(Relaxed),
                     "up": live.is_some(),
                     "link_errors": w.link_errors.load(Relaxed),
@@ -319,6 +419,16 @@ impl Supervisor {
             "workers": workers,
             "apps": apps,
         }))
+    }
+}
+
+/// Waits until nothing holds `old` but this (its requests have finished and
+/// their bodies have been read), or its longest request has had its time,
+/// then drops it, which kills the process.
+async fn drain(old: Arc<Live>) {
+    let deadline = Instant::now() + old.drain;
+    while Arc::strong_count(&old) > 1 && Instant::now() < deadline && !old.kill.is_closed() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
