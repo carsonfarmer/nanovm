@@ -72,6 +72,9 @@ pub struct AppConfig {
     /// Extra environment variables visible to the guest.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Values the guest reads through `wasi:config/store`.
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]

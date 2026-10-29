@@ -237,6 +237,7 @@ pub struct ObjState {
     /// The app's shared `/app` preopen; see `App::static_dir`.
     pub app_dir: Option<wasmtime_wasi::filesystem::Dir>,
     pub quota: QuotaGuard,
+    pub(crate) config: Arc<wasmtime_wasi_config::WasiConfigVariables>,
     _tmp: TmpDir,
 }
 
@@ -318,6 +319,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         stderr,
         app_dir: app.static_dir.clone(),
         quota,
+        config: app.config.clone(),
         _tmp: tmp,
     };
 

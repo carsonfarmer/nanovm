@@ -1675,6 +1675,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "wasmtime",
  "wasmtime-wasi",
+ "wasmtime-wasi-config",
  "wasmtime-wasi-http",
  "webpki-roots",
 ]
@@ -3583,6 +3584,15 @@ dependencies = [
  "wasmtime-wasi-io",
  "wiggle",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmtime-wasi-config"
+version = "50.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92a33412b98848a2eae64338956f5171de3f4552774a38e8bfe6b7ed8e55d5e"
+dependencies = [
+ "wasmtime",
 ]
 
 [[package]]

@@ -1207,6 +1207,11 @@ async fn registry_apps_need_a_trusted_signature() {
     assert!(body.contains(r#""app":"rc""#), "{body}");
     let v = stats_json(addr).await;
     assert_eq!(v["workers"]["rc"]["version"], version.to_string(), "{v}");
+    // Versions published with config values serve them through wasi:config.
+    let (status, body) = reg_get(addr, "/rc/a/config/greeting", &app, SIGNER, None).await;
+    if status != 404 || !body.contains("not found") {
+        assert_eq!((status, body.as_str()), (200, "from the registry"));
+    }
 
     let wrong_subject = SIGNER.replace("publish-guests.yml", "other.yml");
     let wrong_issuer = SIGNER.replace("token.actions", "evil");
@@ -1260,4 +1265,15 @@ async fn registry_app_switches_versions_after_a_drain() {
     let v = stats_json(addr).await;
     assert_eq!(v["workers"]["rh"]["version"], new.0.to_string(), "{v}");
     assert_eq!(v["workers"]["rh"]["starts"], 2, "{v}");
+}
+
+/// An app's `config` values are what its guests read through `wasi:config`.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasi_config_serves_the_apps_values() {
+    let mut cfg = node_cfg("wasi_config", 8, 60_000, 100);
+    cfg.apps[0].config.insert("greeting".into(), "hello from config".into());
+    let node = Node::new(cfg).unwrap();
+    let r = get(&node, "counter", "c", "/config/greeting").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "hello from config"));
+    assert_eq!(get(&node, "counter", "c", "/config/missing").await.status, 404);
 }

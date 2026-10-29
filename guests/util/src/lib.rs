@@ -10,6 +10,12 @@ use wasip3::{wit_future, wit_stream};
 
 pub use wasip3;
 
+/// `wasi:config/store`: the app's config values.
+pub mod config {
+    wit_bindgen::generate!({ path: "../../wit/config", world: "wasi:config/imports", generate_all });
+    pub use wasi::config::store::*;
+}
+
 /// A fully-read incoming request.
 pub struct Req {
     pub method: String,

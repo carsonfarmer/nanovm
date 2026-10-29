@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 wasip3.workspace = true
+wit-bindgen = "0.62"

@@ -59,6 +59,11 @@ async fn route(req: Req, hits: u64) -> Result<Response, ErrorCode> {
             Ok(b) => util::respond(200, "text/plain; charset=utf-8", b),
             Err(e) => text(404, util::fs_err(&e)),
         },
+        ("GET", p) if p.starts_with("/config/") => match util::config::get(&p[8..]) {
+            Ok(Some(v)) => text(200, v),
+            Ok(None) => text(404, "no such config key"),
+            Err(e) => text(500, format!("{e:?}")),
+        },
         (m, p) if p.starts_with("/kv/") => {
             let key = &p[4..];
             if !valid_key(key) {
