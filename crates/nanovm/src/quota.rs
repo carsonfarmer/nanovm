@@ -122,7 +122,24 @@ impl QuotaGuard {
         Ok(())
     }
 
-    fn check_new_entry(&self) -> Result<(), ErrorCode> {
+    /// Makes room to replace a file of `old` bytes (`None`: a new file) with
+    /// one of `new` bytes, or refuses as a full disk would.
+    pub fn reserve(&self, old: Option<u64>, new: u64) -> Result<(), ErrorCode> {
+        let mut q = self.0.lock();
+        if old.is_none() && q.files >= q.max_files {
+            let what = format!("entry limit reached ({} files)", q.max_files);
+            return Err(q.deny(ErrorCode::Quota, what));
+        }
+        let freed = old.unwrap_or(0).min(q.bytes);
+        if (q.bytes - freed).saturating_add(new) > q.max_bytes {
+            return Err(q.full());
+        }
+        q.bytes = q.bytes - freed + new;
+        q.files += u64::from(old.is_none());
+        Ok(())
+    }
+
+    pub fn check_new_entry(&self) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
         if q.files >= q.max_files {
             let what = format!("entry limit reached ({} files)", q.max_files);
@@ -135,7 +152,7 @@ impl QuotaGuard {
         self.0.lock().deny(code, what.to_string()).into()
     }
 
-    fn adjust(&self, bytes: i64, files: i64) {
+    pub fn adjust(&self, bytes: i64, files: i64) {
         let mut q = self.0.lock();
         q.bytes = q.bytes.saturating_add_signed(bytes);
         q.files = q.files.saturating_add_signed(files);

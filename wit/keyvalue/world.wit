@@ -1,0 +1,9 @@
+package wasi:keyvalue@0.2.0-draft;
+
+/// The interfaces nanovm offers objects (from wasmtime-wasi-keyvalue 50,
+/// without `watch`).
+world imports {
+	import store;
+	import atomics;
+	import batch;
+}

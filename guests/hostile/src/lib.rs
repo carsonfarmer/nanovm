@@ -266,6 +266,52 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             json(200, format!("{{\"held\":{}}}", held.len()))
         }
 
+        // wasi:keyvalue: `op` is fill (n keys of `size` bytes until refused),
+        // key (one key `len` bytes long), incr (`delta` on `key`), list (a
+        // page from `cursor`) or open (bucket `name`).
+        "/kv" => {
+            use util::kv::{atomics, store};
+            let q = |k| req.q(k).unwrap_or("").to_string();
+            let err = |e: store::Error| js(&format!("{e:?}"));
+            let bucket = match store::open(&q("name")) {
+                Ok(b) => b,
+                Err(e) => return json(200, format!("{{\"opened\":false,\"error\":{}}}", err(e))),
+            };
+            let out = match q("op").as_str() {
+                "fill" => {
+                    let value = vec![7u8; req.q_u64("size", 1) as usize];
+                    let mut n = 0;
+                    let mut error = String::from("null");
+                    while n < req.q_u64("n", 1_000_000) {
+                        if let Err(e) = bucket.set(&format!("k{n}"), &value) {
+                            error = err(e);
+                            break;
+                        }
+                        n += 1;
+                    }
+                    format!("{{\"set\":{n},\"error\":{error}}}")
+                }
+                "key" => match bucket.set(&"k".repeat(req.q_u64("len", 1) as usize), b"v") {
+                    Ok(()) => "{\"set\":true}".to_string(),
+                    Err(e) => format!("{{\"error\":{}}}", err(e)),
+                },
+                "incr" => match atomics::increment(&bucket, &q("key"), req.q_u64("delta", 1)) {
+                    Ok(n) => format!("{{\"value\":{n}}}"),
+                    Err(e) => format!("{{\"error\":{}}}", err(e)),
+                },
+                "list" => match bucket.list_keys(req.q("cursor").and_then(|c| c.parse().ok())) {
+                    Ok(r) => format!(
+                        "{{\"keys\":{},\"cursor\":{}}}",
+                        r.keys.len(),
+                        r.cursor.map_or("null".to_string(), |c| c.to_string())
+                    ),
+                    Err(e) => format!("{{\"error\":{}}}", err(e)),
+                },
+                _ => "{\"opened\":true}".to_string(),
+            };
+            json(200, out)
+        }
+
         // Hold `n` host resources forever.
         "/leak" => {
             let n = req.q_u64("n", 1_000_000);

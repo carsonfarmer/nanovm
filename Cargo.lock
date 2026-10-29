@@ -1649,6 +1649,7 @@ name = "nanovm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "futures",
  "http",
@@ -1675,7 +1676,9 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "wasmtime",
  "wasmtime-wasi",
+ "wasmtime-wasi-config",
  "wasmtime-wasi-http",
+ "wasmtime-wasi-keyvalue",
  "webpki-roots",
 ]
 
@@ -3586,6 +3589,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtime-wasi-config"
+version = "50.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d92a33412b98848a2eae64338956f5171de3f4552774a38e8bfe6b7ed8e55d5e"
+dependencies = [
+ "wasmtime",
+]
+
+[[package]]
 name = "wasmtime-wasi-http"
 version = "50.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3621,6 +3633,15 @@ dependencies = [
  "bytes",
  "futures",
  "tracing",
+ "wasmtime",
+]
+
+[[package]]
+name = "wasmtime-wasi-keyvalue"
+version = "50.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a73ef6f30ac72ce608f061d1f4d05628a485ad133c16a3e19bbe871397e0167"
+dependencies = [
  "wasmtime",
 ]
 

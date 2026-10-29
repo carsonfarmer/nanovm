@@ -10,6 +10,12 @@ use wasip3::{wit_future, wit_stream};
 
 pub use wasip3;
 
+/// `wasi:keyvalue` (store, atomics, batch), as nanovm offers it.
+pub mod kv {
+    wit_bindgen::generate!({ path: "../../wit/keyvalue", world: "wasi:keyvalue/imports", generate_all });
+    pub use wasi::keyvalue::*;
+}
+
 /// A fully-read incoming request.
 pub struct Req {
     pub method: String,

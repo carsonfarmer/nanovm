@@ -31,6 +31,9 @@ sigstore-verify = "0.15.1"
 sigstore-trust-root = "0.15.1"
 semver = "1"
 sigstore-types = "0.15.1"
+wasmtime-wasi-keyvalue = "50.0.0"
+wasmtime-wasi-config = "50.0.0"
+base64 = "0.22"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"

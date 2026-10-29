@@ -226,7 +226,7 @@ impl Drop for TmpDir {
 
 pub struct ObjState {
     wasi: WasiCtx,
-    table: ResourceTable,
+    pub(crate) table: ResourceTable,
     http: WasiHttpCtx,
     hooks: EgressHooks,
     limiter: MemLimiter,
@@ -237,6 +237,8 @@ pub struct ObjState {
     /// The app's shared `/app` preopen; see `App::static_dir`.
     pub app_dir: Option<wasmtime_wasi::filesystem::Dir>,
     pub quota: QuotaGuard,
+    /// The host directory behind `/data`.
+    pub(crate) volume: std::path::PathBuf,
     _tmp: TmpDir,
 }
 
@@ -318,6 +320,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         stderr,
         app_dir: app.static_dir.clone(),
         quota,
+        volume: data_dir.clone(),
         _tmp: tmp,
     };
 

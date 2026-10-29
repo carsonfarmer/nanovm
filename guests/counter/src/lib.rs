@@ -1,5 +1,5 @@
 //! A benign durable object: an in-memory hit counter (lost on eviction), a
-//! persisted counter in `/data/count` and a tiny key-value store in `/data/kv`.
+//! persisted counter in `/data/count` and `/kv/{key}` on its `wasi:keyvalue` store.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -70,24 +70,27 @@ async fn route(req: Req, hits: u64) -> Result<Response, ErrorCode> {
     }
 }
 
+/// The object's `wasi:keyvalue` default bucket.
 async fn kv(method: &str, key: &str, body: Vec<u8>) -> Result<Response, ErrorCode> {
-    let Some(data) = util::mount("/data") else {
-        return text(500, "no /data");
+    use util::kv::store;
+    let bucket = match store::open("") {
+        Ok(b) => b,
+        Err(e) => return text(500, format!("{e:?}")),
     };
-    let _ = data.create_directory_at("kv".to_string()).await;
-    let path = format!("kv/{key}");
+    let fail = |e: store::Error| json(507, format!("{{\"error\":{}}}", js(&format!("{e:?}"))));
     match method {
-        "GET" => match util::read_file("/data", &path).await {
-            Ok(b) => util::respond(200, "application/octet-stream", b),
-            Err(e) => text(404, util::fs_err(&e)),
+        "GET" => match bucket.get(key) {
+            Ok(Some(v)) => util::respond(200, "application/octet-stream", v),
+            Ok(None) => text(404, "no such key"),
+            Err(e) => fail(e),
         },
-        "PUT" | "POST" => match util::write_file_atomic("/data", &path, body).await {
+        "PUT" | "POST" => match bucket.set(key, &body) {
             Ok(()) => text(204, ""),
-            Err(e) => json(507, format!("{{\"error\":{}}}", js(&util::fs_err(&e)))),
+            Err(e) => fail(e),
         },
-        "DELETE" => match data.unlink_file_at(path).await {
+        "DELETE" => match bucket.delete(key) {
             Ok(()) => text(204, ""),
-            Err(e) => text(404, util::fs_err(&e)),
+            Err(e) => fail(e),
         },
         _ => text(405, "method not allowed"),
     }

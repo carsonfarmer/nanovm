@@ -1261,3 +1261,86 @@ async fn registry_app_switches_versions_after_a_drain() {
     assert_eq!(v["workers"]["rh"]["version"], new.0.to_string(), "{v}");
     assert_eq!(v["workers"]["rh"]["starts"], 2, "{v}");
 }
+
+// ---- wasi:keyvalue -------------------------------------------------------
+
+/// Values survive the instance, live in the object's own volume, and go away
+/// when deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_values_persist_in_the_volume() {
+    let node = node("kv_values_persist", 8, 60_000);
+    assert_eq!(request(&node, "PUT", "counter", "k", "/kv/greeting", "hello").await.status, 204);
+    assert_eq!(get(&node, "counter", "k", "/kv/greeting").await.body, "hello");
+    assert_eq!(get(&node, "counter", "other", "/kv/greeting").await.status, 404, "objects don't share keys");
+
+    node.shutdown().await;
+    assert_eq!(get(&node, "counter", "k", "/kv/greeting").await.body, "hello", "a new instance sees it");
+    let file = node.cfg.data_dir.join("objects/counter/k/.kv/default/Z3JlZXRpbmc");
+    assert_eq!(std::fs::read(file).unwrap(), b"hello");
+
+    assert_eq!(request(&node, "DELETE", "counter", "k", "/kv/greeting", "").await.status, 204);
+    assert_eq!(get(&node, "counter", "k", "/kv/greeting").await.status, 404);
+}
+
+/// Keys count against the object's file limit and values against its disk
+/// budget, which `/data` and `/tmp` share.
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_counts_against_the_disk_quota() {
+    let node = node("kv_quota", 8, 60_000);
+    // An 8 MiB budget holds exactly eight 1 MiB values.
+    let r = get(&node, "hostile", "q", "/kv?op=fill&size=1048576&n=100").await;
+    assert_eq!(r.json()["set"], 8, "{}", r.body);
+    assert!(r.body.contains("InsufficientSpace"), "{}", r.body);
+    // The filesystem sees the same budget as spent.
+    let r = get(&node, "hostile", "q", "/fill?mount=tmp&mb=2").await;
+    assert!(r.body.contains("insufficient-space"), "{}", r.body);
+
+    // 200 entries: the two bucket directories, then one file per key.
+    let r = get(&node, "hostile", "f", "/kv?op=fill&size=1").await;
+    assert_eq!(r.json()["set"], 198, "{}", r.body);
+    assert!(r.body.contains("Quota"), "{}", r.body);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_refuses_bad_names_and_pages_keys() {
+    // Writing 1,500 keys takes real CPU; give it room on a loaded host.
+    let mut cfg = node_cfg("kv_refuses", 8, 60_000, 5_000);
+    cfg.apps[1].limits.max_files = 3000;
+    cfg.apps[1].limits.request_timeout_ms = 10_000;
+    let node = Node::new(cfg).unwrap();
+    let call = |path: &'static str| {
+        let node = node.clone();
+        async move { get(&node, "hostile", "b", path).await }
+    };
+    assert!(call("/kv?op=key&len=180").await.body.contains(r#""set":true"#));
+    assert!(call("/kv?op=key&len=181").await.body.contains("keys are 1 to 180 bytes"));
+    assert!(call("/kv?op=key&len=0").await.body.contains("keys are 1 to 180 bytes"));
+    for name in ["../x", ".kv", "a/b", &"n".repeat(65)] {
+        let r = get(&node, "hostile", "b", &format!("/kv?name={name}")).await;
+        assert!(r.body.contains("NoSuchStore"), "{name}: {}", r.body);
+    }
+    assert_eq!(call("/kv?op=incr&key=c&delta=5").await.json()["value"], 5);
+    assert_eq!(call("/kv?op=incr&key=c&delta=5").await.json()["value"], 10);
+    assert!(call("/kv?op=incr&key=c&delta=18446744073709551615").await.body.contains("overflow"));
+    let not_a_number = "k".repeat(180);
+    let r = get(&node, "hostile", "b", &format!("/kv?op=incr&key={not_a_number}")).await;
+    assert!(r.body.contains("not a number"), "{}", r.body);
+
+    let r = get(&node, "hostile", "p", "/kv?name=paged&op=fill&size=1&n=1500").await;
+    assert_eq!(r.json()["set"], 1500, "{}", r.body);
+    let page = get(&node, "hostile", "p", "/kv?name=paged&op=list").await.json();
+    assert_eq!((page["keys"].as_u64(), page["cursor"].as_u64()), (Some(1000), Some(1000)));
+    let page = get(&node, "hostile", "p", "/kv?name=paged&op=list&cursor=1000").await.json();
+    assert_eq!((page["keys"].as_u64(), page["cursor"].as_u64()), (Some(500), None));
+}
+
+/// Key-value works inside the jail (Landlock and seccomp allow its file calls).
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_works_in_a_jailed_worker() {
+    let (_sup, addr) = supervised("kv_works_in_a_jailed_worker").await;
+    let put = "PUT /counter/j/kv/a HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
+    assert_eq!(raw(addr, put, b"hi").await.0, 204);
+    assert_eq!(http_get(addr, "/counter/j/kv/a").await.1, "hi");
+    let (_, body) = http_get(addr, "/hostile/j/kv?op=list").await;
+    assert!(body.contains(r#""keys":0"#), "{body}");
+}
