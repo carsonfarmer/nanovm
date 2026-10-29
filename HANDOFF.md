@@ -17,7 +17,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 - **Tests:** 51 integration tests pass, plus 5 unit tests. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.
   - `cpu_hogs_leave_cores_for_short_requests` is load-sensitive and fails occasionally when the whole suite runs at once on 4 cores; it passes alone.
   - When guests change, the first run can fail one supervised test with `Permission denied`. The test nodes share one `.cwasm` cache between root in-process nodes and jailed workers. A rerun passes.
-- **Runtime size:** about 4,670 lines (3,704 after phase 3; kv and config added about 300, WebSockets about 670 with the review fixes).
+- **Runtime size:** about 4,650 lines (3,704 after phase 3; kv and config added about 300, WebSockets about 640 after two reviews and a reduction pass).
 - **The repo `carsonfarmer/nanovm` is now public**, so GitHub artifact attestations work. The packages `ghcr.io/carsonfarmer/nanovm-{counter,hostile}` are public. `publish-guests.yml` runs on pushes to `guests/**` and on `gh workflow run publish-guests.yml` (dispatch works through the proxy, and `gh run watch <id>` shows progress). Each run publishes version `1.0.<run number>`.
 - **Old branches** (`jail`, `simplify`, `oci`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical.
 

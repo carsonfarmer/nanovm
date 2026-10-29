@@ -35,7 +35,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
 
-use crate::config::{AppConfig, Limits, NodeConfig};
+use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
 use crate::jail::Jail;
 use crate::link::{self, Dialer};
@@ -91,7 +91,6 @@ struct Live {
     version: Option<String>,
     /// How long its longest request may take, to bound a drain.
     drain: Duration,
-    limits: Limits,
     sockets: Arc<Sockets>,
     /// Reads as changed once the process is gone, closing its sockets.
     gone: watch::Receiver<()>,
@@ -206,15 +205,7 @@ impl Supervisor {
         let Some(object) = req.uri().path().split('/').nth(2).filter(|o| valid_name(o)).map(str::to_string) else {
             return error_response(400, "bad-object-id", "object ids are [A-Za-z0-9_.-]{1,128}");
         };
-        let caps = ws::Caps {
-            total: &self.sockets,
-            max_total: self.cfg.max_sockets,
-            per_object: live.limits.max_sockets,
-            request_max: (live.limits.max_request_body_kb << 10) as usize,
-            response_max: (live.limits.max_response_body_kb << 10) as usize,
-            backlog: (live.limits.socket_backlog_kb << 10) as usize,
-        };
-        let (weak, max) = (Arc::downgrade(&live), caps.response_max);
+        let (weak, max) = (Arc::downgrade(&live), live.sockets.caps.response_max);
         let deliver: ws::Deliver = Box::new(move |req| {
             let (w, weak) = (w.clone(), weak.clone());
             Box::pin(async move {
@@ -223,13 +214,18 @@ impl Supervisor {
                 };
                 match live.link.send(req).await {
                     Ok(res) => ws::answer(res, max).await,
+                    Err(_) if w.live().is_some_and(|c| Arc::ptr_eq(&c, &live)) => ws::Reply::Bad(502),
                     Err(_) => ws::Reply::Gone,
                 }
             })
         });
         let (sockets, gone) = (live.sockets.clone(), live.gone.clone());
         drop(live);
-        match sockets.open(&object, req, caps, gone, deliver).await {
+        // Its own task: a client that hangs up mid-`OPEN` would otherwise
+        // cancel it after the object accepted, and the object would never
+        // hear the socket ended.
+        let open = tokio::spawn(async move { sockets.open(&object, req, gone, deliver).await });
+        match open.await.unwrap_or(Err((500, "opening the socket failed"))) {
             Ok(res) => res.map(|()| Empty::new().map_err(|e| match e {}).boxed_unsync()),
             Err((status, why)) => {
                 let mut res = error_response(status, "socket-refused", why);
@@ -379,7 +375,16 @@ impl Supervisor {
 
         // The worker's spec: the node config with only its app, and its uid.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
-        let (limits, max_sockets) = (app.limits.clone(), app.worker.max_sockets);
+        let kb = |k: u64| (k << 10) as usize;
+        let caps = ws::Caps {
+            total: self.sockets.clone(),
+            max_total: self.cfg.max_sockets,
+            per_app: app.worker.max_sockets,
+            per_object: app.limits.max_sockets,
+            request_max: kb(app.limits.max_request_body_kb),
+            response_max: kb(app.limits.max_response_body_kb),
+            backlog: kb(app.limits.socket_backlog_kb),
+        };
         let node = NodeConfig {
             apps: vec![app],
             ..self.cfg.clone()
@@ -419,8 +424,8 @@ impl Supervisor {
             }
         });
 
-        let (policy, sockets) = (Arc::new(policy), Arc::new(Sockets::new(max_sockets)));
-        let (s, max) = (sockets.clone(), (limits.max_response_body_kb << 10) as usize);
+        let (policy, sockets) = (Arc::new(policy), Arc::new(Sockets::new(caps)));
+        let s = sockets.clone();
         egress.set_nonblocking(true)?;
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, move |req| {
             let (policy, s) = (policy.clone(), s.clone());
@@ -429,7 +434,7 @@ impl Supervisor {
                     return serve_forwarded(req, &policy).await;
                 }
                 let status = match req.uri().path().trim_end_matches('/') {
-                    "/publish" => s.publish(req, max).await,
+                    "/publish" => s.publish(req).await,
                     _ => 404,
                 };
                 verdict_ok(status)
@@ -442,7 +447,6 @@ impl Supervisor {
             digest,
             version,
             drain,
-            limits,
             sockets,
             gone,
             kill: Mutex::new(Some(kill)),

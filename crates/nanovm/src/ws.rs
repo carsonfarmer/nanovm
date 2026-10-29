@@ -156,21 +156,12 @@ pub fn is_event<B>(req: &Request<B>) -> bool {
 
 /// One worker's open sockets, and the channels of each object.
 pub struct Sockets {
-    inner: Mutex<Inner>,
-    /// Sockets the app may hold.
-    max: usize,
-}
-
-#[derive(Default)]
-struct Inner {
-    socks: HashMap<u64, Sock>,
-    /// Sockets per object.
-    objects: HashMap<String, usize>,
-    /// `(object, channel)` → its subscribers.
-    channels: HashMap<(String, String), HashSet<u64>>,
+    socks: Mutex<HashMap<u64, Sock>>,
+    pub caps: Caps,
 }
 
 struct Sock {
+    object: String,
     channels: HashSet<String>,
     out: Out,
 }
@@ -207,9 +198,11 @@ fn frame(code: CloseCode) -> Option<CloseFrame> {
 }
 
 /// The limits a socket opens under.
-pub struct Caps<'a> {
-    pub total: &'a Arc<AtomicUsize>,
+pub struct Caps {
+    /// Sockets open on the node, and the most it may hold.
+    pub total: Arc<AtomicUsize>,
     pub max_total: usize,
+    pub per_app: usize,
     pub per_object: usize,
     /// The most a message may carry from the client.
     pub request_max: usize,
@@ -225,43 +218,17 @@ pub type Deliver = Box<dyn Fn(Request<Body>) -> BoxFuture<'static, Reply> + Send
 /// A socket, as its events are sent to its object.
 pub struct Conn {
     id: u64,
-    object: String,
     uri: Uri,
     headers: HeaderMap,
     grip: bool,
     sockets: Arc<Sockets>,
     out: Out,
-    total: Arc<AtomicUsize>,
 }
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        let mut inner = self.sockets.inner.lock();
-        if let Some(sock) = inner.socks.remove(&self.id) {
-            for c in sock.channels {
-                inner.unsubscribe(&self.object, &c, self.id);
-            }
-            if let Some(n) = inner.objects.get_mut(&self.object) {
-                *n -= 1;
-                if *n == 0 {
-                    inner.objects.remove(&self.object);
-                }
-            }
-        }
-        drop(inner);
-        self.total.fetch_sub(1, Relaxed);
-    }
-}
-
-impl Inner {
-    fn unsubscribe(&mut self, object: &str, channel: &str, id: u64) {
-        let key = (object.to_string(), channel.to_string());
-        if let Some(subs) = self.channels.get_mut(&key) {
-            subs.remove(&id);
-            if subs.is_empty() {
-                self.channels.remove(&key);
-            }
-        }
+        self.sockets.socks.lock().remove(&self.id);
+        self.sockets.caps.total.fetch_sub(1, Relaxed);
     }
 }
 
@@ -303,29 +270,22 @@ impl Conn {
         let Ok(Value::Object(c)) = serde_json::from_str(c) else { return false };
         let channel = c.get("channel").and_then(Value::as_str).filter(|c| crate::table::valid_name(c));
         let (Some(channel), 2) = (channel, c.len()) else { return false };
-        let mut inner = self.sockets.inner.lock();
-        let Some(sock) = inner.socks.get_mut(&self.id) else { return false };
+        let mut socks = self.sockets.socks.lock();
+        let Some(sock) = socks.get_mut(&self.id) else { return false };
         match c.get("type").and_then(Value::as_str) {
-            Some("subscribe") if sock.channels.contains(channel) => {}
-            Some("subscribe") if sock.channels.len() < MAX_CHANNELS => {
-                sock.channels.insert(channel.to_string());
-                let key = (self.object.clone(), channel.to_string());
-                inner.channels.entry(key).or_default().insert(self.id);
+            Some("subscribe") if sock.channels.contains(channel) || sock.channels.len() < MAX_CHANNELS => {
+                sock.channels.insert(channel.to_string())
             }
-            Some("unsubscribe") => {
-                sock.channels.remove(channel);
-                inner.unsubscribe(&self.object, channel, self.id);
-            }
+            Some("unsubscribe") => sock.channels.remove(channel),
             _ => return false,
-        }
+        };
         true
     }
 }
 
 impl Sockets {
-    /// Sockets for an app that may hold `max` of them.
-    pub fn new(max: usize) -> Sockets {
-        Sockets { inner: Mutex::default(), max }
+    pub fn new(caps: Caps) -> Sockets {
+        Sockets { socks: Mutex::default(), caps }
     }
 
     /// Opens a socket on `object` if the caps allow it and the object accepts:
@@ -335,10 +295,10 @@ impl Sockets {
         self: &Arc<Self>,
         object: &str,
         mut req: Request<Body>,
-        caps: Caps<'_>,
         gone: watch::Receiver<()>,
         deliver: Deliver,
     ) -> Result<Response<()>, (u16, &'static str)> {
+        let caps = &self.caps;
         static NEXT: AtomicU64 = AtomicU64::new(1);
         use http::header::{SEC_WEBSOCKET_KEY as KEY, SEC_WEBSOCKET_PROTOCOL as PROTOCOL};
         let upgrade = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>();
@@ -375,24 +335,21 @@ impl Sockets {
         let id = NEXT.fetch_add(1, Relaxed);
         let mut conn = Conn {
             id,
-            object: object.to_string(),
             uri: req.uri().clone(),
             headers,
             grip: false,
             sockets: self.clone(),
             out: out.clone(),
-            total: caps.total.clone(),
         };
         {
-            let mut inner = self.inner.lock();
-            if inner.socks.len() >= self.max {
+            let mut socks = self.socks.lock();
+            if socks.len() >= caps.per_app {
                 return Err((503, "the app has max_sockets open"));
             }
-            if inner.objects.get(object).is_some_and(|n| *n >= caps.per_object) {
+            if socks.values().filter(|s| s.object == object).count() >= caps.per_object {
                 return Err((503, "the object has max_sockets open"));
             }
-            *inner.objects.entry(object.to_string()).or_default() += 1;
-            inner.socks.insert(id, Sock { channels: HashSet::new(), out });
+            socks.insert(id, Sock { object: object.to_string(), channels: HashSet::new(), out });
         }
 
         let mut open = conn.request(&Event::Open);
@@ -409,8 +366,13 @@ impl Sockets {
             offers.flat_map(|v| v.split(',')).any(|o| o.trim().as_bytes() == p.as_bytes())
         };
         let mut events = events.into_iter();
-        if events.next() != Some(Event::Open) || !protocol.is_none_or(offered) || !conn.apply(events.collect()) {
+        if events.next() != Some(Event::Open) {
             return Err((502, "the object did not accept the socket"));
+        }
+        // It accepted, so it is told the socket ended.
+        if !protocol.is_none_or(offered) || !conn.apply(events.collect()) {
+            deliver(conn.request(&Event::Disconnect)).await;
+            return Err((502, "the object's answer to OPEN is not one a socket can take"));
         }
 
         let mut res = Response::builder()
@@ -436,18 +398,17 @@ impl Sockets {
     /// Sends what `object` publishes to its sockets subscribed to each item's
     /// channel: GRIP's `{"items": [{"channel", "formats": {"ws-message":
     /// {"content" | "content-bin"}}}]}`. The status to answer with.
-    pub async fn publish<B>(&self, req: Request<B>, max: usize) -> u16
+    pub async fn publish<B>(&self, req: Request<B>) -> u16
     where
         B: http_body::Body<Data = Bytes>,
         B::Error: Into<crate::object::BoxError>,
     {
         let object = req.headers().get(OBJECT_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
-        let Ok(body) = Limited::new(req.into_body(), max).collect().await else { return 413 };
+        let Ok(body) = Limited::new(req.into_body(), self.caps.response_max).collect().await else { return 413 };
         let (Some(object), Some(items)) = (object, messages(&body.to_bytes())) else { return 400 };
-        let inner = self.inner.lock();
-        for (channel, m) in items {
-            for id in inner.channels.get(&(object.clone(), channel)).into_iter().flatten() {
-                inner.socks[id].out.send(m.clone());
+        for sock in self.socks.lock().values().filter(|s| s.object == object) {
+            for (_, m) in items.iter().filter(|(c, _)| sock.channels.contains(c)) {
+                sock.out.send(m.clone());
             }
         }
         200
@@ -535,10 +496,14 @@ async fn run<Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             // A client silent through a whole interval (while nothing waits
             // on the object) is gone, even if its connection never said so.
             _ = ping.tick() => {
-                if !heard && pending.is_terminated() {
-                    break (None, Some(Event::Disconnect));
+                // The stream isn't read while an event waits, so a pong can't
+                // be heard then.
+                if pending.is_terminated() {
+                    if !heard {
+                        break (None, Some(Event::Disconnect));
+                    }
+                    heard = false;
                 }
-                heard = false;
                 conn.out.send(Message::Ping(Bytes::new()));
             }
         }
@@ -600,19 +565,18 @@ mod tests {
     /// after a ping goes unanswered, and its object is told.
     #[tokio::test(start_paused = true)]
     async fn silent_clients_are_dropped() {
-        let sockets = Arc::new(Sockets::new(1));
+        let total = Arc::new(AtomicUsize::new(1));
+        let caps = Caps { total: total.clone(), max_total: 1, per_app: 1, per_object: 1, request_max: 0, response_max: 0, backlog: 0 };
+        let sockets = Arc::new(Sockets::new(caps));
         let (tx, rx) = mpsc::unbounded_channel();
         let out = Out { tx, queued: Default::default(), max: 1 << 20, behind: Default::default() };
-        let total = Arc::new(AtomicUsize::new(1));
         let conn = Conn {
             id: 1,
-            object: "o".into(),
             uri: "/a/o/".parse().unwrap(),
             headers: HeaderMap::new(),
             grip: false,
             sockets,
             out,
-            total: total.clone(),
         };
         let told = Arc::new(Mutex::new(vec![]));
         let t = told.clone();

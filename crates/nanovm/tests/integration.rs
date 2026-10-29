@@ -1607,6 +1607,23 @@ mod sockets {
         assert_eq!(http_get(addr, "/counter/a/kv/ws-ends").await, (200, "2".into()));
         drop(a1);
 
+        // A client that gives up while its `OPEN` waits on the object still
+        // has its socket ended for the object, which accepted it.
+        let pid = stats_json(addr).await["workers"]["counter"]["pid"].as_u64().unwrap() as i32;
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        let upgrade = "GET /counter/e/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let mut gave_up = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut gave_up, upgrade.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(gave_up);
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        let t0 = Instant::now();
+        while http_get(addr, "/counter/e/kv/ws-ends").await != (200, "1".into()) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "the object never heard the socket end");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
         // A worker's sockets close when it goes.
         let mut s = open(addr, "/counter/d/ws").await.unwrap();
         let pid = stats_json(addr).await["workers"]["counter"]["pid"].as_u64().unwrap();
