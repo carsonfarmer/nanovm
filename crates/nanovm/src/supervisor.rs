@@ -62,8 +62,9 @@ pub struct Supervisor {
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     /// Held while giving a new app its uid.
     uids: Mutex<()>,
-    /// Open WebSockets, across workers.
+    /// Open WebSockets, and the bytes queued for them, across workers.
     sockets: Arc<AtomicUsize>,
+    backlog: Arc<AtomicUsize>,
     started: Instant,
 }
 
@@ -95,9 +96,15 @@ struct Live {
     sockets: Arc<Sockets>,
     /// Reads as changed once the process is gone, closing its sockets.
     gone: watch::Receiver<()>,
-    /// Dropping this kills the process. It reads as closed once the process
-    /// is gone, because its watcher drops the receiver then.
-    kill: oneshot::Sender<()>,
+    /// Dropping or taking this kills the process. It reads as closed once
+    /// the process is gone, because its watcher drops the receiver then.
+    kill: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl Live {
+    fn alive(&self) -> bool {
+        self.kill.lock().as_ref().is_some_and(|k| !k.is_closed())
+    }
 }
 
 impl Worker {
@@ -113,7 +120,7 @@ impl Worker {
     }
 
     fn live(&self) -> Option<Arc<Live>> {
-        self.live.lock().clone().filter(|l| !l.kill.is_closed())
+        self.live.lock().clone().filter(|l| l.alive())
     }
 }
 
@@ -132,6 +139,7 @@ impl Supervisor {
             workers: Mutex::new(workers),
             uids: Mutex::default(),
             sockets: Arc::default(),
+            backlog: Arc::default(),
             started: Instant::now(),
         });
         let local: Vec<_> = sup.workers.lock().values().cloned().collect();
@@ -183,6 +191,9 @@ impl Supervisor {
         if ws::wants(&req) {
             return self.socket(w, req, want.as_ref()).await;
         }
+        if ws::is_event(&req) {
+            return error_response(400, "not-an-event", "socket events come from the node");
+        }
         self.forward(&w, req, want.as_ref()).await
     }
 
@@ -200,6 +211,8 @@ impl Supervisor {
         let caps = ws::Caps {
             total: &self.sockets,
             max_total: self.cfg.max_sockets,
+            backlog: &self.backlog,
+            max_backlog: self.cfg.max_socket_backlog_mb << 20,
             per_object: live.limits.max_sockets,
             request_max: (live.limits.max_request_body_kb << 10) as usize,
             response_max: (live.limits.max_response_body_kb << 10) as usize,
@@ -208,16 +221,24 @@ impl Supervisor {
         let deliver: ws::Deliver = Box::new(move |req| {
             let (w, weak) = (w.clone(), weak.clone());
             Box::pin(async move {
-                let live = weak.upgrade().filter(|l| w.live().is_some_and(|c| Arc::ptr_eq(&c, l)))?;
-                let answer = async { ws::answer(live.link.send(req).await.ok()?, max).await };
-                tokio::time::timeout(live.drain, answer).await.ok()?
+                let Some(live) = weak.upgrade().filter(|l| w.live().is_some_and(|c| Arc::ptr_eq(&c, l))) else {
+                    return ws::Reply::Gone;
+                };
+                match live.link.send(req).await {
+                    Ok(res) => ws::answer(res, max).await,
+                    Err(_) => ws::Reply::Gone,
+                }
             })
         });
         let (sockets, gone) = (live.sockets.clone(), live.gone.clone());
         drop(live);
         match sockets.open(&object, req, caps, gone, deliver).await {
             Ok(res) => res.map(|()| Empty::new().map_err(|e| match e {}).boxed_unsync()),
-            Err((status, why)) => error_response(status, "socket-refused", why),
+            Err((status, why)) => {
+                let mut res = error_response(status, "socket-refused", why);
+                res.headers_mut().insert(http::header::SEC_WEBSOCKET_VERSION, "13".parse().unwrap());
+                res
+            }
         }
     }
 
@@ -361,7 +382,7 @@ impl Supervisor {
 
         // The worker's spec: the node config with only its app, and its uid.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
-        let limits = app.limits.clone();
+        let (limits, max_sockets) = (app.limits.clone(), app.worker.max_sockets);
         let node = NodeConfig {
             apps: vec![app],
             ..self.cfg.clone()
@@ -401,7 +422,7 @@ impl Supervisor {
             }
         });
 
-        let (policy, sockets) = (Arc::new(policy), Arc::new(Sockets::default()));
+        let (policy, sockets) = (Arc::new(policy), Arc::new(Sockets::new(max_sockets)));
         let (s, max) = (sockets.clone(), (limits.max_response_body_kb << 10) as usize);
         egress.set_nonblocking(true)?;
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, move |req| {
@@ -427,7 +448,7 @@ impl Supervisor {
             limits,
             sockets,
             gone,
-            kill,
+            kill: Mutex::new(Some(kill)),
         });
         let ready = tokio::time::timeout(START_TIMEOUT, async {
             let res = live.link.send(get("/_nanovm/stats")).await?;
@@ -488,12 +509,14 @@ impl Supervisor {
 
 /// Waits until nothing holds `old` but this (its requests have finished and
 /// their bodies have been read), or its longest request has had its time,
-/// then drops it, which kills the process.
+/// then kills the process: what still holds it can't keep it running beside
+/// the next version.
 async fn drain(old: Arc<Live>) {
     let deadline = Instant::now() + old.drain;
-    while Arc::strong_count(&old) > 1 && Instant::now() < deadline && !old.kill.is_closed() {
+    while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    old.kill.lock().take();
 }
 
 /// A forwarded request's answer from the supervisor itself.

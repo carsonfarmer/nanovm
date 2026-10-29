@@ -144,6 +144,13 @@ impl Node {
         if let Some(e) = objects.get(&key) {
             match e.tx.try_send(job) {
                 Ok(()) => return Ok(()),
+                // A socket's event waits instead: each socket has one at a
+                // time, so the sockets bound them.
+                Err(mpsc::error::TrySendError::Full(job)) if crate::ws::is_event(&job.req) => {
+                    let tx = e.tx.clone();
+                    tokio::spawn(async move { tx.send(job).await });
+                    return Ok(());
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     self.metrics.rejected_busy.fetch_add(1, Relaxed);
                     let max = app.cfg.limits.max_queue;

@@ -1399,32 +1399,33 @@ mod sockets {
 
     type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-    async fn open(addr: std::net::SocketAddr, path: &str) -> Result<Ws, u16> {
+    /// The socket, or the refusal's status and body.
+    async fn open(addr: std::net::SocketAddr, path: &str) -> Result<Ws, (u16, String)> {
         match tokio_tungstenite::connect_async(format!("ws://{addr}{path}")).await {
             Ok((ws, _)) => Ok(ws),
-            Err(Error::Http(res)) => Err(res.status().as_u16()),
+            Err(Error::Http(res)) => {
+                Err((res.status().as_u16(), String::from_utf8_lossy(res.body().as_deref().unwrap_or(&[])).into()))
+            }
             Err(e) => panic!("{path}: {e}"),
         }
+    }
+
+    fn refused(r: Result<Ws, (u16, String)>) -> (u16, String) {
+        r.err().expect("refused")
     }
 
     /// A socket whose client takes little before the kernel stops sending.
     async fn open_slow(addr: std::net::SocketAddr, path: &str) -> Ws {
         let sock = tokio::net::TcpSocket::new_v4().unwrap();
         sock.set_recv_buffer_size(4096).unwrap();
-        let tcp = sock.connect(addr).await.unwrap();
-        let tcp = tokio_tungstenite::MaybeTlsStream::Plain(tcp);
-        tokio_tungstenite::client_async(format!("ws://{addr}{path}"), tcp)
-            .await
-            .unwrap()
-            .0
+        let tcp = tokio_tungstenite::MaybeTlsStream::Plain(sock.connect(addr).await.unwrap());
+        tokio_tungstenite::client_async(format!("ws://{addr}{path}"), tcp).await.unwrap().0
     }
 
     /// The next data message or close frame.
     async fn next(ws: &mut Ws) -> Message {
         loop {
-            let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
-                .await
-                .expect("a message in time");
+            let m = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a message in time");
             match m.expect("the socket is open").expect("a frame") {
                 Message::Ping(_) | Message::Pong(_) => continue,
                 m => return m,
@@ -1439,35 +1440,27 @@ mod sockets {
     async fn sockets_open(addr: std::net::SocketAddr, n: u64) {
         let t0 = Instant::now();
         while stats_json(addr).await["sockets"] != n {
-            assert!(
-                t0.elapsed() < Duration::from_secs(5),
-                "sockets never reached {n}: {}",
-                stats_json(addr).await
-            );
+            assert!(t0.elapsed() < Duration::from_secs(5), "sockets never reached {n}: {}", stats_json(addr).await);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
     async fn post(addr: std::net::SocketAddr, path: &str) -> u16 {
-        raw(
-            addr,
-            &format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-            b"",
-        )
-        .await
-        .0
+        let head = format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        raw(addr, &head, b"").await.0
     }
 
     /// Events reach the object, which answers on the socket and publishes to
     /// the sockets of its own channel (from an event or a plain request), and
-    /// learns how each socket ended unless it closed it itself.
+    /// learns how each socket ended unless it closed it itself. Events wait
+    /// for room in a full queue, only sockets send them, and handshakes are
+    /// checked.
     #[tokio::test(flavor = "multi_thread")]
     async fn websockets_reach_their_object_and_fan_out_within_it() {
-        let (_sup, addr) = supervised("websockets_fan_out").await;
-        let (mut a, mut b) = (
-            open(addr, "/counter/room/ws").await.unwrap(),
-            open(addr, "/counter/room/ws").await.unwrap(),
-        );
+        let mut cfg = node_cfg("websockets_fan_out", 8, 60_000, 100);
+        cfg.apps[0].limits.max_queue = 2;
+        let (_sup, addr) = supervised_with(cfg).await;
+        let (mut a, mut b) = (open(addr, "/counter/room/ws").await.unwrap(), open(addr, "/counter/room/ws").await.unwrap());
         let mut other = open(addr, "/counter/elsewhere/ws").await.unwrap();
         sockets_open(addr, 3).await;
 
@@ -1476,9 +1469,7 @@ mod sockets {
         a.send(Message::binary(vec![0, 1, 2])).await.unwrap();
         assert_eq!(next(&mut a).await, Message::binary(vec![0, 1, 2]));
         say(&mut a, "id").await;
-        let Message::Text(id) = next(&mut a).await else {
-            panic!()
-        };
+        let Message::Text(id) = next(&mut a).await else { panic!() };
         say(&mut b, "id").await;
         assert_ne!(next(&mut b).await, Message::Text(id));
 
@@ -1493,9 +1484,7 @@ mod sockets {
         assert_eq!(next(&mut other).await, Message::text("echo x"));
 
         say(&mut b, "close").await;
-        let Message::Close(Some(f)) = next(&mut b).await else {
-            panic!("no close frame")
-        };
+        let Message::Close(Some(f)) = next(&mut b).await else { panic!("no close frame") };
         assert_eq!(f.code, CloseCode::from(4000));
         a.close(None).await.unwrap();
         drop(other);
@@ -1503,47 +1492,72 @@ mod sockets {
         assert_eq!(http_get(addr, "/counter/room/kv/ws-ends").await, (200, "1".into()));
         assert_eq!(http_get(addr, "/counter/elsewhere/kv/ws-ends").await, (200, "1".into()));
 
+        // Eight sockets' events at once wait for room in a queue of two.
+        let mut many = Vec::new();
+        for _ in 0..8 {
+            many.push(open(addr, "/counter/busy/ws").await.unwrap());
+        }
+        futures::future::join_all(many.iter_mut().map(|ws| say(ws, "hello"))).await;
+        for ws in &mut many {
+            assert_eq!(next(ws).await, Message::text("echo hello"));
+        }
+        drop(many);
+        sockets_open(addr, 0).await;
+        assert_eq!(http_get(addr, "/counter/busy/kv/ws-ends").await, (200, "8".into()));
+
         // An object that doesn't answer `OPEN` refuses the socket.
-        assert_eq!(open(addr, "/hostile/x/").await.err(), Some(502));
-        assert_eq!(open(addr, "/nope/x/").await.err(), Some(404));
+        assert_eq!(refused(open(addr, "/hostile/x/").await).0, 502);
+        assert_eq!(refused(open(addr, "/nope/x/").await).0, 404);
+        // A client can't send events, and handshakes are checked.
+        let forged = "POST /counter/room/ws HTTP/1.1\r\nHost: x\r\nContent-Type: application/websocket-events\r\n\
+            Connection-Id: 1\r\nContent-Length: 12\r\nConnection: close\r\n\r\nDISCONNECT\r\n";
+        assert_eq!(raw(addr, forged, b"").await.0, 400);
+        let old = "GET /counter/room/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\n\
+            Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n";
+        assert_eq!(raw(addr, old, b"").await.0, 426);
+        assert_eq!(http_get(addr, "/counter/room/kv/ws-ends").await, (200, "1".into()));
         sockets_open(addr, 0).await;
     }
 
-    /// Sockets per object and per node are capped, a message is bounded by
-    /// the request limit, a client that falls behind is dropped, and a
-    /// worker's sockets close with it.
+    /// Sockets per object, per app and per node are capped, a message is
+    /// bounded by the request limit, a client that falls behind is dropped,
+    /// and a worker's sockets close with it.
     #[tokio::test(flavor = "multi_thread")]
     async fn websocket_limits_hold() {
         let mut cfg = node_cfg("websocket_limits_hold", 8, 60_000, 100);
-        cfg.max_sockets = 3;
+        cfg.max_sockets = 4;
+        cfg.apps[0].worker.max_sockets = 3;
         let limits = &mut cfg.apps[0].limits;
-        (
-            limits.max_sockets,
-            limits.max_request_body_kb,
-            limits.max_response_body_kb,
-        ) = (2, 16, 64);
+        (limits.max_sockets, limits.max_request_body_kb, limits.max_response_body_kb) = (2, 16, 64);
+        let mut chat = cfg.apps[0].clone();
+        chat.name = "chat".into();
+        cfg.apps.push(chat);
         let (_sup, addr) = supervised_with(cfg).await;
 
         let a1 = open_slow(addr, "/counter/a/ws").await;
         let _a2 = open_slow(addr, "/counter/a/ws").await;
-        assert_eq!(open(addr, "/counter/a/ws").await.err(), Some(503));
+        let (status, body) = refused(open(addr, "/counter/a/ws").await);
+        assert_eq!((status, body.contains("object has max_sockets")), (503, true), "{body}");
         let mut big = open(addr, "/counter/b/ws").await.unwrap();
-        assert_eq!(open(addr, "/counter/c/ws").await.err(), Some(503));
+        let (status, body) = refused(open(addr, "/counter/c/ws").await);
+        assert_eq!((status, body.contains("app has max_sockets")), (503, true), "{body}");
+        let other_app = open(addr, "/chat/x/ws").await.unwrap();
+        let (status, body) = refused(open(addr, "/chat/y/ws").await);
+        assert_eq!((status, body.contains("node has max_sockets")), (503, true), "{body}");
+        drop(other_app);
+        sockets_open(addr, 3).await;
 
         big.send(Message::text("x".repeat(16 << 10))).await.unwrap();
-        let Message::Close(Some(f)) = next(&mut big).await else {
-            panic!("no close frame")
-        };
+        let Message::Close(Some(f)) = next(&mut big).await else { panic!("no close frame") };
         assert_eq!(f.code, CloseCode::Size);
         sockets_open(addr, 2).await;
 
-        // `a1` never reads; what is published to it piles up until it is
-        // dropped, while `a2` (also unread) goes the same way.
+        // `a1` and `a2` never read; what is published to them piles up until
+        // they are dropped.
         let msg = "y".repeat(1000);
         for i in 0.. {
             assert_eq!(post(addr, &format!("/counter/a/publish?msg={msg}&n=50")).await, 200);
             if stats_json(addr).await["sockets"] == 0 {
-                eprintln!("dropped after {i} publishes");
                 break;
             }
             assert!(i < 2000, "a socket that never reads was never dropped");
@@ -1555,9 +1569,7 @@ mod sockets {
         let mut s = open(addr, "/counter/d/ws").await.unwrap();
         let pid = stats_json(addr).await["workers"]["counter"]["pid"].as_u64().unwrap();
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        let Message::Close(Some(f)) = next(&mut s).await else {
-            panic!("no close frame")
-        };
+        let Message::Close(Some(f)) = next(&mut s).await else { panic!("no close frame") };
         assert_eq!(f.code, CloseCode::Restart);
         sockets_open(addr, 0).await;
     }

@@ -34,6 +34,9 @@ config! {
         /// Upper bound on open WebSockets across all apps: each holds a file
         /// descriptor in the supervisor.
         max_sockets: usize = 10_000usize,
+        /// Bytes queued for WebSocket clients across the node; a socket that
+        /// would go past it is dropped.
+        max_socket_backlog_mb: usize = 512usize,
         /// Virtual address space reserved per linear memory. Every app's
         /// `memory_mb` must fit inside it.
         memory_reservation_mb: u64 = 128u64,
@@ -91,6 +94,8 @@ config! {
         memory_mb: u64 = 0u64,
         cpus: f64 = 0.0f64,
         pids: u64 = 0u64,
+        /// Open WebSockets across the app (held by the supervisor).
+        max_sockets: usize = 1000usize,
     }
 }
 
