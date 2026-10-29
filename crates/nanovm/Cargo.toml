@@ -33,7 +33,11 @@ semver = "1"
 sigstore-types = "0.15.1"
 wasmtime-wasi-config = "50.0.0"
 base64 = "0.22"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
 seccompiler = "0.5.0"
+
+[dev-dependencies]
+tokio-tungstenite = "0.30"

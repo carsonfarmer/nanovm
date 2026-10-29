@@ -128,7 +128,7 @@ pub enum Route {
 /// Marks a supervisor's answer to a forwarded request: `ok`, or the name of
 /// the `Error` the request failed with. Inserting it replaces any copy the
 /// upstream sent, so the worker can trust it.
-const VERDICT: &str = "x-nanovm-egress";
+pub(crate) const VERDICT: &str = "x-nanovm-egress";
 const CONNECT_TIMEOUT: &str = "x-nanovm-connect-timeout-ms";
 const FIRST_BYTE_TIMEOUT: &str = "x-nanovm-first-byte-timeout-ms";
 
@@ -152,6 +152,11 @@ impl WasiHttpHooks for EgressHooks {
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
         let obj = self.obj.clone();
+        // Names the object, so its publishes reach only its own sockets.
+        let mut request = request;
+        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) {
+            request.headers_mut().insert(crate::ws::OBJECT_HEADER, obj.id.parse().expect("object ids are header-safe"));
+        }
         Box::new(async move {
             let target = request.uri().clone();
             let res = async {

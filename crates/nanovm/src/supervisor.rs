@@ -21,7 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -33,19 +33,19 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
-use crate::config::{AppConfig, NodeConfig};
+use crate::config::{AppConfig, Limits, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
 use crate::jail::Jail;
 use crate::link::{self, Dialer};
 use crate::registry::{APP_HEADER, AppRef, MIN_VERSION_HEADER, Registry, TRUST_HEADER};
-use crate::table::valid_name;
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
-use crate::table::Node;
+use crate::table::{Node, valid_name};
+use crate::ws::{self, Sockets};
 
-type Body = UnsyncBoxBody<Bytes, hyper::Error>;
+pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// A worker that failed to start is not retried for this long.
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
@@ -62,6 +62,8 @@ pub struct Supervisor {
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     /// Held while giving a new app its uid.
     uids: Mutex<()>,
+    /// Open WebSockets, across workers.
+    sockets: Arc<AtomicUsize>,
     started: Instant,
 }
 
@@ -89,6 +91,10 @@ struct Live {
     version: Option<String>,
     /// How long its longest request may take, to bound a drain.
     drain: Duration,
+    limits: Limits,
+    sockets: Arc<Sockets>,
+    /// Reads as changed once the process is gone, closing its sockets.
+    gone: watch::Receiver<()>,
     /// Dropping this kills the process. It reads as closed once the process
     /// is gone, because its watcher drops the receiver then.
     kill: oneshot::Sender<()>,
@@ -125,6 +131,7 @@ impl Supervisor {
             exe,
             workers: Mutex::new(workers),
             uids: Mutex::default(),
+            sockets: Arc::default(),
             started: Instant::now(),
         });
         let local: Vec<_> = sup.workers.lock().values().cloned().collect();
@@ -173,7 +180,45 @@ impl Supervisor {
                 (None, _) => return error_response(404, "no-such-app", app),
             }
         };
+        if ws::wants(&req) {
+            return self.socket(w, req, want.as_ref()).await;
+        }
         self.forward(&w, req, want.as_ref()).await
+    }
+
+    /// Opens a WebSocket on the object `req` names, on the worker running the
+    /// version `want` names. Its events go to that worker while it is the
+    /// app's, each bounded by the worker's longest request.
+    async fn socket(&self, w: Arc<Worker>, req: Request<Body>, want: Option<&AppRef>) -> Response<RespBody> {
+        let live = match self.live(&w, want).await {
+            Ok(l) => l,
+            Err(res) => return res,
+        };
+        let Some(object) = req.uri().path().split('/').nth(2).filter(|o| valid_name(o)).map(str::to_string) else {
+            return error_response(400, "bad-object-id", "object ids are [A-Za-z0-9_.-]{1,128}");
+        };
+        let caps = ws::Caps {
+            total: &self.sockets,
+            max_total: self.cfg.max_sockets,
+            per_object: live.limits.max_sockets,
+            request_max: (live.limits.max_request_body_kb << 10) as usize,
+            response_max: (live.limits.max_response_body_kb << 10) as usize,
+        };
+        let (weak, max) = (Arc::downgrade(&live), caps.response_max);
+        let deliver: ws::Deliver = Box::new(move |req| {
+            let (w, weak) = (w.clone(), weak.clone());
+            Box::pin(async move {
+                let live = weak.upgrade().filter(|l| w.live().is_some_and(|c| Arc::ptr_eq(&c, l)))?;
+                let answer = async { ws::answer(live.link.send(req).await.ok()?, max).await };
+                tokio::time::timeout(live.drain, answer).await.ok()?
+            })
+        });
+        let (sockets, gone) = (live.sockets.clone(), live.gone.clone());
+        drop(live);
+        match sockets.open(&object, req, caps, gone, deliver).await {
+            Ok(res) => res.map(|()| Empty::new().map_err(|e| match e {}).boxed_unsync()),
+            Err((status, why)) => error_response(status, "socket-refused", why),
+        }
     }
 
     async fn forward(&self, w: &Worker, req: Request<Body>, want: Option<&AppRef>) -> Response<RespBody> {
@@ -316,6 +361,7 @@ impl Supervisor {
 
         // The worker's spec: the node config with only its app, and its uid.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
+        let limits = app.limits.clone();
         let node = NodeConfig {
             apps: vec![app],
             ..self.cfg.clone()
@@ -341,9 +387,12 @@ impl Supervisor {
         });
 
         // Watches the process; dropping `kill` (with the `Live`) kills it.
+        // `gone` changes when this ends.
         let (kill, killed) = oneshot::channel::<()>();
+        let (gone_tx, gone) = watch::channel(());
         let app = w.name.clone();
         tokio::spawn(async move {
+            let _gone = gone_tx;
             tokio::select! {
                 status = child.wait() => eprintln!("nanovm: worker for app {app:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
                 _ = killed => {
@@ -352,11 +401,21 @@ impl Supervisor {
             }
         });
 
-        let policy = Arc::new(policy);
+        let (policy, sockets) = (Arc::new(policy), Arc::new(Sockets::default()));
+        let (s, max) = (sockets.clone(), (limits.max_response_body_kb << 10) as usize);
         egress.set_nonblocking(true)?;
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, move |req| {
-            let policy = policy.clone();
-            async move { serve_forwarded(req, &policy).await }
+            let (policy, s) = (policy.clone(), s.clone());
+            async move {
+                if req.uri().host() != Some(ws::PUBLISH_HOST) {
+                    return serve_forwarded(req, &policy).await;
+                }
+                let status = match req.uri().path().trim_end_matches('/') {
+                    "/publish" => s.publish(req, max).await,
+                    _ => 404,
+                };
+                verdict_ok(status)
+            }
         }));
 
         let live = Arc::new(Live {
@@ -365,6 +424,9 @@ impl Supervisor {
             digest,
             version,
             drain,
+            limits,
+            sockets,
+            gone,
             kill,
         });
         let ready = tokio::time::timeout(START_TIMEOUT, async {
@@ -416,6 +478,7 @@ impl Supervisor {
         }
         crate::server::ok_json(json!({
             "uptime_ms": self.started.elapsed().as_millis() as u64,
+            "sockets": self.sockets.load(Relaxed),
             "rss_mb": rss_bytes() as f64 / 1048576.0,
             "workers": workers,
             "apps": apps,
@@ -431,6 +494,14 @@ async fn drain(old: Arc<Live>) {
     while Arc::strong_count(&old) > 1 && Instant::now() < deadline && !old.kill.is_closed() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// A forwarded request's answer from the supervisor itself.
+fn verdict_ok(status: u16) -> Response<wasmtime_wasi_http::WasiBody> {
+    let mut res = Response::new(Empty::new().map_err(|e| match e {}).boxed_unsync());
+    *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
+    res.headers_mut().insert(crate::egress::VERDICT, "ok".parse().unwrap());
+    res
 }
 
 fn get(pq: &str) -> Request<Body> {

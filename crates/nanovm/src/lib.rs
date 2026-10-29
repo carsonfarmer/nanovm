@@ -16,3 +16,4 @@ pub mod registry;
 pub mod server;
 pub mod supervisor;
 pub mod table;
+pub mod ws;

@@ -31,6 +31,9 @@ config! {
         data_dir: PathBuf = "nanovm-data",
         /// Upper bound on objects with a live instance; sizes the pooling allocator.
         max_live_objects: usize = 1000usize,
+        /// Upper bound on open WebSockets across all apps: each holds a file
+        /// descriptor in the supervisor.
+        max_sockets: usize = 10_000usize,
         /// Virtual address space reserved per linear memory. Every app's
         /// `memory_mb` must fit inside it.
         memory_reservation_mb: u64 = 128u64,
@@ -105,6 +108,8 @@ config! {
         disk_mb: u64 = 64u64,
         max_files: u64 = 1000u64,
         max_queue: usize = 64usize,
+        /// Open WebSockets per object.
+        max_sockets: usize = 256usize,
         max_outbound_concurrency: usize = 4usize,
         max_resources: usize = 10_000usize,
         /// Outbound HTTP allowlist: `host`, `host:port` or `*.suffix[:port]`.

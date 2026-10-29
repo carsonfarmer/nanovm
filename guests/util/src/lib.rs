@@ -27,6 +27,8 @@ pub struct Req {
     pub method: String,
     pub path: String,
     pub query: HashMap<String, String>,
+    /// Lowercase names; a repeated header keeps its last value.
+    pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
 }
 
@@ -53,6 +55,12 @@ pub async fn read_req(request: Request) -> Req {
         Method::Trace => "TRACE".to_string(),
         Method::Other(m) => m,
     };
+    let headers = request
+        .get_headers()
+        .copy_all()
+        .into_iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), String::from_utf8_lossy(&v).into_owned()))
+        .collect();
     let pq = request.get_path_with_query().unwrap_or_else(|| "/".to_string());
     let (path, qs) = match pq.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
@@ -74,6 +82,7 @@ pub async fn read_req(request: Request) -> Req {
         method,
         path,
         query,
+        headers,
         body,
     }
 }
@@ -106,11 +115,14 @@ fn percent_decode(s: &str) -> String {
 /// returns (writing before returning would deadlock: the host only starts
 /// reading the body once it has the response).
 pub fn respond(status: u16, content_type: &str, body: Vec<u8>) -> Result<Response, ErrorCode> {
-    let headers = Fields::from_list(&[
-        ("content-type".to_string(), content_type.as_bytes().to_vec()),
-        ("content-length".to_string(), body.len().to_string().into_bytes()),
-    ])
-    .map_err(|e| ErrorCode::InternalError(Some(format!("{e:?}"))))?;
+    respond_with(status, &[("content-type", content_type)], body)
+}
+
+/// [`respond`] with any headers.
+pub fn respond_with(status: u16, headers: &[(&str, &str)], body: Vec<u8>) -> Result<Response, ErrorCode> {
+    let mut list: Vec<_> = headers.iter().map(|(k, v)| (k.to_string(), v.as_bytes().to_vec())).collect();
+    list.push(("content-length".to_string(), body.len().to_string().into_bytes()));
+    let headers = Fields::from_list(&list).map_err(|e| ErrorCode::InternalError(Some(format!("{e:?}"))))?;
     let (mut body_tx, body_rx) = wit_stream::new();
     let (trailers_tx, trailers_rx) = wit_future::new(|| Ok(None));
     let (response, _done) = Response::new(headers, Some(body_rx), trailers_rx);
@@ -120,6 +132,22 @@ pub fn respond(status: u16, content_type: &str, body: Vec<u8>) -> Result<Respons
         let _ = body_tx.write_all(body).await;
     });
     Ok(response)
+}
+
+/// POSTs `body` to `http://{authority}{path}`; the status.
+pub async fn post(authority: &str, path: &str, body: Vec<u8>) -> Result<u16, ErrorCode> {
+    let (mut body_tx, body_rx) = wit_stream::new();
+    let (trailers_tx, trailers_rx) = wit_future::new(|| Ok(None));
+    let (request, _sent) = Request::new(Fields::new(), Some(body_rx), trailers_rx, None);
+    drop(trailers_tx);
+    let _ = request.set_method(&Method::Post);
+    let _ = request.set_scheme(Some(&wasip3::http::types::Scheme::Http));
+    let _ = request.set_authority(Some(authority));
+    let _ = request.set_path_with_query(Some(path));
+    wasip3::spawn_local(async move {
+        let _ = body_tx.write_all(body).await;
+    });
+    Ok(wasip3::http::client::send(request).await?.get_status_code())
 }
 
 pub fn text(status: u16, body: impl Into<String>) -> Result<Response, ErrorCode> {

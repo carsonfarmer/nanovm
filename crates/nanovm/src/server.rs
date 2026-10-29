@@ -46,7 +46,7 @@ where
         let res = f(req);
         async move { Ok::<_, Infallible>(res.await) }
     });
-    tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(io), svc));
+    tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(io), svc).with_upgrades());
 }
 
 pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {
