@@ -47,6 +47,9 @@ impl EgressPolicy {
             let (wild, rest) = e.strip_prefix("*.").map_or((false, e.as_str()), |r| (true, r));
             // `host`, `host:port` or `[v6]:port`.
             let a: http::uri::Authority = rest.parse().map_err(|_| anyhow::anyhow!("bad egress entry {e:?}"))?;
+            // A port that isn't a u16 would otherwise read as "any port".
+            let named = a.as_str().rsplit_once(']').map_or(a.as_str(), |(_, p)| p).contains(':');
+            anyhow::ensure!(!named || a.port_u16().is_some(), "bad port in egress entry {e:?}");
             let host = a.host().trim_start_matches('[').trim_end_matches(']');
             let host = match host.parse::<IpAddr>() {
                 _ if wild => HostPat::Suffix(format!(".{host}")),
@@ -450,7 +453,6 @@ mod tests {
     /// A port that isn't a u16 is a malformed entry: taking it as "any port"
     /// would widen what the operator allowed.
     #[test]
-    #[ignore = "bug: an unparsable port (`a.com:99999`, `a.com:8o`) is accepted and matches every port"]
     fn parse_refuses_bad_ports() {
         for bad in ["a.com:99999", "a.com:8o", "*.a.com:-1", "a.com:"] {
             assert!(EgressPolicy::parse(&[bad.to_string()]).is_err(), "{bad:?}");

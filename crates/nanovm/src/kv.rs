@@ -112,8 +112,16 @@ impl ObjState {
             Ok(_) => return fail("the key's file is not a regular file"),
             Err(_) => None,
         };
-        self.quota.reserve(old, value.len() as u64)?;
+        // A `.tmp` the guest left here through its filesystem is replaced,
+        // so it stops counting.
         let tmp = path.with_file_name(".tmp");
+        if let Ok(m) = std::fs::symlink_metadata(&tmp)
+            && m.is_file()
+        {
+            std::fs::remove_file(&tmp)?;
+            self.quota.adjust(-(m.len() as i64), -1);
+        }
+        self.quota.reserve(old, value.len() as u64)?;
         if let Err(e) = std::fs::write(&tmp, value).and_then(|()| std::fs::rename(&tmp, &path)) {
             let _ = std::fs::remove_file(&tmp);
             self.quota.adjust(old.unwrap_or(0) as i64 - value.len() as i64, -i64::from(old.is_none()));
@@ -403,7 +411,6 @@ mod tests {
     /// through its filesystem (and was charged for) is not silently
     /// replaced with its charge kept.
     #[test]
-    #[ignore = "bug: set_value overwrites a guest-made `.tmp` in the bucket and its bytes and entry stay charged"]
     fn guest_tmp_files_are_not_leaked() {
         let mut s = state(Limits::default());
         let b = ok(s.open_bucket(""));
