@@ -78,7 +78,13 @@ impl ObjState {
             Ok(p) => p,
             Err(e) => return Ok(Err(e)),
         };
-        let old = std::fs::metadata(&path).ok().map(|m| m.len());
+        // The guest can also reach the bucket through its filesystem; a key
+        // whose name it has taken with something else is refused up front.
+        let old = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() => Some(m.len()),
+            Ok(_) => return Ok(Err(Error::Other("the key's file is not a regular file".into()))),
+            Err(_) => None,
+        };
         if let Err(e) = self.quota.reserve(old, value.len() as u64) {
             return Ok(Err(other(e)));
         }

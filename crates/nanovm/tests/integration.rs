@@ -1341,6 +1341,21 @@ async fn kv_works_in_a_jailed_worker() {
     let put = "PUT /counter/j/kv/a HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n";
     assert_eq!(raw(addr, put, b"hi").await.0, 204);
     assert_eq!(http_get(addr, "/counter/j/kv/a").await.1, "hi");
+    let delete = "DELETE /counter/j/kv/a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    assert_eq!(raw(addr, delete, b"").await.0, 204);
+    assert_eq!(http_get(addr, "/counter/j/kv/a").await.0, 404);
     let (_, body) = http_get(addr, "/hostile/j/kv?op=list").await;
     assert!(body.contains(r#""keys":0"#), "{body}");
+
+    // A directory planted over a key's file: the set is refused, and leaves
+    // nothing behind that the quota doesn't count.
+    let (_, body) = http_get(addr, "/hostile/p/kv?op=plant").await;
+    assert!(body.contains("not a regular file"), "{body}");
+    let bucket = std::fs::read_dir(node_dir("kv_works_in_a_jailed_worker").join("objects/hostile/p/.kv/default")).unwrap();
+    let names: Vec<_> = bucket.flatten().map(|e| e.file_name()).collect();
+    assert_eq!(names, ["azA"], "only the planted directory is there");
+}
+
+fn node_dir(test: &str) -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes").join(test)
 }

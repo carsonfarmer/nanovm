@@ -307,6 +307,18 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                     ),
                     Err(e) => format!("{{\"error\":{}}}", err(e)),
                 },
+                // Take key `k0`'s file name (base64url "azA") with a
+                // directory through the filesystem, then set the key.
+                "plant" => {
+                    let data = util::mount("/data").unwrap();
+                    for d in [".kv/default/azA", ".kv/default/azA/x"] {
+                        let _ = data.create_directory_at(d.to_string()).await;
+                    }
+                    match bucket.set("k0", &vec![1u8; 1 << 20]) {
+                        Ok(()) => "{\"set\":true}".to_string(),
+                        Err(e) => format!("{{\"error\":{}}}", err(e)),
+                    }
+                }
                 _ => "{\"opened\":true}".to_string(),
             };
             json(200, out)
