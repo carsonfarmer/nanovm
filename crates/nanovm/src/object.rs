@@ -614,3 +614,134 @@ where
         self.inner.size_hint()
     }
 }
+
+#[cfg(test)]
+impl ObjState {
+    /// A state with `/data` at `volume` (removed when it drops), for testing
+    /// host calls without a store or a guest.
+    pub(crate) fn for_test(volume: PathBuf, limits: &crate::config::Limits) -> ObjState {
+        std::fs::create_dir_all(&volume).unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let shared = Arc::new(ObjShared::new("app".into(), "obj"));
+        ObjState {
+            wasi: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+            http: WasiHttpCtx::new(),
+            hooks: EgressHooks {
+                route: crate::egress::Route::Direct(Default::default()),
+                sem: Arc::new(Semaphore::new(1)),
+                metrics: metrics.clone(),
+                obj: shared.clone(),
+            },
+            limiter: MemLimiter {
+                max_bytes: (limits.memory_mb << 20) as usize,
+                used: 0,
+                denied: false,
+            },
+            shared: shared.clone(),
+            cpu_budget_ns: 0,
+            cpu_exceeded: false,
+            stderr: LogTail::default(),
+            app_dir: None,
+            quota: QuotaGuard::new(&volume, limits, metrics, shared).unwrap(),
+            config: Default::default(),
+            _tmp: TmpDir(volume.clone()),
+            volume,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// The limiter caps the sum of every memory's growth; a refused growth
+    /// is remembered and leaves the usage as it was.
+    #[test]
+    fn mem_limiter_caps_total_growth() {
+        let mut l = MemLimiter {
+            max_bytes: 100,
+            used: 0,
+            denied: false,
+        };
+        assert!(l.memory_growing(0, 60, None).unwrap());
+        assert!(l.memory_growing(0, 40, None).unwrap(), "a second memory shares the cap");
+        assert!(!l.denied);
+        assert!(!l.memory_growing(60, 61, None).unwrap());
+        assert!(l.denied);
+        assert_eq!(l.used, 100);
+        assert!(l.memory_growing(10, 5, None).unwrap(), "shrinking is free");
+        assert_eq!(l.used, 100);
+    }
+
+    /// The log tail keeps the last `LOG_TAIL` bytes written, trimmed, with
+    /// bytes that aren't UTF-8 replaced.
+    #[tokio::test]
+    async fn log_tail_keeps_the_end() {
+        let tail = LogTail::default();
+        let mut w = tail.clone();
+        w.write_all(b"  early\n").await.unwrap();
+        assert_eq!(tail.text(), "early");
+        w.write_all(&[b'x'; LOG_TAIL - 4]).await.unwrap();
+        w.write_all(b"end\n\xff").await.unwrap();
+        let text = tail.text();
+        assert!(text.starts_with("xxx") && text.ends_with("end\n\u{fffd}"), "{text:?}");
+        assert_eq!(tail.0.lock().len(), LOG_TAIL);
+        w.write_all(&[b'y'; 3 * LOG_TAIL]).await.unwrap();
+        assert_eq!(tail.text(), "y".repeat(LOG_TAIL));
+    }
+
+    /// A guest's body passes until it would exceed its cap, and fails once
+    /// the instance is aborted.
+    #[tokio::test]
+    async fn guarded_body_caps_and_aborts() {
+        let body = |b: &'static [u8], remaining, abort| GuardedBody {
+            inner: Full::new(Bytes::from_static(b)),
+            remaining,
+            abort: Arc::new(AtomicBool::new(abort)),
+        };
+        assert_eq!(body(b"12345", 5, false).collect().await.unwrap().to_bytes(), "12345");
+        let e = body(b"123456", 5, false).collect().await.unwrap_err();
+        assert!(e.to_string().contains("max_response_body_kb"));
+        let e = body(b"1", 5, true).collect().await.unwrap_err();
+        assert_eq!(e.to_string(), "instance terminated");
+    }
+
+    /// Errors are JSON naming the reason, which is also a header.
+    #[tokio::test]
+    async fn error_responses_are_json() {
+        let res = error_response(503, "busy", "try \"later\"");
+        assert_eq!(res.status(), 503);
+        assert_eq!(res.headers()["content-type"], "application/json");
+        assert_eq!(res.headers()["x-nanovm-error"], "busy");
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v, serde_json::json!({"error": "busy", "detail": "try \"later\""}));
+    }
+
+    /// Only time inside a poll is charged, not time spent waiting; a new
+    /// start resets the charge, and phases name themselves.
+    #[tokio::test]
+    async fn cpu_is_charged_only_inside_polls() {
+        let metrics = Metrics::default();
+        let shared = ObjShared::new("a".into(), "o");
+        assert_eq!(shared.phase().0, Phase::Cold);
+        shared.begin_request();
+        assert_eq!(shared.phase().0.as_str(), "handling");
+        shared
+            .charged(&metrics, tokio::time::sleep(Duration::from_millis(50)))
+            .await;
+        let waited = shared.cpu_accum_ns.load(Relaxed);
+        assert!(waited < 25_000_000, "waiting was charged {waited}ns");
+        shared
+            .charged(&metrics, async { std::thread::sleep(Duration::from_millis(30)) })
+            .await;
+        assert!(shared.cpu_accum_ns.load(Relaxed) >= 30_000_000);
+        assert!(metrics.guest_cpu_ns.load(Relaxed) >= 30_000_000);
+        shared.begin_start();
+        assert!(shared.cpu_used_ns() < 25_000_000);
+        let names = Phase::ALL.map(Phase::as_str);
+        assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold"]);
+    }
+}

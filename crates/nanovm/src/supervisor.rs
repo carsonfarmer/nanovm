@@ -614,3 +614,35 @@ pub fn worker_main() -> anyhow::Result<()> {
         link::serve(requests, move |req| crate::server::handle(node.clone(), req)).await
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Query pairs are split on `&` and the first `=`, undecoded; a pair
+    /// without `=` is skipped and a repeated key keeps its last value.
+    #[test]
+    fn query_pairs() {
+        let q = |u: &str| {
+            query(&u.parse().unwrap())
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert!(q("/_nanovm/events").is_empty());
+        assert!(q("/_nanovm/events?").is_empty());
+        let mut got = q("/e?app=a&since=5&flag&x=1=2&app=b&=v&s=%20");
+        got.sort();
+        let want = [("", "v"), ("app", "b"), ("s", "%20"), ("since", "5"), ("x", "1=2")];
+        assert_eq!(got, want.map(|(k, v)| (k.to_string(), v.to_string())));
+    }
+
+    /// The supervisor's own answer to a forwarded request carries the
+    /// verdict a worker trusts.
+    #[test]
+    fn verdicts_mark_the_supervisors_answers() {
+        let res = verdict_ok(204);
+        assert_eq!(res.status(), 204);
+        assert_eq!(res.headers()[crate::egress::VERDICT], "ok");
+    }
+}

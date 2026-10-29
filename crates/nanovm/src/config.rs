@@ -212,3 +212,156 @@ fn or_cores_over(n: usize, div: usize) -> usize {
         n => n,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(name: &str) -> AppConfig {
+        toml::from_str(&format!("name = {name:?}\ncomponent = \"a.wasm\"")).unwrap()
+    }
+
+    /// Clamping caps every numeric limit at the maximum's, keeps the ones
+    /// already under it, and leaves the egress list the app's own.
+    #[test]
+    fn clamped_caps_each_number_and_keeps_egress() {
+        let mine = Limits {
+            memory_mb: 1 << 20,
+            cpu_ms: 1,
+            max_sockets: usize::MAX,
+            socket_backlog_kb: 0,
+            egress: vec!["example.com".into()],
+            ..Limits::default()
+        };
+        let max = Limits {
+            memory_mb: 32,
+            cpu_ms: 100,
+            max_sockets: 8,
+            egress: vec!["*.other".into()],
+            ..Limits::default()
+        };
+        let c = mine.clamped(&max);
+        assert_eq!(
+            (c.memory_mb, c.cpu_ms, c.max_sockets, c.socket_backlog_kb),
+            (32, 1, 8, 0)
+        );
+        assert_eq!(c.egress, ["example.com"]);
+        assert_eq!(c.request_timeout_ms, Limits::default().request_timeout_ms);
+        let d = Limits::default();
+        assert_eq!(serde_json::json!(d.clamped(&d)), serde_json::json!(d));
+    }
+
+    /// Validation refuses memory limits beyond the reservation (equal fits)
+    /// and app names that are invalid, reserved (`_…`) or repeated.
+    #[test]
+    fn validate_checks_memory_and_names() {
+        let mut cfg = NodeConfig {
+            apps: vec![app("a"), app("b")],
+            ..NodeConfig::default()
+        };
+        cfg.validate().unwrap();
+
+        cfg.registry_limits.memory_mb = cfg.memory_reservation_mb + 1;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("registry_limits.memory_mb")
+        );
+        cfg.registry_limits.memory_mb = cfg.memory_reservation_mb;
+        cfg.apps[1].limits.memory_mb = cfg.memory_reservation_mb;
+        cfg.validate().unwrap();
+        cfg.apps[1].limits.memory_mb += 1;
+        assert!(cfg.validate().unwrap_err().to_string().contains("app \"b\": memory_mb"));
+
+        cfg.apps = vec![app("a"), app("a")];
+        assert!(cfg.validate().unwrap_err().to_string().contains("duplicate app"));
+        for bad in ["", "_nanovm", ".a", "a/b", "a b"] {
+            cfg.apps = vec![app(bad)];
+            assert!(
+                cfg.validate().unwrap_err().to_string().contains("invalid app name"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// An empty file is the documented defaults; a partial table keeps the
+    /// defaults of the keys it leaves out.
+    #[test]
+    fn toml_defaults() {
+        let cfg: NodeConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.listen, "127.0.0.1:8080");
+        assert_eq!(
+            (cfg.max_live_objects, cfg.memory_reservation_mb, cfg.heavy_lanes),
+            (1000, 128, 0)
+        );
+        assert!(cfg.apps.is_empty() && cfg.cgroup.is_none());
+        assert_eq!(cfg.registry_worker.max_sockets, 1000);
+
+        let cfg: NodeConfig = toml::from_str(
+            "[registry_limits]\ncpu_ms = 9\n[[app]]\nname = \"a\"\ncomponent = \"a.wasm\"\n[app.limits]\ndisk_mb = 1\n",
+        )
+        .unwrap();
+        assert_eq!((cfg.registry_limits.cpu_ms, cfg.registry_limits.memory_mb), (9, 64));
+        let a = &cfg.apps[0];
+        assert_eq!(
+            (a.limits.disk_mb, a.limits.max_files, a.worker.max_sockets),
+            (1, 1000, 1000)
+        );
+        assert!(a.static_dir.is_none() && a.env.is_empty());
+    }
+
+    /// A misspelt key anywhere is an error rather than silently a default,
+    /// and an app needs a name and a component.
+    #[test]
+    fn toml_refuses_unknown_keys() {
+        let app = "[[app]]\nname = \"a\"\ncomponent = \"a.wasm\"\n";
+        for bad in [
+            "listn = \"x\"".to_string(),
+            "[registry_limits]\nmemory = 1".into(),
+            "[registry_worker]\ncpu = 1".into(),
+            format!("{app}static = \"x\""),
+            format!("{app}[app.limits]\negres = []"),
+            format!("{app}[app.worker]\nmem = 1"),
+            "[[app]]\nname = \"a\"".into(),
+            "[[app]]\ncomponent = \"a.wasm\"".into(),
+        ] {
+            assert!(toml::from_str::<NodeConfig>(&bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Loading resolves relative paths against the config file's directory,
+    /// keeps absolute ones, and validates.
+    #[test]
+    fn load_resolves_relative_paths_and_validates() {
+        let dir = std::env::temp_dir().join(format!("nanovm-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("n.toml");
+        let app = "[[app]]\nname = \"a\"\ncomponent = \"c/a.wasm\"\nstatic_dir = \"/abs\"\n";
+        std::fs::write(&path, app).unwrap();
+        let cfg = NodeConfig::load(&path).unwrap();
+        assert_eq!(cfg.data_dir, dir.join("nanovm-data"));
+        assert_eq!(cfg.apps[0].component, dir.join("c/a.wasm"));
+        assert_eq!(cfg.apps[0].static_dir.as_deref(), Some(Path::new("/abs")));
+        assert_eq!(cfg.app_dirs("a")[1], dir.join("nanovm-data/tmp/a"));
+
+        std::fs::write(&path, format!("{app}{app}")).unwrap();
+        assert!(NodeConfig::load(&path).is_err(), "validated");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 0 means a share of the cores, at least one; anything else is kept.
+    #[test]
+    fn zero_means_a_share_of_the_cores() {
+        assert_eq!(or_cores_over(3, 4), 3);
+        assert!(or_cores_over(0, usize::MAX) >= 1);
+        let cfg = NodeConfig {
+            front_threads: 5,
+            ..NodeConfig::default()
+        };
+        assert_eq!(
+            (cfg.front_threads(), NodeConfig::default().heavy_lanes() >= 1),
+            (5, true)
+        );
+    }
+}

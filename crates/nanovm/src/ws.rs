@@ -605,4 +605,530 @@ mod tests {
             assert!(messages(bad.as_bytes()).is_none(), "{bad}");
         }
     }
+
+    fn caps(max_total: usize, per_app: usize, per_object: usize) -> Caps {
+        let (request_max, response_max, backlog) = (1 << 16, 1024, 1 << 20);
+        Caps {
+            total: Default::default(),
+            max_total,
+            per_app,
+            per_object,
+            request_max,
+            response_max,
+            backlog,
+        }
+    }
+
+    fn out() -> (Out, mpsc::UnboundedReceiver<Message>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Out {
+                tx,
+                queued: Default::default(),
+                max: 1 << 20,
+                behind: Default::default(),
+            },
+            rx,
+        )
+    }
+
+    fn sock(object: &str, channels: &[&str], out: Out) -> Sock {
+        Sock {
+            object: object.into(),
+            channels: channels.iter().map(|c| c.to_string()).collect(),
+            out,
+        }
+    }
+
+    /// An open socket on object `o`, and its client's queue.
+    fn conn(grip: bool) -> (Conn, mpsc::UnboundedReceiver<Message>) {
+        let sockets = Arc::new(Sockets::new(caps(1, 1, 1)));
+        sockets.caps.total.store(1, Relaxed);
+        let (out, rx) = out();
+        sockets.socks.lock().insert(1, sock("o", &[], out.clone()));
+        let uri = "/a/o/".parse().unwrap();
+        (
+            Conn {
+                id: 1,
+                uri,
+                headers: HeaderMap::new(),
+                grip,
+                sockets,
+                out,
+            },
+            rx,
+        )
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<Message> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn channels(c: &Conn) -> Vec<String> {
+        let mut v: Vec<_> = c.sockets.socks.lock()[&c.id].channels.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Without GRIP, text and binary reach the client as they are, prefix
+    /// and all; an answer may not carry OPEN or DISCONNECT.
+    #[test]
+    fn apply_without_grip_passes_messages_through() {
+        let (c, mut rx) = conn(false);
+        let events = vec![
+            Event::Text("m:hi".into()),
+            Event::Text("c:{}".into()),
+            Event::Binary(Bytes::from_static(b"\0")),
+        ];
+        assert!(c.apply(events));
+        assert_eq!(
+            drain(&mut rx),
+            [Message::text("m:hi"), Message::text("c:{}"), Message::binary(vec![0])]
+        );
+        assert!(channels(&c).is_empty());
+        assert!(!c.apply(vec![Event::Open]));
+        assert!(!c.apply(vec![Event::Disconnect]));
+    }
+
+    /// With GRIP, text is an `m:` message (sent without its prefix) or a
+    /// `c:` control (sent nowhere); any other text ends the socket. Binary
+    /// passes as it is.
+    #[test]
+    fn apply_with_grip_takes_messages_and_controls() {
+        let (c, mut rx) = conn(true);
+        let sub = r#"c:{"type":"subscribe","channel":"news"}"#;
+        let events = vec![
+            Event::Text("m:hello".into()),
+            Event::Text("m:".into()),
+            Event::Text(sub.into()),
+            Event::Binary(Bytes::from_static(b"b")),
+        ];
+        assert!(c.apply(events));
+        assert_eq!(
+            drain(&mut rx),
+            [Message::text("hello"), Message::text(""), Message::binary(&b"b"[..])]
+        );
+        assert_eq!(channels(&c), ["news"]);
+        for bad in ["hello", "m", "", "é", "€", "x:y", "M:hi", "c:"] {
+            assert!(!c.apply(vec![Event::Text(bad.into())]), "{bad:?}");
+        }
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// A control is exactly `{"type", "channel"}`, with a valid channel name
+    /// and a known type; unsubscribing from a channel never joined is fine.
+    #[test]
+    fn controls_are_strict() {
+        let (c, _rx) = conn(true);
+        assert!(c.control(r#"{"type":"subscribe","channel":"a"}"#));
+        assert!(c.control(r#"{"channel":"a","type":"subscribe"}"#), "again is fine");
+        assert_eq!(channels(&c), ["a"]);
+        assert!(c.control(r#"{"type":"unsubscribe","channel":"a"}"#));
+        assert!(c.control(r#"{"type":"unsubscribe","channel":"never"}"#));
+        for bad in [
+            "",
+            "null",
+            "[]",
+            "{",
+            r#""subscribe""#,
+            r#"{"type":"subscribe"}"#,
+            r#"{"channel":"a"}"#,
+            r#"{"type":"subscribe","channel":"a","x":1}"#,
+            r#"{"type":"subscribe","channel":"a/b"}"#,
+            r#"{"type":"subscribe","channel":".a"}"#,
+            r#"{"type":"subscribe","channel":""}"#,
+            r#"{"type":"subscribe","channel":1}"#,
+            r#"{"type":"join","channel":"a"}"#,
+            r#"{"type":"Subscribe","channel":"a"}"#,
+            r#"{"kind":"subscribe","channel":"a"}"#,
+        ] {
+            assert!(!c.control(bad), "{bad}");
+        }
+        assert!(channels(&c).is_empty());
+        c.sockets.socks.lock().remove(&c.id);
+        assert!(
+            !c.control(r#"{"type":"subscribe","channel":"a"}"#),
+            "the socket is gone"
+        );
+    }
+
+    /// A socket joins at most `MAX_CHANNELS` channels; at the cap it may
+    /// still repeat one it has, and leaving one makes room.
+    #[test]
+    fn channels_per_socket_are_capped() {
+        let (c, _rx) = conn(true);
+        let ctl = |t: &str, ch: &str| c.control(&serde_json::json!({"type": t, "channel": ch}).to_string());
+        for i in 0..MAX_CHANNELS {
+            assert!(ctl("subscribe", &format!("c{i}")));
+        }
+        assert!(!ctl("subscribe", "one-more"));
+        assert!(ctl("subscribe", "c0"), "an existing channel at the cap");
+        assert!(ctl("unsubscribe", "c0"));
+        assert!(ctl("subscribe", "one-more"));
+        assert_eq!(channels(&c).len(), MAX_CHANNELS);
+    }
+
+    /// The object's close code is sent if a peer may send it; codes only an
+    /// endpoint may report (1005, 1006, 1015), reserved and out-of-range
+    /// ones, and none at all, become a normal close.
+    #[test]
+    fn close_codes_are_sanitised() {
+        let (c, mut rx) = conn(false);
+        for code in [
+            1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 3000, 3999, 4000, 4999,
+        ] {
+            assert!(c.apply(vec![Event::Close(Some(code))]));
+            assert_eq!(drain(&mut rx), [Message::Close(frame(code.into()))], "{code}");
+        }
+        for code in [
+            None,
+            Some(0),
+            Some(999),
+            Some(1004),
+            Some(1005),
+            Some(1006),
+            Some(1014),
+            Some(1015),
+            Some(2999),
+            Some(5000),
+        ] {
+            assert!(c.apply(vec![Event::Close(code)]));
+            assert_eq!(drain(&mut rx), [Message::Close(frame(CloseCode::Normal))], "{code:?}");
+        }
+    }
+
+    /// A publish is taken whole or not at all: an empty list is fine, at
+    /// most `MAX_ITEMS` items, and one bad item spoils the rest.
+    #[test]
+    fn publishes_are_all_or_nothing() {
+        use serde_json::json;
+        let item = |m: Value| json!({"channel": "a", "formats": {"ws-message": m}});
+        let publish = |items: &[Value]| json!({ "items": items }).to_string();
+        let good = item(json!({"content": "x"}));
+        assert_eq!(messages(publish(&[]).as_bytes()), Some(vec![]));
+        let mut full = vec![good.clone(); MAX_ITEMS];
+        assert_eq!(messages(publish(&full).as_bytes()).unwrap().len(), MAX_ITEMS);
+        full.push(good.clone());
+        assert!(messages(publish(&full).as_bytes()).is_none(), "too many items");
+        for bad in [
+            item(json!({"content": "x", "content-bin": "AA=="})),
+            item(json!({"content": "x", "extra": 1})),
+            item(json!({"content": 1})),
+            item(json!({"content-bin": "not base64!"})),
+            item(json!({"content-bin": [0]})),
+            item(json!("x")),
+            json!({"channel": 1, "formats": {"ws-message": {"content": "x"}}}),
+            json!({"formats": {"ws-message": {"content": "x"}}}),
+            json!({"channel": "a"}),
+            json!("item"),
+        ] {
+            assert!(
+                messages(publish(&[good.clone(), bad.clone()]).as_bytes()).is_none(),
+                "{bad}"
+            );
+        }
+        for bad in ["", "not json", "[]", r#"{"items":{}}"#, r#"{"items":null}"#] {
+            assert!(messages(bad.as_bytes()).is_none(), "{bad}");
+        }
+    }
+
+    /// A publish reaches its own object's sockets on each item's channel,
+    /// and only those; one without the object's name or well-formed items
+    /// is a 400, and one over `response_max` a 413, reaching no one.
+    #[tokio::test]
+    async fn publishes_reach_only_the_objects_subscribers() {
+        let sockets = Sockets::new(caps(10, 10, 10));
+        let mut rxs = vec![];
+        for (id, object, chans) in [
+            (1, "o", &["a"][..]),
+            (2, "o", &["b"]),
+            (3, "p", &["a", "b"]),
+            (4, "o", &["a", "b"]),
+            (5, "o", &[]),
+        ] {
+            let (out, rx) = out();
+            sockets.socks.lock().insert(id, sock(object, chans, out));
+            rxs.push(rx);
+        }
+        let req = |object: Option<&str>, body: String| {
+            let mut r = Request::post("http://nanovm/publish/")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap();
+            if let Some(o) = object {
+                r.headers_mut().insert(OBJECT_HEADER, o.parse().unwrap());
+            }
+            r
+        };
+        let body = r#"{"items":[{"channel":"a","formats":{"ws-message":{"content":"A"}}},
+            {"channel":"b","formats":{"ws-message":{"content":"B"}}}]}"#;
+        assert_eq!(sockets.publish(req(Some("o"), body.into())).await, 200);
+        let got: Vec<_> = rxs.iter_mut().map(drain).collect();
+        let (a, b) = (Message::text("A"), Message::text("B"));
+        assert_eq!(got, [vec![a.clone()], vec![b.clone()], vec![], vec![a, b], vec![]]);
+
+        assert_eq!(sockets.publish(req(None, body.into())).await, 400);
+        assert_eq!(sockets.publish(req(Some("o"), "{}".into())).await, 400);
+        assert_eq!(sockets.publish(req(Some("o"), format!("{body:1100}"))).await, 413);
+        assert!(rxs.iter_mut().all(|rx| drain(rx).is_empty()));
+    }
+
+    /// An upgrade is any case of `websocket`; an event is exactly the events
+    /// content type.
+    #[test]
+    fn upgrades_and_events_are_recognised() {
+        let req = |k: HeaderName, v: &'static str| Request::get("/").header(k, v).body(()).unwrap();
+        for v in ["websocket", "WebSocket"] {
+            assert!(wants(&req(http::header::UPGRADE, v)));
+        }
+        assert!(!wants(&req(http::header::UPGRADE, "h2c")) && !wants(&Request::new(())));
+        assert!(is_event(&req(CONTENT_TYPE, EVENTS)));
+        assert!(!is_event(&req(CONTENT_TYPE, "application/websocket-events; x=1")) && !is_event(&Request::new(())));
+    }
+
+    type Log = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;
+
+    /// Answers every event with `reply()`, recording what was sent.
+    fn deliver(reply: impl Fn() -> Reply + Send + Sync + 'static) -> (Deliver, Log) {
+        let log = Log::default();
+        let l = log.clone();
+        let d: Deliver = Box::new(move |req| {
+            let (l, reply) = (l.clone(), reply());
+            Box::pin(async move {
+                let (parts, body) = req.into_parts();
+                let body = body.collect().await.unwrap().to_bytes();
+                l.lock().push((parts.headers, body));
+                reply
+            })
+        });
+        (d, log)
+    }
+
+    fn accept(
+        headers: &[(&'static str, &'static str)],
+        events: impl Fn() -> Vec<Event> + Send + Sync + 'static,
+    ) -> impl Fn() -> Reply + Send + Sync + 'static {
+        let headers: HeaderMap = headers
+            .iter()
+            .map(|(k, v)| (HeaderName::from_static(k), HeaderValue::from_static(v)))
+            .collect();
+        move || {
+            Reply::Answer(Answer {
+                headers: headers.clone(),
+                events: events(),
+            })
+        }
+    }
+
+    /// The RFC 6455 example handshake, with headers of the client's own and
+    /// ones that are not the object's to see.
+    fn handshake() -> Request<Body> {
+        let mut req = Request::get("/a/o/chat")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-protocol", "chat, superchat")
+            .header("sec-websocket-extensions", "permessage-deflate")
+            .header("connection-id", "spoofed")
+            .header("te", "trailers")
+            .header("x-user", "u1")
+            .body(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync())
+            .unwrap();
+        req.extensions_mut().insert(hyper::upgrade::on(Request::new(())));
+        req
+    }
+
+    async fn try_open(
+        s: &Arc<Sockets>,
+        req: Request<Body>,
+        reply: impl Fn() -> Reply + Send + Sync + 'static,
+    ) -> (Result<Response<()>, (u16, &'static str)>, Log) {
+        let (d, log) = deliver(reply);
+        let (_tx, gone) = watch::channel(());
+        (s.open("o", req, gone, d).await, log)
+    }
+
+    /// Anything but a version-13 WebSocket handshake of bounded size is
+    /// refused before the object is asked, holding no socket.
+    #[tokio::test]
+    async fn bad_handshakes_are_refused() {
+        let s = Arc::new(Sockets::new(caps(10, 10, 10)));
+        type Edit = fn(&mut Request<Body>);
+        let edit: [(Edit, u16); 8] = [
+            (|r| r.extensions_mut().clear(), 400),
+            (|r| *r.method_mut() = http::Method::POST, 400),
+            (|r| _ = r.headers_mut().remove("sec-websocket-key"), 400),
+            (
+                |r| {
+                    _ = r
+                        .headers_mut()
+                        .insert("sec-websocket-key", HeaderValue::from_static("c2hvcnQ="))
+                },
+                400,
+            ),
+            (
+                |r| {
+                    _ = r
+                        .headers_mut()
+                        .insert("sec-websocket-key", HeaderValue::from_static("!!not base64!!"))
+                },
+                400,
+            ),
+            (|r| _ = r.headers_mut().remove("sec-websocket-version"), 426),
+            (
+                |r| {
+                    _ = r
+                        .headers_mut()
+                        .insert("sec-websocket-version", HeaderValue::from_static("8"))
+                },
+                426,
+            ),
+            (
+                |r| {
+                    _ = r
+                        .headers_mut()
+                        .insert("x-big", "x".repeat(MAX_HEADERS).parse().unwrap())
+                },
+                431,
+            ),
+        ];
+        for (i, (edit, status)) in edit.into_iter().enumerate() {
+            let mut req = handshake();
+            edit(&mut req);
+            let (res, log) = try_open(&s, req, accept(&[], || vec![Event::Open])).await;
+            assert_eq!(res.unwrap_err().0, status, "case {i}");
+            assert!(log.lock().is_empty(), "case {i}");
+        }
+        assert_eq!(s.caps.total.load(Relaxed), 0);
+        assert!(s.socks.lock().is_empty());
+    }
+
+    /// The node's, the app's and the object's socket caps each refuse a
+    /// socket with a 503, and leave the count as it was.
+    #[tokio::test]
+    async fn socket_caps_are_enforced() {
+        let open = || accept(&[], || vec![Event::Open]);
+        let node = Arc::new(Sockets::new(caps(1, 10, 10)));
+        node.caps.total.store(1, Relaxed);
+        assert_eq!(
+            try_open(&node, handshake(), open()).await.0.unwrap_err(),
+            (503, "the node has max_sockets open")
+        );
+        assert_eq!(node.caps.total.load(Relaxed), 1);
+
+        let app = Arc::new(Sockets::new(caps(10, 1, 10)));
+        app.socks.lock().insert(0, sock("other", &[], out().0));
+        assert_eq!(
+            try_open(&app, handshake(), open()).await.0.unwrap_err(),
+            (503, "the app has max_sockets open")
+        );
+        assert_eq!(app.caps.total.load(Relaxed), 0);
+
+        let object = Arc::new(Sockets::new(caps(10, 10, 1)));
+        object.socks.lock().insert(0, sock("o", &[], out().0));
+        let (res, log) = try_open(&object, handshake(), open()).await;
+        assert_eq!(res.unwrap_err(), (503, "the object has max_sockets open"));
+        assert!(log.lock().is_empty());
+        assert_eq!((object.caps.total.load(Relaxed), object.socks.lock().len()), (0, 1));
+    }
+
+    /// An object refuses a socket with its own error status, by answering
+    /// anything but OPEN first, by choosing a subprotocol the client didn't
+    /// offer, or with events a socket can't take; once it has said OPEN it
+    /// is told the socket is gone.
+    #[tokio::test]
+    async fn objects_refuse_sockets() {
+        let s = Arc::new(Sockets::new(caps(10, 10, 10)));
+        let refuse = async |reply: Box<dyn Fn() -> Reply + Send + Sync>| {
+            let (res, log) = try_open(&s, handshake(), reply).await;
+            let told: Vec<_> = log.lock().iter().map(|(_, b)| b.clone()).collect();
+            assert_eq!((s.caps.total.load(Relaxed), s.socks.lock().len()), (0, 0));
+            (res.unwrap_err(), told)
+        };
+        let (open, gone) = (Bytes::from("OPEN\r\n"), Bytes::from("DISCONNECT\r\n"));
+        let not_events = (403, "the object refused the socket");
+        assert_eq!(
+            refuse(Box::new(|| Reply::Bad(403))).await,
+            (not_events, vec![open.clone()])
+        );
+        assert_eq!(
+            refuse(Box::new(|| Reply::Gone)).await.0,
+            (503, "the app's worker is restarting")
+        );
+        let not_open = (502, "the object did not accept the socket");
+        assert_eq!(
+            refuse(Box::new(accept(&[], Vec::new))).await,
+            (not_open, vec![open.clone()])
+        );
+        assert_eq!(
+            refuse(Box::new(accept(&[], || vec![Event::Text("hi".into())]))).await.0,
+            not_open
+        );
+        let bad = (502, "the object's answer to OPEN is not one a socket can take");
+        let both = vec![open.clone(), gone.clone()];
+        let protocol = accept(&[("sec-websocket-protocol", "chatty")], || vec![Event::Open]);
+        assert_eq!(refuse(Box::new(protocol)).await, (bad, both.clone()));
+        assert_eq!(
+            refuse(Box::new(accept(&[], || vec![Event::Open, Event::Open]))).await,
+            (bad, both.clone())
+        );
+        let grip = accept(&[("sec-websocket-extensions", "grip")], || {
+            vec![Event::Open, Event::Text("hi".into())]
+        });
+        assert_eq!(refuse(Box::new(grip)).await, (bad, both));
+    }
+
+    /// An accepted socket answers the upgrade with the right accept key and
+    /// the object's subprotocol; the object sees the client's own headers,
+    /// never the handshake's or a spoofed connection id, and is offered
+    /// GRIP. A failed upgrade tells it the socket is gone and frees it.
+    #[tokio::test]
+    async fn accepted_sockets_upgrade() {
+        let s = Arc::new(Sockets::new(caps(10, 10, 10)));
+        let headers = [
+            ("sec-websocket-extensions", "grip"),
+            ("sec-websocket-protocol", "superchat"),
+        ];
+        let (res, log) = try_open(
+            &s,
+            handshake(),
+            accept(&headers, || vec![Event::Open, Event::Text("m:hi".into())]),
+        )
+        .await;
+        let res = res.unwrap();
+        assert_eq!(res.status(), 101);
+        let h = res.headers();
+        assert_eq!(h["upgrade"], "websocket");
+        assert_eq!(h["connection"], "upgrade");
+        assert_eq!(h["sec-websocket-accept"], "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        assert_eq!(h["sec-websocket-protocol"], "superchat");
+
+        let (sent, body) = log.lock()[0].clone();
+        assert_eq!(body, "OPEN\r\n");
+        assert_eq!(sent[CONTENT_TYPE], EVENTS);
+        assert_eq!(sent[SEC_WEBSOCKET_EXTENSIONS], "grip");
+        assert_eq!(sent["x-user"], "u1");
+        assert_eq!(sent["sec-websocket-protocol"], "chat, superchat");
+        assert!(sent["connection-id"].to_str().unwrap().parse::<u64>().is_ok());
+        for gone in [
+            "upgrade",
+            "connection",
+            "sec-websocket-key",
+            "sec-websocket-version",
+            "te",
+        ] {
+            assert!(!sent.contains_key(gone), "{gone}");
+        }
+
+        for _ in 0..100 {
+            if s.caps.total.load(Relaxed) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!((s.caps.total.load(Relaxed), s.socks.lock().len()), (0, 0));
+        let log = log.lock();
+        assert_eq!((log.len(), &log[1].1), (2, &Bytes::from("DISCONNECT\r\n")));
+        assert_eq!(log[1].0["connection-id"], sent["connection-id"]);
+    }
 }

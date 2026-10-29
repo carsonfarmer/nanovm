@@ -404,4 +404,153 @@ mod tests {
             assert!(is_global(good.parse().unwrap()), "{good}");
         }
     }
+
+    fn policy(entries: &[&str]) -> EgressPolicy {
+        EgressPolicy::parse(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    /// Entries that aren't `host`, `host:port` or `*.suffix[:port]` are
+    /// refused, naming the entry.
+    #[test]
+    fn parse_refuses_malformed_entries() {
+        for bad in [
+            "",
+            "  ",
+            "*.",
+            "http://a.com",
+            "a.com/path",
+            "a.com?q",
+            "a b.com",
+            "a.com:1:2",
+            "2001:db8::1",
+            "[::1",
+            "::1]",
+        ] {
+            let e = EgressPolicy::parse(&[bad.to_string()]).unwrap_err().to_string();
+            assert!(e.starts_with("bad egress entry"), "{bad:?}: {e}");
+        }
+        assert!(EgressPolicy::parse(&[]).unwrap().rules.is_empty());
+        assert!(policy(&[]).matches("a.com", 443).is_none(), "an empty list denies all");
+    }
+
+    /// An entry is trimmed and lowercased, and a port restricts it to that
+    /// port only.
+    #[test]
+    fn parse_normalizes_and_reads_ports() {
+        let p = policy(&["  API.Example.COM:8443 ", "plain.com", "zero.com:0"]);
+        assert!(p.matches("api.example.com", 8443).is_some());
+        assert!(p.matches("api.example.com", 443).is_none());
+        for port in [1, 80, 443, 65535] {
+            assert!(p.matches("plain.com", port).is_some());
+        }
+        assert_eq!(p.matches("zero.com", 0).unwrap().port, Some(0));
+        assert!(p.matches("zero.com", 80).is_none());
+    }
+
+    /// A port that isn't a u16 is a malformed entry: taking it as "any port"
+    /// would widen what the operator allowed.
+    #[test]
+    #[ignore = "bug: an unparsable port (`a.com:99999`, `a.com:8o`) is accepted and matches every port"]
+    fn parse_refuses_bad_ports() {
+        for bad in ["a.com:99999", "a.com:8o", "*.a.com:-1", "a.com:"] {
+            assert!(EgressPolicy::parse(&[bad.to_string()]).is_err(), "{bad:?}");
+        }
+    }
+
+    /// IPv6 literals are bracketed, with or without a port, and match the
+    /// address however the request spells it; an IP rule matches no name
+    /// and a name rule no IP.
+    #[test]
+    fn ipv6_entries_match_by_address() {
+        let p = policy(&["[::1]:8080", "[2001:DB8::1]", "10.0.0.1"]);
+        assert!(p.matches("::1", 8080).is_some());
+        assert!(p.matches("0:0:0:0:0:0:0:1", 8080).is_some());
+        assert!(p.matches("::1", 8081).is_none());
+        assert!(p.matches("2001:db8:0::1", 1).is_some());
+        assert!(p.matches("10.0.0.1", 1).is_some());
+        assert!(
+            p.matches("::ffff:10.0.0.1", 1).is_none(),
+            "a mapped address is a different address"
+        );
+        assert!(matches!(p.rules[0].host, HostPat::Ip(IpAddr::V6(_))));
+        let names = policy(&["localhost"]);
+        assert!(names.matches("127.0.0.1", 80).is_none());
+    }
+
+    /// A wildcard matches any depth of subdomain, never the bare suffix, a
+    /// name that merely ends with the same letters, or (written over an IP)
+    /// an IP literal as an IP rule would; `*` alone allows nothing.
+    #[test]
+    fn wildcard_edges() {
+        let p = policy(&["*.Example.com"]);
+        assert!(p.matches("a.b.c.example.com", 1).is_some());
+        assert!(p.matches("A.EXAMPLE.COM", 1).is_some());
+        for no in [
+            "example.com",
+            "badexample.com",
+            "example.com.evil",
+            ".example.com.x",
+            "a.example.co",
+        ] {
+            assert!(p.matches(no, 1).is_none(), "{no}");
+        }
+        assert!(matches!(policy(&["*.1.2.3.4"]).rules[0].host, HostPat::Suffix(_)));
+        let star = policy(&["*"]);
+        for host in ["a.com", "*.com", "1.1.1.1"] {
+            assert!(star.matches(host, 443).is_none(), "{host}");
+        }
+    }
+
+    /// Payload-free errors survive the trip between processes by name;
+    /// anything else becomes `ConnectionTerminated`.
+    #[test]
+    fn errors_cross_by_name() {
+        use Error::*;
+        for e in [
+            HttpRequestDenied,
+            HttpRequestUriInvalid,
+            DestinationIpProhibited,
+            DestinationNotFound,
+            DnsTimeout,
+            ConnectionTimeout,
+            ConnectionReadTimeout,
+            ConnectionRefused,
+        ] {
+            let name = format!("{e:?}");
+            assert_eq!(format!("{:?}", error_named(name.as_bytes())), name);
+        }
+        for other in [&b""[..], b"Connect", b"httprequestdenied", b"HttpRequestDenied ", b"ok"] {
+            assert!(matches!(error_named(other), ConnectionTerminated), "{other:?}");
+        }
+    }
+
+    fn get(uri: &str) -> http::Request<WasiBody> {
+        let body = http_body_util::Empty::<bytes::Bytes>::new()
+            .map_err(|e| match e {})
+            .boxed_unsync();
+        http::Request::get(uri).body(body).unwrap()
+    }
+
+    /// Requests are checked before any connection: not on the list (with
+    /// the scheme's default port), no host, or an allowed name pointing at a
+    /// private address, whether written as an IP or resolved.
+    #[tokio::test]
+    async fn send_refuses_before_connecting() {
+        let p = policy(&["a.example:443", "*.0.0.1", "localhost"]);
+        let refused = async |uri: &str| send(get(uri), None, &p).await.err().map(|e| format!("{e:?}"));
+        assert_eq!(refused("http://a.example/").await.as_deref(), Some("HttpRequestDenied"));
+        assert_eq!(
+            refused("http://other.example:443/").await.as_deref(),
+            Some("HttpRequestDenied")
+        );
+        assert_eq!(refused("/relative").await.as_deref(), Some("HttpRequestUriInvalid"));
+        assert_eq!(
+            refused("http://127.0.0.1/").await.as_deref(),
+            Some("DestinationIpProhibited")
+        );
+        assert_eq!(
+            refused("http://localhost/").await.as_deref(),
+            Some("DestinationIpProhibited")
+        );
+    }
 }

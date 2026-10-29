@@ -206,3 +206,115 @@ impl Registry {
         Ok(bytes.to_vec())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        pairs
+            .iter()
+            .map(|(k, v)| (http::HeaderName::from_static(k), v.parse().unwrap()))
+            .collect()
+    }
+
+    fn app() -> String {
+        format!("ghcr.io/acme/app@{DIGEST}")
+    }
+
+    fn err(h: &HeaderMap) -> String {
+        format!("{:#}", AppRef::from_headers(h).unwrap_err())
+    }
+
+    /// A request without `nanovm-app` names no registry app, whatever else
+    /// it carries.
+    #[test]
+    fn no_app_header_is_no_app() {
+        assert!(AppRef::from_headers(&HeaderMap::new()).unwrap().is_none());
+        let h = headers(&[(TRUST_HEADER, "garbage"), (MIN_VERSION_HEADER, "x")]);
+        assert!(AppRef::from_headers(&h).unwrap().is_none());
+    }
+
+    /// The app is pinned by digest: a tag alone, an unparsable reference or
+    /// a value that isn't text is refused.
+    #[test]
+    fn app_must_be_a_reference_with_a_digest() {
+        let trust = (TRUST_HEADER, "https://issuer subject");
+        assert!(err(&headers(&[(APP_HEADER, "ghcr.io/acme/app:1.0"), trust])).contains("must name a digest"));
+        assert!(err(&headers(&[(APP_HEADER, "ghcr.io/acme/app"), trust])).contains("must name a digest"));
+        assert!(err(&headers(&[(APP_HEADER, "Not A Reference!"), trust])).contains(APP_HEADER));
+        let mut h = headers(&[trust]);
+        h.insert(APP_HEADER, http::HeaderValue::from_bytes(b"\xff").unwrap());
+        assert!(err(&h).contains("not text"));
+
+        let tagged = format!("ghcr.io/acme/app:1.0@{DIGEST}");
+        let r = AppRef::from_headers(&headers(&[(APP_HEADER, &tagged), trust]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.digest, DIGEST);
+        assert_eq!(r.reference.repository(), "acme/app");
+    }
+
+    /// Trust is a comma-separated list of `<issuer> <subject>`, with any
+    /// whitespace around and between them; every entry must be a pair.
+    #[test]
+    fn trust_is_a_list_of_issuer_subject_pairs() {
+        let app = app();
+        let h = headers(&[(APP_HEADER, &app), (TRUST_HEADER, " i1  s1 ,i2\ts2,  i3 s3  ")]);
+        let r = AppRef::from_headers(&h).unwrap().unwrap();
+        let pairs = [("i1", "s1"), ("i2", "s2"), ("i3", "s3")].map(|(i, s)| (i.to_string(), s.to_string()));
+        assert_eq!(r.trust, pairs);
+        assert_eq!(r.min_version, None);
+
+        for bad in ["", "i1", "i1 s1 extra", "i1 s1,", "i1 s1,,i2 s2", ","] {
+            let h = headers(&[(APP_HEADER, &app), (TRUST_HEADER, bad)]);
+            assert!(err(&h).contains("<issuer> <subject>"), "{bad:?}");
+        }
+        assert!(err(&headers(&[(APP_HEADER, &app)])).contains("nanovm-trust is required"));
+    }
+
+    /// The version floor is optional and must be full semver.
+    #[test]
+    fn min_version_is_semver() {
+        let app = app();
+        let with = |v| headers(&[(APP_HEADER, &app), (TRUST_HEADER, "i s"), (MIN_VERSION_HEADER, v)]);
+        let r = AppRef::from_headers(&with("1.2.3-rc.1")).unwrap().unwrap();
+        assert_eq!(r.min_version, Some(semver::Version::parse("1.2.3-rc.1").unwrap()));
+        for bad in ["1.2", "v1.2.3", "", "latest"] {
+            assert!(AppRef::from_headers(&with(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// An app's config blob takes only the known keys; each is optional.
+    #[test]
+    fn app_spec_defaults_and_refuses_unknown_keys() {
+        let spec: AppSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(spec.limits.memory_mb, Limits::default().memory_mb);
+        assert!(spec.env.is_empty() && spec.config.is_empty());
+        let spec: AppSpec = serde_json::from_str(r#"{"limits":{"cpu_ms":7},"env":{"A":"b"}}"#).unwrap();
+        assert_eq!((spec.limits.cpu_ms, spec.limits.memory_mb), (7, 64));
+        assert!(serde_json::from_str::<AppSpec>(r#"{"limit":{}}"#).is_err());
+        assert!(serde_json::from_str::<AppSpec>(r#"{"limits":{"cpu":1}}"#).is_err());
+    }
+
+    /// The cache keeps only bytes that hash to their digest, under a name
+    /// without `:`, and leaves no temporary file behind.
+    #[test]
+    fn cache_keeps_only_matching_blobs() {
+        let dir = std::env::temp_dir().join(format!("nanovm-registry-test-{}", std::process::id()));
+        let reg = Registry::new(dir.clone()).unwrap();
+        let digest = format!("sha256:{:x}", Sha256::digest(b"blob"));
+        assert!(reg.store(&digest, b"other").is_err());
+        assert_eq!(reg.cached(&digest), None);
+        assert_eq!(reg.store(&digest, b"blob").unwrap(), b"blob");
+        assert_eq!(reg.cached(&digest).as_deref(), Some(&b"blob"[..]));
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, [digest.replace(':', "-")]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

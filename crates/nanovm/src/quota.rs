@@ -157,6 +157,13 @@ impl QuotaGuard {
         q.bytes = q.bytes.saturating_add_signed(bytes);
         q.files = q.files.saturating_add_signed(files);
     }
+
+    /// Bytes and entries in use.
+    #[cfg(test)]
+    pub(crate) fn usage(&self) -> (u64, u64) {
+        let q = self.0.lock();
+        (q.bytes, q.files)
+    }
 }
 
 impl Inner {
@@ -501,5 +508,199 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         _new_path: String,
     ) -> FilesystemResult<()> {
         Err(guard(store).refuse(ErrorCode::NotPermitted, "symlinks are not permitted"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A new, empty directory under the system temp dir.
+    fn tempdir(name: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, Relaxed);
+        let dir = std::env::temp_dir().join(format!("nanovm-quota-{name}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A guard over an empty volume with room for `bytes` and `files`.
+    fn guard(bytes: u64, files: u64) -> (QuotaGuard, Arc<Metrics>) {
+        let metrics = Arc::new(Metrics::default());
+        let obj = Arc::new(ObjShared::new("app".into(), "obj"));
+        let limits = Limits {
+            max_files: files,
+            ..Limits::default()
+        };
+        let dir = tempdir("empty");
+        let g = QuotaGuard::new(&dir, &limits, metrics.clone(), obj).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+        g.0.lock().max_bytes = bytes;
+        (g, metrics)
+    }
+
+    fn usage(g: &QuotaGuard) -> (u64, u64) {
+        g.usage()
+    }
+
+    /// A new instance starts from what the volume already holds: every
+    /// entry counts against the file limit, and regular files' bytes.
+    #[test]
+    fn starts_from_the_volumes_usage() {
+        let dir = tempdir("usage");
+        std::fs::write(dir.join("a"), [0; 10]).unwrap();
+        std::fs::create_dir_all(dir.join("d/e")).unwrap();
+        std::fs::write(dir.join("d/e/b"), [0; 5]).unwrap();
+        let limits = Limits {
+            disk_mb: 2,
+            ..Limits::default()
+        };
+        let obj = Arc::new(ObjShared::new("app".into(), "obj"));
+        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj).unwrap();
+        assert_eq!(usage(&g), (15, 4));
+        assert_eq!(g.0.lock().max_bytes, 2 << 20);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A new file costs an entry and its bytes; replacing one costs only the
+    /// difference, so a shrinking replacement frees space.
+    #[test]
+    fn reserve_charges_new_files_and_replacements() {
+        let (g, _) = guard(100, 10);
+        g.reserve(None, 60).unwrap();
+        assert_eq!(usage(&g), (60, 1));
+        g.reserve(Some(60), 100).unwrap();
+        assert_eq!(usage(&g), (100, 1));
+        g.reserve(Some(100), 0).unwrap();
+        assert_eq!(usage(&g), (0, 1));
+        // A replaced file can't free more than is in use.
+        g.reserve(None, 5).unwrap();
+        g.reserve(Some(1000), 1).unwrap();
+        assert_eq!(usage(&g), (1, 2));
+    }
+
+    /// Past the byte limit a write is refused as a full disk would, leaving
+    /// usage as it was; filling it exactly is allowed.
+    #[test]
+    fn reserve_refuses_past_the_byte_limit() {
+        let (g, metrics) = guard(100, 10);
+        g.reserve(None, 70).unwrap();
+        assert!(matches!(g.reserve(None, 31), Err(ErrorCode::InsufficientSpace)));
+        assert!(matches!(g.reserve(Some(70), 101), Err(ErrorCode::InsufficientSpace)));
+        assert!(matches!(g.reserve(None, u64::MAX), Err(ErrorCode::InsufficientSpace)));
+        assert_eq!(usage(&g), (70, 1));
+        g.reserve(None, 30).unwrap();
+        assert_eq!(usage(&g), (100, 2));
+        assert_eq!(metrics.fs_denied.load(Relaxed), 3);
+    }
+
+    /// At the file limit no new entry is allowed, but existing files may
+    /// still be replaced.
+    #[test]
+    fn reserve_and_new_entries_stop_at_the_file_limit() {
+        let (g, _) = guard(100, 2);
+        g.check_new_entry().unwrap();
+        g.reserve(None, 1).unwrap();
+        g.reserve(None, 1).unwrap();
+        assert!(matches!(g.reserve(None, 0), Err(ErrorCode::Quota)));
+        assert!(matches!(g.check_new_entry(), Err(ErrorCode::Quota)));
+        g.reserve(Some(1), 50).unwrap();
+        assert_eq!(usage(&g), (51, 2));
+        g.adjust(0, -1);
+        g.check_new_entry().unwrap();
+    }
+
+    /// Adjustments move usage both ways and never below zero.
+    #[test]
+    fn adjust_saturates() {
+        let (g, _) = guard(100, 10);
+        g.adjust(40, 3);
+        g.adjust(-10, -1);
+        assert_eq!(usage(&g), (30, 2));
+        g.adjust(-1000, -1000);
+        assert_eq!(usage(&g), (0, 0));
+        for _ in 0..3 {
+            g.adjust(i64::MAX, i64::MAX);
+        }
+        assert_eq!(usage(&g), (u64::MAX, u64::MAX));
+    }
+
+    /// A guest refused in a loop is logged on its first denial and every
+    /// thousandth after, though every denial is counted.
+    #[test]
+    fn denials_are_logged_sparingly() {
+        let (g, metrics) = guard(0, 0);
+        for _ in 0..2000 {
+            let _ = g.check_new_entry();
+        }
+        assert_eq!(metrics.fs_denied.load(Relaxed), 2000);
+        let events = metrics.events_since(0);
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            (events[0].kind, &*events[0].app, &*events[0].object),
+            ("fs-denied", "app", "obj")
+        );
+        assert!(events[0].detail.contains("entry limit reached (0 files)"));
+    }
+
+    /// Writes past the budget are cut short, then refused; overwriting
+    /// bytes a file already has costs nothing, and an empty write always
+    /// succeeds.
+    #[test]
+    fn writes_are_cut_at_the_budget() {
+        let dir = tempdir("write");
+        let (g, _) = guard(10, 10);
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.join("f"))
+            .unwrap();
+        assert_eq!(g.write(&f, None, b"123456").unwrap(), 6);
+        assert_eq!(g.write(&f, None, b"abcdef").unwrap(), 4, "a short write");
+        assert_eq!(usage(&g).0, 10);
+        assert!(matches!(g.write(&f, None, b"x"), Err(ErrorCode::InsufficientSpace)));
+        assert_eq!(g.write(&f, None, b"").unwrap(), 0);
+        assert_eq!(
+            g.write(&f, Some(0), b"ABCDEFGHIJ").unwrap(),
+            10,
+            "an overwrite in place"
+        );
+        assert_eq!(g.write(&f, Some(5), b"0123456789").unwrap(), 5);
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"ABCDE01234");
+        assert!(matches!(g.write(&f, Some(u64::MAX), b"x"), Err(ErrorCode::Overflow)));
+        assert_eq!(usage(&g).0, 10);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A write past the end of a file is charged for the gap it leaves.
+    #[test]
+    fn sparse_writes_pay_for_the_hole() {
+        let dir = tempdir("sparse");
+        let (g, _) = guard(10, 10);
+        let f = std::fs::File::create(dir.join("f")).unwrap();
+        assert_eq!(g.write(&f, Some(8), b"abcd").unwrap(), 2);
+        assert_eq!((usage(&g).0, f.metadata().unwrap().len()), (10, 10));
+        assert!(matches!(g.write(&f, Some(20), b"x"), Err(ErrorCode::InsufficientSpace)));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Growing a file is charged and refused past the budget; shrinking it
+    /// frees the difference.
+    #[test]
+    fn set_size_is_charged() {
+        let dir = tempdir("size");
+        let (g, _) = guard(10, 10);
+        let f = std::fs::File::create(dir.join("f")).unwrap();
+        g.set_size(&f, 8).unwrap();
+        assert_eq!(usage(&g).0, 8);
+        assert!(matches!(g.set_size(&f, 11), Err(ErrorCode::InsufficientSpace)));
+        g.set_size(&f, 10).unwrap();
+        g.set_size(&f, 3).unwrap();
+        assert_eq!((usage(&g).0, f.metadata().unwrap().len()), (3, 3));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

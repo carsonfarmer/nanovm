@@ -231,3 +231,23 @@ impl Node {
         phases
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Names are 1 to 128 of `[A-Za-z0-9_.-]`, never starting with `.`, so
+    /// no name is `.`, `..`, hidden, or a path.
+    #[test]
+    fn names_are_safe_path_components() {
+        for good in ["a", "A-z_0.9", "-", "_x", "a..b", &"x".repeat(128)] {
+            assert!(valid_name(good), "{good:?}");
+        }
+        let long = "x".repeat(129);
+        for bad in [
+            "", ".", "..", ".hidden", "a/b", "a\\b", "a b", "é", "a\0", "a:b", "%2e", &long,
+        ] {
+            assert!(!valid_name(bad), "{bad:?}");
+        }
+    }
+}

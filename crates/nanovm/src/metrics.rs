@@ -197,3 +197,102 @@ pub fn rss_bytes() -> u64 {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn us(n: u64) -> Duration {
+        Duration::from_micros(n)
+    }
+
+    /// A quantile is the exclusive upper bound of the power-of-two bucket
+    /// that holds it; an empty histogram reports 0 and the last bucket
+    /// takes everything beyond it.
+    #[test]
+    fn histogram_quantiles_are_bucket_bounds() {
+        let h = Histogram::default();
+        assert_eq!(h.quantile(0.5), 0);
+        for _ in 0..99 {
+            h.record(us(3));
+        }
+        h.record(us(1000));
+        assert_eq!(
+            [h.quantile(0.0), h.quantile(0.5), h.quantile(0.99), h.quantile(0.999)],
+            [4, 4, 4, 1024]
+        );
+        let v = serde_json::to_value(&h).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"count": 100, "mean_us": 12, "p50_us": 4, "p99_us": 4, "p999_us": 1024})
+        );
+
+        let edges = Histogram::default();
+        for n in [0, 1, 1024] {
+            edges.record(us(n));
+        }
+        assert_eq!(
+            [edges.quantile(0.3), edges.quantile(0.6), edges.quantile(1.0)],
+            [1, 2, 2048]
+        );
+        let top = Histogram::default();
+        top.record(Duration::from_secs(1 << 40));
+        assert_eq!(top.quantile(1.0), 1 << 31);
+    }
+
+    /// Statuses count by class, out-of-range ones in the nearest; poisons
+    /// by name; guest CPU is reported in whole milliseconds; the event log
+    /// stays out of the stats.
+    #[test]
+    fn stats_serialize_by_class_and_name() {
+        let m = Metrics::default();
+        for code in [101, 200, 204, 404, 500, 503, 999] {
+            m.status(code);
+        }
+        m.poison(Poison::ResourceTable);
+        m.poison(Poison::Cpu);
+        m.poison(Poison::Cpu);
+        m.guest_cpu_ns.store(2_999_999, Relaxed);
+        m.event("x", "a", "o", "d");
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(
+            v["status"],
+            serde_json::json!({"1xx": 1, "2xx": 2, "3xx": 0, "4xx": 1, "5xx": 3})
+        );
+        let poisons = serde_json::json!({"cpu": 2, "memory": 0, "timeout": 0, "trap": 0, "resource-table": 1});
+        assert_eq!(v["poisons"], poisons);
+        assert_eq!(v["guest_cpu_ms"], 2);
+        assert!(v.get("events").is_none() && v.get("guest_cpu_ns").is_none());
+        for (i, p) in Poison::ALL.iter().enumerate() {
+            assert_eq!(*p as usize, i);
+        }
+    }
+
+    /// Events are numbered from 1, read back after a sequence number, and
+    /// the log keeps only the newest `EVENT_RING`.
+    #[test]
+    fn event_log_is_a_numbered_ring() {
+        let m = Metrics::default();
+        m.event("kill", "app", "obj", "why");
+        let e = &m.events_since(0)[..];
+        assert_eq!(
+            (e.len(), e[0].seq, e[0].kind, &*e[0].app, &*e[0].object, &*e[0].detail),
+            (1, 1, "kill", "app", "obj", "why")
+        );
+        assert!(m.events_since(1).is_empty());
+        for _ in 0..EVENT_RING + 10 {
+            m.event("x", "a", "o", "");
+        }
+        let all = m.events_since(0);
+        assert_eq!(all.len(), EVENT_RING);
+        assert_eq!((all[0].seq, all.last().unwrap().seq), (12, EVENT_RING as u64 + 11));
+        assert_eq!(m.events_since(EVENT_RING as u64 + 9).len(), 2);
+    }
+
+    /// The process's resident size is read, and is plausible.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn rss_is_measured() {
+        assert!(rss_bytes() > 1 << 20);
+    }
+}
