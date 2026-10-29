@@ -267,11 +267,13 @@ The goal: one node, as fast and secure as we can make it, that runs untrusted We
   - New requests go to the new version; objects on the old version drain and are evicted.
   - Manifest limits are clamped to operator maximums.
 - **Features to add:**
-  - **WebSockets,** following tric's WebSocket-over-HTTP model: each event (`OPEN`/`TEXT`/`CLOSE`/`DISCONNECT`) is a normal bounded request to the object, and sockets outlive instances.
-    - The node itself speaks the protocol and handles channel publishing; no Pushpin process.
-    - Events are ordered per object. Channels are scoped per object. There is a per-object socket cap, and tric's size bounds apply.
-  - **Alarms are not a node feature** (Q30). The node passes response headers through and is stateless, so a scheduler in front of it (the proxy) can read `x-nanovm-alarm: <unix-ms>` from responses, keep the schedule, and send a marked `POST` when it is due, stripping that marker from client requests as it already strips the app headers.
-  - **Key-value:** a host-implemented `wasi:keyvalue` stored as files under `/data`. `wasi:filesystem` stays exposed.
+  - **WebSockets** (done), following tric's WebSocket-over-HTTP model: each event (`OPEN`/`TEXT`/`BINARY`/`CLOSE`/`DISCONNECT`) is a normal bounded request to the object, and sockets outlive instances.
+    - The supervisor itself speaks the protocol and handles channel publishing; there is no Pushpin process (Pushpin can't be embedded as a library).
+    - Events are ordered per object. Channels are scoped per object, as in Durable Objects (Q32).
+    - Sockets close when their worker goes, including on a version switch (Q35).
+    - Bounds come from the existing request and response limits, plus `max_sockets` per object and per node (Q36). tric's sizes were API Gateway's, so they weren't carried over.
+  - **Alarms are skipped for now** (Q30). Since they are set by a response header, they could be done outside the node, by a scheduler in front of it.
+  - **Key-value** (done): a host-implemented `wasi:keyvalue` stored as files under `/data`. `wasi:filesystem` stays exposed. `wasi:config` serves each app's config values.
 - **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
 - **Out of scope for now:** clustering, one-shot runs of agent-written code, dashboards, static signing keys.
 
@@ -318,10 +320,13 @@ As in the target design, with these choices (README, "Apps from a registry", has
 - Local `[[app]]` entries stay, for development, the demo and tests (Q27).
 - CI (`publish-guests.yml`) publishes the test guests with GitHub artifact attestations. That needed the repo to be public: attestations aren't available on private user repos.
 
+## Phase 4: key-value and config (done), phase 5: WebSockets (done)
+
+README's "Key-value and config" and "WebSockets" describe them.
+
 ## Next phases
 
-4. Key-value (`wasi:keyvalue` on `/data`) and `wasi:config` (done).
-5. WebSockets.
+6. The front proxy (Q34): it maps a host to an app's digest and trust policy, strips `nanovm-*` headers from clients, and is the public entry point. Perhaps `nanovm proxy` in this repo.
 
 ## Follow-ups
 

@@ -6,6 +6,8 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 - Each object has its own memory cap, CPU budget, deadlines and handle cap.
 - Each object has its own quota'd filesystem: read-only `/app`, scratch `/tmp`, and a persistent `/data` volume.
 - Each app has an egress allowlist.
+- Each object has a `wasi:keyvalue` store in its volume, and each app its `wasi:config` values.
+- Objects accept WebSockets and publish to their own sockets.
 - Memory is lost on eviction; `/data` survives eviction and restarts.
 
 Each app runs in its own jailed worker process. A supervisor that runs no guest code owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
@@ -124,6 +126,31 @@ What happens on the first request for a digest:
 
 **Publishing.** [.github/workflows/publish-guests.yml](.github/workflows/publish-guests.yml) is the reference pipeline. CI builds each test guest, pushes it with `oras` (artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, version `1.0.<run>`), and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity. No key exists anywhere. A person can sign the same way from a laptop with `cosign` and a browser sign-in.
 
+## Key-value and config
+
+**`wasi:keyvalue`** (`store`, `atomics` and `batch`, 0.2.0-draft) is implemented by the host on the object's own volume. Bucket `b` is the directory `/data/.kv/b`, and each key is one file in it, named by the key in unpadded base64url so that no key can name a path.
+- Values count against the object's disk budget and keys against its file limit, like any other file.
+- Each value is replaced atomically: it is written beside, then renamed.
+- A read is bounded by the object's memory limit, and a batch names at most 1,000 keys. Host calls aren't interrupted by the CPU budget, so these bounds keep them short.
+- `wasi:filesystem` stays exposed. A guest can reach `.kv` through it; the store lists only well-formed key files, and refuses to write over anything else.
+
+Spin's store, by comparison, is one SQLite table per app shared by all its instances, with no per-store disk quota. Ours is per object, under the object's quotas, with no dependency. It gives up SQLite's durable, atomic batches: values are not fsynced, and a batch is not atomic.
+
+**`wasi:config/store`** (0.2.0-rc.1) serves the app's `config` table: `[app.config]` for a local app, `"config"` in a registry app's `nanovm.json`. Environment variables (`env`) still work alongside it.
+
+## WebSockets
+
+The supervisor holds client sockets. Objects see them as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work.
+- **Opening.** A socket opened at `/{app}/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`.
+- **Events.** Each later event (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` queued with the object's other requests, so events are ordered with everything else the object serves. The answer carries events for that socket.
+- **Fan-out within an object**, as in Durable Objects (an object is a room). An object that answers `Sec-WebSocket-Extensions: grip` sends `m:` messages and `c:` controls. `{"type":"subscribe","channel":"…"}` subscribes the socket to a channel of its own object. The object reaches every subscribed socket, from any request, by posting GRIP's publish format to `http://nanovm/publish/`; the worker stamps that request with the object's id.
+- **Lifetime.** Sockets outlive instances: an evicted object is started again by the next event. They belong to the worker process, and close (1012) when it exits or the app switches versions, so clients reconnect to the new version. A node restart drops them.
+- **Limits.**
+  - `max_sockets` per object (default 256) and per node (default 10,000; each is a file descriptor in the supervisor).
+  - A message is bounded by `max_request_body_kb` (closed with 1009), and an answer by `max_response_body_kb`.
+  - A socket more than `max_response_body_kb` behind, or a write stalled for 30 s, drops the client.
+  - A socket has at most 64 channels, and a publish at most 1,000 items.
+
 ## Benchmarks
 
 ```bash
@@ -191,7 +218,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 43 integration tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 51 integration tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -221,6 +248,9 @@ The tests cover:
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.
 - a worker that can't reach its own directories failing to start, and saying which one
+- key-value: values persisting in the volume, counting against the disk and file quotas, bad names refused, keys paged, reads bounded by the memory limit and batches by size, and the store working in a jailed worker (including a key file the guest replaced through its filesystem)
+- config values served through `wasi:config`, locally and from a registry app's `nanovm.json`
+- WebSockets through the supervisor: echo, binary, fan-out to the sockets of one object only (from an event and from a plain request), a guest-initiated close, the object told how a socket ended, refusals by an object that doesn't answer `OPEN`; the per-object and per-node caps, the message size, a client that never reads being dropped, and a worker's sockets closing when it dies
 
 ### Testing cgroups in a VM
 
@@ -275,6 +305,8 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `crates/nanovm/src/jail.rs` | uid, Landlock and seccomp, entered by a worker before any guest code |
 | `crates/nanovm/src/registry.rs` | Registry apps: pull by digest, Sigstore verification, version floor, digest cache |
 | `crates/nanovm/src/link.rs` | HTTP/1.1 over socketpairs passed across a control socket |
+| `crates/nanovm/src/kv.rs` | `wasi:keyvalue` on the object's volume |
+| `crates/nanovm/src/ws.rs` | WebSockets: the supervisor's sockets, WebSocket-over-HTTP events and per-object channels |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
 | `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |
 

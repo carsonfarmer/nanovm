@@ -1207,11 +1207,9 @@ async fn registry_apps_need_a_trusted_signature() {
     assert!(body.contains(r#""app":"rc""#), "{body}");
     let v = stats_json(addr).await;
     assert_eq!(v["workers"]["rc"]["version"], version.to_string(), "{v}");
-    // Versions published with config values serve them through wasi:config.
+    // The app's config values are served through wasi:config.
     let (status, body) = reg_get(addr, "/rc/a/config/greeting", &app, SIGNER, None).await;
-    if status != 404 || !body.contains("not found") {
-        assert_eq!((status, body.as_str()), (200, "from the registry"));
-    }
+    assert_eq!((status, body.as_str()), (200, "from the registry"));
 
     let wrong_subject = SIGNER.replace("publish-guests.yml", "other.yml");
     let wrong_issuer = SIGNER.replace("token.actions", "evil");

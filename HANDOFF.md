@@ -2,12 +2,22 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found).
 
-## State (2026-10-28, later)
+## State (2026-10-29)
 
-- **`main` is current.** It has phase 1 (portable core), phase 2 (the Linux jail), two simplification passes, and phase 3 (signed OCI deploys). Every branch is pushed; nothing is uncommitted.
-- **Next: WebSockets** (Q16). Key-value and `wasi:config` are done; alarms were dropped from the node (Q30).
-- **Tests:** 43 integration tests pass, plus 3 unit tests. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io. The demo runs with 0 failures, and `scripts/vm-test.sh` passes.
-- **Runtime size:** 3,704 lines (2,303 before the jail; 3,362 before phase 3).
+- **`main` is current.** It has:
+  - phase 1 (portable core);
+  - phase 2 (the Linux jail);
+  - two simplification passes;
+  - phase 3 (signed OCI deploys);
+  - phase 4 (`wasi:keyvalue`, `wasi:config`);
+  - phase 5 (WebSockets).
+
+  Every branch is pushed; nothing is uncommitted. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
+- **Next: the front proxy** (Q34), once the owner confirms. Alarms are skipped for now (Q30).
+- **Tests:** 51 integration tests pass, plus 5 unit tests. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.
+  - `cpu_hogs_leave_cores_for_short_requests` is load-sensitive and fails occasionally when the whole suite runs at once on 4 cores; it passes alone.
+  - When guests change, the first run can fail one supervised test with `Permission denied`. The test nodes share one `.cwasm` cache between root in-process nodes and jailed workers. A rerun passes.
+- **Runtime size:** about 4,500 lines (3,704 after phase 3; kv and config added about 300, WebSockets about 540).
 - **The repo `carsonfarmer/nanovm` is now public**, so GitHub artifact attestations work. The packages `ghcr.io/carsonfarmer/nanovm-{counter,hostile}` are public. `publish-guests.yml` runs on pushes to `guests/**` and on `gh workflow run publish-guests.yml` (dispatch works through the proxy, and `gh run watch <id>` shows progress). Each run publishes version `1.0.<run number>`.
 - **Old branches** (`jail`, `simplify`, `oci`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical.
 
@@ -40,13 +50,14 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q12 | Untrusted Wasm is compiled inside the app's jailed worker. |
 | Q15 | Key-value is a host-implemented `wasi:keyvalue` stored as files in `/data`; `wasi:filesystem` stays exposed. |
 | Q16 | WebSockets follow tric's model (`github.com/carsonfarmer/tric`, `src/ws.rs`): Pushpin WebSocket-over-HTTP events (OPEN/TEXT/CLOSE/DISCONNECT) delivered as normal bounded requests, plus GRIP-style channels. The node speaks it itself (no Pushpin process). Ordered per object, per-object channels and socket cap, tric's size bounds (128 KiB message, 32 KiB frame, 64 events per answer, 2 MiB answer). Sockets outlive instances. |
-| Q17/Q30 | Alarms stay outside the node: response headers already pass through, so the proxy (or any scheduler in front) can implement `x-nanovm-alarm` without the node keeping state. |
+| Q17/Q30 | Alarms are skipped for now. Being header-based, they could be done outside the node. |
+| Q31–Q36 | WebSockets live in the supervisor; Pushpin can't be embedded. Fan-out is to the object's own sockets only (Q32). Wire format as Q16. The front proxy is a later phase (Q34). The node stays stateless: sockets are in-memory and close with their worker, including on a version switch (Q35). Limits: `max_sockets` per object (256) and per node (10,000), plus the existing request and response limits; tric's API Gateway sizes weren't carried over (Q36). |
 | Q18 | Running agent-written one-shot code is not a goal for now. |
 | Q21 | Trust policy per app: a list of exact `{issuer, subject}` identities; no static public keys. |
 | Q22 | The trust policy and minimum version travel with each request from the proxy. |
 | Q23/Q24 | The jail and the supervisor/worker split as built. Mount and network namespaces were dropped as redundant: Landlock already confines the filesystem, and seccomp removes `socket()`. |
 
-Phases after this one ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets.
+Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets (all done), 6 the front proxy.
 
 ## Phase 3 as built
 
@@ -90,7 +101,7 @@ The owner answered Q25–Q27 "yes", and chose to make the repo public rather tha
 ## Layout pointers
 
 - `crates/nanovm/src`: the runtime.
-  - `supervisor.rs` (supervisor and worker entry), `registry.rs`, `link.rs`, `jail.rs`
+  - `supervisor.rs` (supervisor and worker entry), `registry.rs`, `link.rs`, `jail.rs`, `ws.rs` (WebSockets), `kv.rs` (`wasi:keyvalue`)
   - `egress.rs` (`Route::Direct` in-process, `Route::Supervisor` jailed)
   - `object.rs`, `table.rs` (`Node`), `quota.rs`, `server.rs`, `config.rs`, `engine.rs`, `app.rs`, `metrics.rs`, `main.rs`
 - `crates/nanovm/tests/integration.rs`: the integration tests. Helpers: `node_cfg`, `supervised_with`, `http_get`, `test_cgroup`, `stalling_upstream`. `jail_probe` runs in a child process.
