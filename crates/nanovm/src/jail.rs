@@ -152,9 +152,10 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_mkdir,
         libc::SYS_rename,
         libc::SYS_renameat,
-        // std's remove_file and remove_dir on x86_64 glibc.
+        // std's remove_file, remove_dir and read_link on x86_64 glibc.
         libc::SYS_unlink,
         libc::SYS_rmdir,
+        libc::SYS_readlink,
     ]);
     let mut rules: std::collections::BTreeMap<i64, Vec<SeccompRule>> = allow.into_iter().map(|s| (s, vec![])).collect();
     let rule = |conds: Vec<Cond>| SeccompRule::new(conds);

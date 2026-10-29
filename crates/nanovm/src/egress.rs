@@ -140,6 +140,9 @@ pub struct EgressHooks {
     pub sem: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
     pub obj: Arc<crate::object::ObjShared>,
+    /// Publishes to the object's sockets, held until its request commits.
+    pub held: Arc<parking_lot::Mutex<Vec<http::Request<bytes::Bytes>>>>,
+    pub publish_max: usize,
 }
 
 type IoFuture = Box<dyn Future<Output = Result<(), Error>> + Send>;
@@ -155,10 +158,9 @@ impl WasiHttpHooks for EgressHooks {
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
         let obj = self.obj.clone();
-        // Names the object, so its publishes reach only its own sockets.
-        let mut request = request;
-        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) {
-            request.headers_mut().insert(crate::ws::OBJECT_HEADER, obj.id.parse().expect("object ids are header-safe"));
+        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && matches!(route, Route::Supervisor(_)) {
+            let (held, max) = (self.held.clone(), self.publish_max);
+            return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
         }
         Box::new(async move {
             let target = request.uri().clone();
@@ -190,6 +192,29 @@ impl WasiHttpHooks for EgressHooks {
             res
         })
     }
+}
+
+/// Holds a publish until the request commits, named with its object so it
+/// reaches only that object's sockets; answers what the supervisor would.
+async fn hold(
+    req: http::Request<WasiBody>,
+    obj: &crate::object::ObjShared,
+    held: &parking_lot::Mutex<Vec<http::Request<bytes::Bytes>>>,
+    max: usize,
+) -> http::Response<WasiBody> {
+    let (mut parts, body) = req.into_parts();
+    let status = match http_body_util::Limited::new(body, max).collect().await.map(|b| b.to_bytes()) {
+        Err(_) => 413,
+        Ok(body) if !crate::ws::well_formed(&body) => 400,
+        Ok(body) => {
+            parts.headers.insert(crate::ws::OBJECT_HEADER, obj.id.parse().expect("object ids are header-safe"));
+            held.lock().push(http::Request::from_parts(parts, body));
+            200
+        }
+    };
+    let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
+    *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
+    res
 }
 
 type Sent = (http::Response<WasiBody>, futures::future::BoxFuture<'static, Result<(), Error>>);

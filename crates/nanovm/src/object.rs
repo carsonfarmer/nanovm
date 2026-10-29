@@ -309,6 +309,8 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
             sem: Arc::new(Semaphore::new(limits.max_outbound_concurrency)),
             metrics: node.metrics.clone(),
             obj: shared.clone(),
+            held: Default::default(),
+            publish_max: (limits.max_response_body_kb << 10) as usize,
         },
         limiter: MemLimiter {
             max_bytes: (limits.memory_mb << 20) as usize,
@@ -360,7 +362,37 @@ enum Exit {
     Closed,
     /// No request arrived within the idle timeout.
     Idle,
+    /// A request failed; restarting rolls back what it changed.
+    Reset,
     Poisoned(Poison, String),
+}
+
+/// Ends an instance whose request failed.
+#[derive(Debug)]
+struct RolledBack;
+
+impl std::fmt::Display for RolledBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the request failed, so its changes are rolled back")
+    }
+}
+
+impl std::error::Error for RolledBack {}
+
+/// Makes the request's changes durable, then sends what it published.
+async fn commit(acc: &Accessor<ObjState>) -> anyhow::Result<()> {
+    let (quota, held, route) = acc.with(|mut s| {
+        let s = s.data_mut();
+        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
+    });
+    quota.commit()?;
+    if let crate::egress::Route::Supervisor(up) = route {
+        for req in held {
+            let res = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await?;
+            res.into_body().collect().await?;
+        }
+    }
+    Ok(())
 }
 
 /// Reply slot for the request in flight, shared between the request loop
@@ -395,6 +427,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                 match serve(&node, &app, &shared, store, svc, &mut rx).await {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
+                    Exit::Reset => node.metrics.event("rolled-back", &app.name, &shared.id, RolledBack.to_string()),
                     Exit::Poisoned(p, detail) => {
                         node.metrics.poison(p);
                         node.metrics.event(p.as_str(), &app.name, &shared.id, detail);
@@ -467,6 +500,16 @@ async fn serve(
                     Err(code) => error_response(500, "guest-error", &format!("{code:?}")),
                 };
                 shared.set_phase(Phase::PostReturn);
+                // Nothing is heard of a request before its changes are
+                // durable. One that failed restarts its instance, which
+                // rolls them back.
+                let resp = match resp.status().is_server_error() {
+                    false => match commit(acc).await {
+                        Ok(()) => resp,
+                        Err(e) => error_response(500, "commit-failed", &format!("{e:#}")),
+                    },
+                    true => resp,
+                };
                 let status = resp.status().as_u16();
                 if let Some(tx) = pending.lock().as_mut().and_then(|p| p.reply.take()) {
                     let _ = tx.send(resp);
@@ -478,6 +521,10 @@ async fn serve(
                 // finish before taking the next request.
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
                 *pending.lock() = None;
+                // What it changed after answering commits now.
+                if status >= 500 || commit(acc).await.is_err() {
+                    return Err(RolledBack.into());
+                }
             }
         }
     };
@@ -519,6 +566,7 @@ async fn serve(
         Ok(Ok(())) => Exit::Closed,
         Err(Phase::Idle) => Exit::Idle,
         Err(phase) => Exit::Poisoned(Poison::Timeout, format!("deadline exceeded while {}", phase.as_str())),
+        Ok(Err(e)) if e.is::<RolledBack>() => Exit::Reset,
         Ok(Err(e)) => classify(&store, &e),
     };
 
@@ -632,6 +680,8 @@ impl ObjState {
                 sem: Arc::new(Semaphore::new(1)),
                 metrics: metrics.clone(),
                 obj: shared.clone(),
+                held: Default::default(),
+                publish_max: 0,
             },
             limiter: MemLimiter {
                 max_bytes: (limits.memory_mb << 20) as usize,

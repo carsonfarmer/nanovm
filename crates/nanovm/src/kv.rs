@@ -6,7 +6,7 @@
 //! renamed). An object serves one request at a time, so `increment` and the
 //! batch calls need no locking.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -99,6 +99,12 @@ impl ObjState {
         Ok(Some(std::fs::read(path)?))
     }
 
+    /// The journal's name for `path`, which is in the volume.
+    fn local(&self, path: &Path) -> PathBuf {
+        let local = self.quota.journal(|j| Ok(j.local(path))).ok().flatten();
+        local.expect("a key's path is in the volume")
+    }
+
     fn memory_budget(&self) -> u64 {
         self.limiter.max_bytes as u64
     }
@@ -112,19 +118,17 @@ impl ObjState {
             Ok(_) => return fail("the key's file is not a regular file"),
             Err(_) => None,
         };
-        // A `.tmp` the guest left here through its filesystem is replaced,
-        // so it stops counting.
-        let tmp = path.with_file_name(".tmp");
-        if let Ok(m) = std::fs::symlink_metadata(&tmp)
-            && m.is_file()
-        {
-            std::fs::remove_file(&tmp)?;
-            self.quota.adjust(-(m.len() as i64), -1);
+        // The old value goes into the request's journal, the new one is
+        // written in its place; the request's commit makes it durable.
+        let p = self.local(&path);
+        if let Some(old) = old {
+            self.quota.remove(&p, old)?;
         }
-        self.quota.reserve(old, value.len() as u64)?;
-        if let Err(e) = std::fs::write(&tmp, value).and_then(|()| std::fs::rename(&tmp, &path)) {
-            let _ = std::fs::remove_file(&tmp);
-            self.quota.adjust(old.unwrap_or(0) as i64 - value.len() as i64, -i64::from(old.is_none()));
+        self.quota.reserve(None, value.len() as u64)?;
+        self.quota.journal(|j| j.creating(&p))?;
+        if let Err(e) = std::fs::write(&path, value) {
+            let _ = std::fs::remove_file(&path);
+            self.quota.adjust(-(value.len() as i64), -1);
             return Err(e.into());
         }
         Ok(())
@@ -132,9 +136,10 @@ impl ObjState {
 
     fn delete_value(&self, bucket: &Resource<Bucket>, key: &str) -> Result<(), Fail> {
         let path = self.key_path(bucket, key)?;
-        if let Ok(md) = std::fs::metadata(&path) {
-            std::fs::remove_file(&path)?;
-            self.quota.adjust(-(md.len() as i64), -1);
+        if let Ok(md) = std::fs::symlink_metadata(&path)
+            && md.is_file()
+        {
+            self.quota.remove(&self.local(&path), md.len())?;
         }
         Ok(())
     }
@@ -150,6 +155,7 @@ impl ObjState {
             dir.push(part);
             if !dir.exists() {
                 self.quota.check_new_entry()?;
+                self.quota.journal(|j| j.creating(&self.local(&dir)))?;
                 std::fs::create_dir(&dir)?;
                 self.quota.adjust(0, 1);
             }

@@ -415,6 +415,11 @@ impl Sockets {
     }
 }
 
+/// Whether a publish's body is one [`Sockets::publish`] takes.
+pub fn well_formed(json: &[u8]) -> bool {
+    messages(json).is_some()
+}
+
 /// The (channel, message) of each item of a publish that has one for a
 /// socket; `None` unless all are well formed.
 fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
