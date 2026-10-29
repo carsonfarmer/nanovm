@@ -60,7 +60,8 @@ struct Inner {
     files: u64,
     journal: Journal,
     /// Bytes and entries the journal holds for the current request (backups
-    /// and removed files), counted until it commits.
+    /// and removed files). It may hold as much as the volume may, so an
+    /// object's disk use is at most twice its quota while a request runs.
     held: (u64, u64),
     denials: u64,
     metrics: Arc<Metrics>,
@@ -72,7 +73,7 @@ impl QuotaGuard {
     /// persistent volume starts each instance with its real usage.
     pub fn new(volume: &Path, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>) -> std::io::Result<Self> {
         // First, so a failed request or a crash is undone before it's counted.
-        let journal = Journal::open(volume)?;
+        let journal = Journal::open(volume, obj.clone())?;
         let (mut bytes, mut files) = (0, 0);
         let mut stack = vec![volume.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -114,7 +115,7 @@ impl QuotaGuard {
         }
         if let Some(p) = q.journal.local_file(file) {
             let saved = q.journal.writing(&p, file, at, allowed_end).map_err(|_| ErrorCode::Io)?;
-            q.hold(saved, 0);
+            q.hold(saved, 0)?;
         }
         let n = file
             .write_at(&buf[..(allowed_end - at) as usize], at)
@@ -132,7 +133,7 @@ impl QuotaGuard {
         }
         if let Some(p) = q.journal.local_file(file) {
             let saved = q.journal.writing(&p, file, size, before).map_err(|_| ErrorCode::Io)?;
-            q.hold(saved, 0);
+            q.hold(saved, 0)?;
         }
         file.set_len(size).map_err(|_| ErrorCode::Io)?;
         q.bytes = (q.bytes + size).saturating_sub(before);
@@ -174,13 +175,14 @@ impl QuotaGuard {
         f(&mut self.0.lock().journal).map_err(|_| ErrorCode::Io)
     }
 
-    /// Removes the volume's entry `p` of `bytes` (a file) into the journal:
-    /// it leaves the volume, and its space is free once the request commits.
+    /// Removes the volume's file `p` of `bytes` into the journal, which holds
+    /// it until the request commits.
     pub fn remove(&self, p: &Path, bytes: u64) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
+        q.hold(bytes, 1)?;
         q.journal.remove(p).map_err(|_| ErrorCode::Io)?;
-        q.held.0 += bytes;
-        q.held.1 += 1;
+        q.bytes = q.bytes.saturating_sub(bytes);
+        q.files = q.files.saturating_sub(1);
         Ok(())
     }
 
@@ -188,9 +190,7 @@ impl QuotaGuard {
     pub fn commit(&self) -> std::io::Result<bool> {
         let mut q = self.0.lock();
         let committed = q.journal.commit()?;
-        let (bytes, files) = std::mem::take(&mut q.held);
-        q.bytes = q.bytes.saturating_sub(bytes);
-        q.files = q.files.saturating_sub(files);
+        q.held = (0, 0);
         Ok(committed)
     }
 
@@ -209,12 +209,14 @@ impl QuotaGuard {
 }
 
 impl Inner {
-    /// Counts what the journal holds as used until the request commits.
-    fn hold(&mut self, bytes: u64, files: u64) {
+    /// Counts what the journal holds for the current request.
+    fn hold(&mut self, bytes: u64, files: u64) -> Result<(), ErrorCode> {
+        if self.held.0 + bytes > self.max_bytes || self.held.1 + files > self.max_files {
+            return Err(self.full());
+        }
         self.held.0 += bytes;
         self.held.1 += files;
-        self.bytes += bytes;
-        self.files += files;
+        Ok(())
     }
 
     fn full(&mut self) -> ErrorCode {
@@ -534,7 +536,7 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
                         let abs = q.journal.abs(&p);
                         let file = std::fs::OpenOptions::new().read(true).open(abs).map_err(|_| ErrorCode::Io)?;
                         let saved = q.journal.writing(&p, &file, 0, size).map_err(|_| ErrorCode::Io)?;
-                        q.hold(saved, 0);
+                        q.hold(saved, 0)?;
                     }
                 }
                 Some(_) => {}
@@ -578,12 +580,11 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
             (Some(from), Some(to)) if from == to => return Ok(()),
             (Some(from), Some(to)) => {
                 check_rename(&quota, &from, &to)?;
-                quota.journal(|j| j.rename(&from, &to))?;
                 if let Some(bytes) = replaced {
-                    let mut q = quota.0.lock();
-                    q.held.0 += bytes;
-                    q.held.1 += 1;
+                    quota.0.lock().hold(bytes, 1)?;
+                    quota.adjust(-(bytes as i64), -1);
                 }
+                quota.journal(|j| j.rename(&from, &to))?;
                 return Ok(());
             }
             // Leaving the volume can't be undone once committed elsewhere.

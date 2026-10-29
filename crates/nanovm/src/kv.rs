@@ -155,7 +155,8 @@ impl ObjState {
             dir.push(part);
             if !dir.exists() {
                 self.quota.check_new_entry()?;
-                self.quota.journal(|j| j.creating(&self.local(&dir)))?;
+                let p = self.local(&dir);
+                self.quota.journal(|j| j.creating(&p))?;
                 std::fs::create_dir(&dir)?;
                 self.quota.adjust(0, 1);
             }

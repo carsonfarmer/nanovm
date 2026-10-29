@@ -1430,6 +1430,40 @@ async fn wasi_config_serves_the_apps_values() {
     assert_eq!(get(&node, "counter", "c", "/config/missing").await.status, 404);
 }
 
+// ---- commits ---------------------------------------------------------------
+
+/// A request's writes, to files and to key-value alike, take effect only if
+/// it answers, whatever the status; one that fails, traps or runs out of CPU
+/// leaves nothing behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_requests_writes_are_rolled_back() {
+    let node = node("a_failed_requests_writes_are_rolled_back", 8, 60_000);
+    let read = async || get(&node, "hostile", "c", "/commit").await.json();
+    assert_eq!(get(&node, "hostile", "c", "/commit?v=one").await.status, 200);
+    for then in ["error", "panic", "spin"] {
+        let r = get(&node, "hostile", "c", &format!("/commit?v=two-{then}&then={then}")).await;
+        assert_eq!(r.status, 500, "{}", r.body);
+        assert_eq!(read().await, serde_json::json!({"file": "one", "key": "one"}), "after {then}");
+    }
+    assert_eq!(get(&node, "hostile", "c", "/commit?v=three&then=fail").await.status, 507);
+    assert_eq!(read().await, serde_json::json!({"file": "three", "key": "three"}));
+}
+
+/// A request in flight when its worker dies is rolled back when the object
+/// next starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_mid_request_is_rolled_back() {
+    let (_sup, addr) = supervised("a_crash_mid_request_is_rolled_back").await;
+    assert_eq!(http_get(addr, "/hostile/c/commit?v=one").await.0, 200);
+    let pid = stats_json(addr).await["workers"]["hostile"]["pid"].as_u64().unwrap() as i32;
+    let crashing = tokio::spawn(http_get(addr, "/hostile/c/commit?v=two&then=sleep"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = crashing.await;
+    let (status, body) = http_get(addr, "/hostile/c/commit").await;
+    assert_eq!((status, body.as_str()), (200, r#"{"file":"one","key":"one"}"#));
+}
+
 // ---- WebSockets ----------------------------------------------------------
 
 mod sockets {
@@ -1519,6 +1553,14 @@ mod sockets {
         assert_eq!(post(addr, "/counter/room/publish?msg=yo").await, 200);
         assert_eq!(next(&mut a).await, Message::text("yo"));
         assert_eq!(next(&mut b).await, Message::text("yo"));
+        // What a request publishes is sent only if it answers.
+        say(&mut b, "pubpanic lost").await;
+        let Message::Close(Some(f)) = next(&mut b).await else { panic!("no close frame") };
+        assert_eq!(f.code, CloseCode::Error);
+        b = open(addr, "/counter/room/ws").await.unwrap();
+        say(&mut a, "pub kept").await;
+        assert_eq!(next(&mut a).await, Message::text("kept"));
+        assert_eq!(next(&mut b).await, Message::text("kept"));
         // Another object's sockets heard none of it.
         say(&mut other, "x").await;
         assert_eq!(next(&mut other).await, Message::text("echo x"));
@@ -1529,7 +1571,8 @@ mod sockets {
         a.close(None).await.unwrap();
         drop(other);
         sockets_open(addr, 0).await;
-        assert_eq!(http_get(addr, "/counter/room/kv/ws-ends").await, (200, "1".into()));
+        // `a`, and the `b` whose event failed; not the `b` the object closed.
+        assert_eq!(http_get(addr, "/counter/room/kv/ws-ends").await, (200, "2".into()));
         assert_eq!(http_get(addr, "/counter/elsewhere/kv/ws-ends").await, (200, "1".into()));
 
         // Eight sockets' events at once wait for room in a queue of two.
@@ -1557,7 +1600,7 @@ mod sockets {
         let old = "GET /counter/room/ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\n\
             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n";
         assert_eq!(raw(addr, old, b"").await.0, 426);
-        assert_eq!(http_get(addr, "/counter/room/kv/ws-ends").await, (200, "1".into()));
+        assert_eq!(http_get(addr, "/counter/room/kv/ws-ends").await, (200, "2".into()));
         sockets_open(addr, 0).await;
     }
 

@@ -50,6 +50,33 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             ),
         ),
         "/echo" => util::respond(200, "application/octet-stream", req.body),
+        // Writes `v` to `/data/c.txt` (in place) and to the key `c`, then
+        // ends as `then` says: ok, fail (507), error, panic, spin or sleep.
+        "/commit" => {
+            let v = req.q("v").unwrap_or("").to_string();
+            if !v.is_empty() {
+                let _ = util::write_file("/data", "c.txt", v.clone().into_bytes()).await;
+                let bucket = util::kv::store::open("").unwrap();
+                let _ = bucket.set("c", v.as_bytes());
+            }
+            match req.q("then").unwrap_or("ok") {
+                "fail" => json(507, "{}"),
+                "panic" => panic!("after writing"),
+                "error" => Err(ErrorCode::InternalError(Some("after writing".into()))),
+                "spin" => loop {
+                    std::hint::black_box(0);
+                },
+                "sleep" => {
+                    wasip3::clocks::monotonic_clock::wait_for(ms(60_000)).await;
+                    json(200, "{}")
+                }
+                _ => {
+                    let file = util::read_file("/data", "c.txt").await.unwrap_or_default();
+                    let key = util::kv::store::open("").unwrap().get("c").ok().flatten().unwrap_or_default();
+                    json(200, format!("{{\"file\":{},\"key\":{}}}", js(&String::from_utf8_lossy(&file)), js(&String::from_utf8_lossy(&key))))
+                }
+            }
+        }
         // A body big enough that a client can stop reading it part way.
         "/big" => util::respond(200, "application/octet-stream", vec![b'x'; (req.q_u64("mb", 4) as usize) << 20]),
 

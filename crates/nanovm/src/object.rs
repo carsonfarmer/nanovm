@@ -142,6 +142,12 @@ impl ObjShared {
         .await
     }
 
+    /// Leaves `d`, spent in the poll in progress waiting for the disk, out
+    /// of the CPU charge.
+    pub fn uncharge(&self, d: Duration) {
+        self.poll_start_ns.fetch_add(d.as_nanos() as u64, Relaxed);
+    }
+
     /// CPU charged to the current request, including the poll in progress.
     fn cpu_used_ns(&self) -> u64 {
         let start = self.poll_start_ns.load(Relaxed);
@@ -485,25 +491,27 @@ async fn serve(
                 let (req, req_io) =
                     acc.with(|mut s| wasmtime_wasi_http::p3::Request::from_http(&mut s.data_mut().hooks, req));
 
-                let resp = match svc.handle(acc, req).await? {
+                let (resp, failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
                         let res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
-                        res.map(|b| {
+                        let res = res.map(|b| {
                             GuardedBody {
                                 inner: b,
                                 remaining: max_resp,
                                 abort,
                             }
                             .boxed_unsync()
-                        })
+                        });
+                        (res, false)
                     }
-                    Err(code) => error_response(500, "guest-error", &format!("{code:?}")),
+                    Err(code) => (error_response(500, "guest-error", &format!("{code:?}")), true),
                 };
                 shared.set_phase(Phase::PostReturn);
                 // Nothing is heard of a request before its changes are
-                // durable. One that failed restarts its instance, which
-                // rolls them back.
-                let resp = match resp.status().is_server_error() {
+                // durable. One that failed (as one that traps or runs out of
+                // time) restarts its instance, which rolls them back; an
+                // answer, whatever its status, commits them.
+                let resp = match failed {
                     false => match commit(acc).await {
                         Ok(()) => resp,
                         Err(e) => error_response(500, "commit-failed", &format!("{e:#}")),
@@ -522,7 +530,7 @@ async fn serve(
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
                 *pending.lock() = None;
                 // What it changed after answering commits now.
-                if status >= 500 || commit(acc).await.is_err() {
+                if failed || commit(acc).await.is_err() {
                     return Err(RolledBack.into());
                 }
             }

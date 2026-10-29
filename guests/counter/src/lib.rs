@@ -150,6 +150,10 @@ async fn ws(req: Req) -> Result<Response, ErrorCode> {
             }
             "TEXT" if text == "close" => out.extend(event("CLOSE", &4000u16.to_be_bytes())),
             "TEXT" if text == "id" => out.extend(event("TEXT", format!("m:{id}").as_bytes())),
+            "TEXT" if text.starts_with("pubpanic ") => {
+                publish(&[text[9..].to_string()]).await?;
+                panic!("after publishing");
+            }
             "TEXT" if text.starts_with("pub ") => {
                 publish(&[text[4..].to_string()]).await?;
             }
