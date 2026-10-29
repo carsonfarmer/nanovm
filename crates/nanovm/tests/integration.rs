@@ -1359,3 +1359,18 @@ async fn kv_works_in_a_jailed_worker() {
 fn node_dir(test: &str) -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes").join(test)
 }
+
+/// Reads are bounded by what the guest could hold (its memory limit, 32 MiB
+/// here) and batches by size, so a host call can't run away.
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_reads_and_batches_are_bounded() {
+    let node = node("kv_bounded", 8, 60_000);
+    let r = get(&node, "hostile", "m", "/kv?op=fill&size=4194304&n=1").await;
+    assert_eq!(r.json()["set"], 1, "{}", r.body);
+    // 7 × 4 MiB fits in 32 MiB; 9 doesn't.
+    assert_eq!(get(&node, "hostile", "m", "/kv?op=many&n=7").await.json()["got"], 7);
+    let r = get(&node, "hostile", "m", "/kv?op=many&n=9").await;
+    assert!(r.body.contains("memory limit"), "{}", r.body);
+    let r = get(&node, "hostile", "m", "/kv?op=many&n=1001").await;
+    assert!(r.body.contains("at most 1000 keys"), "{}", r.body);
+}

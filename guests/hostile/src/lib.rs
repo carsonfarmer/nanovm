@@ -319,6 +319,14 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                         Err(e) => format!("{{\"error\":{}}}", err(e)),
                     }
                 }
+                // `get-many` of key `k0`, `n` times over.
+                "many" => {
+                    let keys = vec!["k0".to_string(); req.q_u64("n", 1) as usize];
+                    match util::kv::batch::get_many(&bucket, &keys) {
+                        Ok(v) => format!("{{\"got\":{}}}", v.iter().flatten().count()),
+                        Err(e) => format!("{{\"error\":{}}}", err(e)),
+                    }
+                }
                 _ => "{\"opened\":true}".to_string(),
             };
             json(200, out)

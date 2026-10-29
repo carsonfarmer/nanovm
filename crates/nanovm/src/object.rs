@@ -151,7 +151,7 @@ impl ObjShared {
 
 /// Caps the sum of all linear memories of one instance.
 pub struct MemLimiter {
-    max_bytes: usize,
+    pub(crate) max_bytes: usize,
     used: usize,
     pub denied: bool,
 }
@@ -229,7 +229,7 @@ pub struct ObjState {
     pub(crate) table: ResourceTable,
     http: WasiHttpCtx,
     hooks: EgressHooks,
-    limiter: MemLimiter,
+    pub(crate) limiter: MemLimiter,
     shared: Arc<ObjShared>,
     cpu_budget_ns: u64,
     cpu_exceeded: bool,
