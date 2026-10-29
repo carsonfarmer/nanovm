@@ -270,8 +270,7 @@ The goal: one node, as fast and secure as we can make it, that runs untrusted We
   - **WebSockets,** following tric's WebSocket-over-HTTP model: each event (`OPEN`/`TEXT`/`CLOSE`/`DISCONNECT`) is a normal bounded request to the object, and sockets outlive instances.
     - The node itself speaks the protocol and handles channel publishing; no Pushpin process.
     - Events are ordered per object. Channels are scoped per object. There is a per-object socket cap, and tric's size bounds apply.
-  - **Alarms:** one per object, set with the response header `x-nanovm-alarm: <unix-ms>` (`0` clears).
-    - The node persists the alarm and delivers it at least once, with backoff, as a `POST` carrying a host-only marker that is stripped from client requests.
+  - **Alarms are not a node feature** (Q30). The node passes response headers through and is stateless, so a scheduler in front of it (the proxy) can read `x-nanovm-alarm: <unix-ms>` from responses, keep the schedule, and send a marked `POST` when it is due, stripping that marker from client requests as it already strips the app headers.
   - **Key-value:** a host-implemented `wasi:keyvalue` stored as files under `/data`. `wasi:filesystem` stays exposed.
 - **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
 - **Out of scope for now:** clustering, one-shot runs of agent-written code, dashboards, static signing keys.
@@ -321,9 +320,8 @@ As in the target design, with these choices (README, "Apps from a registry", has
 
 ## Next phases
 
-4. Key-value (`wasi:keyvalue` on `/data`).
-5. Alarms.
-6. WebSockets.
+4. Key-value (`wasi:keyvalue` on `/data`) and `wasi:config` (done).
+5. WebSockets.
 
 ## Follow-ups
 

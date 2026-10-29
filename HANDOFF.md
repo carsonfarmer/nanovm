@@ -5,7 +5,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 ## State (2026-10-28, later)
 
 - **`main` is current.** It has phase 1 (portable core), phase 2 (the Linux jail), two simplification passes, and phase 3 (signed OCI deploys). Every branch is pushed; nothing is uncommitted.
-- **Next: phase 4, key-value** (`wasi:keyvalue` on `/data`, Q15), then alarms (Q17) and WebSockets (Q16). None has been started.
+- **Next: WebSockets** (Q16). Key-value and `wasi:config` are done; alarms were dropped from the node (Q30).
 - **Tests:** 43 integration tests pass, plus 3 unit tests. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io. The demo runs with 0 failures, and `scripts/vm-test.sh` passes.
 - **Runtime size:** 3,704 lines (2,303 before the jail; 3,362 before phase 3).
 - **The repo `carsonfarmer/nanovm` is now public**, so GitHub artifact attestations work. The packages `ghcr.io/carsonfarmer/nanovm-{counter,hostile}` are public. `publish-guests.yml` runs on pushes to `guests/**` and on `gh workflow run publish-guests.yml` (dispatch works through the proxy, and `gh run watch <id>` shows progress). Each run publishes version `1.0.<run number>`.
@@ -40,13 +40,13 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q12 | Untrusted Wasm is compiled inside the app's jailed worker. |
 | Q15 | Key-value is a host-implemented `wasi:keyvalue` stored as files in `/data`; `wasi:filesystem` stays exposed. |
 | Q16 | WebSockets follow tric's model (`github.com/carsonfarmer/tric`, `src/ws.rs`): Pushpin WebSocket-over-HTTP events (OPEN/TEXT/CLOSE/DISCONNECT) delivered as normal bounded requests, plus GRIP-style channels. The node speaks it itself (no Pushpin process). Ordered per object, per-object channels and socket cap, tric's size bounds (128 KiB message, 32 KiB frame, 64 events per answer, 2 MiB answer). Sockets outlive instances. |
-| Q17 | Alarms: one per object, set by the response header `x-nanovm-alarm: <unix-ms>` (0 clears), persisted, delivered at least once with backoff as a POST with a host-only marker stripped from client requests. |
+| Q17/Q30 | Alarms stay outside the node: response headers already pass through, so the proxy (or any scheduler in front) can implement `x-nanovm-alarm` without the node keeping state. |
 | Q18 | Running agent-written one-shot code is not a goal for now. |
 | Q21 | Trust policy per app: a list of exact `{issuer, subject}` identities; no static public keys. |
 | Q22 | The trust policy and minimum version travel with each request from the proxy. |
 | Q23/Q24 | The jail and the supervisor/worker split as built. Mount and network namespaces were dropped as redundant: Landlock already confines the filesystem, and seccomp removes `socket()`. |
 
-Phases after this one ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value, 5 alarms, 6 WebSockets.
+Phases after this one ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets.
 
 ## Phase 3 as built
 
