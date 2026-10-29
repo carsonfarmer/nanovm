@@ -1,3 +1,4 @@
 {
+  "config": { "greeting": "from the registry" },
   "limits": { "memory_mb": 16, "cpu_ms": 50, "request_timeout_ms": 2000, "idle_timeout_ms": 60000, "disk_mb": 1, "max_files": 100 }
 }

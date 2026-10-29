@@ -259,6 +259,7 @@ impl Supervisor {
                     component: PathBuf::new(),
                     static_dir: None,
                     env: p.spec.env,
+                    config: p.spec.config,
                     limits: p.spec.limits.clamped(&self.cfg.registry_limits),
                     worker: self.cfg.registry_worker.clone(),
                 };

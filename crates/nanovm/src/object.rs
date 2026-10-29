@@ -239,6 +239,7 @@ pub struct ObjState {
     pub quota: QuotaGuard,
     /// The host directory behind `/data`.
     pub(crate) volume: std::path::PathBuf,
+    pub(crate) config: Arc<wasmtime_wasi_config::WasiConfigVariables>,
     _tmp: TmpDir,
 }
 
@@ -321,6 +322,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         app_dir: app.static_dir.clone(),
         quota,
         volume: data_dir.clone(),
+        config: app.config.clone(),
         _tmp: tmp,
     };
 

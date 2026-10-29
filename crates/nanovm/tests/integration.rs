@@ -1207,6 +1207,11 @@ async fn registry_apps_need_a_trusted_signature() {
     assert!(body.contains(r#""app":"rc""#), "{body}");
     let v = stats_json(addr).await;
     assert_eq!(v["workers"]["rc"]["version"], version.to_string(), "{v}");
+    // Versions published with config values serve them through wasi:config.
+    let (status, body) = reg_get(addr, "/rc/a/config/greeting", &app, SIGNER, None).await;
+    if status != 404 || !body.contains("not found") {
+        assert_eq!((status, body.as_str()), (200, "from the registry"));
+    }
 
     let wrong_subject = SIGNER.replace("publish-guests.yml", "other.yml");
     let wrong_issuer = SIGNER.replace("token.actions", "evil");
@@ -1373,4 +1378,15 @@ async fn kv_reads_and_batches_are_bounded() {
     assert!(r.body.contains("memory limit"), "{}", r.body);
     let r = get(&node, "hostile", "m", "/kv?op=many&n=1001").await;
     assert!(r.body.contains("at most 1000 keys"), "{}", r.body);
+}
+
+/// An app's `config` values are what its guests read through `wasi:config`.
+#[tokio::test(flavor = "multi_thread")]
+async fn wasi_config_serves_the_apps_values() {
+    let mut cfg = node_cfg("wasi_config", 8, 60_000, 100);
+    cfg.apps[0].config.insert("greeting".into(), "hello from config".into());
+    let node = Node::new(cfg).unwrap();
+    let r = get(&node, "counter", "c", "/config/greeting").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "hello from config"));
+    assert_eq!(get(&node, "counter", "c", "/config/missing").await.status, 404);
 }

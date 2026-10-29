@@ -9,6 +9,7 @@ use wasmtime::Engine;
 use wasmtime::component::{Component, Linker};
 use wasmtime_wasi::filesystem::Dir;
 use wasmtime_wasi::{FsPerms, OpenMode};
+use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
 use wasmtime_wasi_http::p3::bindings::ServicePre;
 
 use crate::config::{AppConfig, NodeConfig};
@@ -30,6 +31,7 @@ const ALLOWED_IMPORTS: &[&str] = &[
     "wasi:keyvalue/store@0.2.0-draft",
     "wasi:keyvalue/atomics@0.2.0-draft",
     "wasi:keyvalue/batch@0.2.0-draft",
+    "wasi:config/store@0.2.0-rc.1",
 ];
 
 pub struct App {
@@ -40,6 +42,8 @@ pub struct App {
     /// `/app`, opened once and shared read-only by every object of the app,
     /// so it costs one fd per app rather than one per live object.
     pub static_dir: Option<Dir>,
+    /// Its `wasi:config` values, shared by every object of the app.
+    pub config: Arc<WasiConfigVariables>,
 }
 
 pub fn linker(engine: &Engine) -> anyhow::Result<Linker<ObjState>> {
@@ -47,6 +51,7 @@ pub fn linker(engine: &Engine) -> anyhow::Result<Linker<ObjState>> {
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     crate::quota::add_to_linker(&mut linker)?;
     crate::kv::add_to_linker(&mut linker)?;
+    wasmtime_wasi_config::add_to_linker(&mut linker, |s| WasiConfig::from(&*s.config))?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
     Ok(linker)
 }
@@ -103,6 +108,7 @@ impl App {
             pre,
             egress,
             static_dir,
+            config: Arc::new(cfg.config.iter().collect()),
         })
     }
 }

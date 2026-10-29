@@ -80,6 +80,8 @@ pub struct AppSpec {
     pub limits: Limits,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub config: BTreeMap<String, String>,
 }
 
 pub struct Pulled {

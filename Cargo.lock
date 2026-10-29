@@ -1678,7 +1678,6 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-config",
  "wasmtime-wasi-http",
- "wasmtime-wasi-keyvalue",
  "webpki-roots",
 ]
 
@@ -3633,15 +3632,6 @@ dependencies = [
  "bytes",
  "futures",
  "tracing",
- "wasmtime",
-]
-
-[[package]]
-name = "wasmtime-wasi-keyvalue"
-version = "50.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a73ef6f30ac72ce608f061d1f4d05628a485ad133c16a3e19bbe871397e0167"
-dependencies = [
  "wasmtime",
 ]
 

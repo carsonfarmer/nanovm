@@ -16,6 +16,12 @@ pub mod kv {
     pub use wasi::keyvalue::*;
 }
 
+/// `wasi:config/store`: the app's config values.
+pub mod config {
+    wit_bindgen::generate!({ path: "../../wit/config", world: "wasi:config/imports", generate_all });
+    pub use wasi::config::store::*;
+}
+
 /// A fully-read incoming request.
 pub struct Req {
     pub method: String,
