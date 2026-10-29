@@ -27,7 +27,6 @@ use futures::{FutureExt, SinkExt, StreamExt};
 use http::header::{CONTENT_TYPE, SEC_WEBSOCKET_EXTENSIONS};
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, Uri};
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::upgrade::Upgraded;
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc, watch};
@@ -47,6 +46,8 @@ const CONNECTION_ID: HeaderName = HeaderName::from_static("connection-id");
 /// A write the client doesn't take for this long closes the socket, which
 /// would otherwise hold its file descriptor and queue for good.
 const STALL: Duration = Duration::from_secs(30);
+/// A socket is pinged this often, and closed if it heard nothing since the last.
+const PING: Duration = Duration::from_secs(30);
 /// Channels per socket, items per publish, and the bytes of a socket's
 /// headers: each costs the supervisor memory or work.
 const MAX_CHANNELS: usize = 64;
@@ -89,7 +90,7 @@ fn parse(body: Bytes) -> Option<Vec<Event>> {
         at = end + 2;
         let (kind, content) = match head.split_once(' ') {
             None => (head, None),
-            Some((kind, n)) if n.len() <= 8 => {
+            Some((kind, n)) if n.len() <= 8 && n.bytes().all(|b| b.is_ascii_hexdigit()) => {
                 let n = usize::from_str_radix(n, 16).ok()?;
                 let content = body.get(at..at + n)?;
                 (body.get(at + n..at + n + 2)? == b"\r\n").then_some(())?;
@@ -110,6 +111,7 @@ fn parse(body: Bytes) -> Option<Vec<Event>> {
     }
     Some(events)
 }
+
 /// An object's answer to an event.
 pub struct Answer {
     headers: HeaderMap,
@@ -119,8 +121,9 @@ pub struct Answer {
 /// What became of an event sent to the object.
 pub enum Reply {
     Answer(Answer),
-    /// The answer wasn't events.
-    Bad,
+    /// The answer wasn't events: the status to refuse a socket with, the
+    /// object's own if it refused.
+    Bad(u16),
     /// The socket's worker is no longer the app's.
     Gone,
 }
@@ -131,12 +134,13 @@ where
     B: http_body::Body<Data = Bytes>,
     B::Error: Into<crate::object::BoxError>,
 {
-    if res.status() != 200 || res.headers().get(CONTENT_TYPE).is_none_or(|v| v != EVENTS) {
-        return Reply::Bad;
+    let status = res.status();
+    if status != 200 || res.headers().get(CONTENT_TYPE).is_none_or(|v| v != EVENTS) {
+        return Reply::Bad(if status.is_client_error() || status.is_server_error() { status.as_u16() } else { 502 });
     }
     let (parts, body) = res.into_parts();
     let events = Limited::new(body, max).collect().await.ok().and_then(|b| parse(b.to_bytes()));
-    events.map_or(Reply::Bad, |events| Reply::Answer(Answer { headers: parts.headers, events }))
+    events.map_or(Reply::Bad(502), |events| Reply::Answer(Answer { headers: parts.headers, events }))
 }
 
 /// Whether `req` asks to open a WebSocket.
@@ -172,15 +176,13 @@ struct Sock {
 }
 
 /// Where a socket's messages wait to be written. Their bytes are counted, and
-/// a socket more than `max` behind, or one that would put the node more than
-/// `node_max` behind, is closed.
+/// a socket more than `max` behind is closed: each socket has a budget of its
+/// own, so no client can crowd out another.
 #[derive(Clone)]
 struct Out {
     tx: mpsc::UnboundedSender<Message>,
     queued: Arc<AtomicUsize>,
     max: usize,
-    node: Arc<AtomicUsize>,
-    node_max: usize,
     behind: Arc<Notify>,
 }
 
@@ -192,17 +194,11 @@ fn cost(m: &Message) -> usize {
 impl Out {
     fn send(&self, m: Message) {
         let n = cost(&m);
-        let mine = self.queued.fetch_add(n, Relaxed) + n;
-        if self.node.fetch_add(n, Relaxed) + n <= self.node_max && mine <= self.max {
+        if self.queued.fetch_add(n, Relaxed) + n <= self.max {
             let _ = self.tx.send(m);
         } else {
             self.behind.notify_one();
         }
-    }
-
-    fn sent(&self, n: usize) {
-        self.queued.fetch_sub(n, Relaxed);
-        self.node.fetch_sub(n, Relaxed);
     }
 }
 
@@ -214,14 +210,13 @@ fn frame(code: CloseCode) -> Option<CloseFrame> {
 pub struct Caps<'a> {
     pub total: &'a Arc<AtomicUsize>,
     pub max_total: usize,
-    /// Bytes waiting to be written, across the node.
-    pub backlog: &'a Arc<AtomicUsize>,
-    pub max_backlog: usize,
     pub per_object: usize,
     /// The most a message may carry from the client.
     pub request_max: usize,
-    /// The most an answer may carry, and a socket may fall behind by.
+    /// The most an answer may carry.
     pub response_max: usize,
+    /// The most a socket may fall behind by.
+    pub backlog: usize,
 }
 
 /// Sends an event's request to the object.
@@ -254,8 +249,6 @@ impl Drop for Conn {
             }
         }
         drop(inner);
-        // What was never written, and what was refused, is no longer behind.
-        self.out.node.fetch_sub(self.out.queued.swap(0, Relaxed), Relaxed);
         self.total.fetch_sub(1, Relaxed);
     }
 }
@@ -376,9 +369,7 @@ impl Sockets {
         let out = Out {
             tx,
             queued: Default::default(),
-            max: caps.response_max,
-            node: caps.backlog.clone(),
-            node_max: caps.max_backlog,
+            max: caps.backlog,
             behind: Default::default(),
         };
         let id = NEXT.fetch_add(1, Relaxed);
@@ -406,8 +397,10 @@ impl Sockets {
 
         let mut open = conn.request(&Event::Open);
         open.headers_mut().insert(SEC_WEBSOCKET_EXTENSIONS, HeaderValue::from_static("grip"));
-        let Reply::Answer(Answer { headers, events }) = deliver(open).await else {
-            return Err((502, "the object did not accept the socket"));
+        let (headers, events) = match deliver(open).await {
+            Reply::Answer(Answer { headers, events }) => (headers, events),
+            Reply::Bad(status) => return Err((status, "the object refused the socket")),
+            Reply::Gone => return Err((503, "the app's worker is restarting")),
         };
         conn.grip = headers.get(SEC_WEBSOCKET_EXTENSIONS).is_some_and(|e| e == "grip");
         let protocol = headers.get(PROTOCOL);
@@ -432,8 +425,9 @@ impl Sockets {
             .max_message_size(Some(caps.request_max.saturating_sub(FRAMING)))
             .max_frame_size(Some(caps.request_max.saturating_sub(FRAMING)));
         tokio::spawn(async move {
-            if let Ok(io) = upgrade.await {
-                run(conn, io, rx, gone, config, deliver).await;
+            match upgrade.await {
+                Ok(io) => run(conn, hyper_util::rt::TokioIo::new(io), rx, gone, config, deliver).await,
+                Err(_) => drop(deliver(conn.request(&Event::Disconnect)).await),
             }
         });
         Ok(res.body(()).expect("a valid response"))
@@ -468,6 +462,7 @@ fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
     let message = |item: &Value| -> Option<Option<(String, Message)>> {
         let channel = item.get("channel")?.as_str()?.to_string();
         let Some(m) = item.get("formats")?.get("ws-message") else { return Some(None) };
+        let m = m.as_object().filter(|m| m.len() == 1)?;
         let m = match (m.get("content"), m.get("content-bin")) {
             (Some(t), None) => Message::text(t.as_str()?),
             (None, Some(b)) => Message::binary(B64.decode(b.as_str()?).ok()?),
@@ -482,20 +477,21 @@ fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
 /// at a time: the next is read once the last is answered. What is queued for
 /// the client is written meanwhile. The object is told how the socket ended,
 /// unless it closed it or its worker is gone.
-async fn run(
+async fn run<Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     conn: Conn,
-    io: Upgraded,
+    io: Io,
     mut rx: mpsc::UnboundedReceiver<Message>,
     mut gone: watch::Receiver<()>,
     config: WebSocketConfig,
     deliver: Deliver,
 ) {
-    let io = hyper_util::rt::TokioIo::new(io);
     let (mut sink, mut stream) = WebSocketStream::from_raw_socket(io, Role::Server, Some(config)).await.split();
     let mut pending = Fuse::terminated();
+    let (mut ping, mut heard) = (tokio::time::interval(PING), true);
     let (close, tell) = loop {
         tokio::select! {
             m = stream.next(), if pending.is_terminated() => {
+                heard = true;
                 let event = match m {
                     Some(Ok(Message::Text(t))) => Event::Text(t),
                     Some(Ok(Message::Binary(b))) => Event::Binary(b),
@@ -529,13 +525,22 @@ async fn run(
                 if !sent {
                     break (None, Some(Event::Disconnect));
                 }
-                conn.out.sent(n);
+                conn.out.queued.fetch_sub(n, Relaxed);
                 if close {
                     break (None, None);
                 }
             }
             _ = conn.out.behind.notified() => break (None, Some(Event::Disconnect)),
             _ = gone.changed() => break (frame(CloseCode::Restart), None),
+            // A client silent through a whole interval (while nothing waits
+            // on the object) is gone, even if its connection never said so.
+            _ = ping.tick() => {
+                if !heard && pending.is_terminated() {
+                    break (None, Some(Event::Disconnect));
+                }
+                heard = false;
+                conn.out.send(Message::Ping(Bytes::new()));
+            }
         }
     };
     if let Some(f) = close {
@@ -577,12 +582,11 @@ mod tests {
         }
     }
 
-    /// Every message counts against the backlogs, an empty one too.
+    /// Every message counts against the socket's backlog, an empty one too.
     #[test]
     fn backlogs_count_every_message() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let node = Arc::new(AtomicUsize::new(0));
-        let out = Out { tx, queued: Default::default(), max: 1000, node: node.clone(), node_max: 10_000, behind: Default::default() };
+        let out = Out { tx, queued: Default::default(), max: 1000, behind: Default::default() };
         for _ in 0..15 {
             out.send(Message::text(""));
         }
@@ -590,11 +594,39 @@ mod tests {
         out.send(Message::text(""));
         assert_eq!(rx.len(), 15, "a socket 1000 bytes behind takes no more");
         assert!(out.behind.notified().now_or_never().is_some());
-        let shared = Out { max: usize::MAX, queued: Default::default(), ..out.clone() };
-        shared.send(Message::binary(vec![0; 9000]));
-        assert_eq!(rx.len(), 15, "nor one that would put the node 10,000 behind");
-        out.sent(64);
-        assert_eq!(node.load(Relaxed), 16 * 64 + 9064 - 64);
+    }
+
+    /// A client that goes silent, as a half-open connection does, is closed
+    /// after a ping goes unanswered, and its object is told.
+    #[tokio::test(start_paused = true)]
+    async fn silent_clients_are_dropped() {
+        let sockets = Arc::new(Sockets::new(1));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let out = Out { tx, queued: Default::default(), max: 1 << 20, behind: Default::default() };
+        let total = Arc::new(AtomicUsize::new(1));
+        let conn = Conn {
+            id: 1,
+            object: "o".into(),
+            uri: "/a/o/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            grip: false,
+            sockets,
+            out,
+            total: total.clone(),
+        };
+        let told = Arc::new(Mutex::new(vec![]));
+        let t = told.clone();
+        let deliver: Deliver = Box::new(move |req| {
+            t.lock().push(req.into_body());
+            Box::pin(async { Reply::Gone })
+        });
+        let (_client, server) = tokio::io::duplex(1 << 16);
+        let (_gone_tx, gone) = watch::channel(());
+        let ran = tokio::spawn(run(conn, server, rx, gone, WebSocketConfig::default(), deliver));
+        tokio::time::sleep(PING * 2 + Duration::from_secs(1)).await;
+        assert!(ran.is_finished(), "a silent client is still open");
+        assert_eq!(told.lock().len(), 1, "the object is told");
+        assert_eq!(total.load(Relaxed), 0);
     }
 
     #[test]

@@ -34,9 +34,6 @@ config! {
         /// Upper bound on open WebSockets across all apps: each holds a file
         /// descriptor in the supervisor.
         max_sockets: usize = 10_000usize,
-        /// Bytes queued for WebSocket clients across the node; a socket that
-        /// would go past it is dropped.
-        max_socket_backlog_mb: usize = 512usize,
         /// Virtual address space reserved per linear memory. Every app's
         /// `memory_mb` must fit inside it.
         memory_reservation_mb: u64 = 128u64,
@@ -115,6 +112,9 @@ config! {
         max_queue: usize = 64usize,
         /// Open WebSockets per object.
         max_sockets: usize = 256usize,
+        /// What a WebSocket may fall behind by, in bytes queued for its
+        /// client, before it is dropped.
+        socket_backlog_kb: u64 = 1024u64,
         max_outbound_concurrency: usize = 4usize,
         max_resources: usize = 10_000usize,
         /// Outbound HTTP allowlist: `host`, `host:port` or `*.suffix[:port]`.

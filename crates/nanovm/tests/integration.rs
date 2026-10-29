@@ -1156,6 +1156,47 @@ const SIGNER: &str = "https://token.actions.githubusercontent.com \
 
 /// The published versions of guest `name`, oldest first, as
 /// `(version, ghcr.io/…@digest)`.
+/// A drain that runs out of time kills the old worker even while a client
+/// still holds one of its responses unread, so it can't run beside the next
+/// version. (The rollback from the newest version to the one before is a
+/// switch like any other.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_that_runs_out_of_time_kills_the_old_worker() {
+    use tokio::io::AsyncWriteExt;
+    let versions = match published("hostile").await {
+        Ok(v) if v.len() >= 2 => v,
+        Ok(_) => return eprintln!("skipped: needs two published versions of hostile"),
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (old, new) = (versions[versions.len() - 2].1.clone(), versions[versions.len() - 1].1.clone());
+    let (_sup, addr) = supervised("drain_kills_the_old_worker").await;
+
+    // A client that reads a little of a 7 MiB answer, then stops.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let mut held = sock.connect(addr).await.unwrap();
+    let head = format!(
+        "GET /rd/h/big?mb=7 HTTP/1.1\r\nHost: x\r\nnanovm-app: {new}\r\nnanovm-trust: {}\r\n\r\n",
+        SIGNER
+    );
+    held.write_all(head.as_bytes()).await.unwrap();
+    let mut response = [0; 64];
+    let n = tokio::io::AsyncReadExt::read(&mut held, &mut response).await.unwrap();
+    assert!(response[..n].starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&response[..n]));
+    let pid = stats_json(addr).await["workers"]["rd"]["pid"].as_u64().unwrap();
+
+    let t0 = Instant::now();
+    assert_eq!(reg_get(addr, "/rd/x/", &old, SIGNER, None).await.0, 200);
+    // The switch waited out the drain (hostile's 2 s + 1 s), then killed it.
+    assert!(t0.elapsed() >= Duration::from_secs(3), "{:?}", t0.elapsed());
+    let t1 = Instant::now();
+    while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z ")) {
+        assert!(t1.elapsed() < Duration::from_secs(2), "the old worker is still running");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop(held);
+}
+
 async fn published(name: &str) -> Result<Vec<(semver::Version, String)>, String> {
     use oci_client::{Reference, secrets::RegistryAuth};
     let repo = format!("ghcr.io/carsonfarmer/nanovm-{name}");
@@ -1289,8 +1330,7 @@ async fn kv_values_persist_in_the_volume() {
 /// budget, which `/data` and `/tmp` share.
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_counts_against_the_disk_quota() {
-    // Moving megabytes through the debug-built host takes real CPU.
-    let node = node_with("kv_quota", 8, 60_000, 5_000);
+    let node = node("kv_quota", 8, 60_000);
     // An 8 MiB budget holds exactly eight 1 MiB values.
     let r = get(&node, "hostile", "q", "/kv?op=fill&size=1048576&n=100").await;
     assert_eq!(r.json()["set"], 8, "{}", r.body);
@@ -1368,7 +1408,7 @@ fn node_dir(test: &str) -> PathBuf {
 /// here) and batches by size, so a host call can't run away.
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_reads_and_batches_are_bounded() {
-    let node = node_with("kv_bounded", 8, 60_000, 5_000);
+    let node = node("kv_bounded", 8, 60_000);
     let r = get(&node, "hostile", "m", "/kv?op=fill&size=4194304&n=1").await;
     assert_eq!(r.json()["set"], 1, "{}", r.body);
     // 7 × 4 MiB fits in 32 MiB; 9 doesn't.
@@ -1505,8 +1545,10 @@ mod sockets {
         sockets_open(addr, 0).await;
         assert_eq!(http_get(addr, "/counter/busy/kv/ws-ends").await, (200, "8".into()));
 
-        // An object that doesn't answer `OPEN` refuses the socket.
+        // An object that doesn't answer `OPEN` refuses the socket, with its
+        // own status if it gave one.
         assert_eq!(refused(open(addr, "/hostile/x/").await).0, 502);
+        assert_eq!(refused(open(addr, "/counter/room/nope").await).0, 404);
         assert_eq!(refused(open(addr, "/nope/x/").await).0, 404);
         // A client can't send events, and handshakes are checked.
         let forged = "POST /counter/room/ws HTTP/1.1\r\nHost: x\r\nContent-Type: application/websocket-events\r\n\

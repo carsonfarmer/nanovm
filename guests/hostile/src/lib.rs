@@ -50,6 +50,8 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             ),
         ),
         "/echo" => util::respond(200, "application/octet-stream", req.body),
+        // A body big enough that a client can stop reading it part way.
+        "/big" => util::respond(200, "application/octet-stream", vec![b'x'; (req.q_u64("mb", 4) as usize) << 20]),
 
         // Grow linear memory by `mb` MiB, touching every page, and keep it.
         "/alloc" => {

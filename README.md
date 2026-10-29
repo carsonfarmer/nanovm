@@ -141,19 +141,19 @@ Spin's store, by comparison, is one SQLite table per app shared by all its insta
 ## WebSockets
 
 The supervisor holds client sockets. Objects see them as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work.
-- **Opening.** A socket opened at `/{app}/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`.
+- **Opening.** A socket opened at `/{app}/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`; any other answer refuses the socket, with the object's own status if it is a 4xx or 5xx (so a `401` reaches the client).
 - **Events.** Each later event (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` queued with the object's other requests, so events are ordered with everything else the object serves. The answer carries events for that socket.
   - A socket has one event in flight at a time, and its next message is read once that is answered. Messages for the client are written meanwhile.
   - An event waits for room in a full queue rather than being refused; the sockets bound how many wait.
-  - Only the node sends events: a client request of type `application/websocket-events` is refused, so an object can trust `Connection-Id`.
+  - Only the node sends events: a client request of type `application/websocket-events` is refused, so an object can trust `Connection-Id`. That type means "an event of a socket the proxy in front holds" and nothing else, so no legitimate client request carries it.
 - **Fan-out within an object**, as in Durable Objects (an object is a room). An object that answers `Sec-WebSocket-Extensions: grip` sends `m:` messages and `c:` controls. `{"type":"subscribe","channel":"…"}` subscribes the socket to a channel of its own object. The object reaches every subscribed socket, from any request, by posting GRIP's publish format to `http://nanovm/publish/`; the worker stamps that request with the object's id.
 - **Lifetime.** Sockets outlive instances: an evicted object is started again by the next event. They belong to the worker process, and close (1012) when it exits or the app switches versions, so clients reconnect to the new version. A node restart drops them.
 - **Limits.**
   - `max_sockets` per object (default 256), per app (`[app.worker] max_sockets`, default 1,000) and per node (default 10,000; each is a file descriptor in the supervisor).
   - A message is bounded by `max_request_body_kb` (closed with 1009), and an answer by `max_response_body_kb`.
-  - Messages waiting to be written count their bytes plus 64 each. A socket more than `max_response_body_kb` behind is dropped. So is one that would put the node more than `max_socket_backlog_mb` (default 512) behind, or whose write stalls for 30 s.
+  - Messages waiting to be written count their bytes plus 64 each. A socket more than `socket_backlog_kb` (default 1,024) behind is dropped, and so is one whose write stalls for 30 s. Each socket's budget is its own, so no client or app can crowd out another; the supervisor's worst case is `max_sockets` × the largest `socket_backlog_kb`, which `registry_limits` caps.
+  - A socket is pinged every 30 s and dropped if it heard nothing for a whole interval, so a half-open connection doesn't hold its slot.
   - A socket has at most 64 channels and 16 KiB of handshake headers. A publish has at most 64 items.
-  - The node-wide backlog is shared: one app's slow clients can use it up, and then other apps' sockets are dropped when they fall behind.
 
 ## Benchmarks
 
@@ -292,13 +292,15 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 - **Pooled links weren't reused.** The same early stop meant a link's response body was dropped before it saw its end, so the connection was closed instead of returned to the pool. The profile showed a socket closed per request. A link now goes back to the pool as soon as its body reports `is_end_stream`.
 - **A jail rule could vanish silently.** The Landlock crate skips a path it cannot open, so a `static_dir` the app's uid couldn't reach simply lost its rule. The worker then failed to load, and the supervisor killed it before it could print why. The jail now checks every path it grants, worker stderr is tagged into the supervisor's log, and a failed start reports the worker's last words.
 - **Jailed workers didn't limit open egress connections.** The per-object `max_outbound_concurrency` permit was held until the connection finished, and on the supervisor path that "connection" ended as soon as response headers arrived. A guest could hold any number of response bodies open. The permit now lives as long as the response body on both paths. An independent review found it; `open_response_bodies_count_against_outbound_concurrency` fails without the fix.
-- **WebSockets, from an independent review.** Each of these was fixed with a test that fails without the fix (the drain fix has none yet):
+- **WebSockets, from an independent review.** Each of these was fixed with a test that fails without the fix:
   - A plain request with the events content type could forge any socket's events.
   - An empty published message cost nothing against the backlog, so a guest could grow the supervisor without limit (66 MB to 730 MB in 20 s).
+  - A node-wide backlog, added for that, let one app's slow clients get other apps' sockets dropped. Each socket now has a budget of its own.
   - A burst of events from more sockets than `max_queue` was refused with `object-busy`, closing those sockets and losing their `DISCONNECT`s.
   - One app could hold every socket on the node.
   - Nothing was written to a socket while its event was in flight.
-  - A drain that ran out of time left the old worker running beside the new version, so an object could be live in two workers. This dated from phase 3. The drain now kills the old worker at its deadline.
+  - A drain that ran out of time left the old worker running beside the new version, so an object could be live in two workers. This dated from phase 3. The drain now kills the old worker at its deadline (`a_drain_that_runs_out_of_time_kills_the_old_worker`).
+- **Debug test builds failed key-value tests on a slower machine.** Host work inside a guest call is charged to the guest's CPU budget, and unoptimized wasmtime copies a guest's `list<u8>` a byte at a time, so 8 MiB of writes took over 100 ms. Test builds are now optimized (`[profile.dev.package]` in `Cargo.toml`); release builds never had the problem.
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
 ## Layout

@@ -62,9 +62,8 @@ pub struct Supervisor {
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     /// Held while giving a new app its uid.
     uids: Mutex<()>,
-    /// Open WebSockets, and the bytes queued for them, across workers.
+    /// Open WebSockets, across workers.
     sockets: Arc<AtomicUsize>,
-    backlog: Arc<AtomicUsize>,
     started: Instant,
 }
 
@@ -139,7 +138,6 @@ impl Supervisor {
             workers: Mutex::new(workers),
             uids: Mutex::default(),
             sockets: Arc::default(),
-            backlog: Arc::default(),
             started: Instant::now(),
         });
         let local: Vec<_> = sup.workers.lock().values().cloned().collect();
@@ -211,11 +209,10 @@ impl Supervisor {
         let caps = ws::Caps {
             total: &self.sockets,
             max_total: self.cfg.max_sockets,
-            backlog: &self.backlog,
-            max_backlog: self.cfg.max_socket_backlog_mb << 20,
             per_object: live.limits.max_sockets,
             request_max: (live.limits.max_request_body_kb << 10) as usize,
             response_max: (live.limits.max_response_body_kb << 10) as usize,
+            backlog: (live.limits.socket_backlog_kb << 10) as usize,
         };
         let (weak, max) = (Arc::downgrade(&live), caps.response_max);
         let deliver: ws::Deliver = Box::new(move |req| {

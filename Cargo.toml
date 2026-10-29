@@ -4,3 +4,13 @@ members = ["crates/nanovm"]
 
 [workspace.package]
 edition = "2024"
+
+# Tests charge host work done inside guest calls to the guest's CPU budget,
+# so test builds are optimized: unoptimized, wasmtime copies a guest's
+# `list<u8>` a byte at a time (its generic lift is compiled into this crate),
+# and 8 MiB of key-value writes took over 100 ms.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.nanovm]
+opt-level = 1
