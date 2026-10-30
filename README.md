@@ -256,7 +256,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 55 integration tests and 83 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 55 integration tests and 84 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -356,6 +356,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
   - A key-value replacement that the full journal refused kept its quota adjustment, so usage could fall below what the volume held. Past the reservation, a failure now traps and the request rolls back (N-9).
   - The jail allowed every `fcntl` command. With `F_SETOWN` and `O_ASYNC`, a worker that got out of Wasm could have the kernel signal (and kill) the supervisor or other apps' workers whenever they share its uid (a supervisor not running as root). Only the five commands the test suite uses are allowed now (N-2).
   - The demo failed every request with `503 instantiate-failed`. A worker canonicalizes its object's directory, which for a relative `data_dir` reads the cwd, and the jail refused `getcwd`. The tests use absolute paths, so only the demo hit it (N-21).
+  - LRU eviction could pick an object that was idle but had a job queued, or a socket event waiting for room. Its actor drains its queue before exiting, so the next request started a second actor for the same object on the same volume. Only an object with no work queued or waiting is evicted now (N-10).
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
 ## Layout

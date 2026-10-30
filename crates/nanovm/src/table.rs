@@ -33,6 +33,18 @@ struct Entry {
     shared: Arc<ObjShared>,
 }
 
+impl Entry {
+    /// Since when the object has been idle with nothing queued and nothing
+    /// waiting for room (a socket event holds a clone of `tx`). Only such an
+    /// object can be evicted: its actor drains its queue before exiting, so
+    /// evicting one with work would start a second actor beside it.
+    fn idle_since(&self) -> Option<u64> {
+        let (phase, since) = self.shared.phase();
+        let empty = self.tx.capacity() == self.tx.max_capacity() && self.tx.strong_count() == 1;
+        (phase == Phase::Idle && empty).then_some(since)
+    }
+}
+
 pub struct Node {
     pub engine: Engine,
     pub cfg: NodeConfig,
@@ -193,10 +205,7 @@ impl Node {
     /// Drops the table's handle on the least recently used idle object; its
     /// actor drains its queue and exits.
     fn evict_lru(&self, objects: &mut HashMap<(Arc<str>, Arc<str>), Entry>) -> bool {
-        let idle = objects.iter().filter_map(|(k, e)| match e.shared.phase() {
-            (Phase::Idle, since) => Some((since, k)),
-            _ => None,
-        });
+        let idle = objects.iter().filter_map(|(k, e)| Some((e.idle_since()?, k)));
         let Some(k) = idle.min().map(|(_, k)| k.clone()) else {
             return false;
         };
@@ -249,5 +258,28 @@ mod tests {
         ] {
             assert!(!valid_name(bad), "{bad:?}");
         }
+    }
+
+    /// An idle object is evictable only with no work queued or waiting.
+    #[test]
+    fn only_objects_without_work_are_evictable() {
+        let job = || Job {
+            req: http::Request::new(Bytes::new()),
+            reply: oneshot::channel().0,
+            enqueued: Instant::now(),
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let e = Entry {
+            tx,
+            shared: Arc::new(ObjShared::new("app".into(), "o")),
+        };
+        assert_eq!(e.idle_since(), None, "a cold object is starting");
+        e.shared.set_phase(Phase::Idle);
+        assert!(e.idle_since().is_some());
+        let waiting = e.tx.clone();
+        assert_eq!(e.idle_since(), None, "an event waiting for room");
+        drop(waiting);
+        e.tx.try_send(job()).unwrap();
+        assert_eq!(e.idle_since(), None, "a job not yet picked up");
     }
 }

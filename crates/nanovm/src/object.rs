@@ -102,7 +102,7 @@ impl ObjShared {
         )
     }
 
-    fn set_phase(&self, p: Phase) {
+    pub(crate) fn set_phase(&self, p: Phase) {
         if matches!(p, Phase::Idle | Phase::Cold) {
             self.lane.lock().take();
         }
