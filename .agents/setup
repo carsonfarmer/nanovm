@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Prepares a fresh Amp orb: the Rust toolchain with the wasm32-wasip2 target,
+# the crates for both workspaces, the test guests, and the prebuilt tests (a
+# cold build takes about 8 minutes on 4 cores; a warm one, seconds).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+step() {
+	printf '\n== %s\n' "$*"
+	SECONDS=0
+}
+done_step() { printf '   (%ss)\n' "$SECONDS"; }
+
+step "rust toolchain"
+if ! [ -x "$HOME/.cargo/bin/rustup" ]; then
+	# Also adds ~/.cargo/env to the shell profiles, so later login shells
+	# (Amp, orb services) find cargo.
+	curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+fi
+# The installer cannot change this running script's environment.
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+rustup toolchain install stable --profile minimal --component rustfmt,clippy --target wasm32-wasip2
+rustup default stable
+done_step
+
+# Login shells read ~/.bash_profile and skip ~/.profile, where rustup puts it.
+if ! grep -Fq '.cargo/env' "$HOME/.bash_profile" 2>/dev/null; then
+	printf '\n. "$HOME/.cargo/env"\n' >>"$HOME/.bash_profile"
+fi
+
+step "fetch crates"
+cargo fetch --locked
+(cd guests && cargo fetch --locked)
+done_step
+
+step "build guests"
+(cd guests && cargo build --locked --release --target wasm32-wasip2)
+done_step
+
+# The release build (demo, bench, scripts/vm-test.sh) is left to the first
+# command that needs it: it would roughly double a cold setup.
+step "build tests"
+cargo test --locked --workspace --no-run
+done_step

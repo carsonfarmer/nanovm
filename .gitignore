@@ -3,3 +3,5 @@
 # Node state from demo runs: the .cwasm cache, volumes and scratch.
 /nanovm-data/
 .DS_Store
+# Amp orb portal registrations.
+/.amp/portals/*

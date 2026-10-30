@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Runs each time an orb starts or wakes. vm.max_map_count resets with the
+# machine, and the node's startup check refuses to run with the default (see
+# HANDOFF.md).
+set -euo pipefail
+if [ "$(cat /proc/sys/vm/max_map_count)" -lt 1048576 ]; then
+	sudo -n sysctl -qw vm.max_map_count=1048576 || echo "could not raise vm.max_map_count" >&2
+fi
