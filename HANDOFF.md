@@ -14,9 +14,9 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
   - 64 unit tests added by an agent, which found two bugs (now fixed).
   - phase 6 (per-request commits, Q37–Q40), after an adversarial review whose findings are fixed. README's "Commits" section describes the design.
   - phase 6b (calls between objects, Q45). README's "Calls between objects" describes it.
-  - phase 7 (the front proxy, Q34, Q52): `nanovm proxy`, apps only from registries and one app per worker, data keyed by repository, dev mode, a registry client with size caps. Built by one agent on branch `proxy`, finished (rebase, demo, docs, reduction pass, review) by another. PLAN's "Phase 7" describes it.
+  - phase 7 (the front proxy, Q34, Q52): `nanovm proxy`, apps only from registries and one app per worker, apps keyed by host and repository, dev mode, a registry client with size caps. Built by one agent on branch `proxy`, finished (rebase, demo, docs, reduction pass, review) by another. PLAN's "Phase 7" describes it.
   - orb setup (`.agents/setup`, `.agents/resume`), so Amp orbs start with the toolchain and the tests prebuilt.
-- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed except N-20, which goes away with W-3.
+- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed except N-20, which goes away with W-3. A review of phase 7 found more; what is left is N-22 to N-31, and **N-22 (nothing bounds the apps a node runs) must be fixed before the proxy faces the public**.
 - **Nobody is mid-rewrite** as of phase 7 landing; claim files through ISSUES.md before large changes (see "Working alongside other agents").
 - **Next:** PLAN.md's "Roadmap" (agreed 2026-10-30), tracked as `W-1`… in ISSUES.md. In short: WebSockets moved into the proxy, OpenTelemetry by default (high priority), the per-object SQLite demo, alarms outside the node, data lifecycle planning, then the groundwork for many nodes.
 - Branches merged into `main` by fast-forward are not always pushed on their own. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
@@ -76,7 +76,7 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q49 | Prepare for many nodes across regions: placement in the proxy, leases with epochs checked at commit; nodes stay unaware of each other. After the proxy. |
 | Q50 | Requests that don't write can run in parallel (stateless routes anywhere, read-only requests on replicas); research, since the in-place undo journal makes same-node readers see uncommitted data. |
 | Q51 | Clean up the review's removable-code list (W-13, done). |
-| Q52 | Phase 7 as built: a host's app comes from its `_nanovm.<host>` TXT record over DNS-over-HTTPS, as a tag the proxy resolves to a digest; apps only from registries, one per worker; app data keyed by `registry/repository`; a loopback-only dev mode without signature checks for tests and the demo; our own size-capped registry client instead of oci-client's downloads. |
+| Q52 | Phase 7 as built: a host's app comes from its `_nanovm.<host>` TXT record over DNS-over-HTTPS, as a tag the proxy resolves to a digest; apps only from registries, one per worker; apps keyed by the host and `registry/repository` (by repository alone at first, until the review showed any domain could then pick another's version); a loopback-only dev mode without signature checks for tests and the demo; our own size-capped registry client instead of oci-client's downloads. |
 
 Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 

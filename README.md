@@ -123,7 +123,7 @@ That is the repository and the tag deployed, each identity whose signature is ac
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
-DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and data keyed by repository so a forged record reaches no other app's data); a change takes up to its TTL to arrive; a host serves one app; the table is public; and a cold lookup adds a round trip.
+DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by host so a record reaches no other host's app); a change takes up to its TTL to arrive; a host serves one app; the table is public; and a cold lookup adds a round trip.
 
 ## Apps
 
@@ -137,7 +137,7 @@ nanovm-min-version: 1.4.0                    # optional floor
 
 The node trusts these headers because only the proxy can reach it, and strips them before the guest sees the request. A request without them reaches only the node's own `/_nanovm/` routes.
 
-**An app is its repository.** Its name on the node (`ghcr.io_org_app-<hash>`), its volumes and its uid come from `registry/repository`, so every version of it, whoever signed it, sees the same data. Only those who can push to a repository can put a signed artifact in it, so naming another identity, or forging a DNS record, never reaches a different app's data. A team signs from CI, or lists each member's identity.
+**An app is a host's deployment of a repository.** Its name on the node (`example.com_ghcr.io_org_app-<hash>`), its volumes and its uid come from the host the proxy found it at (`nanovm-host`) and `registry/repository`, so every version a host runs, whoever signed it, sees the same data. Whoever controls a host chooses the version it runs, so keying by host stops one domain from naming another's repository and switching its app to an old version on its data (a review finding). Only those who can push to a repository can put a signed artifact in it, so naming another identity never reaches a different app's data. The registry is written one way only: lower case, without `:443`. A team signs from CI, or lists each member's identity.
 
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.

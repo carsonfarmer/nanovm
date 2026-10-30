@@ -254,7 +254,7 @@ All nine steps are done. [README.md](README.md) has the results and the bugs the
 The goal: one node, as fast and secure as we can make it, that runs untrusted WebAssembly apps as durable objects, deployable by anyone without handing out a long-lived secret. It is a solid single-node baseline to measure against before any clustering.
 
 - **Placement:** the node sits behind a trusted proxy on a private network. The proxy is the public HTTP(S) entry point (TLS, auth, route → digest); only the proxy-to-node hop is private. The node has no TLS and no auth of its own.
-- **Tenancy:** tenant = app, keyed by its repository (phase 7). Routes are `/{object}/{path}`, with the app named by the proxy's headers. The node exposes only data APIs.
+- **Tenancy:** tenant = app, keyed by its host and repository (phase 7). Routes are `/{object}/{path}`, with the app named by the proxy's headers. The node exposes only data APIs.
 - **Isolation, in layers:** Wasm with the per-object limits; one jailed worker process per app; a supervisor that holds no untrusted code and owns the network. A Wasm escape reaches one app's jail and nothing else.
 - **Deploy, stateless and keyless:**
   - Apps are OCI artifacts (an `application/wasm` layer plus a config blob with limits and env), pulled anonymously and by digest only.
@@ -333,12 +333,12 @@ An object calls another object of its app with an ordinary outgoing request to `
 ## Phase 7: the front proxy (done)
 
 Built on branch `proxy` by one agent and finished by another. README's "The proxy" and "Apps" have the details.
-- **`nanovm proxy`** (`proxy.rs`) is the public entry point. It finds a host's app in the TXT record `_nanovm.<host>` (`app=<repository>:<tag>; trust=<issuer> <subject>; …; min=<version>`), asked of a DNS-over-HTTPS resolver and cached for its TTL; resolves the tag to a digest (cached for `tag_ttl_s`); drops every `nanovm-*` header a client sent; sets `nanovm-app`, `nanovm-trust` and `nanovm-min-version`; and forwards to the node, WebSocket upgrades included. TLS is optional. Whoever controls a domain controls its routing, but the node runs only what a listed identity signed, and an app's data is keyed by its repository, so a forged record can't reach another app's data.
+- **`nanovm proxy`** (`proxy.rs`) is the public entry point. It finds a host's app in the TXT record `_nanovm.<host>` (`app=<repository>:<tag>; trust=<issuer> <subject>; …; min=<version>`), asked of a DNS-over-HTTPS resolver and cached for its TTL; resolves the tag to a digest (cached for `tag_ttl_s`); drops every `nanovm-*` header a client sent; sets `nanovm-app`, `nanovm-trust`, `nanovm-min-version` and `nanovm-host`; and forwards to the node, WebSocket upgrades included. TLS is optional. Whoever controls a domain controls its routing, but the node runs only what a listed identity signed, and an app is keyed by its host and repository, so a record can't reach another host's app.
 - **Apps come only from registries; one app per worker.** `[[app]]`, local components and the read-only `/app` directory are gone. A request's path is `/{object}/{rest}`, checked strictly (`table::route`).
-- **App identity:** an app's name on the node, its volumes and its uid come from `registry/repository` (`registry::app_name`: a readable prefix and a hash of the whole).
+- **App identity:** an app's name on the node, its volumes and its uid come from its host and `registry/repository` (`registry::app_name`: a readable prefix and a hash of the whole). Keyed by repository alone, as first built, any domain could switch another's app to an old signed version on its data; the review caught it.
 - **Dev mode** (`dev = true`, refused unless `listen` is loopback): no signature check; registries and egress may be on private addresses; loopback registries are plain HTTP. Tests and the demo use it with a `container-registry` instance on loopback (`examples/dev-registry.rs`).
 - **A registry client of our own** (`registry::Oci`, over reqwest) replaced oci-client's downloads: every download has a size cap, digests are checked before they name a file, and only public addresses are reached (DNS answers and redirects included) unless in dev mode. oci-client stays for reference parsing and manifest types.
-- **Review findings fixed here:** N-1, N-3, N-4, N-11, N-12, N-13 (and with it N-14, N-15), N-16, N-17, N-18, N-19.
+- **Review findings fixed here:** N-1, N-3, N-4, N-11, N-12, N-13 (and with it N-14, N-15), N-16, N-17, N-18, N-19. An adversarial review of the branch then found eleven more; the blocking ones were fixed before it landed (apps keyed by host, no unsigned manifests on disk, canonical registry addresses, proxy dev mode on loopback only, a bounded token and signature count), and the rest are open as N-22 to N-31 in ISSUES.md. **N-22 (unbounded apps per node) must be fixed before the proxy faces the public.**
 
 ## Roadmap (agreed with the owner, 2026-10-30)
 
