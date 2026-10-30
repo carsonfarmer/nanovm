@@ -130,11 +130,11 @@ What happens on the first request for a digest:
 
 **`wasi:keyvalue`** (`store`, `atomics` and `batch`, 0.2.0-draft) is implemented by the host on the object's own volume. Bucket `b` is the directory `/data/.kv/b`, and each key is one file in it, named by the key in unpadded base64url so that no key can name a path.
 - Values count against the object's disk budget and keys against its file limit, like any other file.
-- Each value is replaced atomically: it is written beside, then renamed.
+- A value is written in place; its request's commit makes it durable, together with everything else the request changed (see Commits).
 - A read is bounded by the object's memory limit, and a batch names at most 1,000 keys. Host calls aren't interrupted by the CPU budget, so these bounds keep them short.
 - `wasi:filesystem` stays exposed. A guest can reach `.kv` through it; the store lists only well-formed key files, and refuses to write over anything else.
 
-Spin's store, by comparison, is one SQLite table per app shared by all its instances, with no per-store disk quota. Ours is per object, under the object's quotas, with no dependency. It gives up SQLite's durable, atomic batches: values are not fsynced, and a batch is not atomic.
+Spin's store, by comparison, is one SQLite table per app shared by all its instances, with no per-store disk quota. Ours is per object, under the object's quotas, with no dependency. Commits give it what SQLite would: a request's values, files included, land together and durably, or not at all.
 
 **`wasi:config/store`** (0.2.0-rc.1) serves the app's `config` table: `[app.config]` for a local app, `"config"` in a registry app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
@@ -154,6 +154,36 @@ The supervisor holds client sockets. Objects see them as ordinary requests, in [
   - Messages waiting to be written count their bytes plus 64 each. A socket more than `socket_backlog_kb` (default 1,024) behind is dropped, and so is one whose write stalls for 30 s. Each socket's budget is its own, so no client or app can crowd out another; the supervisor's worst case is `max_sockets` × the largest `socket_backlog_kb`, which `registry_limits` caps.
   - A socket is pinged every 30 s and dropped if it heard nothing for a whole interval, so a half-open connection doesn't hold its slot.
   - A socket has at most 64 channels and 16 KiB of handshake headers. A publish has at most 64 items.
+
+## Commits
+
+A request's changes to `/data` (files and key-value alike) and what it publishes to WebSockets take effect together when it answers, and are durable before anyone hears of them: Durable Objects' output gate. If the request fails, they never happened. "Fails" means a guest error, a trap, the CPU or time limit, or the worker crashing. An answer of any status commits.
+
+**How:** an undo journal (`journal.rs`), as SQLite's rollback journal, under our `wasi:filesystem` host (`quota.rs`).
+- **Before each change, the host records what the change would destroy, and fsyncs it:**
+  - a file's size, the first time it is written;
+  - the bytes a write or truncation overwrites;
+  - "remove this", for a new entry;
+  - "rename it back", for a rename;
+  - "recreate this", for a removed directory.
+
+  A removed or replaced file is renamed into the journal, not deleted.
+- **Then the change happens in place,** so open files and `mmap` keep working, and SQLite can sit on `/data`.
+- **Commit** (before the response is released, and again after post-return work) fsyncs what changed and deletes the log. Held publishes are sent after it.
+- **Rollback** has one path. A failed request ends its instance, and every instance start replays any log left behind backwards, so a crash is handled the same way. Recovery trims each step off the log as it completes, so a crash during recovery resumes where it stopped.
+- **Costs:**
+  - One fsync per record that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request. Requests that change nothing pay nothing.
+  - Fsync time isn't charged to the guest's CPU budget.
+  - The quota counts committed state; the journal may hold as much again while a request runs.
+- **`/tmp` is not journaled.** It is per-instance scratch, deleted with the instance, so it's the fast place for temporary files. A rename between `/tmp` and `/data` fails as cross-device, as between real filesystems.
+
+**Alternatives considered:**
+- Key-value-only storage: rejected, real files are wanted.
+- FUSE or kernel overlay filesystems: rejected. They need mounts per object, and their commit copies.
+- btrfs or ZFS snapshots: rejected. They tie nanovm to one filesystem, and a snapshot costs a transaction commit per request.
+- Swapping in a shadow copy of the volume: rejected. It copies the tree and breaks files held open.
+- Per-file copies with reflink: rejected. They copy whole files on ext4.
+- Crates (`fs-transaction`, `txfs`, `kaish-vfs`, `eryx-vfs`, `overlayfs_fuse`): none sits behind POSIX writes through open descriptors.
 
 ## Benchmarks
 
@@ -222,7 +252,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 51 integration tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 54 integration tests and 76 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -232,7 +262,12 @@ The tests cover:
 - volumes surviving eviction and restarts, and not being shared between objects
 - `/tmp` wiped on a new instance
 - file-size and file-count quotas
-- read-only `/app`, sandbox escapes, and one disk budget across `/data` and `/tmp`, including renames between them
+- read-only `/app`, sandbox escapes, and one disk budget across `/data` and `/tmp`, and renames between them refused as cross-device
+- commits:
+  - a request that errors, traps or runs out of CPU leaves its files and key-value writes untouched, while one that answers, even with 507, commits;
+  - a worker killed mid-request is rolled back when the object next starts;
+  - a publish followed by a panic reaches no socket;
+  - unit tests roll back every kind of change, commit them, survive a crash at each step of recovery, ignore a torn record, and journal writes to a file removed while open
 - an allowed outbound request through the full egress path
 - the egress allowlist, including DNS rebinding to loopback
 - LRU and idle eviction, and capacity limits
@@ -319,6 +354,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `crates/nanovm/src/registry.rs` | Registry apps: pull by digest, Sigstore verification, version floor, digest cache |
 | `crates/nanovm/src/link.rs` | HTTP/1.1 over socketpairs passed across a control socket |
 | `crates/nanovm/src/kv.rs` | `wasi:keyvalue` on the object's volume |
+| `crates/nanovm/src/journal.rs` | Per-request commits: the undo journal, commit and crash recovery |
 | `crates/nanovm/src/ws.rs` | WebSockets: the supervisor's sockets, WebSocket-over-HTTP events and per-object channels |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
 | `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |

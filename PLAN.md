@@ -275,6 +275,7 @@ The goal: one node, as fast and secure as we can make it, that runs untrusted We
   - **Alarms are skipped for now** (Q30). Since they are set by a response header, they could be done outside the node, by a scheduler in front of it.
   - **Key-value** (done): a host-implemented `wasi:keyvalue` stored as files under `/data`. `wasi:filesystem` stays exposed. `wasi:config` serves each app's config values.
 - **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
+- **Commits** (Q37–Q40): an undo journal under the filesystem host; see README.
 - **Out of scope for now:** clustering, one-shot runs of agent-written code, dashboards, static signing keys.
 
 ## Phase 2: the Linux jail (done)
@@ -324,9 +325,13 @@ As in the target design, with these choices (README, "Apps from a registry", has
 
 README's "Key-value and config" and "WebSockets" describe them.
 
+## Phase 6: per-request commits (on branch `commits`, in review)
+
+A request's changes to `/data` (files and key-value) and its WebSocket publishes take effect only if it answers, durably. A failed request is rolled back. README's "Commits" describes the design and the alternatives rejected.
+
 ## Next phases
 
-6. The front proxy (Q34): it maps a host to an app's digest and trust policy, strips `nanovm-*` headers from clients, and is the public entry point. Perhaps `nanovm proxy` in this repo.
+7. The front proxy (Q34): it maps a host to an app's digest and trust policy, strips `nanovm-*` headers from clients, and is the public entry point. Perhaps `nanovm proxy` in this repo.
 
 ## Follow-ups
 
