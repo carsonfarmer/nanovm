@@ -24,7 +24,6 @@ use anyhow::{Context, bail, ensure};
 use http::HeaderMap;
 use oci_client::Reference;
 use oci_client::manifest::{OciDescriptor, OciImageIndex, OciImageManifest};
-use parking_lot::Mutex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sigstore_trust_root::{SIGSTORE_PRODUCTION_TRUSTED_ROOT, TrustedRoot};
@@ -50,10 +49,15 @@ const MAX_SIGNATURES: usize = 16;
 pub const APP_HEADER: &str = "nanovm-app";
 pub const TRUST_HEADER: &str = "nanovm-trust";
 pub const MIN_VERSION_HEADER: &str = "nanovm-min-version";
+/// The host the proxy found the app at: an app is a host's deployment of a
+/// repository, so a host naming another's repository gets data of its own.
+pub const HOST_HEADER: &str = "nanovm-host";
 
 /// Which app version a request wants, and whose signature it accepts.
 #[derive(Debug, Clone)]
 pub struct AppRef {
+    /// Where the app is served; empty for a node driven directly (tests).
+    pub host: String,
     /// `registry/repository@sha256:…`
     pub reference: Reference,
     pub digest: String,
@@ -86,22 +90,29 @@ impl AppRef {
             .collect::<anyhow::Result<_>>()?;
         let min_version = get(MIN_VERSION_HEADER).transpose()?.map(str::parse).transpose()?;
         Ok(Some(AppRef {
+            host: get(HOST_HEADER).transpose()?.unwrap_or_default().to_ascii_lowercase(),
             reference,
             digest,
             policy: Policy { trust, min_version },
         }))
     }
 
-    /// The app's name on this node: its repository, readable and unique.
+    /// The app's name on this node: its host and repository, readable and
+    /// unique.
     pub fn name(&self) -> String {
-        app_name(&self.reference)
+        app_name(&self.host, &self.reference)
     }
 }
 
-/// `registry/repository` as an app name: the readable part, then a hash of
-/// the whole so that no two repositories share a name.
-pub fn app_name(r: &Reference) -> String {
-    let repo = format!("{}/{}", r.registry(), r.repository());
+/// `host registry/repository` as an app name: the readable part, then a
+/// hash of the whole, so that no two (host, repository) pairs share a name.
+/// A registry is named one way only: lower case, without `:443`. Whoever
+/// controls a host chooses which version of a repository it runs, so every
+/// host gets the repository's app (its volumes, uid and worker) to itself.
+pub fn app_name(host: &str, r: &Reference) -> String {
+    let registry = r.registry().to_ascii_lowercase();
+    let registry = registry.strip_suffix(":443").unwrap_or(&registry);
+    let repo = format!("{host} {registry}/{}", r.repository()).trim_start().to_string();
     let safe = |c: char| if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') { c } else { '_' };
     let readable: String = repo.chars().map(safe).take(100).collect();
     format!("{readable}-{}", &format!("{:x}", Sha256::digest(&repo))[..16])
@@ -160,7 +171,8 @@ impl Registry {
     /// The app `r` names, if it is authorized (see `authorize`). Nothing but
     /// the manifest and the signatures is downloaded before that is settled.
     pub async fn load(&self, r: &AppRef) -> anyhow::Result<Pulled> {
-        let bytes = self.fetch(r, "manifests", &r.digest, MANIFEST_TYPE, MAX_METADATA, true).await?;
+        // Not cached: nothing reaches the disk before the app is authorized.
+        let bytes = self.fetch(r, "manifests", &r.digest, MANIFEST_TYPE, MAX_METADATA, false).await?;
         let manifest: OciImageManifest = serde_json::from_slice(&bytes).context("the manifest")?;
         let version = manifest
             .annotations
@@ -248,10 +260,12 @@ impl Registry {
         let hash = sigstore_types::Sha256Hash::from_hex(hex)?;
         let mut why = String::from("no signature");
         let signatures = index.manifests.iter().filter(|m| m.artifact_type.as_deref() == Some(BUNDLE_TYPE));
+        let mut left = MAX_SIGNATURES;
         for entry in signatures.take(MAX_SIGNATURES) {
             let m = self.fetch(r, "manifests", &entry.digest, MANIFEST_TYPE, MAX_METADATA, false).await?;
             let m: OciImageManifest = serde_json::from_slice(&m)?;
             for layer in m.layers.iter().filter(|l| l.media_type == BUNDLE_TYPE) {
+                left = left.checked_sub(1).context("too many signatures")?;
                 ensure!(layer.size >= 0 && layer.size as u64 <= MAX_METADATA, "a signature is too large");
                 let json = self.fetch(r, "blobs", &layer.digest, "*/*", layer.size as u64, false).await?;
                 let bundle = sigstore_types::Bundle::from_json(std::str::from_utf8(&json)?)?;
@@ -274,8 +288,6 @@ impl Registry {
 pub struct Oci {
     http: reqwest::Client,
     dev: bool,
-    /// The last pull token each repository was given.
-    tokens: Mutex<HashMap<String, String>>,
 }
 
 impl Oci {
@@ -286,16 +298,14 @@ impl Oci {
             _ => a.error("a redirect to a private address"),
         });
         let http = reqwest::Client::builder()
+            // A forward proxy would resolve names itself, past `PublicOnly`.
+            .no_proxy()
             .dns_resolver(Arc::new(PublicOnly(dev)))
             .redirect(redirect)
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))
             .build()?;
-        Ok(Oci {
-            http,
-            dev,
-            tokens: Mutex::default(),
-        })
+        Ok(Oci { http, dev })
     }
 
     /// `GET /v2/<repository>/<kind>/<what>`, at most `max` bytes of it;
@@ -318,27 +328,21 @@ impl Oci {
 
     async fn send(&self, r: &Reference, kind: &str, what: &str, accept: &str) -> anyhow::Result<reqwest::Response> {
         let host = r.resolve_registry();
-        let name = host.rsplit_once(':').map_or(host, |(h, _)| h);
-        ensure!(allowed(name, self.dev), "registry {host} is on a private address");
-        let scheme = if self.dev && loopback(name) { "http" } else { "https" };
-        let url = format!("{scheme}://{host}/v2/{}/{kind}/{what}", r.repository());
-        let repo = format!("{host}/{}", r.repository());
-        let req = |token: Option<&String>| {
-            let req = self.http.get(&url).header(http::header::ACCEPT, accept);
-            match token {
-                Some(t) => req.bearer_auth(t),
-                None => req,
-            }
-        };
-        let token = self.tokens.lock().get(&repo).cloned();
-        let res = req(token.as_ref()).send().await?;
+        let mut url = reqwest::Url::parse(&format!("https://{host}/v2/{}/{kind}/{what}", r.repository()))?;
+        // Checked as parsed, which is how it will be connected to: `127.1`
+        // is 127.0.0.1 by then.
+        ensure!(url.host_str().is_some_and(|h| allowed(h, self.dev)), "registry {host} is on a private address");
+        if self.dev && url.host_str().is_some_and(loopback) {
+            url.set_scheme("http").expect("http is a valid scheme");
+        }
+        let req = || self.http.get(url.clone()).header(http::header::ACCEPT, accept);
+        let res = req().send().await?;
         if res.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(res);
         }
         let challenge = res.headers().get(http::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok());
         let token = self.token(challenge.context("401 without a challenge")?).await?;
-        self.tokens.lock().insert(repo, token.clone());
-        Ok(req(Some(&token)).send().await?)
+        Ok(req().bearer_auth(token).send().await?)
     }
 
     /// An anonymous token for a `Bearer realm="…",service="…",scope="…"`
@@ -376,12 +380,12 @@ fn loopback(host: &str) -> bool {
     host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Whether a registry host may be spoken to: names are checked once
-/// resolved (`PublicOnly`), addresses here.
+/// Whether a registry host, as a parsed URL has it, may be spoken to: names
+/// are checked once resolved (`PublicOnly`), addresses here.
 fn allowed(host: &str, dev: bool) -> bool {
     match host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
         Ok(ip) => dev || is_global(ip),
-        Err(_) => dev || host != "localhost",
+        Err(_) => true,
     }
 }
 
@@ -469,13 +473,33 @@ mod tests {
         }
     }
 
-    /// An app's name is its registry and repository, readable, safe as a
-    /// path component, and distinct for distinct repositories, whatever
-    /// the tag or digest.
+    /// A registry is checked as it will be connected to: non-canonical
+    /// IPv4 forms are private addresses too, and names are left to the
+    /// resolver.
+    #[tokio::test]
+    async fn registries_on_private_addresses_are_refused() {
+        let oci = Oci::new(false).unwrap();
+        for host in ["127.1", "2130706433:443", "0x7f.1", "10.1:5000", "169.254.169.254"] {
+            let r: Reference = format!("{host}/x/y:t").parse().unwrap();
+            let e = oci.get(&r, "manifests", "t", MANIFEST_TYPE, 1).await.unwrap_err().to_string();
+            assert!(e.contains("private address"), "{host}: {e}");
+        }
+    }
+
+    /// An app's name is its host, registry and repository, readable, safe
+    /// as a path component, and distinct for distinct hosts and
+    /// repositories, whatever the tag or digest or how the registry is
+    /// written.
     #[test]
-    fn apps_are_named_by_repository() {
-        let name = |s: &str| app_name(&s.parse().unwrap());
+    fn apps_are_named_by_host_and_repository() {
+        let name = |s: &str| app_name("", &s.parse().unwrap());
         let a = name("ghcr.io/acme/app:1");
+        assert_eq!(a, name("GHCR.IO/acme/app:1"));
+        assert_eq!(a, name("ghcr.io:443/acme/app:1"));
+        let hosted = app_name("example.com", &"ghcr.io/acme/app:1".parse().unwrap());
+        assert!(hosted.starts_with("example.com_ghcr.io_acme_app-"), "{hosted}");
+        assert_ne!(hosted, app_name("evil.com", &"ghcr.io/acme/app:1".parse().unwrap()));
+        assert_ne!(hosted, a);
         assert!(a.starts_with("ghcr.io_acme_app-") && a.len() == "ghcr.io_acme_app-".len() + 16, "{a}");
         assert_eq!(a, name(&format!("ghcr.io/acme/app@{DIGEST}")));
         for other in ["ghcr.io/acme/app2:1", "ghcr.io/acme_app:1", "localhost:5000/acme/app:1"] {
@@ -527,11 +551,12 @@ mod tests {
         assert!(serde_json::from_str::<AppSpec>(r#"{"limits":{"cpu":1}}"#).is_err());
     }
 
-    /// Outside dev mode no registry may be on a private address; in dev mode
-    /// any may, and loopback ones are plain HTTP.
+    /// Outside dev mode no registry address may be private (names are the
+    /// resolver's to check); in dev mode any may, and loopback ones are
+    /// plain HTTP.
     #[test]
     fn registries_are_public_unless_dev() {
-        for private in ["localhost", "127.0.0.1", "[::1]", "10.0.0.1", "169.254.169.254"] {
+        for private in ["127.0.0.1", "[::1]", "10.0.0.1", "169.254.169.254"] {
             assert!(!allowed(private, false), "{private}");
             assert!(allowed(private, true), "{private}");
         }

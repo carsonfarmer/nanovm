@@ -196,12 +196,23 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        let addr: std::net::SocketAddr = self.listen.parse().with_context(|| format!("listen = {:?}", self.listen))?;
-        if self.dev && !addr.ip().is_loopback() {
-            bail!("dev mode needs a loopback listen address, not {addr}");
-        }
-        Ok(())
+        dev_on_loopback(self.dev, &self.listen)
     }
+}
+
+impl ProxyConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        dev_on_loopback(self.dev, &self.listen)
+    }
+}
+
+/// `listen` is an address, and a loopback one in dev mode.
+fn dev_on_loopback(dev: bool, listen: &str) -> anyhow::Result<()> {
+    let addr: std::net::SocketAddr = listen.parse().with_context(|| format!("listen = {listen:?}"))?;
+    if dev && !addr.ip().is_loopback() {
+        bail!("dev mode needs a loopback listen address, not {addr}");
+    }
+    Ok(())
 }
 
 /// `n`, or for 0 the number of cores divided by `div` (at least 1).
@@ -265,6 +276,8 @@ mod tests {
         }
         cfg.dev = false;
         cfg.validate().unwrap();
+        let proxy = ProxyConfig { dev: true, ..ProxyConfig::default() };
+        assert!(proxy.validate().unwrap_err().to_string().contains("dev mode"), "the default listen is public");
     }
 
     /// An empty file is the documented defaults; a partial table keeps the

@@ -29,7 +29,7 @@ use parking_lot::Mutex;
 
 use crate::config::ProxyConfig;
 use crate::object::{RespBody, error_response};
-use crate::registry::{APP_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
+use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
 
 /// What `_nanovm.<host>` says.
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +53,7 @@ type Body = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
 
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> anyhow::Result<Arc<Proxy>> {
+        cfg.validate()?;
         let node = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build(hyper_util::client::legacy::connect::HttpConnector::new());
         Ok(Arc::new(Proxy {
@@ -93,6 +94,7 @@ impl Proxy {
             Ok(())
         };
         set(&mut parts.headers, APP_HEADER, &app)?;
+        set(&mut parts.headers, HOST_HEADER, &host)?;
         set(&mut parts.headers, TRUST_HEADER, &route.trust)?;
         if let Some(min) = &route.min {
             set(&mut parts.headers, MIN_VERSION_HEADER, min)?;

@@ -743,7 +743,7 @@ fn names(app: &str) -> String {
 
 /// The app's name on the node (its worker's, in stats and cgroups).
 fn worker(app: &str) -> String {
-    nanovm::registry::app_name(&app.parse().unwrap())
+    nanovm::registry::app_name("", &app.parse().unwrap())
 }
 
 /// `GET path` on `app`.
@@ -1834,6 +1834,7 @@ async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::Sock
         resolver,
         tag_ttl_s: 0,
         dev: true,
+        listen: "127.0.0.1:0".into(),
         ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1858,18 +1859,24 @@ async fn the_proxy_routes_hosts_by_dns() {
         records.lock().insert(format!("_nanovm.{host}"), txt.iter().map(|t| t.to_string()).collect());
     };
     record("counter.test", &[&format!("app={tagged}; trust=dev dev")]);
+    let at = |host: &str, app: &str| nanovm::registry::app_name(host, &app.parse().unwrap());
     let get = async |host: &str, path: &str, extra: &str| {
         raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n"), b"").await
     };
 
     let (status, body) = get("counter.test", "/a/", "").await;
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains(&format!(r#""app":"{}","object":"a""#, worker(&counter))), "{body}");
+    assert!(body.contains(&format!(r#""app":"{}","object":"a""#, at("counter.test", &counter))), "{body}");
     // What a client says its app is goes unheard.
     let (status, body) = get("Counter.Test:8443", "/a/", &names(&hostile)).await;
     assert_eq!(status, 200, "{body}");
-    assert!(body.contains(&worker(&counter)), "{body}");
+    assert!(body.contains(&at("counter.test", &counter)), "{body}");
     assert_eq!(get("counter.test", "/_nanovm/stats", "").await.0, 400);
+    // Another host naming the same repository runs an app of its own: it
+    // can choose the version it runs, but not the one counter.test runs.
+    record("other.test", &[&format!("app={tagged}; trust=dev dev")]);
+    let (status, body) = get("other.test", "/a/", "").await;
+    assert!(status == 200 && body.contains(&at("other.test", &counter)), "{body}");
 
     // No record is no app; a bad record, or two, is the proxy's error.
     assert_eq!(get("nowhere.test", "/a/", "").await.0, 404);
@@ -1885,7 +1892,7 @@ async fn the_proxy_routes_hosts_by_dns() {
     let next = publish("counter", &next).await;
     assert_eq!(get("counter.test", "/a/config/greeting", "").await, (200, "deployed".into()));
     let digest = next.split_once('@').unwrap().1;
-    assert_eq!(stats_json(node).await["workers"][worker(&counter).as_str()]["digest"], digest);
+    assert_eq!(stats_json(node).await["workers"][at("counter.test", &counter).as_str()]["digest"], digest);
 
     let mut req = format!("ws://{proxy}/room/ws").into_client_request().unwrap();
     req.headers_mut().insert("host", "counter.test".parse().unwrap());
@@ -1945,6 +1952,25 @@ async fn a_running_version_is_checked_against_each_policy() {
     assert_eq!(raw(addr, &with_floor("1.0.0"), b"").await.0, 200);
     let v = stats_json(addr).await;
     assert_eq!(v["workers"][worker(&counter).as_str()]["starts"], 1, "{v}");
+}
+
+/// Nothing a registry sends reaches the node's disk before its app is
+/// authorized: an app refused (here for its version floor) leaves the
+/// registry cache empty, so unsigned manifests can't fill the disk.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_app_leaves_nothing_on_disk() {
+    let test = "a_refused_app_leaves_nothing_on_disk";
+    let (_sup, addr) = supervised(test).await;
+    let counter = publish("counter", &app("counter")).await;
+    let head = format!(
+        "GET /a/ HTTP/1.1\r\nHost: x\r\n{}nanovm-min-version: 9.0.0\r\nConnection: close\r\n\r\n",
+        names(&counter)
+    );
+    let (status, body) = raw(addr, &head, b"").await;
+    assert!(status == 502 && body.contains("below the minimum"), "{status} {body}");
+    let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes").join(test).join("registry");
+    let kept: Vec<_> = std::fs::read_dir(&cache).into_iter().flatten().flatten().map(|e| e.file_name()).collect();
+    assert!(kept.is_empty(), "{kept:?}");
 }
 
 /// A switch, once begun, finishes even if the request that began it goes

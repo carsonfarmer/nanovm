@@ -40,7 +40,7 @@ use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
 use crate::jail::Jail;
 use crate::link::{self, Dialer};
-use crate::registry::{APP_HEADER, AppRef, MIN_VERSION_HEADER, Policy, Registry, TRUST_HEADER};
+use crate::registry::{APP_HEADER, AppRef, HOST_HEADER, MIN_VERSION_HEADER, Policy, Registry, TRUST_HEADER};
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
 use crate::table::{BAD_OBJECT, Node, route};
@@ -144,7 +144,7 @@ impl Supervisor {
             Ok(None) => return self.admin(req).await,
             Err(e) => return error_response(400, "bad-app-ref", &format!("{e:#}")),
         };
-        for h in [APP_HEADER, TRUST_HEADER, MIN_VERSION_HEADER] {
+        for h in [APP_HEADER, TRUST_HEADER, MIN_VERSION_HEADER, HOST_HEADER] {
             req.headers_mut().remove(h);
         }
         if route(req.uri().path()).is_none() {
