@@ -155,17 +155,22 @@ impl Journal {
     pub fn writing(&mut self, file: &File, at: u64, end: u64) -> std::io::Result<()> {
         let Some(p) = self.local_file(file) else { return Ok(()) };
         let md = file.metadata()?;
-        if self.sized.insert(md.ino()) {
+        if !self.sized.contains(&md.ino()) {
             self.record(Undo::Size(p.clone(), md.len()))?;
+            self.sized.insert(md.ino());
             self.touched.insert(p.clone());
         }
         let (mut at, end) = (at, end.min(md.len()));
-        while at < end {
-            let mut old = vec![0; (end - at).min(CHUNK) as usize];
-            file.read_exact_at(&mut old, at)?;
-            let n = old.len() as u64;
-            self.record(Undo::Bytes(p.clone(), at, old))?;
-            at += n;
+        if at < end {
+            // Read through a handle of our own: the guest's may be write-only.
+            let current = File::open(self.base.join(&p))?;
+            while at < end {
+                let mut old = vec![0; (end - at).min(CHUNK) as usize];
+                current.read_exact_at(&mut old, at)?;
+                let n = old.len() as u64;
+                self.record(Undo::Bytes(p.clone(), at, old))?;
+                at += n;
+            }
         }
         Ok(())
     }
@@ -183,8 +188,11 @@ impl Journal {
         Ok(())
     }
 
-    /// Before the empty directory at `path` is removed.
+    /// Before the empty directory at `path` is removed, if one is there.
     pub fn removing_dir(&mut self, path: &Path) -> std::io::Result<()> {
+        if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
         let p = self.rel(path);
         self.record(Undo::RemovedDir(p.clone()))?;
         self.touch_parent(&p);
@@ -558,16 +566,20 @@ mod tests {
         assert_eq!(j.local(Path::new("/tmp/x")), None);
     }
 
-    /// Creating what already exists records nothing: a failed `mkdir` on a
-    /// directory, or a file named with a trailing `/`, can't make a rollback
-    /// delete what was there, or make recovery fail.
+    /// Creating what already exists, or removing a directory that isn't
+    /// there, records nothing: a failed `mkdir` on a directory, a file named
+    /// with a trailing `/`, or a failed `rmdir` can't make a rollback delete
+    /// what was there, create what never was, or make recovery fail.
     #[test]
-    fn creating_what_exists_is_not_undone() {
+    fn failed_creates_and_removes_are_not_undone() {
         let v = volume();
         let before = tree(&v);
         let mut j = open(&v);
         for p in ["d", "a/", "", "e"] {
             j.creating(&v.join(p)).unwrap();
+        }
+        for p in ["missing", "a", "d/missing"] {
+            j.removing_dir(&v.join(p)).unwrap();
         }
         assert!(j.log.is_none());
         drop(j);
@@ -587,6 +599,40 @@ mod tests {
         rename(&mut j, &v, "a", "b");
         rename(&mut j, &v, "f", "a");
         write(&mut j, &v, "a", 2, b"23456789");
+        drop(j);
+        open(&v);
+        assert_eq!(tree(&v), before);
+    }
+
+    /// A file opened write-only can be written over: the bytes it replaces
+    /// are read through a handle of the journal's own.
+    #[test]
+    fn write_only_files_can_be_overwritten() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        let file = File::options().write(true).open(v.join("a")).unwrap();
+        j.writing(&file, 0, 5).unwrap();
+        file.write_all_at(b"HELLO", 0).unwrap();
+        drop(j);
+        open(&v);
+        assert_eq!(tree(&v), before);
+    }
+
+    /// A change the full journal refused stays refused when retried: the
+    /// failed attempt can't leave the file's size counted as recorded, which
+    /// would let an append through with nothing to undo it.
+    #[test]
+    fn refused_changes_stay_refused() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = reopen(&v, 30).unwrap();
+        let a = File::options().read(true).write(true).open(v.join("a")).unwrap();
+        for _ in 0..2 {
+            if j.writing(&a, 11, 16).is_ok() {
+                a.write_all_at(b"MORE!", 11).unwrap();
+            }
+        }
         drop(j);
         open(&v);
         assert_eq!(tree(&v), before);

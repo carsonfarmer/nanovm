@@ -255,7 +255,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 55 integration tests and 79 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 55 integration tests and 81 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -270,7 +270,7 @@ The tests cover:
   - a request that errors, traps or runs out of CPU leaves its files and key-value writes untouched, while one that answers, even with 507, commits;
   - a worker killed mid-request is rolled back when the object next starts;
   - a publish followed by a panic reaches no socket;
-  - unit tests roll back every kind of change, commit them, survive a crash at each step of recovery, ignore a torn record, and journal writes to a file removed while open
+  - unit tests roll back every kind of change, commit them, survive a crash at each step of recovery, ignore a torn record, journal writes to a file removed while open and to one opened write-only, and record nothing for a failed `rmdir` or a refused change
 - an allowed outbound request through the full egress path
 - the egress allowlist, including DNS rebinding to loopback
 - LRU and idle eviction, and capacity limits
@@ -347,6 +347,10 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
   - A kv write refused for space deleted the old value.
   - The journal had no bound.
   - My own crash test also found that replaying a recovery from the start could undo a rename twice and lose a file; recovery now trims each step off the log.
+- **From a second review** (listed in [ISSUES.md](ISSUES.md)). Each fix has a test that fails without it.
+  - A failed `rmdir` was journaled anyway, so rolling back created a directory the file count never saw; repeated, it went past `max_files` (N-5).
+  - When the full journal refused a file's size record, the file was still marked as recorded, so a retried append went through with nothing to undo it (N-6).
+  - Overwriting a file opened write-only failed: the journal read the old bytes through the guest's descriptor (N-7).
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
 ## Layout
