@@ -132,4 +132,4 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `object.rs:287`, `jail.rs` (the seccomp allowlist)
 - **Scenario:** `new_store` canonicalizes the object's directory, and with a relative `data_dir` (the demo's `../nanovm-data`) that reads the cwd. `getcwd` isn't on the worker's allowlist, so every instantiation fails with `ENOSYS` and the demo answers `503 instantiate-failed` to everything. The tests use absolute paths, so they pass. Found running the demo while fixing N-2.
 - **Reproduced:** yes (`demo/demo.sh`, and strace showing the refused `getcwd`)
-- **Status:** fixing
+- **Status:** fixed in d7f7ee6
