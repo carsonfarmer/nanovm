@@ -2192,3 +2192,34 @@ async fn the_proxy_outlasts_idle_and_excess_connections() {
         assert!(took >= Duration::from_secs(9), "{took:?}");
     }
 }
+
+/// Hop-by-hop headers, and the ones a client's `Connection` lists, stay on
+/// the client's connection; the rest reach the node.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_proxy_drops_hop_by_hop_headers() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::server::serve_http1(listener, |req: http::Request<hyper::body::Incoming>| {
+        let names: Vec<_> = req.headers().keys().map(|k| k.to_string()).collect();
+        async move { nanovm::server::ok_json(serde_json::json!(names)) }
+    }));
+    let records = Arc::new(parking_lot::Mutex::default());
+    let proxy = proxied(echo, doh(records.clone()).await).await;
+    let counter = publish("counter", &app("counter")).await;
+    let txt = format!("app={}:latest; trust=dev dev", counter.split_once('@').unwrap().0);
+    records.lock().insert("_nanovm.hop.test".to_string(), vec![txt]);
+    let head = "GET /a/ HTTP/1.1\r\nHost: hop.test\r\nConnection: close, x-private\r\nx-private: 1\r\n\
+        Keep-Alive: timeout=5\r\nTE: trailers\r\nProxy-Authorization: Basic eA==\r\nx-kept: 1\r\n\r\n";
+    let (status, body) = raw(proxy, head, b"").await;
+    assert_eq!(status, 200, "{body}");
+    let names: Vec<String> = serde_json::from_str(&body).unwrap();
+    assert!(names.contains(&"x-kept".to_string()) && names.contains(&"nanovm-app".to_string()), "{names:?}");
+    for gone in ["x-private", "keep-alive", "te", "proxy-authorization", "connection"] {
+        assert!(!names.contains(&gone.to_string()), "{gone} reached the node: {names:?}");
+    }
+    // An upgrade still says so.
+    let head = "GET /a/ HTTP/1.1\r\nHost: hop.test\r\nConnection: Upgrade, close, x-private\r\nUpgrade: websocket\r\n\r\n";
+    let names: Vec<String> = serde_json::from_str(&raw(proxy, head, b"").await.1).unwrap();
+    assert!(names.contains(&"connection".to_string()) && names.contains(&"upgrade".to_string()), "{names:?}");
+    assert!(!names.contains(&"x-private".to_string()), "{names:?}");
+}

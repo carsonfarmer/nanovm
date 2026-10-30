@@ -21,7 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use http::{HeaderValue, Request, Response, StatusCode};
+use http::header::{CONNECTION, PROXY_AUTHORIZATION, TE, TRAILER, UPGRADE};
+use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use oci_client::Reference;
@@ -133,6 +134,21 @@ impl Proxy {
         let theirs: Vec<_> = parts.headers.keys().filter(|k| k.as_str().starts_with("nanovm-")).cloned().collect();
         for k in theirs {
             parts.headers.remove(k);
+        }
+        // Hop-by-hop headers, and those `Connection` lists, are the client
+        // connection's; an upgrade's are passed on.
+        let h = &mut parts.headers;
+        let listed: Vec<_> = h.get_all(CONNECTION).iter().flat_map(|v| v.to_str().unwrap_or("").split(',')).collect();
+        let listed: Vec<HeaderName> = listed.iter().filter_map(|n| n.trim().parse().ok()).filter(|n| *n != UPGRADE).collect();
+        let upgrading = h.contains_key(UPGRADE);
+        for k in listed.iter().chain(&[CONNECTION, TE, TRAILER, PROXY_AUTHORIZATION]) {
+            h.remove(k);
+        }
+        for k in ["keep-alive", "proxy-connection"] {
+            h.remove(k);
+        }
+        if upgrading {
+            h.insert(CONNECTION, HeaderValue::from_static("upgrade"));
         }
         let app = format!("{}/{}@{digest}", route.app.registry(), route.app.repository());
         let set = |h: &mut http::HeaderMap, k: &'static str, v: &str| -> Result<(), (StatusCode, String)> {
