@@ -180,18 +180,25 @@ where
 }
 
 /// The accepting end: serves HTTP/1.1 on every connection received on
-/// `ctl`, until the dialer hangs up.
-pub async fn serve<F, Fut, R>(ctl: UnixStream, f: F) -> anyhow::Result<()>
+/// `ctl`, at most `max` at once (one past that is closed unserved), until
+/// the dialer hangs up.
+pub async fn serve<F, Fut, R>(ctl: UnixStream, max: usize, f: F) -> anyhow::Result<()>
 where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Response<R>> + Send + 'static,
     R: Body<Data = Bytes> + Send + 'static,
     R::Error: Into<BoxError>,
 {
+    let open = Arc::new(tokio::sync::Semaphore::new(max.min(tokio::sync::Semaphore::MAX_PERMITS)));
     while let Some(fd) = recv_fd(&ctl).await? {
+        let Ok(permit) = open.clone().try_acquire_owned() else { continue };
         let sock = std::os::unix::net::UnixStream::from(fd);
         sock.set_nonblocking(true)?;
-        crate::server::serve_conn(UnixStream::from_std(sock)?, f.clone());
+        let conn = crate::server::serve_conn(UnixStream::from_std(sock)?, f.clone());
+        tokio::spawn(async move {
+            let _ = conn.await;
+            drop(permit);
+        });
     }
     Ok(())
 }
@@ -254,11 +261,47 @@ mod tests {
             .collect();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         peer.set_nonblocking(true).unwrap();
-        tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), |_req| async {
+        tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), usize::MAX, |_req| async {
             Response::new(Full::new(Bytes::from_static(b"ok")))
         }));
         for s in sends {
             assert_eq!(s.await.unwrap().unwrap(), "ok");
         }
+    }
+
+    /// A dialer gets at most `max` connections served at once: one more is
+    /// closed unserved, and those it has keep working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connections_are_capped() {
+        let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let g = gate.clone();
+        tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), 2, move |_req| {
+            let g = g.clone();
+            async move {
+                g.notified().await;
+                Response::new(Full::new(Bytes::from_static(b"ok")))
+            }
+        }));
+        let dialer = Dialer::<Empty<Bytes>>::new(ctl, 1);
+        let send = || {
+            let d = dialer.clone();
+            tokio::spawn(async move {
+                let res = d.send(Request::get("/").body(Empty::new()).unwrap()).await?;
+                anyhow::Ok(res.into_body().collect().await?.to_bytes())
+            })
+        };
+        let held = [send(), send()];
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(send().await.unwrap().is_err(), "a third connection was served");
+        gate.notify_waiters();
+        for h in held {
+            assert_eq!(h.await.unwrap().unwrap(), "ok");
+        }
+        let again = send();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.notify_waiters();
+        assert_eq!(again.await.unwrap().unwrap(), "ok", "a pooled connection still works");
     }
 }

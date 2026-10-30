@@ -323,6 +323,9 @@ impl Supervisor {
 
         // The worker's spec: the node config, its app, and its uid.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
+        // As many links to the supervisor as its objects may use at once:
+        // each its outbound requests and a publish.
+        let links = self.cfg.max_live_objects * (app.limits.max_outbound_concurrency + 1);
         let kb = |k: u64| (k << 10) as usize;
         let caps = ws::Caps {
             total: self.sockets.clone(),
@@ -375,7 +378,7 @@ impl Supervisor {
         let (policy, sockets) = (Arc::new(policy), Arc::new(Sockets::new(caps)));
         let s = sockets.clone();
         egress.set_nonblocking(true)?;
-        tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, move |req| {
+        tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, links, move |req| {
             let (policy, s) = (policy.clone(), s.clone());
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
@@ -610,7 +613,7 @@ pub fn worker_main() -> anyhow::Result<()> {
         let upstream = Dialer::new(upstream, 1);
         let node = Node::new(cfg, &app, &wasm, Some(upstream))?;
         let requests = tokio::net::UnixStream::from_std(requests)?;
-        link::serve(requests, move |req| crate::server::handle(node.clone(), req)).await
+        link::serve(requests, usize::MAX, move |req| crate::server::handle(node.clone(), req)).await
     })
 }
 
