@@ -73,6 +73,9 @@ pub struct Supervisor {
     /// One per running worker, `max_apps` in all.
     slots: Arc<tokio::sync::Semaphore>,
     fetches: tokio::sync::Semaphore,
+    /// Links all workers may hold open at once: each costs the supervisor a
+    /// file descriptor, and its upstream another.
+    links: Arc<tokio::sync::Semaphore>,
     /// Held while giving a new app its uid.
     uids: Arc<Mutex<()>>,
     /// Open WebSockets, across workers.
@@ -146,6 +149,9 @@ impl Supervisor {
             workers: Mutex::default(),
             slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_apps)),
             fetches: tokio::sync::Semaphore::new(MAX_FETCHES),
+            // A quarter of the fds: half for links and their upstreams, half
+            // for clients, WebSockets and the rest.
+            links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
             uids: Arc::default(),
             cfg,
             sockets: Arc::default(),
@@ -433,7 +439,8 @@ impl Supervisor {
         let (policy, sockets) = (Arc::new(policy), Arc::new(Sockets::new(caps)));
         let s = sockets.clone();
         egress.set_nonblocking(true)?;
-        tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, links, move |req| {
+        let link_caps = vec![Arc::new(tokio::sync::Semaphore::new(links)), self.links.clone()];
+        tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, link_caps, move |req| {
             let (policy, s) = (policy.clone(), s.clone());
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
@@ -702,7 +709,7 @@ pub fn worker_main() -> anyhow::Result<()> {
         let upstream = Dialer::new(upstream, 1);
         let node = Node::new(cfg, &app, &wasm, Some(upstream))?;
         let requests = tokio::net::UnixStream::from_std(requests)?;
-        link::serve(requests, usize::MAX, move |req| crate::server::handle(node.clone(), req)).await
+        link::serve(requests, vec![], move |req| crate::server::handle(node.clone(), req)).await
     })
 }
 

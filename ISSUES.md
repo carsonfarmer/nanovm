@@ -176,7 +176,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** the N-13 cap is `max_live_objects × (max_outbound_concurrency + 1)` per worker, 5,000 by default, with nothing across the node. A worker that got out of Wasm can hold 5,000 to 10,000 supervisor fds (links plus upstreams); past the supervisor's fd limit, its accept loop fails and the node exits (N-24).
 - **Reproduced:** no (phase 7 review)
 - **Fix:** a node-wide semaphore shared by every `link::serve`, sized from the fd limit, or a much smaller per-worker cap.
-- **Status:** open
+- **Status:** fixing
 
 ### N-28: a drain doesn't wait for the old worker to be gone
 - **Where:** `supervisor.rs:519-525` (`drain`)

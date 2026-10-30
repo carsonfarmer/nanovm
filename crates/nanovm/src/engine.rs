@@ -83,7 +83,7 @@ pub fn preflight(cfg: &NodeConfig) -> anyhow::Result<()> {
 }
 
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit and returns the result.
-fn raise_nofile() -> anyhow::Result<u64> {
+pub(crate) fn raise_nofile() -> anyhow::Result<u64> {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

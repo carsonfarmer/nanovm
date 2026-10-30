@@ -180,18 +180,19 @@ where
 }
 
 /// The accepting end: serves HTTP/1.1 on every connection received on
-/// `ctl`, at most `max` at once (one past that is closed unserved), until
-/// the dialer hangs up.
-pub async fn serve<F, Fut, R>(ctl: UnixStream, max: usize, f: F) -> anyhow::Result<()>
+/// `ctl` that gets a permit from each of `caps` (one that doesn't is closed
+/// unserved), until the dialer hangs up.
+pub async fn serve<F, Fut, R>(ctl: UnixStream, caps: Vec<Arc<tokio::sync::Semaphore>>, f: F) -> anyhow::Result<()>
 where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Response<R>> + Send + 'static,
     R: Body<Data = Bytes> + Send + 'static,
     R::Error: Into<BoxError>,
 {
-    let open = Arc::new(tokio::sync::Semaphore::new(max.min(tokio::sync::Semaphore::MAX_PERMITS)));
     while let Some(fd) = recv_fd(&ctl).await? {
-        let Ok(permit) = open.clone().try_acquire_owned() else { continue };
+        let Ok(permit) = caps.iter().map(|c| c.clone().try_acquire_owned()).collect::<Result<Vec<_>, _>>() else {
+            continue;
+        };
         let sock = std::os::unix::net::UnixStream::from(fd);
         sock.set_nonblocking(true)?;
         let conn = crate::server::serve_conn(UnixStream::from_std(sock)?, None, f.clone());
@@ -261,7 +262,7 @@ mod tests {
             .collect();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         peer.set_nonblocking(true).unwrap();
-        tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), usize::MAX, |_req| async {
+        tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), vec![], |_req| async {
             Response::new(Full::new(Bytes::from_static(b"ok")))
         }));
         for s in sends {
@@ -269,38 +270,51 @@ mod tests {
         }
     }
 
-    /// A dialer gets at most `max` connections served at once: one more is
-    /// closed unserved, and those it has keep working.
+    /// A dialer gets at most its own cap of connections served at once, and
+    /// all dialers together at most the shared one: one more is closed
+    /// unserved, and those served keep working.
     #[tokio::test(flavor = "multi_thread")]
     async fn connections_are_capped() {
-        let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        peer.set_nonblocking(true).unwrap();
+        use tokio::sync::Semaphore;
         let gate = Arc::new(tokio::sync::Notify::new());
-        let g = gate.clone();
-        tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), 2, move |_req| {
-            let g = g.clone();
-            async move {
-                g.notified().await;
-                Response::new(Full::new(Bytes::from_static(b"ok")))
-            }
-        }));
-        let dialer = Dialer::<Empty<Bytes>>::new(ctl, 1);
-        let send = || {
-            let d = dialer.clone();
+        let shared = Arc::new(Semaphore::new(3));
+        let dialer = || {
+            let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let g = gate.clone();
+            let caps = vec![Arc::new(Semaphore::new(2)), shared.clone()];
+            tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), caps, move |_req| {
+                let g = g.clone();
+                async move {
+                    g.notified().await;
+                    Response::new(Full::new(Bytes::from_static(b"ok")))
+                }
+            }));
+            Dialer::<Empty<Bytes>>::new(ctl, 1)
+        };
+        let send = |d: &Arc<Dialer<Empty<Bytes>>>| {
+            let d = d.clone();
             tokio::spawn(async move {
                 let res = d.send(Request::get("/").body(Empty::new()).unwrap()).await?;
                 anyhow::Ok(res.into_body().collect().await?.to_bytes())
             })
         };
-        let held = [send(), send()];
+        let refused = async |d: &Arc<Dialer<Empty<Bytes>>>| {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(1), send(d)).await;
+            r.is_ok_and(|r| r.unwrap().is_err())
+        };
+        let (a, b) = (dialer(), dialer());
+        let held = [send(&a), send(&a)];
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let third = tokio::time::timeout(std::time::Duration::from_secs(1), send()).await;
-        assert!(third.is_ok_and(|r| r.unwrap().is_err()), "a third connection was served");
+        assert!(refused(&a).await, "a third connection from one dialer was served");
+        let held_b = send(&b);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(refused(&b).await, "a fourth connection in all was served");
         gate.notify_waiters();
-        for h in held {
+        for h in held.into_iter().chain([held_b]) {
             assert_eq!(h.await.unwrap().unwrap(), "ok");
         }
-        let again = send();
+        let again = send(&a);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         gate.notify_waiters();
         assert_eq!(again.await.unwrap().unwrap(), "ok", "a pooled connection still works");
