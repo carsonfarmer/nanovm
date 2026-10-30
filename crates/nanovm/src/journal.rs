@@ -12,18 +12,19 @@
 //! Writes then happen in place, so open files stay valid. Committing syncs
 //! what changed and deletes the log. Rolling back replays it backwards, which
 //! is what [`recover`] does when an instance starts, so a failed request (its
-//! instance is restarted) and a crash take the same path. Every step is
-//! idempotent, so a crash during recovery is recovered from too.
+//! instance is restarted) and a crash take the same path. Recovery drops each
+//! record once undone, so a crash during it resumes where it stopped.
 //!
 //! The log lives beside the volume, at `<objects>/~journal/<object>`, which
-//! no object id can name. Paths in it are relative to `<objects>`, inside the
-//! volume or the journal (a file the guest still writes after unlinking it
-//! lives there).
+//! no object id can name and no guest path reaches. Paths in it are relative
+//! to `<objects>`: in the volume, or in the journal for a file the guest
+//! still writes after removing it. The log, and the removed files, may each
+//! hold as much as the object's quota.
 
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{ErrorKind, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -31,6 +32,8 @@ use std::time::Instant;
 use crate::object::ObjShared;
 
 const LOG: &str = "log";
+/// Overwritten bytes are kept in records of at most this many.
+const CHUNK: u64 = 1 << 20;
 
 enum Undo {
     Size(PathBuf, u64),
@@ -48,18 +51,22 @@ pub struct Journal {
     dir: PathBuf,
     /// Open while the current request has changes.
     log: Option<File>,
-    /// Files whose size is recorded, and everything to sync on commit.
-    sized: HashSet<PathBuf>,
+    /// Files (by inode) whose size is recorded, and what to sync on commit.
+    sized: HashSet<u64>,
     touched: HashSet<PathBuf>,
     slots: u64,
+    /// Bytes the log holds, and the removed files; each may reach `max`.
+    held: (u64, u64),
+    max: u64,
     /// Waits for the disk aren't charged to its CPU budget.
     obj: Arc<ObjShared>,
 }
 
 impl Journal {
-    /// The journal of `volume`, after rolling back what a previous instance
-    /// left uncommitted.
-    pub fn open(volume: &Path, obj: Arc<ObjShared>) -> std::io::Result<Journal> {
+    /// The journal of `volume` (an absolute path without symlinks), whose
+    /// log and removed files may each hold `max` bytes, after rolling back
+    /// what a previous instance left uncommitted.
+    pub fn open(volume: &Path, max: u64, obj: Arc<ObjShared>) -> std::io::Result<Journal> {
         let base = volume.parent().expect("a volume has a parent").to_path_buf();
         let dir = base.join("~journal").join(volume.file_name().expect("a volume has a name"));
         recover(&base, &dir)?;
@@ -71,14 +78,16 @@ impl Journal {
             sized: HashSet::new(),
             touched: HashSet::new(),
             slots: 0,
+            held: (0, 0),
+            max,
             obj,
         })
     }
 
-    /// `path` relative to the base, if it is in the volume or the journal.
-    /// No symlink can exist there, so resolving `..` by hand is exact.
+    /// The guest path `path`, if it is in the volume, without `..`. Nothing
+    /// there is a symlink, so resolving `..` by hand is exact.
     pub fn local(&self, path: &Path) -> Option<PathBuf> {
-        let mut out = PathBuf::new();
+        let mut out = PathBuf::from("/");
         for c in path.components() {
             match c {
                 Component::ParentDir => _ = out.pop(),
@@ -86,96 +95,129 @@ impl Journal {
                 _ => {}
             }
         }
-        let out = Path::new("/").join(out);
-        let inside = out.starts_with(&self.volume) || out.starts_with(&self.dir);
-        inside.then(|| out.strip_prefix(&self.base).expect("inside the base").to_path_buf())
+        out.starts_with(&self.volume).then_some(out)
     }
 
-    /// The path, relative to the base, of the file behind `file`.
-    pub fn local_file(&self, file: &File) -> Option<PathBuf> {
-        self.local(&fd_path(file)?)
+    /// The guest path `path` under the directory `dir`, if in the volume.
+    pub fn local_at(&self, dir: &File, path: &str) -> Option<PathBuf> {
+        (dir.metadata().ok()?.nlink() > 0).then_some(())?;
+        self.local(&fd_path(dir)?.join(path))
     }
 
-    pub fn abs(&self, p: &Path) -> PathBuf {
-        self.base.join(p)
+    /// Where `file` is, relative to the base, if in the volume or (removed
+    /// while open) the journal.
+    fn local_file(&self, file: &File) -> Option<PathBuf> {
+        if file.metadata().ok()?.nlink() == 0 {
+            return None;
+        }
+        let p = fd_path(file)?;
+        (p.starts_with(&self.volume) || p.starts_with(&self.dir)).then(|| self.rel(&p))
+    }
+
+    fn rel(&self, abs: &Path) -> PathBuf {
+        abs.strip_prefix(&self.base).expect("inside the base").to_path_buf()
+    }
+
+    /// Counts `log` bytes more logged and `removed` more removed, or refuses
+    /// as a full disk.
+    fn charge(&mut self, log: u64, removed: u64) -> std::io::Result<()> {
+        let held = (self.held.0 + log, self.held.1 + removed);
+        if held.0 > self.max || held.1 > self.max {
+            return Err(ErrorKind::StorageFull.into());
+        }
+        self.held = held;
+        Ok(())
     }
 
     /// Appends `undo` and syncs it, before the change it undoes is made.
     fn record(&mut self, undo: Undo) -> std::io::Result<()> {
+        let rec = encode(&undo);
+        self.charge(rec.len() as u64, 0)?;
+        let t0 = Instant::now();
         if self.log.is_none() {
+            // The directories the log is first made in must be durable too.
             std::fs::create_dir_all(&self.dir)?;
             let log = File::options().create(true).append(true).open(self.dir.join(LOG))?;
-            sync(&self.dir)?;
+            for d in [&self.dir, self.dir.parent().expect("in ~journal"), &self.base] {
+                sync(d)?;
+            }
             self.log = Some(log);
         }
         let log = self.log.as_mut().expect("opened above");
-        log.write_all(&encode(&undo))?;
-        let t0 = Instant::now();
+        log.write_all(&rec)?;
         log.sync_data()?;
         self.obj.uncharge(t0.elapsed());
         Ok(())
     }
 
-    /// Before `file` (at `p`) is written over `[at, end)`: its size, the first
-    /// time, and the bytes the write replaces. The bytes the log holds.
-    pub fn writing(&mut self, p: &Path, file: &File, at: u64, end: u64) -> std::io::Result<u64> {
-        let len = file.metadata()?.len();
-        if self.sized.insert(p.to_path_buf()) {
-            self.record(Undo::Size(p.to_path_buf(), len))?;
-            self.touched.insert(p.to_path_buf());
+    /// Before `file` is written over `[at, end)`, if it is in the volume:
+    /// its size, the first time, and the bytes the write replaces.
+    pub fn writing(&mut self, file: &File, at: u64, end: u64) -> std::io::Result<()> {
+        let Some(p) = self.local_file(file) else { return Ok(()) };
+        let md = file.metadata()?;
+        if self.sized.insert(md.ino()) {
+            self.record(Undo::Size(p.clone(), md.len()))?;
+            self.touched.insert(p.clone());
         }
-        let end = end.min(len);
-        if at >= end {
-            return Ok(0);
+        let (mut at, end) = (at, end.min(md.len()));
+        while at < end {
+            let mut old = vec![0; (end - at).min(CHUNK) as usize];
+            file.read_exact_at(&mut old, at)?;
+            let n = old.len() as u64;
+            self.record(Undo::Bytes(p.clone(), at, old))?;
+            at += n;
         }
-        let mut old = vec![0; (end - at) as usize];
-        file.read_exact_at(&mut old, at)?;
-        let n = old.len() as u64;
-        self.record(Undo::Bytes(p.to_path_buf(), at, old))?;
-        Ok(n)
-    }
-
-    /// Before the entry `p` is created.
-    pub fn creating(&mut self, p: &Path) -> std::io::Result<()> {
-        self.record(Undo::Created(p.to_path_buf()))?;
-        self.touched.insert(p.to_path_buf());
-        self.touch_parent(p);
         Ok(())
     }
 
-    /// Before the empty directory `p` is removed.
-    pub fn removing_dir(&mut self, p: &Path) -> std::io::Result<()> {
-        self.record(Undo::RemovedDir(p.to_path_buf()))?;
-        self.touch_parent(p);
+    /// Before the entry at `path` is created, if nothing is there yet.
+    pub fn creating(&mut self, path: &Path) -> std::io::Result<()> {
+        let path: PathBuf = path.components().collect();
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Ok(());
+        }
+        let p = self.rel(&path);
+        self.record(Undo::Created(p.clone()))?;
+        self.touched.insert(p.clone());
+        self.touch_parent(&p);
         Ok(())
     }
 
-    /// Removes the entry `p` by moving it into the journal.
-    pub fn remove(&mut self, p: &Path) -> std::io::Result<()> {
+    /// Before the empty directory at `path` is removed.
+    pub fn removing_dir(&mut self, path: &Path) -> std::io::Result<()> {
+        let p = self.rel(path);
+        self.record(Undo::RemovedDir(p.clone()))?;
+        self.touch_parent(&p);
+        Ok(())
+    }
+
+    /// Removes the file at `path`, of `bytes`, by moving it into the
+    /// journal: where it now is.
+    pub fn remove(&mut self, path: &Path, bytes: u64) -> std::io::Result<PathBuf> {
+        self.charge(0, bytes)?;
         self.slots += 1;
-        let slot = self.local(&self.dir.join(self.slots.to_string())).expect("the journal is local");
-        self.record(Undo::Renamed(p.to_path_buf(), slot.clone()))?;
-        std::fs::rename(self.abs(p), self.abs(&slot))?;
-        self.touch_parent(p);
-        Ok(())
+        let slot = self.dir.join(self.slots.to_string());
+        let p = self.rel(path);
+        self.record(Undo::Renamed(p.clone(), self.rel(&slot)))?;
+        std::fs::rename(path, &slot)?;
+        self.touch_parent(&p);
+        Ok(slot)
     }
 
-    /// Renames `from` to `to`, moving whatever `to` held into the journal.
-    pub fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
-        if std::fs::symlink_metadata(self.abs(to)).is_ok() {
-            self.remove(to)?;
-        }
-        self.record(Undo::Renamed(from.to_path_buf(), to.to_path_buf()))?;
-        std::fs::rename(self.abs(from), self.abs(to))?;
-        // What is to be synced moved with it.
-        let moved = |p: PathBuf| match p.strip_prefix(from) {
-            Ok(rest) if rest.as_os_str().is_empty() => to.to_path_buf(),
+    /// Before `from` is renamed to `to`, where nothing is or an empty
+    /// directory (removed with [`Self::removing_dir`]) is.
+    pub fn renaming(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        let (from, to) = (self.rel(from), self.rel(to));
+        self.record(Undo::Renamed(from.clone(), to.clone()))?;
+        // What is to be synced moves with it.
+        let moved = |p: PathBuf| match p.strip_prefix(&from) {
+            Ok(rest) if rest.as_os_str().is_empty() => to.clone(),
             Ok(rest) => to.join(rest),
             Err(_) => p,
         };
         self.touched = self.touched.drain().map(moved).collect();
-        self.touch_parent(from);
-        self.touch_parent(to);
+        self.touch_parent(&from);
+        self.touch_parent(&to);
         Ok(())
     }
 
@@ -183,10 +225,9 @@ impl Journal {
         self.touched.insert(p.parent().unwrap_or(Path::new("")).to_path_buf());
     }
 
-    /// Makes the request's changes durable and forgets how to undo them:
-    /// whether there were any.
-    pub fn commit(&mut self) -> std::io::Result<bool> {
-        let Some(log) = self.log.take() else { return Ok(false) };
+    /// Makes the request's changes durable and forgets how to undo them.
+    pub fn commit(&mut self) -> std::io::Result<()> {
+        let Some(log) = self.log.take() else { return Ok(()) };
         let t0 = Instant::now();
         for p in self.touched.drain() {
             sync_if_there(&self.base.join(p))?;
@@ -198,11 +239,14 @@ impl Journal {
         self.obj.uncharge(t0.elapsed());
         clear(&self.dir)?;
         self.sized.clear();
-        Ok(true)
+        self.held = (0, 0);
+        Ok(())
     }
 }
 
-/// Rolls back the log in `dir` if there is one, then empties `dir`.
+/// Rolls back the log in `dir` if there is one, then empties `dir`. An undo
+/// that can't be applied is skipped rather than leave the object unable to
+/// start.
 fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
     let log = match std::fs::read(dir.join(LOG)) {
         Ok(log) => log,
@@ -215,23 +259,18 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
     let file = File::options().write(true).open(dir.join(LOG))?;
     for (at, undo) in decode(&log).into_iter().rev() {
         let abs = |p: &PathBuf| base.join(p);
-        let gone = |r: std::io::Result<()>| match r {
-            Err(e) if e.kind() != ErrorKind::NotFound && e.kind() != ErrorKind::AlreadyExists => Err(e),
-            _ => Ok(()),
+        let open = |p: &PathBuf| File::options().write(true).open(abs(p));
+        let _ = match &undo {
+            Undo::Size(p, n) => open(p).and_then(|f| f.set_len(*n)),
+            Undo::Bytes(p, at, data) => open(p).and_then(|f| f.write_all_at(data, *at)),
+            Undo::Created(p) => std::fs::remove_file(abs(p)).or_else(|_| std::fs::remove_dir(abs(p))),
+            Undo::RemovedDir(p) => std::fs::create_dir(abs(p)),
+            Undo::Renamed(from, to) if !abs(from).exists() => std::fs::rename(abs(to), abs(from)),
+            Undo::Renamed(..) => Ok(()),
         };
-        match &undo {
-            Undo::Size(p, n) => gone(File::options().write(true).open(abs(p)).and_then(|f| f.set_len(*n)))?,
-            Undo::Bytes(p, at, data) => gone(File::options().write(true).open(abs(p)).and_then(|f| f.write_all_at(data, *at)))?,
-            Undo::Created(p) => gone(std::fs::remove_file(abs(p)).or_else(|_| std::fs::remove_dir(abs(p))))?,
-            Undo::RemovedDir(p) => gone(std::fs::create_dir(abs(p)))?,
-            Undo::Renamed(from, to) if !abs(from).exists() => gone(std::fs::rename(abs(to), abs(from)))?,
-            Undo::Renamed(..) => {}
-        }
         let p = match &undo {
             Undo::Size(p, _) | Undo::Bytes(p, ..) => p.as_path(),
-            Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => {
-                p.parent().unwrap_or(Path::new(""))
-            }
+            Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
         };
         sync_if_there(&base.join(p))?;
         #[cfg(test)]
@@ -328,7 +367,7 @@ fn sync_if_there(p: &Path) -> std::io::Result<()> {
 }
 
 /// Where the file behind `file` is now.
-pub fn fd_path(file: &File) -> Option<PathBuf> {
+fn fd_path(file: &File) -> Option<PathBuf> {
     use std::os::fd::AsRawFd;
     #[cfg(target_os = "linux")]
     return std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok();
@@ -362,7 +401,7 @@ mod tests {
         std::fs::write(v.join("a"), "hello world").unwrap();
         std::fs::write(v.join("d/b"), "bee").unwrap();
         std::fs::write(v.join("f"), "ff").unwrap();
-        v
+        v.canonicalize().unwrap()
     }
 
     /// Every entry under `v`: a file's contents, or `None` for a directory.
@@ -383,16 +422,30 @@ mod tests {
         out
     }
 
+    fn reopen(v: &Path, max: u64) -> std::io::Result<Journal> {
+        Journal::open(v, max, Arc::new(ObjShared::new("app".into(), "o")))
+    }
+
     fn open(v: &Path) -> Journal {
-        Journal::open(v, Arc::new(ObjShared::new("app".into(), "o"))).unwrap()
+        reopen(v, 1 << 30).unwrap()
     }
 
     /// Writes as the filesystem host does: journal first, then the write.
     fn write(j: &mut Journal, v: &Path, name: &str, at: u64, data: &[u8]) {
         let file = File::options().read(true).write(true).open(v.join(name)).unwrap();
-        let p = j.local_file(&file).unwrap();
-        j.writing(&p, &file, at, at + data.len() as u64).unwrap();
+        j.writing(&file, at, at + data.len() as u64).unwrap();
         file.write_all_at(data, at).unwrap();
+    }
+
+    /// Renames as the filesystem host does: a file in the way goes into the
+    /// journal, then the rename is recorded and made.
+    fn rename(j: &mut Journal, v: &Path, from: &str, to: &str) {
+        let (from, to) = (v.join(from), v.join(to));
+        if let Ok(md) = std::fs::metadata(&to) {
+            j.remove(&to, md.len()).unwrap();
+        }
+        j.renaming(&from, &to).unwrap();
+        std::fs::rename(from, to).unwrap();
     }
 
     thread_local! {
@@ -411,21 +464,19 @@ mod tests {
     /// file and directory, a removed file and directory, and renames, one
     /// over an existing file.
     fn change(j: &mut Journal, v: &Path) {
-        // Paths relative to the base; the volume is `o`.
-        let l = |name: &str| Path::new("o").join(name);
         write(j, v, "a", 6, b"WORLD, again");
         let f = File::options().read(true).write(true).open(v.join("f")).unwrap();
-        j.writing(&l("f"), &f, 0, 2).unwrap();
+        j.writing(&f, 0, 2).unwrap();
         f.set_len(0).unwrap();
-        j.creating(&l("n")).unwrap();
+        j.creating(&v.join("n")).unwrap();
         std::fs::write(v.join("n"), "new").unwrap();
-        j.creating(&l("m")).unwrap();
+        j.creating(&v.join("m")).unwrap();
         std::fs::create_dir(v.join("m")).unwrap();
-        j.remove(&l("d/b")).unwrap();
-        j.removing_dir(&l("e")).unwrap();
+        j.remove(&v.join("d/b"), 3).unwrap();
+        j.removing_dir(&v.join("e")).unwrap();
         std::fs::remove_dir(v.join("e")).unwrap();
-        j.rename(&l("a"), &l("d/a2")).unwrap();
-        j.rename(&l("n"), &l("f")).unwrap();
+        rename(j, v, "a", "d/a2");
+        rename(j, v, "n", "f");
     }
 
     /// An uncommitted request is rolled back when the volume is next opened,
@@ -447,8 +498,8 @@ mod tests {
         let mut j = open(&v);
         change(&mut j, &v);
         let after = tree(&v);
-        assert!(j.commit().unwrap());
-        assert!(!j.commit().unwrap(), "nothing left to commit");
+        j.commit().unwrap();
+        assert!(j.log.is_none() && j.held == (0, 0));
         open(&v);
         assert_eq!(tree(&v), after);
         assert_eq!(std::fs::read(v.join("d/a2")).unwrap(), b"hello WORLD, again");
@@ -469,7 +520,7 @@ mod tests {
             log.write_all(&encode(&Undo::Created(PathBuf::from("o/a")))[..9]).unwrap();
             drop(j);
             CRASH_AFTER.with(|c| c.set(Some(after)));
-            let crashed = Journal::open(&v, Arc::new(ObjShared::new("app".into(), "o"))).is_err();
+            let crashed = reopen(&v, 1 << 30).is_err();
             CRASH_AFTER.with(|c| c.set(None));
             open(&v);
             assert_eq!(tree(&v), before, "crashed after {after} undos: {crashed}");
@@ -484,24 +535,75 @@ mod tests {
         let before = tree(&v);
         let mut j = open(&v);
         let file = File::options().read(true).write(true).open(v.join("a")).unwrap();
-        j.remove(&j.local(&v.join("a")).unwrap()).unwrap();
+        j.remove(&v.join("a"), 11).unwrap();
         let p = j.local_file(&file).expect("the journal is local");
         assert!(p.starts_with("~journal"), "{p:?}");
-        j.writing(&p, &file, 0, 5).unwrap();
+        j.writing(&file, 0, 5).unwrap();
         file.write_all_at(b"HELLO", 0).unwrap();
         drop(j);
         open(&v);
         assert_eq!(tree(&v), before);
     }
 
-    /// Only the volume and its journal are journaled, and `..` can't leave.
+    /// A guest path is the volume's only if it is inside it after `..`: its
+    /// journal and everything else are out of reach.
     #[test]
     fn only_the_volume_is_local() {
         let v = volume();
         let j = open(&v);
-        assert_eq!(j.local(&v.join("d/../a")), Some(PathBuf::from("o/a")));
+        assert_eq!(j.local(&v.join("d/../a")), Some(v.join("a")));
+        assert_eq!(j.local(&v.join("../~journal/o/log")), None);
         assert_eq!(j.local(&v.join("../other/x")), None);
         assert_eq!(j.local(&v.join("../../../etc/passwd")), None);
         assert_eq!(j.local(Path::new("/tmp/x")), None);
+    }
+
+    /// Creating what already exists records nothing: a failed `mkdir` on a
+    /// directory, or a file named with a trailing `/`, can't make a rollback
+    /// delete what was there, or make recovery fail.
+    #[test]
+    fn creating_what_exists_is_not_undone() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        for p in ["d", "a/", "", "e"] {
+            j.creating(&v.join(p)).unwrap();
+        }
+        assert!(j.log.is_none());
+        drop(j);
+        open(&v);
+        assert_eq!(tree(&v), before);
+    }
+
+    /// A file's size is recorded once per file, not per path: writing one
+    /// file, then renaming another onto its path and extending that, rolls
+    /// both back.
+    #[test]
+    fn sizes_follow_files_not_paths() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        write(&mut j, &v, "a", 0, b"A");
+        rename(&mut j, &v, "a", "b");
+        rename(&mut j, &v, "f", "a");
+        write(&mut j, &v, "a", 2, b"23456789");
+        drop(j);
+        open(&v);
+        assert_eq!(tree(&v), before);
+    }
+
+    /// What the journal holds is bounded: past it, a change is refused as a
+    /// full disk, before it is made.
+    #[test]
+    fn the_journal_is_bounded() {
+        let v = volume();
+        let mut j = reopen(&v, 250).unwrap();
+        let a = File::options().read(true).write(true).open(v.join("a")).unwrap();
+        for _ in 0..3 {
+            j.writing(&a, 0, 11).unwrap();
+        }
+        assert_eq!(j.writing(&a, 0, 11).unwrap_err().kind(), ErrorKind::StorageFull);
+        assert_eq!(j.remove(&v.join("f"), 1 << 20).unwrap_err().kind(), ErrorKind::StorageFull);
+        assert!(v.join("f").exists());
     }
 }

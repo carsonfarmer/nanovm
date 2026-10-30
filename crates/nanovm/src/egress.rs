@@ -206,6 +206,8 @@ async fn hold(
     let status = match http_body_util::Limited::new(body, max).collect().await.map(|b| b.to_bytes()) {
         Err(_) => 413,
         Ok(body) if !crate::ws::well_formed(&body) => 400,
+        // What a request holds is bounded like one publish.
+        Ok(body) if held.lock().iter().map(|r| r.body().len()).sum::<usize>() + body.len() > max => 413,
         Ok(body) => {
             parts.headers.insert(crate::ws::OBJECT_HEADER, obj.id.parse().expect("object ids are header-safe"));
             held.lock().push(http::Request::from_parts(parts, body));

@@ -32,7 +32,7 @@ use wasmtime_wasi::p3::filesystem::{FilesystemError, FilesystemResult};
 use wasmtime_wasi::{FsPerms, OpenMode};
 
 use crate::config::Limits;
-use crate::journal::{Journal, fd_path};
+use crate::journal::Journal;
 use crate::metrics::Metrics;
 use crate::object::{ObjShared, ObjState};
 
@@ -58,11 +58,11 @@ struct Inner {
     max_files: u64,
     bytes: u64,
     files: u64,
+    /// What the current request changed in the volume, to commit or roll
+    /// back. Its log and removed files may each hold as much as the volume,
+    /// so an object's disk use is at most three times its quota while a
+    /// request runs.
     journal: Journal,
-    /// Bytes and entries the journal holds for the current request (backups
-    /// and removed files). It may hold as much as the volume may, so an
-    /// object's disk use is at most twice its quota while a request runs.
-    held: (u64, u64),
     denials: u64,
     metrics: Arc<Metrics>,
     obj: Arc<ObjShared>,
@@ -73,7 +73,7 @@ impl QuotaGuard {
     /// persistent volume starts each instance with its real usage.
     pub fn new(volume: &Path, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>) -> std::io::Result<Self> {
         // First, so a failed request or a crash is undone before it's counted.
-        let journal = Journal::open(volume, obj.clone())?;
+        let journal = Journal::open(volume, limits.disk_mb << 20, obj.clone())?;
         let (mut bytes, mut files) = (0, 0);
         let mut stack = vec![volume.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -93,7 +93,6 @@ impl QuotaGuard {
             bytes,
             files,
             journal,
-            held: (0, 0),
             denials: 0,
             metrics,
             obj,
@@ -113,10 +112,7 @@ impl QuotaGuard {
         if allowed_end <= at && !buf.is_empty() {
             return Err(q.full());
         }
-        if let Some(p) = q.journal.local_file(file) {
-            let saved = q.journal.writing(&p, file, at, allowed_end).map_err(|_| ErrorCode::Io)?;
-            q.hold(saved, 0)?;
-        }
+        q.journaled(|j| j.writing(file, at, allowed_end))?;
         let n = file
             .write_at(&buf[..(allowed_end - at) as usize], at)
             .map_err(|_| ErrorCode::Io)?;
@@ -131,10 +127,7 @@ impl QuotaGuard {
         if size > room {
             return Err(q.full());
         }
-        if let Some(p) = q.journal.local_file(file) {
-            let saved = q.journal.writing(&p, file, size, before).map_err(|_| ErrorCode::Io)?;
-            q.hold(saved, 0)?;
-        }
+        q.journaled(|j| j.writing(file, size, before))?;
         file.set_len(size).map_err(|_| ErrorCode::Io)?;
         q.bytes = (q.bytes + size).saturating_sub(before);
         Ok(())
@@ -170,28 +163,23 @@ impl QuotaGuard {
         self.0.lock().deny(code, what.to_string()).into()
     }
 
-    /// Runs `f` on the journal; an I/O error is the guest's `io`.
     pub fn journal<T>(&self, f: impl FnOnce(&mut Journal) -> std::io::Result<T>) -> Result<T, ErrorCode> {
-        f(&mut self.0.lock().journal).map_err(|_| ErrorCode::Io)
+        self.0.lock().journaled(f)
     }
 
-    /// Removes the volume's file `p` of `bytes` into the journal, which holds
-    /// it until the request commits.
-    pub fn remove(&self, p: &Path, bytes: u64) -> Result<(), ErrorCode> {
+    /// Removes the volume's file at `path`, of `bytes`, into the journal:
+    /// where it now is.
+    pub fn remove(&self, path: &Path, bytes: u64) -> Result<std::path::PathBuf, ErrorCode> {
         let mut q = self.0.lock();
-        q.hold(bytes, 1)?;
-        q.journal.remove(p).map_err(|_| ErrorCode::Io)?;
+        let slot = q.journaled(|j| j.remove(path, bytes))?;
         q.bytes = q.bytes.saturating_sub(bytes);
         q.files = q.files.saturating_sub(1);
-        Ok(())
+        Ok(slot)
     }
 
-    /// Makes the current request's changes durable; whether it had any.
-    pub fn commit(&self) -> std::io::Result<bool> {
-        let mut q = self.0.lock();
-        let committed = q.journal.commit()?;
-        q.held = (0, 0);
-        Ok(committed)
+    /// Makes the current request's changes durable.
+    pub fn commit(&self) -> std::io::Result<()> {
+        self.0.lock().journal.commit()
     }
 
     pub fn adjust(&self, bytes: i64, files: i64) {
@@ -209,14 +197,13 @@ impl QuotaGuard {
 }
 
 impl Inner {
-    /// Counts what the journal holds for the current request.
-    fn hold(&mut self, bytes: u64, files: u64) -> Result<(), ErrorCode> {
-        if self.held.0 + bytes > self.max_bytes || self.held.1 + files > self.max_files {
-            return Err(self.full());
-        }
-        self.held.0 += bytes;
-        self.held.1 += files;
-        Ok(())
+    /// Runs `f` on the journal: a full journal is a full disk to the guest,
+    /// and anything else an I/O error.
+    fn journaled<T>(&mut self, f: impl FnOnce(&mut Journal) -> std::io::Result<T>) -> Result<T, ErrorCode> {
+        f(&mut self.journal).map_err(|e| match e.kind() {
+            std::io::ErrorKind::StorageFull => self.full(),
+            _ => ErrorCode::Io,
+        })
     }
 
     fn full(&mut self) -> ErrorCode {
@@ -277,14 +264,13 @@ async fn entry_size(inner: &Accessor<ObjState, WasiFilesystem>, fd: &Resource<De
     })
 }
 
-/// The journal's name for `path` under the directory `fd`, if that is in
-/// the object's volume.
+/// Where `path` under the directory `fd` is, if in the object's volume.
 fn local(a: &Accessor<ObjState, QuotaFs>, fd: &Resource<Descriptor>, path: &str) -> Option<std::path::PathBuf> {
     a.with(|mut s| {
         let s = s.data_mut();
         let Ok(Descriptor::Dir(d)) = s.filesystem().table.get(fd) else { return None };
-        let dir = fd_path(&d.dir)?;
-        s.quota.0.lock().journal.local(&dir.join(path))
+        let dir = d.dir.clone();
+        s.quota.0.lock().journal.local_at(&dir, path)
     })
 }
 
@@ -398,26 +384,6 @@ impl StreamConsumer<ObjState> for QuotaWriter {
     }
 }
 
-/// What `rename` would refuse, refused before the journal moves the target
-/// aside.
-fn check_rename(quota: &QuotaGuard, from: &Path, to: &Path) -> Result<(), ErrorCode> {
-    let q = quota.0.lock();
-    let src = std::fs::symlink_metadata(q.journal.abs(from)).map_err(|_| ErrorCode::NoEntry)?;
-    let dst = std::fs::symlink_metadata(q.journal.abs(to));
-    if src.is_dir() && to.starts_with(from) && to != from {
-        return Err(ErrorCode::Invalid);
-    }
-    match dst {
-        Err(_) => Ok(()),
-        Ok(d) if d.is_dir() && !src.is_dir() => Err(ErrorCode::IsDirectory),
-        Ok(d) if !d.is_dir() && src.is_dir() => Err(ErrorCode::NotDirectory),
-        Ok(d) if d.is_dir() && std::fs::read_dir(q.journal.abs(to)).is_ok_and(|mut e| e.next().is_some()) => {
-            Err(ErrorCode::NotEmpty)
-        }
-        Ok(_) => Ok(()),
-    }
-}
-
 /// Methods that need no quota check: forwarded to the stock implementation.
 macro_rules! delegate {
     ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
@@ -520,37 +486,36 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         fd: Resource<Descriptor>,
         path_flags: PathFlags,
         path: String,
-        open_flags: OpenFlags,
+        mut open_flags: OpenFlags,
         flags: DescriptorFlags,
     ) -> FilesystemResult<Resource<Descriptor>> {
         let (inner, quota) = (stock(store), guard(store));
+        let local = local(store, &fd, &path);
+        // In the volume, a truncation is made a `set_size` the journal sees.
+        let truncate = local.is_some() && open_flags.contains(OpenFlags::TRUNCATE);
         let (mut created, mut freed) = (false, 0);
         if open_flags.intersects(OpenFlags::CREATE | OpenFlags::TRUNCATE) {
-            let local = local(store, &fd, &path);
             match entry_size(&inner, &fd, &path).await {
-                Some(size) if open_flags.contains(OpenFlags::TRUNCATE) => {
-                    freed = size;
-                    // What the truncation destroys is kept first.
-                    if let Some(p) = local.filter(|_| size > 0) {
-                        let mut q = quota.0.lock();
-                        let file = std::fs::File::open(q.journal.abs(&p)).map_err(|_| ErrorCode::Io)?;
-                        let saved = q.journal.writing(&p, &file, 0, size).map_err(|_| ErrorCode::Io)?;
-                        q.hold(saved, 0)?;
-                    }
-                }
+                Some(size) if open_flags.contains(OpenFlags::TRUNCATE) && !truncate => freed = size,
                 Some(_) => {}
                 None if open_flags.contains(OpenFlags::CREATE) => {
                     quota.check_new_entry()?;
-                    if let Some(p) = local {
-                        quota.journal(|j| j.creating(&p))?;
+                    if let Some(p) = &local {
+                        quota.journal(|j| j.creating(p))?;
                     }
                     created = true;
                 }
                 None => {}
             }
         }
+        if truncate {
+            open_flags &= !OpenFlags::TRUNCATE;
+        }
         let new = WasiFilesystem::open_at(&inner, fd, path_flags, path, open_flags, flags).await?;
         quota.adjust(-(freed as i64), created as i64);
+        if truncate && let Some((quota, file)) = store.with(|mut s| writable_file(s.data_mut(), &new)) {
+            quota.set_size(&file, 0)?;
+        }
         Ok(new)
     }
 
@@ -562,39 +527,56 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         new_path: String,
     ) -> FilesystemResult<()> {
         let (inner, quota) = (stock(store), guard(store));
-        // Renaming over an existing entry frees it, unless both paths name the
-        // same file: POSIX makes that a no-op, and crediting it would let a
-        // guest zero its usage by renaming a file onto itself.
-        let id = async |fd: &Resource<Descriptor>, path: &str| {
-            let h = WasiFilesystem::metadata_hash_at(&inner, dup(fd), PathFlags::empty(), path.to_string()).await;
-            h.ok().map(|h| (h.lower, h.upper))
-        };
-        let replaced = match id(&new_fd, &new_path).await {
-            Some(target) if id(&fd, &old_path).await != Some(target) => entry_size(&inner, &new_fd, &new_path).await,
-            _ => None,
-        };
         match (local(store, &fd, &old_path), local(store, &new_fd, &new_path)) {
-            // Within the volume, the journal renames, keeping what it replaces.
             // POSIX makes renaming a file onto itself a no-op.
-            (Some(from), Some(to)) if from == to => return Ok(()),
+            (Some(from), Some(to)) if from == to => Ok(()),
+            // The journal keeps what the rename replaces; the stock rename
+            // makes it, with its own checks.
             (Some(from), Some(to)) => {
-                check_rename(&quota, &from, &to)?;
-                if let Some(bytes) = replaced {
-                    quota.0.lock().hold(bytes, 1)?;
-                    quota.adjust(-(bytes as i64), -1);
+                let src = std::fs::symlink_metadata(&from).map_err(|_| ErrorCode::NoEntry)?;
+                let (mut file, mut dir) = (None, false);
+                match std::fs::symlink_metadata(&to) {
+                    Ok(d) if d.is_file() && src.is_dir() => return Err(ErrorCode::NotDirectory.into()),
+                    Ok(d) if d.is_file() => file = Some((quota.remove(&to, d.len())?, d.len())),
+                    Ok(_) => dir = quota.journal(|j| j.removing_dir(&to)).is_ok(),
+                    Err(_) => {}
                 }
-                quota.journal(|j| j.rename(&from, &to))?;
-                return Ok(());
+                quota.journal(|j| j.renaming(&from, &to))?;
+                if let Err(e) = WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await {
+                    // Nothing was replaced after all.
+                    if let Some((slot, bytes)) = file {
+                        let _ = std::fs::rename(slot, &to);
+                        quota.adjust(bytes as i64, 1);
+                    }
+                    return Err(e);
+                }
+                quota.adjust(0, -(dir as i64));
+                Ok(())
             }
             // `/data` and `/tmp` are separate filesystems to the guest.
-            (Some(_), None) | (None, Some(_)) => return Err(ErrorCode::CrossDevice.into()),
-            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => Err(ErrorCode::CrossDevice.into()),
+            (None, None) => {
+                // Renaming over an existing entry frees it, unless both paths
+                // name the same file: POSIX makes that a no-op, and crediting
+                // it would let a guest zero its usage by renaming a file onto
+                // itself.
+                let id = async |fd: &Resource<Descriptor>, path: &str| {
+                    let h = WasiFilesystem::metadata_hash_at(&inner, dup(fd), PathFlags::empty(), path.to_string());
+                    h.await.ok().map(|h| (h.lower, h.upper))
+                };
+                let replaced = match id(&new_fd, &new_path).await {
+                    Some(target) if id(&fd, &old_path).await != Some(target) => {
+                        entry_size(&inner, &new_fd, &new_path).await
+                    }
+                    _ => None,
+                };
+                WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await?;
+                if let Some(bytes) = replaced {
+                    quota.adjust(-(bytes as i64), -1);
+                }
+                Ok(())
+            }
         }
-        WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await?;
-        if let Some(bytes) = replaced {
-            quota.adjust(-(bytes as i64), -1);
-        }
-        Ok(())
     }
 
     async fn unlink_file_at(
@@ -603,13 +585,14 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         path: String,
     ) -> FilesystemResult<()> {
         let (inner, quota) = (stock(store), guard(store));
-        let size = entry_size(&inner, &fd, &path).await.unwrap_or(0);
-        if let Some(p) = local(store, &fd, &path) {
-            let md = std::fs::symlink_metadata(quota.0.lock().journal.abs(&p));
-            if md.is_ok_and(|m| m.is_file()) {
-                return Ok(quota.remove(&p, size)?);
-            }
+        if let Some(p) = local(store, &fd, &path)
+            && let Ok(md) = std::fs::symlink_metadata(&p)
+            && md.is_file()
+        {
+            quota.remove(&p, md.len())?;
+            return Ok(());
         }
+        let size = entry_size(&inner, &fd, &path).await.unwrap_or(0);
         WasiFilesystem::unlink_file_at(&inner, fd, path).await?;
         quota.adjust(-(size as i64), -1);
         Ok(())

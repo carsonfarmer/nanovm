@@ -2,11 +2,11 @@
 //! bucket `b` is the directory `/data/.kv/b`, and each key one file in it,
 //! named by the key in unpadded base64url so no key can name a path. Values
 //! count against the object's disk budget and keys against its file limit,
-//! like any other file, and are replaced atomically (written beside, then
-//! renamed). An object serves one request at a time, so `increment` and the
-//! batch calls need no locking.
+//! like any other file, and each request's writes commit with it (see
+//! `journal`). An object serves one request at a time, so `increment` and
+//! the batch calls need no locking.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -99,12 +99,6 @@ impl ObjState {
         Ok(Some(std::fs::read(path)?))
     }
 
-    /// The journal's name for `path`, which is in the volume.
-    fn local(&self, path: &Path) -> PathBuf {
-        let local = self.quota.journal(|j| Ok(j.local(path))).ok().flatten();
-        local.expect("a key's path is in the volume")
-    }
-
     fn memory_budget(&self) -> u64 {
         self.limiter.max_bytes as u64
     }
@@ -118,20 +112,15 @@ impl ObjState {
             Ok(_) => return fail("the key's file is not a regular file"),
             Err(_) => None,
         };
-        // The old value goes into the request's journal, the new one is
-        // written in its place; the request's commit makes it durable.
-        let p = self.local(&path);
+        // The old value goes into the request's journal and the new one is
+        // written in its place; the request's commit makes it durable. A
+        // write that fails traps, so the request rolls back.
+        self.quota.reserve(old, value.len() as u64)?;
         if let Some(old) = old {
-            self.quota.remove(&p, old)?;
+            self.quota.journal(|j| j.remove(&path, old))?;
         }
-        self.quota.reserve(None, value.len() as u64)?;
-        self.quota.journal(|j| j.creating(&p))?;
-        if let Err(e) = std::fs::write(&path, value) {
-            let _ = std::fs::remove_file(&path);
-            self.quota.adjust(-(value.len() as i64), -1);
-            return Err(e.into());
-        }
-        Ok(())
+        self.quota.journal(|j| j.creating(&path))?;
+        std::fs::write(&path, value).map_err(|e| Fail::Trap(e.into()))
     }
 
     fn delete_value(&self, bucket: &Resource<Bucket>, key: &str) -> Result<(), Fail> {
@@ -139,7 +128,7 @@ impl ObjState {
         if let Ok(md) = std::fs::symlink_metadata(&path)
             && md.is_file()
         {
-            self.quota.remove(&self.local(&path), md.len())?;
+            self.quota.remove(&path, md.len())?;
         }
         Ok(())
     }
@@ -155,8 +144,7 @@ impl ObjState {
             dir.push(part);
             if !dir.exists() {
                 self.quota.check_new_entry()?;
-                let p = self.local(&dir);
-                self.quota.journal(|j| j.creating(&p))?;
+                self.quota.journal(|j| j.creating(&dir))?;
                 std::fs::create_dir(&dir)?;
                 self.quota.adjust(0, 1);
             }
@@ -397,6 +385,9 @@ mod tests {
         assert!(why(s.set_value(&b, "big", &vec![0; (1 << 20) + 1])).contains("InsufficientSpace"));
         assert_eq!(get(&s, &b, "big"), None);
         ok(s.set_value(&b, "a", &vec![0; 1 << 20]));
+        // A replacement refused for space leaves the value it would replace.
+        assert!(why(s.set_value(&b, "a", &vec![1; (1 << 20) + 1])).contains("InsufficientSpace"));
+        assert_eq!(get(&s, &b, "a"), Some(vec![0; 1 << 20]));
         assert!(why(s.set_value(&b, "b", b"")).contains("Quota"));
         ok(s.set_value(&b, "a", b"small"));
         assert_eq!(s.quota.usage(), (5, 3));

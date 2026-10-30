@@ -246,6 +246,8 @@ pub struct ObjState {
     /// The host directory behind `/data`.
     pub(crate) volume: std::path::PathBuf,
     pub(crate) config: Arc<wasmtime_wasi_config::WasiConfigVariables>,
+    /// A request failed: the instance ends, and its restart rolls back.
+    reset: bool,
     _tmp: TmpDir,
 }
 
@@ -281,6 +283,8 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
     let data_dir = objects.join(&*shared.id);
     let tmp_dir = tmp.join(format!("{}.{n}", shared.id));
     std::fs::create_dir_all(&data_dir)?;
+    // The journal compares it with where open files really are.
+    let data_dir = data_dir.canonicalize()?;
     std::fs::create_dir_all(&tmp_dir)?;
     let tmp = TmpDir(tmp_dir.clone());
 
@@ -331,6 +335,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         quota,
         volume: data_dir.clone(),
         config: app.config.clone(),
+        reset: false,
         _tmp: tmp,
     };
 
@@ -373,20 +378,9 @@ enum Exit {
     Poisoned(Poison, String),
 }
 
-/// Ends an instance whose request failed.
-#[derive(Debug)]
-struct RolledBack;
-
-impl std::fmt::Display for RolledBack {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("the request failed, so its changes are rolled back")
-    }
-}
-
-impl std::error::Error for RolledBack {}
-
-/// Makes the request's changes durable, then sends what it published.
-async fn commit(acc: &Accessor<ObjState>) -> anyhow::Result<()> {
+/// Makes the request's changes durable, then sends what it published (the
+/// changes stand whether or not a publish gets through).
+async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
     let (quota, held, route) = acc.with(|mut s| {
         let s = s.data_mut();
         (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
@@ -394,8 +388,9 @@ async fn commit(acc: &Accessor<ObjState>) -> anyhow::Result<()> {
     quota.commit()?;
     if let crate::egress::Route::Supervisor(up) = route {
         for req in held {
-            let res = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await?;
-            res.into_body().collect().await?;
+            if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
+                let _ = res.into_body().collect().await;
+            }
         }
     }
     Ok(())
@@ -433,7 +428,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                 match serve(&node, &app, &shared, store, svc, &mut rx).await {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
-                    Exit::Reset => node.metrics.event("rolled-back", &app.name, &shared.id, RolledBack.to_string()),
+                    Exit::Reset => node.metrics.event("rolled-back", &app.name, &shared.id, "a request failed"),
                     Exit::Poisoned(p, detail) => {
                         node.metrics.poison(p);
                         node.metrics.event(p.as_str(), &app.name, &shared.id, detail);
@@ -491,7 +486,7 @@ async fn serve(
                 let (req, req_io) =
                     acc.with(|mut s| wasmtime_wasi_http::p3::Request::from_http(&mut s.data_mut().hooks, req));
 
-                let (resp, failed) = match svc.handle(acc, req).await? {
+                let (resp, mut failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
                         let res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
                         let res = res.map(|b| {
@@ -514,7 +509,10 @@ async fn serve(
                 let resp = match failed {
                     false => match commit(acc).await {
                         Ok(()) => resp,
-                        Err(e) => error_response(500, "commit-failed", &format!("{e:#}")),
+                        Err(e) => {
+                            failed = true;
+                            error_response(500, "commit-failed", &e.to_string())
+                        }
                     },
                     true => resp,
                 };
@@ -531,7 +529,8 @@ async fn serve(
                 *pending.lock() = None;
                 // What it changed after answering commits now.
                 if failed || commit(acc).await.is_err() {
-                    return Err(RolledBack.into());
+                    acc.with(|mut s| s.data_mut().reset = true);
+                    return Ok(());
                 }
             }
         }
@@ -571,10 +570,10 @@ async fn serve(
     };
 
     let exit = match result {
+        Ok(Ok(())) if store.data().reset => Exit::Reset,
         Ok(Ok(())) => Exit::Closed,
         Err(Phase::Idle) => Exit::Idle,
         Err(phase) => Exit::Poisoned(Poison::Timeout, format!("deadline exceeded while {}", phase.as_str())),
-        Ok(Err(e)) if e.is::<RolledBack>() => Exit::Reset,
         Ok(Err(e)) => classify(&store, &e),
     };
 
@@ -703,6 +702,7 @@ impl ObjState {
             app_dir: None,
             quota: QuotaGuard::new(&volume, limits, metrics, shared).unwrap(),
             config: Default::default(),
+            reset: false,
             _tmp: TmpDir(volume.clone()),
             volume,
         }

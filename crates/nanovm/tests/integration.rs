@@ -1438,7 +1438,8 @@ async fn wasi_config_serves_the_apps_values() {
 async fn a_failed_requests_writes_are_rolled_back() {
     let node = node("a_failed_requests_writes_are_rolled_back", 8, 60_000);
     let read = async || get(&node, "hostile", "c", "/commit").await.json();
-    assert_eq!(get(&node, "hostile", "c", "/commit?v=one").await.status, 200);
+    let r = get(&node, "hostile", "c", "/commit?v=one").await;
+    assert_eq!(r.status, 200, "{}", r.body);
     for then in ["error", "panic", "spin"] {
         let r = get(&node, "hostile", "c", &format!("/commit?v=two-{then}&then={then}")).await;
         assert_eq!(r.status, 500, "{}", r.body);
@@ -1446,6 +1447,26 @@ async fn a_failed_requests_writes_are_rolled_back() {
     }
     assert_eq!(get(&node, "hostile", "c", "/commit?v=three&then=fail").await.status, 507);
     assert_eq!(read().await, serde_json::json!({"file": "three", "key": "three"}));
+}
+
+/// The journal is out of a guest's reach, and commits work with a relative
+/// `data_dir` (the demo's).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_journal_is_out_of_reach_and_works_from_a_relative_data_dir() {
+    let mut cfg = node_cfg("journal_out_of_reach", 8, 60_000, 100);
+    let rel = Path::new("../../target/journal-rel");
+    let _ = std::fs::remove_dir_all(rel);
+    std::fs::create_dir_all(rel).unwrap();
+    std::os::unix::fs::symlink(cfg.data_dir.join("cache"), rel.join("cache")).unwrap();
+    cfg.data_dir = rel.to_path_buf();
+    let node = Node::new(cfg).unwrap();
+    let r = get(&node, "hostile", "c", "/commit?v=one").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = get(&node, "hostile", "c", "/rename?mount=data&from=../~journal/c&to=j").await;
+    assert_eq!(r.status, 507, "{}", r.body);
+    assert_eq!(get(&node, "hostile", "c", "/commit?v=two&then=panic").await.status, 500);
+    let r = get(&node, "hostile", "c", "/commit").await;
+    assert_eq!(r.json(), serde_json::json!({"file": "one", "key": "one"}), "{}", r.body);
 }
 
 /// A request in flight when its worker dies is rolled back when the object
