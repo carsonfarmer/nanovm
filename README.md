@@ -174,7 +174,10 @@ A request's changes to `/data` (files and key-value alike) and what it publishes
 - **Costs:**
   - One fsync per record that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request. Requests that change nothing pay nothing.
   - Fsync time isn't charged to the guest's CPU budget.
-  - The quota counts committed state; the journal may hold as much again while a request runs.
+  - The quota counts committed state. While a request runs, the log and the files it removed may each hold as much again, so an object's disk use peaks at three times its quota. Past that, a change is refused as a full disk.
+- **Safety:**
+  - Guest paths reach only the volume. The journal sits beside it, out of reach.
+  - An undo that can't be applied is skipped rather than leave the object unable to start.
 - **`/tmp` is not journaled.** It is per-instance scratch, deleted with the instance, so it's the fast place for temporary files. A rename between `/tmp` and `/data` fails as cross-device, as between real filesystems.
 
 **Alternatives considered:**
@@ -252,7 +255,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 54 integration tests and 76 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 55 integration tests and 79 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -336,6 +339,14 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
   - Nothing was written to a socket while its event was in flight.
   - A drain that ran out of time left the old worker running beside the new version, so an object could be live in two workers. This dated from phase 3. The drain now kills the old worker at its deadline (`a_drain_that_runs_out_of_time_kills_the_old_worker`).
 - **Debug test builds failed key-value tests on a slower machine.** Host work inside a guest call is charged to the guest's CPU budget, and unoptimized wasmtime copies a guest's `list<u8>` a byte at a time, so 8 MiB of writes took over 100 ms. Test builds are now optimized (`[profile.dev.package]` in `Cargo.toml`); release builds never had the problem.
+- **Commits, from an independent review.** Each fix has a test that fails without it.
+  - A guest could reach its own journal through `..`, plant records, and make recovery delete files outside its volume.
+  - An ordinary `mkdir` on an existing directory recorded "remove this", so a failed request deleted the directory, or bricked the object if it wasn't empty.
+  - A relative `data_dir` (the demo's) silently turned the journal off.
+  - A replaced file's size was recorded per path, so renaming another file onto that path escaped the undo.
+  - A kv write refused for space deleted the old value.
+  - The journal had no bound.
+  - My own crash test also found that replaying a recovery from the start could undo a rename twice and lose a file; recovery now trims each step off the log.
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
 ## Layout

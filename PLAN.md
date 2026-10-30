@@ -325,7 +325,7 @@ As in the target design, with these choices (README, "Apps from a registry", has
 
 README's "Key-value and config" and "WebSockets" describe them.
 
-## Phase 6: per-request commits (on branch `commits`, in review)
+## Phase 6: per-request commits (done)
 
 A request's changes to `/data` (files and key-value) and its WebSocket publishes take effect only if it answers, durably. A failed request is rolled back. README's "Commits" describes the design and the alternatives rejected.
 

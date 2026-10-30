@@ -12,13 +12,13 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
   - phase 4 (`wasi:keyvalue`, `wasi:config`);
   - phase 5 (WebSockets, after two reviews and a reduction pass);
   - 64 unit tests added by an agent, which found two bugs (now fixed).
-- **In progress: branch `commits`** (phase 6, per-request commits, Q37–Q40). It is complete and every test passes. An independent adversarial review is running; fix what holds up, then merge to `main`. README's "Commits" section describes the design.
-- **Next after that: the front proxy** (Q34). The owner said "probably yes"; confirm before starting. Alarms are skipped for now (Q30).
+  - phase 6 (per-request commits, Q37–Q40), after an adversarial review whose findings are fixed. README's "Commits" section describes the design.
+- **Next: the front proxy** (Q34). The owner said "probably yes"; confirm before starting. Alarms are skipped for now (Q30).
 - Every branch is pushed. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
-- **Tests (on `commits`):** 54 integration tests and 76 unit tests pass. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.
+- **Tests:** 55 integration tests and 79 unit tests pass. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.
   - `cpu_hogs_leave_cores_for_short_requests` is load-sensitive and fails occasionally when the whole suite runs at once on 4 cores; it passes alone.
   - When guests change, the first run can fail one supervised test with `Permission denied`. The test nodes share one `.cwasm` cache between root in-process nodes and jailed workers. A rerun passes.
-- **Runtime size:** about 4,650 lines on `main` (3,704 after phase 3; kv and config added about 300, WebSockets about 640). Commits add about 490 non-blank, non-comment lines, against an estimate of 250–300; the owner was told and asked for a reduction pass.
+- **Runtime size:** about 5,250 lines (3,704 after phase 3; kv and config added about 300, WebSockets about 640, commits about 500 non-blank, non-comment lines, against an estimate of 250–300, which the owner accepted after a reduction pass).
 - **The repo `carsonfarmer/nanovm` is now public**, so GitHub artifact attestations work. The packages `ghcr.io/carsonfarmer/nanovm-{counter,hostile}` are public. `publish-guests.yml` runs on pushes to `guests/**` and on `gh workflow run publish-guests.yml` (dispatch works through the proxy, and `gh run watch <id>` shows progress). Each run publishes version `1.0.<run number>`.
 - **Old branches** (`jail`, `simplify`, `oci`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical.
 
