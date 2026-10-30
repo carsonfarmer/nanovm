@@ -10,12 +10,21 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [cmd, flag, path] if cmd == "serve" && flag == "--config" => serve(NodeConfig::load(&PathBuf::from(path))?),
+        [cmd, flag, path] if cmd == "proxy" && flag == "--config" => {
+            let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+            let cfg: nanovm::config::ProxyConfig = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                let listener = tokio::net::TcpListener::bind(&cfg.listen).await.with_context(|| format!("binding {}", cfg.listen))?;
+                nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg)?, listener).await
+            })
+        }
         // Started by the supervisor only, which reports the worker's last line.
         [cmd] if cmd == "worker" => nanovm::supervisor::worker_main().map_err(|e| {
             eprintln!("{e:#}");
             std::process::exit(1)
         }),
-        _ => bail!("usage: nanovm serve --config <nanovm.toml>"),
+        _ => bail!("usage: nanovm serve --config <nanovm.toml> | nanovm proxy --config <proxy.toml>"),
     }
 }
 
@@ -27,7 +36,7 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
     let threads = cfg.front_threads();
     let t0 = std::time::Instant::now();
     let rt = runtime()?;
-    let sup = rt.block_on(Supervisor::new(cfg, std::env::current_exe()?, threads))?;
+    let sup = Supervisor::new(cfg, std::env::current_exe()?, threads)?;
     let first = rt.block_on(async { listener(addr) })?;
     eprintln!("nanovm: ready in {:.0?} on http://{addr}/ (stats: /_nanovm/stats)", t0.elapsed());
     for i in 1..threads {

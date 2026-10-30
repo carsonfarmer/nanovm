@@ -177,11 +177,6 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             json(200, format!("{{\"removed\":{removed}}}"))
         }
 
-        "/write-app" => match util::write_file("/app", "pwned.txt", b"pwned".to_vec()).await {
-            Ok(()) => json(200, "{\"wrote\":true}"),
-            Err(e) => fs_fail(0, &e),
-        },
-
         // Try to read outside the sandbox in every way we can think of.
         "/escape" => {
             let mut results = Vec::new();
@@ -189,7 +184,7 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                 ("/data", "../../../../../../etc/passwd"),
                 ("/data", "/etc/passwd"),
                 ("/tmp", "../"),
-                ("/app", "../../data"),
+                ("/tmp", "../../data"),
             ] {
                 let r = match util::read_file(mount, path).await {
                     Ok(b) => format!("LEAKED {} bytes", b.len()),

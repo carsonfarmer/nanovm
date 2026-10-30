@@ -54,24 +54,26 @@ config! {
         /// controllers enabled for its children. Each worker is placed in
         /// `<cgroup>/<app>` with that app's `[app.worker]` limits.
         cgroup: Option<PathBuf> = None::<PathBuf>,
-        /// The most a registry app gets: each of its limits is clamped to
-        /// these. Egress entries are the app's own.
-        registry_limits: Limits = Limits::default(),
-        /// Worker limits for every registry app.
-        registry_worker: WorkerLimits = WorkerLimits::default(),
-        #[serde(rename = "app")]
-        apps: Vec<AppConfig> = Vec::new(),
+        /// The most an app gets: each of its limits is clamped to these.
+        /// Egress entries are the app's own.
+        limits: Limits = Limits::default(),
+        /// Every app's worker limits.
+        worker: WorkerLimits = WorkerLimits::default(),
+        /// The largest component the node will download.
+        max_component_mb: u64 = 64u64,
+        /// For local development only: apps need no signature, registries
+        /// and egress may be on private addresses, and loopback registries
+        /// are plain HTTP. Allowed only with a loopback `listen`.
+        dev: bool = false,
     }
 }
 
+/// An app as its worker runs it: from its registry config, within the
+/// node's limits.
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub name: String,
-    /// Path to the wasip3 HTTP component.
-    pub component: PathBuf,
-    /// Host directory mounted read-only at `/app`.
-    pub static_dir: Option<PathBuf>,
     /// Extra environment variables visible to the guest.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -82,6 +84,29 @@ pub struct AppConfig {
     pub limits: Limits,
     #[serde(default)]
     pub worker: WorkerLimits,
+}
+
+config! {
+    /// `nanovm proxy`: the public front door (see `proxy`).
+    pub struct ProxyConfig {
+        /// Address the proxy listens on.
+        listen: String = "0.0.0.0:8443",
+        /// A certificate chain and its key, as PEM files. Without them the
+        /// proxy speaks plain HTTP (behind something else that terminates
+        /// TLS).
+        tls_cert: Option<PathBuf> = None::<PathBuf>,
+        tls_key: Option<PathBuf> = None::<PathBuf>,
+        /// The node it forwards to.
+        node: String = "127.0.0.1:8080",
+        /// A DNS-over-HTTPS resolver (the JSON API) asked for each host's
+        /// `_nanovm` TXT record.
+        resolver: String = "https://cloudflare-dns.com/dns-query",
+        /// How long a tag's digest is reused before asking the registry again.
+        tag_ttl_s: u64 = 30u64,
+        /// For local development only: registries may be on private
+        /// addresses, and loopback ones are plain HTTP (as for the node).
+        dev: bool = false,
+    }
 }
 
 config! {
@@ -168,38 +193,19 @@ impl NodeConfig {
             }
         };
         fix(&mut self.data_dir);
-        for app in &mut self.apps {
-            fix(&mut app.component);
-            if let Some(d) = &mut app.static_dir {
-                fix(d);
-            }
-        }
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.registry_limits.memory_mb > self.memory_reservation_mb {
+        if self.limits.memory_mb > self.memory_reservation_mb {
             bail!(
-                "registry_limits.memory_mb {} exceeds memory_reservation_mb {}",
-                self.registry_limits.memory_mb,
+                "limits.memory_mb {} exceeds memory_reservation_mb {}",
+                self.limits.memory_mb,
                 self.memory_reservation_mb
             );
         }
-        let mut seen = std::collections::HashSet::new();
-        for app in &self.apps {
-            if !crate::table::valid_name(&app.name) || app.name.starts_with('_') {
-                bail!("invalid app name {:?}", app.name);
-            }
-            if !seen.insert(&app.name) {
-                bail!("duplicate app {:?}", app.name);
-            }
-            if app.limits.memory_mb > self.memory_reservation_mb {
-                bail!(
-                    "app {:?}: memory_mb {} exceeds memory_reservation_mb {}",
-                    app.name,
-                    app.limits.memory_mb,
-                    self.memory_reservation_mb
-                );
-            }
+        let addr: std::net::SocketAddr = self.listen.parse().with_context(|| format!("listen = {:?}", self.listen))?;
+        if self.dev && !addr.ip().is_loopback() {
+            bail!("dev mode needs a loopback listen address, not {addr}");
         }
         Ok(())
     }
@@ -216,10 +222,6 @@ fn or_cores_over(n: usize, div: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn app(name: &str) -> AppConfig {
-        toml::from_str(&format!("name = {name:?}\ncomponent = \"a.wasm\"")).unwrap()
-    }
 
     /// Clamping caps every numeric limit at the maximum's, keeps the ones
     /// already under it, and leaves the egress list the app's own.
@@ -251,38 +253,31 @@ mod tests {
         assert_eq!(serde_json::json!(d.clamped(&d)), serde_json::json!(d));
     }
 
-    /// Validation refuses memory limits beyond the reservation (equal fits)
-    /// and app names that are invalid, reserved (`_…`) or repeated.
+    /// Validation refuses memory limits beyond the reservation (equal fits),
+    /// a listen address that isn't one, and dev mode off loopback.
     #[test]
-    fn validate_checks_memory_and_names() {
-        let mut cfg = NodeConfig {
-            apps: vec![app("a"), app("b")],
-            ..NodeConfig::default()
-        };
+    fn validate_checks_memory_listen_and_dev() {
+        let mut cfg = NodeConfig::default();
         cfg.validate().unwrap();
-
-        cfg.registry_limits.memory_mb = cfg.memory_reservation_mb + 1;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("registry_limits.memory_mb")
-        );
-        cfg.registry_limits.memory_mb = cfg.memory_reservation_mb;
-        cfg.apps[1].limits.memory_mb = cfg.memory_reservation_mb;
+        cfg.limits.memory_mb = cfg.memory_reservation_mb;
         cfg.validate().unwrap();
-        cfg.apps[1].limits.memory_mb += 1;
-        assert!(cfg.validate().unwrap_err().to_string().contains("app \"b\": memory_mb"));
+        cfg.limits.memory_mb += 1;
+        assert!(cfg.validate().unwrap_err().to_string().contains("limits.memory_mb"));
+        cfg.limits.memory_mb = 1;
 
-        cfg.apps = vec![app("a"), app("a")];
-        assert!(cfg.validate().unwrap_err().to_string().contains("duplicate app"));
-        for bad in ["", "_nanovm", ".a", "a/b", "a b"] {
-            cfg.apps = vec![app(bad)];
-            assert!(
-                cfg.validate().unwrap_err().to_string().contains("invalid app name"),
-                "{bad:?}"
-            );
+        cfg.listen = "nowhere".into();
+        assert!(cfg.validate().unwrap_err().to_string().contains("listen"));
+        cfg.dev = true;
+        for ok in ["127.0.0.1:1", "[::1]:1"] {
+            cfg.listen = ok.into();
+            cfg.validate().unwrap();
         }
+        for public in ["0.0.0.0:1", "10.0.0.1:1", "[::]:1"] {
+            cfg.listen = public.into();
+            assert!(cfg.validate().unwrap_err().to_string().contains("dev mode"), "{public}");
+        }
+        cfg.dev = false;
+        cfg.validate().unwrap();
     }
 
     /// An empty file is the documented defaults; a partial table keeps the
@@ -292,60 +287,45 @@ mod tests {
         let cfg: NodeConfig = toml::from_str("").unwrap();
         assert_eq!(cfg.listen, "127.0.0.1:8080");
         assert_eq!(
-            (cfg.max_live_objects, cfg.memory_reservation_mb, cfg.heavy_lanes),
-            (1000, 128, 0)
+            (cfg.max_live_objects, cfg.memory_reservation_mb, cfg.heavy_lanes, cfg.max_component_mb),
+            (1000, 128, 0, 64)
         );
-        assert!(cfg.apps.is_empty() && cfg.cgroup.is_none());
-        assert_eq!(cfg.registry_worker.max_sockets, 1000);
+        assert!(cfg.cgroup.is_none() && !cfg.dev);
+        assert_eq!(cfg.worker.max_sockets, 1000);
 
-        let cfg: NodeConfig = toml::from_str(
-            "[registry_limits]\ncpu_ms = 9\n[[app]]\nname = \"a\"\ncomponent = \"a.wasm\"\n[app.limits]\ndisk_mb = 1\n",
-        )
-        .unwrap();
-        assert_eq!((cfg.registry_limits.cpu_ms, cfg.registry_limits.memory_mb), (9, 64));
-        let a = &cfg.apps[0];
-        assert_eq!(
-            (a.limits.disk_mb, a.limits.max_files, a.worker.max_sockets),
-            (1, 1000, 1000)
-        );
-        assert!(a.static_dir.is_none() && a.env.is_empty());
+        let cfg: NodeConfig = toml::from_str("[limits]\ncpu_ms = 9\n").unwrap();
+        assert_eq!((cfg.limits.cpu_ms, cfg.limits.memory_mb), (9, 64));
     }
 
     /// A misspelt key anywhere is an error rather than silently a default,
-    /// and an app needs a name and a component.
+    /// and apps come from registries, not the config.
     #[test]
     fn toml_refuses_unknown_keys() {
-        let app = "[[app]]\nname = \"a\"\ncomponent = \"a.wasm\"\n";
         for bad in [
-            "listn = \"x\"".to_string(),
-            "[registry_limits]\nmemory = 1".into(),
-            "[registry_worker]\ncpu = 1".into(),
-            format!("{app}static = \"x\""),
-            format!("{app}[app.limits]\negres = []"),
-            format!("{app}[app.worker]\nmem = 1"),
-            "[[app]]\nname = \"a\"".into(),
-            "[[app]]\ncomponent = \"a.wasm\"".into(),
+            "listn = \"x\"",
+            "[limits]\nmemory = 1",
+            "[worker]\ncpu = 1",
+            "[[app]]\nname = \"a\"",
         ] {
-            assert!(toml::from_str::<NodeConfig>(&bad).is_err(), "{bad}");
+            assert!(toml::from_str::<NodeConfig>(bad).is_err(), "{bad}");
         }
     }
 
-    /// Loading resolves relative paths against the config file's directory,
-    /// keeps absolute ones, and validates.
+    /// Loading resolves a relative data directory against the config file's
+    /// directory, and validates.
     #[test]
     fn load_resolves_relative_paths_and_validates() {
         let dir = std::env::temp_dir().join(format!("nanovm-config-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("n.toml");
-        let app = "[[app]]\nname = \"a\"\ncomponent = \"c/a.wasm\"\nstatic_dir = \"/abs\"\n";
-        std::fs::write(&path, app).unwrap();
+        std::fs::write(&path, "").unwrap();
         let cfg = NodeConfig::load(&path).unwrap();
         assert_eq!(cfg.data_dir, dir.join("nanovm-data"));
-        assert_eq!(cfg.apps[0].component, dir.join("c/a.wasm"));
-        assert_eq!(cfg.apps[0].static_dir.as_deref(), Some(Path::new("/abs")));
         assert_eq!(cfg.app_dirs("a")[1], dir.join("nanovm-data/tmp/a"));
+        std::fs::write(&path, "data_dir = \"/abs\"").unwrap();
+        assert_eq!(NodeConfig::load(&path).unwrap().data_dir, Path::new("/abs"));
 
-        std::fs::write(&path, format!("{app}{app}")).unwrap();
+        std::fs::write(&path, "dev = true\nlisten = \"0.0.0.0:1\"").unwrap();
         assert!(NodeConfig::load(&path).is_err(), "validated");
         std::fs::remove_dir_all(dir).unwrap();
     }

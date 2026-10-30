@@ -1,4 +1,4 @@
-//! The node: loaded apps, and the table mapping `(app, object-id)` to the
+//! The node: one loaded app, and the table mapping each object id to the
 //! single actor that owns that object.
 
 use std::collections::HashMap;
@@ -12,14 +12,13 @@ use tokio::sync::{Semaphore, mpsc, oneshot};
 use wasmtime::Engine;
 
 use crate::app::App;
-use anyhow::Context;
-
-use crate::config::NodeConfig;
+use crate::config::{AppConfig, NodeConfig};
 use crate::egress::Upstream;
 use crate::metrics::Metrics;
 use crate::object::{self, Job, ObjShared, Phase, RespBody, error_response};
 
-/// App and object names: `[A-Za-z0-9_.-]{1,128}`, not starting with `.`.
+/// App, object and channel names: `[A-Za-z0-9_.-]{1,128}`, not starting
+/// with `.`.
 pub fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -45,56 +44,56 @@ impl Entry {
     }
 }
 
+/// An object id: a name not starting with `_`, which the node keeps for
+/// itself (`/_nanovm/…`).
+pub fn valid_object(s: &str) -> bool {
+    valid_name(s) && !s.starts_with('_')
+}
+
+/// `/{object}/{rest}` as `(object, /rest)`, if the object id is valid.
+pub fn route(path: &str) -> Option<(&str, &str)> {
+    let path = path.strip_prefix('/')?;
+    let (id, rest) = path.split_at(path.find('/').unwrap_or(path.len()));
+    valid_object(id).then_some((id, rest))
+}
+
+pub const BAD_OBJECT: &str = "object ids are [A-Za-z0-9_.-]{1,128}, not starting with `.` or `_`";
+
 pub struct Node {
     pub engine: Engine,
     pub cfg: NodeConfig,
-    pub apps: HashMap<String, Arc<App>>,
+    pub app: Arc<App>,
     pub metrics: Arc<Metrics>,
     pub started: Instant,
     /// Cores CPU-heavy requests may occupy at once; see `heavy_lanes`.
     pub heavy: Arc<Semaphore>,
     /// One permit per live store, released only after the store is dropped.
     pub slots: Arc<Semaphore>,
-    objects: Mutex<HashMap<(Arc<str>, Arc<str>), Entry>>,
+    objects: Mutex<HashMap<Arc<str>, Entry>>,
 }
 
 impl Node {
-    /// Builds a node from the components named in `cfg`, with direct egress.
-    pub fn new(cfg: NodeConfig) -> anyhow::Result<Arc<Node>> {
-        crate::engine::preflight(&cfg)?;
-        let mut wasm = Vec::new();
-        for a in &cfg.apps {
-            wasm.push(std::fs::read(&a.component).with_context(|| format!("reading {}", a.component.display()))?);
-        }
-        Node::from_wasm(cfg, wasm, None)
-    }
-
-    /// Builds a node from component bytes, one per app in `cfg.apps`. With
+    /// Builds a node running `app` from its component bytes. With
     /// `upstream`, guests' outbound requests go to the supervisor instead of
-    /// the network.
-    /// The caller has run `engine::preflight` (a jailed worker must, before
-    /// it jails itself).
-    pub fn from_wasm(cfg: NodeConfig, wasm: Vec<Vec<u8>>, upstream: Option<Upstream>) -> anyhow::Result<Arc<Node>> {
+    /// the network. The caller has run `engine::preflight` (a jailed worker
+    /// must, before it jails itself).
+    pub fn new(cfg: NodeConfig, app: &AppConfig, wasm: &[u8], upstream: Option<Upstream>) -> anyhow::Result<Arc<Node>> {
         let engine = crate::engine::build(&cfg)?;
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
-        let mut apps = HashMap::new();
-        for (a, wasm) in cfg.apps.iter().zip(wasm) {
-            let app = App::load(&engine, &linker, &cfg, a, &wasm, upstream.clone())?;
-            apps.insert(a.name.clone(), Arc::new(app));
-            // Scratch from a previous run is garbage; volumes are kept. The
-            // directory itself stays: a jailed worker's Landlock rule names it.
-            let [_, tmp, _] = cfg.app_dirs(&a.name);
-            for e in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
+        let app = Arc::new(App::load(&engine, &linker, &cfg, app, wasm, upstream)?);
+        // Scratch from a previous run is garbage; volumes are kept. The
+        // directory itself stays: a jailed worker's Landlock rule names it.
+        let [_, tmp, _] = cfg.app_dirs(&app.name);
+        for e in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
+            let _ = std::fs::remove_dir_all(e.path());
         }
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
         Ok(Arc::new(Node {
             engine,
             cfg,
-            apps,
+            app,
             metrics: Arc::default(),
             started: Instant::now(),
             heavy,
@@ -120,14 +119,9 @@ impl Node {
 
     /// Routes one request to its object's actor, starting the actor if the
     /// object isn't live, and waits for the response.
-    pub async fn dispatch(
-        self: &Arc<Self>,
-        app: &Arc<App>,
-        id: &str,
-        req: http::Request<Bytes>,
-    ) -> http::Response<RespBody> {
-        if !valid_name(id) {
-            return error_response(400, "bad-object-id", "object ids are [A-Za-z0-9_.-]{1,128}");
+    pub async fn dispatch(self: &Arc<Self>, id: &str, req: http::Request<Bytes>) -> http::Response<RespBody> {
+        if !valid_object(id) {
+            return error_response(400, "bad-object-id", BAD_OBJECT);
         }
         let (reply, rx) = oneshot::channel();
         let job = Job {
@@ -135,7 +129,7 @@ impl Node {
             reply,
             enqueued: Instant::now(),
         };
-        if let Err(resp) = self.enqueue(app, id, job) {
+        if let Err(resp) = self.enqueue(id, job) {
             return resp;
         }
         match rx.await {
@@ -144,8 +138,8 @@ impl Node {
         }
     }
 
-    fn enqueue(self: &Arc<Self>, app: &Arc<App>, id: &str, mut job: Job) -> Result<(), http::Response<RespBody>> {
-        let key: (Arc<str>, Arc<str>) = (app.name.clone(), id.into());
+    fn enqueue(self: &Arc<Self>, id: &str, mut job: Job) -> Result<(), http::Response<RespBody>> {
+        let (app, key): (_, Arc<str>) = (&self.app, id.into());
         let mut objects = self.objects.lock();
         if let Some(e) = objects.get(&key) {
             match e.tx.try_send(job) {
@@ -209,7 +203,7 @@ impl Node {
                 return false;
             }
             if seen.insert(id.clone())
-                && let Some(e) = objects.get(&(from.app.clone(), id))
+                && let Some(e) = objects.get(&id)
             {
                 next.extend(e.shared.waiting_on.lock().iter().cloned());
             }
@@ -220,7 +214,7 @@ impl Node {
 
     /// Drops the table's handle on the least recently used idle object; its
     /// actor drains its queue and exits.
-    fn evict_lru(&self, objects: &mut HashMap<(Arc<str>, Arc<str>), Entry>) -> bool {
+    fn evict_lru(&self, objects: &mut HashMap<Arc<str>, Entry>) -> bool {
         let idle = objects.iter().filter_map(|(k, e)| Some((e.idle_since()?, k)));
         let Some(k) = idle.min().map(|(_, k)| k.clone()) else {
             return false;
@@ -240,9 +234,9 @@ impl Node {
         if !rx.is_empty() {
             return false;
         }
-        let key = (shared.app.clone(), shared.id.clone());
-        if objects.get(&key).is_some_and(|e| Arc::ptr_eq(&e.shared, shared)) {
-            objects.remove(&key);
+        let key = &shared.id;
+        if objects.get(key).is_some_and(|e| Arc::ptr_eq(&e.shared, shared)) {
+            objects.remove(key);
         }
         true
     }
@@ -297,5 +291,17 @@ mod tests {
         drop(waiting);
         e.tx.try_send(job()).unwrap();
         assert_eq!(e.idle_since(), None, "a job not yet picked up");
+    }
+
+    /// A path is `/{object}` and what follows it; the object is a valid
+    /// name not starting with `_`, so `//x` or `/_nanovm/…` name none.
+    #[test]
+    fn routes_name_one_object() {
+        assert_eq!(route("/a"), Some(("a", "")));
+        assert_eq!(route("/a/"), Some(("a", "/")));
+        assert_eq!(route("/a/b/c?"), Some(("a", "/b/c?")));
+        for bad in ["", "a", "/", "//a", "//a/b", "/_nanovm/stats", "/_x", "/../a", "/a b/c"] {
+            assert_eq!(route(bad), None, "{bad:?}");
+        }
     }
 }

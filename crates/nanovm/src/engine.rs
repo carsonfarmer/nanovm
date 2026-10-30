@@ -48,7 +48,7 @@ pub fn build(cfg: &NodeConfig) -> anyhow::Result<Engine> {
 }
 
 /// File descriptors a live object holds: its `/data` and `/tmp` preopens.
-/// `/app` is one shared fd per app; files a guest opens come on top.
+/// Files a guest opens come on top.
 pub const FDS_PER_OBJECT: u64 = 2;
 /// Memory mappings per pool slot, measured on Linux: about 4 per slot once
 /// the pool is created (stacks and their guard pages) and 4 more per live

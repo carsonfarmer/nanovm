@@ -4,13 +4,13 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 
 - Each `(app, object-id)` has exactly one live instance, which serves one request at a time.
 - Each object has its own memory cap, CPU budget, deadlines and handle cap.
-- Each object has its own quota'd filesystem: read-only `/app`, scratch `/tmp`, and a persistent `/data` volume.
+- Each object has its own quota'd filesystem: scratch `/tmp` and a persistent `/data` volume.
 - Each app has an egress allowlist.
 - Each object has a `wasi:keyvalue` store in its volume, and each app its `wasi:config` values.
 - Objects accept WebSockets and publish to their own sockets.
 - Memory is lost on eviction; `/data` survives eviction and restarts.
 
-Each app runs in its own jailed worker process. A supervisor that runs no guest code owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
+Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
 ## Try it
 
@@ -20,16 +20,18 @@ demo/demo.sh
 
 The script:
 1. Builds the guests and the node.
-2. Starts a node from [demo/nanovm.toml](demo/nanovm.toml), with a benign `counter` app and a `hostile` app on the same host.
-3. Pings a canary object throughout.
-4. Drives it over HTTP with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm requests, `/data` writes, and a storm of 110 simultaneous attacks.
+2. Publishes a benign `counter` app and a `hostile` app to a registry on loopback (`cargo run --example dev-registry`).
+3. Starts a node in dev mode from [demo/nanovm.toml](demo/nanovm.toml), which runs them unsigned.
+4. Pings a canary object throughout.
+5. Drives it over HTTP with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm requests, `/data` writes, and a storm of 100 simultaneous attacks.
 
-It leaves the node running. Its data APIs (deprecated: OpenTelemetry replaces them, see [ISSUES.md](ISSUES.md) W-2) are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (that app's kills, denials and evictions).
+It leaves the node running. Its data APIs (deprecated: OpenTelemetry replaces them, see [ISSUES.md](ISSUES.md) W-2) are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (app `A`'s kills, denials and evictions).
 
-Requests are routed as `/{app}/{object}/{path}`:
+A request names its app in the headers the proxy sets (see [Apps](#apps)), and its object in the path, `/{object}/{path}`:
 
 ```bash
-curl -XPOST http://127.0.0.1:8080/counter/alice/incr
+curl -XPOST http://127.0.0.1:8080/alice/incr \
+  -H 'nanovm-app: 127.0.0.1:5000/nanovm/counter@sha256:…' -H 'nanovm-trust: dev dev'
 ```
 
 ## What a run of `demo/demo.sh` shows
@@ -42,7 +44,7 @@ On the 4-core Linux sandbox, with each app's worker capped at 8,000 objects (the
 | 50,000 GETs over 1,000 warm objects | 19K/s, p50 2.2 ms | 27K/s, p50 1.2 ms |
 | 10,000 `POST /incr` (each one rewrites `/data/count`) | 6.7K/s | 7.3K/s |
 | One object, one client | 3.0K/s, p50 0.3 ms | 5.6K/s, p50 0.1 ms |
-| 110 attacks at once | All contained in 2.2 s; the 2 s wall-clock deadline sets the slowest | the same |
+| 110 attacks at once (now 100: `/app` is gone) | All contained in 2.2 s; the 2 s wall-clock deadline sets the slowest | the same |
 | Canary over HTTP, throughout | 0 failures | 0 failures |
 
 Every request succeeded and each worker started once. The cost of the jail is the hop between the supervisor and the worker; see [What the jail costs](#what-the-jail-costs).
@@ -58,7 +60,6 @@ Every attack in the storm, and how it ended:
 | leak 1M handles | killed at 2,000 handles |
 | fill the disk | write refused at the 8 MiB disk budget |
 | create files | refused at 200 files |
-| write `/app` | refused (read-only) |
 | `../` and symlink escapes | refused |
 | fetch cloud metadata (169.254.169.254) | denied (not on the allowlist) |
 | allowlisted name that resolves to 127.0.0.1 | denied by the resolved-IP check (in this sandbox, which has no DNS, it fails to resolve instead; the `localhost` integration test covers the IP check) |
@@ -67,7 +68,7 @@ Every attack in the storm, and how it ended:
 
 ```
 client ─► proxy ─► supervisor (nanovm serve): runs no guest code
-                    │  HTTP/1.1 front end; routes /{app}/... to the app's worker
+                    │  HTTP/1.1 front end; routes each request to its app's worker
                     │  makes every outbound request: allowlist, DNS, public-IP filter
                     │  starts and restarts workers; places each in its cgroup
                     ├── fd 3: links for requests ──► worker "counter"  (nanovm worker)
@@ -77,7 +78,7 @@ client ─► proxy ─► supervisor (nanovm serve): runs no guest code
 A worker reads its config and component from stdin, then jails itself while it still has one thread, before it compiles or runs anything:
 
 - **Its own uid.** When the supervisor runs as root, app `i` runs as `jail_uid_base + i`, and its directories are chowned to it.
-- **Landlock.** It gets read-write access to the app's own `objects/`, `tmp/` and `cache/`, read-only access to its `static_dir`, and nothing else.
+- **Landlock.** It gets read-write access to the app's own `objects/`, `tmp/` and `cache/`, and nothing else.
 - **seccomp.** The allowlist holds only the syscalls Wasmtime, tokio and the filesystem host make, traced over the test suite:
   - no `socket`, `connect`, `bind`, `execve`, `ptrace`, `mount` or namespace calls
   - `clone` for threads only
@@ -87,7 +88,7 @@ A worker reads its config and component from stdin, then jails itself while it s
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
-- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker goes into `<cgroup>/<app>` with that app's `[app.worker]` memory, CPU and pids limits, before it is given anything.
+- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker goes into `<cgroup>/<app>` with the node's `[worker]` memory, CPU and pids limits, before it is given anything.
 
 Mount and network namespaces were left out on purpose: Landlock already confines the filesystem, and with no `socket()` there is no network to remove.
 
@@ -104,9 +105,27 @@ The hop between the processes costs two extra cross-process round trips, about 3
 
 The in-process benchmark below measures the node inside a worker, and is unchanged.
 
-## Apps from a registry
+## The proxy
 
-A local app comes from the node config (`[[app]]`, used by the demo and most tests). A registry app is named by the proxy, with each request:
+`nanovm proxy --config proxy.toml` is the public front door. It finds the app a request's host serves in a TXT record at `_nanovm.<host>`:
+
+```
+app=ghcr.io/org/app:prod; trust=<issuer> <subject>; trust=…; min=1.2.0
+```
+
+That is the repository and the tag deployed, each identity whose signature is accepted, and an optional version floor. Whoever controls the domain controls its routing; deploying moves the tag, and rolling back moves it back. The proxy:
+- asks a DNS-over-HTTPS resolver (`resolver`, Cloudflare's by default) and keeps the answer for its TTL;
+- asks the registry which digest the tag names, and keeps that for `tag_ttl_s` (30 s);
+- drops every `nanovm-*` header a client sent, names the app to the node (below), and forwards the request, WebSockets included;
+- speaks TLS with `tls_cert` and `tls_key` (PEM files), or plain HTTP behind something that terminates it.
+
+A host with no record is a 404; a malformed record, or more than one, is a 502.
+
+DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and data keyed by repository so a forged record reaches no other app's data); a change takes up to its TTL to arrive; a host serves one app; the table is public; and a cold lookup adds a round trip.
+
+## Apps
+
+Every app comes from a registry. The proxy names it with each request:
 
 ```
 nanovm-app: ghcr.io/org/app@sha256:…        # by digest only
@@ -114,16 +133,24 @@ nanovm-trust: <issuer> <subject>[, …]        # whose signature is accepted
 nanovm-min-version: 1.4.0                    # optional floor
 ```
 
-The node trusts these headers because only the proxy can reach it; the proxy must drop any a client sends. The node strips them before the guest sees the request. `/{app}/` in the path still names the app and its volumes, and the digests sent under one name are versions of one app.
+The node trusts these headers because only the proxy can reach it, and strips them before the guest sees the request. A request without them reaches only the node's own `/_nanovm/` routes.
+
+**An app is its repository.** Its name on the node (`ghcr.io_org_app-<hash>`), its volumes and its uid come from `registry/repository`, so every version of it, whoever signed it, sees the same data. Only those who can push to a repository can put a signed artifact in it, so naming another identity, or forging a DNS record, never reaches a different app's data. A team signs from CI, or lists each member's identity.
 
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
 2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
-3. **Then the worker.** The app's limits are clamped to the operator's `registry_limits`, and its workers get `registry_worker`. The component goes to a fresh jailed worker, which compiles it.
+3. **Then the worker.** The app's limits are clamped to the operator's `limits`, and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
 
-**Switching versions.** A request naming a digest the app's worker isn't running switches the app. The new version is fetched and verified while the old one keeps serving. The old worker then drains: no new requests, and in-flight ones (and their response bodies) finish, bounded by its longest request time. Only then does the new worker start. Both versions share the app's volumes, so an object is never live in two workers.
+**A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running.
 
-**Uids.** An app's uid is the owner of its `objects/<app>` directory, or the next free one for a new app. It is stable across restarts and config changes, with no separate record.
+**Bounds.** Every registry read is bounded: a manifest, config, token or signature at 4 MiB, a component at `max_component_mb` (64), and 16 signatures per load. Digests are checked before they name anything. Registries, and their redirects and token servers, must be on public addresses: a deploy names the registry, so it must not reach the node's own network.
+
+**Dev mode** (`dev = true`, refused unless `listen` is loopback) is for local development: apps need no signature, registries and egress entries may be on private addresses, and loopback registries are plain HTTP. The tests and the demo use it with a registry on loopback; signatures are tested against the CI-signed guests on ghcr.io.
+
+**Switching versions.** A request naming a digest the app's worker isn't running switches the app. The new version is fetched and verified while the old one keeps serving. The old worker then drains: no new requests, and in-flight ones (and their response bodies) finish, bounded by its longest request time. Only then does the new worker start. Both versions share the app's volumes, so an object is never live in two workers. A switch, once begun, finishes even if the request that began it goes away.
+
+**Uids.** An app's uid is the owner of its `objects/<app>` directory, or the next free one for a new app. It is stable across restarts, with no separate record.
 
 **Publishing.** [.github/workflows/publish-guests.yml](.github/workflows/publish-guests.yml) is the reference pipeline. CI builds each test guest, pushes it with `oras` (artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, version `1.0.<run>`), and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity. No key exists anywhere. A person can sign the same way from a laptop with `cosign` and a browser sign-in.
 
@@ -137,7 +164,7 @@ What happens on the first request for a digest:
 
 Spin's store, by comparison, is one SQLite table per app shared by all its instances, with no per-store disk quota. Ours is per object, under the object's quotas, with no dependency. Commits give it what SQLite would: a request's values, files included, land together and durably, or not at all.
 
-**`wasi:config/store`** (0.2.0-rc.1) serves the app's `config` table: `[app.config]` for a local app, `"config"` in a registry app's `nanovm.json`. Environment variables (`env`) still work alongside it.
+**`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
 ## Calls between objects
 
@@ -152,7 +179,7 @@ An object calls another object of its own app with an ordinary outgoing request 
 The supervisor holds client sockets for now. They are planned to move into the front proxy, so the node only ever answers requests ([ISSUES.md](ISSUES.md) W-3).
 
 The supervisor holds client sockets. Objects see them as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work.
-- **Opening.** A socket opened at `/{app}/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`; any other answer refuses the socket, with the object's own status if it is a 4xx or 5xx (so a `401` reaches the client).
+- **Opening.** A socket opened at `/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`; any other answer refuses the socket, with the object's own status if it is a 4xx or 5xx (so a `401` reaches the client).
 - **Events.** Each later event (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` queued with the object's other requests, so events are ordered with everything else the object serves. The answer carries events for that socket.
   - A socket has one event in flight at a time, and its next message is read once that is answered. Messages for the client are written meanwhile.
   - An event waits for room in a full queue rather than being refused; the sockets bound how many wait.
@@ -160,9 +187,9 @@ The supervisor holds client sockets. Objects see them as ordinary requests, in [
 - **Fan-out within an object**, as in Durable Objects (an object is a room). An object that answers `Sec-WebSocket-Extensions: grip` sends `m:` messages and `c:` controls. `{"type":"subscribe","channel":"…"}` subscribes the socket to a channel of its own object. The object reaches every subscribed socket, from any request, by posting GRIP's publish format to `http://nanovm/publish/`; the worker stamps that request with the object's id.
 - **Lifetime.** Sockets outlive instances: an evicted object is started again by the next event. They belong to the worker process, and close (1012) when it exits or the app switches versions, so clients reconnect to the new version. A node restart drops them.
 - **Limits.**
-  - `max_sockets` per object (default 256), per app (`[app.worker] max_sockets`, default 1,000) and per node (default 10,000; each is a file descriptor in the supervisor).
+  - `max_sockets` per object (default 256), per app (`[worker] max_sockets`, default 1,000) and per node (default 10,000; each is a file descriptor in the supervisor).
   - A message is bounded by `max_request_body_kb` (closed with 1009), and an answer by `max_response_body_kb`.
-  - Messages waiting to be written count their bytes plus 64 each. A socket more than `socket_backlog_kb` (default 1,024) behind is dropped, and so is one whose write stalls for 30 s. Each socket's budget is its own, so no client or app can crowd out another; the supervisor's worst case is `max_sockets` × the largest `socket_backlog_kb`, which `registry_limits` caps.
+  - Messages waiting to be written count their bytes plus 64 each. A socket more than `socket_backlog_kb` (default 1,024) behind is dropped, and so is one whose write stalls for 30 s. Each socket's budget is its own, so no client or app can crowd out another; the supervisor's worst case is `max_sockets` × the largest `socket_backlog_kb`, which `limits` caps.
   - A socket is pinged every 30 s and dropped if it heard nothing for a whole interval, so a half-open connection doesn't hold its slot.
   - A socket has at most 64 channels and 16 KiB of handshake headers. A publish has at most 64 items.
 
@@ -254,7 +281,7 @@ Every scenario completed with 0 failed requests.
 
 Each worker checks these at startup and refuses to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
 
-- **File descriptors:** each live object holds 2 (`/data` and `/tmp`; `/app` is shared per app). The check needs about `2 × max_live_objects + 1024`. The worker raises its soft limit to the hard limit itself, before it jails itself; the demo's 8,000 objects per app need `ulimit -n` of at least 17,088.
+- **File descriptors:** each live object holds 2 (`/data` and `/tmp`). The check needs about `2 × max_live_objects + 1024`. The worker raises its soft limit to the hard limit itself, before it jails itself; the demo's 8,000 objects per app need `ulimit -n` of at least 17,088.
 - **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 8,000 needs `sysctl -w vm.max_map_count=68352` or more.
 - **The jail** needs Landlock (Linux 5.13+) and seccomp. A separate uid per app needs the supervisor to run as root.
 - **Don't run with `RUST_BACKTRACE` set.** wasmtime then captures a stack backtrace for every guest-visible error. That includes routine ones, like reading a file that doesn't exist yet. With it set, warm throughput across 1,000 objects fell from 63K/s to 23K/s.
@@ -276,7 +303,7 @@ The tests cover:
 - volumes surviving eviction and restarts, and not being shared between objects
 - `/tmp` wiped on a new instance
 - file-size and file-count quotas
-- read-only `/app`, sandbox escapes, and one disk budget across `/data` and `/tmp`, and renames between them refused as cross-device
+- sandbox escapes, and one disk budget across `/data` and `/tmp`, and renames between them refused as cross-device
 - commits:
   - a request that errors, traps or runs out of CPU leaves its files and key-value writes untouched, while one that answers, even with 507, commits;
   - a worker killed mid-request is rolled back when the object next starts;
@@ -294,14 +321,15 @@ The tests cover:
 - registry apps against the real, CI-signed guests on ghcr.io:
   - a good signature runs
   - a wrong identity, a wrong issuer, a version below the floor and an unknown digest are each refused, with the reason
-  - a local app can't be named from a registry, and the trust header is required
+  - a running version is checked again under each new policy, a refusal is not remembered and leaves it running, and the trust header is required
   - switching versions lets the old worker's in-flight request finish before the new worker answers, on the same volumes
 
   These skip, saying why, where ghcr.io can't be reached.
 - open response bodies counting against `max_outbound_concurrency`, in-process and through the supervisor
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.
-- a worker that can't reach its own directories failing to start, and saying which one
+- apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, and a switch that finishes when its request goes away
+- the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and WebSockets pass through
 - key-value: values persisting in the volume, counting against the disk and file quotas, bad names refused, keys paged, reads bounded by the memory limit and batches by size, and the store working in a jailed worker (including a key file the guest replaced through its filesystem)
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`
 - WebSockets through the supervisor: echo, binary, fan-out to the sockets of one object only (from an event and from a plain request), a guest-initiated close, the object told how a socket ended, refusals by an object that doesn't answer `OPEN`; the per-object and per-node caps, the message size, a client that never reads being dropped, and a worker's sockets closing when it dies
@@ -377,13 +405,15 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `crates/nanovm/src/engine.rs` | Engine config, pooling allocator, epoch ticker, `.cwasm` cache |
 | `crates/nanovm/src/app.rs` | Component loading and the linker |
 | `crates/nanovm/src/object.rs` | The per-object actor: instance lifecycle, limits, CPU accounting, heavy lanes, poisoning |
-| `crates/nanovm/src/table.rs` | The node: `(app, id)` → actor, LRU and idle eviction |
+| `crates/nanovm/src/table.rs` | The node: one app, object id → actor, LRU and idle eviction |
 | `crates/nanovm/src/quota.rs` | Per-mount byte and file quotas over WASIp3 filesystem calls |
 | `crates/nanovm/src/egress.rs` | Allowlist plus resolved-IP filtering for outgoing HTTP |
 | `crates/nanovm/src/server.rs` | A node's HTTP surface: routing, `/_nanovm/stats` and `/_nanovm/events` |
 | `crates/nanovm/src/supervisor.rs` | The supervisor (front end, workers, egress on their behalf) and the worker's entry point |
 | `crates/nanovm/src/jail.rs` | uid, Landlock and seccomp, entered by a worker before any guest code |
-| `crates/nanovm/src/registry.rs` | Registry apps: pull by digest, Sigstore verification, version floor, digest cache |
+| `crates/nanovm/src/registry.rs` | Apps: bounded registry reads, Sigstore verification, version floor, digest cache |
+| `crates/nanovm/src/proxy.rs` | `nanovm proxy`: DNS routing, tag resolution, forwarding, TLS |
+| `crates/nanovm/examples/dev-registry.rs` | A loopback registry with the guests published, for dev mode |
 | `crates/nanovm/src/link.rs` | HTTP/1.1 over socketpairs passed across a control socket |
 | `crates/nanovm/src/kv.rs` | `wasi:keyvalue` on the object's volume |
 | `crates/nanovm/src/journal.rs` | Per-request commits: the undo journal, commit and crash recovery |
@@ -396,3 +426,4 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 - **Inline filesystem calls can't be interrupted by the epoch.** Each one is bounded by the quotas and charged to the guest's CPU budget.
 - **The CPU budget is wall time inside each poll of the guest.** It inflates when the host is oversubscribed, which errs on the side of killing hogs early.
 - **Without root, apps share the supervisor's uid.** Landlock and seccomp still separate them.
+- **A worker's stderr lines are passed on whole up to 4 KiB**; longer ones are split.

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use nanovm::config::NodeConfig;
+use anyhow::Context;
+use nanovm::config::{AppConfig, NodeConfig};
 #[path = "../support/load.rs"]
 #[allow(dead_code)]
 mod load;
@@ -26,70 +27,51 @@ fn repo() -> PathBuf {
         .unwrap()
 }
 
-fn node(name: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
+/// An in-process node running the guest `app`, with its own data directory.
+fn node(name: &str, app: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
     let root = repo().join("target/bench-data");
     let dir = root.join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     std::fs::create_dir_all(root.join("cache"))?;
     std::os::unix::fs::symlink(root.join("cache"), dir.join("cache"))?;
-    let guest = |g: &str| repo().join(format!("guests/target/wasm32-wasip2/release/{g}.wasm"));
-    for g in ["counter", "hostile"] {
-        anyhow::ensure!(
-            guest(g).exists(),
-            "{} is missing: run scripts/build-guests.sh",
-            guest(g).display()
-        );
-    }
-    let text = format!(
-        r#"
-        data_dir = "{dir}"
-        max_live_objects = {max_live}
-        memory_reservation_mb = 64
-
-        [[app]]
-        name = "counter"
-        component = "{counter}"
-        [app.limits]
-        memory_mb = 16
-        cpu_ms = 50
-        idle_timeout_ms = 600000
-        disk_mb = 1
-        max_queue = 1024
-
-        [[app]]
-        name = "hostile"
-        component = "{hostile}"
-        [app.limits]
-        memory_mb = 32
-        cpu_ms = 100
-        request_timeout_ms = 1000
-        max_resources = 2000
-        "#,
-        dir = dir.display(),
-        counter = guest("counter").display(),
-        hostile = guest("hostile").display(),
-    );
-    let cfg: NodeConfig = toml::from_str(&text)?;
+    let guest = repo().join(format!("guests/target/wasm32-wasip2/release/{app}.wasm"));
+    let wasm = std::fs::read(&guest).with_context(|| format!("{}: run scripts/build-guests.sh", guest.display()))?;
+    let limits = match app {
+        "counter" => json!({ "memory_mb": 16, "cpu_ms": 50, "idle_timeout_ms": 600000, "disk_mb": 1, "max_queue": 1024 }),
+        _ => json!({ "memory_mb": 32, "cpu_ms": 100, "request_timeout_ms": 1000, "max_resources": 2000 }),
+    };
+    let app = AppConfig {
+        name: app.into(),
+        env: Default::default(),
+        config: Default::default(),
+        limits: serde_json::from_value(limits)?,
+        worker: Default::default(),
+    };
+    let cfg = NodeConfig {
+        data_dir: dir,
+        max_live_objects: max_live,
+        memory_reservation_mb: 64,
+        ..NodeConfig::default()
+    };
     cfg.validate()?;
-    Node::new(cfg)
+    nanovm::engine::preflight(&cfg)?;
+    Node::new(cfg, &app, &wasm, None)
 }
 
-async fn once(node: &Arc<Node>, app: &str, id: &str, path: &str) -> Reply {
-    request(node, "GET", app, id, path, "").await
+async fn once(node: &Arc<Node>, id: &str, path: &str) -> Reply {
+    request(node, "GET", id, path, "").await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn load(
     node: &Arc<Node>,
-    app: &str,
     method: &str,
     path: &str,
     n: usize,
     conc: usize,
     id: impl Fn(usize) -> String + Send + Sync + 'static,
 ) -> Run {
-    load::run(node, app, method, path, n, None, conc, id).await
+    load::run(node, method, path, n, None, conc, id).await
 }
 
 fn row(name: &str, r: &Run, note: &str) {
@@ -139,10 +121,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ---- cold starts, then warm traffic on the same node ----
-    let n = node("main", cold_n + 64)?;
-    once(&n, "counter", "warmup", "/").await;
+    let n = node("main", "counter", cold_n + 64)?;
+    once(&n, "warmup", "/").await;
     let rss0 = rss_bytes();
-    let cold = load(&n, "counter", "GET", "/", cold_n, conc, |i| format!("o{i}")).await;
+    let cold = load(&n, "GET", "/", cold_n, conc, |i| format!("o{i}")).await;
     let live = n.live_objects();
     let rss1 = rss_bytes();
     let per_obj_kb = rss1.saturating_sub(rss0) as f64 / live.max(1) as f64 / 1024.0;
@@ -160,16 +142,16 @@ async fn main() -> anyhow::Result<()> {
         json!({ "run": cold.json(), "live": live, "rss_mb": rss1 as f64 / 1e6, "kb_per_object": per_obj_kb.round() }),
     );
 
-    let warm = load(&n, "counter", "GET", "/", warm_n, conc, move |i| {
+    let warm = load(&n, "GET", "/", warm_n, conc, move |i| {
         format!("o{}", i % warm_objects)
     })
     .await;
-    let serial = load(&n, "counter", "GET", "/", 20_000 / scale, 1, |_| "o0".into()).await;
-    let incr = load(&n, "counter", "POST", "/incr", warm_n / 5, conc, move |i| {
+    let serial = load(&n, "GET", "/", 20_000 / scale, 1, |_| "o0".into()).await;
+    let incr = load(&n, "POST", "/incr", warm_n / 5, conc, move |i| {
         format!("o{}", i % warm_objects)
     })
     .await;
-    let incr1 = load(&n, "counter", "POST", "/incr", 2_000 / scale, 1, |_| "o0".into()).await;
+    let incr1 = load(&n, "POST", "/incr", 2_000 / scale, 1, |_| "o0".into()).await;
     println!("\nwarm ({warm_objects} live objects)");
     row(&format!("GET, {conc} concurrent"), &warm, "");
     row("GET, one client, one object", &serial, "");
@@ -183,14 +165,14 @@ async fn main() -> anyhow::Result<()> {
     drop(n);
 
     // ---- kill and recover ----
-    let n = node("kill", 256)?;
+    let n = node("kill", "hostile", 256)?;
     let kills = 300 / scale;
     let t0 = Instant::now();
     let mut recover = Run::default();
     for i in 0..kills {
         let id = format!("k{}", i % 16);
-        once(&n, "hostile", &id, "/panic").await;
-        recover.add(&once(&n, "hostile", &id, "/").await);
+        once(&n, &id, "/panic").await;
+        recover.add(&once(&n, &id, "/").await);
     }
     recover.elapsed = t0.elapsed();
     recover.lat_us.sort_unstable();
@@ -208,8 +190,8 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|i| args.get(i + 1))
         .map(|v| v.parse().expect("--churn-cap takes a number"))
         .unwrap_or(1_000 / scale);
-    let n = node("churn", cap)?;
-    let churn = load(&n, "counter", "GET", "/", 20_000 / scale, 64, |i| format!("c{i}")).await;
+    let n = node("churn", "counter", cap)?;
+    let churn = load(&n, "GET", "/", 20_000 / scale, 64, |i| format!("c{i}")).await;
     println!(
         "\nchurn ({} new objects through {cap} slots, 64 concurrent)",
         20_000 / scale
@@ -229,14 +211,13 @@ async fn main() -> anyhow::Result<()> {
     n.shutdown().await;
     drop(n);
 
-    // ---- neighbours under attack ----
-    let n = node("attack", 1_000)?;
+    // ---- neighbours under attack: other objects of the attackers' app ----
+    let n = node("attack", "hostile", 1_000)?;
     let objs = 100 / scale.min(10);
-    load(&n, "counter", "GET", "/", objs, 64, |i| format!("v{i}")).await;
+    load(&n, "GET", "/", objs, 64, |i| format!("v{i}")).await;
     let window = Duration::from_millis(if quick { 1000 } else { 3000 });
     let base = load::run(
         &n,
-        "counter",
         "GET",
         "/",
         usize::MAX,
@@ -253,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
                 let paths = ["/spin", "/alloc?mb=1024", "/panic", "/leak"];
                 let mut k = 0;
                 while !stop.load(Relaxed) {
-                    once(&n, "hostile", &format!("a{a}"), paths[k % paths.len()]).await;
+                    once(&n, &format!("a{a}"), paths[k % paths.len()]).await;
                     k += 1;
                 }
                 k
@@ -265,7 +246,6 @@ async fn main() -> anyhow::Result<()> {
     let killed0: u64 = n.metrics.poisons.iter().map(|p| p.load(Relaxed)).sum();
     let under = load::run(
         &n,
-        "counter",
         "GET",
         "/",
         usize::MAX,

@@ -7,8 +7,6 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 use wasmtime::Engine;
 use wasmtime::component::{Component, Linker};
-use wasmtime_wasi::filesystem::Dir;
-use wasmtime_wasi::{FsPerms, OpenMode};
 use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
 use wasmtime_wasi_http::p3::bindings::ServicePre;
 
@@ -39,9 +37,6 @@ pub struct App {
     pub cfg: AppConfig,
     pub pre: ServicePre<ObjState>,
     pub egress: Route,
-    /// `/app`, opened once and shared read-only by every object of the app,
-    /// so it costs one fd per app rather than one per live object.
-    pub static_dir: Option<Dir>,
     /// Its `wasi:config` values, shared by every object of the app.
     pub config: Arc<WasiConfigVariables>,
 }
@@ -89,25 +84,14 @@ impl App {
         let egress = match upstream {
             Some(u) => Route::Supervisor(u),
             None => Route::Direct(Arc::new(
-                EgressPolicy::parse(&cfg.limits.egress).with_context(|| format!("app {:?} egress", cfg.name))?,
+                EgressPolicy::parse(&cfg.limits.egress, node.dev).with_context(|| format!("app {:?} egress", cfg.name))?,
             )),
-        };
-        let static_dir = match &cfg.static_dir {
-            Some(d) if !d.is_dir() => bail!("app {:?}: static_dir {} is not a directory", cfg.name, d.display()),
-            // Reads through a shared directory fd don't interfere: every
-            // lookup is `*at` relative to it, and listing opens a fresh fd.
-            Some(d) => {
-                let fd = std::fs::File::open(d).with_context(|| format!("opening static_dir {}", d.display()))?;
-                Some(Dir::new(fd, FsPerms::ReadOnly, OpenMode::READ, true))
-            }
-            None => None,
         };
         Ok(App {
             name: cfg.name.as_str().into(),
             cfg: cfg.clone(),
             pre,
             egress,
-            static_dir,
             config: Arc::new(cfg.config.iter().collect()),
         })
     }

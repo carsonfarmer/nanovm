@@ -1,7 +1,9 @@
 #!/bin/sh
-# Builds everything, starts a nanovm node with demo/nanovm.toml (unless one is
-# already listening), and drives it over HTTP with curl while a canary object
-# is pinged throughout. Needs curl (7.84+) and jq. These numbers include
+# Builds everything, publishes the guests to a loopback registry, starts a
+# dev-mode nanovm node with demo/nanovm.toml (unless one is already
+# listening), and drives it over HTTP with curl while a canary object is
+# pinged throughout. Each request names its app with the headers the proxy
+# would set. Needs curl (7.84+) and jq. These numbers include
 # curl and the HTTP front end; `cargo run --release --example bench` measures
 # the node in-process.
 set -e
@@ -29,7 +31,21 @@ blast() {
 
 say "building guests and the node"
 scripts/build-guests.sh >/dev/null
-cargo build --release -p nanovm 2>&1 | tail -1
+cargo build --release -p nanovm --example dev-registry 2>&1 | tail -1
+
+say "publishing the guests to a registry on 127.0.0.1:5000"
+./target/release/examples/dev-registry >target/demo-apps.txt 2>target/demo-registry.log &
+REGISTRY=$!
+until [ "$(wc -l <target/demo-apps.txt)" -ge 2 ]; do
+    kill -0 $REGISTRY 2>/dev/null || { cat target/demo-registry.log; exit 1; }
+    sleep 0.1
+done
+# The headers naming each app, for `curl -H @file`.
+for app in counter hostile; do
+    printf 'nanovm-app: %s\nnanovm-trust: dev dev\n' "$(awk -v a=$app '$1 == a {print $2}' target/demo-apps.txt)" >target/demo-$app.h
+done
+C="-H @target/demo-counter.h" H="-H @target/demo-hostile.h"
+cat target/demo-apps.txt | sed 's/^/  /'
 
 SERVER=
 if curl -sf "$URL/_nanovm/stats" >/dev/null 2>&1; then
@@ -43,61 +59,61 @@ else
         sleep 0.1
     done
 fi
-echo "  stats: $URL/_nanovm/stats, events: $URL/_nanovm/events?app=<app>"
+echo "  stats: $URL/_nanovm/stats, events: $URL/_nanovm/events?app=<worker>"
 
 # The canary: one benign object, pinged every 20 ms for the whole demo.
 CANARY=target/demo-canary.txt
 : >"$CANARY"
 (
     while :; do
-        curl -s -o /dev/null -w '%{http_code} %{time_total}\n' "$URL/counter/canary/" >>"$CANARY"
+        curl -s $C -o /dev/null -w '%{http_code} %{time_total}\n' "$URL/canary/" >>"$CANARY"
         sleep 0.02
     done
 ) &
 PINGER=$!
-trap 'kill $PINGER 2>/dev/null; [ -n "$SERVER" ] && kill $SERVER 2>/dev/null; exit' INT TERM EXIT
+trap 'kill $PINGER $REGISTRY 2>/dev/null; [ -n "$SERVER" ] && kill $SERVER 2>/dev/null; exit' INT TERM EXIT
 
 say "every object is its own sandbox with its own /data"
-curl -s -XPOST "$URL/counter/alice/incr" >/dev/null
-echo "  alice: $(curl -s -XPOST "$URL/counter/alice/incr")"
-echo "  bob:   $(curl -s "$URL/counter/bob/")"
-echo "  path escapes: $(curl -s "$URL/hostile/demo/escape" | jq -c '[.[] | .result // .symlink] | unique')"
-echo "  egress to example.com (allowlisted): $(curl -s "$URL/hostile/demo/fetch?url=http://example.com/" | jq -c '{status, bytes, denied}')"
-echo "  egress to 169.254.169.254: $(curl -s "$URL/hostile/demo/fetch?url=http://169.254.169.254/latest/meta-data/" | jq -c .)"
+curl -s $C -XPOST "$URL/alice/incr" >/dev/null
+echo "  alice: $(curl -s $C -XPOST "$URL/alice/incr")"
+echo "  bob:   $(curl -s $C "$URL/bob/")"
+echo "  path escapes: $(curl -s $H "$URL/demo/escape" | jq -c '[.[] | .result // .symlink] | unique')"
+echo "  egress to example.com (allowlisted): $(curl -s $H "$URL/demo/fetch?url=http://example.com/" | jq -c '{status, bytes, denied}')"
+echo "  egress to 169.254.169.254: $(curl -s $H "$URL/demo/fetch?url=http://169.254.169.254/latest/meta-data/" | jq -c .)"
 
 say "cold-starting 5,000 new objects"
 # RSS of the supervisor plus every app's worker.
 rss='def rss: [.rss_mb, .apps[].rss_mb] | add;'
 before=$(curl -s "$URL/_nanovm/stats" | jq "$rss rss")
-blast 5000 64 5000 "counter/s$$-%d/"
+blast 5000 64 5000 "s$$-%d/" $C
 curl -s "$URL/_nanovm/stats" | jq -r --argjson b "$before" "$rss"'
     "  \([.apps[].live_objects] | add) live objects, RSS \(rss | floor) MB, \((rss - $b) * 1024 / 5000 | floor) KB per new object"'
 
 say "hammering 1,000 warm objects (50,000 requests)"
-blast 50000 64 1000 "counter/s$$-%d/"
+blast 50000 64 1000 "s$$-%d/" $C
 
 say "writing /data on 1,000 objects (10,000 POST /incr)"
-blast 10000 64 1000 "counter/s$$-%d/incr" -X POST
+blast 10000 64 1000 "s$$-%d/incr" $C -X POST
 
 say "one object serves one request at a time (5,000 requests, 1 client)"
-blast 5000 1 1 "counter/solo/"
+blast 5000 1 1 "solo/" $C
 
 say "attack storm: 10 rounds of every attack in the hostile guest, all at once"
 ATTACKS='/alloc?mb=1024 /spin /sleep?ms=60000 /panic /leak?n=1000000 /fill?mount=tmp&mb=1024 /files?mount=tmp
-/write-app /escape /fetch?url=http://169.254.169.254/latest/meta-data/ /fetch?url=http://localtest.me:8080/_nanovm/stats'
+/escape /fetch?url=http://169.254.169.254/latest/meta-data/ /fetch?url=http://localtest.me:8080/_nanovm/stats'
 : >target/demo-storm.cfg
 for r in 1 2 3 4 5 6 7 8 9 10; do
     k=0
     for a in $ATTACKS; do
         k=$((k + 1))
-        printf 'url = "%s/hostile/storm-%d-%d%s"\noutput = "/dev/null"\n' "$URL" "$k" "$r" "$a" >>target/demo-storm.cfg
+        printf 'url = "%s/storm-%d-%d%s"\noutput = "/dev/null"\n' "$URL" "$k" "$r" "$a" >>target/demo-storm.cfg
     done
 done
 t0=$(date +%s%N)
-curl -s -Z --parallel-max 110 -K target/demo-storm.cfg \
+curl -s $H -Z --parallel-max 100 -K target/demo-storm.cfg \
     -w '%{url} %{http_code} %header{x-nanovm-error} %{time_total}\n' >target/demo-storm.txt || true
 echo "  $(wc -l <target/demo-storm.txt) attacks in $((($(date +%s%N) - t0) / 1000000)) ms"
-sed 's|^[^ ]*/hostile/storm-[0-9]*-[0-9]*||' target/demo-storm.txt | awk '
+sed 's|^[^ ]*/storm-[0-9]*-[0-9]*||' target/demo-storm.txt | awk '
     { attack = $1; code = $2; why = (NF == 4) ? $3 : "refused"; t = $NF * 1000
       key = attack; out[key] = code " " why; if (t > slow[key]) slow[key] = t; n[key]++ }
     END { for (k in out) printf "  %-46s %d× %s, slowest %d ms\n", substr(k, 1, 46), n[k], out[k], slow[k] }' | sort
@@ -113,6 +129,6 @@ curl -s "$URL/_nanovm/stats" | jq -r '.workers as $w | .apps | to_entries[] |
 
 if [ -n "$SERVER" ]; then
     say "node still running on $URL (Ctrl-C to stop)"
-    trap 'kill $SERVER 2>/dev/null; exit' INT TERM EXIT
+    trap 'kill $SERVER $REGISTRY 2>/dev/null; exit' INT TERM EXIT
     wait $SERVER
 fi
