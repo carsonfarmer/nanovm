@@ -18,7 +18,7 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `jail.rs:131`
 - **Scenario:** `F_SETOWN` with `O_ASYNC` (and `F_SETSIG`) on a descriptor a worker holds makes the kernel signal a process of the worker's choosing when I/O arrives; the kernel checks only that the uids match. When the supervisor isn't root, workers share its uid, so code that got out of Wasm can stop the supervisor and other apps' workers.
 - **Reproduced:** yes (the mechanism, at the OS level, against a throwaway process)
-- **Status:** open
+- **Status:** fixing
 
 ## N-3: manifest digests become cache paths unchecked
 - **Where:** `registry.rs:151`, `registry.rs:187-193`
@@ -36,37 +36,37 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `quota.rs:476-478`, `journal.rs:186-191`, `journal.rs:267`
 - **Scenario:** `RemovedDir` is recorded before the removal, without checking that an empty directory is there. When the removal fails, rollback creates a directory that never existed and that the file count never charged; repeated, it takes the volume past `max_files`.
 - **Reproduced:** yes (journal compiled alone in a scratch harness)
-- **Status:** open
+- **Status:** fixing
 
 ## N-6: an inode is marked as size-recorded before the record is written
 - **Where:** `journal.rs:155-158`
 - **Scenario:** `sized.insert(ino)` runs before `record(Undo::Size(..))`. When the record fails (journal full), the retry skips it, and rollback can't undo the file's growth.
 - **Reproduced:** yes (scratch harness)
-- **Status:** open
+- **Status:** fixing
 
 ## N-7: undo bytes are read through the guest's own descriptor
 - **Where:** `journal.rs:162`
 - **Scenario:** Overwriting a file opened write-only fails with `EBADF`, because the old bytes are read with `read_exact_at` on the guest's descriptor.
 - **Reproduced:** yes (scratch harness)
-- **Status:** open
+- **Status:** fixing
 
 ## N-8: truncating an open file after unlinking it credits its bytes twice
 - **Where:** `quota.rs:588-592`, `journal.rs:108-115`, `quota.rs:123-133`
 - **Scenario:** Unlinking moves the file into the journal and credits its bytes. `local_file` still accepts the file there, so `set_size` credits them again. Repeated, committed data exceeds `disk_mb`.
 - **Reproduced:** no (from source)
-- **Status:** open
+- **Status:** fixing
 
 ## N-9: a failed `wasi:keyvalue` set keeps its quota adjustment
 - **Where:** `kv.rs:118-123`
 - **Scenario:** `reserve` changes the counters, then the journal steps can fail with a non-trap error (journal full); the reservation is never undone and the counters drift from the volume.
 - **Reproduced:** no (from source)
-- **Status:** open
+- **Status:** fixing
 
 ## N-10: eviction can drop an object that still has queued work
 - **Where:** `table.rs:195-207`, `table.rs:150-151`
 - **Scenario:** `evict_lru` picks entries whose phase is `Idle`, which an entry still is with a job queued but not yet received, or a WebSocket event waiting in the spawned send. The evicted actor drains its queue while the next request starts a second actor for the same object on the same volume.
 - **Reproduced:** no (from source)
-- **Status:** open
+- **Status:** fixing
 
 ## N-11: cancelling a version switch mid-drain can leave two workers on one app's volumes
 - **Where:** `supervisor.rs:334-337`
@@ -84,19 +84,19 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `link.rs:191-195`
 - **Scenario:** Every fd sent on a control socket becomes a served connection, with no limit. A worker can make the supervisor hold any number of connections (each one a pending outbound request), and the worker-side outbound limit (`egress.rs:140`) is only enforced inside the worker.
 - **Reproduced:** no (from source)
-- **Status:** open
+- **Status:** fixing
 
 ## N-14: publish bodies are collected with no deadline
 - **Where:** `ws.rs:407`
 - **Scenario:** The supervisor collects a publish body up to `response_max` with no time limit; a worker that sends part of one holds that memory for as long as it likes, per link (see N-13).
 - **Reproduced:** no (from source)
-- **Status:** open
+- **Status:** fixing
 
 ## N-15: forwarded responses have no body timeout
 - **Where:** `egress.rs:281-285`, `egress.rs:367-369`
 - **Scenario:** `serve_forwarded` bounds connecting and the first byte, but nothing bounds the response body after it, so a slow upstream holds the supervisor's connection and link for as long as it trickles.
 - **Reproduced:** no (from source)
-- **Status:** open
+- **Status:** fixing
 
 ## N-16: worker stderr without newlines grows one buffer without limit
 - **Where:** `supervisor.rs:402-407`
@@ -126,4 +126,4 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `ws.rs:409`
 - **Scenario:** Each publish walks all of the worker's sockets to find its object's; cost grows with the app's sockets, not the object's.
 - **Reproduced:** no (from source)
-- **Status:** open
+- **Status:** fixing
