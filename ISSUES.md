@@ -182,13 +182,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `supervisor.rs:519-525` (`drain`)
 - **Scenario:** `drain` drops the kill sender but doesn't wait for the process to exit, so the next worker can start on the same volumes a moment before the old one is dead.
 - **Reproduced:** no (phase 7 review; predates phase 7)
-- **Status:** fixing
+- **Status:** fixed in 04d2e62; no test, since SIGKILL ends the old process far faster than a new worker starts, so the race can't be made to fail on demand
 
 ### N-29 (efficiency): uid lookup and chown run on the front-end thread
 - **Where:** `supervisor.rs` (`uid`, `chown_tree`)
 - **Scenario:** blocking filesystem walks on the single-threaded front end stall every request on that thread while a worker starts.
 - **Reproduced:** no (phase 7 review; predates phase 7)
-- **Status:** fixing
+- **Status:** fixed in 04d2e62 (a latency change, no test)
 
 ### N-30: the proxy doesn't strip hop-by-hop headers
 - **Where:** `proxy.rs` (`forward`)
