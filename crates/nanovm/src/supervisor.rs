@@ -3,18 +3,19 @@
 //! and makes every outbound request on the workers' behalf under their app's
 //! egress policy, so the network is reachable only from outside the jails.
 //!
-//! An app is local (from the node config) or comes from a registry, named
-//! per request by the proxy (`registry`). A request naming a digest the app's
-//! worker isn't running switches the app to it: the new version is fetched
-//! and verified, the old worker drains (no new requests; in-flight ones
-//! finish), and a fresh worker starts, so an object is never live in two.
+//! Every request names its app's version, as the proxy found it (see
+//! `registry`); a request without one reaches only the node's own routes.
+//! A request naming a digest the app's worker isn't running switches the app
+//! to it: the new version is fetched and verified, the old worker drains (no
+//! new requests; in-flight ones finish), and a fresh worker starts, so an
+//! object is never live in two. Public paths are `/{object}/{rest}`.
 //!
 //! Each worker gets two control sockets (see `link`): on fd 3 the supervisor
 //! hands it connections for requests, and on fd 4 the worker hands the
 //! supervisor connections for its guests' outbound requests. Its config and
 //! component arrive on stdin, read before the worker jails itself.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
@@ -31,7 +32,7 @@ use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
 
@@ -39,10 +40,10 @@ use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
 use crate::jail::Jail;
 use crate::link::{self, Dialer};
-use crate::registry::{APP_HEADER, AppRef, MIN_VERSION_HEADER, Registry, TRUST_HEADER};
+use crate::registry::{APP_HEADER, AppRef, MIN_VERSION_HEADER, Policy, Registry, TRUST_HEADER};
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
-use crate::table::{Node, valid_name};
+use crate::table::{BAD_OBJECT, Node, route};
 use crate::ws::{self, Sockets};
 
 pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
@@ -51,6 +52,8 @@ pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 /// Compiling a large component on first start can take a while.
 const START_TIMEOUT: Duration = Duration::from_secs(120);
+/// The longest line of a worker's stderr passed on whole.
+const MAX_LINE: u64 = 4096;
 
 pub struct Supervisor {
     cfg: NodeConfig,
@@ -69,16 +72,21 @@ pub struct Supervisor {
 
 struct Worker {
     name: String,
-    /// The app's config, for a local app; a registry app's comes with each
-    /// version.
-    local: Option<AppConfig>,
     live: Mutex<Option<Arc<Live>>>,
-    /// Held while (re)starting, so starts are single-flight; holds the time
-    /// of the last failed start.
-    starting: tokio::sync::Mutex<Option<Instant>>,
+    /// Held while starting or switching, so they are single-flight; holds
+    /// the last failed start, which is answered again for a while rather
+    /// than retried.
+    starting: tokio::sync::Mutex<Option<Failed>>,
     starts: AtomicU64,
     /// Requests that failed between the supervisor and the worker.
     link_errors: AtomicU64,
+}
+
+struct Failed {
+    at: Instant,
+    digest: String,
+    policy: Policy,
+    why: String,
 }
 
 /// A running worker process. Every request to it, and every response body
@@ -86,9 +94,11 @@ struct Worker {
 struct Live {
     link: Arc<Dialer<Body>>,
     pid: u32,
-    /// The registry digest and version it runs (`None` for a local app).
-    digest: Option<String>,
-    version: Option<String>,
+    /// The app version it runs.
+    digest: String,
+    version: semver::Version,
+    /// The policies that have accepted it.
+    policies: Mutex<HashSet<Policy>>,
     /// How long its longest request may take, to bound a drain.
     drain: Duration,
     sockets: Arc<Sockets>,
@@ -106,180 +116,130 @@ impl Live {
 }
 
 impl Worker {
-    fn new(name: &str, local: Option<AppConfig>) -> Arc<Worker> {
-        Arc::new(Worker {
-            name: name.to_string(),
-            local,
-            live: Mutex::default(),
-            starting: Default::default(),
-            starts: AtomicU64::new(0),
-            link_errors: AtomicU64::new(0),
-        })
-    }
-
     fn live(&self) -> Option<Arc<Live>> {
         self.live.lock().clone().filter(|l| l.alive())
     }
 }
 
 impl Supervisor {
-    /// Starts a worker for every local app; fails if any of them fails to
-    /// start. `threads` is the number of front-end threads that will call
-    /// `handle`.
-    pub async fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
+    /// `threads` is the number of front-end threads that will call `handle`.
+    pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
-        let workers = cfg.apps.iter().map(|a| (a.name.clone(), Worker::new(&a.name, Some(a.clone())))).collect();
-        let sup = Arc::new(Supervisor {
-            registry: Registry::new(cfg.data_dir.join("registry"))?,
+        Ok(Arc::new(Supervisor {
+            registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
             cfg,
             threads,
             exe,
-            workers: Mutex::new(workers),
+            workers: Mutex::default(),
             uids: Mutex::default(),
             sockets: Arc::default(),
             started: Instant::now(),
-        });
-        let local: Vec<_> = sup.workers.lock().values().cloned().collect();
-        for w in local {
-            sup.start(&w, None)
-                .await
-                .with_context(|| format!("starting the worker for app {:?}", w.name))?;
-        }
-        Ok(sup)
+        }))
     }
 
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         let mut req = req.map(|b| b.boxed_unsync());
-        match req.uri().path() {
-            "/_nanovm/stats" => return self.stats().await,
-            "/_nanovm/events" => {
-                let q: HashMap<_, _> = query(req.uri());
-                let Some(w) = q.get("app").and_then(|a| self.workers.lock().get(*a).cloned()) else {
-                    return error_response(404, "no-such-app", "events take ?app=<name>&since=<seq>");
-                };
-                let pq = format!("/_nanovm/events?since={}", q.get("since").unwrap_or(&"0"));
-                let (mut parts, body) = req.into_parts();
-                parts.uri = pq.parse().expect("a valid path");
-                return self.forward(&w, Request::from_parts(parts, body), None).await;
-            }
-            _ => {}
-        }
         let want = match AppRef::from_headers(req.headers()) {
-            Ok(w) => w,
+            Ok(Some(w)) => w,
+            Ok(None) => return self.admin(req).await,
             Err(e) => return error_response(400, "bad-app-ref", &format!("{e:#}")),
         };
         for h in [APP_HEADER, TRUST_HEADER, MIN_VERSION_HEADER] {
             req.headers_mut().remove(h);
         }
-        let app = req.uri().path().trim_start_matches('/').split('/').next().unwrap_or("");
-        let w = {
-            let mut workers = self.workers.lock();
-            match (workers.get(app), &want) {
-                (Some(w), Some(_)) if w.local.is_some() => {
-                    return error_response(409, "app-is-local", "a local app can't be named from a registry");
-                }
-                (Some(w), _) => w.clone(),
-                (None, Some(_)) if valid_name(app) && !app.starts_with('_') => {
-                    workers.entry(app.to_string()).or_insert_with(|| Worker::new(app, None)).clone()
-                }
-                (None, _) => return error_response(404, "no-such-app", app),
-            }
-        };
-        if ws::wants(&req) {
-            return self.socket(w, req, want.as_ref()).await;
+        if route(req.uri().path()).is_none() {
+            return error_response(400, "bad-object-id", BAD_OBJECT);
         }
+        let name = want.name();
+        let w = self.workers.lock().entry(name.clone()).or_insert_with(|| {
+            Arc::new(Worker {
+                name,
+                live: Mutex::default(),
+                starting: Default::default(),
+                starts: AtomicU64::new(0),
+                link_errors: AtomicU64::new(0),
+            })
+        }).clone();
         if ws::is_event(&req) {
             return error_response(400, "not-an-event", "socket events come from the node");
         }
-        self.forward(&w, req, want.as_ref()).await
-    }
-
-    /// Opens a WebSocket on the object `req` names, on the worker running the
-    /// version `want` names. Its events go to that worker while it is the
-    /// app's, each bounded by the worker's longest request.
-    async fn socket(&self, w: Arc<Worker>, req: Request<Body>, want: Option<&AppRef>) -> Response<RespBody> {
-        let live = match self.live(&w, want).await {
+        let live = match self.live(&w, &want).await {
             Ok(l) => l,
             Err(res) => return res,
         };
-        let Some(object) = req.uri().path().split('/').nth(2).filter(|o| valid_name(o)).map(str::to_string) else {
-            return error_response(400, "bad-object-id", "object ids are [A-Za-z0-9_.-]{1,128}");
-        };
-        let (weak, max) = (Arc::downgrade(&live), live.sockets.caps.response_max);
-        let deliver: ws::Deliver = Box::new(move |req| {
-            let (w, weak) = (w.clone(), weak.clone());
-            Box::pin(async move {
-                let Some(live) = weak.upgrade().filter(|l| w.live().is_some_and(|c| Arc::ptr_eq(&c, l))) else {
-                    return ws::Reply::Gone;
+        if ws::wants(&req) {
+            return socket(w, live, req).await;
+        }
+        forward(&w, live, req).await
+    }
+
+    /// The node's own routes, for requests that name no app.
+    async fn admin(&self, req: Request<Body>) -> Response<RespBody> {
+        match req.uri().path() {
+            "/_nanovm/stats" => self.stats().await,
+            "/_nanovm/events" => {
+                let q: HashMap<_, _> = query(req.uri());
+                let w = q.get("app").and_then(|a| self.workers.lock().get(*a).cloned());
+                let Some((w, live)) = w.and_then(|w| Some((w.clone(), w.live()?))) else {
+                    return error_response(404, "no-such-app", "events take ?app=<running app>&since=<seq>");
                 };
-                match live.link.send(req).await {
-                    Ok(res) => ws::answer(res, max).await,
-                    Err(_) if w.live().is_some_and(|c| Arc::ptr_eq(&c, &live)) => ws::Reply::Bad(502),
-                    Err(_) => ws::Reply::Gone,
-                }
-            })
-        });
-        let (sockets, gone) = (live.sockets.clone(), live.gone.clone());
-        drop(live);
-        // Its own task: a client that hangs up mid-`OPEN` would otherwise
-        // cancel it after the object accepted, and the object would never
-        // hear the socket ended.
-        let open = tokio::spawn(async move { sockets.open(&object, req, gone, deliver).await });
-        match open.await.unwrap_or(Err((500, "opening the socket failed"))) {
-            Ok(res) => res.map(|()| Empty::new().map_err(|e| match e {}).boxed_unsync()),
-            Err((status, why)) => {
-                let mut res = error_response(status, "socket-refused", why);
-                res.headers_mut().insert(http::header::SEC_WEBSOCKET_VERSION, "13".parse().unwrap());
-                res
+                let pq = format!("/_nanovm/events?since={}", q.get("since").unwrap_or(&"0"));
+                let (mut parts, body) = req.into_parts();
+                parts.uri = pq.parse().expect("a valid path");
+                forward(&w, live, Request::from_parts(parts, body)).await
             }
+            _ => error_response(400, "no-app", "requests name their app (nanovm-app)"),
         }
     }
 
-    async fn forward(&self, w: &Worker, req: Request<Body>, want: Option<&AppRef>) -> Response<RespBody> {
-        let live = match self.live(w, want).await {
-            Ok(l) => l,
-            Err(res) => return res,
-        };
-        match live.link.send(req).await {
-            // The body holds the worker until it has been read; see `drain`.
-            Ok(res) => res.map(|b| {
-                b.map_frame(move |f| {
-                    let _ = &live;
-                    f
-                })
-                .map_err(Into::into)
-                .boxed_unsync()
-            }),
-            Err(e) => {
-                w.link_errors.fetch_add(1, Relaxed);
-                error_response(502, "worker-down", &e.to_string())
-            }
-        }
-    }
-
-    /// The worker running the version `want` names (any, if it names none),
+    /// The worker running the version `want` names, under its policy,
     /// starting or switching to it as needed.
-    async fn live(&self, w: &Worker, want: Option<&AppRef>) -> Result<Arc<Live>, Response<RespBody>> {
-        let wanted = || {
-            w.live()
-                .filter(|l| want.is_none_or(|r| l.digest.as_ref() == Some(&r.digest)))
-        };
-        if let Some(l) = wanted() {
+    async fn live(self: &Arc<Self>, w: &Arc<Worker>, want: &AppRef) -> Result<Arc<Live>, Response<RespBody>> {
+        if let Some(l) = w.live().filter(|l| l.digest == want.digest && l.policies.lock().contains(&want.policy)) {
             return Ok(l);
         }
+        // In its own task: once begun, a switch finishes even if every
+        // request waiting for it goes away.
+        let (sup, w, want) = (self.clone(), w.clone(), want.clone());
+        match tokio::spawn(async move { sup.ensure(&w, &want).await }).await {
+            Ok(live) => live,
+            Err(e) => Err(error_response(500, "worker-down", &e.to_string())),
+        }
+    }
+
+    async fn ensure(&self, w: &Worker, want: &AppRef) -> Result<Arc<Live>, Response<RespBody>> {
+        let down = |why: &str| error_response(502, "worker-down", why);
         let mut failed = w.starting.lock().await;
-        if let Some(l) = wanted() {
+        if let Some(l) = w.live().filter(|l| l.digest == want.digest) {
+            if !l.policies.lock().contains(&want.policy) {
+                let ok = self.registry.authorize(want, &l.version).await;
+                ok.map_err(|e| down(&format!("{e:#}")))?;
+                l.policies.lock().insert(want.policy.clone());
+            }
             return Ok(l);
         }
-        if failed.is_some_and(|t| t.elapsed() < RESTART_BACKOFF) {
-            return Err(error_response(503, "worker-restarting", &w.name));
+        if let Some(f) = &*failed
+            && f.at.elapsed() < RESTART_BACKOFF
+            && (&f.digest, &f.policy) == (&want.digest, &want.policy)
+        {
+            return Err(down(&f.why));
         }
         match self.start(w, want).await {
-            Ok(()) => Ok(w.live().expect("just started")),
+            Ok(l) => {
+                *failed = None;
+                Ok(l)
+            }
             Err(e) => {
-                *failed = Some(Instant::now());
-                eprintln!("nanovm: worker for app {:?}: {e:#}", w.name);
-                Err(error_response(502, "worker-down", &format!("{e:#}")))
+                let why = format!("{e:#}");
+                eprintln!("nanovm: worker for app {:?}: {why}", w.name);
+                let res = down(&why);
+                *failed = Some(Failed {
+                    at: Instant::now(),
+                    digest: want.digest.clone(),
+                    policy: want.policy.clone(),
+                    why,
+                });
+                Err(res)
             }
         }
     }
@@ -306,31 +266,19 @@ impl Supervisor {
         Ok(Some(uid))
     }
 
-    /// Gets the app version `want` names (or the local app), retires the
-    /// running worker, then spawns a new one, places it in its cgroup, hands
-    /// it its config and component, and waits until it answers.
-    async fn start(&self, w: &Worker, want: Option<&AppRef>) -> anyhow::Result<()> {
-        let (app, wasm, digest, version) = match (want, &w.local) {
-            (Some(r), _) => {
-                let p = self.registry.load(r).await.with_context(|| format!("loading {}", r.reference))?;
-                let app = AppConfig {
-                    name: w.name.clone(),
-                    component: PathBuf::new(),
-                    static_dir: None,
-                    env: p.spec.env,
-                    config: p.spec.config,
-                    limits: p.spec.limits.clamped(&self.cfg.registry_limits),
-                    worker: self.cfg.registry_worker.clone(),
-                };
-                (app, p.wasm, Some(r.digest.clone()), Some(p.version.to_string()))
-            }
-            (None, Some(app)) => {
-                let wasm = std::fs::read(&app.component).with_context(|| format!("reading {}", app.component.display()))?;
-                (app.clone(), wasm, None, None)
-            }
-            (None, None) => bail!("requests for a registry app must name its version ({APP_HEADER})"),
+    /// Gets the app version `want` names, retires the running worker, then
+    /// spawns a new one, places it in its cgroup, hands it its config and
+    /// component, and waits until it answers.
+    async fn start(&self, w: &Worker, want: &AppRef) -> anyhow::Result<Arc<Live>> {
+        let p = self.registry.load(want).await.with_context(|| format!("loading {}", want.reference))?;
+        let app = AppConfig {
+            name: w.name.clone(),
+            env: p.spec.env,
+            config: p.spec.config,
+            limits: p.spec.limits.clamped(&self.cfg.limits),
+            worker: self.cfg.worker.clone(),
         };
-        let policy = EgressPolicy::parse(&app.limits.egress).context("egress")?;
+        let policy = EgressPolicy::parse(&app.limits.egress, self.cfg.dev).context("egress")?;
         let old = w.live.lock().take();
         if let Some(old) = old {
             drain(old).await;
@@ -373,7 +321,7 @@ impl Supervisor {
             place_in_cgroup(root, &app, pid)?;
         }
 
-        // The worker's spec: the node config with only its app, and its uid.
+        // The worker's spec: the node config, its app, and its uid.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
         let kb = |k: u64| (k << 10) as usize;
         let caps = ws::Caps {
@@ -385,28 +333,28 @@ impl Supervisor {
             response_max: kb(app.limits.max_response_body_kb),
             backlog: kb(app.limits.socket_backlog_kb),
         };
-        let node = NodeConfig {
-            apps: vec![app],
-            ..self.cfg.clone()
-        };
-        let mut spec = serde_json::to_vec(&(node, uid))?;
+        let mut spec = serde_json::to_vec(&(&self.cfg, &app, uid))?;
         spec.push(b'\n');
         let mut stdin = child.stdin.take().expect("piped");
         stdin.write_all(&spec).await?;
-        stdin.write_all(&wasm).await?;
+        stdin.write_all(&p.wasm).await?;
         drop(stdin);
 
-        // The worker's stderr goes to ours, tagged with its app. It closes when
-        // the worker exits, and the last line explains a failed start.
+        // The worker's stderr goes to ours, tagged with its app, a line (of at
+        // most `MAX_LINE`) at a time. It closes when the worker exits, and
+        // the last line explains a failed start.
         let app = w.name.clone();
-        let mut lines = tokio::io::BufReader::new(child.stderr.take().expect("piped")).lines();
+        let mut stderr = tokio::io::BufReader::new(child.stderr.take().expect("piped"));
         let last_words = tokio::spawn(async move {
-            let mut last = String::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("nanovm[{app}]: {line}");
-                last = line;
+            let (mut line, mut last) = (Vec::new(), String::new());
+            loop {
+                line.clear();
+                match (&mut stderr).take(MAX_LINE).read_until(b'\n', &mut line).await {
+                    Ok(0) | Err(_) => return last,
+                    Ok(_) => last = String::from_utf8_lossy(&line).trim_end().to_string(),
+                }
+                eprintln!("nanovm[{app}]: {last}");
             }
-            last
         });
 
         // Watches the process; dropping `kill` (with the `Live`) kills it.
@@ -444,8 +392,9 @@ impl Supervisor {
         let live = Arc::new(Live {
             link: Dialer::new(requests, self.threads),
             pid,
-            digest,
-            version,
+            digest: want.digest.clone(),
+            version: p.version,
+            policies: Mutex::new(HashSet::from([want.policy.clone()])),
             drain,
             sockets,
             gone,
@@ -459,9 +408,9 @@ impl Supervisor {
         });
         let e = match ready.await {
             Ok(Ok(())) => {
-                *w.live.lock() = Some(live);
+                *w.live.lock() = Some(live.clone());
                 w.starts.fetch_add(1, Relaxed);
-                return Ok(());
+                return Ok(live);
             }
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => format!("no answer within {START_TIMEOUT:?}"),
@@ -483,8 +432,8 @@ impl Supervisor {
                 name.clone(),
                 json!({
                     "pid": live.as_ref().map(|l| l.pid),
-                    "digest": live.as_ref().and_then(|l| l.digest.clone()),
-                    "version": live.as_ref().and_then(|l| l.version.clone()),
+                    "digest": live.as_ref().map(|l| l.digest.clone()),
+                    "version": live.as_ref().map(|l| l.version.to_string()),
                     "starts": w.starts.load(Relaxed),
                     "up": live.is_some(),
                     "link_errors": w.link_errors.load(Relaxed),
@@ -505,6 +454,58 @@ impl Supervisor {
             "workers": workers,
             "apps": apps,
         }))
+    }
+}
+
+/// Opens a WebSocket on the object `req` names, on `live`. Its events go to
+/// that worker while it is the app's, each bounded by its longest request.
+async fn socket(w: Arc<Worker>, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
+    let object = route(req.uri().path()).expect("checked by `handle`").0.to_string();
+    let (weak, max) = (Arc::downgrade(&live), live.sockets.caps.response_max);
+    let deliver: ws::Deliver = Box::new(move |req| {
+        let (w, weak) = (w.clone(), weak.clone());
+        Box::pin(async move {
+            let Some(live) = weak.upgrade().filter(|l| w.live().is_some_and(|c| Arc::ptr_eq(&c, l))) else {
+                return ws::Reply::Gone;
+            };
+            match live.link.send(req).await {
+                Ok(res) => ws::answer(res, max).await,
+                Err(_) if w.live().is_some_and(|c| Arc::ptr_eq(&c, &live)) => ws::Reply::Bad(502),
+                Err(_) => ws::Reply::Gone,
+            }
+        })
+    });
+    let (sockets, gone) = (live.sockets.clone(), live.gone.clone());
+    drop(live);
+    // Its own task: a client that hangs up mid-`OPEN` would otherwise
+    // cancel it after the object accepted, and the object would never
+    // hear the socket ended.
+    let open = tokio::spawn(async move { sockets.open(&object, req, gone, deliver).await });
+    match open.await.unwrap_or(Err((500, "opening the socket failed"))) {
+        Ok(res) => res.map(|()| Empty::new().map_err(|e| match e {}).boxed_unsync()),
+        Err((status, why)) => {
+            let mut res = error_response(status, "socket-refused", why);
+            res.headers_mut().insert(http::header::SEC_WEBSOCKET_VERSION, "13".parse().unwrap());
+            res
+        }
+    }
+}
+
+async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
+    match live.link.send(req).await {
+        // The body holds the worker until it has been read; see `drain`.
+        Ok(res) => res.map(|b| {
+            b.map_frame(move |f| {
+                let _ = &live;
+                f
+            })
+            .map_err(Into::into)
+            .boxed_unsync()
+        }),
+        Err(e) => {
+            w.link_errors.fetch_add(1, Relaxed);
+            error_response(502, "worker-down", &e.to_string())
+        }
     }
 }
 
@@ -586,9 +587,9 @@ pub fn worker_main() -> anyhow::Result<()> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let nl = input.iter().position(|&b| b == b'\n').context("no worker spec on stdin")?;
-    let (cfg, uid): (NodeConfig, Option<u32>) = serde_json::from_slice(&input[..nl]).context("worker spec")?;
+    let (cfg, app, uid): (NodeConfig, AppConfig, Option<u32>) =
+        serde_json::from_slice(&input[..nl]).context("worker spec")?;
     let wasm = input.split_off(nl + 1);
-    let app = cfg.apps.first().context("worker spec names no app")?;
     // SAFETY: the supervisor put these sockets at fds 3 and 4 and nothing
     // else in this process owns them.
     let (requests, upstream) = unsafe { (UnixStream::from_raw_fd(3), UnixStream::from_raw_fd(4)) };
@@ -596,12 +597,10 @@ pub fn worker_main() -> anyhow::Result<()> {
     // Before the jail, which stops raising the fd limit and reading sysctls.
     crate::engine::preflight(&cfg)?;
 
-    let mut read_only: Vec<PathBuf> = app.static_dir.iter().cloned().collect();
-    read_only.push("/proc/self".into());
     Jail {
         uid,
         read_write: cfg.app_dirs(&app.name).into(),
-        read_only,
+        read_only: vec!["/proc/self".into()],
     }
     .enter()
     .context("entering the jail")?;
@@ -609,7 +608,7 @@ pub fn worker_main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
         let upstream = Dialer::new(upstream, 1);
-        let node = Node::from_wasm(cfg, vec![wasm], Some(upstream))?;
+        let node = Node::new(cfg, &app, &wasm, Some(upstream))?;
         let requests = tokio::net::UnixStream::from_std(requests)?;
         link::serve(requests, move |req| crate::server::handle(node.clone(), req)).await
     })

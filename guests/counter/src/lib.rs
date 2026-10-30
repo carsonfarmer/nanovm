@@ -59,10 +59,6 @@ async fn route(req: Req, hits: u64) -> Result<Response, ErrorCode> {
                 Err(e) => json(507, format!("{{\"error\":{}}}", js(&util::fs_err(&e)))),
             }
         }
-        ("GET", "/static") => match util::read_file("/app", "hello.txt").await {
-            Ok(b) => util::respond(200, "text/plain; charset=utf-8", b),
-            Err(e) => text(404, util::fs_err(&e)),
-        },
         ("GET", p) if p.starts_with("/config/") => match util::config::get(&p[8..]) {
             Ok(Some(v)) => text(200, v),
             Ok(None) => text(404, "no such config key"),

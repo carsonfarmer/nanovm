@@ -5,9 +5,8 @@
 //! stock one. Every call is delegated, except that calls which can consume
 //! bytes or directory entries are checked against the object's budget first,
 //! and writes go through a counting stream consumer. Both writable mounts
-//! share one budget; `/app` is read-only, so the stock host refuses every
-//! mutation there before any usage changes. Hard links and symlinks are
-//! refused so the accounting stays exact.
+//! share one budget. Hard links and symlinks are refused so the accounting
+//! stays exact.
 
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -302,14 +301,7 @@ impl types::HostDescriptor for QuotaView<'_> {
 
 impl preopens::Host for QuotaView<'_> {
     fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
-        let mut dirs = preopens::Host::get_directories(&mut self.0.filesystem())?;
-        if let Some(app) = self.0.app_dir.clone() {
-            dirs.push((
-                self.0.filesystem().table.push(Descriptor::Dir(app))?,
-                "/app".to_string(),
-            ));
-        }
-        Ok(dirs)
+        preopens::Host::get_directories(&mut self.0.filesystem())
     }
 }
 

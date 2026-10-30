@@ -12,6 +12,7 @@ pub mod kv;
 pub mod link;
 pub mod metrics;
 pub mod object;
+pub mod proxy;
 pub mod quota;
 pub mod registry;
 pub mod server;

@@ -1,1 +1,0 @@
-Hello from /app — a read-only mount shared by every object of this app.

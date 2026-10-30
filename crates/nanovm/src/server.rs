@@ -1,7 +1,7 @@
-//! The node's HTTP surface: `/{app}/{object}/{rest}` goes to the object, and
+//! The node's HTTP surface: `/{object}/{rest}` goes to the object, and
 //! `/_nanovm/stats` and `/_nanovm/events` serve the node's metrics and event
-//! log. In-process nodes serve it on TCP; a worker serves it to its
-//! supervisor over a `link`.
+//! log. A worker serves it to its supervisor over a `link`; tests serve it
+//! on TCP.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
-use crate::table::Node;
+use crate::table::{BAD_OBJECT, Node, route};
 
 /// Serves HTTP/1.1 on every connection `listener` accepts.
 pub async fn serve_http1<F, Fut>(listener: TcpListener, f: F) -> anyhow::Result<()>
@@ -54,21 +54,16 @@ pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBod
     if let Some(rest) = path.strip_prefix("/_nanovm") {
         return admin(&node, rest, &req).await;
     }
-    let mut parts = path.trim_start_matches('/').splitn(3, '/');
-    // `dispatch` rejects an empty or invalid object id.
-    let (Some(app), Some(id)) = (parts.next(), parts.next()) else {
-        return error_response(404, "not-found", "routes are /{app}/{object}/{path}");
+    let Some((id, rest)) = route(&path) else {
+        return error_response(400, "bad-object-id", BAD_OBJECT);
     };
-    let Some(a) = node.apps.get(app) else {
-        return error_response(404, "no-such-app", app);
-    };
-    let rest = format!("/{}", parts.next().unwrap_or(""));
+    let rest = if rest.is_empty() { "/" } else { rest };
     let pq = match req.uri().query() {
         Some(q) => format!("{rest}?{q}"),
-        None => rest,
+        None => rest.to_string(),
     };
 
-    let limit = (a.cfg.limits.max_request_body_kb << 10) as usize;
+    let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
     let (mut parts, body) = req.into_parts();
     let body = match Limited::new(body, limit).collect().await {
         Ok(b) => b.to_bytes(),
@@ -90,7 +85,7 @@ pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBod
         Ok(u) => u,
         Err(_) => return error_response(400, "bad-uri", &pq),
     };
-    node.dispatch(a, id, Request::from_parts(parts, body)).await
+    node.dispatch(id, Request::from_parts(parts, body)).await
 }
 
 pub fn ok_json(v: serde_json::Value) -> Response<RespBody> {
@@ -121,6 +116,6 @@ fn stats(node: &Node) -> serde_json::Value {
     v["live_objects"] = json!(node.live_objects());
     v["max_live_objects"] = json!(node.cfg.max_live_objects);
     v["phases"] = json!(node.phases());
-    v["apps"] = node.apps.values().map(|a| json!({ "name": &*a.name, "limits": a.cfg.limits })).collect();
+    v["app"] = json!({ "name": &*node.app.name, "limits": node.app.cfg.limits });
     v
 }

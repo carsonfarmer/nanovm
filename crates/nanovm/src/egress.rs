@@ -23,8 +23,7 @@ enum HostPat {
     Exact(String),
     /// `*.example.com` matches `a.example.com`, not `example.com`.
     Suffix(String),
-    /// An IP literal; the operator named it explicitly, so it bypasses the
-    /// private-range filter.
+    /// An IP literal: public, unless in dev mode.
     Ip(IpAddr),
 }
 
@@ -40,7 +39,9 @@ pub struct EgressPolicy {
 }
 
 impl EgressPolicy {
-    pub fn parse(entries: &[String]) -> anyhow::Result<Self> {
+    /// An app's list. Its author is the tenant, so it may name no private
+    /// address, unless `dev`.
+    pub fn parse(entries: &[String], dev: bool) -> anyhow::Result<Self> {
         let mut rules = Vec::new();
         for e in entries {
             let e = e.trim().to_ascii_lowercase();
@@ -53,7 +54,8 @@ impl EgressPolicy {
             let host = a.host().trim_start_matches('[').trim_end_matches(']');
             let host = match host.parse::<IpAddr>() {
                 _ if wild => HostPat::Suffix(format!(".{host}")),
-                Ok(ip) => HostPat::Ip(ip),
+                Ok(ip) if dev || is_global(ip) => HostPat::Ip(ip),
+                Ok(_) => anyhow::bail!("egress entry {e:?} is a private address"),
                 Err(_) => HostPat::Exact(host.to_string()),
             };
             rules.push(Rule {
@@ -399,7 +401,7 @@ mod tests {
             "api.example.com".into(),
             "*.cdn.example.net:443".into(),
             "127.0.0.1:9000".into(),
-        ])
+        ], true)
         .unwrap();
         assert!(p.matches("api.example.com", 443).is_some());
         assert!(p.matches("API.EXAMPLE.COM", 80).is_some());
@@ -436,7 +438,7 @@ mod tests {
     }
 
     fn policy(entries: &[&str]) -> EgressPolicy {
-        EgressPolicy::parse(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>()).unwrap()
+        EgressPolicy::parse(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>(), true).unwrap()
     }
 
     /// Entries that aren't `host`, `host:port` or `*.suffix[:port]` are
@@ -456,10 +458,10 @@ mod tests {
             "[::1",
             "::1]",
         ] {
-            let e = EgressPolicy::parse(&[bad.to_string()]).unwrap_err().to_string();
+            let e = EgressPolicy::parse(&[bad.to_string()], true).unwrap_err().to_string();
             assert!(e.starts_with("bad egress entry"), "{bad:?}: {e}");
         }
-        assert!(EgressPolicy::parse(&[]).unwrap().rules.is_empty());
+        assert!(EgressPolicy::parse(&[], false).unwrap().rules.is_empty());
         assert!(policy(&[]).matches("a.com", 443).is_none(), "an empty list denies all");
     }
 
@@ -482,8 +484,21 @@ mod tests {
     #[test]
     fn parse_refuses_bad_ports() {
         for bad in ["a.com:99999", "a.com:8o", "*.a.com:-1", "a.com:"] {
-            assert!(EgressPolicy::parse(&[bad.to_string()]).is_err(), "{bad:?}");
+            assert!(EgressPolicy::parse(&[bad.to_string()], true).is_err(), "{bad:?}");
         }
+    }
+
+    /// Outside dev mode a list names no private address: the tenant wrote
+    /// it. Public addresses and names (checked once resolved) are fine.
+    #[test]
+    fn parse_refuses_private_addresses_unless_dev() {
+        for private in ["127.0.0.1:9000", "169.254.169.254", "[::1]", "10.0.0.1", "[::ffff:127.0.0.1]:80"] {
+            let e = EgressPolicy::parse(&[private.to_string()], false).unwrap_err().to_string();
+            assert!(e.contains("private address"), "{private}: {e}");
+            EgressPolicy::parse(&[private.to_string()], true).unwrap();
+        }
+        let public = ["1.1.1.1:443", "[2606:4700:4700::1111]", "localhost", "*.0.0.1"].map(String::from);
+        EgressPolicy::parse(&public, false).unwrap();
     }
 
     /// IPv6 literals are bracketed, with or without a port, and match the

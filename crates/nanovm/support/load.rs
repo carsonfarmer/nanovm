@@ -30,17 +30,14 @@ impl Reply {
 }
 
 /// Sends `method path` with `body` to object `id` of `app` and reads the reply.
-pub async fn request(node: &Arc<Node>, method: &str, app: &str, id: &str, path: &str, body: &str) -> Reply {
+pub async fn request(node: &Arc<Node>, method: &str, id: &str, path: &str, body: &str) -> Reply {
     let t0 = Instant::now();
     let req = http::Request::builder()
         .method(Method::from_bytes(method.as_bytes()).unwrap_or(Method::GET))
         .uri(format!("http://localhost{path}"))
         .body(Bytes::from(body.to_string()))
         .unwrap();
-    let resp = match node.apps.get(app) {
-        Some(a) => node.dispatch(a, id, req).await,
-        None => nanovm::object::error_response(404, "no-such-app", app),
-    };
+    let resp = node.dispatch(id, req).await;
     let status = resp.status().as_u16();
     let error = resp
         .headers()
@@ -113,7 +110,6 @@ impl Run {
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     node: &Arc<Node>,
-    app: &str,
     method: &str,
     path: &str,
     n: usize,
@@ -127,7 +123,7 @@ pub async fn run(
     let clients: Vec<_> = (0..conc.clamp(1, n.max(1)))
         .map(|_| {
             let (node, next, id) = (node.clone(), next.clone(), id.clone());
-            let (app, method, path) = (app.to_string(), method.to_string(), path.to_string());
+            let (method, path) = (method.to_string(), path.to_string());
             tokio::spawn(async move {
                 let mut run = Run::default();
                 loop {
@@ -135,7 +131,7 @@ pub async fn run(
                     if i >= n || until.is_some_and(|d| Instant::now() >= d) {
                         return run;
                     }
-                    run.add(&request(&node, &method, &app, &id(i), &path, "").await);
+                    run.add(&request(&node, &method, &id(i), &path, "").await);
                 }
             })
         })

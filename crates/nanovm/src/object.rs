@@ -240,8 +240,6 @@ pub struct ObjState {
     cpu_budget_ns: u64,
     cpu_exceeded: bool,
     stderr: LogTail,
-    /// The app's shared `/app` preopen; see `App::static_dir`.
-    pub app_dir: Option<wasmtime_wasi::filesystem::Dir>,
     pub quota: QuotaGuard,
     /// The host directory behind `/data`.
     pub(crate) volume: std::path::PathBuf,
@@ -331,7 +329,6 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         cpu_budget_ns: limits.cpu_ms * 1_000_000,
         cpu_exceeded: false,
         stderr,
-        app_dir: app.static_dir.clone(),
         quota,
         volume: data_dir.clone(),
         config: app.config.clone(),
@@ -699,7 +696,6 @@ impl ObjState {
             cpu_budget_ns: 0,
             cpu_exceeded: false,
             stderr: LogTail::default(),
-            app_dir: None,
             quota: QuotaGuard::new(&volume, limits, metrics, shared).unwrap(),
             config: Default::default(),
             reset: false,
