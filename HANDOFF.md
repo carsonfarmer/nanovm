@@ -13,6 +13,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
   - phase 5 (WebSockets, after two reviews and a reduction pass);
   - 64 unit tests added by an agent, which found two bugs (now fixed).
   - phase 6 (per-request commits, Q37–Q40), after an adversarial review whose findings are fixed. README's "Commits" section describes the design.
+- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). Those in `journal.rs`, `quota.rs`, `kv.rs`, `jail.rs` and `table.rs` are fixed. Those in `supervisor.rs`, `registry.rs` and `config.rs` are deferred to the rewrite there, and so are N-13 to N-15, whose fix needs the supervisor's call site.
 - **Next: the front proxy** (Q34). The owner said "probably yes"; confirm before starting. Alarms are skipped for now (Q30).
 - Every branch is pushed. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
 - **Tests:** 55 integration tests and 84 unit tests pass. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.

@@ -126,7 +126,7 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `ws.rs:409`
 - **Scenario:** Each publish walks all of the worker's sockets to find its object's; cost grows with the app's sockets, not the object's.
 - **Reproduced:** no (from source)
-- **Status:** fixing
+- **Status:** open: not fixed on purpose. At the default `max_sockets` of 1,000 per app, the scan costs a few microseconds against a publish's HTTP hop, and indexing by object would add code to every open, close and test. Worth it only if `max_sockets` grows by an order of magnitude.
 
 ## N-21: jailed workers can't use a relative `data_dir`, so the demo fails
 - **Where:** `object.rs:287`, `jail.rs` (the seccomp allowlist)
