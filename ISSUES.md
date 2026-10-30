@@ -60,7 +60,7 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `kv.rs:118-123`
 - **Scenario:** `reserve` changes the counters, then the journal steps can fail with a non-trap error (journal full); the reservation is never undone and the counters drift from the volume.
 - **Reproduced:** no (from source)
-- **Status:** fixing
+- **Status:** fixed in 734468c
 
 ## N-10: eviction can drop an object that still has queued work
 - **Where:** `table.rs:195-207`, `table.rs:150-151`
