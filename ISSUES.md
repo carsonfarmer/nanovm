@@ -54,7 +54,7 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `quota.rs:588-592`, `journal.rs:108-115`, `quota.rs:123-133`
 - **Scenario:** Unlinking moves the file into the journal and credits its bytes. `local_file` still accepts the file there, so `set_size` credits them again. Repeated, committed data exceeds `disk_mb`.
 - **Reproduced:** no (from source)
-- **Status:** fixing
+- **Status:** fixed in 60c46ed
 
 ## N-9: a failed `wasi:keyvalue` set keeps its quota adjustment
 - **Where:** `kv.rs:118-123`
