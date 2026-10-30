@@ -17,7 +17,8 @@ use oci_client::manifest::{OCI_IMAGE_MEDIA_TYPE, OciImageManifest};
 async fn main() -> anyhow::Result<()> {
     let addr = std::env::args().nth(1).unwrap_or("127.0.0.1:5000".into()).parse()?;
     let mut registry = container_registry::ContainerRegistry::builder().build_for_testing();
-    let running = registry.bind(addr).run_in_background();
+    registry.bind(addr);
+    let running = registry.run_in_background();
     let guests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guests");
     let client = oci_client::Client::new(ClientConfig {
         protocol: ClientProtocol::Http,

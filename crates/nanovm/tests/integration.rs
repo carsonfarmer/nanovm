@@ -1553,19 +1553,19 @@ async fn a_crash_mid_request_is_rolled_back() {
 /// deadlocking until a deadline kills both.
 #[tokio::test(flavor = "multi_thread")]
 async fn objects_call_objects() {
-    let node = node("objects_call_objects", 8, 60_000);
+    let node = node("objects_call_objects", "hostile", 8);
     let enc = |s: &str| s.replace('%', "%25").replace('&', "%26").replace('?', "%3F").replace('=', "%3D");
     let call = async |from: &str, url: &str| {
-        let r = get(&node, "hostile", from, &format!("/fetch?url={}", enc(url))).await;
+        let r = get(&node, from, &format!("/fetch?url={}", enc(url))).await;
         assert_eq!(r.status, 200, "{}", r.body);
         r.json()
     };
 
     let r = call("a", "http://nanovm/objects/b/commit?v=via-a").await;
     assert_eq!((r["status"].as_u64(), r["body"].as_str()), (Some(200), Some(r#"{"file":"via-a","key":"via-a"}"#)));
-    let r = get(&node, "hostile", "b", "/commit").await;
+    let r = get(&node, "b", "/commit").await;
     assert_eq!(r.body, r#"{"file":"via-a","key":"via-a"}"#, "the callee's volume has it");
-    assert_eq!(get(&node, "hostile", "a", "/commit").await.body, r#"{"file":"","key":""}"#, "the caller's doesn't");
+    assert_eq!(get(&node, "a", "/commit").await.body, r#"{"file":"","key":""}"#, "the caller's doesn't");
 
     let t0 = Instant::now();
     let r = call("a", "http://nanovm/objects/a/").await;
