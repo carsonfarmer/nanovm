@@ -294,7 +294,8 @@ mod tests {
         };
         let held = [send(), send()];
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(send().await.unwrap().is_err(), "a third connection was served");
+        let third = tokio::time::timeout(std::time::Duration::from_secs(1), send()).await;
+        assert!(third.is_ok_and(|r| r.unwrap().is_err()), "a third connection was served");
         gate.notify_waiters();
         for h in held {
             assert_eq!(h.await.unwrap().unwrap(), "ok");
