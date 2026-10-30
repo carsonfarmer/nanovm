@@ -141,7 +141,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** since phase 7 the public names apps: any domain's TXT record, and with apps keyed by host, every host is an app of its own. Each new app gets a worker process, a uid, directories and a cgroup, and nothing caps them or removes them; worker-map entries (and their failure records) are never dropped. Loads aren't limited across apps either, and `read_timeout` is per read, so a registry trickling a byte every 29 s holds a load (up to `max_component_mb` of memory) for as long as it likes. A wildcard DNS record makes this free.
 - **Reproduced:** no (found by reading, in the phase 7 review)
 - **Fix:** a node `max_apps`, with idle workers exiting and leaving the map (else the cap is a permanent denial of service); a node-wide semaphore around `Registry::load`; an overall deadline per load.
-- **Status:** fixing
+- **Status:** fixed in add9b68
 
 ### N-23: a dev-mode node behind the proxy is reachable from the public
 - **Where:** `config.rs` (`dev_on_loopback`)
@@ -202,7 +202,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### N-32 (tests): two integration tests failed once on a cold first run
 - **Where:** `tests/integration.rs:1335` (`registry_app_switches_versions_after_a_drain`, first request not 200), `tests/integration.rs:1515` (`the_journal_is_out_of_reach_and_works_from_a_relative_data_dir`, killed for using more than 100 ms of CPU)
-- **Scenario:** in the first full run after rebuilding, at 7ea5e8e, both failed; alone, and in two more full runs, they passed. Likely load while components compile (the CPU budget is tight for a first request on a busy machine) plus network for the ghcr.io test, but the cause isn't confirmed.
+- **Scenario:** in the first full run after rebuilding, at 7ea5e8e, both failed (and at add9b68, `data_quota_survives_restart`, `tests/integration.rs:438`, an in-process test); alone, and in two more full runs, they passed. Likely load while components compile (the CPU budget is tight for a first request on a busy machine) plus network for the ghcr.io test, but the cause isn't confirmed.
 - **Reproduced:** once, not on demand
 - **Status:** open
 
