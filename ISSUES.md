@@ -18,7 +18,7 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `jail.rs:131`
 - **Scenario:** `F_SETOWN` with `O_ASYNC` (and `F_SETSIG`) on a descriptor a worker holds makes the kernel signal a process of the worker's choosing when I/O arrives; the kernel checks only that the uids match. When the supervisor isn't root, workers share its uid, so code that got out of Wasm can stop the supervisor and other apps' workers.
 - **Reproduced:** yes (the mechanism, at the OS level, against a throwaway process)
-- **Status:** fixing
+- **Status:** fixed in 62c9edf
 
 ## N-3: manifest digests become cache paths unchecked
 - **Where:** `registry.rs:151`, `registry.rs:187-193`
