@@ -32,7 +32,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `registry.rs:139-145`, `registry.rs:154-156`, `registry.rs:168-173`
 - **Scenario:** The manifest, blobs, referrer manifests and Sigstore bundles are buffered whole in supervisor memory; referrers and bundles are fetched before verification, from a repository the tenant controls. One deploy can exhaust the supervisor's memory.
 - **Reproduced:** no (from source)
-- **Status:** fixed in bbeb543 (size caps) and db99779 (signatures counted per bundle); an overall deadline per download is still missing, see N-22
+- **Status:** fixed in bbeb543 (size caps) and db99779 (signatures counted per bundle); the overall deadline per fetch came with N-22
 
 ### N-5: a failed `rmdir` is still journaled
 - **Where:** `quota.rs:476-478`, `journal.rs:186-191`, `journal.rs:267`
@@ -141,7 +141,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** since phase 7 the public names apps: any domain's TXT record, and with apps keyed by host, every host is an app of its own. Each new app gets a worker process, a uid, directories and a cgroup, and nothing caps them or removes them; worker-map entries (and their failure records) are never dropped. Loads aren't limited across apps either, and `read_timeout` is per read, so a registry trickling a byte every 29 s holds a load (up to `max_component_mb` of memory) for as long as it likes. A wildcard DNS record makes this free.
 - **Reproduced:** no (found by reading, in the phase 7 review)
 - **Fix:** a node `max_apps`, with idle workers exiting and leaving the map (else the cap is a permanent denial of service); a node-wide semaphore around `Registry::load`; an overall deadline per load.
-- **Status:** open
+- **Status:** fixing
 
 ### N-23: a dev-mode node behind the proxy is reachable from the public
 - **Where:** `config.rs` (`dev_on_loopback`)

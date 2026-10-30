@@ -146,7 +146,9 @@ What happens on the first request for a digest:
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running.
 
-**Bounds.** Every registry read is bounded: a manifest, config, token or signature at 4 MiB, a component at `max_component_mb` (64), and 16 signatures per load. Digests are checked before they name anything. Registries, and their redirects and token servers, must be on public addresses: a deploy names the registry, so it must not reach the node's own network.
+**How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight and no open sockets, whose worker is retired (its next request starts it again). With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since anyone's DNS can name an app, this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
+
+**Bounds.** Every registry read is bounded: a manifest, config, token or signature at 4 MiB, a component at `max_component_mb` (64), and 16 signatures per load. At most four registry fetches run at once across the node, each within `load_timeout_ms` (60 s) in all, so a registry that answers a byte at a time holds nothing for long. Digests are checked before they name anything. Registries, and their redirects and token servers, must be on public addresses: a deploy names the registry, so it must not reach the node's own network.
 
 **Dev mode** (`dev = true`, refused unless `listen` is loopback) is for local development: apps need no signature, registries and egress entries may be on private addresses, and loopback registries are plain HTTP. The tests and the demo use it with a registry on loopback; signatures are tested against the CI-signed guests on ghcr.io.
 
@@ -295,7 +297,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 57 integration tests and 90 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 60 integration tests and 91 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -330,7 +332,7 @@ The tests cover:
 - open response bodies counting against `max_outbound_concurrency`, in-process and through the supervisor
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.
-- apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, and a switch that finishes when its request goes away
+- apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, a switch that finishes when its request goes away, at most `max_apps` workers (taking only idle apps' slots), and slow registries held to four fetches at once and a deadline
 - the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and WebSockets pass through
 - key-value: values persisting in the volume, counting against the disk and file quotas, bad names refused, keys paged, reads bounded by the memory limit and batches by size, and the store working in a jailed worker (including a key file the guest replaced through its filesystem)
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`

@@ -288,6 +288,10 @@ impl Sockets {
         Sockets { socks: Mutex::default(), caps }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.socks.lock().is_empty()
+    }
+
     /// Opens a socket on `object` if the caps allow it and the object accepts:
     /// the 101 to answer the upgrade with. `req` has had the app headers
     /// removed; its own WebSocket headers are the client's.

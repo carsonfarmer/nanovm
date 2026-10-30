@@ -2011,3 +2011,98 @@ async fn a_switch_finishes_when_its_request_goes_away() {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
     assert!(stat.map_or(true, |s| s.contains(") Z ")), "the old worker still runs");
 }
+
+/// At most `max_apps` workers run. A new app takes the slot of the least
+/// recently used idle app, never a busy one's; with none idle it is refused,
+/// and served once one is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_runs_at_most_max_apps() {
+    let mut cfg = node_cfg("a_node_runs_at_most_max_apps", 8);
+    cfg.max_apps = 2;
+    let (_sup, addr) = supervised_with(cfg).await;
+    let mut apps = Vec::new();
+    for repo in ["apps-a", "apps-b", "apps-c"] {
+        apps.push(publish(repo, &app("hostile")).await);
+    }
+    let [a, b, c] = &apps[..] else { unreachable!() };
+    let busy = |app: &String, ms: u64| {
+        let app = app.clone();
+        tokio::spawn(async move { app_get(addr, &app, &format!("/s/sleep?ms={ms}")).await })
+    };
+    let up = async |app: &str| stats_json(addr).await["workers"][worker(app).as_str()]["up"] == true;
+
+    assert_eq!(app_get(addr, a, "/x/").await.0, 200);
+    assert_eq!(app_get(addr, b, "/x/").await.0, 200);
+    // `a` is idle and least recently used; `b` is busy.
+    let slow_b = busy(b, 900);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(app_get(addr, c, "/x/").await.0, 200);
+    assert!(!up(a).await && up(b).await && up(c).await, "{}", stats_json(addr).await);
+    // Both running apps busy: `a` is refused, and neither is disturbed.
+    let slow_c = busy(c, 600);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (status, body) = app_get(addr, a, "/x/").await;
+    assert!(status == 502 && body.contains("most apps (2)"), "{status} {body}");
+    assert_eq!(slow_b.await.unwrap().0, 200);
+    assert_eq!(slow_c.await.unwrap().0, 200);
+    // Once one is idle (and the refusal's backoff has passed), `a` runs.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(app_get(addr, a, "/x/").await.0, 200);
+    assert!(up(a).await && !up(b).await && up(c).await, "{}", stats_json(addr).await);
+    // Apps that never start are forgotten once there are 2 × max_apps.
+    for i in 0..6 {
+        let bogus = format!("127.0.0.1:1/nothing/n{i}@sha256:{}", "a".repeat(64));
+        assert_eq!(app_get(addr, &bogus, "/x/").await.0, 502);
+    }
+    let v = stats_json(addr).await;
+    let known = v["workers"].as_object().unwrap();
+    assert!(known.len() <= 4, "{v}");
+    assert_eq!(known.values().filter(|w| w["up"] == true).count(), 2, "{v}");
+}
+
+/// A registry that answers a byte at a time can't hold the node: at most
+/// four fetches run at once, across apps, and each ends at
+/// `load_timeout_ms`.
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_registries_are_bounded() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow = listener.local_addr().unwrap();
+    let (open, most) = (Arc::new(std::sync::atomic::AtomicUsize::new(0)), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+    let (o, m) = (open, most.clone());
+    tokio::spawn(async move {
+        loop {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let (o, m) = (o.clone(), m.clone());
+            tokio::spawn(async move {
+                m.fetch_max(o.fetch_add(1, Relaxed) + 1, Relaxed);
+                let _ = conn.read(&mut [0; 4096]).await;
+                let mut out = b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\n".to_vec();
+                while conn.write_all(&out).await.is_ok() {
+                    out = b"x".to_vec();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                o.fetch_sub(1, Relaxed);
+            });
+        }
+    });
+    let mut cfg = node_cfg("slow_registries_are_bounded", 8);
+    cfg.load_timeout_ms = 1000;
+    let (_sup, addr) = supervised_with(cfg).await;
+    let t0 = Instant::now();
+    let loads: Vec<_> = (0..8)
+        .map(|i| {
+            let app = format!("{slow}/slow/app{i}@sha256:{}", "a".repeat(64));
+            tokio::spawn(async move { app_get(addr, &app, "/x/").await })
+        })
+        .collect();
+    // Before any deadline, so dropped connections can't be counted.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let most = most.load(Relaxed);
+    assert!((1..=4).contains(&most), "{most} fetches at once");
+    for load in loads {
+        let (status, body) = tokio::time::timeout(Duration::from_secs(10), load).await.expect("a load hangs").unwrap();
+        assert!(status == 502 && body.contains("took over 1s"), "{status} {body}");
+    }
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+}

@@ -61,6 +61,13 @@ config! {
         worker: WorkerLimits = WorkerLimits::default(),
         /// The largest component the node will download.
         max_component_mb: u64 = 64u64,
+        /// Upper bound on running app workers. A new app takes the slot of
+        /// the least recently used idle one (no requests, no sockets), or is
+        /// refused when none is idle.
+        max_apps: usize = 100usize,
+        /// How long a registry fetch (an app's load, or a check of a new
+        /// policy) may take in all, however slowly its registry answers.
+        load_timeout_ms: u64 = 60_000u64,
         /// For local development only: apps need no signature, registries
         /// and egress may be on private addresses, and loopback registries
         /// are plain HTTP. Allowed only with a loopback `listen`.

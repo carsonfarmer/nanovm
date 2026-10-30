@@ -34,7 +34,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 
 use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
@@ -54,6 +54,9 @@ const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// The longest line of a worker's stderr passed on whole.
 const MAX_LINE: u64 = 4096;
+/// Registry fetches under way at once, across apps: each may hold up to
+/// `max_component_mb` in memory.
+const MAX_FETCHES: usize = 4;
 
 pub struct Supervisor {
     cfg: NodeConfig,
@@ -63,6 +66,9 @@ pub struct Supervisor {
     exe: PathBuf,
     registry: Registry,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
+    /// One per running worker, `max_apps` in all.
+    slots: Arc<tokio::sync::Semaphore>,
+    fetches: tokio::sync::Semaphore,
     /// Held while giving a new app its uid.
     uids: Mutex<()>,
     /// Open WebSockets, across workers.
@@ -78,6 +84,8 @@ struct Worker {
     /// than retried.
     starting: tokio::sync::Mutex<Option<Failed>>,
     starts: AtomicU64,
+    /// When it was last asked for, in ms since the supervisor started.
+    used: AtomicU64,
     /// Requests that failed between the supervisor and the worker.
     link_errors: AtomicU64,
 }
@@ -104,6 +112,8 @@ struct Live {
     sockets: Arc<Sockets>,
     /// Reads as changed once the process is gone, closing its sockets.
     gone: watch::Receiver<()>,
+    /// Its slot among `max_apps`, passed on to the worker that replaces it.
+    slot: Mutex<Option<OwnedSemaphorePermit>>,
     /// Dropping or taking this kills the process. It reads as closed once
     /// the process is gone, because its watcher drops the receiver then.
     kill: Mutex<Option<oneshot::Sender<()>>>,
@@ -127,11 +137,13 @@ impl Supervisor {
         cfg.validate()?;
         Ok(Arc::new(Supervisor {
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
-            cfg,
             threads,
             exe,
             workers: Mutex::default(),
+            slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_apps)),
+            fetches: tokio::sync::Semaphore::new(MAX_FETCHES),
             uids: Mutex::default(),
+            cfg,
             sockets: Arc::default(),
             started: Instant::now(),
         }))
@@ -151,15 +163,25 @@ impl Supervisor {
             return error_response(400, "bad-object-id", BAD_OBJECT);
         }
         let name = want.name();
-        let w = self.workers.lock().entry(name.clone()).or_insert_with(|| {
-            Arc::new(Worker {
-                name,
-                live: Mutex::default(),
-                starting: Default::default(),
-                starts: AtomicU64::new(0),
-                link_errors: AtomicU64::new(0),
-            })
-        }).clone();
+        let w = {
+            let mut workers = self.workers.lock();
+            if !workers.contains_key(&name) && workers.len() >= 2 * self.cfg.max_apps {
+                // Forget apps with no worker and no start under way, and
+                // their last failures.
+                workers.retain(|_, w| w.live.lock().is_some() || w.starting.try_lock().is_err());
+            }
+            workers.entry(name.clone()).or_insert_with(|| {
+                Arc::new(Worker {
+                    name,
+                    live: Mutex::default(),
+                    starting: Default::default(),
+                    starts: AtomicU64::new(0),
+                    used: AtomicU64::new(0),
+                    link_errors: AtomicU64::new(0),
+                })
+            }).clone()
+        };
+        w.used.store(self.started.elapsed().as_millis() as u64, Relaxed);
         if ws::is_event(&req) {
             return error_response(400, "not-an-event", "socket events come from the node");
         }
@@ -207,12 +229,16 @@ impl Supervisor {
         }
     }
 
-    async fn ensure(&self, w: &Worker, want: &AppRef) -> Result<Arc<Live>, Response<RespBody>> {
+    async fn ensure(&self, w: &Arc<Worker>, want: &AppRef) -> Result<Arc<Live>, Response<RespBody>> {
         let down = |why: &str| error_response(502, "worker-down", why);
         let mut failed = w.starting.lock().await;
+        // A forgotten entry must not start a worker beside its successor.
+        if !Arc::ptr_eq(self.workers.lock().entry(w.name.clone()).or_insert_with(|| w.clone()), w) {
+            return Err(down("the app was restarting; try again"));
+        }
         if let Some(l) = w.live().filter(|l| l.digest == want.digest) {
             if !l.policies.lock().contains(&want.policy) {
-                let ok = self.registry.authorize(want, &l.version).await;
+                let ok = self.fetch(self.registry.authorize(want, &l.version)).await;
                 ok.map_err(|e| down(&format!("{e:#}")))?;
                 l.policies.lock().insert(want.policy.clone());
             }
@@ -244,6 +270,44 @@ impl Supervisor {
         }
     }
 
+    /// Runs a registry fetch: a few at a time across the node, each within
+    /// `load_timeout_ms` in all (waiting its turn included).
+    async fn fetch<T>(&self, f: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+        let limit = Duration::from_millis(self.cfg.load_timeout_ms);
+        let turn = async {
+            let _turn = self.fetches.acquire().await?;
+            f.await
+        };
+        tokio::time::timeout(limit, turn).await.map_err(|_| anyhow::anyhow!("registry fetch took over {limit:?}"))?
+    }
+
+    /// A slot for `w`'s first worker: a free one, else that of the least
+    /// recently used idle app, whose worker is retired for it.
+    async fn slot(&self, w: &Worker) -> anyhow::Result<OwnedSemaphorePermit> {
+        if let Ok(slot) = self.slots.clone().try_acquire_owned() {
+            return Ok(slot);
+        }
+        let full = || anyhow::anyhow!("the node runs its most apps ({}), none idle", self.cfg.max_apps);
+        let idle = self
+            .workers
+            .lock()
+            .values()
+            .filter(|o| o.name != w.name)
+            .filter_map(|o| {
+                let l = o.live.lock().clone()?;
+                // Held only by its slot and here: no requests or bodies.
+                (Arc::strong_count(&l) == 2 && l.sockets.is_empty()).then(|| (o.used.load(Relaxed), o.clone()))
+            })
+            .min_by_key(|(used, _)| *used)
+            .map(|(_, o)| o)
+            .ok_or_else(full)?;
+        let Ok(_switching) = idle.starting.try_lock() else { return Err(full()) };
+        let old = idle.live.lock().take().ok_or_else(full)?;
+        let slot = old.slot.lock().take();
+        drain(old).await;
+        slot.ok_or_else(full)
+    }
+
     /// The uid app `name` runs as when the supervisor is root: the owner of
     /// its volumes if it has any, else the next free one. Ownership is the
     /// record, so a uid survives restarts and config changes.
@@ -270,7 +334,7 @@ impl Supervisor {
     /// spawns a new one, places it in its cgroup, hands it its config and
     /// component, and waits until it answers.
     async fn start(&self, w: &Worker, want: &AppRef) -> anyhow::Result<Arc<Live>> {
-        let p = self.registry.load(want).await.with_context(|| format!("loading {}", want.reference))?;
+        let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
         let app = AppConfig {
             name: w.name.clone(),
             env: p.spec.env,
@@ -280,9 +344,18 @@ impl Supervisor {
         };
         let policy = EgressPolicy::parse(&app.limits.egress, self.cfg.dev).context("egress")?;
         let old = w.live.lock().take();
-        if let Some(old) = old {
-            drain(old).await;
-        }
+        let slot = match old {
+            Some(old) => {
+                let slot = old.slot.lock().take();
+                drain(old).await;
+                slot
+            }
+            None => None,
+        };
+        let slot = match slot {
+            Some(slot) => slot,
+            None => self.slot(w).await?,
+        };
 
         let uid = self.uid(&w.name)?;
         for d in self.cfg.app_dirs(&w.name) {
@@ -401,6 +474,7 @@ impl Supervisor {
             drain,
             sockets,
             gone,
+            slot: Mutex::new(Some(slot)),
             kill: Mutex::new(Some(kill)),
         });
         let ready = tokio::time::timeout(START_TIMEOUT, async {
