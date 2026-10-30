@@ -198,7 +198,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### N-31 (removable): code the phase 7 review found removable
 - **What:** `check_digest` in `AppRef::from_headers` repeats the one in `fetch`, which runs before any path (1 line); TLS in the proxy (`proxy.rs` `tls`, `tls_cert`/`tls_key`, about 30 lines) if a terminator in front is assumed (owner's call: there is no ACME anyway); depending on `oci-spec` directly instead of oci-client, which the runtime now uses only for its re-exports (fewer dependencies, not lines).
-- **Status:** partly done in 57d17a4: the runtime depends on `oci-spec` instead of oci-client (10 fewer crates in the runtime build; three small serde structs read the manifest fields it needs). The `check_digest` in `from_headers` stays on purpose: Reference parsing accepts upper case and other algorithms, and the early check answers a malformed digest with a 400 before any start lock or registry work. Open: dropping TLS from the proxy (owner's call).
+- **Status:** partly done in 57d17a4: the runtime depends on `oci-spec` instead of oci-client (10 fewer crates in the runtime build; three small serde structs read the manifest fields it needs). The `check_digest` in `from_headers` stays on purpose: Reference parsing accepts upper case and other algorithms, and the early check answers a malformed digest with a 400 before any start lock or registry work. Its last part, dropping TLS from the proxy, is W-14 (decided).
 
 ### N-32 (tests): two integration tests failed once on a cold first run
 - **Where:** `tests/integration.rs:1335` (`registry_app_switches_versions_after_a_drain`, first request not 200), `tests/integration.rs:1515` (`the_journal_is_out_of_reach_and_works_from_a_relative_data_dir`, killed for using more than 100 ms of CPU)
@@ -223,8 +223,8 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 
 ### W-3: move WebSockets into the front proxy
 - **What:** the proxy holds client sockets, Pushpin-style, and sends each event to the object as the plain `POST` it gets today; publishes go to the proxy. Most of `ws.rs` leaves the node, and the node only answers requests. Resolves N-14 and N-20. Supersedes Q31.
-- **Where:** `proxy.rs` (on branch `proxy`), `ws.rs`, `supervisor.rs`, the WebSocket tests.
-- **Status:** open, after the proxy lands
+- **Where:** `proxy.rs`, `ws.rs`, `supervisor.rs`, `egress.rs` (`hold`), `object.rs` (`commit`), the WebSocket tests.
+- **Status:** open; next up. HANDOFF's "Next up: W-3" has the brief (start with W-14 and W-15).
 
 ### W-4: alarms, outside the node
 - **What:** a scheduler beside the proxy. An object sets an alarm with a response header; when it fires, the scheduler sends the object a request. Durable across restarts of the scheduler; the node is unchanged.

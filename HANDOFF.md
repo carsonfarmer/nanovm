@@ -16,13 +16,11 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
   - phase 6b (calls between objects, Q45). README's "Calls between objects" describes it.
   - phase 7 (the front proxy, Q34, Q52): `nanovm proxy`, apps only from registries and one app per worker, apps keyed by host and repository, dev mode, a registry client with size caps. Built by one agent on branch `proxy`, finished (rebase, demo, docs, reduction pass, review) by another. PLAN's "Phase 7" describes it.
   - orb setup (`.agents/setup`, `.agents/resume`), so Amp orbs start with the toolchain and the tests prebuilt.
-- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed except N-20, which goes away with W-3. A review of phase 7 found N-22 to N-31; all are fixed except two that wait on the owner (below). N-32 (occasional test failures under load) is partly fixed.
-- **Waiting on the owner:**
-  - N-23: a dev-mode node on loopback is still reachable through a proxy on the same host. Either refuse dev mode in release builds (the demo runs a release build in dev mode, so that needs a cargo feature) or document the limit.
-  - N-31: whether to drop TLS from the proxy (about 30 lines) and leave it to a terminator in front.
-  - Apps are keyed by host and repository (an agent's call, to close a review finding; see Q52). The owner may prefer repository alone plus a version floor the node never lets an app go below; that blocks rolling back by moving a tag.
+- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed except N-20, which goes away with W-3. A review of phase 7 found N-22 to N-31; all are fixed (N-31 in part: its proxy TLS half is now W-14). N-32 (occasional test failures under load) is partly fixed.
+- **Owner decisions:**
+  - Nothing is waiting on the owner as of 2026-10-30. The owner decided: dev mode needs the `dev` cargo feature (N-23, done); drop TLS from the proxy (W-14, to do); key apps by the DNS name that owns their `_nanovm` record, after CNAMEs, so aliases share one app (W-15, to do).
 - **Nobody is mid-rewrite** as of phase 7 landing; claim files through ISSUES.md before large changes (see "Working alongside other agents").
-- **Next:** PLAN.md's "Roadmap" (agreed 2026-10-30), tracked as `W-1`… in ISSUES.md. In short: WebSockets moved into the proxy, OpenTelemetry by default (high priority), the per-object SQLite demo, alarms outside the node, data lifecycle planning, then the groundwork for many nodes.
+- **Next:** see "Next up: W-3" below. Then PLAN.md's "Roadmap" (agreed 2026-10-30), tracked as `W-1`… in ISSUES.md. In short: WebSockets moved into the proxy, OpenTelemetry by default (high priority), the per-object SQLite demo, alarms outside the node, data lifecycle planning, then the groundwork for many nodes.
 - Branches merged into `main` by fast-forward are not always pushed on their own. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
 - **Tests:** 62 integration tests and 92 unit tests pass (three full runs in a row clean at `f3ecf23`). One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.
   - Tests that do heavy file work under `hostile`'s 100 ms CPU budget (wall time inside guest polls) can be killed when the whole suite loads the machine; such tests use `filler()` (1 s). See N-32.
@@ -31,6 +29,35 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 - **Runtime size:** about 5,250 lines before phase 7, which added the proxy and a registry client of our own (3,704 after phase 3; kv and config added about 300, WebSockets about 640, commits about 500 non-blank, non-comment lines, against an estimate of 250–300, which the owner accepted after a reduction pass).
 - **The repo `carsonfarmer/nanovm` is now public**, so GitHub artifact attestations work. The packages `ghcr.io/carsonfarmer/nanovm-{counter,hostile}` are public. `publish-guests.yml` runs on pushes to `guests/**` and on `gh workflow run publish-guests.yml` (dispatch works through the proxy, and `gh run watch <id>` shows progress). Each run publishes version `1.0.<run number>`.
 - **Old branches** (`jail`, `simplify`, `oci`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical.
+
+## Next up: W-3, WebSockets move into the front proxy
+
+The owner chose this as the next big piece of work (PLAN "Roadmap" item 1, ISSUES W-3, Q42). Start with W-14 and W-15, which are small, already decided, and touch `proxy.rs` too; then W-3.
+
+**Goal.** The node only ever answers requests. The front proxy (`nanovm proxy`) holds client WebSockets, as Pushpin does, and turns each socket event into the plain `POST` of `application/websocket-events` that objects already get. Objects and guests don't change: they keep answering events in Pushpin's WebSocket-over-HTTP format and publishing GRIP messages to `http://nanovm/publish/`. Most of `ws.rs` (about 1,140 lines) leaves the node, and N-14 and N-20 go with it.
+
+**How it works today** (read these first):
+- `ws.rs`: `Sockets` (per worker: open sockets, channels, caps), `Sockets::open` (upgrade, `OPEN` round trip, then `run`, the per-socket loop: one event in flight, a write backlog, ping, stall timeout), `Sockets::publish` (GRIP publish, fan-out to the object's own subscribed sockets), `answer` and `parse` (the event wire format), `Caps`.
+- `supervisor.rs`: `handle` refuses client requests of type `application/websocket-events` (`ws::is_event`) and sends upgrades (`ws::wants`) to `socket()`, which opens the socket on the app's current `Live` and delivers its events over the worker link (`Deliver`). Each `Live` owns a `Sockets`; they close (1012) when the worker exits or the app switches versions. The egress link serves `http://nanovm/publish` from the worker by calling `Sockets::publish`. `slot()` (N-22) treats an app with open sockets as busy.
+- Worker side: a guest's publish is intercepted in `egress.rs` (`send`, then `hold`: size bound, `well_formed`, stamped with `nanovm-object`), held until the request commits, and sent to the supervisor by `object::commit`. `table.rs` `enqueue` lets a socket event wait for room in a full queue instead of being refused.
+- The proxy (`proxy.rs`) today passes upgrades through to the node with `copy_bidirectional`.
+- Tests: `websockets_reach_their_object_and_fan_out_within_it`, `websocket_limits_hold`, the WebSocket part of `the_proxy_routes_hosts_by_dns`, and the unit tests in `ws.rs`. README's "WebSockets" lists every rule and limit the tests pin.
+
+**The shape to aim for** (decide the details, and record them as Q-numbered decisions in the table below):
+- **The proxy holds the sockets.** On an upgrade it sends `OPEN` to the node as a `POST` with the app headers it already sets, keeps the socket if the object answers `OPEN`, and posts each later event the same way. Keep the current rules: one event in flight per socket, the write backlog and stall limits, pings, the size bounds, and an object's 4xx/5xx refusal reaching the client.
+- **Publishes go to the proxy.** The proxy needs a publish endpoint that only the node can reach (a second, private listener, like Pushpin's control port), and the node needs to know where it is (a node config key). The supervisor still makes the request, since it owns the network; the worker side (`hold`, held until commit) stays. A publish must name its app and object, and the proxy must scope channels to `(app, object)`, so one app can never reach another's sockets. The app identity the proxy uses must be the same one the node uses (W-15 changes it to the record's owner name).
+- **Only the proxy sends events.** The check that refuses a client request of type `application/websocket-events` moves to the proxy (strip or refuse it before forwarding); the node then trusts events as it trusts the other `nanovm-*` headers, because only the proxy can reach it.
+- **What leaves the node:** `Sockets`, `socket()`, `Live.sockets`, `ws::Caps`, the node's `max_sockets` settings (they become proxy settings), the publish handler on the egress link (it becomes a forward to the proxy), and the open-sockets check in `slot()`. What stays in `ws.rs`, if anything, is the event wire format, which the proxy and the worker share; move it wherever is simplest.
+- **Lifetime changes, so decide it with the owner in mind:** sockets would now outlive workers, so a version switch no longer has to close them. Either keep closing them on a switch (the proxy sees the digest change) or let them carry over to the new version; write down which, and why.
+- **Pushpin itself** was named as an alternative (run Pushpin in front instead of growing `proxy.rs`). If you consider it, compare the two briefly and say why you chose; the owner prefers the fewest moving parts.
+
+**Constraints:**
+- Guests stay as they are. Changing `guests/**` and pushing publishes new guest versions through CI, so ask the owner before doing that.
+- The node keeps its existing guarantees: per-object ordering of events with other requests, commits before publishes, and the caps that keep the node's memory bounded.
+- The proxy faces the public: every per-client resource it holds (sockets, backlogs, channels) needs a bound, as N-22 to N-30 did for the node. Expect the reviewer to try exactly that.
+- The runtime should get smaller overall; report the line count before and after (non-blank, non-comment lines of `crates/nanovm/src`, without `#[cfg(test)]` modules).
+
+**Done means:** the WebSocket tests pass through the proxy (moved from the supervisor), plus new ones for the proxy's bounds and for cross-app isolation of channels; the full suite and the demo pass; benchmarks don't regress (`cargo run --release --example bench -- --quick`); an adversarial review by a subagent, with its findings fixed or recorded in ISSUES.md; README ("The proxy", "WebSockets", "Tests"), PLAN, HANDOFF and ISSUES (W-3, N-14, N-20) updated in the same push.
 
 ## What nanovm is
 
