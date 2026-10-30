@@ -13,9 +13,12 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
   - phase 5 (WebSockets, after two reviews and a reduction pass);
   - 64 unit tests added by an agent, which found two bugs (now fixed).
   - phase 6 (per-request commits, Q37–Q40), after an adversarial review whose findings are fixed. README's "Commits" section describes the design.
+  - phase 6b (calls between objects, Q45). README's "Calls between objects" describes it.
+  - orb setup (`.agents/setup`, `.agents/resume`), so Amp orbs start with the toolchain and the tests prebuilt.
 - **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). Those in `journal.rs`, `quota.rs`, `kv.rs`, `jail.rs` and `table.rs` are fixed. Those in `supervisor.rs`, `registry.rs` and `config.rs` are deferred to the rewrite there, and so are N-13 to N-15, whose fix needs the supervisor's call site.
-- **Next: the front proxy** (Q34). The owner said "probably yes"; confirm before starting. Alarms are skipped for now (Q30).
-- Every branch is pushed. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
+- **In progress elsewhere:** another agent is rewriting `supervisor.rs`, `registry.rs`, `config.rs` and the integration-test helpers for the front proxy (Q34): local apps removed, app data keyed by repository, `nanovm proxy` added. Its work in progress is on the remote branch `proxy`. Don't edit those files without coordinating; see "Working alongside other agents".
+- **Next:** PLAN.md's "Roadmap" (agreed 2026-10-30), tracked as `W-1`… in ISSUES.md. In short: the proxy with WebSockets moved into it, OpenTelemetry by default (high priority), the per-object SQLite demo, alarms outside the node, data lifecycle planning, then the groundwork for many nodes.
+- Branches merged into `main` by fast-forward are not always pushed on their own. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
 - **Tests:** 56 integration tests and 84 unit tests pass. One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.
   - `cpu_hogs_leave_cores_for_short_requests` is load-sensitive and fails occasionally when the whole suite runs at once on 4 cores; it passes alone.
   - When guests change, the first run can fail one supervised test with `Permission denied`. The test nodes share one `.cwasm` cache between root in-process nodes and jailed workers. A rerun passes.
@@ -61,8 +64,19 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q21 | Trust policy per app: a list of exact `{issuer, subject}` identities; no static public keys. |
 | Q22 | The trust policy and minimum version travel with each request from the proxy. |
 | Q23/Q24 | The jail and the supervisor/worker split as built. Mount and network namespaces were dropped as redundant: Landlock already confines the filesystem, and seccomp removes `socket()`. |
+| Q41 | Alarms: queued again soon, built outside the core node as a scheduler beside the proxy. |
+| Q42 | WebSockets move out of the node into the front proxy, Pushpin-style: the proxy holds client sockets, objects keep receiving events as plain requests. Supersedes Q31. |
+| Q43 | Observability is high priority: OpenTelemetry tracing, metrics and guest logs on by default, per tenant. The custom `/_nanovm/stats` and `/_nanovm/events` APIs are deprecated. |
+| Q44 | Data lifecycle (deleting, exporting, backing up an app's or object's data) needs a plan; queued. |
+| Q45 | Calls between objects of one app: an outgoing request to `http://nanovm/objects/{id}/{path}`, through the callee's queue; cycles refused with 508 (done). |
+| Q46 | The per-object SQLite demo is the priority showcase. |
+| Q47 | JS and Python guests, `nanovm publish`, and benchmarks against workerd and Spin are tracked as issues, after the SQLite demo. |
+| Q48 | Research shipping commit change records off the node (Litestream-style), so a node becomes a cache of its volumes. |
+| Q49 | Prepare for many nodes across regions: placement in the proxy, leases with epochs checked at commit; nodes stay unaware of each other. After the proxy. |
+| Q50 | Requests that don't write can run in parallel (stateless routes anywhere, read-only requests on replicas); research, since the in-place undo journal makes same-node readers see uncommitted data. |
+| Q51 | Clean up the review's removable-code list: done where it touched files outside the rewrite; the rest is W-13. |
 
-Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets (all done), 6 per-request commits (on `commits`, in review), 7 the front proxy.
+Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 
 ## Phase 3 as built
 
@@ -82,7 +96,7 @@ The owner answered Q25–Q27 "yes", and chose to make the repo public rather tha
 - Never say you lack access to something: find a way (clone public repos, use the proxy, boot a VM). The Spin repos were cloned this way.
 - **Git:**
   - Work on a branch, then fast-forward `main` when it's done and tested. The owner has OK'd merging to `main` without PRs; don't open PRs unless asked.
-  - Commit messages end with the Co-Authored-By and Claude-Session lines from the system reminder.
+  - Commit messages end with the trailers your tool adds: Claude Code agents the Co-Authored-By and Claude-Session lines from the system reminder; Amp adds an `Amp-Thread-ID` trailer itself.
   - Ask before outward-facing actions: new public packages, workflows, anything published.
 - **Hosts:**
   - Never touch the `hetzner-*.fleet.recall.network` hosts.
@@ -93,7 +107,25 @@ The owner answered Q25–Q27 "yes", and chose to make the repo public rather tha
 - **Design from the problem, not from the code we have.** Present the correct, minimal design, and say when it differs from what fits the code today.
 - Keep replies brief.
 
-## Environment gotchas (this cloud sandbox)
+## Working alongside other agents
+
+Several agents work on this repo at once, each in its own checkout.
+- **ISSUES.md is the shared list.** Check it before starting; mark an entry `fixing` or `in progress` (with who) and push before you begin, and `fixed in <commit>` / `done in <commit>` in the same push as the work. Record anything new you find there, even if you don't fix it.
+- **Own files, not features.** Whoever is rewriting a file owns it until they land; ISSUES.md and the State section above say who has what. A finding in someone else's files is recorded with `deferred: <why>` and left for them.
+- **Land small, on top of `main`.** One finding or a small related group per branch; rebase onto `origin/main`, run the full suite (`env -u RUST_BACKTRACE cargo test -p nanovm`), fast-forward `main`, push. Never rewrite pushed history.
+- **Docs move with the code.** README (what exists, tests, bugs found), PLAN (design and roadmap), HANDOFF (state, decisions, how to work) and ISSUES are updated in the same push as the change they describe.
+
+## Environment gotchas: Amp orbs
+
+- **Setup is automatic.** `.agents/setup` installs stable Rust with the `wasm32-wasip2` target, fetches both workspaces' crates, builds the test guests and prebuilds the tests (about 8 minutes cold on 4 cores; a fresh orb usually starts from a snapshot where it's done). It leaves the release build to the first command that needs it (demo, bench, `scripts/vm-test.sh`).
+- **cargo is on the PATH of login shells** (`~/.cargo/env` from `~/.bash_profile`). A shell started before setup ran may not have it: use `bash -lc '…'`.
+- **`.agents/resume` raises `vm.max_map_count`** on every start and wake (sudo works without a password in orbs).
+- **The soft fd limit is 1,024** (hard limit 1,048,576): run `ulimit -n 100000` before the demo or the benchmark.
+- **The demo works in orbs** since N-21. Outbound HTTPS works directly (the egress test to example.com passes in the demo).
+- **`strace` installs with `sudo apt-get install -y strace`**; it is how the seccomp allowlist was traced (`strace -f -e trace=<syscall>` over the integration tests).
+- Everything below about the earlier cloud sandbox still holds unless an orb note above says otherwise; `RUST_BACKTRACE` isn't set in orbs, but keep using `env -u RUST_BACKTRACE`.
+
+## Environment gotchas (the earlier cloud sandbox)
 
 - **`vm.max_map_count`** resets when the container restarts. Run `sysctl -qw vm.max_map_count=1048576` before tests or the demo; the worker's startup check names the fix if you forget.
 - **The fd limit is 20,000** and can't be raised (no `CAP_SYS_RESOURCE`). The demo uses `max_live_objects = 8000` per app, and the full benchmark needs `--quick`.
@@ -112,9 +144,11 @@ The owner answered Q25–Q27 "yes", and chose to make the repo public rather tha
 
 ## Layout pointers
 
+- [ISSUES.md](ISSUES.md): known problems and planned work, with status. [PLAN.md](PLAN.md): design and roadmap.
+- `.agents/setup`, `.agents/resume`: orb setup.
 - `crates/nanovm/src`: the runtime.
   - `supervisor.rs` (supervisor and worker entry), `registry.rs`, `link.rs`, `jail.rs`, `ws.rs` (WebSockets), `kv.rs` (`wasi:keyvalue`), `journal.rs` (per-request commits)
-  - `egress.rs` (`Route::Direct` in-process, `Route::Supervisor` jailed)
+  - `egress.rs` (`Route::Direct` in-process, `Route::Supervisor` jailed; also calls between objects and held publishes)
   - `object.rs`, `table.rs` (`Node`), `quota.rs`, `server.rs`, `config.rs`, `engine.rs`, `app.rs`, `metrics.rs`, `main.rs`
 - `crates/nanovm/tests/integration.rs`: the integration tests. Helpers: `node_cfg`, `supervised_with`, `http_get`, `test_cgroup`, `stalling_upstream`. `jail_probe` runs in a child process.
 - `crates/nanovm/support/load.rs`: the in-process load generator, used by the tests and the benchmark.

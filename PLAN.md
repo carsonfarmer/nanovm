@@ -18,7 +18,7 @@ Done means:
 - `nanovm serve` hosts real guest components with every limit enforced.
 - `cargo test` proves each guarantee against hostile guests.
 - `examples/bench.rs` prints cold-start, warm-latency, throughput and density numbers.
-- `demo/demo.sh` drives thousands of objects and the attack storm over HTTP. The node's only control surface is two JSON APIs, `/_nanovm/stats` and `/_nanovm/events`.
+- `demo/demo.sh` drives thousands of objects and the attack storm over HTTP. The node's only control surface is two JSON APIs, `/_nanovm/stats` and `/_nanovm/events` (deprecated in favour of OpenTelemetry; see Roadmap).
 
 ## Architecture
 
@@ -272,11 +272,11 @@ The goal: one node, as fast and secure as we can make it, that runs untrusted We
     - Events are ordered per object. Channels are scoped per object, as in Durable Objects (Q32).
     - Sockets close when their worker goes, including on a version switch (Q35).
     - Bounds come from the existing request and response limits, plus `max_sockets` per object and per node (Q36). tric's sizes were API Gateway's, so they weren't carried over.
-  - **Alarms are skipped for now** (Q30). Since they are set by a response header, they could be done outside the node, by a scheduler in front of it.
+  - **Alarms** (Q30, then Q41): skipped so far; queued as a scheduler outside the node (Roadmap 4).
   - **Key-value** (done): a host-implemented `wasi:keyvalue` stored as files under `/data`. `wasi:filesystem` stays exposed. `wasi:config` serves each app's config values.
 - **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
 - **Commits** (Q37–Q40): an undo journal under the filesystem host; see README.
-- **Out of scope for now:** clustering, one-shot runs of agent-written code, dashboards, static signing keys.
+- **Out of scope for now:** one-shot runs of agent-written code, dashboards, static signing keys. Clustering is no longer out of scope: it is prepared for in Roadmap 8, after the proxy.
 
 ## Phase 2: the Linux jail (done)
 
@@ -329,16 +329,33 @@ README's "Key-value and config" and "WebSockets" describe them.
 
 A request's changes to `/data` (files and key-value) and its WebSocket publishes take effect only if it answers, durably. A failed request is rolled back. README's "Commits" describes the design and the alternatives rejected.
 
-## Next phases
+## Phase 6b: calls between objects (done)
 
-7. The front proxy (Q34): it maps a host to an app's digest and trust policy, strips `nanovm-*` headers from clients, and is the public entry point. Perhaps `nanovm proxy` in this repo.
+An object calls another object of its app with an ordinary outgoing request to `http://nanovm/objects/{id}/{path}`, dispatched into the callee's queue (`egress.rs` `call`). A call that would wait on its own caller, directly or through other calls, is refused with 508; `Node::wait_for` checks and records the wait-for edges under the table lock. README's "Calls between objects" has the details.
+
+## Roadmap (agreed with the owner, 2026-10-30)
+
+Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tracked; the decisions are Q41–Q51 in [HANDOFF.md](HANDOFF.md). In priority order:
+
+1. **The front proxy (Q34), with WebSockets moved into it (Q42).** Another agent is building the proxy (branch `proxy`): local apps removed, app data keyed by repository, `nanovm proxy` as the public entry point. The proxy then also holds client WebSockets, as Pushpin does: the node only ever answers requests, and an object sees socket events as plain `POST`s in the WebSocket-over-HTTP format it already gets. Most of `ws.rs` leaves the node, and N-14 and N-20 go with it. This supersedes Q31 (sockets in the supervisor). (W-3)
+2. **Observability by default (Q43).** OpenTelemetry tracing, metrics and guest logs, on by default, tagged per tenant (app, object, version). `/_nanovm/stats` and `/_nanovm/events` are deprecated and go once OTel covers them. A jailed worker has no sockets, so its telemetry leaves through the supervisor. (W-2)
+3. **A per-object SQLite demo (Q46).** The showcase: every object its own SQLite database on `/data`, committed with its response. It works today, since writes happen in place and `mmap` is kept. (W-1)
+4. **Alarms, outside the node (Q41).** A scheduler beside the proxy sends a request to an object when its alarm fires; an object sets alarms with a response header. The node stays request-only. (W-4)
+5. **Data lifecycle (Q44).** Planning first: deleting an app's or an object's data, exporting a volume, backups and retention. (W-5)
+6. **More guest languages and a publish command (Q47).** JS and Python guests through componentize-js and componentize-py; `nanovm publish` wrapping the `oras` push and keyless signing. (W-6, W-7)
+7. **Numbers against the alternatives (Q47).** Density, cold starts and warm latency against workerd and Spin. (W-8)
+8. **Toward many nodes (Q48–Q50).** Research and groundwork, after the proxy lands:
+   - **Change records shipped off the node** (Litestream-style): the journal already knows what each commit touched, so a commit can emit a self-contained record of it. Replicated, they make the node a cache of its volumes. (W-9)
+   - **Placement and leases:** the proxy places each object on a home node (rendezvous hashing to start); a node takes a lease with an epoch before instantiating an object, and every commit carries the epoch, so a node that lost its lease can't commit. On one node the lease is always granted, so the hook can land early. (W-10)
+   - **Requests that don't write can run in parallel** (Q50): stateless routes on any node, and read-only requests on read replicas of an object fed by committed change records. On one node it needs care: the undo journal writes in place, so a concurrent reader would see uncommitted data. (W-11)
+9. **Cleanups:** the rest of the review's removable-code list (registry cache and re-hash, config memory checks), for the agent doing the rewrite. (W-13)
 
 ## Follow-ups
 
 - gVisor-systrap comparison.
 - Quota on the WASI 0.2 filesystem (shadowing p2 writes).
 - Wizer pre-initialisation (not published for 50.0.0, and it needs a custom init export).
-- Multi-node placement and leases.
+- A trusted caller header on calls between objects, so an object can tell a call from a client request. (W-12)
 
 ## Risks
 

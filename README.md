@@ -24,7 +24,7 @@ The script:
 3. Pings a canary object throughout.
 4. Drives it over HTTP with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm requests, `/data` writes, and a storm of 110 simultaneous attacks.
 
-It leaves the node running. Its data APIs are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (that app's kills, denials and evictions).
+It leaves the node running. Its data APIs (deprecated: OpenTelemetry replaces them, see [ISSUES.md](ISSUES.md) W-2) are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (that app's kills, denials and evictions).
 
 Requests are routed as `/{app}/{object}/{path}`:
 
@@ -148,6 +148,8 @@ An object calls another object of its own app with an ordinary outgoing request 
 - **Cycles are refused.** With one request at a time per object, a call that waits on its own caller, directly (`a` calls `a`) or through other calls (`a` calls `b`, which calls `a`), could never be served. Each object records the objects its calls wait on. A call that would close a cycle gets `508 call-cycle` at once, instead of hanging until a deadline kills both requests and rolls them back. The check and the record happen under the table lock, so two objects calling each other at the same moment can't both get through.
 
 ## WebSockets
+
+The supervisor holds client sockets for now. They are planned to move into the front proxy, so the node only ever answers requests ([ISSUES.md](ISSUES.md) W-3).
 
 The supervisor holds client sockets. Objects see them as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work.
 - **Opening.** A socket opened at `/{app}/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`; any other answer refuses the socket, with the object's own status if it is a 4xx or 5xx (so a `401` reaches the client).
