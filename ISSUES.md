@@ -204,7 +204,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `tests/integration.rs:1335` (`registry_app_switches_versions_after_a_drain`, first request not 200), `tests/integration.rs:1515` (`the_journal_is_out_of_reach_and_works_from_a_relative_data_dir`, killed for using more than 100 ms of CPU)
 - **Scenario:** in the first full run after rebuilding, at 7ea5e8e, both failed (and at add9b68, `data_quota_survives_restart`, `tests/integration.rs:438`, an in-process test); alone, and in two more full runs, they passed. Likely load while components compile (the CPU budget is tight for a first request on a busy machine) plus network for the ghcr.io test, but the cause isn't confirmed.
 - **Reproduced:** once, not on demand
-- **Status:** partly fixed in N32COMMIT: the in-process quota tests failed when the full suite loaded the machine enough that a 4 MiB write passed `hostile`'s 100 ms CPU budget (wall time inside guest polls; the journal test's failure said so). They now use a `filler()` app with 1 s, as `file_count_limit` already did. The ghcr.io test's one failure is unexplained (likely network); open for that.
+- **Status:** partly fixed in d64c80a: the in-process quota tests failed when the full suite loaded the machine enough that a 4 MiB write passed `hostile`'s 100 ms CPU budget (wall time inside guest polls; the journal test's failure said so). They now use a `filler()` app with 1 s, as `file_count_limit` already did. The ghcr.io test's one failure is unexplained (likely network); open for that.
 
 ## Planned work
 
