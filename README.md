@@ -154,7 +154,7 @@ What happens on the first request for a digest:
 
 **Dev mode** (`dev = true`, refused unless `listen` is loopback) is for local development: apps need no signature, registries and egress entries may be on private addresses, and loopback registries are plain HTTP. The tests and the demo use it with a registry on loopback; signatures are tested against the CI-signed guests on ghcr.io.
 
-**Switching versions.** A request naming a digest the app's worker isn't running switches the app. The new version is fetched and verified while the old one keeps serving. The old worker then drains: no new requests, and in-flight ones (and their response bodies) finish, bounded by its longest request time. Only then does the new worker start. Both versions share the app's volumes, so an object is never live in two workers. A switch, once begun, finishes even if the request that began it goes away.
+**Switching versions.** A request naming a digest the app's worker isn't running switches the app. The new version is fetched and verified while the old one keeps serving. The old worker then drains: no new requests, and in-flight ones (and their response bodies) finish, bounded by its longest request time. It is then killed, and only once its process has exited does the new worker start. Both versions share the app's volumes, so an object is never live in two workers. A switch, once begun, finishes even if the request that began it goes away.
 
 **Uids.** An app's uid is the owner of its `objects/<app>` directory, or the next free one for a new app. It is stable across restarts, with no separate record.
 

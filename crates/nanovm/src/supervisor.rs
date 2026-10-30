@@ -74,7 +74,7 @@ pub struct Supervisor {
     slots: Arc<tokio::sync::Semaphore>,
     fetches: tokio::sync::Semaphore,
     /// Held while giving a new app its uid.
-    uids: Mutex<()>,
+    uids: Arc<Mutex<()>>,
     /// Open WebSockets, across workers.
     sockets: Arc<AtomicUsize>,
     started: Instant,
@@ -146,7 +146,7 @@ impl Supervisor {
             workers: Mutex::default(),
             slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_apps)),
             fetches: tokio::sync::Semaphore::new(MAX_FETCHES),
-            uids: Mutex::default(),
+            uids: Arc::default(),
             cfg,
             sockets: Arc::default(),
             started: Instant::now(),
@@ -316,28 +316,6 @@ impl Supervisor {
         slot.ok_or_else(full)
     }
 
-    /// The uid app `name` runs as when the supervisor is root: the owner of
-    /// its volumes if it has any, else the next free one. Ownership is the
-    /// record, so a uid survives restarts and config changes.
-    fn uid(&self, name: &str) -> anyhow::Result<Option<u32>> {
-        use std::os::unix::fs::MetadataExt;
-        if unsafe { libc::geteuid() } != 0 {
-            return Ok(None);
-        }
-        let _one_at_a_time = self.uids.lock();
-        let base = self.cfg.jail_uid_base;
-        let objects = self.cfg.data_dir.join("objects");
-        let owner = |p: &Path| std::fs::metadata(p).ok().map(|m| m.uid()).filter(|&u| u >= base);
-        if let Some(uid) = owner(&objects.join(name)) {
-            return Ok(Some(uid));
-        }
-        let taken = std::fs::read_dir(&objects).into_iter().flatten().flatten();
-        let uid = taken.filter_map(|e| owner(&e.path())).max().map_or(base, |u| u + 1);
-        std::fs::create_dir_all(objects.join(name))?;
-        std::os::unix::fs::chown(objects.join(name), Some(uid), Some(uid))?;
-        Ok(Some(uid))
-    }
-
     /// Gets the app version `want` names, retires the running worker, then
     /// spawns a new one, places it in its cgroup, hands it its config and
     /// component, and waits until it answers.
@@ -365,13 +343,9 @@ impl Supervisor {
             None => self.slot(w).await?,
         };
 
-        let uid = self.uid(&w.name)?;
-        for d in self.cfg.app_dirs(&w.name) {
-            std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
-            if let Some(uid) = uid {
-                chown_tree(&d, uid)?;
-            }
-        }
+        // Walking directories blocks; this thread serves other requests.
+        let (cfg, name, uids) = (self.cfg.clone(), w.name.clone(), self.uids.clone());
+        let uid = tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
 
         let (requests, worker_requests) = UnixStream::pair()?;
         let (egress, worker_egress) = UnixStream::pair()?;
@@ -597,14 +571,16 @@ async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<Re
 
 /// Waits until nothing holds `old` but this (its requests have finished and
 /// their bodies have been read), or its longest request has had its time,
-/// then kills the process: what still holds it can't keep it running beside
-/// the next version.
+/// then kills the process and waits for it to be gone: what still holds it
+/// can't keep it running beside the next version.
 async fn drain(old: Arc<Live>) {
     let deadline = Instant::now() + old.drain;
     while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     old.kill.lock().take();
+    // Its watcher drops the sender once the process has exited.
+    let _ = old.gone.clone().changed().await;
 }
 
 /// A forwarded request's answer from the supervisor itself.
@@ -628,6 +604,36 @@ fn query(uri: &http::Uri) -> HashMap<&str, &str> {
         .split('&')
         .filter_map(|kv| kv.split_once('='))
         .collect()
+}
+
+/// Makes app `name`'s directories, and when the supervisor is root gives
+/// them the uid the app runs as (returned): the owner of its volumes if it
+/// has any, else the next free one. Ownership is the record, so a uid
+/// survives restarts and config changes.
+fn app_dirs(cfg: &NodeConfig, name: &str, uids: &Mutex<()>) -> anyhow::Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = if unsafe { libc::geteuid() } != 0 {
+        None
+    } else {
+        let _one_at_a_time = uids.lock();
+        let base = cfg.jail_uid_base;
+        let objects = cfg.data_dir.join("objects");
+        let owner = |p: &Path| std::fs::metadata(p).ok().map(|m| m.uid()).filter(|&u| u >= base);
+        let uid = owner(&objects.join(name)).unwrap_or_else(|| {
+            let taken = std::fs::read_dir(&objects).into_iter().flatten().flatten();
+            taken.filter_map(|e| owner(&e.path())).max().map_or(base, |u| u + 1)
+        });
+        std::fs::create_dir_all(objects.join(name))?;
+        std::os::unix::fs::chown(objects.join(name), Some(uid), Some(uid))?;
+        Some(uid)
+    };
+    for d in cfg.app_dirs(name) {
+        std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
+        if let Some(uid) = uid {
+            chown_tree(&d, uid)?;
+        }
+    }
+    Ok(uid)
 }
 
 /// Gives `uid` a directory tree it will own inside its jail. Skipped when the
