@@ -128,7 +128,6 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_pwritev,
         libc::SYS_lseek,
         libc::SYS_close,
-        libc::SYS_fcntl,
         libc::SYS_openat,
         libc::SYS_openat2,
         libc::SYS_fstat,
@@ -183,6 +182,11 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
     );
     // Reading limits, never raising them.
     rules.insert(libc::SYS_prlimit64, vec![rule(vec![Cond::new(2, Qword, Eq, 0)?])?]);
+    // Descriptor flags only. Not F_SETOWN or F_SETSIG: with O_ASYNC they have
+    // the kernel signal any process of the same uid.
+    let fcntl = [libc::F_GETFD, libc::F_SETFD, libc::F_GETFL, libc::F_SETFL, libc::F_DUPFD_CLOEXEC];
+    let fcntl = fcntl.map(|c| Ok(rule(vec![Cond::new(1, Dword, Eq, c as u64)?])?));
+    rules.insert(libc::SYS_fcntl, fcntl.into_iter().collect::<anyhow::Result<_>>()?);
     // Making a received socket non-blocking (std uses this ioctl for it).
     rules.insert(libc::SYS_ioctl, vec![rule(vec![Cond::new(1, Dword, Eq, libc::FIONBIO)?])?]);
     // tokio's signal driver wakes itself through a local socketpair, which

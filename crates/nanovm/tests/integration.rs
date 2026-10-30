@@ -862,6 +862,7 @@ fn jail_blocks_escapes() {
         ("unshare", "denied"),
         ("mmap_wx", "denied"),
         ("raise_nofile", "denied"),
+        ("signal_owner", "denied"),
         ("sleep_survives_stop", "ok"),
     ];
     for (k, v) in expect {
@@ -919,6 +920,10 @@ fn jail_probe() {
             rlim_max: libc::RLIM_INFINITY,
         };
         report("raise_nofile", sys(libc::setrlimit(libc::RLIMIT_NOFILE, &lim) as i64));
+        // Owning a descriptor's I/O signals would let it signal its supervisor.
+        let f = std::fs::File::open(dir.join("mine/f")).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+        report("signal_owner", sys(libc::fcntl(fd, libc::F_SETOWN, libc::getppid()) as i64));
     }
     std::thread::sleep(Duration::from_millis(400));
     report("sleep_survives_stop", true);

@@ -83,6 +83,7 @@ A worker reads its config and component from stdin, then jails itself while it s
   - `clone` for threads only
   - no memory that is writable and executable at once
   - limits can be read, never raised
+  - `fcntl` for descriptor flags only: no `F_SETOWN` or `F_SETSIG`, which would have the kernel signal another process of the same uid
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
@@ -276,7 +277,7 @@ The tests cover:
 - LRU and idle eviction, and capacity limits
 - churn past capacity
 - the HTTP front end
-- the jail, from a probe process inside it (`jail_blocks_escapes`): another app's files, `/etc`, sockets, fork, exec, setuid, ptrace, signals, namespaces, W+X memory and raising limits are all refused; a sleep survives a stop and continue
+- the jail, from a probe process inside it (`jail_blocks_escapes`): another app's files, `/etc`, sockets, fork, exec, setuid, ptrace, signals (sent, or arranged through `F_SETOWN`), namespaces, W+X memory and raising limits are all refused; a sleep survives a stop and continue
 - the same attacks through the supervisor and jailed workers, with egress enforced by the supervisor, including an allowed request whose upstream tries to forge the supervisor's verdict header
 - a killed worker restarted with its volumes intact, while its neighbour keeps serving
 - registry apps against the real, CI-signed guests on ghcr.io:
@@ -353,6 +354,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
   - Overwriting a file opened write-only failed: the journal read the old bytes through the guest's descriptor (N-7).
   - Truncating a file after removing it, while still open, freed its bytes a second time, so committed data could exceed the quota (N-8).
   - A key-value replacement that the full journal refused kept its quota adjustment, so usage could fall below what the volume held. Past the reservation, a failure now traps and the request rolls back (N-9).
+  - The jail allowed every `fcntl` command. With `F_SETOWN` and `O_ASYNC`, a worker that got out of Wasm could have the kernel signal (and kill) the supervisor or other apps' workers whenever they share its uid (a supervisor not running as root). Only the five commands the test suite uses are allowed now (N-2).
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
 ## Layout
