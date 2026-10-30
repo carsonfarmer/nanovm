@@ -365,13 +365,18 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
 
 // ---- filesystem layout and quotas -------------------------------------
 
-#[tokio::test(flavor = "multi_thread")]
-async fn file_count_limit() {
-    // 200 creates run inline and count against the CPU budget, which on a
-    // loaded small host can pass 100 ms; this test is about the file count.
+/// `hostile` with room for heavy file work: writes and creates run inline
+/// and count against the CPU budget, which on a loaded host (the full suite)
+/// can pass 100 ms. These tests are about quotas, not CPU.
+fn filler() -> AppConfig {
     let mut hostile = app("hostile");
     hostile.limits.cpu_ms = 1_000;
-    let node = node_with(node_cfg("file_count_limit", 8), hostile);
+    hostile
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_count_limit() {
+    let node = node_with(node_cfg("file_count_limit", 8), filler());
     let r = get(&node, "f", "/files?mount=tmp").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["created"], 200);
@@ -380,7 +385,7 @@ async fn file_count_limit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn disk_quota_and_tmp_wipe() {
-    let node = node("disk_quota_and_tmp_wipe", "hostile", 8);
+    let node = node_with(node_cfg("disk_quota_and_tmp_wipe", 8), filler());
     let fill = async |name: &str, mount: &str, mb: u32| {
         get(
             &node,
@@ -432,7 +437,7 @@ async fn rename_quota_accounting() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn data_quota_survives_restart() {
-    let node = node("data_quota_survives_restart", "hostile", 8);
+    let node = node_with(node_cfg("data_quota_survives_restart", 8), filler());
     for name in ["a", "b"] {
         let r = get(&node, "d", &format!("/fill?mount=data&mb=4&name={name}")).await;
         assert_eq!(r.status, 200, "{}", r.body);
