@@ -31,7 +31,7 @@ blast() {
 
 say "building guests and the node"
 scripts/build-guests.sh >/dev/null
-cargo build --release -p nanovm --bins --example dev-registry 2>&1 | tail -1
+cargo build --release -p nanovm --features dev --bins --example dev-registry 2>&1 | tail -1
 
 say "publishing the guests to a registry on 127.0.0.1:5000"
 : >target/demo-apps.txt

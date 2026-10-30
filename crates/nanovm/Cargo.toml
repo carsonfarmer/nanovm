@@ -40,7 +40,14 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["h
 landlock = "0.4.7"
 seccompiler = "0.5.0"
 
+[features]
+# Allows `dev = true` (no signature checks, private registries and egress).
+# Off by default, so a release build can't be configured into dev mode.
+dev = []
+
 [dev-dependencies]
+# The tests run nodes in dev mode against a loopback registry.
+nanovm = { path = ".", features = ["dev"] }
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
 tokio-tungstenite = "0.30"
 tokio = { version = "1", features = ["test-util"] }

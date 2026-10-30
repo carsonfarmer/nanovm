@@ -1799,6 +1799,7 @@ dependencies = [
  "hyper-util",
  "landlock",
  "libc",
+ "nanovm",
  "oci-client",
  "oci-spec",
  "parking_lot",

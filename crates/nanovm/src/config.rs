@@ -70,7 +70,8 @@ config! {
         load_timeout_ms: u64 = 60_000u64,
         /// For local development only: apps need no signature, registries
         /// and egress may be on private addresses, and loopback registries
-        /// are plain HTTP. Allowed only with a loopback `listen`.
+        /// are plain HTTP. Allowed only in a build with the `dev` feature and
+        /// with a loopback `listen`.
         dev: bool = false,
     }
 }
@@ -203,19 +204,23 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        dev_on_loopback(self.dev, &self.listen)
+        dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
 
 impl ProxyConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        dev_on_loopback(self.dev, &self.listen)
+        dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
 
-/// `listen` is an address, and a loopback one in dev mode.
-fn dev_on_loopback(dev: bool, listen: &str) -> anyhow::Result<()> {
+/// `listen` is an address; dev mode needs a build with the `dev` feature
+/// (`built`) and a loopback address.
+fn dev_on_loopback(dev: bool, listen: &str, built: bool) -> anyhow::Result<()> {
     let addr: std::net::SocketAddr = listen.parse().with_context(|| format!("listen = {listen:?}"))?;
+    if dev && !built {
+        bail!("dev mode needs a build with `--features dev`");
+    }
     if dev && !addr.ip().is_loopback() {
         bail!("dev mode needs a loopback listen address, not {addr}");
     }
@@ -285,6 +290,10 @@ mod tests {
         cfg.validate().unwrap();
         let proxy = ProxyConfig { dev: true, ..ProxyConfig::default() };
         assert!(proxy.validate().unwrap_err().to_string().contains("dev mode"), "the default listen is public");
+        // A build without the feature refuses dev mode, even on loopback.
+        let e = dev_on_loopback(true, "127.0.0.1:1", false).unwrap_err().to_string();
+        assert!(e.contains("--features dev"), "{e}");
+        dev_on_loopback(false, "127.0.0.1:1", false).unwrap();
     }
 
     /// An empty file is the documented defaults; a partial table keeps the
