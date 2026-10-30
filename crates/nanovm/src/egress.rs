@@ -135,8 +135,13 @@ pub(crate) const VERDICT: &str = "x-nanovm-egress";
 const CONNECT_TIMEOUT: &str = "x-nanovm-connect-timeout-ms";
 const FIRST_BYTE_TIMEOUT: &str = "x-nanovm-first-byte-timeout-ms";
 
+/// Where an object calls another of its app: `http://nanovm/objects/{id}/…`.
+const CALLS: &str = "/objects/";
+
 pub struct EgressHooks {
     pub route: Route,
+    /// The node, for calls to other objects of the app.
+    pub node: std::sync::Weak<crate::table::Node>,
     pub sem: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
     pub obj: Arc<crate::object::ObjShared>,
@@ -158,6 +163,10 @@ impl WasiHttpHooks for EgressHooks {
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
         let obj = self.obj.clone();
+        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS) {
+            let node = self.node.clone();
+            return Box::new(async move { Ok((call(node, sem, obj, request).await?, Box::new(async { Ok(()) }) as IoFuture)) });
+        }
         if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && matches!(route, Route::Supervisor(_)) {
             let (held, max) = (self.held.clone(), self.publish_max);
             return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
@@ -191,6 +200,62 @@ impl WasiHttpHooks for EgressHooks {
             }
             res
         })
+    }
+}
+
+/// Sends `req`, for `http://nanovm/objects/{id}/{path}`, to object `id` of
+/// the caller's app as a request for `/{path}`, through its queue like any
+/// other request. The callee commits before it answers, so the caller sees
+/// only durable changes. A call that would wait on its own caller, directly
+/// or through other calls, is refused with 508: one request at a time per
+/// object would deadlock it.
+async fn call(
+    node: std::sync::Weak<crate::table::Node>,
+    sem: Arc<Semaphore>,
+    obj: Arc<crate::object::ObjShared>,
+    req: http::Request<WasiBody>,
+) -> Result<http::Response<WasiBody>, Error> {
+    let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
+    let app = node.apps.get(&*obj.app).ok_or(Error::ConnectionTerminated)?.clone();
+    let (mut parts, body) = req.into_parts();
+    let target = parts.uri.clone();
+    let rest = target.path_and_query().map_or("", |p| p.as_str()).strip_prefix(CALLS).unwrap_or("");
+    let (id, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    let to_guest = |res: http::Response<crate::object::RespBody>| {
+        res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync())
+    };
+    if !node.wait_for(&obj, id) {
+        let why = format!("{id} is already waiting on {}", obj.id);
+        return Ok(to_guest(crate::object::error_response(508, "call-cycle", &why)));
+    }
+    let _waiting = Waiting(obj.clone(), id.into());
+    let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
+    let limit = (app.cfg.limits.max_request_body_kb << 10) as usize;
+    let body = http_body_util::Limited::new(body, limit).collect().await;
+    let body = body.map_err(|_| Error::HttpRequestBodySize(None))?.to_bytes();
+    parts.uri = format!("http://{}/{}", crate::ws::PUBLISH_HOST, path.trim_start_matches('/'))
+        .parse()
+        .map_err(|_| Error::HttpRequestUriInvalid)?;
+    let res = node.dispatch(&app, id, http::Request::from_parts(parts, body)).await;
+    // The permit lives as long as the response body, as for any request.
+    Ok(to_guest(res.map(|b| {
+        b.map_frame(move |f| {
+            let _ = &permit;
+            f
+        })
+        .boxed_unsync()
+    })))
+}
+
+/// A call `.0` waits on, until it is answered or given up.
+struct Waiting(Arc<crate::object::ObjShared>, Arc<str>);
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        let mut waiting = self.0.waiting_on.lock();
+        if let Some(i) = waiting.iter().position(|id| *id == self.1) {
+            waiting.swap_remove(i);
+        }
     }
 }
 

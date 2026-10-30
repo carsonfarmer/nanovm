@@ -1492,6 +1492,41 @@ async fn a_crash_mid_request_is_rolled_back() {
     assert_eq!((status, body.as_str()), (200, r#"{"file":"one","key":"one"}"#));
 }
 
+// ---- calls between objects ---------------------------------------------
+
+/// An object calls another of its app at `http://nanovm/objects/{id}/…`. The
+/// callee serves the call from its own queue and volume, and commits before
+/// the caller hears back. A call that would wait on its own caller, directly
+/// or through another call, is refused at once with 508 instead of
+/// deadlocking until a deadline kills both.
+#[tokio::test(flavor = "multi_thread")]
+async fn objects_call_objects() {
+    let node = node("objects_call_objects", 8, 60_000);
+    let enc = |s: &str| s.replace('%', "%25").replace('&', "%26").replace('?', "%3F").replace('=', "%3D");
+    let call = async |from: &str, url: &str| {
+        let r = get(&node, "hostile", from, &format!("/fetch?url={}", enc(url))).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()
+    };
+
+    let r = call("a", "http://nanovm/objects/b/commit?v=via-a").await;
+    assert_eq!((r["status"].as_u64(), r["body"].as_str()), (Some(200), Some(r#"{"file":"via-a","key":"via-a"}"#)));
+    let r = get(&node, "hostile", "b", "/commit").await;
+    assert_eq!(r.body, r#"{"file":"via-a","key":"via-a"}"#, "the callee's volume has it");
+    assert_eq!(get(&node, "hostile", "a", "/commit").await.body, r#"{"file":"","key":""}"#, "the caller's doesn't");
+
+    let t0 = Instant::now();
+    let r = call("a", "http://nanovm/objects/a/").await;
+    assert_eq!(r["status"], 508, "{r}");
+    let inner = format!("http://nanovm/objects/a/fetch?url={}", enc("http://nanovm/objects/b/"));
+    let r = call("b", &inner).await;
+    assert!(r["body"].as_str().unwrap().contains(r#""status":508"#), "{r}");
+    assert!(t0.elapsed() < Duration::from_secs(1), "refused at once: {:?}", t0.elapsed());
+
+    // Answered calls wait on nothing: b may now call a.
+    assert_eq!(call("b", "http://nanovm/objects/a/").await["status"], 200);
+}
+
 // ---- WebSockets ----------------------------------------------------------
 
 mod sockets {

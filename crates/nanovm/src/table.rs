@@ -202,6 +202,28 @@ impl Node {
         Ok(())
     }
 
+    /// Records that `from` waits on a call to object `to` of its app, unless
+    /// `to` already waits on `from`, directly or through other calls: with
+    /// one request at a time per object, that call could never be served.
+    /// Checked and recorded under the table lock, so two objects calling each
+    /// other at once can't both pass.
+    pub fn wait_for(&self, from: &ObjShared, to: &str) -> bool {
+        let objects = self.objects.lock();
+        let (mut next, mut seen) = (vec![Arc::<str>::from(to)], std::collections::HashSet::new());
+        while let Some(id) = next.pop() {
+            if id == from.id {
+                return false;
+            }
+            if seen.insert(id.clone())
+                && let Some(e) = objects.get(&(from.app.clone(), id))
+            {
+                next.extend(e.shared.waiting_on.lock().iter().cloned());
+            }
+        }
+        from.waiting_on.lock().push(to.into());
+        true
+    }
+
     /// Drops the table's handle on the least recently used idle object; its
     /// actor drains its queue and exits.
     fn evict_lru(&self, objects: &mut HashMap<(Arc<str>, Arc<str>), Entry>) -> bool {

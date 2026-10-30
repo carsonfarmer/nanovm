@@ -139,6 +139,14 @@ Spin's store, by comparison, is one SQLite table per app shared by all its insta
 
 **`wasi:config/store`** (0.2.0-rc.1) serves the app's `config` table: `[app.config]` for a local app, `"config"` in a registry app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
+## Calls between objects
+
+An object calls another object of its own app with an ordinary outgoing request to `http://nanovm/objects/{id}/{path}`, as a Durable Object calls a stub:
+- The callee gets it as a request for `/{path}`, through its queue like any other, so it is still served one request at a time.
+- The callee commits before it answers, so the caller only ever sees durable changes. Each object commits on its own: a caller that fails afterwards doesn't undo the callee's changes.
+- Calls need no egress rule. They count against the caller's `max_outbound_concurrency`, and their bodies against the app's `max_request_body_kb`.
+- **Cycles are refused.** With one request at a time per object, a call that waits on its own caller, directly (`a` calls `a`) or through other calls (`a` calls `b`, which calls `a`), could never be served. Each object records the objects its calls wait on. A call that would close a cycle gets `508 call-cycle` at once, instead of hanging until a deadline kills both requests and rolls them back. The check and the record happen under the table lock, so two objects calling each other at the same moment can't both get through.
+
 ## WebSockets
 
 The supervisor holds client sockets. Objects see them as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work.
@@ -256,7 +264,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 55 integration tests and 84 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 56 integration tests and 84 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -272,6 +280,7 @@ The tests cover:
   - a worker killed mid-request is rolled back when the object next starts;
   - a publish followed by a panic reaches no socket;
   - unit tests roll back every kind of change, commit them, survive a crash at each step of recovery, ignore a torn record, journal writes to a file removed while open and to one opened write-only, and record nothing for a failed `rmdir` or a refused change
+- calls between objects: the callee's volume and commit, and cycles (an object calling itself, or back through another) refused at once
 - an allowed outbound request through the full egress path
 - the egress allowlist, including DNS rebinding to loopback
 - LRU and idle eviction, and capacity limits

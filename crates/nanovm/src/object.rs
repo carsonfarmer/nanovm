@@ -80,6 +80,8 @@ pub struct ObjShared {
     poll_start_ns: AtomicU64,
     /// The heavy lane this object's request holds until its next yield.
     lane: Mutex<Option<OwnedSemaphorePermit>>,
+    /// The objects its calls are waiting on, one entry per call.
+    pub waiting_on: Mutex<Vec<Arc<str>>>,
 }
 
 impl ObjShared {
@@ -276,7 +278,7 @@ impl WasiHttpView for ObjState {
     }
 }
 
-fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
+fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
     let limits = &app.cfg.limits;
     let n = node.next_seq();
     let [objects, tmp, _] = node.cfg.app_dirs(&app.name);
@@ -316,6 +318,7 @@ fn new_store(node: &Node, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<
         http: WasiHttpCtx::new(),
         hooks: EgressHooks {
             route: app.egress.clone(),
+            node: Arc::downgrade(node),
             sem: Arc::new(Semaphore::new(limits.max_outbound_concurrency)),
             metrics: node.metrics.clone(),
             obj: shared.clone(),
@@ -684,6 +687,7 @@ impl ObjState {
             http: WasiHttpCtx::new(),
             hooks: EgressHooks {
                 route: crate::egress::Route::Direct(Default::default()),
+                node: Default::default(),
                 sem: Arc::new(Semaphore::new(1)),
                 metrics: metrics.clone(),
                 obj: shared.clone(),
