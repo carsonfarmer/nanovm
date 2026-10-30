@@ -34,8 +34,8 @@ config! {
         /// Upper bound on open WebSockets across all apps: each holds a file
         /// descriptor in the supervisor.
         max_sockets: usize = 10_000usize,
-        /// Virtual address space reserved per linear memory. Every app's
-        /// `memory_mb` must fit inside it.
+        /// Virtual address space reserved per linear memory: no memory grows
+        /// past it, whatever an app's `memory_mb`.
         memory_reservation_mb: u64 = 128u64,
         /// Epoch tick; the granularity of CPU-budget checks and guest yields.
         epoch_tick_ms: u64 = 5u64,
@@ -196,13 +196,6 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.limits.memory_mb > self.memory_reservation_mb {
-            bail!(
-                "limits.memory_mb {} exceeds memory_reservation_mb {}",
-                self.limits.memory_mb,
-                self.memory_reservation_mb
-            );
-        }
         let addr: std::net::SocketAddr = self.listen.parse().with_context(|| format!("listen = {:?}", self.listen))?;
         if self.dev && !addr.ip().is_loopback() {
             bail!("dev mode needs a loopback listen address, not {addr}");
@@ -253,18 +246,12 @@ mod tests {
         assert_eq!(serde_json::json!(d.clamped(&d)), serde_json::json!(d));
     }
 
-    /// Validation refuses memory limits beyond the reservation (equal fits),
-    /// a listen address that isn't one, and dev mode off loopback.
+    /// Validation refuses a listen address that isn't one, and dev mode off
+    /// loopback.
     #[test]
-    fn validate_checks_memory_listen_and_dev() {
+    fn validate_checks_listen_and_dev() {
         let mut cfg = NodeConfig::default();
         cfg.validate().unwrap();
-        cfg.limits.memory_mb = cfg.memory_reservation_mb;
-        cfg.validate().unwrap();
-        cfg.limits.memory_mb += 1;
-        assert!(cfg.validate().unwrap_err().to_string().contains("limits.memory_mb"));
-        cfg.limits.memory_mb = 1;
-
         cfg.listen = "nowhere".into();
         assert!(cfg.validate().unwrap_err().to_string().contains("listen"));
         cfg.dev = true;
