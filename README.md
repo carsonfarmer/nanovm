@@ -118,6 +118,7 @@ app=ghcr.io/org/app:prod; trust=<issuer> <subject>; trust=…; min=1.2.0
 That is the repository and the tag deployed, each identity whose signature is accepted, and an optional version floor. Whoever controls the domain controls its routing; deploying moves the tag, and rolling back moves it back. The proxy:
 - asks a DNS-over-HTTPS resolver (`resolver`, Cloudflare's by default) and keeps the answer for its TTL;
 - asks the registry which digest the tag names, and keeps that for `tag_ttl_s` (30 s);
+- looks each host or tag up once however many requests ask at once, keeps a failed lookup's answer for 5 s rather than asking again, and remembers at most 10,000 of each;
 - drops every `nanovm-*` header a client sent, names the app to the node (below), and forwards the request, WebSockets included;
 - speaks TLS with `tls_cert` and `tls_key` (PEM files), or plain HTTP behind something that terminates it;
 - gives a client 10 s for its TLS handshake and for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too).
@@ -298,7 +299,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 61 integration tests and 91 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 61 integration tests and 92 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel

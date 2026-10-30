@@ -26,6 +26,7 @@ use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use oci_client::Reference;
 use parking_lot::Mutex;
+use tokio::sync::OnceCell;
 
 use crate::config::ProxyConfig;
 use crate::object::{RespBody, error_response};
@@ -49,8 +50,49 @@ pub struct Proxy {
     http: reqwest::Client,
     registry: Oci,
     node: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
-    routes: Mutex<HashMap<String, (Option<Route>, Instant)>>,
-    digests: Mutex<HashMap<String, (String, Instant)>>,
+    routes: Cache<Option<Route>>,
+    digests: Cache<String>,
+}
+
+/// Hosts or tags remembered at most, each cache.
+const MAX_CACHED: usize = 10_000;
+/// How long a failed lookup is answered again rather than retried.
+const ERROR_TTL: Duration = Duration::from_secs(5);
+
+/// Answers kept until they expire, failures included (briefly). However many
+/// ask for a key at once, it is looked up once.
+#[derive(Default)]
+struct Cache<T>(Mutex<HashMap<String, Arc<OnceCell<(Result<T, String>, Instant)>>>>);
+
+impl<T: Clone> Cache<T> {
+    /// `key`'s answer, from `lookup` (an answer and how long it lasts) when
+    /// there is none fresh.
+    async fn get(&self, key: &str, lookup: impl Future<Output = anyhow::Result<(T, Duration)>>) -> anyhow::Result<T> {
+        let cell = {
+            let mut cells = self.0.lock();
+            let now = Instant::now();
+            let fresh = |c: &Arc<OnceCell<(Result<T, String>, Instant)>>| c.get().is_none_or(|(_, until)| *until > now);
+            match cells.get(key).filter(|c| fresh(c)) {
+                Some(c) => c.clone(),
+                None => {
+                    if cells.len() >= MAX_CACHED {
+                        cells.retain(|_, c| fresh(c));
+                        if cells.len() >= MAX_CACHED {
+                            cells.clear();
+                        }
+                    }
+                    cells.entry(key.to_string()).insert_entry(Arc::default()).get().clone()
+                }
+            }
+        };
+        let (answer, _) = cell
+            .get_or_init(async || match lookup.await {
+                Ok((v, ttl)) => (Ok(v), Instant::now() + ttl),
+                Err(e) => (Err(format!("{e:#}")), Instant::now() + ERROR_TTL),
+            })
+            .await;
+        answer.clone().map_err(anyhow::Error::msg)
+    }
 }
 
 type Body = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
@@ -65,8 +107,8 @@ impl Proxy {
             cfg,
             http: reqwest::Client::new(),
             node,
-            routes: Mutex::default(),
-            digests: Mutex::default(),
+            routes: Cache::default(),
+            digests: Cache::default(),
         }))
     }
 
@@ -129,11 +171,10 @@ impl Proxy {
     /// The route `_nanovm.<host>` names, if any, from the cache while its TTL
     /// lasts.
     async fn route(&self, host: &str) -> anyhow::Result<Option<Route>> {
-        if let Some((r, until)) = self.routes.lock().get(host)
-            && *until > Instant::now()
-        {
-            return Ok(r.clone());
-        }
+        self.routes.get(host, self.lookup(host)).await
+    }
+
+    async fn lookup(&self, host: &str) -> anyhow::Result<(Option<Route>, Duration)> {
         let url = reqwest::Url::parse_with_params(&self.cfg.resolver, [("name", format!("_nanovm.{host}")), ("type", "TXT".into())])?;
         let answer: serde_json::Value =
             self.http.get(url).header("accept", "application/dns-json").send().await?.error_for_status()?.json().await?;
@@ -144,23 +185,17 @@ impl Proxy {
             [a] => (Some(parse(&unquote(a["data"].as_str().unwrap_or_default()))?), a["TTL"].as_u64().unwrap_or(30)),
             _ => bail!("_nanovm.{host} has more than one TXT record"),
         };
-        let until = Instant::now() + Duration::from_secs(ttl.clamp(1, 3600));
-        self.routes.lock().insert(host.to_string(), (route.clone(), until));
-        Ok(route)
+        Ok((route, Duration::from_secs(ttl.clamp(1, 3600))))
     }
 
     /// The digest `app`'s tag names, from the cache for `tag_ttl_s`.
     async fn digest(&self, app: &Reference) -> anyhow::Result<String> {
         let key = app.whole();
-        if let Some((d, until)) = self.digests.lock().get(&key)
-            && *until > Instant::now()
-        {
-            return Ok(d.clone());
-        }
-        let digest = self.registry.digest(app).await.with_context(|| format!("resolving {key}"))?;
-        let until = Instant::now() + Duration::from_secs(self.cfg.tag_ttl_s);
-        self.digests.lock().insert(key, (digest.clone(), until));
-        Ok(digest)
+        let lookup = async {
+            let digest = self.registry.digest(app).await.with_context(|| format!("resolving {key}"))?;
+            Ok((digest, Duration::from_secs(self.cfg.tag_ttl_s)))
+        };
+        self.digests.get(&key, lookup).await
     }
 }
 
@@ -233,6 +268,39 @@ fn tls(cert: &std::path::Path, key: &std::path::Path) -> anyhow::Result<tokio_ru
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key is looked up once however many ask at once; a failure is
+    /// answered again until `ERROR_TTL`; and the cache never holds more
+    /// than `MAX_CACHED` keys.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn caches_are_single_flight_and_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let (cache, asked) = (Arc::new(Cache::<u32>::default()), Arc::new(AtomicUsize::new(0)));
+        let slow = |asked: Arc<AtomicUsize>, ok: bool| async move {
+            asked.fetch_add(1, Relaxed);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if ok { Ok((7, Duration::from_secs(60))) } else { Err(anyhow::anyhow!("resolver down")) }
+        };
+        let many: Vec<_> = (0..20)
+            .map(|_| {
+                let (cache, asked) = (cache.clone(), asked.clone());
+                tokio::spawn(async move { cache.get("a", slow(asked, true)).await.unwrap() })
+            })
+            .collect();
+        for one in many {
+            assert_eq!(one.await.unwrap(), 7);
+        }
+        assert_eq!(asked.swap(0, Relaxed), 1);
+        for _ in 0..3 {
+            let e = cache.get("bad", slow(asked.clone(), false)).await.unwrap_err();
+            assert_eq!(e.to_string(), "resolver down");
+        }
+        assert_eq!(asked.load(Relaxed), 1);
+        for i in 0..MAX_CACHED + 10 {
+            cache.get(&i.to_string(), async { Ok((1, Duration::from_secs(60))) }).await.unwrap();
+        }
+        assert!(cache.0.lock().len() <= MAX_CACHED);
+    }
 
     /// A record names a tagged repository, one or more identities, and an
     /// optional floor; anything else is refused.

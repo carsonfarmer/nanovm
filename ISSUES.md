@@ -162,7 +162,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** every distinct `Host` costs a DNS-over-HTTPS query and an entry that is never removed (a wildcard record makes it free); errors aren't cached, so a bad record is asked about on every request, inviting the resolver to rate-limit the proxy; a popular host's expiry sends a burst of identical queries.
 - **Reproduced:** no (phase 7 review)
 - **Fix:** drop expired entries past a size limit when inserting; cache errors briefly; one lookup in flight per host.
-- **Status:** open
+- **Status:** fixing
 
 ### N-26: a running app's accepted policies grow without bound
 - **Where:** `supervisor.rs:101`, `supervisor.rs:213-218` (`Live.policies`)
