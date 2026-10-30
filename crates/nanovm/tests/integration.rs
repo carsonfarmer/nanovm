@@ -848,6 +848,7 @@ fn jail_blocks_escapes() {
         .collect();
     let expect = [
         ("write_own_dir", "ok"),
+        ("cwd", "ok"),
         ("thread", "ok"),
         ("read_other_app", "denied"),
         ("read_etc_passwd", "denied"),
@@ -888,6 +889,8 @@ fn jail_probe() {
     let report = |name: &str, ok: bool| println!("probe {name}={}", if ok { "ok" } else { "denied" });
     let sys = |r: i64| r >= 0;
     report("write_own_dir", std::fs::write(dir.join("mine/f"), "x").is_ok());
+    // A relative data_dir is canonicalized against it.
+    report("cwd", std::env::current_dir().is_ok());
     report("thread", std::thread::spawn(|| 1).join().is_ok());
     report("read_other_app", std::fs::read(dir.join("other/secret")).is_ok());
     report("read_etc_passwd", std::fs::read("/etc/passwd").is_ok());

@@ -143,6 +143,8 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_fsync,
         libc::SYS_fdatasync,
         libc::SYS_utimensat,
+        // Canonicalizing a relative data_dir (the demo's) reads the cwd.
+        libc::SYS_getcwd,
     ];
     #[cfg(target_arch = "x86_64")]
     allow.extend([

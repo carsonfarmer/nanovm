@@ -277,7 +277,7 @@ The tests cover:
 - LRU and idle eviction, and capacity limits
 - churn past capacity
 - the HTTP front end
-- the jail, from a probe process inside it (`jail_blocks_escapes`): another app's files, `/etc`, sockets, fork, exec, setuid, ptrace, signals (sent, or arranged through `F_SETOWN`), namespaces, W+X memory and raising limits are all refused; a sleep survives a stop and continue
+- the jail, from a probe process inside it (`jail_blocks_escapes`): another app's files, `/etc`, sockets, fork, exec, setuid, ptrace, signals (sent, or arranged through `F_SETOWN`), namespaces, W+X memory and raising limits are all refused, while its own directory and the cwd are reachable; a sleep survives a stop and continue
 - the same attacks through the supervisor and jailed workers, with egress enforced by the supervisor, including an allowed request whose upstream tries to forge the supervisor's verdict header
 - a killed worker restarted with its volumes intact, while its neighbour keeps serving
 - registry apps against the real, CI-signed guests on ghcr.io:
@@ -355,6 +355,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
   - Truncating a file after removing it, while still open, freed its bytes a second time, so committed data could exceed the quota (N-8).
   - A key-value replacement that the full journal refused kept its quota adjustment, so usage could fall below what the volume held. Past the reservation, a failure now traps and the request rolls back (N-9).
   - The jail allowed every `fcntl` command. With `F_SETOWN` and `O_ASYNC`, a worker that got out of Wasm could have the kernel signal (and kill) the supervisor or other apps' workers whenever they share its uid (a supervisor not running as root). Only the five commands the test suite uses are allowed now (N-2).
+  - The demo failed every request with `503 instantiate-failed`. A worker canonicalizes its object's directory, which for a relative `data_dir` reads the cwd, and the jail refused `getcwd`. The tests use absolute paths, so only the demo hit it (N-21).
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
 ## Layout

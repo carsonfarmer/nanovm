@@ -127,3 +127,9 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Scenario:** Each publish walks all of the worker's sockets to find its object's; cost grows with the app's sockets, not the object's.
 - **Reproduced:** no (from source)
 - **Status:** fixing
+
+## N-21: jailed workers can't use a relative `data_dir`, so the demo fails
+- **Where:** `object.rs:287`, `jail.rs` (the seccomp allowlist)
+- **Scenario:** `new_store` canonicalizes the object's directory, and with a relative `data_dir` (the demo's `../nanovm-data`) that reads the cwd. `getcwd` isn't on the worker's allowlist, so every instantiation fails with `ENOSYS` and the demo answers `503 instantiate-failed` to everything. The tests use absolute paths, so they pass. Found running the demo while fixing N-2.
+- **Reproduced:** yes (`demo/demo.sh`, and strace showing the refused `getcwd`)
+- **Status:** fixing
