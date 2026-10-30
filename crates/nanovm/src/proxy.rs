@@ -25,7 +25,7 @@ use http::header::{CONNECTION, PROXY_AUTHORIZATION, TE, TRAILER, UPGRADE};
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
-use oci_client::Reference;
+use oci_spec::distribution::Reference;
 use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 

@@ -22,8 +22,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use http::HeaderMap;
-use oci_client::Reference;
-use oci_client::manifest::{OciDescriptor, OciImageIndex, OciImageManifest};
+use oci_spec::distribution::Reference;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sigstore_trust_root::{SIGSTORE_PRODUCTION_TRUSTED_ROOT, TrustedRoot};
@@ -38,6 +37,32 @@ pub const WASM_TYPE: &str = "application/wasm";
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const BUNDLE_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
+
+/// The fields of an OCI manifest the node reads.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Manifest {
+    artifact_type: Option<String>,
+    config: Descriptor,
+    layers: Vec<Descriptor>,
+    #[serde(default)]
+    annotations: HashMap<String, String>,
+}
+
+/// The fields of an OCI index (here, a referrers list) the node reads.
+#[derive(Deserialize)]
+struct Index {
+    manifests: Vec<Descriptor>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Descriptor {
+    media_type: String,
+    digest: String,
+    size: u64,
+    artifact_type: Option<String>,
+}
 pub const VERSION: &str = "org.opencontainers.image.version";
 /// The most a manifest, index, config, token or signature may be.
 const MAX_METADATA: u64 = 4 << 20;
@@ -173,11 +198,10 @@ impl Registry {
     pub async fn load(&self, r: &AppRef) -> anyhow::Result<Pulled> {
         // Not cached: nothing reaches the disk before the app is authorized.
         let bytes = self.fetch(r, "manifests", &r.digest, MANIFEST_TYPE, MAX_METADATA, false).await?;
-        let manifest: OciImageManifest = serde_json::from_slice(&bytes).context("the manifest")?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).context("the manifest")?;
         let version = manifest
             .annotations
-            .as_ref()
-            .and_then(|a| a.get(VERSION))
+            .get(VERSION)
             .context("the manifest has no org.opencontainers.image.version")?;
         let version: semver::Version = version.parse().with_context(|| format!("version {version:?}"))?;
         self.authorize(r, &version).await?;
@@ -205,10 +229,10 @@ impl Registry {
         Ok(())
     }
 
-    async fn blob(&self, r: &AppRef, d: &OciDescriptor, max: u64) -> anyhow::Result<Vec<u8>> {
-        ensure!(d.size >= 0 && d.size as u64 <= max, "{} is {} bytes, over {max}", d.digest, d.size);
-        let bytes = self.fetch(r, "blobs", &d.digest, "*/*", d.size as u64, true).await?;
-        ensure!(bytes.len() as u64 == d.size as u64, "{} is not {} bytes", d.digest, d.size);
+    async fn blob(&self, r: &AppRef, d: &Descriptor, max: u64) -> anyhow::Result<Vec<u8>> {
+        ensure!(d.size <= max, "{} is {} bytes, over {max}", d.digest, d.size);
+        let bytes = self.fetch(r, "blobs", &d.digest, "*/*", d.size, true).await?;
+        ensure!(bytes.len() as u64 == d.size, "{} is not {} bytes", d.digest, d.size);
         Ok(bytes)
     }
 
@@ -253,7 +277,7 @@ impl Registry {
             // A registry without the referrers API keeps them under a tag.
             None => self.oci.get(&r.reference, "manifests", &format!("sha256-{hex}"), INDEX_TYPE, MAX_METADATA).await?,
         };
-        let index: OciImageIndex = match index {
+        let index: Index = match index {
             Some(b) => serde_json::from_slice(&b).context("the referrers")?,
             None => bail!("not signed by a trusted identity (no signatures)"),
         };
@@ -263,11 +287,11 @@ impl Registry {
         let mut left = MAX_SIGNATURES;
         for entry in signatures.take(MAX_SIGNATURES) {
             let m = self.fetch(r, "manifests", &entry.digest, MANIFEST_TYPE, MAX_METADATA, false).await?;
-            let m: OciImageManifest = serde_json::from_slice(&m)?;
+            let m: Manifest = serde_json::from_slice(&m)?;
             for layer in m.layers.iter().filter(|l| l.media_type == BUNDLE_TYPE) {
                 left = left.checked_sub(1).context("too many signatures")?;
-                ensure!(layer.size >= 0 && layer.size as u64 <= MAX_METADATA, "a signature is too large");
-                let json = self.fetch(r, "blobs", &layer.digest, "*/*", layer.size as u64, false).await?;
+                ensure!(layer.size <= MAX_METADATA, "a signature is too large");
+                let json = self.fetch(r, "blobs", &layer.digest, "*/*", layer.size, false).await?;
                 let bundle = sigstore_types::Bundle::from_json(std::str::from_utf8(&json)?)?;
                 for (issuer, subject) in &r.policy.trust {
                     let policy = VerificationPolicy::new(subject.as_str(), issuer.as_str());

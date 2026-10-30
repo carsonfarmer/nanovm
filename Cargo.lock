@@ -1800,6 +1800,7 @@ dependencies = [
  "landlock",
  "libc",
  "oci-client",
+ "oci-spec",
  "parking_lot",
  "reqwest",
  "rustix",
