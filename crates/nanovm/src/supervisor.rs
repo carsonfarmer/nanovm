@@ -57,6 +57,10 @@ const MAX_LINE: u64 = 4096;
 /// Registry fetches under way at once, across apps: each may hold up to
 /// `max_component_mb` in memory.
 const MAX_FETCHES: usize = 4;
+/// Policies remembered as accepting a running version; past this they are
+/// forgotten (and checked again as they come), so requests naming ever-new
+/// ones can't grow the set.
+const MAX_POLICIES: usize = 16;
 
 pub struct Supervisor {
     cfg: NodeConfig,
@@ -240,7 +244,11 @@ impl Supervisor {
             if !l.policies.lock().contains(&want.policy) {
                 let ok = self.fetch(self.registry.authorize(want, &l.version)).await;
                 ok.map_err(|e| down(&format!("{e:#}")))?;
-                l.policies.lock().insert(want.policy.clone());
+                let mut accepted = l.policies.lock();
+                if accepted.len() >= MAX_POLICIES {
+                    accepted.clear();
+                }
+                accepted.insert(want.policy.clone());
             }
             return Ok(l);
         }
@@ -511,6 +519,7 @@ impl Supervisor {
                     "pid": live.as_ref().map(|l| l.pid),
                     "digest": live.as_ref().map(|l| l.digest.clone()),
                     "version": live.as_ref().map(|l| l.version.to_string()),
+                    "policies": live.as_ref().map(|l| l.policies.lock().len()),
                     "starts": w.starts.load(Relaxed),
                     "up": live.is_some(),
                     "link_errors": w.link_errors.load(Relaxed),

@@ -1952,6 +1952,13 @@ async fn a_running_version_is_checked_against_each_policy() {
     assert_eq!(raw(addr, &with_floor("1.0.0"), b"").await.0, 200);
     let v = stats_json(addr).await;
     assert_eq!(v["workers"][worker(&counter).as_str()]["starts"], 1, "{v}");
+    // Ever-new policies don't grow what the supervisor remembers.
+    for i in 0..20 {
+        assert_eq!(raw(addr, &with_floor(&format!("0.0.{i}")), b"").await.0, 200);
+    }
+    let v = stats_json(addr).await;
+    let w = &v["workers"][worker(&counter).as_str()];
+    assert!(w["policies"].as_u64().unwrap() <= 16 && w["starts"] == 1, "{v}");
 }
 
 /// Nothing a registry sends reaches the node's disk before its app is

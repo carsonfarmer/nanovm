@@ -145,7 +145,7 @@ What happens on the first request for a digest:
 2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
 3. **Then the worker.** The app's limits are clamped to the operator's `limits`, and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
 
-**A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running.
+**A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
 
 **How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight and no open sockets, whose worker is retired (its next request starts it again). With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since anyone's DNS can name an app, this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
 
