@@ -5,6 +5,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -12,9 +13,9 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::json;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
@@ -27,14 +28,31 @@ where
     Fut: Future<Output = Response<RespBody>> + Send + 'static,
 {
     loop {
-        let (sock, _) = listener.accept().await?;
-        let _ = sock.set_nodelay(true);
-        serve_conn(sock, f.clone());
+        serve_conn(accept(&listener).await, None, f.clone());
     }
 }
 
-/// Serves HTTP/1.1 on one connection, in its own task.
-pub fn serve_conn<I, F, Fut, B>(io: I, f: F) -> tokio::task::JoinHandle<Result<(), hyper::Error>>
+/// The next connection on `listener`. An error, such as running out of file
+/// descriptors, is logged and waited out rather than ending the server.
+pub async fn accept(listener: &TcpListener) -> TcpStream {
+    loop {
+        match listener.accept().await {
+            Ok((sock, _)) => {
+                let _ = sock.set_nodelay(true);
+                return sock;
+            }
+            Err(e) => {
+                eprintln!("nanovm: accepting a connection: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
+/// Serves HTTP/1.1 on one connection, in its own task. With `header_timeout`,
+/// a client that takes longer to send a request's headers (or leaves the
+/// connection idle that long between requests) is hung up on.
+pub fn serve_conn<I, F, Fut, B>(io: I, header_timeout: Option<Duration>, f: F) -> tokio::task::JoinHandle<Result<(), hyper::Error>>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
@@ -46,7 +64,11 @@ where
         let res = f(req);
         async move { Ok::<_, Infallible>(res.await) }
     });
-    tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(io), svc).with_upgrades())
+    let mut builder = http1::Builder::new();
+    if header_timeout.is_some() {
+        builder.timer(TokioTimer::new()).header_read_timeout(header_timeout);
+    }
+    tokio::spawn(builder.serve_connection(TokioIo::new(io), svc).with_upgrades())
 }
 
 pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {

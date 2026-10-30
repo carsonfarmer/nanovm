@@ -155,7 +155,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** at the fd limit, `accept` fails with EMFILE and `serve` returns, ending the process; about 1,024 idle TCP connections do it at a default soft limit. `tls.accept` has no timeout, and without a hyper timer there is no header-read timeout.
 - **Reproduced:** no (phase 7 review)
 - **Fix:** log, sleep about 10 ms and continue on accept errors; `timeout(10 s)` around the TLS accept; a `TokioTimer` and a header-read timeout on the proxy's connections.
-- **Status:** open
+- **Status:** fixing
 
 ### N-25: the proxy's caches are unbounded and not single-flight
 - **Where:** `proxy.rs:48-49` (`routes`, `digests`), `route`, `digest`

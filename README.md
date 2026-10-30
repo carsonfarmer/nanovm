@@ -119,7 +119,8 @@ That is the repository and the tag deployed, each identity whose signature is ac
 - asks a DNS-over-HTTPS resolver (`resolver`, Cloudflare's by default) and keeps the answer for its TTL;
 - asks the registry which digest the tag names, and keeps that for `tag_ttl_s` (30 s);
 - drops every `nanovm-*` header a client sent, names the app to the node (below), and forwards the request, WebSockets included;
-- speaks TLS with `tls_cert` and `tls_key` (PEM files), or plain HTTP behind something that terminates it.
+- speaks TLS with `tls_cert` and `tls_key` (PEM files), or plain HTTP behind something that terminates it;
+- gives a client 10 s for its TLS handshake and for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too).
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
@@ -297,7 +298,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 60 integration tests and 91 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 61 integration tests and 91 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -333,6 +334,7 @@ The tests cover:
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.
 - apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, a switch that finishes when its request goes away, at most `max_apps` workers (taking only idle apps' slots), and slow registries held to four fetches at once and a deadline
+- the proxy hanging up on clients that stall their TLS handshake or headers, and surviving running out of file descriptors (TLS checked when `openssl` is installed, to make a throwaway certificate)
 - the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and WebSockets pass through
 - key-value: values persisting in the volume, counting against the disk and file quotas, bad names refused, keys paged, reads bounded by the memory limit and batches by size, and the store working in a jailed worker (including a key file the guest replaced through its filesystem)
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`

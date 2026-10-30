@@ -2106,3 +2106,82 @@ async fn slow_registries_are_bounded() {
     }
     assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
 }
+
+/// The public proxy outlasts clients that hold connections: one that never
+/// finishes its TLS handshake or its headers is hung up on after 10 s, and
+/// running out of file descriptors pauses accepting rather than ending the
+/// process.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_proxy_outlasts_idle_and_excess_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("proxy_outlasts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let port = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    // A proxy whose resolver is unreachable: every request is its 502.
+    let start = |name: &str, extra: &str| {
+        let addr = port();
+        let cfg = dir.join(format!("{name}.toml"));
+        let toml = format!("listen = \"{addr}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\n{extra}");
+        std::fs::write(&cfg, toml).unwrap();
+        let cmd = format!("ulimit -n 64 && exec {} proxy --config {}", env!("CARGO_BIN_EXE_nanovm"), cfg.display());
+        let child = tokio::process::Command::new("sh").args(["-c", &cmd]).kill_on_drop(true).spawn().unwrap();
+        (child, addr)
+    };
+    let connect = async |addr| {
+        for _ in 0..100 {
+            if let Ok(c) = tokio::net::TcpStream::connect(addr).await {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the proxy never listened on {addr}");
+    };
+    // Waits for the server to hang up, and says how long that took.
+    let hung_up = async |mut c: tokio::net::TcpStream| {
+        let t0 = Instant::now();
+        let n = tokio::time::timeout(Duration::from_secs(20), c.read(&mut [0; 64])).await;
+        assert!(matches!(n, Ok(Ok(0)) | Ok(Err(_))), "still open: {n:?}");
+        t0.elapsed()
+    };
+
+    let (mut plain, addr) = start("plain", "");
+    let mut slow = connect(addr).await;
+    slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+    let headers = tokio::spawn(async move { hung_up(slow).await });
+    let tls = std::process::Command::new("openssl")
+        .args(["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"])
+        .args(["-days", "1", "-subj", "/CN=localhost", "-keyout", "key.pem", "-out", "cert.pem"])
+        .current_dir(&dir)
+        .output();
+    let handshake = match tls {
+        Ok(out) if out.status.success() => {
+            let extra = format!("tls_cert = {:?}\ntls_key = {:?}\n", dir.join("cert.pem"), dir.join("key.pem"));
+            let (child, addr) = start("tls", &extra);
+            let silent = connect(addr).await;
+            Some((child, tokio::spawn(async move { hung_up(silent).await })))
+        }
+        _ => {
+            eprintln!("skipped the TLS handshake check: no openssl");
+            None
+        }
+    };
+
+    // Past the fd limit, then back under it: the proxy still answers.
+    let mut excess = Vec::new();
+    for _ in 0..100 {
+        excess.push(connect(addr).await);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(excess);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(plain.try_wait().unwrap().is_none(), "the proxy exited");
+    let (status, body) = raw(addr, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", b"").await;
+    assert_eq!(status, 502, "{body}");
+
+    let took = headers.await.unwrap();
+    assert!(took >= Duration::from_secs(9), "{took:?}");
+    if let Some((_child, handshake)) = handshake {
+        let took = handshake.await.unwrap();
+        assert!(took >= Duration::from_secs(9), "{took:?}");
+    }
+}

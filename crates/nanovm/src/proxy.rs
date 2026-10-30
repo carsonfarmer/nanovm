@@ -31,6 +31,10 @@ use crate::config::ProxyConfig;
 use crate::object::{RespBody, error_response};
 use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
 
+/// How long a client may take over its TLS handshake, and over each
+/// request's headers (or idling between requests).
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// What `_nanovm.<host>` says.
 #[derive(Clone, Debug, PartialEq)]
 struct Route {
@@ -197,19 +201,18 @@ pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyh
         _ => bail!("tls_cert and tls_key go together"),
     };
     loop {
-        let (sock, _) = listener.accept().await?;
-        let _ = sock.set_nodelay(true);
+        let sock = crate::server::accept(&listener).await;
         let (p, tls) = (proxy.clone(), tls.clone());
         tokio::spawn(async move {
             let f = move |req| p.clone().handle(req);
             match tls {
                 Some(tls) => {
-                    if let Ok(sock) = tls.accept(sock).await {
-                        crate::server::serve_conn(sock, f);
+                    if let Ok(Ok(sock)) = tokio::time::timeout(CLIENT_TIMEOUT, tls.accept(sock)).await {
+                        crate::server::serve_conn(sock, Some(CLIENT_TIMEOUT), f);
                     }
                 }
                 None => {
-                    crate::server::serve_conn(sock, f);
+                    crate::server::serve_conn(sock, Some(CLIENT_TIMEOUT), f);
                 }
             }
         });

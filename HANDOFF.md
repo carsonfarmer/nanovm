@@ -16,7 +16,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
   - phase 6b (calls between objects, Q45). README's "Calls between objects" describes it.
   - phase 7 (the front proxy, Q34, Q52): `nanovm proxy`, apps only from registries and one app per worker, apps keyed by host and repository, dev mode, a registry client with size caps. Built by one agent on branch `proxy`, finished (rebase, demo, docs, reduction pass, review) by another. PLAN's "Phase 7" describes it.
   - orb setup (`.agents/setup`, `.agents/resume`), so Amp orbs start with the toolchain and the tests prebuilt.
-- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed except N-20, which goes away with W-3. A review of phase 7 found more; N-22 (nothing bounded the apps a node runs) is fixed; N-23 to N-31 are open.
+- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed except N-20, which goes away with W-3. A review of phase 7 found more; N-22 (nothing bounded the apps a node runs) and N-24 (accept errors, proxy timeouts) are fixed; the rest of N-23 to N-32 are open.
 - **Nobody is mid-rewrite** as of phase 7 landing; claim files through ISSUES.md before large changes (see "Working alongside other agents").
 - **Next:** PLAN.md's "Roadmap" (agreed 2026-10-30), tracked as `W-1`… in ISSUES.md. In short: WebSockets moved into the proxy, OpenTelemetry by default (high priority), the per-object SQLite demo, alarms outside the node, data lifecycle planning, then the groundwork for many nodes.
 - Branches merged into `main` by fast-forward are not always pushed on their own. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.

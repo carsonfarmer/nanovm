@@ -194,7 +194,7 @@ where
         let Ok(permit) = open.clone().try_acquire_owned() else { continue };
         let sock = std::os::unix::net::UnixStream::from(fd);
         sock.set_nonblocking(true)?;
-        let conn = crate::server::serve_conn(UnixStream::from_std(sock)?, f.clone());
+        let conn = crate::server::serve_conn(UnixStream::from_std(sock)?, None, f.clone());
         tokio::spawn(async move {
             let _ = conn.await;
             drop(permit);
