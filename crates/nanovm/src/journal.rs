@@ -114,6 +114,12 @@ impl Journal {
         (p.starts_with(&self.volume) || p.starts_with(&self.dir)).then(|| self.rel(&p))
     }
 
+    /// Whether `file` was removed into the journal, so it is no longer the
+    /// volume's.
+    pub fn holds(&self, file: &File) -> bool {
+        fd_path(file).is_some_and(|p| p.starts_with(&self.dir))
+    }
+
     fn rel(&self, abs: &Path) -> PathBuf {
         abs.strip_prefix(&self.base).expect("inside the base").to_path_buf()
     }

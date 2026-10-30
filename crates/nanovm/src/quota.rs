@@ -129,7 +129,10 @@ impl QuotaGuard {
         }
         q.journaled(|j| j.writing(file, size, before))?;
         file.set_len(size).map_err(|_| ErrorCode::Io)?;
-        q.bytes = (q.bytes + size).saturating_sub(before);
+        // A removed file's bytes were freed when it was removed; growing it
+        // still costs, but shrinking it frees nothing more.
+        let freed = if q.journal.holds(file) { 0 } else { before.saturating_sub(size) };
+        q.bytes = (q.bytes + size.saturating_sub(before)).saturating_sub(freed);
         Ok(())
     }
 
@@ -809,6 +812,25 @@ mod tests {
         g.set_size(&f, 10).unwrap();
         g.set_size(&f, 3).unwrap();
         assert_eq!((usage(&g).0, f.metadata().unwrap().len()), (3, 3));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file removed while open had its bytes freed then; truncating it
+    /// afterwards can't free them a second time.
+    #[test]
+    fn a_removed_file_is_freed_once() {
+        let dir = tempdir("removed").canonicalize().unwrap();
+        std::fs::write(dir.join("f"), [0; 10]).unwrap();
+        std::fs::write(dir.join("g"), [0; 10]).unwrap();
+        let obj = Arc::new(ObjShared::new("app".into(), "obj"));
+        let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj).unwrap();
+        let f = std::fs::File::options().write(true).open(dir.join("f")).unwrap();
+        g.remove(&dir.join("f"), 10).unwrap();
+        assert_eq!(usage(&g), (10, 1));
+        g.set_size(&f, 0).unwrap();
+        assert_eq!(usage(&g).0, 10);
+        g.set_size(&f, 4).unwrap();
+        assert_eq!(usage(&g).0, 14, "growing it still costs");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

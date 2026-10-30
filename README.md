@@ -255,7 +255,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 55 integration tests and 81 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 55 integration tests and 82 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel
@@ -351,6 +351,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
   - A failed `rmdir` was journaled anyway, so rolling back created a directory the file count never saw; repeated, it went past `max_files` (N-5).
   - When the full journal refused a file's size record, the file was still marked as recorded, so a retried append went through with nothing to undo it (N-6).
   - Overwriting a file opened write-only failed: the journal read the old bytes through the guest's descriptor (N-7).
+  - Truncating a file after removing it, while still open, freed its bytes a second time, so committed data could exceed the quota (N-8).
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
 ## Layout
