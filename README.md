@@ -49,6 +49,8 @@ On the 4-core Linux sandbox, with each app's worker capped at 8,000 objects (the
 
 Every request succeeded and each worker started once. The cost of the jail is the hop between the supervisor and the worker; see [What the jail costs](#what-the-jail-costs).
 
+A run in a 4-core Amp orb after phase 7 (the registry setup, with per-request commits): 5,000 cold starts at 2.9K/s (p50 18 ms, 95 KB per new object), 50,000 warm GETs at 15.9K/s (p50 2.7 ms), 10,000 `POST /incr` at 600/s (each now fsyncs its commit; 1 of them was a CPU kill under load), one client at 2.9K/s (p50 0.3 ms), all 100 attacks contained in 2.2 s, and 0 canary failures.
+
 Every attack in the storm, and how it ended:
 
 | Attack | Outcome |
@@ -293,7 +295,7 @@ scripts/build-guests.sh
 cargo test --release -p nanovm
 ```
 
-There are 56 integration tests and 84 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
+There are 57 integration tests and 90 unit tests, plus one that needs the internet and is ignored by default: it is the only one that makes a real HTTPS request (to example.com, through the webpki roots), and this sandbox has no DNS or direct internet. They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
 The tests cover:
 - one request at a time per object, with objects running in parallel

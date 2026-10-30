@@ -24,7 +24,7 @@ Done means:
 
 ```
 client ──HTTP──► nanovm (hyper 1, http1)
-                  │  data:    /{app}/{object}/{rest...}   (guest sees /{rest...})
+                  │  data:    /{object}/{rest...}, app named by headers (guest sees /{rest...})
                   │  control: /_nanovm/stats, /_nanovm/events (JSON)
                   ▼
               ObjectTable  (app, object) → ObjectHandle { mailbox tx, last_used, state }
@@ -38,7 +38,7 @@ client ──HTTP──► nanovm (hyper 1, http1)
                   • trap / timeout / limit → poison → drop Store (/data survives),
                     then re-instantiate for queued requests
                   │
-                  ├─ VFS (wasi:filesystem@0.3, quota'd):  /app RO · /tmp scratch · /data persistent
+                  ├─ VFS (wasi:filesystem@0.3, quota'd):  /tmp scratch · /data persistent
                   ├─ env: NANOVM_APP, NANOVM_OBJECT_ID (the object's "this.id")
                   └─ egress: allowlist → DNS → public-IP filter → connect to the resolved IP
 ```
@@ -138,11 +138,10 @@ nanovm/
 
 `allow_blocking_current_thread(true)` is set on the `WasiCtxBuilder` before the preopens (which capture it), so small filesystem calls run inline and are charged to the CPU budget instead of queueing on tokio's `spawn_blocking` mutex.
 
-- **Preopens:** three calls to `preopened_dir(host, guest, FsPerms)`:
-  - `/app` read-only, shared per app (`apps/<app>/static`)
+- **Preopens:** two calls to `preopened_dir(host, guest, FsPerms)` (the read-only `/app` went with local apps in phase 7):
   - `/tmp` read-write, at `scratch/<app>/<object>-<instance>`
   - `/data` read-write, at `data/<app>/<object>`
-- **One budget per object:** `/data` and `/tmp` share `disk_mb` and `max_files`. `/app` is read-only, so the stock host refuses every mutation there before usage changes; no descriptor-to-mount bookkeeping is needed. `/data` is walked at instance start; `/tmp` starts empty.
+- **One budget per object:** `/data` and `/tmp` share `disk_mb` and `max_files`, so no descriptor-to-mount bookkeeping is needed. `/data` is walked at instance start; `/tmp` starts empty.
 - **Writes:** `write-via-stream` and `append-via-stream` use our `QuotaWriter: StreamConsumer`, which writes inline: the quota check and `write_at` happen under the quota lock, writing as much as the budget allows, so a filler sees a short write and then an error, as on a full disk.
   - Going over the byte budget returns `insufficient-space`.
   - Going over the entry limit returns `quota`.
@@ -152,7 +151,6 @@ nanovm/
 - **Denied:**
   - `link-at` and `symlink-at`, so shared inodes and link targets don't have to be tracked.
   - Renames between `/tmp` and `/data` are allowed: both draw on the same budget.
-  - Writes to `/app` return `ReadOnly`.
 - **Everything else** delegates to `<WasiFilesystem as HostDescriptorWithStore<T>>::*`.
 - **Counting:** logical `st_size`. Files, directories and symlinks all count toward the file limit.
 - **Path escape:** stock wasmtime-wasi already confines paths to their preopen. Tests confirm it.
@@ -172,7 +170,7 @@ nanovm/
 5. **Not yet done:** a timeout on the TLS handshake itself, a between-bytes timeout and a size cap on the upstream response body. Today these are bounded only by the request's wall-clock deadline.
 6. **Sockets:** wasi sockets stay denied by default, and `inherit_network()` is never called.
 
-## Limits (per app, in each `[[app]]`'s `[app.limits]`)
+## Limits (per app, from its `nanovm.json`, clamped to the node's `[limits]`)
 
 | Knob | Default | Enforced by |
 |---|---|---|
@@ -195,7 +193,6 @@ Node-level settings: `max_live_objects` (1000), `memory_reservation_mb` (128), `
   - `GET /`: object id, in-memory hit count, persisted counter
   - `POST /incr`
   - `GET/PUT/DELETE /kv/{key}`, stored in `/data/kv`
-  - `GET /static`: reads `/app`
 - **hostile:**
   - `/alloc?mb=`, `/spin`, `/sleep?ms=`, `/panic`
   - `/fill?mount=&mb=`, `/files?n=`, `/bigfile?mb=`
@@ -257,7 +254,7 @@ All nine steps are done. [README.md](README.md) has the results and the bugs the
 The goal: one node, as fast and secure as we can make it, that runs untrusted WebAssembly apps as durable objects, deployable by anyone without handing out a long-lived secret. It is a solid single-node baseline to measure against before any clustering.
 
 - **Placement:** the node sits behind a trusted proxy on a private network. The proxy is the public HTTP(S) entry point (TLS, auth, route → digest); only the proxy-to-node hop is private. The node has no TLS and no auth of its own.
-- **Tenancy:** tenant = app. Routes stay `/{app}/{object}/{path}`. The node exposes only data APIs.
+- **Tenancy:** tenant = app, keyed by its repository (phase 7). Routes are `/{object}/{path}`, with the app named by the proxy's headers. The node exposes only data APIs.
 - **Isolation, in layers:** Wasm with the per-object limits; one jailed worker process per app; a supervisor that holds no untrusted code and owns the network. A Wasm escape reaches one app's jail and nothing else.
 - **Deploy, stateless and keyless:**
   - Apps are OCI artifacts (an `application/wasm` layer plus a config blob with limits and env), pulled anonymously and by digest only.
@@ -294,7 +291,7 @@ client ─► proxy ─► supervisor (nanovm serve): no untrusted code
 - **Worker = one Node for one app.** The supervisor passes the app's config (JSON) and the component bytes on the worker's stdin. Later it passes bytes it has fetched and verified (Q24). The worker reads them, jails itself, and only then compiles and serves. Untrusted code never runs before the jail is in place.
 - **Jail (Linux), applied by the worker to itself before any thread starts:**
   - **uid:** when the supervisor runs as root, each app gets its own uid (`jail_uid_base` + app index). The supervisor chowns the app's directories to that uid.
-  - **Landlock:** read-write access to the app's `objects/`, `tmp/` and `cache/` subtrees; read-only access to its `static_dir`; nothing else.
+  - **Landlock:** read-write access to the app's `objects/`, `tmp/` and `cache/` subtrees; nothing else.
   - **seccomp:** an allowlist of the syscalls Wasmtime, tokio and the filesystem host need. There is no `socket`, `connect`, `bind`, `execve`, `ptrace`, `mount` or namespace calls, `clone` only creates threads, and anything else fails with `EPERM`. With no way to make a socket, the worker has no network beyond the two it inherited.
   - **no_new_privs** and `PR_SET_PDEATHSIG`, so a worker dies with its supervisor.
 - **Mount and network namespaces were dropped from the Q23 plan.** Landlock already confines the filesystem, and seccomp's lack of `socket` already removes the network, so namespaces would be redundant defence.
@@ -317,8 +314,8 @@ As in the target design, with these choices (README, "Apps from a registry", has
 - Headers `nanovm-app` (ref@digest), `nanovm-trust` (`<issuer> <subject>`, comma-separated) and `nanovm-min-version`. The version is the manifest's `org.opencontainers.image.version`.
 - Verification happens before any blob is fetched. Bundles are fetched every time a worker starts (they are small, and whether one exists is the registry's current answer). Manifests and blobs are cached by digest.
 - One worker per app at a time. A version switch fetches and verifies the new version first, then drains the old worker, then starts the new one. That also makes fetches single-flight per app, so no separate single-flight map was needed.
-- A registry app's egress entries are its own (the public-IP filter still applies). Its numeric limits are clamped to `registry_limits`.
-- Local `[[app]]` entries stay, for development, the demo and tests (Q27).
+- A registry app's egress entries are its own (the public-IP filter still applies). Its numeric limits are clamped to `registry_limits` (`limits` since phase 7).
+- Local `[[app]]` entries stayed, for development, the demo and tests (Q27), until phase 7 removed them.
 - CI (`publish-guests.yml`) publishes the test guests with GitHub artifact attestations. That needed the repo to be public: attestations aren't available on private user repos.
 
 ## Phase 4: key-value and config (done), phase 5: WebSockets (done)
@@ -333,11 +330,21 @@ A request's changes to `/data` (files and key-value) and its WebSocket publishes
 
 An object calls another object of its app with an ordinary outgoing request to `http://nanovm/objects/{id}/{path}`, dispatched into the callee's queue (`egress.rs` `call`). A call that would wait on its own caller, directly or through other calls, is refused with 508; `Node::wait_for` checks and records the wait-for edges under the table lock. README's "Calls between objects" has the details.
 
+## Phase 7: the front proxy (done)
+
+Built on branch `proxy` by one agent and finished by another. README's "The proxy" and "Apps" have the details.
+- **`nanovm proxy`** (`proxy.rs`) is the public entry point. It finds a host's app in the TXT record `_nanovm.<host>` (`app=<repository>:<tag>; trust=<issuer> <subject>; …; min=<version>`), asked of a DNS-over-HTTPS resolver and cached for its TTL; resolves the tag to a digest (cached for `tag_ttl_s`); drops every `nanovm-*` header a client sent; sets `nanovm-app`, `nanovm-trust` and `nanovm-min-version`; and forwards to the node, WebSocket upgrades included. TLS is optional. Whoever controls a domain controls its routing, but the node runs only what a listed identity signed, and an app's data is keyed by its repository, so a forged record can't reach another app's data.
+- **Apps come only from registries; one app per worker.** `[[app]]`, local components and the read-only `/app` directory are gone. A request's path is `/{object}/{rest}`, checked strictly (`table::route`).
+- **App identity:** an app's name on the node, its volumes and its uid come from `registry/repository` (`registry::app_name`: a readable prefix and a hash of the whole).
+- **Dev mode** (`dev = true`, refused unless `listen` is loopback): no signature check; registries and egress may be on private addresses; loopback registries are plain HTTP. Tests and the demo use it with a `container-registry` instance on loopback (`examples/dev-registry.rs`).
+- **A registry client of our own** (`registry::Oci`, over reqwest) replaced oci-client's downloads: every download has a size cap, digests are checked before they name a file, and only public addresses are reached (DNS answers and redirects included) unless in dev mode. oci-client stays for reference parsing and manifest types.
+- **Review findings fixed here:** N-1, N-3, N-4, N-11, N-12, N-13 (and with it N-14, N-15), N-16, N-17, N-18, N-19.
+
 ## Roadmap (agreed with the owner, 2026-10-30)
 
 Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tracked; the decisions are Q41–Q51 in [HANDOFF.md](HANDOFF.md). In priority order:
 
-1. **The front proxy (Q34), with WebSockets moved into it (Q42).** Another agent is building the proxy (branch `proxy`): local apps removed, app data keyed by repository, `nanovm proxy` as the public entry point. The proxy then also holds client WebSockets, as Pushpin does: the node only ever answers requests, and an object sees socket events as plain `POST`s in the WebSocket-over-HTTP format it already gets. Most of `ws.rs` leaves the node, and N-14 and N-20 go with it. This supersedes Q31 (sockets in the supervisor). (W-3)
+1. **WebSockets moved into the front proxy (Q42).** The proxy itself landed as phase 7. It then also holds client WebSockets, as Pushpin does: the node only ever answers requests, and an object sees socket events as plain `POST`s in the WebSocket-over-HTTP format it already gets. Most of `ws.rs` leaves the node, and N-14 and N-20 go with it. This supersedes Q31 (sockets in the supervisor). (W-3)
 2. **Observability by default (Q43).** OpenTelemetry tracing, metrics and guest logs, on by default, tagged per tenant (app, object, version). `/_nanovm/stats` and `/_nanovm/events` are deprecated and go once OTel covers them. A jailed worker has no sockets, so its telemetry leaves through the supervisor. (W-2)
 3. **A per-object SQLite demo (Q46).** The showcase: every object its own SQLite database on `/data`, committed with its response. It works today, since writes happen in place and `mmap` is kept. (W-1)
 4. **Alarms, outside the node (Q41).** A scheduler beside the proxy sends a request to an object when its alarm fires; an object sets alarms with a response header. The node stays request-only. (W-4)
