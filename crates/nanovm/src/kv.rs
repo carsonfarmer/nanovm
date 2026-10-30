@@ -113,13 +113,15 @@ impl ObjState {
             Err(_) => None,
         };
         // The old value goes into the request's journal and the new one is
-        // written in its place; the request's commit makes it durable. A
-        // write that fails traps, so the request rolls back.
+        // written in its place; the request's commit makes it durable. Past
+        // the reservation, a failure traps: the request rolls back, and the
+        // next instance counts usage from the volume.
         self.quota.reserve(old, value.len() as u64)?;
+        let trap = |e| Fail::Trap(wasmtime::Error::msg(format!("journal: {e:?}")));
         if let Some(old) = old {
-            self.quota.journal(|j| j.remove(&path, old))?;
+            self.quota.journal(|j| j.remove(&path, old)).map_err(trap)?;
         }
-        self.quota.journal(|j| j.creating(&path))?;
+        self.quota.journal(|j| j.creating(&path)).map_err(trap)?;
         std::fs::write(&path, value).map_err(|e| Fail::Trap(e.into()))
     }
 
@@ -391,6 +393,23 @@ mod tests {
         assert!(why(s.set_value(&b, "b", b"")).contains("Quota"));
         ok(s.set_value(&b, "a", b"small"));
         assert_eq!(s.quota.usage(), (5, 3));
+    }
+
+    /// A replacement the full journal refuses traps, so the request rolls
+    /// back: it can't leave usage counting the new value while the old one
+    /// is still there.
+    #[test]
+    fn a_replacement_the_journal_refuses_traps() {
+        let mut s = state(Limits {
+            disk_mb: 1,
+            ..Limits::default()
+        });
+        let b = ok(s.open_bucket(""));
+        let big = vec![0; 600 << 10];
+        ok(s.set_value(&b, "a", &big));
+        ok(s.set_value(&b, "a", &big));
+        // The journal now holds one removed value; a second won't fit.
+        assert!(matches!(s.set_value(&b, "a", b"small"), Err(Fail::Trap(_))));
     }
 
     /// A key whose file the guest replaced with something else through its
