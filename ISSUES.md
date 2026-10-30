@@ -66,7 +66,7 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `table.rs:195-207`, `table.rs:150-151`
 - **Scenario:** `evict_lru` picks entries whose phase is `Idle`, which an entry still is with a job queued but not yet received, or a WebSocket event waiting in the spawned send. The evicted actor drains its queue while the next request starts a second actor for the same object on the same volume.
 - **Reproduced:** no (from source)
-- **Status:** fixing
+- **Status:** fixed in f98cb9a
 
 ## N-11: cancelling a version switch mid-drain can leave two workers on one app's volumes
 - **Where:** `supervisor.rs:334-337`
