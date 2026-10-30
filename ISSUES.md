@@ -169,7 +169,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** each distinct `(trust, min)` a request names is re-verified over the network (holding the app's start lock) and kept once accepted; varying `min=` or adding junk `trust=` entries grows the set and costs a referrers fetch each time.
 - **Reproduced:** no (phase 7 review)
 - **Fix:** clear the set past about 16 entries.
-- **Status:** fixing
+- **Status:** fixed in 0571c92
 
 ### N-27: links are capped per worker only, and high
 - **Where:** `link.rs:192-201`, `supervisor.rs:328`
