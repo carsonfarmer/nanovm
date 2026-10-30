@@ -36,19 +36,19 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `quota.rs:476-478`, `journal.rs:186-191`, `journal.rs:267`
 - **Scenario:** `RemovedDir` is recorded before the removal, without checking that an empty directory is there. When the removal fails, rollback creates a directory that never existed and that the file count never charged; repeated, it takes the volume past `max_files`.
 - **Reproduced:** yes (journal compiled alone in a scratch harness)
-- **Status:** fixing
+- **Status:** fixed in 5f79152
 
 ## N-6: an inode is marked as size-recorded before the record is written
 - **Where:** `journal.rs:155-158`
 - **Scenario:** `sized.insert(ino)` runs before `record(Undo::Size(..))`. When the record fails (journal full), the retry skips it, and rollback can't undo the file's growth.
 - **Reproduced:** yes (scratch harness)
-- **Status:** fixing
+- **Status:** fixed in 5f79152
 
 ## N-7: undo bytes are read through the guest's own descriptor
 - **Where:** `journal.rs:162`
 - **Scenario:** Overwriting a file opened write-only fails with `EBADF`, because the old bytes are read with `read_exact_at` on the guest's descriptor.
 - **Reproduced:** yes (scratch harness)
-- **Status:** fixing
+- **Status:** fixed in 5f79152
 
 ## N-8: truncating an open file after unlinking it credits its bytes twice
 - **Where:** `quota.rs:588-592`, `journal.rs:108-115`, `quota.rs:123-133`
