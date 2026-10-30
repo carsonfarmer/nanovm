@@ -34,7 +34,7 @@ where
 }
 
 /// Serves HTTP/1.1 on one connection, in its own task.
-pub fn serve_conn<I, F, Fut, B>(io: I, f: F)
+pub fn serve_conn<I, F, Fut, B>(io: I, f: F) -> tokio::task::JoinHandle<Result<(), hyper::Error>>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
@@ -46,7 +46,7 @@ where
         let res = f(req);
         async move { Ok::<_, Infallible>(res.await) }
     });
-    tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(io), svc).with_upgrades());
+    tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(io), svc).with_upgrades())
 }
 
 pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {

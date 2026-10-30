@@ -206,7 +206,9 @@ pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyh
                         crate::server::serve_conn(sock, f);
                     }
                 }
-                None => crate::server::serve_conn(sock, f),
+                None => {
+                    crate::server::serve_conn(sock, f);
+                }
             }
         });
     }
