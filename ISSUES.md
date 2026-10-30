@@ -84,19 +84,19 @@ Found by the review at `c607ec9`; line numbers are as of that commit.
 - **Where:** `link.rs:191-195`
 - **Scenario:** Every fd sent on a control socket becomes a served connection, with no limit. A worker can make the supervisor hold any number of connections (each one a pending outbound request), and the worker-side outbound limit (`egress.rs:140`) is only enforced inside the worker.
 - **Reproduced:** no (from source)
-- **Status:** fixing
+- **Status:** deferred: supervisor/registry/config rewrite in progress. The cap has to come from the supervisor's call site (`supervisor.rs:430`), which knows the app's limits; `link::serve` serves both directions, and the worker side must not be capped. A cap of `max_live_objects × max_outbound_concurrency` (plus room for publishes) per worker is what a guest can legitimately use.
 
 ## N-14: publish bodies are collected with no deadline
 - **Where:** `ws.rs:407`
 - **Scenario:** The supervisor collects a publish body up to `response_max` with no time limit; a worker that sends part of one holds that memory for as long as it likes, per link (see N-13).
 - **Reproduced:** no (from source)
-- **Status:** fixing
+- **Status:** deferred with N-13: only a worker that got out of Wasm can send a partial publish (the worker holds a guest's publishes whole until its request commits, `egress.rs:199-216`), and with N-13's cap it holds at most `response_max` per link it is allowed.
 
 ## N-15: forwarded responses have no body timeout
 - **Where:** `egress.rs:281-285`, `egress.rs:367-369`
 - **Scenario:** `serve_forwarded` bounds connecting and the first byte, but nothing bounds the response body after it, so a slow upstream holds the supervisor's connection and link for as long as it trickles.
 - **Reproduced:** no (from source)
-- **Status:** fixing
+- **Status:** deferred with N-13: a guest reading a slow body is bounded by its own request deadline, after which the worker drops the link and the supervisor drops the upstream. Only a worker that got out of Wasm can keep one open, and N-13's cap bounds how many.
 
 ## N-16: worker stderr without newlines grows one buffer without limit
 - **Where:** `supervisor.rs:402-407`
