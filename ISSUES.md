@@ -194,7 +194,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `proxy.rs` (`forward`)
 - **Scenario:** `Connection`-listed and other hop-by-hop headers from the client are forwarded to the node. Low risk (the node is HTTP/1.1 and strips its own headers), but a proxy should drop them.
 - **Reproduced:** no (phase 7 review)
-- **Status:** fixing
+- **Status:** fixed in ca4f51e
 
 ### N-31 (removable): code the phase 7 review found removable
 - **What:** `check_digest` in `AppRef::from_headers` repeats the one in `fetch`, which runs before any path (1 line); TLS in the proxy (`proxy.rs` `tls`, `tls_cert`/`tls_key`, about 30 lines) if a terminator in front is assumed (owner's call: there is no ACME anyway); depending on `oci-spec` directly instead of oci-client, which the runtime now uses only for its re-exports (fewer dependencies, not lines).
