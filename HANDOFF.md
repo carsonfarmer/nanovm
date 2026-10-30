@@ -1,6 +1,6 @@
 # Handoff
 
-Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found).
+Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
 ## State (2026-10-30)
 
