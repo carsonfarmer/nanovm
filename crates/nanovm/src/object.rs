@@ -280,7 +280,9 @@ impl WasiHttpView for ObjState {
 
 fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
     let limits = &app.cfg.limits;
-    let n = node.next_seq();
+    // Each instance gets scratch of its own.
+    static INSTANCE: AtomicU64 = AtomicU64::new(0);
+    let n = INSTANCE.fetch_add(1, Relaxed);
     let [objects, tmp, _] = node.cfg.app_dirs(&app.name);
     let data_dir = objects.join(&*shared.id);
     let tmp_dir = tmp.join(format!("{}.{n}", shared.id));

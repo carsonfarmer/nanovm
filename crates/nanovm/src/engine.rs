@@ -133,15 +133,11 @@ pub fn load_component(engine: &Engine, bytes: &[u8], cache_dir: &Path) -> anyhow
     let key = format!("{digest:x}-{:016x}.cwasm", h.finish());
     let cached = cache_dir.join(key);
 
-    if cached.exists() {
-        // SAFETY: the cache directory belongs to this app and is only ever
-        // written by `precompile_component` below, in this app's process.
-        match unsafe { Component::deserialize_file(engine, &cached) } {
-            Ok(c) => return Ok(c),
-            Err(_) => {
-                let _ = std::fs::remove_file(&cached);
-            }
-        }
+    // SAFETY: the cache directory belongs to this app and is only ever
+    // written by `precompile_component` below, in this app's process. A
+    // missing or stale file fails here and is replaced by the rename below.
+    if let Ok(c) = unsafe { Component::deserialize_file(engine, &cached) } {
+        return Ok(c);
     }
     let compiled = engine.precompile_component(bytes)?;
     std::fs::create_dir_all(cache_dir)?;

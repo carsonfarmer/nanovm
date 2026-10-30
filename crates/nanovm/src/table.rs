@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -56,7 +56,6 @@ pub struct Node {
     /// One permit per live store, released only after the store is dropped.
     pub slots: Arc<Semaphore>,
     objects: Mutex<HashMap<(Arc<str>, Arc<str>), Entry>>,
-    seq: AtomicU64,
 }
 
 impl Node {
@@ -101,7 +100,6 @@ impl Node {
             heavy,
             slots,
             objects: Mutex::default(),
-            seq: AtomicU64::new(1),
         }))
     }
 
@@ -114,10 +112,6 @@ impl Node {
         while self.metrics.stores_live.load(Relaxed) > 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }
-
-    pub fn next_seq(&self) -> u64 {
-        self.seq.fetch_add(1, Relaxed)
     }
 
     pub fn live_objects(&self) -> usize {
