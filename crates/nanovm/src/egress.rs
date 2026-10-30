@@ -158,7 +158,7 @@ impl WasiHttpHooks for EgressHooks {
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
         let obj = self.obj.clone();
-        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && false {
+        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && matches!(route, Route::Supervisor(_)) {
             let (held, max) = (self.held.clone(), self.publish_max);
             return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
         }

@@ -479,15 +479,14 @@ async fn sandbox_escapes_blocked() {
     assert!(!r.body.contains("LEAKED") && !r.body.contains("OPENED"), "{}", r.body);
 }
 
+/// `/data` and `/tmp` are separate filesystems to the guest: a rename
+/// between them is refused as cross-device, as POSIX does.
 #[tokio::test(flavor = "multi_thread")]
-async fn rename_across_mounts_keeps_one_budget() {
-    let node = node("rename_across_mounts_keeps_one_budget", 8, 60_000);
+async fn renames_between_mounts_are_cross_device() {
+    let node = node("renames_between_mounts_are_cross_device", 8, 60_000);
     let r = get(&node, "hostile", "r", "/cross-rename").await;
-    assert_eq!(r.status, 200, "{}", r.body);
-    assert!(node.cfg.data_dir.join("objects/hostile/r/x.txt").exists());
-    // The moved file is still counted once: 8 MiB minus its byte still fit.
-    let r = get(&node, "hostile", "r", "/fill?mount=data&mb=4&name=a").await;
-    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["error"], "cross-device", "{}", r.body);
+    assert!(!node.cfg.data_dir.join("objects/hostile/r/x.txt").exists());
 }
 
 // ---- egress -----------------------------------------------------------

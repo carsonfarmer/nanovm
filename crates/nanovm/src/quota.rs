@@ -531,10 +531,9 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
                 Some(size) if open_flags.contains(OpenFlags::TRUNCATE) => {
                     freed = size;
                     // What the truncation destroys is kept first.
-                    if let Some(p) = local {
+                    if let Some(p) = local.filter(|_| size > 0) {
                         let mut q = quota.0.lock();
-                        let abs = q.journal.abs(&p);
-                        let file = std::fs::OpenOptions::new().read(true).open(abs).map_err(|_| ErrorCode::Io)?;
+                        let file = std::fs::File::open(q.journal.abs(&p)).map_err(|_| ErrorCode::Io)?;
                         let saved = q.journal.writing(&p, &file, 0, size).map_err(|_| ErrorCode::Io)?;
                         q.hold(saved, 0)?;
                     }
@@ -587,17 +586,8 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
                 quota.journal(|j| j.rename(&from, &to))?;
                 return Ok(());
             }
-            // Leaving the volume can't be undone once committed elsewhere.
-            (Some(_), None) => return Err(ErrorCode::CrossDevice.into()),
-            // Arriving in it is a creation, over whatever was there.
-            (None, Some(to)) => {
-                if replaced.is_some() {
-                    quota.remove(&to, replaced.unwrap_or(0))?;
-                }
-                quota.journal(|j| j.creating(&to))?;
-                WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await?;
-                return Ok(());
-            }
+            // `/data` and `/tmp` are separate filesystems to the guest.
+            (Some(_), None) | (None, Some(_)) => return Err(ErrorCode::CrossDevice.into()),
             (None, None) => {}
         }
         WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await?;

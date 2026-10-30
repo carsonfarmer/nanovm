@@ -5,9 +5,8 @@
 //! - a file's size, the first time it is written or truncated;
 //! - the bytes a write or a truncation overwrites;
 //! - "remove this", for a new file or directory;
-//! - "rename it back", for a rename;
-//! - a removed or replaced file itself, moved into the journal rather than
-//!   deleted;
+//! - "rename it back", for a rename; a removed or replaced file is itself
+//!   renamed into the journal rather than deleted;
 //! - "recreate this", for a removed directory.
 //!
 //! Writes then happen in place, so open files stay valid. Committing syncs
@@ -38,8 +37,6 @@ enum Undo {
     Bytes(PathBuf, u64, Vec<u8>),
     Created(PathBuf),
     RemovedDir(PathBuf),
-    /// The entry at the first path was moved to the second.
-    Moved(PathBuf, PathBuf),
     /// The entry at the first path was renamed to the second.
     Renamed(PathBuf, PathBuf),
 }
@@ -157,7 +154,7 @@ impl Journal {
     pub fn remove(&mut self, p: &Path) -> std::io::Result<()> {
         self.slots += 1;
         let slot = self.local(&self.dir.join(self.slots.to_string())).expect("the journal is local");
-        self.record(Undo::Moved(p.to_path_buf(), slot.clone()))?;
+        self.record(Undo::Renamed(p.to_path_buf(), slot.clone()))?;
         std::fs::rename(self.abs(p), self.abs(&slot))?;
         self.touch_parent(p);
         Ok(())
@@ -227,13 +224,12 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
             Undo::Bytes(p, at, data) => gone(File::options().write(true).open(abs(p)).and_then(|f| f.write_all_at(data, *at)))?,
             Undo::Created(p) => gone(std::fs::remove_file(abs(p)).or_else(|_| std::fs::remove_dir(abs(p))))?,
             Undo::RemovedDir(p) => gone(std::fs::create_dir(abs(p)))?,
-            Undo::Moved(p, slot) => gone(std::fs::rename(abs(slot), abs(p)))?,
             Undo::Renamed(from, to) if !abs(from).exists() => gone(std::fs::rename(abs(to), abs(from)))?,
             Undo::Renamed(..) => {}
         }
         let p = match &undo {
             Undo::Size(p, _) | Undo::Bytes(p, ..) => p.as_path(),
-            Undo::Created(p) | Undo::RemovedDir(p) | Undo::Moved(p, _) | Undo::Renamed(p, _) => {
+            Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => {
                 p.parent().unwrap_or(Path::new(""))
             }
         };
@@ -262,8 +258,7 @@ fn encode(undo: &Undo) -> Vec<u8> {
         Undo::Bytes(a, at, data) => (1, vec![p(a), at.to_le_bytes().to_vec(), data.clone()]),
         Undo::Created(a) => (2, vec![p(a)]),
         Undo::RemovedDir(a) => (3, vec![p(a)]),
-        Undo::Moved(a, b) => (4, vec![p(a), p(b)]),
-        Undo::Renamed(a, b) => (5, vec![p(a), p(b)]),
+        Undo::Renamed(a, b) => (4, vec![p(a), p(b)]),
     };
     put(&[tag]);
     fields.iter().for_each(|f| put(f));
@@ -294,8 +289,7 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
             [1] => Undo::Bytes(path(log)?, num(log)?, bytes(log)?),
             [2] => Undo::Created(path(log)?),
             [3] => Undo::RemovedDir(path(log)?),
-            [4] => Undo::Moved(path(log)?, path(log)?),
-            [5] => Undo::Renamed(path(log)?, path(log)?),
+            [4] => Undo::Renamed(path(log)?, path(log)?),
             _ => return None,
         })
     };
