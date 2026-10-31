@@ -125,7 +125,7 @@ That is the repository and the tag deployed, each identity whose signature is ac
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
-DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by host so a record reaches no other host's app); a change takes up to its TTL to arrive; a host serves one app; the table is public; and a cold lookup adds a round trip.
+DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs); the table is public; and a cold lookup adds a round trip.
 
 ## Apps
 
@@ -139,7 +139,7 @@ nanovm-min-version: 1.4.0                    # optional floor
 
 The node trusts these headers because only the proxy can reach it, and strips them before the guest sees the request. A request without them reaches only the node's own `/_nanovm/` routes.
 
-**An app is a host's deployment of a repository.** Its name on the node (`example.com_ghcr.io_org_app-<hash>`), its volumes and its uid come from the host the proxy found it at (`nanovm-host`) and `registry/repository`, so every version a host runs, whoever signed it, sees the same data. Whoever controls a host chooses the version it runs, so keying by host stops one domain from naming another's repository and switching its app to an old version on its data (a review finding). Only those who can push to a repository can put a signed artifact in it, so naming another identity never reaches a different app's data. The registry is written one way only: lower case, without `:443`. A team signs from CI, or lists each member's identity.
+**An app is a DNS name's deployment of a repository.** Its name on the node (`example.com_ghcr.io_org_app-<hash>`), its volumes and its uid come from the name that owns its `_nanovm` record (`nanovm-host`) and `registry/repository`, so every version that name runs, whoever signed it, sees the same data. The owner is the name the record was found at after CNAMEs, so `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app. Whoever controls that name chooses the version it runs, so no domain can name another's repository and switch its app to an old version on its data (a review finding); a CNAME to someone else's record only serves their app as their record configures it. Only those who can push to a repository can put a signed artifact in it, so naming another identity never reaches a different app's data. The registry is written one way only: lower case, without `:443`. A team signs from CI, or lists each member's identity.
 
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.

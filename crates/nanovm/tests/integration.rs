@@ -1822,10 +1822,18 @@ async fn doh(records: Arc<parking_lot::Mutex<std::collections::HashMap<String, V
     let addr = listener.local_addr().unwrap();
     tokio::spawn(nanovm::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| {
         let q = req.uri().query().unwrap_or("");
-        let name = q.split('&').find_map(|kv| kv.strip_prefix("name=")).unwrap_or("").to_string();
-        let answer: Vec<_> = records.lock().get(&name).into_iter().flatten().map(|txt| {
-            serde_json::json!({ "name": name, "type": 16, "TTL": 1, "data": format!("\"{txt}\"") })
-        }).collect();
+        let mut name = q.split('&').find_map(|kv| kv.strip_prefix("name=")).unwrap_or("").to_string();
+        let mut answer = Vec::new();
+        // A record `CNAME <target>` answers as resolvers do: the alias, then
+        // the target's records under the target's name.
+        let target = records.lock().get(&name).and_then(|r| r.first()?.strip_prefix("CNAME ").map(String::from));
+        if let Some(target) = target {
+            answer.push(serde_json::json!({ "name": name, "type": 5, "TTL": 1, "data": format!("{target}.") }));
+            name = target;
+        }
+        answer.extend(records.lock().get(&name).into_iter().flatten().map(|txt| {
+            serde_json::json!({ "name": format!("{name}."), "type": 16, "TTL": 1, "data": format!("\"{txt}\"") })
+        }));
         async move { nanovm::server::ok_json(serde_json::json!({ "Status": 0, "Answer": answer })) }
     }));
     format!("http://{addr}/dns-query")
@@ -1882,6 +1890,10 @@ async fn the_proxy_routes_hosts_by_dns() {
     record("other.test", &[&format!("app={tagged}; trust=dev dev")]);
     let (status, body) = get("other.test", "/a/", "").await;
     assert!(status == 200 && body.contains(&at("other.test", &counter)), "{body}");
+    // An alias (its record a CNAME of counter.test's) is counter.test's app.
+    record("www.counter.test", &["CNAME _nanovm.counter.test"]);
+    let (status, body) = get("WWW.counter.test", "/a/", "").await;
+    assert!(status == 200 && body.contains(&at("counter.test", &counter)), "{body}");
 
     // No record is no app; a bad record, or two, is the proxy's error.
     assert_eq!(get("nowhere.test", "/a/", "").await.0, 404);

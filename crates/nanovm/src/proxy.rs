@@ -40,6 +40,10 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 /// What `_nanovm.<host>` says.
 #[derive(Clone, Debug, PartialEq)]
 struct Route {
+    /// The name the record was found at, after CNAMEs, without `_nanovm.`:
+    /// the app is this name's deployment of its repository, so aliases
+    /// share one app.
+    owner: String,
     /// `repository:tag`.
     app: Reference,
     trust: String,
@@ -156,7 +160,7 @@ impl Proxy {
             Ok(())
         };
         set(&mut parts.headers, APP_HEADER, &app)?;
-        set(&mut parts.headers, HOST_HEADER, &host)?;
+        set(&mut parts.headers, HOST_HEADER, &route.owner)?;
         set(&mut parts.headers, TRUST_HEADER, &route.trust)?;
         if let Some(min) = &route.min {
             set(&mut parts.headers, MIN_VERSION_HEADER, min)?;
@@ -198,7 +202,12 @@ impl Proxy {
         let txt: Vec<_> = records.iter().filter(|a| a["type"] == 16).collect();
         let (route, ttl) = match txt[..] {
             [] => (None, 30),
-            [a] => (Some(parse(&unquote(a["data"].as_str().unwrap_or_default()))?), a["TTL"].as_u64().unwrap_or(30)),
+            [a] => {
+                let name = a["name"].as_str().unwrap_or_default().trim_end_matches('.').to_ascii_lowercase();
+                let owner = name.strip_prefix("_nanovm.").unwrap_or(&name).to_string();
+                let route = Route { owner, ..parse(&unquote(a["data"].as_str().unwrap_or_default()))? };
+                (Some(route), a["TTL"].as_u64().unwrap_or(30))
+            }
             _ => bail!("_nanovm.{host} has more than one TXT record"),
         };
         Ok((route, Duration::from_secs(ttl.clamp(1, 3600))))
@@ -241,7 +250,7 @@ fn parse(txt: &str) -> anyhow::Result<Route> {
     if trust.is_empty() {
         bail!("no trust=");
     }
-    Ok(Route { app, trust: trust.join(", "), min })
+    Ok(Route { owner: String::new(), app, trust: trust.join(", "), min })
 }
 
 /// Serves the proxy on `listener`, over plain HTTP: TLS is left to a
