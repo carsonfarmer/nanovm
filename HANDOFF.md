@@ -19,7 +19,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 - **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed except N-20, which goes away with W-3. A review of phase 7 found N-22 to N-31; all are fixed (N-31 in part: its proxy TLS half is now W-14). N-32 (occasional test failures under load) is partly fixed.
 - **Owner decisions:**
   - Nothing is waiting on the owner as of 2026-10-30. The owner decided: dev mode needs the `dev` cargo feature (N-23, done); drop TLS from the proxy (W-14, done); key apps by the DNS name that owns their `_nanovm` record, after CNAMEs, so aliases share one app (W-15, done).
-- **Nobody is mid-rewrite** as of phase 7 landing; claim files through ISSUES.md before large changes (see "Working alongside other agents").
+- **W-3 is in progress** by Amp on `w3-proxy-sockets`; owns ws.rs, supervisor.rs, egress.rs, proxy.rs, config.rs and tests. Baseline runtime size: 4,247 nonblank, noncomment lines before test modules. Resume from ISSUES W-3; guests must remain unchanged.
 - **Next:** see "Next up: W-3" below. Then PLAN.md's "Roadmap" (agreed 2026-10-30), tracked as `W-1`… in ISSUES.md. In short: WebSockets moved into the proxy, OpenTelemetry by default (high priority), the per-object SQLite demo, alarms outside the node, data lifecycle planning, then the groundwork for many nodes.
 - Branches merged into `main` by fast-forward are not always pushed on their own. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
 - **Tests:** 62 integration tests and 92 unit tests pass (three full runs in a row clean at `f3ecf23`). One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.
@@ -125,6 +125,7 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q50 | Requests that don't write can run in parallel (stateless routes anywhere, read-only requests on replicas); research, since the in-place undo journal makes same-node readers see uncommitted data. |
 | Q51 | Clean up the review's removable-code list (W-13, done). |
 | Q52 | Phase 7 as built: a host's app comes from its `_nanovm.<host>` TXT record over DNS-over-HTTPS, as a tag the proxy resolves to a digest; apps only from registries, one per worker; apps keyed by the name that owns their `_nanovm` record, after CNAMEs, and `registry/repository` (by repository alone at first, until the review showed any domain could then pick another's version; then by request host, until the owner chose record owners so aliases share one app, W-15); a loopback-only dev mode without signature checks for tests and the demo; our own size-capped registry client instead of oci-client's downloads. |
+| Q53 | Sockets live in the proxy keyed by app and carry over worker exits and version switches. Every event resolves the current digest through the proxy caches; never pin the OPEN digest and switch the app back. |
 
 Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 
