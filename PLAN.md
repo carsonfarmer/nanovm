@@ -265,10 +265,10 @@ The goal: one node, as fast and secure as we can make it, that runs untrusted We
   - Manifest limits are clamped to operator maximums.
 - **Features to add:**
   - **WebSockets** (done), following tric's WebSocket-over-HTTP model: each event (`OPEN`/`TEXT`/`BINARY`/`CLOSE`/`DISCONNECT`) is a normal bounded request to the object, and sockets outlive instances.
-    - The supervisor itself speaks the protocol and handles channel publishing; there is no Pushpin process (Pushpin can't be embedded as a library).
+    - The front proxy speaks the protocol and handles channel publishing; there is no Pushpin process (Q55). The supervisor forwards committed publishes with its worker's app identity.
     - Events are ordered per object. Channels are scoped per object, as in Durable Objects (Q32).
-    - Sockets close when their worker goes, including on a version switch (Q35).
-    - Bounds come from the existing request and response limits, plus `max_sockets` per object and per node (Q36). tric's sizes were API Gateway's, so they weren't carried over.
+    - Sockets survive worker exits and version switches; every event resolves the current digest (Q53, superseding Q35). A changed app identity closes the socket rather than crossing apps (Q54).
+    - Proxy settings bound sockets globally, per app and per object, message/answer size and per-socket backlog (Q55, superseding Q36).
   - **Alarms** (Q30, then Q41): skipped so far; queued as a scheduler outside the node (Roadmap 4).
   - **Key-value** (done): a host-implemented `wasi:keyvalue` stored as files under `/data`. `wasi:filesystem` stays exposed. `wasi:config` serves each app's config values.
 - **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
@@ -344,7 +344,7 @@ Built on branch `proxy` by one agent and finished by another. README's "The prox
 
 Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tracked; the decisions are Q41–Q51 in [HANDOFF.md](HANDOFF.md). In priority order:
 
-1. **WebSockets moved into the front proxy (Q42, Q53; W-3 in validation).** The proxy owns sockets and app/object-scoped channels; the node answers ordinary event POSTs. Each event resolves the current digest, so sockets and subscriptions survive worker exits and deployments. A private publish listener receives committed publishes, stamped with the app by the supervisor and object by the worker. Socket caps belong to the proxy, shared directly with socket managers; an object-keyed tree bounds fan-out work to that object's sockets (Q56). This supersedes Q31/Q35; validation and review follow-ups are tracked in HANDOFF and ISSUES.
+1. **WebSockets moved into the front proxy (Q42, Q53; W-3 done).** The proxy owns sockets and app/object-scoped channels; the node answers ordinary event POSTs. Each event resolves the current digest, so sockets and subscriptions survive worker exits and deployments. A private publish listener receives committed publishes, stamped with the app by the supervisor and object by the worker. Socket caps belong to the proxy, shared directly with socket managers; an object-keyed tree bounds fan-out work to that object's sockets (Q56). This supersedes Q31/Q35; full-suite, mutation, demo and benchmark results are in HANDOFF. Review follow-ups N-33/N-34 remain in ISSUES.
 2. **Observability by default (Q43).** OpenTelemetry tracing, metrics and guest logs, on by default, tagged per tenant (app, object, version). `/_nanovm/stats` and `/_nanovm/events` are deprecated and go once OTel covers them. A jailed worker has no sockets, so its telemetry leaves through the supervisor. (W-2)
 3. **A per-object SQLite demo (Q46).** The showcase: every object its own SQLite database on `/data`, committed with its response. It works today, since writes happen in place and `mmap` is kept. (W-1)
 4. **Alarms, outside the node (Q41).** A scheduler beside the proxy sends a request to an object when its alarm fires; an object sets alarms with a response header. The node stays request-only. (W-4)

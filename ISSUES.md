@@ -92,7 +92,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `ws.rs:407`
 - **Scenario:** The supervisor collects a publish body up to `response_max` with no time limit; a worker that sends part of one holds that memory for as long as it likes, per link (see N-13).
 - **Reproduced:** no (from source)
-- **Status:** fixed with N-13 (e410377): a worker holds at most `response_max` per link it is allowed
+- **Status:** fixed in e62e9ac: proxy publish collection and supervisor forwarding have 30 s deadlines. N-13 (e410377) previously bounded memory per link, but not duration.
 
 ### N-15: forwarded responses have no body timeout
 - **Where:** `egress.rs:281-285`, `egress.rs:367-369`
@@ -128,7 +128,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `ws.rs:409`
 - **Scenario:** Each publish walks all of the worker's sockets to find its object's; cost grows with the app's sockets, not the object's.
 - **Reproduced:** no (from source)
-- **Status:** open: not fixed on purpose. At the default `max_sockets` of 1,000 per app, the scan costs a few microseconds against a publish's HTTP hop, and indexing by object would add code to every open, close and test. Worth it only if `max_sockets` grows by an order of magnitude.
+- **Status:** fixed in bb8a418: the proxy's single socket tree is keyed by object and connection id; fan-out visits only that object's sockets, without a second index.
 
 ### N-21: jailed workers can't use a relative `data_dir`, so the demo fails
 - **Where:** `object.rs:287`, `jail.rs` (the seccomp allowlist)
@@ -235,7 +235,7 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 ### W-3: move WebSockets into the front proxy
 - **What:** the proxy holds client sockets, Pushpin-style, and sends each event to the object as the plain `POST` it gets today; publishes go to the proxy. Most of `ws.rs` leaves the node, and the node only answers requests. Resolves N-14 and N-20. Supersedes Q31.
 - **Where:** `proxy.rs`, `ws.rs`, `supervisor.rs`, `egress.rs` (`hold`), `object.rs` (`commit`), the WebSocket tests.
-- **Status:** in validation by Amp on `w3-proxy-sockets` (2026-10-31). Runtime 4,247 baseline → 4,264 implementation → 4,246 after cleanup. Four WebSocket integration tests and 93 unit tests pass; full-suite load-sensitive failures need reruns. Review found no runtime blocker; stronger identity tests added, N-33/N-34 recorded. Mutation checks and demo/benchmark pending. Guests unchanged.
+- **Status:** done in e62e9ac (migration), bb8a418 (cleanup). Runtime 4,247 baseline → 4,264 implementation → 4,246 cleanup. Full suite passed twice: 93 unit, 64 integration, one ignored; seven mutations caught and restored cleanly. Demo: 70,000 normal requests succeeded, 100 attacks contained, canary zero failures. Quick benchmark has mixed small variation and unchanged 96 KB/object density; HANDOFF records numbers and limitations. Adversarial review found no confirmed runtime blocker; identity test gaps fixed, N-33/N-34 recorded. Guests unchanged.
 
 ### W-4: alarms, outside the node
 - **What:** a scheduler beside the proxy. An object sets an alarm with a response header; when it fires, the scheduler sends the object a request. Durable across restarts of the scheduler; the node is unchanged.

@@ -2,7 +2,7 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
-## State (2026-10-30)
+## State (2026-10-31)
 
 - **`main`** has:
   - phase 1 (portable core);
@@ -16,17 +16,20 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
   - phase 6b (calls between objects, Q45). README's "Calls between objects" describes it.
   - phase 7 (the front proxy, Q34, Q52): `nanovm proxy`, apps only from registries and one app per worker, apps keyed by record owner and repository, dev mode, a registry client with size caps. Built by one agent on branch `proxy`, finished (rebase, demo, docs, reduction pass, review) by another. PLAN's "Phase 7" describes it.
   - orb setup (`.agents/setup`, `.agents/resume`), so Amp orbs start with the toolchain and the tests prebuilt.
-- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed except N-20, which goes away with W-3. A review of phase 7 found N-22 to N-31; all are fixed (N-31 in part: its proxy TLS half is now W-14). N-32 (occasional test failures under load) is partly fixed.
+- **A second review** (at `c607ec9`) found N-1 to N-21, tracked in [ISSUES.md](ISSUES.md). All are fixed, including N-20 with W-3. A review of phase 7 found N-22 to N-31; all are fixed (N-31 in part: its proxy TLS half is now W-14). N-32 (occasional test failures under load) is partly fixed.
 - **Owner decisions:**
   - Nothing is waiting on the owner as of 2026-10-30. The owner decided: dev mode needs the `dev` cargo feature (N-23, done); drop TLS from the proxy (W-14, done); key apps by the DNS name that owns their `_nanovm` record, after CNAMEs, so aliases share one app (W-15, done).
-- **W-3 is in progress** by Amp on `w3-proxy-sockets`; owns ws.rs, supervisor.rs, egress.rs, proxy.rs, config.rs and tests. Baseline runtime size: 4,247 nonblank, noncomment lines before test modules. Resume from ISSUES W-3; guests must remain unchanged.
-  - First implementation: 4,264 runtime lines. Targeted `cargo test --locked -p nanovm sockets` passes (three integration, two unit). Full suite, cleanup/N-20, mutation checks, demo/benchmark and review resolution remain. Standalone cargo check exposed a missing reqwest `query` feature, now explicit.
-  - **Handoff prompt after implementation:** Continue `w3-proxy-sockets`. Read the current diff and Q53–Q55; proxy ownership and committed forwarding are implemented and socket tests pass. Finish cleanup (especially object-indexed fan-out), test all new boundaries and mutation-check from a clean commit, resolve the adversarial review, run the full suite/demo/quick benchmark, update all four docs, then rebase and fast-forward main. Do not edit guests.
-  - Cleanup: 4,264 → 4,246 runtime lines (baseline 4,247), removing duplicated Caps and redundant map-emptiness checks; object-keyed fan-out fixes N-20. Egress's commit gate stays unchanged after review. All four W-3 integration tests and 93 unit tests pass in the full run; unrelated load-sensitive integration failures are being rerun (N-32). Review found no runtime blocker; owner/repository/alias test gaps were filled. N-33/N-34 record the remaining follow-ups. The subagent tool could not attest to Opus routing.
-  - **Handoff prompt after cleanup:** Continue validation on `w3-proxy-sockets`: run mutation checks from this clean checkpoint and restore with `git checkout --` plus an empty diff; finish full-suite reruns, demo and quick benchmark comparison to origin/main; update the four docs and fast-forward main. Baseline benchmark is `/tmp/w3-bench-before.log`; review follow-ups are N-33/N-34. Guests remain unchanged.
-- **Next:** see "Next up: W-3" below. Then PLAN.md's "Roadmap" (agreed 2026-10-30), tracked as `W-1`… in ISSUES.md. In short: WebSockets moved into the proxy, OpenTelemetry by default (high priority), the per-object SQLite demo, alarms outside the node, data lifecycle planning, then the groundwork for many nodes.
+- **W-3 complete:** migration `e62e9ac`, cleanup `bb8a418`, on branch `w3-proxy-sockets` for fast-forward into main with this validation record. Proxy sockets survive worker exits and deployments (Q53–Q56); no guest changes. Runtime: 4,247 baseline → 4,264 implementation → 4,246 cleanup (nonblank, noncomment lines before test modules). Egress's commit gate stays unchanged.
+  - Full suite passed twice on clean restored code: `env -u RUST_BACKTRACE cargo test --locked -p nanovm`, 93 unit and 64 integration passed, one ignored. Earlier load-sensitive failures passed unchanged reruns (N-32).
+  - Seven mutations failed their tests: pinning the old digest, deleting the identity guard, disabling the global cap, extending the publish deadline, cross-object fan-out, dropping record-owner identity, and permitting forged client events. Each restored with `git checkout -- <file>` and an empty diff confirmed before clean-suite validation.
+  - Adversarial subagent review found no confirmed runtime blocker. Owner/repository/alias test gaps were fixed. N-33 (initial DNS lookup deadline) and N-34 (malicious-worker header test) remain recorded follow-ups. The tool could not attest to Opus routing.
+  - Demo: 5,000 cold + 50,000 warm + 10,000 writes + 5,000 serial requests all succeeded; 100 attacks contained; canary 543 requests, zero failures. Started/stopped via `amp orb service`; no services left running.
+  - Quick release benchmark, baseline → cleanup requests/s: cold 3318→3353; warm concurrent 69196→67023; serial GET 9747→9924; concurrent writes 574→580; serial writes 287→304; trap recovery 1368→1309; churn 5313→5536; neighbors under attack 54900→61185. Density 96 KB/object both. Mixed variation on one before/after run, not proof of no performance regression; this measures the in-process node, not proxy throughput.
+  - **Implementation handoff:** Read Q53–Q55 and `e62e9ac`; preserve current-digest event routing, app identity, and committed publish forwarding when simplifying.
+  - **Cleanup/successor handoff:** Start on main; read HANDOFF, ISSUES, README and PLAN. W-3 and N-14/N-20 are complete. Next roadmap item is W-2 (OpenTelemetry); N-33/N-34 are recorded follow-ups. Claim a branch and update docs at milestones; leave guests unchanged without owner approval.
+- **Next:** PLAN.md's Roadmap: OpenTelemetry by default (W-2), the per-object SQLite demo, alarms outside the node, data lifecycle planning, then the groundwork for many nodes.
 - Branches merged into `main` by fast-forward are not always pushed on their own. The remote `config` branch is stale: it was merged by a fast-forward of a rebased copy.
-- **Tests:** 62 integration tests and 92 unit tests pass (three full runs in a row clean at `f3ecf23`). One is ignored: `egress_listed_host_allowed` makes a real HTTPS request to example.com, which this sandbox can't reach directly. The registry tests run against the real CI-signed guests on ghcr.io.
+- **Tests:** 64 integration tests and 93 unit tests pass. One is ignored: `egress_listed_host_allowed` needs external HTTPS; it succeeded in the demo. The registry tests run against the real CI-signed guests on ghcr.io.
   - Tests that do heavy file work under `hostile`'s 100 ms CPU budget (wall time inside guest polls) can be killed when the whole suite loads the machine; such tests use `filler()` (1 s). See N-32.
   - `cpu_hogs_leave_cores_for_short_requests` is load-sensitive and fails occasionally when the whole suite runs at once on 4 cores; it passes alone.
   - When guests change, the first run can fail one supervised test with `Permission denied`. The test nodes share one `.cwasm` cache between root in-process nodes and jailed workers. A rerun passes.
@@ -34,9 +37,9 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 - **The repo `carsonfarmer/nanovm` is now public**, so GitHub artifact attestations work. The packages `ghcr.io/carsonfarmer/nanovm-{counter,hostile}` are public. `publish-guests.yml` runs on pushes to `guests/**` and on `gh workflow run publish-guests.yml` (dispatch works through the proxy, and `gh run watch <id>` shows progress). Each run publishes version `1.0.<run number>`.
 - **Old branches** (`jail`, `simplify`, `oci`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical.
 
-## Next up: W-3, WebSockets move into the front proxy
+## Completed W-3 brief (historical starting point)
 
-The owner chose this as the next big piece of work (PLAN "Roadmap" item 1, ISSUES W-3, Q42). W-14 (no TLS in the proxy) and W-15 (apps keyed by record owner) are done, so start with W-3.
+The following records the pre-W-3 implementation and plan. W-3 is complete; current behavior and validation are above, with decisions Q53–Q56 below.
 
 **Goal.** The node only ever answers requests. The front proxy (`nanovm proxy`) holds client WebSockets, as Pushpin does, and turns each socket event into the plain `POST` of `application/websocket-events` that objects already get. Objects and guests don't change: they keep answering events in Pushpin's WebSocket-over-HTTP format and publishing GRIP messages to `http://nanovm/publish/`. Most of `ws.rs` (about 1,140 lines) leaves the node, and N-14 and N-20 go with it.
 
