@@ -224,7 +224,7 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 ### W-3: move WebSockets into the front proxy
 - **What:** the proxy holds client sockets, Pushpin-style, and sends each event to the object as the plain `POST` it gets today; publishes go to the proxy. Most of `ws.rs` leaves the node, and the node only answers requests. Resolves N-14 and N-20. Supersedes Q31.
 - **Where:** `proxy.rs`, `ws.rs`, `supervisor.rs`, `egress.rs` (`hold`), `object.rs` (`commit`), the WebSocket tests.
-- **Status:** open; next up. HANDOFF's "Next up: W-3" has the brief.
+- **Status:** open; next up. HANDOFF's "Next up: W-3" has the brief and a concrete plan (Q53: sockets carry over version switches), followed by a simplification pass.
 
 ### W-4: alarms, outside the node
 - **What:** a scheduler beside the proxy. An object sets an alarm with a response header; when it fires, the scheduler sends the object a request. Durable across restarts of the scheduler; the node is unchanged.
