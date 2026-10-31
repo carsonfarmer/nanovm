@@ -5,7 +5,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 ## State (2026-10-31)
 
 - **CI enabled (W-16):** `ci-checks` passed GitHub run 41227208960 at `57d1595`: production check, 93 unit and 64 integration tests, one ignored. The initial run exposed a runner fd-limit mismatch; CI now uses its hard limit. Read-only permissions, no guest publishing. Branch protection was not changed.
-- **Current work:** W-2 has started on `w2-observability`, incorporating main's CI. It owns telemetry, object/table instrumentation, server/supervisor and demo consumers. Its transport plan and readiness prerequisite are committed; no OTLP export exists yet. Guests remain unchanged.
+- **Current work:** W-2 on `w2-observability`, incorporating main's CI. Bounded OTLP/HTTP export now carries traces, metrics and guest logs through the existing jailed-worker egress link. The supervisor stamps app/digest identity. Real-worker exports, trace parentage, panic logs, runtime counters and collector refusal pass targeted tests. Stats/events consumer migration and final validation remain; do not mark W-2 complete. Guests remain unchanged.
 - **`main`** has:
   - phase 1 (portable core);
   - phase 2 (the Linux jail);
@@ -55,7 +55,13 @@ Implementation plan from source inspection:
 - Replace stats/events consumers in the demo and integration tests with a local OTLP collector fixture; preserve worker death, version-switch and isolation assertions. Worker readiness becomes a small private response, not an exported metric. Delete HTTP stats/events and the event ring only once equivalent checks exist.
 - Validate real jailed-worker exports for all three signals, tenant/version isolation, collector outage, telemetry flood, trace parentage and guest logs. Mutation-check those contracts, run the full suite/demo/benchmark, and review the telemetry trust boundary before landing.
 
-**First-piece handoff:** Continue `w2-observability` with bounded OTLP transport; the readiness prerequisite is validated. The plan above is not an assertion that telemetry already exists. Do not change guests without approval.
+**Transport milestone (implementation):** OpenTelemetry 0.33 SDK/OTLP exporters use a custom HTTP client on the existing egress link. The operator's `telemetry_endpoint` defaults to `http://127.0.0.1:4318`. Resource app/digest identity is replaced by the supervisor, and reserved identity attributes are removed from scopes, records and metric exemplars. No jail permission changed. Requests have explicit W3C context across actor queues, with queue, instantiate, guest, commit and object-call spans. Guest log bodies are capped at 4 KiB after UTF-8 conversion. Request count/duration and existing worker atomics export as bounded-cardinality metrics; weak observer references avoid a Node/provider ownership cycle.
+
+Bounds: 1 MiB protobuf batches, 16 resource groups, 16 supervisor exports globally and 3 per worker, 2 s collection/forward deadlines; trace queue 1024, log queue 256, batches 64, one-second periodic export, metric cardinality 2048 per instrument. Exports do not retry or follow redirects. Collector failure does not gate requests.
+
+Validation: `env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked -p nanovm` passed on restored code (94 unit, 65 integration, one ignored); all-targets check passed. Seven mutations failed as expected: remove resource stamping, double the batch cap, permit guest telemetry requests, remove worker metric observers, discard incoming trace context, remove post-UTF-8 truncation, extend the body deadline. Every mutation was restored with `git checkout -- <file>` and an empty diff confirmed. The relay test covers all three signals' forged identities, malformed/oversized/stalled input, and invalid UTF-8 expansion. `origin/main` is already an ancestor via the earlier CI integration; an unnecessary rebase was aborted rather than rewriting published branch commits. Demo/benchmark and final rollout checks remain.
+
+**Successor handoff:** Continue `w2-observability`. Finish runtime event logs, remaining metric parity (phases, instantiation, supervisor worker status), collector response/error reporting and SDK shutdown behavior; migrate demo/tests off stats/events, then remove the APIs and ring. Strengthen slow-collector/concurrency/cardinality and inter-object tracing tests, mutation-check, run full suite/demo/benchmark, review the trust boundary, and only then land W-2. Do not change guests without approval.
 
 ## Completed W-3 brief (historical starting point)
 
@@ -157,6 +163,8 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q55 | Keep tungstenite and the existing GRIP implementation rather than add a Pushpin process. Proxy socket caps are operator settings, not guest manifests. The private publish listener trusts network isolation, like the node; only the supervisor stamps the app identity. |
 | Q56 | Socket managers share the proxy config directly, with no copied `Caps` model. A BTreeMap keyed by `(object, connection-id)` makes fan-out visit only the publishing object's sockets, without a second index or per-object counters (N-20). Pending opens and connections hold the app manager alive; its Arc count also identifies removable map entries. |
 | Q57 | Worker readiness is a private 204 response on the request link, independent of stats and telemetry. Removing the deprecated stats/events APIs must not make startup depend on a collector. |
+| Q58 | Use the OpenTelemetry SDK and OTLP/HTTP protobuf through the existing worker egress link; only the supervisor selects the collector and stamps app/digest identity. Telemetry is best effort with bounded queues, concurrency and deadlines, never a condition for accepting or committing a request. |
+| Q59 | Carry trace context explicitly across actor queues and object calls, rather than thread-local guards across awaits. `service.version` is the immutable manifest digest; `nanovm.object` belongs on records, not a resource per object. Metric cardinality is bounded per instrument. |
 
 Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 

@@ -64,6 +64,7 @@ pub struct Node {
     pub cfg: NodeConfig,
     pub app: Arc<App>,
     pub metrics: Arc<Metrics>,
+    pub telemetry: Arc<crate::telemetry::Telemetry>,
     pub started: Instant,
     /// Cores CPU-heavy requests may occupy at once; see `heavy_lanes`.
     pub heavy: Arc<Semaphore>,
@@ -81,6 +82,7 @@ impl Node {
         let engine = crate::engine::build(&cfg)?;
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
         let app = Arc::new(App::load(&engine, &linker, &cfg, app, wasm, upstream)?);
         // Scratch from a previous run is garbage; volumes are kept. The
         // directory itself stays: a jailed worker's Landlock rule names it.
@@ -90,16 +92,19 @@ impl Node {
         }
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
-        Ok(Arc::new(Node {
+        let node = Arc::new(Node {
             engine,
             cfg,
             app,
             metrics: Arc::default(),
+            telemetry,
             started: Instant::now(),
             heavy,
             slots,
             objects: Mutex::default(),
-        }))
+        });
+        node.telemetry.observe(&node);
+        Ok(node)
     }
 
     /// Releases every object and waits until all their stores are gone.
@@ -123,19 +128,29 @@ impl Node {
         if !valid_object(id) {
             return error_response(400, "bad-object-id", BAD_OBJECT);
         }
+        use opentelemetry::propagation::TextMapPropagator;
+        let parent = req.extensions().get::<opentelemetry::Context>().cloned().unwrap_or_else(|| {
+            opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                .extract(&opentelemetry_http::HeaderExtractor(req.headers()))
+        });
+        let span = self.telemetry.span("request", id, &parent);
+        let enqueued = Instant::now();
         let (reply, rx) = oneshot::channel();
         let job = Job {
             req,
             reply,
-            enqueued: Instant::now(),
+            enqueued,
+            context: span.0.clone(),
+            queue: self.telemetry.span("queue", id, &span.0),
         };
-        if let Err(resp) = self.enqueue(id, job) {
-            return resp;
-        }
-        match rx.await {
-            Ok(resp) => resp,
-            Err(_) => error_response(503, "object-unavailable", "the object stopped before answering"),
-        }
+        let response = match self.enqueue(id, job) {
+            Err(resp) => resp,
+            Ok(()) => rx.await.unwrap_or_else(|_| error_response(503, "object-unavailable", "the object stopped before answering")),
+        };
+        use opentelemetry::trace::TraceContextExt;
+        span.0.span().set_attribute(opentelemetry::KeyValue::new("http.response.status_code", response.status().as_u16() as i64));
+        self.telemetry.request(id, response.status().as_u16(), enqueued.elapsed());
+        response
     }
 
     fn enqueue(self: &Arc<Self>, id: &str, mut job: Job) -> Result<(), http::Response<RespBody>> {
@@ -176,6 +191,7 @@ impl Node {
             ));
         }
         let shared = Arc::new(ObjShared::new(app.name.clone(), id));
+        *shared.context.lock() = job.context.clone();
         let (tx, rx) = mpsc::channel(app.cfg.limits.max_queue.max(1));
         tx.try_send(job).ok().expect("fresh queue has room");
         objects.insert(
@@ -277,6 +293,8 @@ mod tests {
             req: http::Request::new(Bytes::new()),
             reply: oneshot::channel().0,
             enqueued: Instant::now(),
+            context: Default::default(),
+            queue: crate::telemetry::Span(Default::default()),
         };
         let (tx, _rx) = mpsc::channel(4);
         let e = Entry {

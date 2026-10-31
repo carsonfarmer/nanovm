@@ -39,6 +39,8 @@ pub struct Job {
     pub req: http::Request<Bytes>,
     pub reply: oneshot::Sender<http::Response<RespBody>>,
     pub enqueued: Instant,
+    pub context: opentelemetry::Context,
+    pub queue: crate::telemetry::Span,
 }
 
 #[repr(u8)]
@@ -82,6 +84,7 @@ pub struct ObjShared {
     lane: Mutex<Option<OwnedSemaphorePermit>>,
     /// The objects its calls are waiting on, one entry per call.
     pub waiting_on: Mutex<Vec<Arc<str>>>,
+    pub context: Mutex<opentelemetry::Context>,
 }
 
 impl ObjShared {
@@ -184,13 +187,16 @@ impl ResourceLimiter for MemLimiter {
 /// Keeps the last few KiB a guest wrote to stdout/stderr, so a trap can be
 /// reported with the panic message that preceded it.
 #[derive(Clone, Default)]
-pub struct LogTail(Arc<Mutex<VecDeque<u8>>>);
+pub struct LogTail {
+    buf: Arc<Mutex<VecDeque<u8>>>,
+    export: Option<(Arc<crate::telemetry::Telemetry>, Arc<ObjShared>, &'static str)>,
+}
 
 const LOG_TAIL: usize = 2048;
 
 impl LogTail {
     pub fn text(&self) -> String {
-        let buf: Vec<u8> = self.0.lock().iter().copied().collect();
+        let buf: Vec<u8> = self.buf.lock().iter().copied().collect();
         String::from_utf8_lossy(&buf).trim().to_string()
     }
 }
@@ -209,7 +215,10 @@ impl StdoutStream for LogTail {
 
 impl tokio::io::AsyncWrite for LogTail {
     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
-        let mut buf = self.0.lock();
+        if let Some((telemetry, object, stream)) = &self.export {
+            telemetry.log(&object.id, stream, data, &object.context.lock());
+        }
+        let mut buf = self.buf.lock();
         buf.extend(data.iter().rev().take(LOG_TAIL).rev());
         let excess = buf.len().saturating_sub(LOG_TAIL);
         buf.drain(..excess);
@@ -302,7 +311,10 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     b.allow_blocking_current_thread(true);
     b.preopened_dir(&data_dir, "/data", FsPerms::ReadWrite)?;
     b.preopened_dir(&tmp_dir, "/tmp", FsPerms::ReadWrite)?;
-    b.stdout(stderr.clone()).stderr(stderr.clone());
+    let output = |stream| LogTail {
+        buf: stderr.buf.clone(), export: Some((node.telemetry.clone(), shared.clone(), stream)),
+    };
+    b.stdout(output("stdout")).stderr(output("stderr"));
 
     let mut table = ResourceTable::new();
     table.set_max_capacity(limits.max_resources);
@@ -417,6 +429,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         shared.begin_start();
         let t0 = Instant::now();
         let started = async {
+            let _span = node.telemetry.span("instantiate", &shared.id, &shared.context.lock());
             let mut store = new_store(&node, &app, &shared)?;
             let svc = shared
                 .charged(&node.metrics, app.pre.instantiate_async(&mut store))
@@ -475,6 +488,8 @@ async fn serve(
             loop {
                 shared.set_phase(Phase::Idle);
                 let Some(job) = rx.recv().await else { return Ok(()) };
+                drop(job.queue);
+                *shared.context.lock() = job.context.clone();
                 shared.begin_request();
                 metrics.requests.fetch_add(1, Relaxed);
                 let abort = Arc::new(AtomicBool::new(false));
@@ -488,6 +503,7 @@ async fn serve(
                 let (req, req_io) =
                     acc.with(|mut s| wasmtime_wasi_http::p3::Request::from_http(&mut s.data_mut().hooks, req));
 
+                let guest_span = node.telemetry.span("guest", &shared.id, &job.context);
                 let (resp, mut failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
                         let res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
@@ -503,13 +519,17 @@ async fn serve(
                     }
                     Err(code) => (error_response(500, "guest-error", &format!("{code:?}")), true),
                 };
+                drop(guest_span);
                 shared.set_phase(Phase::PostReturn);
                 // Nothing is heard of a request before its changes are
                 // durable. One that failed (as one that traps or runs out of
                 // time) restarts its instance, which rolls them back; an
                 // answer, whatever its status, commits them.
                 let resp = match failed {
-                    false => match commit(acc).await {
+                    false => match {
+                        let _span = node.telemetry.span("commit", &shared.id, &job.context);
+                        commit(acc).await
+                    } {
                         Ok(()) => resp,
                         Err(e) => {
                             failed = true;
@@ -530,7 +550,10 @@ async fn serve(
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
                 *pending.lock() = None;
                 // What it changed after answering commits now.
-                if failed || commit(acc).await.is_err() {
+                if failed || {
+                    let _span = node.telemetry.span("commit", &shared.id, &job.context);
+                    commit(acc).await.is_err()
+                } {
                     acc.with(|mut s| s.data_mut().reset = true);
                     return Ok(());
                 }
@@ -747,7 +770,7 @@ mod tests {
         w.write_all(b"end\n\xff").await.unwrap();
         let text = tail.text();
         assert!(text.starts_with("xxx") && text.ends_with("end\n\u{fffd}"), "{text:?}");
-        assert_eq!(tail.0.lock().len(), LOG_TAIL);
+        assert_eq!(tail.buf.lock().len(), LOG_TAIL);
         w.write_all(&[b'y'; 3 * LOG_TAIL]).await.unwrap();
         assert_eq!(tail.text(), "y".repeat(LOG_TAIL));
     }

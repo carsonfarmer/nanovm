@@ -48,6 +48,7 @@ fn app(name: &str) -> AppConfig {
     };
     AppConfig {
         name: name.into(),
+        digest: "test".into(),
         env: Default::default(),
         config: Default::default(),
         limits: serde_json::from_value(limits).unwrap(),
@@ -2311,4 +2312,112 @@ async fn the_proxy_drops_hop_by_hop_headers() {
     // WebSocket upgrades terminate here, not at the node; malformed ones fail.
     let head = "GET /a/ HTTP/1.1\r\nHost: hop.test\r\nConnection: Upgrade, close, x-private\r\nUpgrade: websocket\r\n\r\n";
     assert_eq!(raw(proxy, head, b"").await.0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jailed_workers_export_otel_without_guest_network_access() {
+    use http_body_util::BodyExt;
+    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
+    use prost::Message;
+    let batches = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let unavailable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let received = batches.clone();
+    let (down, rejected) = (unavailable.clone(), failures.clone());
+    let collector = tokio::spawn(nanovm::server::serve_http1(listener, move |req| {
+        let received = received.clone();
+        let (down, rejected) = (down.clone(), rejected.clone());
+        async move {
+            let path = req.uri().path().to_string();
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            if down.load(Relaxed) {
+                rejected.fetch_add(1, Relaxed);
+                return nanovm::object::error_response(503, "collector-down", "");
+            }
+            received.lock().push((path, body));
+            nanovm::server::ok_json(serde_json::json!({}))
+        }
+    }));
+    let mut cfg = node_cfg("jailed_workers_export_otel_without_guest_network_access", 8);
+    cfg.telemetry_endpoint = endpoint;
+    let (_sup, addr) = supervised_with(cfg).await;
+    let counter = publish("otel-counter", &app("counter")).await;
+    let hostile = publish("otel-hostile", &app("hostile")).await;
+    let head = format!("GET /room/ HTTP/1.1\r\nHost: x\r\n{}traceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\nConnection: close\r\n\r\n", names(&counter));
+    assert_eq!(raw(addr, &head, b"").await.0, 200);
+    assert_eq!(app_get(addr, &hostile, "/other/panic").await.0, 500);
+    let (_, denied) = app_get(addr, &hostile, "/other/fetch?url=http://nanovm/telemetry/logs").await;
+    assert!(denied.contains("HttpRequestDenied"), "{denied}");
+
+    let attr = |attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue], key: &str| {
+        attrs.iter().find(|kv| kv.key == key).and_then(|kv| kv.value.as_ref()).and_then(|v| match &v.value {
+            Some(Value::StringValue(s)) => Some(s.clone()), _ => None,
+        }).unwrap_or_default()
+    };
+    let mut spans = Vec::new();
+    let mut logs = Vec::new();
+    let mut metrics = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            for (path, body) in std::mem::take(&mut *batches.lock()) {
+                match path.as_str() {
+                    "/v1/traces" => spans.extend(collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap().resource_spans),
+                    "/v1/logs" => logs.extend(collector::logs::v1::ExportLogsServiceRequest::decode(body).unwrap().resource_logs),
+                    "/v1/metrics" => metrics.extend(collector::metrics::v1::ExportMetricsServiceRequest::decode(body).unwrap().resource_metrics),
+                    other => panic!("unexpected collector route {other}"),
+                }
+            }
+            let complete = [&counter, &hostile].iter().all(|app| {
+                let matches = |r: &Option<opentelemetry_proto::tonic::resource::v1::Resource>| {
+                    r.as_ref().is_some_and(|r| attr(&r.attributes, "nanovm.app") == worker(app))
+                };
+                spans.iter().any(|r| matches(&r.resource) && r.scope_spans.iter().flat_map(|s| &s.spans).any(|s| s.name == "request"))
+                    && metrics.iter().any(|r| matches(&r.resource))
+            });
+            if complete && logs.iter().any(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&hostile)) { break }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("all three signals from real jailed workers");
+    for app in [&counter, &hostile] {
+        let resource = spans.iter().find(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(app)).unwrap();
+        assert_eq!(attr(&resource.resource.as_ref().unwrap().attributes, "service.version"), app.split_once('@').unwrap().1);
+    }
+    let counter_spans = spans.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&counter))
+        .flat_map(|r| &r.scope_spans).flat_map(|s| &s.spans).collect::<Vec<_>>();
+    let request = counter_spans.iter().find(|s| s.name == "request").unwrap();
+    assert_eq!(request.trace_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(2));
+    assert_eq!(request.parent_span_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+    for name in ["queue", "instantiate", "guest", "commit"] {
+        let child = counter_spans.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(child.parent_span_id, request.span_id, "{name}");
+        assert_eq!(attr(&child.attributes, "nanovm.object"), "room");
+    }
+    assert!(logs.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&hostile))
+        .flat_map(|r| &r.scope_logs).flat_map(|s| &s.log_records).any(|l| {
+            attr(&l.attributes, "nanovm.object") == "other" && attr(&l.attributes, "log.iostream") == "stderr"
+                && matches!(l.body.as_ref().and_then(|v| v.value.as_ref()), Some(Value::StringValue(s)) if s.contains("hostile guest panicked"))
+        }));
+    let counter_metrics = metrics.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&counter))
+        .flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics);
+    assert!(counter_metrics.into_iter().any(|m| m.name == "nanovm.requests" && matches!(&m.data,
+        Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum)) if sum.data_points.iter().any(|p|
+            attr(&p.attributes, "nanovm.object") == "room" && p.value == Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(1))))));
+    use opentelemetry_proto::tonic::metrics::v1::{metric::Data, number_data_point};
+    let hostile_metrics = metrics.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&hostile))
+        .flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics).collect::<Vec<_>>();
+    assert!(hostile_metrics.iter().any(|m| m.name == "nanovm.poisons" && matches!(&m.data,
+        Some(Data::Sum(s)) if s.data_points.iter().any(|p| attr(&p.attributes, "reason") == "trap"
+            && p.value == Some(number_data_point::Value::AsInt(1))))));
+    assert!(hostile_metrics.iter().any(|m| m.name == "nanovm.objects.limit" && matches!(&m.data,
+        Some(Data::Gauge(g)) if g.data_points.iter().any(|p| p.value == Some(number_data_point::Value::AsInt(8))))));
+    // Refuse exports on existing connections too, and prove an export failed
+    // before checking that requests still succeed.
+    unavailable.store(true, Relaxed);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while failures.load(Relaxed) == 0 { tokio::time::sleep(Duration::from_millis(20)).await; }
+    }).await.expect("collector must actually refuse an export");
+    assert_eq!(tokio::time::timeout(Duration::from_secs(2), app_get(addr, &counter, "/room/")).await.unwrap().0, 200);
+    collector.abort();
 }

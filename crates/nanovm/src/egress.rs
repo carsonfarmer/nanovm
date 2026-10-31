@@ -165,6 +165,9 @@ impl WasiHttpHooks for EgressHooks {
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
         let obj = self.obj.clone();
+        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(crate::telemetry::PATH) {
+            return Box::new(async { Err(Error::HttpRequestDenied) });
+        }
         if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS) {
             let node = self.node.clone();
             return Box::new(async move { Ok((call(node, sem, obj, request).await?, Box::new(async { Ok(()) }) as IoFuture)) });
@@ -218,7 +221,9 @@ async fn call(
     req: http::Request<WasiBody>,
 ) -> Result<http::Response<WasiBody>, Error> {
     let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
+    let span = node.telemetry.span("call", &obj.id, &obj.context.lock());
     let (mut parts, body) = req.into_parts();
+    parts.extensions.insert(span.0.clone());
     let target = parts.uri.clone();
     let rest = target.path_and_query().map_or("", |p| p.as_str()).strip_prefix(CALLS).unwrap_or("");
     let (id, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));

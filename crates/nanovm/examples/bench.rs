@@ -43,6 +43,7 @@ fn node(name: &str, app: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
     };
     let app = AppConfig {
         name: app.into(),
+        digest: "bench".into(),
         env: Default::default(),
         config: Default::default(),
         limits: serde_json::from_value(limits)?,

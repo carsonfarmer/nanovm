@@ -79,6 +79,7 @@ pub struct Supervisor {
     /// Held while giving a new app its uid.
     uids: Arc<Mutex<()>>,
     publishes: reqwest::Client,
+    telemetry: Arc<crate::telemetry::Relay>,
     started: Instant,
 }
 
@@ -151,6 +152,7 @@ impl Supervisor {
             // for clients and the rest.
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
             uids: Arc::default(),
+            telemetry: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
             cfg,
             publishes: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build()?,
             started: Instant::now(),
@@ -321,6 +323,7 @@ impl Supervisor {
         let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
         let app = AppConfig {
             name: w.name.clone(),
+            digest: want.digest.clone(),
             env: p.spec.env,
             config: p.spec.config,
             limits: p.spec.limits.clamped(&self.cfg.limits),
@@ -420,13 +423,20 @@ impl Supervisor {
 
         let policy = Arc::new(policy);
         let (http, target, app) = (self.publishes.clone(), self.cfg.publish_to.clone(), w.name.clone());
+        let (telemetry, digest) = (self.telemetry.clone(), want.digest.clone());
+        let telemetry_slots = Arc::new(tokio::sync::Semaphore::new(3));
         egress.set_nonblocking(true)?;
         let link_caps = vec![Arc::new(tokio::sync::Semaphore::new(links)), self.links.clone()];
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, link_caps, move |req| {
             let (policy, http, target, app) = (policy.clone(), http.clone(), target.clone(), app.clone());
+            let (telemetry, digest, slots) = (telemetry.clone(), digest.clone(), telemetry_slots.clone());
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
                     return serve_forwarded(req, &policy).await;
+                }
+                if req.uri().path().starts_with(crate::telemetry::PATH) {
+                    let Ok(_slot) = slots.try_acquire() else { return verdict_ok(429) };
+                    return verdict_ok(telemetry.handle(req, &app, &digest).await);
                 }
                 if req.method() != http::Method::POST || req.uri().path().trim_end_matches('/') != "/publish" {
                     return verdict_ok(404);
