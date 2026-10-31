@@ -4,7 +4,8 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## State (2026-10-31)
 
-- **Current work:** Amp is enabling build/test CI on `ci-checks` (W-16), then starting W-2. The old publishing workflow alone did not test runtime changes. New CI uses read-only permissions and never publishes guests; first remote run pending.
+- **CI enabled (W-16):** `ci-checks` passed GitHub run 41227208960 at `57d1595`: production check, 93 unit and 64 integration tests, one ignored. The initial run exposed a runner fd-limit mismatch; CI now uses its hard limit. Read-only permissions, no guest publishing. Branch protection was not changed.
+- **Current work:** W-2 has started on `w2-observability`; that branch contains its transport plan and readiness prerequisite. Continue there after landing CI; no OTLP export exists yet.
 - **`main`** has:
   - phase 1 (portable core);
   - phase 2 (the Linux jail);

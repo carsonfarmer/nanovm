@@ -287,4 +287,4 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 
 ### W-16: build and test CI
 - **What:** run a production-feature build check and the unit/integration suite on pushes and pull requests; build guests locally without publishing packages. Read-only token, Ubuntu 24.04, locked dependencies, serial test scheduling to reduce N-32 contention.
-- **Status:** in progress by Amp on `ci-checks`; validating the first GitHub Actions run before landing. W-2 follows.
+- **Status:** done in d6f89f9, runner fd-limit correction in 57d1595. GitHub run 41227208960 passed: production build check, 93 unit and 64 integration tests, one ignored. Workflow checks are enabled; no branch-protection rule was changed.

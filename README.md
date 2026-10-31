@@ -304,6 +304,8 @@ There are 64 integration tests and 93 unit tests, plus one that needs external H
 
 GitHub Actions runs **CI / Build and test** on pushes and pull requests: a production build check without dev features, locally built guests, then the locked unit/integration suite on Ubuntu 24.04. Tests run serially to avoid competing wall-clock CPU budgets; concurrency tests still exercise parallel requests. The workflow has read-only permissions and publishes nothing. Cgroup tests skip when controllers are unavailable; the external HTTPS test remains ignored by default.
 
+The first successful [CI run](https://github.com/carsonfarmer/nanovm/actions/runs/41227208960) passed the production check and all 157 enabled tests.
+
 The tests cover:
 - one request at a time per object, with objects running in parallel
 - full queues
