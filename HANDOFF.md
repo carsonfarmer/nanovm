@@ -4,7 +4,8 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## State (2026-10-31)
 
-- **Current work:** Amp is validating build/test CI on `ci-checks` (W-16) and starting W-2 on `w2-observability`, based on that branch. W-2 owns telemetry, object/table instrumentation, server/supervisor and demo consumers. Guests remain unchanged. CI's first run passed the production check but could not raise fds to 100,000; the next uses the runner's actual hard limit.
+- **CI enabled (W-16):** `ci-checks` passed GitHub run 41227208960 at `57d1595`: production check, 93 unit and 64 integration tests, one ignored. The initial run exposed a runner fd-limit mismatch; CI now uses its hard limit. Read-only permissions, no guest publishing. Branch protection was not changed.
+- **Current work:** W-2 has started on `w2-observability`, incorporating main's CI. It owns telemetry, object/table instrumentation, server/supervisor and demo consumers. Its transport plan and readiness prerequisite are committed; no OTLP export exists yet. Guests remain unchanged.
 - **`main`** has:
   - phase 1 (portable core);
   - phase 2 (the Linux jail);
@@ -42,6 +43,8 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 The owner requested W-2 after enabling CI. The first code milestone decouples worker readiness from `/_nanovm/stats`: `Supervisor::start` now requests the private `/_nanovm/ready` response (204, no snapshot, no guest dispatch). The extended `http_front_end` regression failed with 404 before implementation. Keep the deprecated APIs until their OTel replacements and demo/test consumers work, then delete them (no compatibility layer).
 
+Readiness validation: full locked suite with `RUST_TEST_THREADS=1` passed (93 unit, 64 integration, one ignored). Deleting the readiness handler made `http_front_end` fail with 404; restored with `git checkout -- crates/nanovm/src/server.rs`, confirmed an empty diff, and the same test passed. No guest changes or new telemetry dependencies yet.
+
 Implementation plan from source inspection:
 - Use `opentelemetry`, `opentelemetry_sdk` and `opentelemetry-otlp`, rather than invent a telemetry encoding. The OTLP HTTP exporter accepts a custom `opentelemetry_http::HttpClient`; a worker client can send through its existing egress link. Only the supervisor reaches the collector. `tracing-opentelemetry` bridges spans, but does not export logs: use the logs SDK for guest stdout/stderr. Docs inspected: https://docs.rs/opentelemetry-otlp/latest/opentelemetry_otlp/ and https://docs.rs/tracing-opentelemetry/latest/tracing_opentelemetry/ . Resolve compatible crate versions at implementation time.
 - The supervisor owns collector configuration and credentials. A worker must not choose an arbitrary export URL or claim another app/version. Decode bounded OTLP batches, replace tenant resource identity from the worker's trusted supervisor record, then export. Guest HTTP must not access this internal telemetry route. Test these boundaries with crafted requests, including duplicate/spoofed attributes.
@@ -50,7 +53,7 @@ Implementation plan from source inspection:
 - Replace stats/events consumers in the demo and integration tests with a local OTLP collector fixture; preserve worker death, version-switch and isolation assertions. Worker readiness becomes a small private response, not an exported metric. Delete HTTP stats/events and the event ring only once equivalent checks exist.
 - Validate real jailed-worker exports for all three signals, tenant/version isolation, collector outage, telemetry flood, trace parentage and guest logs. Mutation-check those contracts, run the full suite/demo/benchmark, and review the telemetry trust boundary before landing.
 
-**First-piece handoff:** Continue `w2-observability` with bounded OTLP transport after validating the readiness prerequisite. The plan above is not an assertion that telemetry already exists. Do not change guests without approval.
+**First-piece handoff:** Continue `w2-observability` with bounded OTLP transport; the readiness prerequisite is validated. The plan above is not an assertion that telemetry already exists. Do not change guests without approval.
 
 ## Completed W-3 brief (historical starting point)
 

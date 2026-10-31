@@ -230,7 +230,7 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 - **What:** OTel traces (a span per request, with queue wait, instantiation, guest time, commit, calls), metrics (what `/_nanovm/stats` reports today) and guest logs (each object's stdout and stderr), on by default and tagged with app, object and version. Then remove `/_nanovm/stats` and `/_nanovm/events`.
 - **Design notes:** a jailed worker can't open sockets, so its telemetry has to leave through the supervisor, over the egress link or its stderr; the supervisor exports OTLP to an operator-configured collector. Look at the `opentelemetry` and `tracing-opentelemetry` crates before designing. Touches the supervisor, so coordinate with the rewrite.
 - **Where:** `metrics.rs`, `object.rs`, `server.rs`, `supervisor.rs`, `demo/demo.sh` (it reads `/_nanovm/stats`).
-- **Status:** in progress by Amp on `w2-observability` (2026-10-31), based on `ci-checks` pending CI validation. Library/transport investigation recorded in HANDOFF. First prerequisite implemented: worker readiness no longer uses the stats API (Q57); telemetry and API removal remain to implement.
+- **Status:** in progress by Amp on `w2-observability` (2026-10-31), incorporating main's enabled CI. Library/transport investigation recorded in HANDOFF. First prerequisite implemented and mutation-checked: worker readiness no longer uses the stats API (Q57); full local suite passes. Telemetry and API removal remain to implement.
 
 ### W-3: move WebSockets into the front proxy
 - **What:** the proxy holds client sockets, Pushpin-style, and sends each event to the object as the plain `POST` it gets today; publishes go to the proxy. Most of `ws.rs` leaves the node, and the node only answers requests. Resolves N-14 and N-20. Supersedes Q31.
@@ -287,4 +287,4 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 
 ### W-16: build and test CI
 - **What:** run a production-feature build check and the unit/integration suite on pushes and pull requests; build guests locally without publishing packages. Read-only token, Ubuntu 24.04, locked dependencies, serial test scheduling to reduce N-32 contention.
-- **Status:** in progress by Amp on `ci-checks`; validating the first GitHub Actions run before landing. W-2 follows.
+- **Status:** done in d6f89f9, runner fd-limit correction in 57d1595. GitHub run 41227208960 passed: production build check, 93 unit and 64 integration tests, one ignored. Workflow checks are enabled; no branch-protection rule was changed.
