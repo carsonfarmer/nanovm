@@ -1,4 +1,4 @@
-//! WebSockets, held by the supervisor and delivered to objects in Pushpin's
+//! WebSockets, held by the proxy and delivered to objects in Pushpin's
 //! WebSocket-over-HTTP (https://pushpin.org/docs/protocols/websocket-over-http/).
 //! A socket opened at `/{app}/{object}/…` opens if the object answers `OPEN`;
 //! each event after (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` of
@@ -10,9 +10,7 @@
 //! channel of its own object. It reaches every subscribed socket by posting
 //! GRIP's publish format to `http://nanovm/publish/`.
 //!
-//! A socket belongs to the worker process it opened on and closes with it, so
-//! a version switch closes the app's sockets and clients reconnect to the new
-//! version.
+//! Sockets belong to apps, not workers; events resolve the current version.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -29,7 +27,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, Uri};
 use http_body_util::{BodyExt, Full, Limited};
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig, frame::coding::CloseCode};
 use tokio_tungstenite::tungstenite::{self, Message, Utf8Bytes};
@@ -124,8 +122,6 @@ pub enum Reply {
     /// The answer wasn't events: the status to refuse a socket with, the
     /// object's own if it refused.
     Bad(u16),
-    /// The socket's worker is no longer the app's.
-    Gone,
 }
 
 /// `res` as events, if it is a `200` of them within `max` bytes.
@@ -299,7 +295,6 @@ impl Sockets {
         self: &Arc<Self>,
         object: &str,
         mut req: Request<Body>,
-        gone: watch::Receiver<()>,
         deliver: Deliver,
     ) -> Result<Response<()>, (u16, &'static str)> {
         let caps = &self.caps;
@@ -361,7 +356,6 @@ impl Sockets {
         let (headers, events) = match deliver(open).await {
             Reply::Answer(Answer { headers, events }) => (headers, events),
             Reply::Bad(status) => return Err((status, "the object refused the socket")),
-            Reply::Gone => return Err((503, "the app's worker is restarting")),
         };
         conn.grip = headers.get(SEC_WEBSOCKET_EXTENSIONS).is_some_and(|e| e == "grip");
         let protocol = headers.get(PROTOCOL);
@@ -392,7 +386,7 @@ impl Sockets {
             .max_frame_size(Some(caps.request_max.saturating_sub(FRAMING)));
         tokio::spawn(async move {
             match upgrade.await {
-                Ok(io) => run(conn, hyper_util::rt::TokioIo::new(io), rx, gone, config, deliver).await,
+                Ok(io) => run(conn, hyper_util::rt::TokioIo::new(io), rx, config, deliver).await,
                 Err(_) => drop(deliver(conn.request(&Event::Disconnect)).await),
             }
         });
@@ -408,7 +402,8 @@ impl Sockets {
         B::Error: Into<crate::object::BoxError>,
     {
         let object = req.headers().get(OBJECT_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
-        let Ok(body) = Limited::new(req.into_body(), self.caps.response_max).collect().await else { return 413 };
+        let body = tokio::time::timeout(STALL, Limited::new(req.into_body(), self.caps.response_max).collect()).await;
+        let body = match body { Ok(Ok(body)) => body, Ok(Err(_)) => return 413, Err(_) => return 408 };
         let (Some(object), Some(items)) = (object, messages(&body.to_bytes())) else { return 400 };
         for sock in self.socks.lock().values().filter(|s| s.object == object) {
             for (_, m) in items.iter().filter(|(c, _)| sock.channels.contains(c)) {
@@ -451,7 +446,6 @@ async fn run<Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     conn: Conn,
     io: Io,
     mut rx: mpsc::UnboundedReceiver<Message>,
-    mut gone: watch::Receiver<()>,
     config: WebSocketConfig,
     deliver: Deliver,
 ) {
@@ -482,7 +476,6 @@ async fn run<Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         break (frame(CloseCode::Error), Some(Event::Disconnect));
                     }
                 }
-                Reply::Gone => break (frame(CloseCode::Restart), None),
                 _ => break (frame(CloseCode::Error), Some(Event::Disconnect)),
             },
             Some(m) = rx.recv() => {
@@ -501,7 +494,6 @@ async fn run<Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 }
             }
             _ = conn.out.behind.notified() => break (None, Some(Event::Disconnect)),
-            _ = gone.changed() => break (frame(CloseCode::Restart), None),
             // A client silent through a whole interval (while nothing waits
             // on the object) is gone, even if its connection never said so.
             _ = ping.tick() => {
@@ -591,15 +583,22 @@ mod tests {
         let t = told.clone();
         let deliver: Deliver = Box::new(move |req| {
             t.lock().push(req.into_body());
-            Box::pin(async { Reply::Gone })
+            Box::pin(async { Reply::Bad(502) })
         });
         let (_client, server) = tokio::io::duplex(1 << 16);
-        let (_gone_tx, gone) = watch::channel(());
-        let ran = tokio::spawn(run(conn, server, rx, gone, WebSocketConfig::default(), deliver));
+        let ran = tokio::spawn(run(conn, server, rx, WebSocketConfig::default(), deliver));
         tokio::time::sleep(PING * 2 + Duration::from_secs(1)).await;
         assert!(ran.is_finished(), "a silent client is still open");
         assert_eq!(told.lock().len(), 1, "the object is told");
         assert_eq!(total.load(Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_publishes_have_a_deadline() {
+        let sockets = Sockets::new(caps(10, 10, 10));
+        let body = http_body_util::StreamBody::new(futures::stream::pending::<Result<http_body::Frame<Bytes>, std::io::Error>>());
+        let req = Request::post("/publish").header(OBJECT_HEADER, "o").body(body).unwrap();
+        assert_eq!(tokio::time::timeout(STALL * 2, sockets.publish(req)).await.unwrap(), 408);
     }
 
     #[test]
@@ -953,8 +952,7 @@ mod tests {
         reply: impl Fn() -> Reply + Send + Sync + 'static,
     ) -> (Result<Response<()>, (u16, &'static str)>, Log) {
         let (d, log) = deliver(reply);
-        let (_tx, gone) = watch::channel(());
-        (s.open("o", req, gone, d).await, log)
+        (s.open("o", req, d).await, log)
     }
 
     /// Anything but a version-13 WebSocket handshake of bounded size is
@@ -1059,10 +1057,6 @@ mod tests {
         assert_eq!(
             refuse(Box::new(|| Reply::Bad(403))).await,
             (not_events, vec![open.clone()])
-        );
-        assert_eq!(
-            refuse(Box::new(|| Reply::Gone)).await.0,
-            (503, "the app's worker is restarting")
         );
         let not_open = (502, "the object did not accept the socket");
         assert_eq!(

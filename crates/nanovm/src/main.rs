@@ -16,7 +16,10 @@ fn main() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let listener = tokio::net::TcpListener::bind(&cfg.listen).await.with_context(|| format!("binding {}", cfg.listen))?;
-                nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg)?, listener).await
+                let publish = tokio::net::TcpListener::bind(&cfg.publish_listen).await?;
+                let proxy = nanovm::proxy::Proxy::new(cfg)?;
+                tokio::try_join!(nanovm::proxy::serve(proxy.clone(), listener), nanovm::proxy::serve_publish(proxy, publish))?;
+                Ok(())
             })
         }
         // Started by the supervisor only, which reports the worker's last line.

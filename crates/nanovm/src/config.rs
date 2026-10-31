@@ -31,9 +31,8 @@ config! {
         data_dir: PathBuf = "nanovm-data",
         /// Upper bound on objects with a live instance; sizes the pooling allocator.
         max_live_objects: usize = 1000usize,
-        /// Upper bound on open WebSockets across all apps: each holds a file
-        /// descriptor in the supervisor.
-        max_sockets: usize = 10_000usize,
+        /// Private proxy endpoint receiving committed publishes.
+        publish_to: String = "http://127.0.0.1:8444/publish",
         /// Virtual address space reserved per linear memory: no memory grows
         /// past it, whatever an app's `memory_mb`.
         memory_reservation_mb: u64 = 128u64,
@@ -62,7 +61,7 @@ config! {
         /// The largest component the node will download.
         max_component_mb: u64 = 64u64,
         /// Upper bound on running app workers. A new app takes the slot of
-        /// the least recently used idle one (no requests, no sockets), or is
+        /// the least recently used idle one (no requests), or is
         /// refused when none is idle.
         max_apps: usize = 100usize,
         /// How long a registry fetch (an app's load, or a check of a new
@@ -101,6 +100,14 @@ config! {
         listen: String = "0.0.0.0:8443",
         /// The node it forwards to.
         node: String = "127.0.0.1:8080",
+        /// Private control listener; only nodes may reach it.
+        publish_listen: String = "127.0.0.1:8444",
+        max_sockets: usize = 10_000usize,
+        max_sockets_per_app: usize = 1000usize,
+        max_sockets_per_object: usize = 256usize,
+        max_request_body_kb: u64 = 1024u64,
+        max_response_body_kb: u64 = 8192u64,
+        socket_backlog_kb: u64 = 1024u64,
         /// A DNS-over-HTTPS resolver (the JSON API) asked for each host's
         /// `_nanovm` TXT record.
         resolver: String = "https://cloudflare-dns.com/dns-query",
@@ -119,8 +126,6 @@ config! {
         memory_mb: u64 = 0u64,
         cpus: f64 = 0.0f64,
         pids: u64 = 0u64,
-        /// Open WebSockets across the app (held by the supervisor).
-        max_sockets: usize = 1000usize,
     }
 }
 
@@ -138,11 +143,6 @@ config! {
         disk_mb: u64 = 64u64,
         max_files: u64 = 1000u64,
         max_queue: usize = 64usize,
-        /// Open WebSockets per object.
-        max_sockets: usize = 256usize,
-        /// What a WebSocket may fall behind by, in bytes queued for its
-        /// client, before it is dropped.
-        socket_backlog_kb: u64 = 1024u64,
         max_outbound_concurrency: usize = 4usize,
         max_resources: usize = 10_000usize,
         /// Outbound HTTP allowlist: `host`, `host:port` or `*.suffix[:port]`.
@@ -241,21 +241,21 @@ mod tests {
         let mine = Limits {
             memory_mb: 1 << 20,
             cpu_ms: 1,
-            max_sockets: usize::MAX,
-            socket_backlog_kb: 0,
+            max_queue: usize::MAX,
+            max_resources: 0,
             egress: vec!["example.com".into()],
             ..Limits::default()
         };
         let max = Limits {
             memory_mb: 32,
             cpu_ms: 100,
-            max_sockets: 8,
+            max_queue: 8,
             egress: vec!["*.other".into()],
             ..Limits::default()
         };
         let c = mine.clamped(&max);
         assert_eq!(
-            (c.memory_mb, c.cpu_ms, c.max_sockets, c.socket_backlog_kb),
+            (c.memory_mb, c.cpu_ms, c.max_queue, c.max_resources),
             (32, 1, 8, 0)
         );
         assert_eq!(c.egress, ["example.com"]);
@@ -302,7 +302,7 @@ mod tests {
             (1000, 128, 0, 64)
         );
         assert!(cfg.cgroup.is_none() && !cfg.dev);
-        assert_eq!(cfg.worker.max_sockets, 1000);
+        assert_eq!(ProxyConfig::default().max_sockets_per_app, 1000);
 
         let cfg: NodeConfig = toml::from_str("[limits]\ncpu_ms = 9\n").unwrap();
         assert_eq!((cfg.limits.cpu_ms, cfg.limits.memory_mb), (9, 64));

@@ -1593,12 +1593,46 @@ mod sockets {
 
     type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+    async fn front(label: &str, mut cfg: nanovm::config::ProxyConfig, apps: &[(&str, AppConfig)]) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, std::net::SocketAddr) {
+        let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut node_cfg = node_cfg(label, 8);
+        node_cfg.publish_to = format!("http://{}/publish", control.local_addr().unwrap());
+        let (sup, node) = supervised_with(node_cfg).await;
+        let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        for (host, app) in apps {
+            let published = publish(&format!("{label}-{host}"), app).await;
+            records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", published.split_once('@').unwrap().0)]);
+        }
+        cfg.listen = "127.0.0.1:0".into();
+        cfg.node = node.to_string();
+        cfg.resolver = doh(records).await;
+        cfg.tag_ttl_s = 0;
+        cfg.dev = true;
+        let proxy = nanovm::proxy::Proxy::new(cfg).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(nanovm::proxy::serve(proxy.clone(), listener));
+        tokio::spawn(nanovm::proxy::serve_publish(proxy, control));
+        (sup, node, addr)
+    }
+
+    async fn app_get(addr: std::net::SocketAddr, host: &str, path: &str) -> (u16, String) {
+        raw(addr, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"), b"").await
+    }
+
+    async fn ended(addr: std::net::SocketAddr, host: &str, object: &str, n: usize) {
+        let t0 = Instant::now();
+        while app_get(addr, host, &format!("/{object}/kv/ws-ends")).await != (200, n.to_string()) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "{host}/{object} never ended {n} sockets");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// A handshake for `path` on `app`.
     fn handshake(addr: std::net::SocketAddr, app: &str, path: &str) -> http::Request<()> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut req = format!("ws://{addr}{path}").into_client_request().unwrap();
-        req.headers_mut().insert("nanovm-app", app.parse().unwrap());
-        req.headers_mut().insert("nanovm-trust", "dev dev".parse().unwrap());
+        req.headers_mut().insert("host", app.parse().unwrap());
         req
     }
 
@@ -1640,17 +1674,28 @@ mod sockets {
         ws.send(Message::text(text)).await.unwrap();
     }
 
-    async fn sockets_open(addr: std::net::SocketAddr, n: u64) {
-        let t0 = Instant::now();
-        while stats_json(addr).await["sockets"] != n {
-            assert!(t0.elapsed() < Duration::from_secs(5), "sockets never reached {n}: {}", stats_json(addr).await);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+    async fn post(addr: std::net::SocketAddr, app: &str, path: &str) -> u16 {
+        let head = format!("POST {path} HTTP/1.1\r\nHost: {app}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        raw(addr, &head, b"").await.0
     }
 
-    async fn post(addr: std::net::SocketAddr, app: &str, path: &str) -> u16 {
-        let head = format!("POST {path} HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(app));
-        raw(addr, &head, b"").await.0
+    /// An existing socket uses the new digest, retains its subscriptions,
+    /// and cannot switch the node back to its OPEN version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sockets_follow_current_versions() {
+        let (_sup, node, addr) = front("socket_versions", Default::default(), &[("counter", app("counter"))]).await;
+        let mut ws = open(addr, "counter", "/room/ws").await.unwrap();
+        let mut changed = app("counter");
+        changed.config.insert("greeting".into(), "new version".into());
+        let next_version = publish("socket_versions-counter", &changed).await;
+        say(&mut ws, "pub after deploy").await;
+        assert_eq!(next(&mut ws).await, Message::text("after deploy"));
+        let name = nanovm::registry::app_name("counter", &next_version.parse().unwrap());
+        assert_eq!(stats_json(node).await["workers"][&name]["digest"], next_version.split_once('@').unwrap().1);
+        assert_eq!(app_get(addr, "counter", "/room/config/greeting").await, (200, "new version".into()));
+        say(&mut ws, "still new").await;
+        assert_eq!(next(&mut ws).await, Message::text("echo still new"));
+        assert_eq!(stats_json(node).await["workers"][&name]["starts"], 2);
     }
 
     /// Events reach the object, which answers on the socket and publishes to
@@ -1660,13 +1705,13 @@ mod sockets {
     /// checked.
     #[tokio::test(flavor = "multi_thread")]
     async fn websockets_reach_their_object_and_fan_out_within_it() {
-        let (_sup, addr) = supervised("websockets_fan_out").await;
         let mut counter = app("counter");
         counter.limits.max_queue = 2;
-        let (counter, hostile) = (publish("counter", &counter).await, publish("hostile", &app("hostile")).await);
+        let (_sup, _node, addr) = front("websockets_fan_out", Default::default(), &[("counter", counter.clone()), ("other", counter), ("hostile", app("hostile"))]).await;
+        let (counter, hostile) = ("counter", "hostile");
         let (mut a, mut b) = (open(addr, &counter, "/room/ws").await.unwrap(), open(addr, &counter, "/room/ws").await.unwrap());
         let mut other = open(addr, &counter, "/elsewhere/ws").await.unwrap();
-        sockets_open(addr, 3).await;
+        let mut other_app = open(addr, "other", "/room/ws").await.unwrap();
 
         say(&mut a, "hello").await;
         assert_eq!(next(&mut a).await, Message::text("echo hello"));
@@ -1694,13 +1739,16 @@ mod sockets {
         // Another object's sockets heard none of it.
         say(&mut other, "x").await;
         assert_eq!(next(&mut other).await, Message::text("echo x"));
+        say(&mut other_app, "x").await;
+        assert_eq!(next(&mut other_app).await, Message::text("echo x"), "another app hears no publish even with the same object and channel");
 
         say(&mut b, "close").await;
         let Message::Close(Some(f)) = next(&mut b).await else { panic!("no close frame") };
         assert_eq!(f.code, CloseCode::from(4000));
         a.close(None).await.unwrap();
         drop(other);
-        sockets_open(addr, 0).await;
+        ended(addr, counter, "room", 2).await;
+        ended(addr, counter, "elsewhere", 1).await;
         // `a`, and the `b` whose event failed; not the `b` the object closed.
         assert_eq!(app_get(addr, &counter, "/room/kv/ws-ends").await, (200, "2".into()));
         assert_eq!(app_get(addr, &counter, "/elsewhere/kv/ws-ends").await, (200, "1".into()));
@@ -1715,7 +1763,7 @@ mod sockets {
             assert_eq!(next(ws).await, Message::text("echo hello"));
         }
         drop(many);
-        sockets_open(addr, 0).await;
+        ended(addr, counter, "busy", 8).await;
         assert_eq!(app_get(addr, &counter, "/busy/kv/ws-ends").await, (200, "8".into()));
 
         // An object that doesn't answer `OPEN` refuses the socket, with its
@@ -1724,19 +1772,16 @@ mod sockets {
         assert_eq!(refused(open(addr, &counter, "/room/nope").await).0, 404);
         // A client can't send events, and handshakes are checked.
         let forged = format!(
-            "POST /room/ws HTTP/1.1\r\nHost: x\r\n{}Content-Type: application/websocket-events\r\n\
+            "POST /room/ws HTTP/1.1\r\nHost: {counter}\r\nContent-Type: application/websocket-events\r\n\
             Connection-Id: 1\r\nContent-Length: 12\r\nConnection: close\r\n\r\nDISCONNECT\r\n",
-            names(&counter)
         );
         assert_eq!(raw(addr, &forged, b"").await.0, 400);
         let old = format!(
-            "GET /room/ws HTTP/1.1\r\nHost: x\r\n{}Upgrade: websocket\r\nConnection: Upgrade, close\r\n\
+            "GET /room/ws HTTP/1.1\r\nHost: {counter}\r\nUpgrade: websocket\r\nConnection: Upgrade, close\r\n\
             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n",
-            names(&counter)
         );
         assert_eq!(raw(addr, &old, b"").await.0, 426);
         assert_eq!(app_get(addr, &counter, "/room/kv/ws-ends").await, (200, "2".into()));
-        sockets_open(addr, 0).await;
     }
 
     /// Sockets per object, per app and per node are capped, a message is
@@ -1744,14 +1789,13 @@ mod sockets {
     /// and a worker's sockets close with it.
     #[tokio::test(flavor = "multi_thread")]
     async fn websocket_limits_hold() {
-        let mut cfg = node_cfg("websocket_limits_hold", 8);
-        cfg.max_sockets = 4;
-        cfg.worker.max_sockets = 3;
-        let (_sup, addr) = supervised_with(cfg).await;
+        let cfg = nanovm::config::ProxyConfig { max_sockets: 4, max_sockets_per_app: 3, max_sockets_per_object: 2,
+            max_request_body_kb: 16, max_response_body_kb: 64, ..Default::default() };
         let mut counter = app("counter");
         let limits = &mut counter.limits;
-        (limits.max_sockets, limits.max_request_body_kb, limits.max_response_body_kb) = (2, 16, 64);
-        let (counter, chat) = (publish("counter", &counter).await, publish("chat", &counter).await);
+        (limits.max_request_body_kb, limits.max_response_body_kb) = (16, 64);
+        let (_sup, node, addr) = front("websocket_limits_hold", cfg, &[("counter", counter.clone()), ("chat", counter)]).await;
+        let (counter, chat) = ("counter", "chat");
 
         let a1 = open_slow(addr, &counter, "/a/ws").await;
         let _a2 = open_slow(addr, &counter, "/a/ws").await;
@@ -1764,19 +1808,19 @@ mod sockets {
         let (status, body) = refused(open(addr, &chat, "/y/ws").await);
         assert_eq!((status, body.contains("node has max_sockets")), (503, true), "{body}");
         drop(other_app);
-        sockets_open(addr, 3).await;
+        ended(addr, chat, "x", 1).await;
 
         big.send(Message::text("x".repeat(16 << 10))).await.unwrap();
         let Message::Close(Some(f)) = next(&mut big).await else { panic!("no close frame") };
         assert_eq!(f.code, CloseCode::Size);
-        sockets_open(addr, 2).await;
+        ended(addr, counter, "b", 1).await;
 
         // `a1` and `a2` never read; what is published to them piles up until
         // they are dropped.
         let msg = "y".repeat(1000);
         for i in 0.. {
             assert_eq!(post(addr, &counter, &format!("/a/publish?msg={msg}&n=50")).await, 200);
-            if stats_json(addr).await["sockets"] == 0 {
+            if app_get(addr, counter, "/a/kv/ws-ends").await == (200, "2".into()) {
                 break;
             }
             assert!(i < 2000, "a socket that never reads was never dropped");
@@ -1786,12 +1830,12 @@ mod sockets {
 
         // A client that gives up while its `OPEN` waits on the object still
         // has its socket ended for the object, which accepted it.
-        let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap() as i32;
+        let stats = stats_json(node).await;
+        let pid = stats["workers"].as_object().unwrap().iter().find(|(name, _)| name.starts_with("counter_")).unwrap().1["pid"].as_u64().unwrap() as i32;
         unsafe { libc::kill(pid, libc::SIGSTOP) };
         let upgrade = format!(
-            "GET /e/ws HTTP/1.1\r\nHost: x\r\n{}Upgrade: websocket\r\nConnection: Upgrade\r\n\
+            "GET /e/ws HTTP/1.1\r\nHost: {counter}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-            names(&counter)
         );
         let mut gave_up = tokio::net::TcpStream::connect(addr).await.unwrap();
         tokio::io::AsyncWriteExt::write_all(&mut gave_up, upgrade.as_bytes()).await.unwrap();
@@ -1804,13 +1848,12 @@ mod sockets {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
-        // A worker's sockets close when it goes.
+        // A worker exit doesn't close its sockets; their next event starts it.
         let mut s = open(addr, &counter, "/d/ws").await.unwrap();
-        let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-        let Message::Close(Some(f)) = next(&mut s).await else { panic!("no close frame") };
-        assert_eq!(f.code, CloseCode::Restart);
-        sockets_open(addr, 0).await;
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        say(&mut s, "survived").await;
+        assert_eq!(next(&mut s).await, Message::text("echo survived"));
     }
 }
 
@@ -2212,9 +2255,7 @@ async fn the_proxy_drops_hop_by_hop_headers() {
     for gone in ["x-private", "keep-alive", "te", "proxy-authorization", "connection"] {
         assert!(!names.contains(&gone.to_string()), "{gone} reached the node: {names:?}");
     }
-    // An upgrade still says so.
+    // WebSocket upgrades terminate here, not at the node; malformed ones fail.
     let head = "GET /a/ HTTP/1.1\r\nHost: hop.test\r\nConnection: Upgrade, close, x-private\r\nUpgrade: websocket\r\n\r\n";
-    let names: Vec<String> = serde_json::from_str(&raw(proxy, head, b"").await.1).unwrap();
-    assert!(names.contains(&"connection".to_string()) && names.contains(&"upgrade".to_string()), "{names:?}");
-    assert!(!names.contains(&"x-private".to_string()), "{names:?}");
+    assert_eq!(raw(proxy, head, b"").await.0, 400);
 }

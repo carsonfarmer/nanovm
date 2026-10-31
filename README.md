@@ -119,7 +119,7 @@ That is the repository and the tag deployed, each identity whose signature is ac
 - asks a DNS-over-HTTPS resolver (`resolver`, Cloudflare's by default) and keeps the answer for its TTL;
 - asks the registry which digest the tag names, and keeps that for `tag_ttl_s` (30 s);
 - looks each host or tag up once however many requests ask at once, keeps a failed lookup's answer for 5 s rather than asking again, and remembers at most 10,000 of each;
-- drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards the request, WebSockets included;
+- drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards HTTP requests; it holds WebSockets itself and forwards their events;
 - speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
 - gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too).
 
@@ -148,7 +148,7 @@ What happens on the first request for a digest:
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
 
-**How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight and no open sockets, whose worker is retired (its next request starts it again). With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since anyone's DNS can name an app, this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
+**How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight, whose worker is retired (its next request starts it again). Open proxy sockets do not pin workers. With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since anyone's DNS can name an app, this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
 
 **Bounds.** Every registry read is bounded: a manifest, config, token or signature at 4 MiB, a component at `max_component_mb` (64), and 16 signatures per load. At most four registry fetches run at once across the node, each within `load_timeout_ms` (60 s) in all, so a registry that answers a byte at a time holds nothing for long. Digests are checked before they name anything. Registries, and their redirects and token servers, must be on public addresses: a deploy names the registry, so it must not reach the node's own network.
 
@@ -182,20 +182,20 @@ An object calls another object of its own app with an ordinary outgoing request 
 
 ## WebSockets
 
-The supervisor holds client sockets for now. They are planned to move into the front proxy, so the node only ever answers requests ([ISSUES.md](ISSUES.md) W-3).
+The front proxy holds client sockets; the node only answers requests. Objects see sockets as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work. No separate Pushpin process is needed.
 
-The supervisor holds client sockets. Objects see them as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work.
+Committed publishes travel from the supervisor to the proxy's private `publish_listen` (`127.0.0.1:8444`), at `POST /publish`. Set the node's `publish_to` accordingly (default `http://127.0.0.1:8444/publish`). **Only nodes may reach this control port**, just as only proxies may reach the node. The supervisor names the app, the worker names the object; channels cannot cross either boundary. Publish bodies have a 30 s deadline.
 - **Opening.** A socket opened at `/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`; any other answer refuses the socket, with the object's own status if it is a 4xx or 5xx (so a `401` reaches the client).
 - **Events.** Each later event (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` queued with the object's other requests, so events are ordered with everything else the object serves. The answer carries events for that socket.
   - A socket has one event in flight at a time, and its next message is read once that is answered. Messages for the client are written meanwhile.
   - An event waits for room in a full queue rather than being refused; the sockets bound how many wait.
-  - Only the node sends events: a client request of type `application/websocket-events` is refused, so an object can trust `Connection-Id`. That type means "an event of a socket the proxy in front holds" and nothing else, so no legitimate client request carries it.
+  - Only the proxy sends events: it refuses a client request of type `application/websocket-events`, so an object can trust `Connection-Id`. The node trusts events from its private front end just like the app headers.
 - **Fan-out within an object**, as in Durable Objects (an object is a room). An object that answers `Sec-WebSocket-Extensions: grip` sends `m:` messages and `c:` controls. `{"type":"subscribe","channel":"…"}` subscribes the socket to a channel of its own object. The object reaches every subscribed socket, from any request, by posting GRIP's publish format to `http://nanovm/publish/`; the worker stamps that request with the object's id.
-- **Lifetime.** Sockets outlive instances: an evicted object is started again by the next event. They belong to the worker process, and close (1012) when it exits or the app switches versions, so clients reconnect to the new version. A node restart drops them.
+- **Lifetime.** Sockets outlive instances, workers and version switches. Each event resolves the app's current digest from the proxy's caches; subscriptions remain intact. If the host changes app identity (record owner or repository), or an event cannot reach the node, the socket closes with 1011. Events have a 240 s overall deadline, including cold deployment. A proxy restart drops its sockets.
 - **Limits.**
-  - `max_sockets` per object (default 256), per app (`[worker] max_sockets`, default 1,000) and per node (default 10,000; each is a file descriptor in the supervisor).
-  - A message is bounded by `max_request_body_kb` (closed with 1009), and an answer by `max_response_body_kb`.
-  - Messages waiting to be written count their bytes plus 64 each. A socket more than `socket_backlog_kb` (default 1,024) behind is dropped, and so is one whose write stalls for 30 s. Each socket's budget is its own, so no client or app can crowd out another; the supervisor's worst case is `max_sockets` × the largest `socket_backlog_kb`, which `limits` caps.
+  - Proxy settings: `max_sockets_per_object` (256), `max_sockets_per_app` (1,000), and `max_sockets` (10,000 total).
+  - Proxy `max_request_body_kb` (1,024) bounds messages (closed with 1009); `max_response_body_kb` (8,192) bounds answers and publishes. The node's independent request/response caps still apply.
+  - Messages waiting to be written count their bytes plus 64 each. A socket more than the proxy's `socket_backlog_kb` (1,024) behind is dropped, and so is one whose write stalls for 30 s. Each socket has its own budget.
   - A socket is pinged every 30 s and dropped if it heard nothing for a whole interval, so a half-open connection doesn't hold its slot.
   - A socket has at most 64 channels and 16 KiB of handshake headers. A publish has at most 64 items.
 
@@ -339,7 +339,7 @@ The tests cover:
 - the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and WebSockets pass through
 - key-value: values persisting in the volume, counting against the disk and file quotas, bad names refused, keys paged, reads bounded by the memory limit and batches by size, and the store working in a jailed worker (including a key file the guest replaced through its filesystem)
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`
-- WebSockets through the supervisor: echo, binary, fan-out to the sockets of one object only (from an event and from a plain request), a guest-initiated close, the object told how a socket ended, refusals by an object that doesn't answer `OPEN`; the per-object and per-node caps, the message size, a client that never reads being dropped, and a worker's sockets closing when it dies
+- WebSockets through the proxy: echo, binary, committed fan-out scoped by app and object, a guest-initiated close, the object told how a socket ended, refusals by an object that doesn't answer `OPEN`; per-object, per-app and total caps, bounded messages and slow clients, publish deadlines, worker restart and version switches without reconnecting
 
 ### Testing cgroups in a VM
 
@@ -424,7 +424,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `crates/nanovm/src/link.rs` | HTTP/1.1 over socketpairs passed across a control socket |
 | `crates/nanovm/src/kv.rs` | `wasi:keyvalue` on the object's volume |
 | `crates/nanovm/src/journal.rs` | Per-request commits: the undo journal, commit and crash recovery |
-| `crates/nanovm/src/ws.rs` | WebSockets: the supervisor's sockets, WebSocket-over-HTTP events and per-object channels |
+| `crates/nanovm/src/ws.rs` | WebSockets: the proxy's sockets, WebSocket-over-HTTP events and per-object channels |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
 | `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |
 

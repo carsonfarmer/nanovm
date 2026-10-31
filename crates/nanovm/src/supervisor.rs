@@ -22,7 +22,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -44,7 +44,7 @@ use crate::registry::{APP_HEADER, AppRef, HOST_HEADER, MIN_VERSION_HEADER, Polic
 use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
 use crate::table::{BAD_OBJECT, Node, route};
-use crate::ws::{self, Sockets};
+use crate::ws;
 
 pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
@@ -78,8 +78,7 @@ pub struct Supervisor {
     links: Arc<tokio::sync::Semaphore>,
     /// Held while giving a new app its uid.
     uids: Arc<Mutex<()>>,
-    /// Open WebSockets, across workers.
-    sockets: Arc<AtomicUsize>,
+    publishes: reqwest::Client,
     started: Instant,
 }
 
@@ -116,8 +115,7 @@ struct Live {
     policies: Mutex<HashSet<Policy>>,
     /// How long its longest request may take, to bound a drain.
     drain: Duration,
-    sockets: Arc<Sockets>,
-    /// Reads as changed once the process is gone, closing its sockets.
+    /// Reads as changed once the process is gone, completing its drain.
     gone: watch::Receiver<()>,
     /// Its slot among `max_apps`, passed on to the worker that replaces it.
     slot: Mutex<Option<OwnedSemaphorePermit>>,
@@ -154,7 +152,7 @@ impl Supervisor {
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
             uids: Arc::default(),
             cfg,
-            sockets: Arc::default(),
+            publishes: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build()?,
             started: Instant::now(),
         }))
     }
@@ -192,16 +190,10 @@ impl Supervisor {
             }).clone()
         };
         w.used.store(self.started.elapsed().as_millis() as u64, Relaxed);
-        if ws::is_event(&req) {
-            return error_response(400, "not-an-event", "socket events come from the node");
-        }
         let live = match self.live(&w, &want).await {
             Ok(l) => l,
             Err(res) => return res,
         };
-        if ws::wants(&req) {
-            return socket(w, live, req).await;
-        }
         forward(&w, live, req).await
     }
 
@@ -310,7 +302,7 @@ impl Supervisor {
             .filter_map(|o| {
                 let l = o.live.lock().clone()?;
                 // Held only by its slot and here: no requests or bodies.
-                (Arc::strong_count(&l) == 2 && l.sockets.is_empty()).then(|| (o.used.load(Relaxed), o.clone()))
+                (Arc::strong_count(&l) == 2).then(|| (o.used.load(Relaxed), o.clone()))
             })
             .min_by_key(|(used, _)| *used)
             .map(|(_, o)| o)
@@ -387,16 +379,6 @@ impl Supervisor {
         // As many links to the supervisor as its objects may use at once:
         // each its outbound requests and a publish.
         let links = self.cfg.max_live_objects * (app.limits.max_outbound_concurrency + 1);
-        let kb = |k: u64| (k << 10) as usize;
-        let caps = ws::Caps {
-            total: self.sockets.clone(),
-            max_total: self.cfg.max_sockets,
-            per_app: app.worker.max_sockets,
-            per_object: app.limits.max_sockets,
-            request_max: kb(app.limits.max_request_body_kb),
-            response_max: kb(app.limits.max_response_body_kb),
-            backlog: kb(app.limits.socket_backlog_kb),
-        };
         let mut spec = serde_json::to_vec(&(&self.cfg, &app, uid))?;
         spec.push(b'\n');
         let mut stdin = child.stdin.take().expect("piped");
@@ -436,20 +418,23 @@ impl Supervisor {
             }
         });
 
-        let (policy, sockets) = (Arc::new(policy), Arc::new(Sockets::new(caps)));
-        let s = sockets.clone();
+        let policy = Arc::new(policy);
+        let (http, target, app) = (self.publishes.clone(), self.cfg.publish_to.clone(), w.name.clone());
         egress.set_nonblocking(true)?;
         let link_caps = vec![Arc::new(tokio::sync::Semaphore::new(links)), self.links.clone()];
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, link_caps, move |req| {
-            let (policy, s) = (policy.clone(), s.clone());
+            let (policy, http, target, app) = (policy.clone(), http.clone(), target.clone(), app.clone());
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
                     return serve_forwarded(req, &policy).await;
                 }
-                let status = match req.uri().path().trim_end_matches('/') {
-                    "/publish" => s.publish(req).await,
-                    _ => 404,
-                };
+                if req.method() != http::Method::POST || req.uri().path().trim_end_matches('/') != "/publish" {
+                    return verdict_ok(404);
+                }
+                let object = req.headers().get(ws::OBJECT_HEADER).cloned().unwrap_or_else(|| http::HeaderValue::from_static(""));
+                let status = http.post(target).header(APP_HEADER, app).header(ws::OBJECT_HEADER, object)
+                    .body(reqwest::Body::wrap(req.into_body())).send().await
+                    .map_or(502, |r| r.status().as_u16());
                 verdict_ok(status)
             }
         }));
@@ -461,7 +446,6 @@ impl Supervisor {
             version: p.version,
             policies: Mutex::new(HashSet::from([want.policy.clone()])),
             drain,
-            sockets,
             gone,
             slot: Mutex::new(Some(slot)),
             kill: Mutex::new(Some(kill)),
@@ -516,45 +500,10 @@ impl Supervisor {
         }
         crate::server::ok_json(json!({
             "uptime_ms": self.started.elapsed().as_millis() as u64,
-            "sockets": self.sockets.load(Relaxed),
             "rss_mb": rss_bytes() as f64 / 1048576.0,
             "workers": workers,
             "apps": apps,
         }))
-    }
-}
-
-/// Opens a WebSocket on the object `req` names, on `live`. Its events go to
-/// that worker while it is the app's, each bounded by its longest request.
-async fn socket(w: Arc<Worker>, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
-    let object = route(req.uri().path()).expect("checked by `handle`").0.to_string();
-    let (weak, max) = (Arc::downgrade(&live), live.sockets.caps.response_max);
-    let deliver: ws::Deliver = Box::new(move |req| {
-        let (w, weak) = (w.clone(), weak.clone());
-        Box::pin(async move {
-            let Some(live) = weak.upgrade().filter(|l| w.live().is_some_and(|c| Arc::ptr_eq(&c, l))) else {
-                return ws::Reply::Gone;
-            };
-            match live.link.send(req).await {
-                Ok(res) => ws::answer(res, max).await,
-                Err(_) if w.live().is_some_and(|c| Arc::ptr_eq(&c, &live)) => ws::Reply::Bad(502),
-                Err(_) => ws::Reply::Gone,
-            }
-        })
-    });
-    let (sockets, gone) = (live.sockets.clone(), live.gone.clone());
-    drop(live);
-    // Its own task: a client that hangs up mid-`OPEN` would otherwise
-    // cancel it after the object accepted, and the object would never
-    // hear the socket ended.
-    let open = tokio::spawn(async move { sockets.open(&object, req, gone, deliver).await });
-    match open.await.unwrap_or(Err((500, "opening the socket failed"))) {
-        Ok(res) => res.map(|()| Empty::new().map_err(|e| match e {}).boxed_unsync()),
-        Err((status, why)) => {
-            let mut res = error_response(status, "socket-refused", why);
-            res.headers_mut().insert(http::header::SEC_WEBSOCKET_VERSION, "13".parse().unwrap());
-            res
-        }
     }
 }
 

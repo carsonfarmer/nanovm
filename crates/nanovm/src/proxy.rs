@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use http::header::{CONNECTION, PROXY_AUTHORIZATION, TE, TRAILER, UPGRADE};
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use oci_spec::distribution::Reference;
 use parking_lot::Mutex;
@@ -32,6 +32,7 @@ use tokio::sync::OnceCell;
 use crate::config::ProxyConfig;
 use crate::object::{RespBody, error_response};
 use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
+use crate::ws::{self, Sockets};
 
 /// How long a client may take over each request's headers (or idle between
 /// requests).
@@ -57,6 +58,8 @@ pub struct Proxy {
     node: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
     routes: Cache<Option<Route>>,
     digests: Cache<String>,
+    sockets: Mutex<HashMap<String, Arc<Sockets>>>,
+    total: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Hosts or tags remembered at most, each cache.
@@ -114,6 +117,8 @@ impl Proxy {
             node,
             routes: Cache::default(),
             digests: Cache::default(),
+            sockets: Mutex::default(),
+            total: Arc::default(),
         }))
     }
 
@@ -124,68 +129,114 @@ impl Proxy {
         }
     }
 
-    async fn forward(&self, req: Request<Incoming>) -> Result<Response<RespBody>, (StatusCode, String)> {
+    async fn resolve(&self, host: &str) -> Result<(String, http::HeaderMap), (StatusCode, String)> {
         let bad = |s: StatusCode| move |e: anyhow::Error| (s, format!("{e:#}"));
-        let host = req.headers().get(http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
-        let host = host.rsplit_once(':').map_or(host, |(h, _)| h).to_ascii_lowercase();
-        let route = self.route(&host).await.map_err(bad(StatusCode::BAD_GATEWAY))?;
+        let route = self.route(host).await.map_err(bad(StatusCode::BAD_GATEWAY))?;
         let route = route.ok_or((StatusCode::NOT_FOUND, format!("no app at {host}")))?;
         let digest = self.digest(&route.app).await.map_err(bad(StatusCode::BAD_GATEWAY))?;
+        let mut headers = http::HeaderMap::new();
+        let app = format!("{}/{}@{digest}", route.app.registry(), route.app.repository());
+        for (k, v) in [(APP_HEADER, Some(app.as_str())), (HOST_HEADER, Some(route.owner.as_str())),
+            (TRUST_HEADER, Some(route.trust.as_str())), (MIN_VERSION_HEADER, route.min.as_deref())] {
+            if let Some(v) = v {
+                headers.insert(k, HeaderValue::from_str(v).map_err(|_| (StatusCode::BAD_GATEWAY, format!("bad {k}")))?);
+            }
+        }
+        Ok((crate::registry::app_name(&route.owner, &route.app), headers))
+    }
 
+    async fn forward(self: &Arc<Self>, req: Request<Incoming>) -> Result<Response<RespBody>, (StatusCode, String)> {
+        if ws::is_event(&req) {
+            return Err((StatusCode::BAD_REQUEST, "socket events come from the proxy".into()));
+        }
+        let host = req.headers().get(http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+        let host = host.rsplit_once(':').map_or(host, |(h, _)| h).to_ascii_lowercase();
+        let (name, headers) = self.resolve(&host).await?;
+        let upgrading = ws::wants(&req);
         let (mut parts, body) = req.into_parts();
-        let upgrade = parts.extensions.remove::<hyper::upgrade::OnUpgrade>();
         // Only the proxy names apps to the node.
         let theirs: Vec<_> = parts.headers.keys().filter(|k| k.as_str().starts_with("nanovm-")).cloned().collect();
         for k in theirs {
             parts.headers.remove(k);
         }
-        // Hop-by-hop headers, and those `Connection` lists, are the client
-        // connection's; an upgrade's are passed on.
+        // Hop-by-hop headers belong to the client connection, not the node.
         let h = &mut parts.headers;
         let listed: Vec<_> = h.get_all(CONNECTION).iter().flat_map(|v| v.to_str().unwrap_or("").split(',')).collect();
-        let listed: Vec<HeaderName> = listed.iter().filter_map(|n| n.trim().parse().ok()).filter(|n| *n != UPGRADE).collect();
-        let upgrading = h.contains_key(UPGRADE);
-        for k in listed.iter().chain(&[CONNECTION, TE, TRAILER, PROXY_AUTHORIZATION]) {
+        let listed: Vec<HeaderName> = listed.iter().filter_map(|n| n.trim().parse().ok()).collect();
+        for k in listed.iter().chain(&[CONNECTION, UPGRADE, TE, TRAILER, PROXY_AUTHORIZATION]) {
             h.remove(k);
         }
         for k in ["keep-alive", "proxy-connection"] {
             h.remove(k);
         }
-        if upgrading {
-            h.insert(CONNECTION, HeaderValue::from_static("upgrade"));
-        }
-        let app = format!("{}/{}@{digest}", route.app.registry(), route.app.repository());
-        let set = |h: &mut http::HeaderMap, k: &'static str, v: &str| -> Result<(), (StatusCode, String)> {
-            h.insert(k, HeaderValue::from_str(v).map_err(|_| (StatusCode::BAD_GATEWAY, format!("bad {k}")))?);
-            Ok(())
-        };
-        set(&mut parts.headers, APP_HEADER, &app)?;
-        set(&mut parts.headers, HOST_HEADER, &route.owner)?;
-        set(&mut parts.headers, TRUST_HEADER, &route.trust)?;
-        if let Some(min) = &route.min {
-            set(&mut parts.headers, MIN_VERSION_HEADER, min)?;
-        }
         let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
         parts.uri = format!("http://{}{pq}", self.cfg.node).parse().map_err(|_| (StatusCode::BAD_REQUEST, pq.to_string()))?;
 
-        let mut res = self
+        if upgrading {
+            return Ok(self.socket(name, host, Request::from_parts(parts, body.boxed_unsync())).await);
+        }
+        parts.headers.extend(headers);
+        let res = self
             .node
             .request(Request::from_parts(parts, body.boxed_unsync()))
             .await
             .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-        // A WebSocket: once both sides have switched, bytes flow both ways.
-        if res.status() == StatusCode::SWITCHING_PROTOCOLS
-            && let Some(client) = upgrade
-        {
-            let node = hyper::upgrade::on(&mut res);
-            tokio::spawn(async move {
-                if let (Ok(client), Ok(node)) = (client.await, node.await) {
-                    let (mut client, mut node) = (hyper_util::rt::TokioIo::new(client), hyper_util::rt::TokioIo::new(node));
-                    let _ = tokio::io::copy_bidirectional(&mut client, &mut node).await;
-                }
-            });
-        }
         Ok(res.map(|b| b.map_err(Into::into).boxed_unsync()))
+    }
+
+    async fn socket(self: &Arc<Self>, name: String, host: String, req: Request<Body>) -> Response<RespBody> {
+        let Some((object, _)) = crate::table::route(req.uri().path()) else {
+            return error_response(400, "bad-object-id", crate::table::BAD_OBJECT);
+        };
+        let object = object.to_string();
+        let sockets = {
+            let mut apps = self.sockets.lock();
+            apps.retain(|_, s| Arc::strong_count(s) > 1 || !s.is_empty());
+            if apps.len() >= self.cfg.max_sockets && !apps.contains_key(&name) {
+                return error_response(503, "socket-refused", "the proxy has max_sockets open");
+            }
+            apps.entry(name.clone()).or_insert_with(|| Arc::new(Sockets::new(ws::Caps {
+                total: self.total.clone(), max_total: self.cfg.max_sockets,
+                per_app: self.cfg.max_sockets_per_app, per_object: self.cfg.max_sockets_per_object,
+                request_max: (self.cfg.max_request_body_kb << 10) as usize,
+                response_max: (self.cfg.max_response_body_kb << 10) as usize,
+                backlog: (self.cfg.socket_backlog_kb << 10) as usize,
+            }))).clone()
+        };
+        let (proxy, max) = (self.clone(), sockets.caps.response_max);
+        let deliver: ws::Deliver = Box::new(move |mut req| {
+            let (proxy, host, name) = (proxy.clone(), host.clone(), name.clone());
+            Box::pin(async move {
+                let event = async {
+                    let Ok((current, headers)) = proxy.resolve(&host).await else { return ws::Reply::Bad(502) };
+                    if current != name { return ws::Reply::Bad(502) }
+                    req.headers_mut().extend(headers);
+                    match proxy.node.request(req).await {
+                        Ok(res) => ws::answer(res, max).await,
+                        Err(_) => ws::Reply::Bad(502),
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(240), event).await.unwrap_or(ws::Reply::Bad(502))
+            })
+        });
+        // Finish OPEN even when the client leaves, then deliver DISCONNECT.
+        let open = tokio::spawn(async move { sockets.open(&object, req, deliver).await });
+        match open.await.unwrap_or(Err((500, "opening the socket failed"))) {
+            Ok(res) => res.map(|()| Empty::new().map_err(|e| match e {}).boxed_unsync()),
+            Err((status, why)) => {
+                let mut res = error_response(status, "socket-refused", why);
+                res.headers_mut().insert(http::header::SEC_WEBSOCKET_VERSION, "13".parse().unwrap());
+                res
+            }
+        }
+    }
+
+    async fn publish(&self, req: Request<Incoming>) -> Response<RespBody> {
+        let sockets = req.headers().get(APP_HEADER).and_then(|h| h.to_str().ok()).and_then(|app| self.sockets.lock().get(app).cloned());
+        let status = if req.method() != http::Method::POST || req.uri().path() != "/publish" { 404 }
+            else if let Some(s) = sockets { s.publish(req).await }
+            else { 200 };
+        Response::builder().status(status).body(Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap()
     }
 
     /// The route `_nanovm.<host>` names, if any, from the cache while its TTL
@@ -259,6 +310,17 @@ pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyh
     loop {
         let p = proxy.clone();
         crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| p.clone().handle(req));
+    }
+}
+
+/// Private control port: network policy must restrict it to nodes.
+pub async fn serve_publish(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+    loop {
+        let p = proxy.clone();
+        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| {
+            let p = p.clone();
+            async move { p.publish(req).await }
+        });
     }
 }
 
