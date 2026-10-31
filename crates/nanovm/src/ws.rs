@@ -1,6 +1,6 @@
 //! WebSockets, held by the proxy and delivered to objects in Pushpin's
 //! WebSocket-over-HTTP (https://pushpin.org/docs/protocols/websocket-over-http/).
-//! A socket opened at `/{app}/{object}/…` opens if the object answers `OPEN`;
+//! A socket opened at `/{object}/…` opens if the object answers `OPEN`;
 //! each event after (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` of
 //! `application/websocket-events` with the socket's `Connection-Id`, queued
 //! with the object's other requests, and answered with events for the socket.
@@ -12,7 +12,7 @@
 //!
 //! Sockets belong to apps, not workers; events resolve the current version.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
@@ -32,7 +32,8 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig, frame::coding::CloseCode};
 use tokio_tungstenite::tungstenite::{self, Message, Utf8Bytes};
 
-use crate::supervisor::Body;
+use crate::proxy::Body;
+use crate::config::ProxyConfig;
 
 /// Where an object publishes to its sockets.
 pub const PUBLISH_HOST: &str = "nanovm";
@@ -47,7 +48,7 @@ const STALL: Duration = Duration::from_secs(30);
 /// A socket is pinged this often, and closed if it heard nothing since the last.
 const PING: Duration = Duration::from_secs(30);
 /// Channels per socket, items per publish, and the bytes of a socket's
-/// headers: each costs the supervisor memory or work.
+/// headers: each costs the proxy memory or work.
 const MAX_CHANNELS: usize = 64;
 const MAX_ITEMS: usize = 64;
 const MAX_HEADERS: usize = 16 << 10;
@@ -144,20 +145,20 @@ pub fn wants<B>(req: &Request<B>) -> bool {
     req.headers().get(http::header::UPGRADE).is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
 }
 
-/// Whether `req` claims to be a socket's event, which only the supervisor may
+/// Whether `req` claims to be a socket's event, which only the proxy may
 /// send.
 pub fn is_event<B>(req: &Request<B>) -> bool {
     req.headers().get(CONTENT_TYPE).is_some_and(|v| v == EVENTS)
 }
 
-/// One worker's open sockets, and the channels of each object.
+/// One app's sockets, ordered by object so publishing visits only its own.
 pub struct Sockets {
-    socks: Mutex<HashMap<u64, Sock>>,
-    pub caps: Caps,
+    socks: Mutex<BTreeMap<(String, u64), Sock>>,
+    cfg: Arc<ProxyConfig>,
+    total: Arc<AtomicUsize>,
 }
 
 struct Sock {
-    object: String,
     channels: HashSet<String>,
     out: Out,
 }
@@ -193,27 +194,12 @@ fn frame(code: CloseCode) -> Option<CloseFrame> {
     Some(CloseFrame { code, reason: "".into() })
 }
 
-/// The limits a socket opens under.
-pub struct Caps {
-    /// Sockets open on the node, and the most it may hold.
-    pub total: Arc<AtomicUsize>,
-    pub max_total: usize,
-    pub per_app: usize,
-    pub per_object: usize,
-    /// The most a message may carry from the client.
-    pub request_max: usize,
-    /// The most an answer may carry.
-    pub response_max: usize,
-    /// The most a socket may fall behind by.
-    pub backlog: usize,
-}
-
 /// Sends an event's request to the object.
 pub type Deliver = Box<dyn Fn(Request<Body>) -> BoxFuture<'static, Reply> + Send + Sync>;
 
 /// A socket, as its events are sent to its object.
 pub struct Conn {
-    id: u64,
+    key: (String, u64),
     uri: Uri,
     headers: HeaderMap,
     grip: bool,
@@ -223,8 +209,8 @@ pub struct Conn {
 
 impl Drop for Conn {
     fn drop(&mut self) {
-        self.sockets.socks.lock().remove(&self.id);
-        self.sockets.caps.total.fetch_sub(1, Relaxed);
+        self.sockets.socks.lock().remove(&self.key);
+        self.sockets.total.fetch_sub(1, Relaxed);
     }
 }
 
@@ -235,7 +221,7 @@ impl Conn {
             .expect("a valid request");
         *req.headers_mut() = self.headers.clone();
         req.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(EVENTS));
-        req.headers_mut().insert(CONNECTION_ID, self.id.into());
+        req.headers_mut().insert(CONNECTION_ID, self.key.1.into());
         req
     }
 
@@ -267,7 +253,7 @@ impl Conn {
         let channel = c.get("channel").and_then(Value::as_str).filter(|c| crate::table::valid_name(c));
         let (Some(channel), 2) = (channel, c.len()) else { return false };
         let mut socks = self.sockets.socks.lock();
-        let Some(sock) = socks.get_mut(&self.id) else { return false };
+        let Some(sock) = socks.get_mut(&self.key) else { return false };
         match c.get("type").and_then(Value::as_str) {
             Some("subscribe") if sock.channels.contains(channel) || sock.channels.len() < MAX_CHANNELS => {
                 sock.channels.insert(channel.to_string())
@@ -280,12 +266,8 @@ impl Conn {
 }
 
 impl Sockets {
-    pub fn new(caps: Caps) -> Sockets {
-        Sockets { socks: Mutex::default(), caps }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.socks.lock().is_empty()
+    pub fn new(cfg: Arc<ProxyConfig>, total: Arc<AtomicUsize>) -> Sockets {
+        Sockets { socks: Mutex::default(), cfg, total }
     }
 
     /// Opens a socket on `object` if the caps allow it and the object accepts:
@@ -297,7 +279,7 @@ impl Sockets {
         mut req: Request<Body>,
         deliver: Deliver,
     ) -> Result<Response<()>, (u16, &'static str)> {
-        let caps = &self.caps;
+        let cfg = &self.cfg;
         static NEXT: AtomicU64 = AtomicU64::new(1);
         use http::header::{SEC_WEBSOCKET_KEY as KEY, SEC_WEBSOCKET_PROTOCOL as PROTOCOL};
         let upgrade = req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>();
@@ -320,20 +302,20 @@ impl Sockets {
             return Err((431, "the handshake's headers are too large"));
         }
 
-        if caps.total.fetch_add(1, Relaxed) >= caps.max_total {
-            caps.total.fetch_sub(1, Relaxed);
-            return Err((503, "the node has max_sockets open"));
+        if self.total.fetch_add(1, Relaxed) >= cfg.max_sockets {
+            self.total.fetch_sub(1, Relaxed);
+            return Err((503, "the proxy has max_sockets open"));
         }
         let (tx, rx) = mpsc::unbounded_channel();
         let out = Out {
             tx,
             queued: Default::default(),
-            max: caps.backlog,
+            max: (cfg.socket_backlog_kb << 10) as usize,
             behind: Default::default(),
         };
         let id = NEXT.fetch_add(1, Relaxed);
         let mut conn = Conn {
-            id,
+            key: (object.to_string(), id),
             uri: req.uri().clone(),
             headers,
             grip: false,
@@ -342,13 +324,13 @@ impl Sockets {
         };
         {
             let mut socks = self.socks.lock();
-            if socks.len() >= caps.per_app {
+            if socks.len() >= cfg.max_sockets_per_app {
                 return Err((503, "the app has max_sockets open"));
             }
-            if socks.values().filter(|s| s.object == object).count() >= caps.per_object {
+            if socks.range((object.to_string(), 0)..=(object.to_string(), u64::MAX)).count() >= cfg.max_sockets_per_object {
                 return Err((503, "the object has max_sockets open"));
             }
-            socks.insert(id, Sock { object: object.to_string(), channels: HashSet::new(), out });
+            socks.insert(conn.key.clone(), Sock { channels: HashSet::new(), out });
         }
 
         let mut open = conn.request(&Event::Open);
@@ -381,9 +363,8 @@ impl Sockets {
         if let Some(p) = protocol {
             res = res.header(PROTOCOL, p);
         }
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(caps.request_max.saturating_sub(FRAMING)))
-            .max_frame_size(Some(caps.request_max.saturating_sub(FRAMING)));
+        let max = ((cfg.max_request_body_kb << 10) as usize).saturating_sub(FRAMING);
+        let config = WebSocketConfig::default().max_message_size(Some(max)).max_frame_size(Some(max));
         tokio::spawn(async move {
             match upgrade.await {
                 Ok(io) => run(conn, hyper_util::rt::TokioIo::new(io), rx, config, deliver).await,
@@ -402,10 +383,10 @@ impl Sockets {
         B::Error: Into<crate::object::BoxError>,
     {
         let object = req.headers().get(OBJECT_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
-        let body = tokio::time::timeout(STALL, Limited::new(req.into_body(), self.caps.response_max).collect()).await;
+        let body = tokio::time::timeout(STALL, Limited::new(req.into_body(), (self.cfg.max_response_body_kb << 10) as usize).collect()).await;
         let body = match body { Ok(Ok(body)) => body, Ok(Err(_)) => return 413, Err(_) => return 408 };
         let (Some(object), Some(items)) = (object, messages(&body.to_bytes())) else { return 400 };
-        for sock in self.socks.lock().values().filter(|s| s.object == object) {
+        for (_, sock) in self.socks.lock().range((object.clone(), 0)..=(object, u64::MAX)) {
             for (_, m) in items.iter().filter(|(c, _)| sock.channels.contains(c)) {
                 sock.out.send(m.clone());
             }
@@ -567,12 +548,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn silent_clients_are_dropped() {
         let total = Arc::new(AtomicUsize::new(1));
-        let caps = Caps { total: total.clone(), max_total: 1, per_app: 1, per_object: 1, request_max: 0, response_max: 0, backlog: 0 };
-        let sockets = Arc::new(Sockets::new(caps));
+        let sockets = Arc::new(Sockets::new(caps(1, 1, 1), total.clone()));
         let (tx, rx) = mpsc::unbounded_channel();
         let out = Out { tx, queued: Default::default(), max: 1 << 20, behind: Default::default() };
         let conn = Conn {
-            id: 1,
+            key: ("o".into(), 1),
             uri: "/a/o/".parse().unwrap(),
             headers: HeaderMap::new(),
             grip: false,
@@ -595,7 +575,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn slow_publishes_have_a_deadline() {
-        let sockets = Sockets::new(caps(10, 10, 10));
+        let sockets = Sockets::new(caps(10, 10, 10), Arc::default());
         let body = http_body_util::StreamBody::new(futures::stream::pending::<Result<http_body::Frame<Bytes>, std::io::Error>>());
         let req = Request::post("/publish").header(OBJECT_HEADER, "o").body(body).unwrap();
         assert_eq!(tokio::time::timeout(STALL * 2, sockets.publish(req)).await.unwrap(), 408);
@@ -614,17 +594,15 @@ mod tests {
         }
     }
 
-    fn caps(max_total: usize, per_app: usize, per_object: usize) -> Caps {
-        let (request_max, response_max, backlog) = (1 << 16, 1024, 1 << 20);
-        Caps {
-            total: Default::default(),
-            max_total,
-            per_app,
-            per_object,
-            request_max,
-            response_max,
-            backlog,
-        }
+    fn caps(max_total: usize, per_app: usize, per_object: usize) -> Arc<ProxyConfig> {
+        Arc::new(ProxyConfig {
+            max_sockets: max_total,
+            max_sockets_per_app: per_app,
+            max_sockets_per_object: per_object,
+            max_request_body_kb: 64,
+            max_response_body_kb: 1,
+            ..Default::default()
+        })
     }
 
     fn out() -> (Out, mpsc::UnboundedReceiver<Message>) {
@@ -640,9 +618,8 @@ mod tests {
         )
     }
 
-    fn sock(object: &str, channels: &[&str], out: Out) -> Sock {
+    fn sock(channels: &[&str], out: Out) -> Sock {
         Sock {
-            object: object.into(),
             channels: channels.iter().map(|c| c.to_string()).collect(),
             out,
         }
@@ -650,14 +627,14 @@ mod tests {
 
     /// An open socket on object `o`, and its client's queue.
     fn conn(grip: bool) -> (Conn, mpsc::UnboundedReceiver<Message>) {
-        let sockets = Arc::new(Sockets::new(caps(1, 1, 1)));
-        sockets.caps.total.store(1, Relaxed);
+        let sockets = Arc::new(Sockets::new(caps(1, 1, 1), Arc::default()));
+        sockets.total.store(1, Relaxed);
         let (out, rx) = out();
-        sockets.socks.lock().insert(1, sock("o", &[], out.clone()));
+        sockets.socks.lock().insert(("o".into(), 1), sock(&[], out.clone()));
         let uri = "/a/o/".parse().unwrap();
         (
             Conn {
-                id: 1,
+                key: ("o".into(), 1),
                 uri,
                 headers: HeaderMap::new(),
                 grip,
@@ -673,7 +650,7 @@ mod tests {
     }
 
     fn channels(c: &Conn) -> Vec<String> {
-        let mut v: Vec<_> = c.sockets.socks.lock()[&c.id].channels.iter().cloned().collect();
+        let mut v: Vec<_> = c.sockets.socks.lock()[&c.key].channels.iter().cloned().collect();
         v.sort();
         v
     }
@@ -753,7 +730,7 @@ mod tests {
             assert!(!c.control(bad), "{bad}");
         }
         assert!(channels(&c).is_empty());
-        c.sockets.socks.lock().remove(&c.id);
+        c.sockets.socks.lock().remove(&c.key);
         assert!(
             !c.control(r#"{"type":"subscribe","channel":"a"}"#),
             "the socket is gone"
@@ -845,7 +822,7 @@ mod tests {
     /// is a 400, and one over `response_max` a 413, reaching no one.
     #[tokio::test]
     async fn publishes_reach_only_the_objects_subscribers() {
-        let sockets = Sockets::new(caps(10, 10, 10));
+        let sockets = Sockets::new(caps(10, 10, 10), Arc::default());
         let mut rxs = vec![];
         for (id, object, chans) in [
             (1, "o", &["a"][..]),
@@ -855,7 +832,7 @@ mod tests {
             (5, "o", &[]),
         ] {
             let (out, rx) = out();
-            sockets.socks.lock().insert(id, sock(object, chans, out));
+            sockets.socks.lock().insert((object.into(), id), sock(chans, out));
             rxs.push(rx);
         }
         let req = |object: Option<&str>, body: String| {
@@ -959,7 +936,7 @@ mod tests {
     /// refused before the object is asked, holding no socket.
     #[tokio::test]
     async fn bad_handshakes_are_refused() {
-        let s = Arc::new(Sockets::new(caps(10, 10, 10)));
+        let s = Arc::new(Sockets::new(caps(10, 10, 10), Arc::default()));
         type Edit = fn(&mut Request<Body>);
         let edit: [(Edit, u16); 8] = [
             (|r| r.extensions_mut().clear(), 400),
@@ -1006,7 +983,7 @@ mod tests {
             assert_eq!(res.unwrap_err().0, status, "case {i}");
             assert!(log.lock().is_empty(), "case {i}");
         }
-        assert_eq!(s.caps.total.load(Relaxed), 0);
+        assert_eq!(s.total.load(Relaxed), 0);
         assert!(s.socks.lock().is_empty());
     }
 
@@ -1015,28 +992,28 @@ mod tests {
     #[tokio::test]
     async fn socket_caps_are_enforced() {
         let open = || accept(&[], || vec![Event::Open]);
-        let node = Arc::new(Sockets::new(caps(1, 10, 10)));
-        node.caps.total.store(1, Relaxed);
+        let node = Arc::new(Sockets::new(caps(1, 10, 10), Arc::default()));
+        node.total.store(1, Relaxed);
         assert_eq!(
             try_open(&node, handshake(), open()).await.0.unwrap_err(),
-            (503, "the node has max_sockets open")
+            (503, "the proxy has max_sockets open")
         );
-        assert_eq!(node.caps.total.load(Relaxed), 1);
+        assert_eq!(node.total.load(Relaxed), 1);
 
-        let app = Arc::new(Sockets::new(caps(10, 1, 10)));
-        app.socks.lock().insert(0, sock("other", &[], out().0));
+        let app = Arc::new(Sockets::new(caps(10, 1, 10), Arc::default()));
+        app.socks.lock().insert(("other".into(), 0), sock(&[], out().0));
         assert_eq!(
             try_open(&app, handshake(), open()).await.0.unwrap_err(),
             (503, "the app has max_sockets open")
         );
-        assert_eq!(app.caps.total.load(Relaxed), 0);
+        assert_eq!(app.total.load(Relaxed), 0);
 
-        let object = Arc::new(Sockets::new(caps(10, 10, 1)));
-        object.socks.lock().insert(0, sock("o", &[], out().0));
+        let object = Arc::new(Sockets::new(caps(10, 10, 1), Arc::default()));
+        object.socks.lock().insert(("o".into(), 0), sock(&[], out().0));
         let (res, log) = try_open(&object, handshake(), open()).await;
         assert_eq!(res.unwrap_err(), (503, "the object has max_sockets open"));
         assert!(log.lock().is_empty());
-        assert_eq!((object.caps.total.load(Relaxed), object.socks.lock().len()), (0, 1));
+        assert_eq!((object.total.load(Relaxed), object.socks.lock().len()), (0, 1));
     }
 
     /// An object refuses a socket with its own error status, by answering
@@ -1045,11 +1022,11 @@ mod tests {
     /// is told the socket is gone.
     #[tokio::test]
     async fn objects_refuse_sockets() {
-        let s = Arc::new(Sockets::new(caps(10, 10, 10)));
+        let s = Arc::new(Sockets::new(caps(10, 10, 10), Arc::default()));
         let refuse = async |reply: Box<dyn Fn() -> Reply + Send + Sync>| {
             let (res, log) = try_open(&s, handshake(), reply).await;
             let told: Vec<_> = log.lock().iter().map(|(_, b)| b.clone()).collect();
-            assert_eq!((s.caps.total.load(Relaxed), s.socks.lock().len()), (0, 0));
+            assert_eq!((s.total.load(Relaxed), s.socks.lock().len()), (0, 0));
             (res.unwrap_err(), told)
         };
         let (open, gone) = (Bytes::from("OPEN\r\n"), Bytes::from("DISCONNECT\r\n"));
@@ -1087,7 +1064,7 @@ mod tests {
     /// GRIP. A failed upgrade tells it the socket is gone and frees it.
     #[tokio::test]
     async fn accepted_sockets_upgrade() {
-        let s = Arc::new(Sockets::new(caps(10, 10, 10)));
+        let s = Arc::new(Sockets::new(caps(10, 10, 10), Arc::default()));
         let headers = [
             ("sec-websocket-extensions", "grip"),
             ("sec-websocket-protocol", "superchat"),
@@ -1124,12 +1101,12 @@ mod tests {
         }
 
         for _ in 0..100 {
-            if s.caps.total.load(Relaxed) == 0 {
+            if s.total.load(Relaxed) == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!((s.caps.total.load(Relaxed), s.socks.lock().len()), (0, 0));
+        assert_eq!((s.total.load(Relaxed), s.socks.lock().len()), (0, 0));
         let log = log.lock();
         assert_eq!((log.len(), &log[1].1), (2, &Bytes::from("DISCONNECT\r\n")));
         assert_eq!(log[1].0["connection-id"], sent["connection-id"]);

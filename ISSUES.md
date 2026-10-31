@@ -206,6 +206,17 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** once, not on demand
 - **Status:** partly fixed in d64c80a: the in-process quota tests failed when the full suite loaded the machine enough that a 4 MiB write passed `hostile`'s 100 ms CPU budget (wall time inside guest polls; the journal test's failure said so). They now use a `filler()` app with 1 s, as `file_count_limit` already did. The ghcr.io test's one failure is unexplained (likely network); open for that. Still seen once after that: `a_failed_requests_writes_are_rolled_back` (`tests/integration.rs:1498`, its first `/commit` on `hostile`) on the first full run after a rebuild, at the N-23 commit; the commit tests could use `filler()` too, but their `then=spin` case expects a CPU kill, so check the status it gets with a 1 s budget. Seen again at the W-15 commit in `the_journal_is_out_of_reach_and_works_from_a_relative_data_dir` (`tests/integration.rs:1520`); the commit and journal tests are now the ones that flake.
 
+### N-33: initial proxy DNS lookups have no deadline
+- **Where:** `proxy.rs`, `forward` → `resolve` → `lookup`
+- **Scenario:** a resolver that accepts but never answers holds the initial HTTP request or WebSocket handshake before socket admission. W-3's event-delivery timeout does not cover that initial lookup. Predates W-3; found by its adversarial review.
+- **Reproduced:** from source, not a live stalled-resolver test
+- **Status:** open; bound the initial lookup and add a stalled-resolver test
+
+### N-34 (tests): forged worker publish identity lacks a direct regression test
+- **Where:** `supervisor.rs`, the egress link's publish branch
+- **Scenario:** W-3 constructs fresh publish headers and stamps the worker's app, ignoring any worker-supplied `nanovm-app`, including duplicates. The review found no runtime flaw, but the normal-guest isolation tests do not exercise a compromised worker forging those headers.
+- **Status:** deferred: source-reviewed boundary is correct; a malicious-link harness is needed without changing guests. Do not weaken the supervisor stamp when refactoring.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -224,7 +235,7 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 ### W-3: move WebSockets into the front proxy
 - **What:** the proxy holds client sockets, Pushpin-style, and sends each event to the object as the plain `POST` it gets today; publishes go to the proxy. Most of `ws.rs` leaves the node, and the node only answers requests. Resolves N-14 and N-20. Supersedes Q31.
 - **Where:** `proxy.rs`, `ws.rs`, `supervisor.rs`, `egress.rs` (`hold`), `object.rs` (`commit`), the WebSocket tests.
-- **Status:** in progress by Amp on `w3-proxy-sockets` (2026-10-31). First implementation passes targeted socket tests; runtime 4,247 → 4,264 lines before cleanup. Owns ws.rs, supervisor.rs, egress.rs, proxy.rs, config.rs and tests. Full suite, cleanup/N-20, mutation checks, demo/benchmark and review resolution pending. Guests unchanged.
+- **Status:** in validation by Amp on `w3-proxy-sockets` (2026-10-31). Runtime 4,247 baseline → 4,264 implementation → 4,246 after cleanup. Four WebSocket integration tests and 93 unit tests pass; full-suite load-sensitive failures need reruns. Review found no runtime blocker; stronger identity tests added, N-33/N-34 recorded. Mutation checks and demo/benchmark pending. Guests unchanged.
 
 ### W-4: alarms, outside the node
 - **What:** a scheduler beside the proxy. An object sets an alarm with a response header; when it fires, the scheduler sends the object a request. Durable across restarts of the scheduler; the node is unchanged.

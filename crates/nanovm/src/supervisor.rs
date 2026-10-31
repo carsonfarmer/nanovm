@@ -148,7 +148,7 @@ impl Supervisor {
             slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_apps)),
             fetches: tokio::sync::Semaphore::new(MAX_FETCHES),
             // A quarter of the fds: half for links and their upstreams, half
-            // for clients, WebSockets and the rest.
+            // for clients and the rest.
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
             uids: Arc::default(),
             cfg,

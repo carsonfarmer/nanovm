@@ -1592,8 +1592,9 @@ mod sockets {
     use tokio_tungstenite::tungstenite::{Error, Message, protocol::frame::coding::CloseCode};
 
     type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    type Records = Arc<parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>>;
 
-    async fn front(label: &str, mut cfg: nanovm::config::ProxyConfig, apps: &[(&str, AppConfig)]) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, std::net::SocketAddr) {
+    async fn front(label: &str, mut cfg: nanovm::config::ProxyConfig, apps: &[(&str, AppConfig)]) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, std::net::SocketAddr, Records) {
         let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut node_cfg = node_cfg(label, 8);
         node_cfg.publish_to = format!("http://{}/publish", control.local_addr().unwrap());
@@ -1605,7 +1606,7 @@ mod sockets {
         }
         cfg.listen = "127.0.0.1:0".into();
         cfg.node = node.to_string();
-        cfg.resolver = doh(records).await;
+        cfg.resolver = doh(records.clone()).await;
         cfg.tag_ttl_s = 0;
         cfg.dev = true;
         let proxy = nanovm::proxy::Proxy::new(cfg).unwrap();
@@ -1613,7 +1614,7 @@ mod sockets {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(nanovm::proxy::serve(proxy.clone(), listener));
         tokio::spawn(nanovm::proxy::serve_publish(proxy, control));
-        (sup, node, addr)
+        (sup, node, addr, records)
     }
 
     async fn app_get(addr: std::net::SocketAddr, host: &str, path: &str) -> (u16, String) {
@@ -1683,7 +1684,7 @@ mod sockets {
     /// and cannot switch the node back to its OPEN version.
     #[tokio::test(flavor = "multi_thread")]
     async fn sockets_follow_current_versions() {
-        let (_sup, node, addr) = front("socket_versions", Default::default(), &[("counter", app("counter"))]).await;
+        let (_sup, node, addr, _) = front("socket_versions", Default::default(), &[("counter", app("counter"))]).await;
         let mut ws = open(addr, "counter", "/room/ws").await.unwrap();
         let mut changed = app("counter");
         changed.config.insert("greeting".into(), "new version".into());
@@ -1698,6 +1699,49 @@ mod sockets {
         assert_eq!(stats_json(node).await["workers"][&name]["starts"], 2);
     }
 
+    /// Owners, not request hosts or repositories, scope channels and caps.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sockets_stay_with_their_record_owner_and_repository() {
+        let cfg = nanovm::config::ProxyConfig { max_sockets_per_app: 2, ..Default::default() };
+        let (_sup, _node, addr, records) = front("socket_owners", cfg, &[("counter", app("counter")), ("replacement", app("counter"))]).await;
+        {
+            let mut r = records.lock();
+            let same = r["_nanovm.counter"].clone();
+            r.insert("_nanovm.other".into(), same);
+            for alias in ["alias", "alias2"] {
+                r.insert(format!("_nanovm.{alias}"), vec!["CNAME _nanovm.counter".into()]);
+            }
+        }
+        let mut a = open(addr, "counter", "/room/ws").await.unwrap();
+        let mut b = open(addr, "alias", "/room/ws").await.unwrap();
+        assert_eq!(refused(open(addr, "alias2", "/room/ws").await).0, 503);
+        let mut other = open(addr, "other", "/room/ws").await.unwrap();
+        say(&mut a, "pub shared").await;
+        assert_eq!(next(&mut a).await, Message::text("shared"));
+        assert_eq!(next(&mut b).await, Message::text("shared"));
+        say(&mut other, "isolated").await;
+        assert_eq!(next(&mut other).await, Message::text("echo isolated"));
+
+        // A changed owner, even on the same repository, is another app.
+        records.lock().insert("_nanovm.alias".into(), vec!["CNAME _nanovm.other".into()]);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        say(&mut b, "pub must not arrive").await;
+        let Message::Close(Some(f)) = next(&mut b).await else { panic!("no close frame") };
+        assert_eq!(f.code, CloseCode::Error);
+        say(&mut other, "still isolated").await;
+        assert_eq!(next(&mut other).await, Message::text("echo still isolated"));
+        assert_eq!(app_get(addr, "other", "/room/kv/ws-ends").await.0, 404);
+
+        // The same owner naming a different repository is also another app.
+        let replacement = records.lock()["_nanovm.replacement"].clone();
+        records.lock().insert("_nanovm.counter".into(), replacement);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        say(&mut a, "pub must not arrive either").await;
+        let Message::Close(Some(f)) = next(&mut a).await else { panic!("no close frame") };
+        assert_eq!(f.code, CloseCode::Error);
+        assert_eq!(app_get(addr, "counter", "/room/kv/ws-ends").await.0, 404);
+    }
+
     /// Events reach the object, which answers on the socket and publishes to
     /// the sockets of its own channel (from an event or a plain request), and
     /// learns how each socket ended unless it closed it itself. Events wait
@@ -1707,7 +1751,7 @@ mod sockets {
     async fn websockets_reach_their_object_and_fan_out_within_it() {
         let mut counter = app("counter");
         counter.limits.max_queue = 2;
-        let (_sup, _node, addr) = front("websockets_fan_out", Default::default(), &[("counter", counter.clone()), ("other", counter), ("hostile", app("hostile"))]).await;
+        let (_sup, _node, addr, _) = front("websockets_fan_out", Default::default(), &[("counter", counter.clone()), ("other", counter), ("hostile", app("hostile"))]).await;
         let (counter, hostile) = ("counter", "hostile");
         let (mut a, mut b) = (open(addr, &counter, "/room/ws").await.unwrap(), open(addr, &counter, "/room/ws").await.unwrap());
         let mut other = open(addr, &counter, "/elsewhere/ws").await.unwrap();
@@ -1794,7 +1838,7 @@ mod sockets {
         let mut counter = app("counter");
         let limits = &mut counter.limits;
         (limits.max_request_body_kb, limits.max_response_body_kb) = (16, 64);
-        let (_sup, node, addr) = front("websocket_limits_hold", cfg, &[("counter", counter.clone()), ("chat", counter)]).await;
+        let (_sup, node, addr, _) = front("websocket_limits_hold", cfg, &[("counter", counter.clone()), ("chat", counter)]).await;
         let (counter, chat) = ("counter", "chat");
 
         let a1 = open_slow(addr, &counter, "/a/ws").await;
@@ -1806,7 +1850,7 @@ mod sockets {
         assert_eq!((status, body.contains("app has max_sockets")), (503, true), "{body}");
         let other_app = open(addr, &chat, "/x/ws").await.unwrap();
         let (status, body) = refused(open(addr, &chat, "/y/ws").await);
-        assert_eq!((status, body.contains("node has max_sockets")), (503, true), "{body}");
+        assert_eq!((status, body.contains("proxy has max_sockets")), (503, true), "{body}");
         drop(other_app);
         ended(addr, chat, "x", 1).await;
 

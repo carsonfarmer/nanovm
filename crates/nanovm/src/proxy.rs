@@ -1,6 +1,6 @@
 //! `nanovm proxy`: the public front door. It finds which app a request's
 //! host serves in DNS, names that app's current signed version to the node,
-//! and forwards the request (WebSockets included).
+//! and forwards requests and WebSocket events.
 //!
 //! A host's app is a TXT record at `_nanovm.<host>`:
 //!
@@ -52,7 +52,7 @@ struct Route {
 }
 
 pub struct Proxy {
-    cfg: ProxyConfig,
+    cfg: Arc<ProxyConfig>,
     http: reqwest::Client,
     registry: Oci,
     node: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
@@ -103,7 +103,7 @@ impl<T: Clone> Cache<T> {
     }
 }
 
-type Body = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
+pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
 
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> anyhow::Result<Arc<Proxy>> {
@@ -112,7 +112,7 @@ impl Proxy {
             .build(hyper_util::client::legacy::connect::HttpConnector::new());
         Ok(Arc::new(Proxy {
             registry: Oci::new(cfg.dev)?,
-            cfg,
+            cfg: Arc::new(cfg),
             http: reqwest::Client::new(),
             node,
             routes: Cache::default(),
@@ -191,19 +191,14 @@ impl Proxy {
         let object = object.to_string();
         let sockets = {
             let mut apps = self.sockets.lock();
-            apps.retain(|_, s| Arc::strong_count(s) > 1 || !s.is_empty());
+            // Pending opens, live connections and publishes each hold an Arc.
+            apps.retain(|_, s| Arc::strong_count(s) > 1);
             if apps.len() >= self.cfg.max_sockets && !apps.contains_key(&name) {
                 return error_response(503, "socket-refused", "the proxy has max_sockets open");
             }
-            apps.entry(name.clone()).or_insert_with(|| Arc::new(Sockets::new(ws::Caps {
-                total: self.total.clone(), max_total: self.cfg.max_sockets,
-                per_app: self.cfg.max_sockets_per_app, per_object: self.cfg.max_sockets_per_object,
-                request_max: (self.cfg.max_request_body_kb << 10) as usize,
-                response_max: (self.cfg.max_response_body_kb << 10) as usize,
-                backlog: (self.cfg.socket_backlog_kb << 10) as usize,
-            }))).clone()
+            apps.entry(name.clone()).or_insert_with(|| Arc::new(Sockets::new(self.cfg.clone(), self.total.clone()))).clone()
         };
-        let (proxy, max) = (self.clone(), sockets.caps.response_max);
+        let (proxy, max) = (self.clone(), (self.cfg.max_response_body_kb << 10) as usize);
         let deliver: ws::Deliver = Box::new(move |mut req| {
             let (proxy, host, name) = (proxy.clone(), host.clone(), name.clone());
             Box::pin(async move {
