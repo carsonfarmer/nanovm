@@ -120,8 +120,8 @@ That is the repository and the tag deployed, each identity whose signature is ac
 - asks the registry which digest the tag names, and keeps that for `tag_ttl_s` (30 s);
 - looks each host or tag up once however many requests ask at once, keeps a failed lookup's answer for 5 s rather than asking again, and remembers at most 10,000 of each;
 - drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards the request, WebSockets included;
-- speaks TLS with `tls_cert` and `tls_key` (PEM files), or plain HTTP behind something that terminates it;
-- gives a client 10 s for its TLS handshake and for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too).
+- speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
+- gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too).
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
@@ -335,7 +335,7 @@ The tests cover:
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.
 - apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, a switch that finishes when its request goes away, at most `max_apps` workers (taking only idle apps' slots), and slow registries held to four fetches at once and a deadline
-- the proxy hanging up on clients that stall their TLS handshake or headers, and surviving running out of file descriptors (TLS checked when `openssl` is installed, to make a throwaway certificate)
+- the proxy hanging up on clients that stall their headers, and surviving running out of file descriptors
 - the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and WebSockets pass through
 - key-value: values persisting in the volume, counting against the disk and file quotas, bad names refused, keys paged, reads bounded by the memory limit and batches by size, and the store working in a jailed worker (including a key file the guest replaced through its filesystem)
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`
@@ -419,7 +419,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `crates/nanovm/src/supervisor.rs` | The supervisor (front end, workers, egress on their behalf) and the worker's entry point |
 | `crates/nanovm/src/jail.rs` | uid, Landlock and seccomp, entered by a worker before any guest code |
 | `crates/nanovm/src/registry.rs` | Apps: bounded registry reads, Sigstore verification, version floor, digest cache |
-| `crates/nanovm/src/proxy.rs` | `nanovm proxy`: DNS routing, tag resolution, forwarding, TLS |
+| `crates/nanovm/src/proxy.rs` | `nanovm proxy`: DNS routing, tag resolution, forwarding |
 | `crates/nanovm/examples/dev-registry.rs` | A loopback registry with the guests published, for dev mode |
 | `crates/nanovm/src/link.rs` | HTTP/1.1 over socketpairs passed across a control socket |
 | `crates/nanovm/src/kv.rs` | `wasi:keyvalue` on the object's volume |

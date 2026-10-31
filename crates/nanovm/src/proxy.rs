@@ -33,8 +33,8 @@ use crate::config::ProxyConfig;
 use crate::object::{RespBody, error_response};
 use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
 
-/// How long a client may take over its TLS handshake, and over each
-/// request's headers (or idling between requests).
+/// How long a client may take over each request's headers (or idle between
+/// requests).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What `_nanovm.<host>` says.
@@ -244,41 +244,13 @@ fn parse(txt: &str) -> anyhow::Result<Route> {
     Ok(Route { app, trust: trust.join(", "), min })
 }
 
-/// Serves the proxy on `listener`, over TLS if it has a certificate.
+/// Serves the proxy on `listener`, over plain HTTP: TLS is left to a
+/// terminator in front.
 pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-    let tls = match (&proxy.cfg.tls_cert, &proxy.cfg.tls_key) {
-        (Some(cert), Some(key)) => Some(tls(cert, key)?),
-        (None, None) => None,
-        _ => bail!("tls_cert and tls_key go together"),
-    };
     loop {
-        let sock = crate::server::accept(&listener).await;
-        let (p, tls) = (proxy.clone(), tls.clone());
-        tokio::spawn(async move {
-            let f = move |req| p.clone().handle(req);
-            match tls {
-                Some(tls) => {
-                    if let Ok(Ok(sock)) = tokio::time::timeout(CLIENT_TIMEOUT, tls.accept(sock)).await {
-                        crate::server::serve_conn(sock, Some(CLIENT_TIMEOUT), f);
-                    }
-                }
-                None => {
-                    crate::server::serve_conn(sock, Some(CLIENT_TIMEOUT), f);
-                }
-            }
-        });
+        let p = proxy.clone();
+        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| p.clone().handle(req));
     }
-}
-
-fn tls(cert: &std::path::Path, key: &std::path::Path) -> anyhow::Result<tokio_rustls::TlsAcceptor> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
-    let certs = CertificateDer::pem_file_iter(cert)?.collect::<Result<Vec<_>, _>>().context("tls_cert")?;
-    let key = PrivateKeyDer::from_pem_file(key).context("tls_key")?;
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
 #[cfg(test)]

@@ -99,11 +99,6 @@ config! {
     pub struct ProxyConfig {
         /// Address the proxy listens on.
         listen: String = "0.0.0.0:8443",
-        /// A certificate chain and its key, as PEM files. Without them the
-        /// proxy speaks plain HTTP (behind something else that terminates
-        /// TLS).
-        tls_cert: Option<PathBuf> = None::<PathBuf>,
-        tls_key: Option<PathBuf> = None::<PathBuf>,
         /// The node it forwards to.
         node: String = "127.0.0.1:8080",
         /// A DNS-over-HTTPS resolver (the JSON API) asked for each host's
