@@ -114,7 +114,9 @@ impl Telemetry {
         let meters = sdk_metrics::SdkMeterProvider::builder().with_resource(resource)
             .with_reader(sdk_metrics::PeriodicReader::builder(exporter!(MetricExporter, "metrics"))
                 .with_interval(INTERVAL).build())
-            .with_view(|_| sdk_metrics::Stream::builder().with_cardinality_limit(2048).build().ok()).build();
+            // Two histograms plus request counts with maximum-length object
+            // IDs must still fit together in the 1 MiB export budget.
+            .with_view(|_| sdk_metrics::Stream::builder().with_cardinality_limit(512).build().ok()).build();
         let meter = meters.meter("nanovm");
         let durations = |name| meter.f64_histogram(name).with_unit("s")
             .with_boundaries(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0, 240.0]).build();
@@ -393,6 +395,46 @@ mod tests {
                 seen.insert(path);
             }
         }).await.expect("all pending signals exported on drop");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metric_cardinality_overflow_still_exports_complete_totals() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(crate::server::serve_http1(listener, move |req| {
+            let tx = tx.clone();
+            async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                tx.send(body).unwrap();
+                http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            }
+        }));
+        let telemetry = Telemetry::new(&endpoint, "cardinality", "digest", None).unwrap();
+        for i in 0..4096 {
+            let object = format!("{i:0128}");
+            telemetry.request(&object, 200, Duration::from_millis(1));
+            telemetry.instantiated(&object, Duration::from_millis(2));
+        }
+        tokio::task::spawn_blocking(move || telemetry.flush()).await.unwrap().unwrap();
+        let body = rx.recv().await.unwrap();
+        assert!(body.len() <= MAX_BATCH);
+        let metrics = collector::metrics::v1::ExportMetricsServiceRequest::decode(body).unwrap();
+        assert_eq!(metrics.resource_metrics.iter().flat_map(|r| &r.scope_metrics).map(|s| s.metrics.len()).sum::<usize>(), 3);
+        for metric in metrics.resource_metrics.iter().flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics) {
+            match metric.data.as_ref().unwrap() {
+                metrics::metric::Data::Sum(s) => {
+                    assert!(s.data_points.len() <= 513);
+                    assert_eq!(s.data_points.iter().map(|p| match p.value { Some(metrics::number_data_point::Value::AsInt(v)) => v, _ => 0 }).sum::<i64>(), 4096);
+                }
+                metrics::metric::Data::Histogram(h) => {
+                    assert!(h.data_points.len() <= 513);
+                    assert_eq!(h.data_points.iter().map(|p| p.count).sum::<u64>(), 4096);
+                }
+                other => panic!("unexpected metric: {other:?}"),
+            }
+        }
         server.abort();
     }
 

@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 #[derive(Default)]
 pub struct Collector {
-    metrics: BTreeMap<String, ResourceMetrics>,
+    metrics: BTreeMap<String, (ResourceMetrics, u128)>,
     pub logs: VecDeque<Value>,
 }
 
@@ -30,7 +30,8 @@ impl Collector {
                     let a = attrs(&resource.resource.as_ref().ok_or_else(|| anyhow::anyhow!("missing resource"))?.attributes);
                     let app = a["nanovm.app"].as_str().unwrap_or_default().to_owned();
                     if !self.metrics.contains_key(&app) && self.metrics.len() >= 1024 { self.metrics.pop_first(); }
-                    self.metrics.insert(app, resource);
+                    let received = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+                    self.metrics.insert(app, (resource, received));
                 }
             }
             "/v1/logs" => {
@@ -56,7 +57,7 @@ impl Collector {
     /// value comes from decoded OTLP; no runtime introspection or stats HTTP.
     pub fn snapshot(&self) -> Value {
         let mut root = json!({"workers": {}, "apps": {}, "rss_mb": 0});
-        for (app, resource) in &self.metrics {
+        for (app, (resource, _)) in &self.metrics {
             for m in resource.scope_metrics.iter().flat_map(|s| &s.metrics) {
                 let points = match &m.data {
                     Some(metric::Data::Gauge(g)) => &g.data_points,
@@ -117,6 +118,8 @@ impl Collector {
         let active: Vec<_> = root["workers"].as_object().unwrap().iter()
             .filter(|(_, w)| w["up"] == true).map(|(name, _)| name.clone()).collect();
         root["apps"].as_object_mut().unwrap().retain(|name, _| active.contains(name));
+        root["collected_at_ms"] = json!(active.iter().map(String::as_str).chain(["_supervisor"])
+            .map(|app| self.metrics.get(app).map_or(0, |(_, received)| *received)).min().unwrap_or(0));
         root
     }
 }

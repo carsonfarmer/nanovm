@@ -685,14 +685,9 @@ async fn http_front_end() {
     let (status, _) = raw(addr, &head, &big).await;
     assert_eq!(status, 413);
 
-    let (status, body) = raw(
-        addr,
-        "GET /_nanovm/stats HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
-        b"",
-    )
-    .await;
-    assert_eq!(status, 200);
-    assert!(body.contains("\"live_objects\""), "{body}");
+    for path in ["/_nanovm/stats", "/_nanovm/events"] {
+        assert_eq!(http_get(addr, path).await.0, 404);
+    }
 
     let (status, _) = raw(
         addr,
@@ -813,6 +808,10 @@ async fn stats_json(addr: std::net::SocketAddr) -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn supervised_workers_contain_attacks() {
     let (_sup, addr) = supervised("supervised_workers_contain_attacks").await;
+    assert_eq!(http_get(addr, "/_nanovm/ready").await, (204, String::new()));
+    for path in ["/_nanovm/stats", "/_nanovm/events"] {
+        assert_eq!(http_get(addr, path).await.0, 404);
+    }
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
 
     let (status, body) = app_get(addr, &counter, "/s/").await;

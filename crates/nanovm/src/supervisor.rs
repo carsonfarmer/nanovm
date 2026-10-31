@@ -31,7 +31,6 @@ use http::{Request, Response};
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use parking_lot::Mutex;
-use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
@@ -257,18 +256,8 @@ impl Supervisor {
     /// The node's own routes, for requests that name no app.
     async fn admin(&self, req: Request<Body>) -> Response<RespBody> {
         match req.uri().path() {
-            "/_nanovm/stats" => self.stats().await,
-            "/_nanovm/events" => {
-                let q: HashMap<_, _> = query(req.uri());
-                let w = q.get("app").and_then(|a| self.workers.lock().get(*a).cloned());
-                let Some((w, live)) = w.and_then(|w| Some((w.clone(), w.live()?))) else {
-                    return error_response(404, "no-such-app", "events take ?app=<running app>&since=<seq>");
-                };
-                let pq = format!("/_nanovm/events?since={}", q.get("since").unwrap_or(&"0"));
-                let (mut parts, body) = req.into_parts();
-                parts.uri = pq.parse().expect("a valid path");
-                forward(&w, live, Request::from_parts(parts, body)).await
-            }
+            "/_nanovm/ready" => Response::builder().status(204).body(Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap(),
+            path if path.starts_with("/_nanovm/") => error_response(404, "not-found", path),
             _ => error_response(400, "no-app", "requests name their app (nanovm-app)"),
         }
     }
@@ -536,40 +525,6 @@ impl Supervisor {
         bail!("worker did not start ({e}): {}", words.ok().and_then(Result::ok).unwrap_or_default())
     }
 
-    async fn stats(&self) -> Response<RespBody> {
-        let mut workers = serde_json::Map::new();
-        let mut apps = serde_json::Map::new();
-        let all: Vec<_> = self.workers.lock().values().cloned().collect();
-        for w in all {
-            let name = w.name.clone();
-            let live = w.live();
-            workers.insert(
-                name.clone(),
-                json!({
-                    "pid": live.as_ref().map(|l| l.pid),
-                    "digest": live.as_ref().map(|l| l.digest.clone()),
-                    "version": live.as_ref().map(|l| l.version.to_string()),
-                    "policies": live.as_ref().map(|l| l.policies.lock().len()),
-                    "starts": w.starts.load(Relaxed),
-                    "up": live.is_some(),
-                    "link_errors": w.link_errors.load(Relaxed),
-                }),
-            );
-            if let Some(l) = live
-                && let Ok(res) = l.link.send(get("/_nanovm/stats")).await
-                && let Ok(body) = res.into_body().collect().await
-                && let Ok(v) = serde_json::from_slice::<Value>(&body.to_bytes())
-            {
-                apps.insert(name.clone(), v);
-            }
-        }
-        crate::server::ok_json(json!({
-            "uptime_ms": self.started.elapsed().as_millis() as u64,
-            "rss_mb": rss_bytes() as f64 / 1048576.0,
-            "workers": workers,
-            "apps": apps,
-        }))
-    }
 }
 
 async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
@@ -617,14 +572,6 @@ fn get(pq: &str) -> Request<Body> {
         .header(http::header::HOST, "worker")
         .body(Empty::new().map_err(|e| match e {}).boxed_unsync())
         .unwrap()
-}
-
-fn query(uri: &http::Uri) -> HashMap<&str, &str> {
-    uri.query()
-        .unwrap_or("")
-        .split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .collect()
 }
 
 /// Makes app `name`'s directories, and when the supervisor is root gives
@@ -730,24 +677,6 @@ pub fn worker_main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Query pairs are split on `&` and the first `=`, undecoded; a pair
-    /// without `=` is skipped and a repeated key keeps its last value.
-    #[test]
-    fn query_pairs() {
-        let q = |u: &str| {
-            query(&u.parse().unwrap())
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<Vec<_>>()
-        };
-        assert!(q("/_nanovm/events").is_empty());
-        assert!(q("/_nanovm/events?").is_empty());
-        let mut got = q("/e?app=a&since=5&flag&x=1=2&app=b&=v&s=%20");
-        got.sort();
-        let want = [("", "v"), ("app", "b"), ("s", "%20"), ("since", "5"), ("x", "1=2")];
-        assert_eq!(got, want.map(|(k, v)| (k.to_string(), v.to_string())));
-    }
 
     /// The supervisor's own answer to a forwarded request carries the
     /// verdict a worker trusts.

@@ -1,12 +1,8 @@
-//! Node-wide counters, latency histograms, an event log and process RSS.
+//! Node-wide admission/benchmark counters and process RSS; events go to OTel.
 
-use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
-
-use parking_lot::Mutex;
-use serde::{Serialize, Serializer};
 
 /// Monotonic nanoseconds since process start.
 pub fn now_ns() -> u64 {
@@ -19,7 +15,6 @@ pub fn now_ns() -> u64 {
 pub struct Histogram {
     buckets: [AtomicU64; 32],
     count: AtomicU64,
-    sum_us: AtomicU64,
 }
 
 impl Histogram {
@@ -27,7 +22,6 @@ impl Histogram {
         let us = d.as_micros() as u64;
         self.buckets[((64 - us.leading_zeros()) as usize).min(31)].fetch_add(1, Relaxed);
         self.count.fetch_add(1, Relaxed);
-        self.sum_us.fetch_add(us, Relaxed);
     }
 
     /// Upper bound (µs) of the bucket holding quantile `q`.
@@ -41,16 +35,6 @@ impl Histogram {
             }
         }
         0
-    }
-}
-
-impl Serialize for Histogram {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let count = self.count.load(Relaxed);
-        let mean_us = self.sum_us.load(Relaxed).checked_div(count).unwrap_or(0);
-        let [p50_us, p99_us, p999_us] = [0.5, 0.99, 0.999].map(|q| self.quantile(q));
-        serde_json::json!({ "count": count, "mean_us": mean_us, "p50_us": p50_us, "p99_us": p99_us, "p999_us": p999_us })
-            .serialize(s)
     }
 }
 
@@ -78,26 +62,14 @@ impl Poison {
     }
 }
 
-#[derive(Serialize, Clone)]
-pub struct Event {
-    pub seq: u64,
-    pub t_ms: u64,
-    pub kind: &'static str,
-    pub app: String,
-    pub object: String,
-    pub detail: String,
-}
-
-/// Node-wide counters; serialized as-is into `/_nanovm/stats`.
-#[derive(Default, Serialize)]
+/// Node-wide counters used by admission, benchmarks and OTel observers.
+#[derive(Default)]
 pub struct Metrics {
     pub requests: AtomicU64,
-    #[serde(serialize_with = "by_class")]
     pub status: [AtomicU64; 6],
     pub instantiate_failures: AtomicU64,
     pub stores_live: AtomicI64,
     pub stores_peak: AtomicI64,
-    #[serde(serialize_with = "by_poison")]
     pub poisons: [AtomicU64; 5],
     pub evicted_idle: AtomicU64,
     pub evicted_lru: AtomicU64,
@@ -106,36 +78,11 @@ pub struct Metrics {
     pub egress_allowed: AtomicU64,
     pub egress_denied: AtomicU64,
     pub fs_denied: AtomicU64,
-    #[serde(rename = "guest_cpu_ms", serialize_with = "as_ms")]
     pub guest_cpu_ns: AtomicU64,
     pub latency: Histogram,
     pub instantiate: Histogram,
-    #[serde(skip)]
-    events: Mutex<EventLog>,
-    #[serde(skip)]
     pub(crate) telemetry: OnceLock<std::sync::Weak<crate::telemetry::Telemetry>>,
 }
-
-/// Status counts keyed `1xx`..`5xx`.
-fn by_class<S: Serializer>(v: &[AtomicU64; 6], s: S) -> Result<S::Ok, S::Error> {
-    s.collect_map((1..6).map(|i| (format!("{i}xx"), v[i].load(Relaxed))))
-}
-
-fn by_poison<S: Serializer>(v: &[AtomicU64; 5], s: S) -> Result<S::Ok, S::Error> {
-    s.collect_map(Poison::ALL.iter().map(|p| (p.as_str(), v[*p as usize].load(Relaxed))))
-}
-
-fn as_ms<S: Serializer>(v: &AtomicU64, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_u64(v.load(Relaxed) / 1_000_000)
-}
-
-#[derive(Default)]
-struct EventLog {
-    seq: u64,
-    ring: VecDeque<Event>,
-}
-
-const EVENT_RING: usize = 512;
 
 impl Metrics {
     pub fn status(&self, code: u16) {
@@ -146,30 +93,11 @@ impl Metrics {
         self.poisons[p as usize].fetch_add(1, Relaxed);
     }
 
-    pub fn event(&self, kind: &'static str, app: &str, object: &str, detail: impl Into<String>) {
+    pub fn event(&self, kind: &'static str, object: &str, detail: impl Into<String>) {
         let detail = detail.into();
         if let Some(telemetry) = self.telemetry.get().and_then(std::sync::Weak::upgrade) {
             telemetry.event(object, kind, &detail);
         }
-        let mut log = self.events.lock();
-        log.seq += 1;
-        let ev = Event {
-            seq: log.seq,
-            t_ms: now_ns() / 1_000_000,
-            kind,
-            app: app.to_string(),
-            object: object.to_string(),
-            detail,
-        };
-        if log.ring.len() == EVENT_RING {
-            log.ring.pop_front();
-        }
-        log.ring.push_back(ev);
-    }
-
-    pub fn events_since(&self, seq: u64) -> Vec<Event> {
-        let log = self.events.lock();
-        log.ring.iter().filter(|e| e.seq > seq).cloned().collect()
     }
 }
 
@@ -227,11 +155,6 @@ mod tests {
             [h.quantile(0.0), h.quantile(0.5), h.quantile(0.99), h.quantile(0.999)],
             [4, 4, 4, 1024]
         );
-        let v = serde_json::to_value(&h).unwrap();
-        assert_eq!(
-            v,
-            serde_json::json!({"count": 100, "mean_us": 12, "p50_us": 4, "p99_us": 4, "p999_us": 1024})
-        );
 
         let edges = Histogram::default();
         for n in [0, 1, 1024] {
@@ -246,11 +169,9 @@ mod tests {
         assert_eq!(top.quantile(1.0), 1 << 31);
     }
 
-    /// Statuses count by class, out-of-range ones in the nearest; poisons
-    /// by name; guest CPU is reported in whole milliseconds; the event log
-    /// stays out of the stats.
+    /// Statuses count by class, out-of-range ones in the nearest.
     #[test]
-    fn stats_serialize_by_class_and_name() {
+    fn status_and_poison_counts() {
         let m = Metrics::default();
         for code in [101, 200, 204, 404, 500, 503, 999] {
             m.status(code);
@@ -258,41 +179,11 @@ mod tests {
         m.poison(Poison::ResourceTable);
         m.poison(Poison::Cpu);
         m.poison(Poison::Cpu);
-        m.guest_cpu_ns.store(2_999_999, Relaxed);
-        m.event("x", "a", "o", "d");
-        let v = serde_json::to_value(&m).unwrap();
-        assert_eq!(
-            v["status"],
-            serde_json::json!({"1xx": 1, "2xx": 2, "3xx": 0, "4xx": 1, "5xx": 3})
-        );
-        let poisons = serde_json::json!({"cpu": 2, "memory": 0, "timeout": 0, "trap": 0, "resource-table": 1});
-        assert_eq!(v["poisons"], poisons);
-        assert_eq!(v["guest_cpu_ms"], 2);
-        assert!(v.get("events").is_none() && v.get("guest_cpu_ns").is_none());
+        assert_eq!(m.status.each_ref().map(|v| v.load(Relaxed)), [0, 1, 2, 0, 1, 3]);
+        assert_eq!(m.poisons.each_ref().map(|v| v.load(Relaxed)), [2, 0, 0, 0, 1]);
         for (i, p) in Poison::ALL.iter().enumerate() {
             assert_eq!(*p as usize, i);
         }
-    }
-
-    /// Events are numbered from 1, read back after a sequence number, and
-    /// the log keeps only the newest `EVENT_RING`.
-    #[test]
-    fn event_log_is_a_numbered_ring() {
-        let m = Metrics::default();
-        m.event("kill", "app", "obj", "why");
-        let e = &m.events_since(0)[..];
-        assert_eq!(
-            (e.len(), e[0].seq, e[0].kind, &*e[0].app, &*e[0].object, &*e[0].detail),
-            (1, 1, "kill", "app", "obj", "why")
-        );
-        assert!(m.events_since(1).is_empty());
-        for _ in 0..EVENT_RING + 10 {
-            m.event("x", "a", "o", "");
-        }
-        let all = m.events_since(0);
-        assert_eq!(all.len(), EVENT_RING);
-        assert_eq!((all[0].seq, all.last().unwrap().seq), (12, EVENT_RING as u64 + 11));
-        assert_eq!(m.events_since(EVENT_RING as u64 + 9).len(), 2);
     }
 
     /// The process's resident size is read, and is plausible.

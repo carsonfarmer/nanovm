@@ -199,7 +199,7 @@ impl WasiHttpHooks for EgressHooks {
             .await;
             if let Err(e) = &res {
                 metrics.egress_denied.fetch_add(1, Relaxed);
-                metrics.event("egress-denied", &obj.app, &obj.id, format!("{target} → {e}"));
+                metrics.event("egress-denied", &obj.id, format!("{target} → {e}"));
             } else {
                 metrics.egress_allowed.fetch_add(1, Relaxed);
             }

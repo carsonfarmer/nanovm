@@ -18,14 +18,14 @@ Done means:
 - `nanovm serve` hosts real guest components with every limit enforced.
 - `cargo test` proves each guarantee against hostile guests.
 - `examples/bench.rs` prints cold-start, warm-latency, throughput and density numbers.
-- `demo/demo.sh` drives thousands of objects and the attack storm over HTTP. The node's only control surface is two JSON APIs, `/_nanovm/stats` and `/_nanovm/events` (deprecated in favour of OpenTelemetry; see Roadmap).
+- `demo/demo.sh` drives thousands of objects and the attack storm over HTTP. Observability uses OTLP; the demo reads a local collector's JSON file. The node has no stats/events HTTP APIs.
 
 ## Architecture
 
 ```
 client ──HTTP──► nanovm (hyper 1, http1)
                   │  data:    /{object}/{rest...}, app named by headers (guest sees /{rest...})
-                  │  control: /_nanovm/stats, /_nanovm/events (JSON)
+                  │  telemetry: OTLP through the supervisor to a collector
                   ▼
               ObjectTable  (app, object) → ObjectHandle { mailbox tx, last_used, state }
                   │  on miss: spawn actor; at max_live_objects, evict the LRU idle object first
@@ -57,8 +57,8 @@ nanovm/
     src/table.rs                 Node: (app, id) -> actor, slot permits, LRU/idle eviction, retire handshake
     src/quota.rs                 quota'd wasi:filesystem@0.3 host (QuotaFs), per-object disk budget, QuotaWriter
     src/egress.rs                allowlist, IP classifier, resolver + connector, send_request
-    src/metrics.rs               atomic counters, log2 latency histograms, event ring buffer, RSS
-    src/server.rs                hyper front end, routing, /_nanovm/{stats,events}
+    src/metrics.rs               atomic counters, benchmark histograms, RSS
+    src/server.rs                hyper front end, routing, private readiness/flush
     src/main.rs                  `nanovm serve --config demo/nanovm.toml`
     examples/bench.rs            in-process benchmark driver (no sockets)
     tests/integration.rs         integration tests against real guest components
@@ -303,9 +303,7 @@ client ─► proxy ─► supervisor (nanovm serve): no untrusted code
   - Each front-end thread has its own single-threaded runtime, `SO_REUSEPORT` listener and pool, so a request stays on one thread.
 - **Egress:** in a worker, `EgressHooks` forwards each outbound request to the supervisor over its egress link. The per-object connection semaphore stays in the worker. The supervisor applies the allowlist, DNS and IP filter, then connects. A denial comes back as the same `ErrorCode` the guest saw before.
 - **Failure:** a worker that dies takes down only its app. In-flight requests get `502 worker-down`, and the next request restarts the worker. A worker that fails to start isn't retried for 1 s. If the epoch thread ever dies, the worker aborts rather than run guests without CPU limits.
-- **Data APIs:**
-  - `/_nanovm/stats` returns the supervisor's view plus each worker's stats, keyed by app.
-  - `/_nanovm/events?app=<a>&since=` serves that worker's event log.
+- **Observability:** OTLP exports worker/supervisor metrics, request traces and logs. The former stats/events APIs and event ring were removed by W-2; readiness is an independent private 204 response.
 - **In-process `Node`** stays the unit of the tests and benchmarks, and is what each worker runs. On macOS the same supervisor/worker topology runs without the Linux jail calls.
 - **Tests:** the hostile guest run through the supervisor. A jailed worker cannot open a socket, read another app's or the supervisor's files, or exec; egress policy is enforced by the supervisor; a killed worker is restarted.
 - **Cost (4-core sandbox, over HTTP with curl on the same cores):** about 0.1 ms more per request for one client, and about 25% less throughput at 64 in flight. In-process numbers are unchanged. README has the table.
@@ -347,9 +345,9 @@ Built on branch `proxy` by one agent and finished by another. README's "The prox
 Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tracked; the decisions are Q41–Q51 in [HANDOFF.md](HANDOFF.md). In priority order:
 
 1. **WebSockets moved into the front proxy (Q42, Q53; W-3 done).** The proxy owns sockets and app/object-scoped channels; the node answers ordinary event POSTs. Each event resolves the current digest, so sockets and subscriptions survive worker exits and deployments. A private publish listener receives committed publishes, stamped with the app by the supervisor and object by the worker. Socket caps belong to the proxy, shared directly with socket managers; an object-keyed tree bounds fan-out work to that object's sockets (Q56). This supersedes Q31/Q35; full-suite, mutation, demo and benchmark results are in HANDOFF. Review follow-ups N-33/N-34 remain in ISSUES.
-2. **Observability by default (Q43; W-2 in progress).** Bounded OpenTelemetry SDK/OTLP export now sends request/queue/instantiate/guest/commit/call spans, request and worker counters, and guest stdout/stderr through the supervisor (Q58–Q59). The supervisor stamps app/digest identity; no jail permission changed. Worker readiness is separated from stats (Q57). Next finish metric/event parity and export lifecycle handling, migrate demo/test consumers, and remove `/_nanovm/stats` and `/_nanovm/events` once OTel covers them. HANDOFF records bounds, validation and remaining work; this is not yet the completed W-2 rollout.
+2. **Observability by default (Q43; W-2 in progress).** Bounded OpenTelemetry SDK/OTLP export now sends request/queue/instantiate/guest/commit/call spans, request and worker counters, and guest stdout/stderr through the supervisor (Q58–Q59). The supervisor stamps app/digest identity; no jail permission changed. Worker readiness is separated from telemetry (Q57). Next finish collector error reporting, hostile-load and trace-parentage coverage, review and performance validation. HANDOFF records bounds, validation and remaining work; this is not yet the completed W-2 rollout.
    - Transport CI and the demo pass. Full tracing's measured throughput regression remains a landing blocker. SDK spans are now directly owned, with immutable context propagated between tasks; no sampling or phase-detail reduction has been adopted.
-   - Worker runtime events, instantiation histograms and phase gauges now export too, alongside supervisor worker state, starts/link errors, memory and uptime. Supervised integration checks now consume decoded OTLP. SDK shutdown stays off the async runtime thread; the demo and remaining in-process consumers still need migration before API deletion, without a compatibility endpoint.
+   - Worker runtime events, instantiation histograms and phase gauges now export too, alongside supervisor worker state, starts/link errors, memory and uptime. Tests and the demo consume decoded OTLP; stats/events endpoints and their event ring are removed. SDK shutdown stays off the async runtime thread. Metric cardinality is 512 plus overflow, preserving totals within the 1 MiB batch budget even with maximum-length object IDs (Q60).
 3. **A per-object SQLite demo (Q46).** The showcase: every object its own SQLite database on `/data`, committed with its response. It works today, since writes happen in place and `mmap` is kept. (W-1)
 4. **Alarms, outside the node (Q41).** A scheduler beside the proxy sends a request to an object when its alarm fires; an object sets alarms with a response header. The node stays request-only. (W-4)
 5. **Data lifecycle (Q44).** Planning first: deleting an app's or an object's data, exporting a volume, backups and retention. (W-5)

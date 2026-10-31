@@ -198,15 +198,7 @@ async fn main() -> anyhow::Result<()> {
         20_000 / scale
     );
     row("new object + LRU eviction", &churn, "");
-    for e in n
-        .metrics
-        .events_since(0)
-        .iter()
-        .filter(|e| e.kind == "instantiate-failed")
-        .take(3)
-    {
-        println!("    instantiate-failed: {}", e.detail);
-    }
+    println!("  {:<34} {} instantiation failures (details in OTLP logs)", "", n.metrics.instantiate_failures.load(Relaxed));
     println!("  {:<34} {} evicted", "", n.metrics.evicted_lru.load(Relaxed));
     out.insert("churn".into(), churn.json());
     n.shutdown().await;

@@ -25,11 +25,11 @@ The script:
 4. Pings a canary object throughout.
 5. Drives it over HTTP with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm requests, `/data` writes, and a storm of 100 simultaneous attacks.
 
-It leaves the node running. Its data APIs (deprecated: OpenTelemetry will replace them, see [ISSUES.md](ISSUES.md) W-2) are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (app `A`'s kills, denials and evictions). W-2 is in progress: OTLP/HTTP now exports request traces, request/runtime metrics and guest stdout/stderr by default to `telemetry_endpoint` (default `http://127.0.0.1:4318`). Jailed workers export over their existing link; the supervisor owns the destination and stamps app/manifest-digest identity. Object IDs appear on request records and logs. Export queues, batch sizes, concurrency, cardinality and deadlines are bounded; a missing collector does not prevent requests or commits. Worker startup uses a separate private readiness response. Supervisor worker-state, restart/link-error counters, memory and uptime now export too; supervised integration tests consume OTLP rather than the deprecated APIs. The demo and remaining in-process consumers have not yet migrated.
+It leaves the node running. OTLP/HTTP exports request traces, request/runtime metrics and guest stdout/stderr by default to `telemetry_endpoint` (default `http://127.0.0.1:4318`). Jailed workers export over their existing link; the supervisor owns the destination and stamps app/manifest-digest identity. Object IDs appear on request records and logs. Export queues, batch sizes, concurrency, cardinality and deadlines are bounded; a missing collector does not prevent requests or commits. Worker startup uses a separate private readiness response. Supervisor worker-state, restart/link-error counters, memory and uptime export too. The demo's loopback `dev-collector` writes decoded OTLP to `target/demo-telemetry.json`; it refuses stale snapshots. Production deployments should use an OpenTelemetry Collector. The stats/events HTTP APIs and event ring are removed, with no compatibility endpoints. W-2's final validation and performance gate remain unfinished.
 
 The W-2 branch passes transport tests and CI, but full tracing currently reduces benchmark throughput. It has not met the performance gate for merging; HANDOFF records measurements and rejected experiments. Recording spans are owned by each operation; only immutable trace context crosses task boundaries.
 
-Worker observability includes runtime event logs (`event.name`), guest stream logs (`log.iostream`), instantiation and request duration histograms, and object counts by phase. Histograms use seconds with buckets from 100 µs through 240 s. SDK shutdown exports pending records off the async runtime thread; abrupt process kills can still lose buffered telemetry.
+Worker observability includes runtime event logs (`event.name`), guest stream logs (`log.iostream`), instantiation and request duration histograms, and object counts by phase. Histograms use seconds with buckets from 100 µs through 240 s. Each instrument keeps 512 distinct attribute sets plus the SDK overflow series: totals survive excess object cardinality without exceeding the 1 MiB batch limit. SDK shutdown exports pending records off the async runtime thread; abrupt process kills can still lose buffered telemetry.
 
 A request names its app in the headers the proxy sets (see [Apps](#apps)), and its object in the path, `/{object}/{path}`:
 
@@ -424,7 +424,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `crates/nanovm/src/table.rs` | The node: one app, object id → actor, LRU and idle eviction |
 | `crates/nanovm/src/quota.rs` | Per-mount byte and file quotas over WASIp3 filesystem calls |
 | `crates/nanovm/src/egress.rs` | Allowlist plus resolved-IP filtering for outgoing HTTP |
-| `crates/nanovm/src/server.rs` | A node's HTTP surface: routing, `/_nanovm/stats` and `/_nanovm/events` |
+| `crates/nanovm/src/server.rs` | A node's HTTP surface: routing, private readiness and telemetry flush |
 | `crates/nanovm/src/supervisor.rs` | The supervisor (front end, workers, egress on their behalf) and the worker's entry point |
 | `crates/nanovm/src/jail.rs` | uid, Landlock and seccomp, entered by a worker before any guest code |
 | `crates/nanovm/src/registry.rs` | Apps: bounded registry reads, Sigstore verification, version floor, digest cache |

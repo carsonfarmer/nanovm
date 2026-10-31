@@ -41,7 +41,7 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
     let rt = runtime()?;
     let sup = rt.block_on(async { Supervisor::new(cfg, std::env::current_exe()?, threads) })?;
     let first = rt.block_on(async { listener(addr) })?;
-    eprintln!("nanovm: ready in {:.0?} on http://{addr}/ (stats: /_nanovm/stats)", t0.elapsed());
+    eprintln!("nanovm: ready in {:.0?} on http://{addr}/", t0.elapsed());
     for i in 1..threads {
         let sup = sup.clone();
         std::thread::Builder::new()
