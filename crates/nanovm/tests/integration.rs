@@ -11,6 +11,9 @@ use nanovm::config::{AppConfig, NodeConfig};
 #[allow(dead_code)]
 mod load;
 
+#[path = "../support/collector.rs"]
+mod collector;
+
 use load::{Reply, request};
 use nanovm::table::Node;
 
@@ -706,11 +709,35 @@ async fn supervised(test: &str) -> (Arc<nanovm::supervisor::Supervisor>, std::ne
     supervised_with(node_cfg(test, 8)).await
 }
 
-async fn supervised_with(cfg: NodeConfig) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+type Capture = (std::sync::Weak<nanovm::supervisor::Supervisor>, Arc<parking_lot::Mutex<collector::Collector>>);
+fn captures() -> &'static parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Capture>> {
+    static CAPTURES: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Capture>>> = std::sync::OnceLock::new();
+    CAPTURES.get_or_init(Default::default)
+}
+
+async fn supervised_with(mut cfg: NodeConfig) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+    let captured = Arc::new(parking_lot::Mutex::new(collector::Collector::default()));
+    if cfg.telemetry_endpoint == NodeConfig::default().telemetry_endpoint {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        cfg.telemetry_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let captured = captured.clone();
+        tokio::spawn(nanovm::server::serve_http1(listener, move |req| {
+            let captured = captured.clone();
+            async move {
+                use http_body_util::BodyExt;
+                let path = req.uri().path().to_owned();
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                captured.lock().ingest(&path, &body).unwrap();
+                http::Response::new(http_body_util::Full::new(bytes::Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            }
+        }));
+    }
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
     let sup = nanovm::supervisor::Supervisor::new(cfg, exe, 1).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    captures().lock().retain(|_, (sup, _)| sup.strong_count() != 0);
+    captures().lock().insert(addr, (Arc::downgrade(&sup), captured));
     let s = sup.clone();
     tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
     (sup, addr)
@@ -772,9 +799,15 @@ async fn http_get(addr: std::net::SocketAddr, path: &str) -> (u16, String) {
 }
 
 async fn stats_json(addr: std::net::SocketAddr) -> serde_json::Value {
-    let (status, body) = http_get(addr, "/_nanovm/stats").await;
-    assert_eq!(status, 200, "{body}");
-    serde_json::from_str(&body).unwrap()
+    let (sup, captured) = captures().lock()[&addr].clone();
+    let sup = sup.upgrade().unwrap();
+    let started = Instant::now();
+    // A killed worker's link can close before its process watcher runs.
+    while let Err(e) = sup.flush_telemetry().await {
+        assert!(started.elapsed() < Duration::from_secs(2), "telemetry flush failed: {e:#}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    captured.lock().snapshot()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -808,6 +841,8 @@ async fn supervised_workers_contain_attacks() {
     assert_eq!(app_get(addr, &hostile, "/_nanovm/stats").await.0, 400);
 
     let v = stats_json(addr).await;
+    assert!(v["rss_mb"].as_f64().unwrap() > 0.0, "{v}");
+    assert!(v["uptime_ms"].as_f64().unwrap() > 0.0, "{v}");
     assert_eq!(v["apps"][worker(&hostile).as_str()]["egress_denied"], 2, "{v}");
     for app in [worker(&counter), worker(&hostile)] {
         let pid = v["workers"][&app]["pid"].as_u64().unwrap();
@@ -829,9 +864,8 @@ async fn supervised_workers_contain_attacks() {
             assert!(uid >= 200_000, "{app} runs as uid {uid}");
         }
     }
-    let (status, body) = http_get(addr, &format!("/_nanovm/events?app={}&since=0", worker(&hostile))).await;
-    assert_eq!(status, 200);
-    assert!(body.contains("egress-denied"), "{body}");
+    let captured = captures().lock()[&addr].1.clone();
+    assert!(captured.lock().logs.iter().any(|log| log["app"] == worker(&hostile) && log["kind"] == "egress-denied"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

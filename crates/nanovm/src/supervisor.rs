@@ -79,7 +79,8 @@ pub struct Supervisor {
     /// Held while giving a new app its uid.
     uids: Arc<Mutex<()>>,
     publishes: reqwest::Client,
-    telemetry: Arc<crate::telemetry::Relay>,
+    relay: Arc<crate::telemetry::Relay>,
+    telemetry: Arc<crate::telemetry::Telemetry>,
     started: Instant,
 }
 
@@ -138,10 +139,10 @@ impl Worker {
 }
 
 impl Supervisor {
-    /// `threads` is the number of front-end threads that will call `handle`.
+    /// Call within the front-end runtime. `threads` counts threads calling `handle`.
     pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
-        Ok(Arc::new(Supervisor {
+        let sup = Arc::new(Supervisor {
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
             threads,
             exe,
@@ -152,11 +153,65 @@ impl Supervisor {
             // for clients and the rest.
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
             uids: Arc::default(),
-            telemetry: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
+            relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
             cfg,
             publishes: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build()?,
             started: Instant::now(),
-        }))
+        });
+        use opentelemetry::{KeyValue, metrics::MeterProvider};
+        let meter = sup.telemetry.meters.meter("nanovm");
+        meter.u64_observable_gauge("process.memory.usage").with_unit("By")
+            .with_callback(|o| o.observe(rss_bytes(), &[])).build();
+        let started = sup.started;
+        meter.f64_observable_gauge("process.uptime").with_unit("s")
+            .with_callback(move |o| o.observe(started.elapsed().as_secs_f64(), &[])).build();
+        let weak = Arc::downgrade(&sup);
+        meter.u64_observable_gauge("nanovm.worker.up").with_callback(move |o| {
+            if let Some(sup) = weak.upgrade() {
+                let workers: Vec<_> = sup.workers.lock().values().cloned().collect();
+                for w in workers {
+                    let live = w.live();
+                    o.observe(u64::from(live.is_some()), &[
+                        KeyValue::new("nanovm.worker.app", w.name.clone()),
+                        KeyValue::new("nanovm.worker.digest", live.as_ref().map_or(String::new(), |l| l.digest.clone())),
+                        KeyValue::new("nanovm.worker.version", live.as_ref().map_or(String::new(), |l| l.version.to_string())),
+                        KeyValue::new("process.pid", live.as_ref().map_or(0, |l| l.pid) as i64),
+                        KeyValue::new("nanovm.worker.policies", live.as_ref().map_or(0, |l| l.policies.lock().len()) as i64),
+                    ]);
+                }
+            }
+        }).build();
+        for (name, read) in [
+            ("nanovm.worker.starts", (|w: &Worker| w.starts.load(Relaxed)) as fn(&Worker) -> u64),
+            ("nanovm.worker.link_errors", |w: &Worker| w.link_errors.load(Relaxed)),
+        ] {
+            let weak = Arc::downgrade(&sup);
+            meter.u64_observable_counter(name).with_callback(move |o| {
+                if let Some(sup) = weak.upgrade() {
+                    for w in sup.workers.lock().values() {
+                        o.observe(read(w), &[KeyValue::new("nanovm.worker.app", w.name.clone())]);
+                    }
+                }
+            }).build();
+        }
+        Ok(sup)
+    }
+
+    /// Flush live workers and host metrics to the collector, without an HTTP
+    /// snapshot API. Readiness and ordinary requests never call this.
+    pub async fn flush_telemetry(&self) -> anyhow::Result<()> {
+        let live: Vec<_> = self.workers.lock().values().filter_map(|w| w.live()).collect();
+        let mut failed = false;
+        for l in live {
+            let ok = tokio::time::timeout(Duration::from_secs(10), l.link.send(get("/_nanovm/flush")))
+                .await.is_ok_and(|r| r.is_ok_and(|r| r.status() == 204));
+            failed |= !ok && l.alive();
+        }
+        let telemetry = self.telemetry.clone();
+        tokio::task::spawn_blocking(move || telemetry.flush()).await??;
+        anyhow::ensure!(!failed, "a live worker failed to flush telemetry");
+        Ok(())
     }
 
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
@@ -423,7 +478,7 @@ impl Supervisor {
 
         let policy = Arc::new(policy);
         let (http, target, app) = (self.publishes.clone(), self.cfg.publish_to.clone(), w.name.clone());
-        let (telemetry, digest) = (self.telemetry.clone(), want.digest.clone());
+        let (telemetry, digest) = (self.relay.clone(), want.digest.clone());
         let telemetry_slots = Arc::new(tokio::sync::Semaphore::new(3));
         egress.set_nonblocking(true)?;
         let link_caps = vec![Arc::new(tokio::sync::Semaphore::new(links)), self.links.clone()];

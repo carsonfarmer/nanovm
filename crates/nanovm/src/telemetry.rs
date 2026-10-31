@@ -71,8 +71,9 @@ impl HttpClient for Client {
 }
 
 pub struct Telemetry {
+    runtime: tokio::runtime::Handle,
     traces: trace::SdkTracerProvider,
-    meters: sdk_metrics::SdkMeterProvider,
+    pub(crate) meters: sdk_metrics::SdkMeterProvider,
     logs: logs::SdkLoggerProvider,
     tracer: trace::SdkTracer,
     logger: logs::SdkLogger,
@@ -118,6 +119,7 @@ impl Telemetry {
         let durations = |name| meter.f64_histogram(name).with_unit("s")
             .with_boundaries(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0, 240.0]).build();
         Ok(Self {
+            runtime: client.runtime.clone(),
             tracer: traces.tracer("nanovm"), logger: logs.logger("nanovm"),
             requests: meter.u64_counter("nanovm.requests").build(),
             latency: durations("nanovm.request.duration"),
@@ -219,10 +221,23 @@ impl Telemetry {
     /// Call from a blocking task: SDK flushing waits for its export threads,
     /// whose link operations still need the async runtime to be running.
     pub fn flush(&self) -> anyhow::Result<()> {
-        self.traces.force_flush()?;
-        self.meters.force_flush()?;
-        self.logs.force_flush()?;
+        for result in [self.traces.force_flush(), self.meters.force_flush(), self.logs.force_flush()] {
+            result?;
+        }
         Ok(())
+    }
+}
+
+impl Drop for Telemetry {
+    fn drop(&mut self) {
+        // SDK shutdown waits for export threads. Keep that wait off both the
+        // async runtime and a metric callback dropping its last Node reference.
+        let (traces, meters, logs) = (self.traces.clone(), self.meters.clone(), self.logs.clone());
+        self.runtime.spawn_blocking(move || {
+            let _ = traces.shutdown_with_timeout(DEADLINE);
+            let _ = meters.shutdown_with_timeout(DEADLINE);
+            let _ = logs.shutdown_with_timeout(DEADLINE);
+        });
     }
 }
 
@@ -335,6 +350,50 @@ mod tests {
         common::KeyValue { key: key.into(), value: Some(common::AnyValue {
             value: Some(common::any_value::Value::StringValue(value.into())),
         }), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn dropping_telemetry_exports_pending_records_without_blocking_the_runtime() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(crate::server::serve_http1(listener, move |req| {
+            let tx = tx.clone();
+            async move {
+                let path = req.uri().path().to_owned();
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                tx.send((path, body)).unwrap();
+                http::Response::new(http_body_util::Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            }
+        }));
+        let telemetry = Telemetry::new(&endpoint, "lifecycle", "v1", None).unwrap();
+        drop(telemetry.span("last-request", "room", &Context::new()));
+        telemetry.log("room", "stdout", b"last log", &Context::new());
+        telemetry.request("room", 201, Duration::from_millis(3));
+        let started = std::time::Instant::now();
+        drop(telemetry);
+        assert!(started.elapsed() < Duration::from_millis(250), "SDK shutdown blocked the runtime");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut seen = std::collections::HashSet::new();
+            while seen.len() < 3 {
+                let (path, body) = rx.recv().await.unwrap();
+                match path.as_str() {
+                    "/v1/traces" => assert!(collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap()
+                        .resource_spans.iter().flat_map(|r| &r.scope_spans).flat_map(|s| &s.spans)
+                        .any(|s| s.name == "last-request")),
+                    "/v1/logs" => assert!(collector::logs::v1::ExportLogsServiceRequest::decode(body).unwrap()
+                        .resource_logs.iter().flat_map(|r| &r.scope_logs).flat_map(|s| &s.log_records)
+                        .any(|l| l.body.as_ref().and_then(|v| v.value.as_ref()) == Some(&common::any_value::Value::StringValue("last log".into())))),
+                    "/v1/metrics" => assert!(collector::metrics::v1::ExportMetricsServiceRequest::decode(body).unwrap()
+                        .resource_metrics.iter().flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics)
+                        .any(|m| m.name == "nanovm.requests" && matches!(&m.data, Some(metrics::metric::Data::Sum(s))
+                            if s.data_points.iter().any(|p| p.value == Some(metrics::number_data_point::Value::AsInt(1)))))),
+                    _ => panic!("unexpected signal: {path}"),
+                }
+                seen.insert(path);
+            }
+        }).await.expect("all pending signals exported on drop");
+        server.abort();
     }
 
     /// Exercise the private relay as a compromised worker, not a guest:

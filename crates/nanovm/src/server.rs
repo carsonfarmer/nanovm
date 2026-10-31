@@ -126,6 +126,11 @@ async fn admin(node: &Arc<Node>, path: &str, req: &Request<Incoming>) -> Respons
     let since = req.uri().query().and_then(|q| q.strip_prefix("since=")?.parse().ok());
     match path {
         "/ready" => Response::builder().status(204).body(full("")).unwrap(),
+        "/flush" => {
+            let telemetry = node.telemetry.clone();
+            let ok = tokio::task::spawn_blocking(move || telemetry.flush()).await.is_ok_and(|r| r.is_ok());
+            Response::builder().status(if ok { 204 } else { 503 }).body(full("")).unwrap()
+        }
         "/stats" => ok_json(stats(node)),
         "/events" => ok_json(json!(node.metrics.events_since(since.unwrap_or(0)))),
         _ => error_response(404, "not-found", path),
