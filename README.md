@@ -25,7 +25,7 @@ The script:
 4. Pings a canary object throughout.
 5. Drives it over HTTP with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm requests, `/data` writes, and a storm of 100 simultaneous attacks.
 
-It leaves the node running. Its data APIs (deprecated: OpenTelemetry will replace them, see [ISSUES.md](ISSUES.md) W-2) are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (app `A`'s kills, denials and evictions). W-2 is in progress; OTLP export is not implemented yet. The migration separates worker readiness from stats before replacing these APIs.
+It leaves the node running. Its data APIs (deprecated: OpenTelemetry will replace them, see [ISSUES.md](ISSUES.md) W-2) are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (app `A`'s kills, denials and evictions). W-2 is in progress; OTLP export is not implemented yet. Worker startup now uses a separate private readiness response, so it does not depend on these APIs or a collector.
 
 A request names its app in the headers the proxy sets (see [Apps](#apps)), and its object in the path, `/{object}/{path}`:
 

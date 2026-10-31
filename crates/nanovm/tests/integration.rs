@@ -649,6 +649,15 @@ async fn http_front_end() {
 
     let (status, body) = raw(
         addr,
+        "GET /_nanovm/ready HTTP/1.1\r\nHost: worker\r\nConnection: close\r\n\r\n",
+        b"",
+    ).await;
+    assert_eq!(status, 204, "{body}");
+    assert!(body.is_empty(), "readiness must not return a stats snapshot: {body}");
+    assert_eq!(node.live_objects(), 0);
+
+    let (status, body) = raw(
+        addr,
         "GET /web/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
         b"",
     )

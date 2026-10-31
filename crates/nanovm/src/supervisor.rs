@@ -451,8 +451,8 @@ impl Supervisor {
             kill: Mutex::new(Some(kill)),
         });
         let ready = tokio::time::timeout(START_TIMEOUT, async {
-            let res = live.link.send(get("/_nanovm/stats")).await?;
-            anyhow::ensure!(res.status() == 200, "worker answered {}", res.status());
+            let res = live.link.send(get("/_nanovm/ready")).await?;
+            anyhow::ensure!(res.status() == 204, "worker answered {}", res.status());
             res.into_body().collect().await?;
             anyhow::Ok(())
         });

@@ -40,7 +40,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## Next up: W-2, OpenTelemetry
 
-The owner requested W-2 after enabling CI. First decouple worker readiness from `/_nanovm/stats`; that API is currently used by `Supervisor::start`, not just operators. Keep the deprecated APIs until their OTel replacements and demo/test consumers work, then delete them (no compatibility layer).
+The owner requested W-2 after enabling CI. The first code milestone decouples worker readiness from `/_nanovm/stats`: `Supervisor::start` now requests the private `/_nanovm/ready` response (204, no snapshot, no guest dispatch). The extended `http_front_end` regression failed with 404 before implementation. Keep the deprecated APIs until their OTel replacements and demo/test consumers work, then delete them (no compatibility layer).
 
 Implementation plan from source inspection:
 - Use `opentelemetry`, `opentelemetry_sdk` and `opentelemetry-otlp`, rather than invent a telemetry encoding. The OTLP HTTP exporter accepts a custom `opentelemetry_http::HttpClient`; a worker client can send through its existing egress link. Only the supervisor reaches the collector. `tracing-opentelemetry` bridges spans, but does not export logs: use the logs SDK for guest stdout/stderr. Docs inspected: https://docs.rs/opentelemetry-otlp/latest/opentelemetry_otlp/ and https://docs.rs/tracing-opentelemetry/latest/tracing_opentelemetry/ . Resolve compatible crate versions at implementation time.
@@ -50,7 +50,7 @@ Implementation plan from source inspection:
 - Replace stats/events consumers in the demo and integration tests with a local OTLP collector fixture; preserve worker death, version-switch and isolation assertions. Worker readiness becomes a small private response, not an exported metric. Delete HTTP stats/events and the event ring only once equivalent checks exist.
 - Validate real jailed-worker exports for all three signals, tenant/version isolation, collector outage, telemetry flood, trace parentage and guest logs. Mutation-check those contracts, run the full suite/demo/benchmark, and review the telemetry trust boundary before landing.
 
-**First-piece handoff:** Finish/land CI, then the W-2 readiness prerequisite on `w2-observability`. Implement the bounded OTLP transport next; the plan above is not an assertion that telemetry already exists. Do not change guests without approval.
+**First-piece handoff:** Continue `w2-observability` with bounded OTLP transport after validating the readiness prerequisite. The plan above is not an assertion that telemetry already exists. Do not change guests without approval.
 
 ## Completed W-3 brief (historical starting point)
 
@@ -151,6 +151,7 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q54 | A socket closes with 1011 if its host changes app identity (record owner or repository); events never cross apps. Event delivery has a 240 s overall deadline, allowing cold deploys but bounding stuck nodes/resolvers. Publishes have a 30 s body/forwarding deadline. |
 | Q55 | Keep tungstenite and the existing GRIP implementation rather than add a Pushpin process. Proxy socket caps are operator settings, not guest manifests. The private publish listener trusts network isolation, like the node; only the supervisor stamps the app identity. |
 | Q56 | Socket managers share the proxy config directly, with no copied `Caps` model. A BTreeMap keyed by `(object, connection-id)` makes fan-out visit only the publishing object's sockets, without a second index or per-object counters (N-20). Pending opens and connections hold the app manager alive; its Arc count also identifies removable map entries. |
+| Q57 | Worker readiness is a private 204 response on the request link, independent of stats and telemetry. Removing the deprecated stats/events APIs must not make startup depend on a collector. |
 
 Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 
