@@ -4,7 +4,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## State (2026-10-31)
 
-- **Current work:** Amp is enabling build/test CI on `ci-checks` (W-16), then starting W-2. The old publishing workflow alone did not test runtime changes. New CI uses read-only permissions and never publishes guests; first remote run pending.
+- **Current work:** Amp is validating build/test CI on `ci-checks` (W-16) and starting W-2 on `w2-observability`, based on that branch. W-2 owns telemetry, object/table instrumentation, server/supervisor and demo consumers. Guests remain unchanged. CI's first run passed the production check but could not raise fds to 100,000; the next uses the runner's actual hard limit.
 - **`main`** has:
   - phase 1 (portable core);
   - phase 2 (the Linux jail);
@@ -37,6 +37,20 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 - **Runtime size:** about 5,250 lines before phase 7, which added the proxy and a registry client of our own (3,704 after phase 3; kv and config added about 300, WebSockets about 640, commits about 500 non-blank, non-comment lines, against an estimate of 250–300, which the owner accepted after a reduction pass).
 - **The repo `carsonfarmer/nanovm` is now public**, so GitHub artifact attestations work. The packages `ghcr.io/carsonfarmer/nanovm-{counter,hostile}` are public. `publish-guests.yml` runs on pushes to `guests/**` and on `gh workflow run publish-guests.yml` (dispatch works through the proxy, and `gh run watch <id>` shows progress). Each run publishes version `1.0.<run number>`.
 - **Old branches** (`jail`, `simplify`, `oci`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical.
+
+## Next up: W-2, OpenTelemetry
+
+The owner requested W-2 after enabling CI. First decouple worker readiness from `/_nanovm/stats`; that API is currently used by `Supervisor::start`, not just operators. Keep the deprecated APIs until their OTel replacements and demo/test consumers work, then delete them (no compatibility layer).
+
+Implementation plan from source inspection:
+- Use `opentelemetry`, `opentelemetry_sdk` and `opentelemetry-otlp`, rather than invent a telemetry encoding. The OTLP HTTP exporter accepts a custom `opentelemetry_http::HttpClient`; a worker client can send through its existing egress link. Only the supervisor reaches the collector. `tracing-opentelemetry` bridges spans, but does not export logs: use the logs SDK for guest stdout/stderr. Docs inspected: https://docs.rs/opentelemetry-otlp/latest/opentelemetry_otlp/ and https://docs.rs/tracing-opentelemetry/latest/tracing_opentelemetry/ . Resolve compatible crate versions at implementation time.
+- The supervisor owns collector configuration and credentials. A worker must not choose an arbitrary export URL or claim another app/version. Decode bounded OTLP batches, replace tenant resource identity from the worker's trusted supervisor record, then export. Guest HTTP must not access this internal telemetry route. Test these boundaries with crafted requests, including duplicate/spoofed attributes.
+- Bound SDK queues, batch bytes, forwarding concurrency, export deadlines and metric cardinality. Collector failure must drop/report telemetry, not block requests or retain unbounded data. Do not weaken the jail for SDK network access. Verify SDK background-thread/custom-client runtime behavior before integrating.
+- Instrument dispatch/queue wait, instantiation, guest handling, commit and object calls. Pass trace context explicitly across actor queues and links; do not hold thread-local span guards across awaits. Tag app/object/digest; distinguish stdout and stderr while keeping bounded panic-tail diagnostics. Counters needed for live-store admission remain runtime state, not an OTel round trip.
+- Replace stats/events consumers in the demo and integration tests with a local OTLP collector fixture; preserve worker death, version-switch and isolation assertions. Worker readiness becomes a small private response, not an exported metric. Delete HTTP stats/events and the event ring only once equivalent checks exist.
+- Validate real jailed-worker exports for all three signals, tenant/version isolation, collector outage, telemetry flood, trace parentage and guest logs. Mutation-check those contracts, run the full suite/demo/benchmark, and review the telemetry trust boundary before landing.
+
+**First-piece handoff:** Finish/land CI, then the W-2 readiness prerequisite on `w2-observability`. Implement the bounded OTLP transport next; the plan above is not an assertion that telemetry already exists. Do not change guests without approval.
 
 ## Completed W-3 brief (historical starting point)
 
