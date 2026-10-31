@@ -129,26 +129,28 @@ impl Node {
             return error_response(400, "bad-object-id", BAD_OBJECT);
         }
         use opentelemetry::propagation::TextMapPropagator;
+        use opentelemetry::trace::{Span, TraceContextExt};
         let parent = req.extensions().get::<opentelemetry::Context>().cloned().unwrap_or_else(|| {
             opentelemetry_sdk::propagation::TraceContextPropagator::new()
                 .extract(&opentelemetry_http::HeaderExtractor(req.headers()))
         });
-        let span = self.telemetry.span("request", id, &parent);
+        let mut span = self.telemetry.span("request", id, &parent);
+        // Only immutable IDs cross tasks; the dispatch owns the SDK span.
+        let context = parent.with_remote_span_context(span.span_context().clone());
         let enqueued = Instant::now();
         let (reply, rx) = oneshot::channel();
         let job = Job {
             req,
             reply,
             enqueued,
-            context: span.0.clone(),
-            queue: self.telemetry.span("queue", id, &span.0),
+            queue: self.telemetry.span("queue", id, &context),
+            context,
         };
         let response = match self.enqueue(id, job) {
             Err(resp) => resp,
             Ok(()) => rx.await.unwrap_or_else(|_| error_response(503, "object-unavailable", "the object stopped before answering")),
         };
-        use opentelemetry::trace::TraceContextExt;
-        span.0.span().set_attribute(opentelemetry::KeyValue::new("http.response.status_code", response.status().as_u16() as i64));
+        span.set_attribute(opentelemetry::KeyValue::new("http.response.status_code", response.status().as_u16() as i64));
         self.telemetry.request(id, response.status().as_u16(), enqueued.elapsed());
         response
     }
@@ -289,12 +291,14 @@ mod tests {
     /// An idle object is evictable only with no work queued or waiting.
     #[test]
     fn only_objects_without_work_are_evictable() {
+        use opentelemetry::trace::{Tracer, TracerProvider};
+        let tracer = opentelemetry_sdk::trace::SdkTracerProvider::default().tracer("test");
         let job = || Job {
             req: http::Request::new(Bytes::new()),
             reply: oneshot::channel().0,
             enqueued: Instant::now(),
             context: Default::default(),
-            queue: crate::telemetry::Span(Default::default()),
+            queue: tracer.start("queue"),
         };
         let (tx, _rx) = mpsc::channel(4);
         let e = Entry {

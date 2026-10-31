@@ -122,11 +122,10 @@ impl Telemetry {
         })
     }
 
-    pub fn span(&self, name: &'static str, object: &str, parent: &Context) -> Span {
-        let span = self.tracer.span_builder(name)
+    pub fn span(&self, name: &'static str, object: &str, parent: &Context) -> trace::Span {
+        self.tracer.span_builder(name)
             .with_attributes([KeyValue::new("nanovm.object", object.to_owned())])
-            .start_with_context(&self.tracer, parent);
-        Span(parent.with_span(span))
+            .start_with_context(&self.tracer, parent)
     }
 
     pub fn request(&self, object: &str, status: u16, elapsed: Duration) {
@@ -196,11 +195,6 @@ impl Telemetry {
         self.logs.force_flush()?;
         Ok(())
     }
-}
-
-pub struct Span(pub Context);
-impl Drop for Span {
-    fn drop(&mut self) { self.0.span().end(); }
 }
 
 /// Shared across all workers. A compromised worker gets neither an arbitrary

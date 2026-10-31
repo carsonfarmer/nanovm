@@ -220,10 +220,12 @@ async fn call(
     obj: Arc<crate::object::ObjShared>,
     req: http::Request<WasiBody>,
 ) -> Result<http::Response<WasiBody>, Error> {
+    use opentelemetry::trace::{Span, TraceContextExt};
     let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
-    let span = node.telemetry.span("call", &obj.id, &obj.context.lock());
+    let parent = obj.context.lock().clone();
+    let span = node.telemetry.span("call", &obj.id, &parent);
     let (mut parts, body) = req.into_parts();
-    parts.extensions.insert(span.0.clone());
+    parts.extensions.insert(parent.with_remote_span_context(span.span_context().clone()));
     let target = parts.uri.clone();
     let rest = target.path_and_query().map_or("", |p| p.as_str()).strip_prefix(CALLS).unwrap_or("");
     let (id, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));

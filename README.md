@@ -27,6 +27,8 @@ The script:
 
 It leaves the node running. Its data APIs (deprecated: OpenTelemetry will replace them, see [ISSUES.md](ISSUES.md) W-2) are `GET /_nanovm/stats` (the supervisor's view plus each app worker's counters and latency histograms, as JSON) and `GET /_nanovm/events?app=A&since=N` (app `A`'s kills, denials and evictions). W-2 is in progress: OTLP/HTTP now exports request traces, request/runtime metrics and guest stdout/stderr by default to `telemetry_endpoint` (default `http://127.0.0.1:4318`). Jailed workers export over their existing link; the supervisor owns the destination and stamps app/manifest-digest identity. Object IDs appear on request records and logs. Export queues, batch sizes, concurrency, cardinality and deadlines are bounded; a missing collector does not prevent requests or commits. Worker startup uses a separate private readiness response. Full metric/event parity and migration of the demo off the deprecated APIs remain unfinished.
 
+The W-2 branch passes transport tests and CI, but full tracing currently reduces benchmark throughput. It has not met the performance gate for merging; HANDOFF records measurements and rejected experiments. Recording spans are owned by each operation; only immutable trace context crosses task boundaries.
+
 A request names its app in the headers the proxy sets (see [Apps](#apps)), and its object in the path, `/{object}/{path}`:
 
 ```bash
