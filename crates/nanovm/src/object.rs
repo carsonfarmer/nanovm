@@ -54,7 +54,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    const ALL: [Phase; 5] = [
+    pub(crate) const ALL: [Phase; 5] = [
         Phase::Starting,
         Phase::Idle,
         Phase::Handling,
@@ -440,6 +440,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         match started {
             Ok((store, svc)) => {
                 node.metrics.instantiate.record(t0.elapsed());
+                node.telemetry.instantiated(&shared.id, t0.elapsed());
                 match serve(&node, &app, &shared, store, svc, &mut rx).await {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),

@@ -78,6 +78,7 @@ pub struct Telemetry {
     logger: logs::SdkLogger,
     requests: opentelemetry::metrics::Counter<u64>,
     latency: opentelemetry::metrics::Histogram<f64>,
+    instantiation: opentelemetry::metrics::Histogram<f64>,
 }
 
 impl Telemetry {
@@ -114,10 +115,13 @@ impl Telemetry {
                 .with_interval(INTERVAL).build())
             .with_view(|_| sdk_metrics::Stream::builder().with_cardinality_limit(2048).build().ok()).build();
         let meter = meters.meter("nanovm");
+        let durations = |name| meter.f64_histogram(name).with_unit("s")
+            .with_boundaries(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0, 240.0]).build();
         Ok(Self {
             tracer: traces.tracer("nanovm"), logger: logs.logger("nanovm"),
             requests: meter.u64_counter("nanovm.requests").build(),
-            latency: meter.f64_histogram("nanovm.request.duration").with_unit("s").build(),
+            latency: durations("nanovm.request.duration"),
+            instantiation: durations("nanovm.instantiate.duration"),
             traces, meters, logs,
         })
     }
@@ -132,6 +136,10 @@ impl Telemetry {
         let attrs = [KeyValue::new("nanovm.object", object.to_owned()), KeyValue::new("http.response.status_code", status as i64)];
         self.requests.add(1, &attrs);
         self.latency.record(elapsed.as_secs_f64(), &attrs);
+    }
+
+    pub fn instantiated(&self, object: &str, elapsed: Duration) {
+        self.instantiation.record(elapsed.as_secs_f64(), &[KeyValue::new("nanovm.object", object.to_owned())]);
     }
 
     pub fn observe(&self, node: &Arc<crate::table::Node>) {
@@ -170,9 +178,30 @@ impl Telemetry {
         gauge!("nanovm.objects.limit", n, n.cfg.max_live_objects);
         gauge!("process.memory.usage", _n, crate::metrics::rss_bytes());
         gauge!("nanovm.uptime", n, n.started.elapsed().as_secs());
+        let weak = Arc::downgrade(node);
+        meter.u64_observable_gauge("nanovm.objects.phase").with_callback(move |o| {
+            if let Some(node) = weak.upgrade() {
+                let phases = node.phases();
+                for phase in crate::object::Phase::ALL {
+                    o.observe(*phases.get(phase.as_str()).unwrap_or(&0) as u64, &[KeyValue::new("phase", phase.as_str())]);
+                }
+            }
+        }).build();
     }
 
     pub fn log(&self, object: &str, stream: &'static str, bytes: &[u8], context: &Context) {
+        let mut record = self.record(object, bytes, context);
+        record.add_attribute("log.iostream", stream);
+        self.logger.emit(record);
+    }
+
+    pub fn event(&self, object: &str, kind: &'static str, detail: &str) {
+        let mut record = self.record(object, detail.as_bytes(), &Context::new());
+        record.add_attribute("event.name", kind);
+        self.logger.emit(record);
+    }
+
+    fn record(&self, object: &str, bytes: &[u8], context: &Context) -> logs::SdkLogRecord {
         // A guest write can be arbitrarily large. Export at most one bounded
         // record per write, including expansion of invalid UTF-8. The queue
         // retains at most 1 MiB of log bodies (plus attributes and SDK overhead).
@@ -180,11 +209,11 @@ impl Telemetry {
         let mut body = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
         body.truncate(body.floor_char_boundary(4096.min(body.len())));
         record.set_body(body.into());
-        record.add_attributes([("nanovm.object", object.to_owned()), ("log.iostream", stream.to_owned())]);
+        record.add_attribute("nanovm.object", object.to_owned());
         let span = context.span();
         let sc = span.span_context();
         if sc.is_valid() { record.set_trace_context(sc.trace_id(), sc.span_id(), Some(sc.trace_flags())); }
-        self.logger.emit(record);
+        record
     }
 
     /// Call from a blocking task: SDK flushing waits for its export threads,

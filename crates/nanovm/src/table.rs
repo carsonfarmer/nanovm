@@ -103,6 +103,7 @@ impl Node {
             slots,
             objects: Mutex::default(),
         });
+        node.metrics.telemetry.set(Arc::downgrade(&node.telemetry)).ok();
         node.telemetry.observe(&node);
         Ok(node)
     }

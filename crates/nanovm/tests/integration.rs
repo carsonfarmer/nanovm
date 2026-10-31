@@ -2376,7 +2376,9 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
                 spans.iter().any(|r| matches(&r.resource) && r.scope_spans.iter().flat_map(|s| &s.spans).any(|s| s.name == "request"))
                     && metrics.iter().any(|r| matches(&r.resource))
             });
-            if complete && logs.iter().any(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&hostile)) { break }
+            if complete && logs.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&hostile))
+                .flat_map(|r| &r.scope_logs).flat_map(|s| &s.log_records)
+                .any(|l| attr(&l.attributes, "event.name") == "trap") { break }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }).await.expect("all three signals from real jailed workers");
@@ -2400,11 +2402,19 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
                 && matches!(l.body.as_ref().and_then(|v| v.value.as_ref()), Some(Value::StringValue(s)) if s.contains("hostile guest panicked"))
         }));
     let counter_metrics = metrics.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&counter))
-        .flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics);
-    assert!(counter_metrics.into_iter().any(|m| m.name == "nanovm.requests" && matches!(&m.data,
+        .flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics).collect::<Vec<_>>();
+    assert!(counter_metrics.iter().any(|m| m.name == "nanovm.requests" && matches!(&m.data,
         Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum)) if sum.data_points.iter().any(|p|
             attr(&p.attributes, "nanovm.object") == "room" && p.value == Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(1))))));
     use opentelemetry_proto::tonic::metrics::v1::{metric::Data, number_data_point};
+    for name in ["nanovm.request.duration", "nanovm.instantiate.duration"] {
+        assert!(counter_metrics.iter().any(|m| m.name == name && matches!(&m.data,
+            Some(Data::Histogram(h)) if h.data_points.iter().any(|p| attr(&p.attributes, "nanovm.object") == "room"
+                && p.count == 1 && p.sum.is_some_and(|s| s > 0.0) && p.explicit_bounds.contains(&0.001)))), "{name}");
+    }
+    assert!(counter_metrics.iter().any(|m| m.name == "nanovm.objects.phase" && matches!(&m.data,
+        Some(Data::Gauge(g)) if g.data_points.iter().any(|p| attr(&p.attributes, "phase") == "idle"
+            && p.value == Some(number_data_point::Value::AsInt(1))))));
     let hostile_metrics = metrics.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&hostile))
         .flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics).collect::<Vec<_>>();
     assert!(hostile_metrics.iter().any(|m| m.name == "nanovm.poisons" && matches!(&m.data,

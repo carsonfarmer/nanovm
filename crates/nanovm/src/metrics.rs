@@ -112,6 +112,8 @@ pub struct Metrics {
     pub instantiate: Histogram,
     #[serde(skip)]
     events: Mutex<EventLog>,
+    #[serde(skip)]
+    pub(crate) telemetry: OnceLock<std::sync::Weak<crate::telemetry::Telemetry>>,
 }
 
 /// Status counts keyed `1xx`..`5xx`.
@@ -145,6 +147,10 @@ impl Metrics {
     }
 
     pub fn event(&self, kind: &'static str, app: &str, object: &str, detail: impl Into<String>) {
+        let detail = detail.into();
+        if let Some(telemetry) = self.telemetry.get().and_then(std::sync::Weak::upgrade) {
+            telemetry.event(object, kind, &detail);
+        }
         let mut log = self.events.lock();
         log.seq += 1;
         let ev = Event {
@@ -153,7 +159,7 @@ impl Metrics {
             kind,
             app: app.to_string(),
             object: object.to_string(),
-            detail: detail.into(),
+            detail,
         };
         if log.ring.len() == EVENT_RING {
             log.ring.pop_front();

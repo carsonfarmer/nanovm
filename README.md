@@ -29,6 +29,8 @@ It leaves the node running. Its data APIs (deprecated: OpenTelemetry will replac
 
 The W-2 branch passes transport tests and CI, but full tracing currently reduces benchmark throughput. It has not met the performance gate for merging; HANDOFF records measurements and rejected experiments. Recording spans are owned by each operation; only immutable trace context crosses task boundaries.
 
+Worker observability includes runtime event logs (`event.name`), guest stream logs (`log.iostream`), instantiation and request duration histograms, and object counts by phase. Histograms use seconds with buckets from 100 µs through 240 s. Supervisor worker-state metrics and replacement of the deprecated API consumers are still pending.
+
 A request names its app in the headers the proxy sets (see [Apps](#apps)), and its object in the path, `/{object}/{path}`:
 
 ```bash
