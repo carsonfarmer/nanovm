@@ -40,7 +40,7 @@ pub struct Job {
     pub reply: oneshot::Sender<http::Response<RespBody>>,
     pub enqueued: Instant,
     pub context: opentelemetry::Context,
-    pub queue: opentelemetry_sdk::trace::Span,
+    pub queue: crate::telemetry::Span,
 }
 
 #[repr(u8)]

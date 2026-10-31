@@ -2380,7 +2380,8 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
     let hostile = publish("otel-hostile", &app("hostile")).await;
     let head = format!("GET /room/ HTTP/1.1\r\nHost: x\r\n{}traceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\nConnection: close\r\n\r\n", names(&counter));
     assert_eq!(raw(addr, &head, b"").await.0, 200);
-    assert_eq!(app_get(addr, &hostile, "/other/panic").await.0, 500);
+    let head = format!("GET /other/panic HTTP/1.1\r\nHost: x\r\n{}traceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\nConnection: close\r\n\r\n", names(&hostile));
+    assert_eq!(raw(addr, &head, b"").await.0, 500);
     let (_, denied) = app_get(addr, &hostile, "/other/fetch?url=http://nanovm/telemetry/logs").await;
     assert!(denied.contains("HttpRequestDenied"), "{denied}");
 
@@ -2406,7 +2407,7 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
                 let matches = |r: &Option<opentelemetry_proto::tonic::resource::v1::Resource>| {
                     r.as_ref().is_some_and(|r| attr(&r.attributes, "nanovm.app") == worker(app))
                 };
-                spans.iter().any(|r| matches(&r.resource) && r.scope_spans.iter().flat_map(|s| &s.spans).any(|s| s.name == "request"))
+                (!cfg!(feature = "tracing") || spans.iter().any(|r| matches(&r.resource) && r.scope_spans.iter().flat_map(|s| &s.spans).any(|s| s.name == "request")))
                     && metrics.iter().any(|r| matches(&r.resource))
             });
             if complete && logs.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&hostile))
@@ -2415,23 +2416,34 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }).await.expect("all three signals from real jailed workers");
-    for app in [&counter, &hostile] {
-        let resource = spans.iter().find(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(app)).unwrap();
-        assert_eq!(attr(&resource.resource.as_ref().unwrap().attributes, "service.version"), app.split_once('@').unwrap().1);
-    }
-    let counter_spans = spans.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&counter))
-        .flat_map(|r| &r.scope_spans).flat_map(|s| &s.spans).collect::<Vec<_>>();
-    let request = counter_spans.iter().find(|s| s.name == "request").unwrap();
-    assert_eq!(request.trace_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(2));
-    assert_eq!(request.parent_span_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
-    for name in ["queue", "instantiate", "guest", "commit"] {
-        let child = counter_spans.iter().find(|s| s.name == name).unwrap();
-        assert_eq!(child.parent_span_id, request.span_id, "{name}");
-        assert_eq!(attr(&child.attributes, "nanovm.object"), "room");
+    #[cfg(not(feature = "tracing"))]
+    assert!(spans.is_empty(), "trace export must be compiled out");
+    #[cfg(feature = "tracing")]
+    {
+        for app in [&counter, &hostile] {
+            let resource = spans.iter().find(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(app)).unwrap();
+            assert_eq!(attr(&resource.resource.as_ref().unwrap().attributes, "service.version"), app.split_once('@').unwrap().1);
+        }
+        let counter_spans = spans.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&counter))
+            .flat_map(|r| &r.scope_spans).flat_map(|s| &s.spans).collect::<Vec<_>>();
+        let request = counter_spans.iter().find(|s| s.name == "request").unwrap();
+        assert_eq!(request.trace_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(2));
+        assert_eq!(request.parent_span_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        assert_eq!(attr(&request.attributes, "nanovm.object"), "room");
+        assert!(request.attributes.iter().any(|a| a.key == "http.response.status_code"
+            && a.value.as_ref().and_then(|v| v.value.as_ref()) == Some(&Value::IntValue(200))));
+        for name in ["queue", "instantiate", "guest", "commit"] {
+            let child = counter_spans.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(child.trace_id, request.trace_id, "{name}");
+            assert_eq!(child.parent_span_id, request.span_id, "{name}");
+            assert!(child.start_time_unix_nano > 0 && child.end_time_unix_nano >= child.start_time_unix_nano, "{name}");
+            assert_eq!(attr(&child.attributes, "nanovm.object"), "room");
+        }
     }
     assert!(logs.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&hostile))
         .flat_map(|r| &r.scope_logs).flat_map(|s| &s.log_records).any(|l| {
             attr(&l.attributes, "nanovm.object") == "other" && attr(&l.attributes, "log.iostream") == "stderr"
+                && l.trace_id == [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(2)
                 && matches!(l.body.as_ref().and_then(|v| v.value.as_ref()), Some(Value::StringValue(s)) if s.contains("hostile guest panicked"))
         }));
     let counter_metrics = metrics.iter().filter(|r| attr(&r.resource.as_ref().unwrap().attributes, "nanovm.app") == worker(&counter))

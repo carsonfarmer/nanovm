@@ -10,11 +10,15 @@ use http_body_util::{BodyExt, Full, Limited};
 use opentelemetry::{Context, KeyValue};
 use opentelemetry::logs::{LogRecord, Logger, LoggerProvider};
 use opentelemetry::metrics::MeterProvider;
-use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider};
+use opentelemetry::trace::TraceContextExt;
+#[cfg(feature = "tracing")]
+use opentelemetry::trace::{Tracer, TracerProvider};
 use opentelemetry_http::{HttpClient, HttpError};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_proto::tonic::{collector, common::v1 as common, metrics::v1 as metrics, resource::v1::Resource};
-use opentelemetry_sdk::{logs, metrics as sdk_metrics, trace};
+use opentelemetry_sdk::{logs, metrics as sdk_metrics};
+#[cfg(feature = "tracing")]
+use opentelemetry_sdk::trace;
 use prost::Message;
 
 use crate::egress::Upstream;
@@ -23,6 +27,11 @@ pub(crate) const PATH: &str = "/telemetry/";
 const MAX_BATCH: usize = 1 << 20;
 const DEADLINE: Duration = Duration::from_secs(2);
 const INTERVAL: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "tracing")]
+pub type Span = trace::Span;
+#[cfg(not(feature = "tracing"))]
+pub type Span = opentelemetry::trace::noop::NoopSpan;
 
 fn identity(app: &str, digest: &str) -> [KeyValue; 3] {
     [KeyValue::new("service.name", "nanovm"), KeyValue::new("nanovm.app", app.to_owned()),
@@ -72,9 +81,11 @@ impl HttpClient for Client {
 
 pub struct Telemetry {
     runtime: tokio::runtime::Handle,
+    #[cfg(feature = "tracing")]
     traces: trace::SdkTracerProvider,
     pub(crate) meters: sdk_metrics::SdkMeterProvider,
     logs: logs::SdkLoggerProvider,
+    #[cfg(feature = "tracing")]
     tracer: trace::SdkTracer,
     logger: logs::SdkLogger,
     requests: opentelemetry::metrics::Counter<u64>,
@@ -101,6 +112,7 @@ impl Telemetry {
                     .with_retry_policy(opentelemetry_otlp::RetryPolicy::default().with_max_retries(0)).build()?
             }
         }
+        #[cfg(feature = "tracing")]
         let traces = trace::SdkTracerProvider::builder().with_resource(resource.clone())
             .with_span_processor(trace::BatchSpanProcessor::builder(exporter!(SpanExporter, "traces"))
                 .with_batch_config(trace::BatchConfigBuilder::default().with_max_queue_size(1024)
@@ -122,18 +134,32 @@ impl Telemetry {
             .with_boundaries(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0, 240.0]).build();
         Ok(Self {
             runtime: client.runtime.clone(),
-            tracer: traces.tracer("nanovm"), logger: logs.logger("nanovm"),
+            #[cfg(feature = "tracing")]
+            tracer: traces.tracer("nanovm"),
+            #[cfg(feature = "tracing")]
+            traces,
+            logger: logs.logger("nanovm"),
             requests: meter.u64_counter("nanovm.requests").build(),
             latency: durations("nanovm.request.duration"),
             instantiation: durations("nanovm.instantiate.duration"),
-            traces, meters, logs,
+            meters, logs,
         })
     }
 
-    pub fn span(&self, name: &'static str, object: &str, parent: &Context) -> trace::Span {
+    #[cfg(feature = "tracing")]
+    pub fn span(&self, name: &'static str, object: &str, parent: &Context) -> Span {
+        // Requests append their response status on completion. Reserve its
+        // slot now rather than reallocating the attributes on every request.
+        let mut attributes = Vec::with_capacity(if name == "request" { 2 } else { 1 });
+        attributes.push(KeyValue::new("nanovm.object", object.to_owned()));
         self.tracer.span_builder(name)
-            .with_attributes([KeyValue::new("nanovm.object", object.to_owned())])
+            .with_attributes(attributes)
             .start_with_context(&self.tracer, parent)
+    }
+
+    #[cfg(not(feature = "tracing"))]
+    pub fn span(&self, _name: &'static str, _object: &str, _parent: &Context) -> Span {
+        Span::DEFAULT
     }
 
     pub fn request(&self, object: &str, status: u16, elapsed: Duration) {
@@ -223,7 +249,11 @@ impl Telemetry {
     /// Call from a blocking task: SDK flushing waits for its export threads,
     /// whose link operations still need the async runtime to be running.
     pub fn flush(&self) -> anyhow::Result<()> {
-        for result in [self.traces.force_flush(), self.meters.force_flush(), self.logs.force_flush()] {
+        for result in [
+            #[cfg(feature = "tracing")]
+            self.traces.force_flush(),
+            self.meters.force_flush(), self.logs.force_flush(),
+        ] {
             result?;
         }
         Ok(())
@@ -234,8 +264,11 @@ impl Drop for Telemetry {
     fn drop(&mut self) {
         // SDK shutdown waits for export threads. Keep that wait off both the
         // async runtime and a metric callback dropping its last Node reference.
-        let (traces, meters, logs) = (self.traces.clone(), self.meters.clone(), self.logs.clone());
+        #[cfg(feature = "tracing")]
+        let traces = self.traces.clone();
+        let (meters, logs) = (self.meters.clone(), self.logs.clone());
         self.runtime.spawn_blocking(move || {
+            #[cfg(feature = "tracing")]
             let _ = traces.shutdown_with_timeout(DEADLINE);
             let _ = meters.shutdown_with_timeout(DEADLINE);
             let _ = logs.shutdown_with_timeout(DEADLINE);
@@ -369,7 +402,10 @@ mod tests {
             }
         }));
         let telemetry = Telemetry::new(&endpoint, "lifecycle", "v1", None).unwrap();
-        drop(telemetry.span("last-request", "room", &Context::new()));
+        use opentelemetry::trace::Span as _;
+        let span = telemetry.span("last-request", "room", &Context::new());
+        assert_eq!(span.is_recording(), cfg!(feature = "tracing"));
+        drop(span);
         telemetry.log("room", "stdout", b"last log", &Context::new());
         telemetry.request("room", 201, Duration::from_millis(3));
         let started = std::time::Instant::now();
@@ -377,8 +413,9 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(250), "SDK shutdown blocked the runtime");
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut seen = std::collections::HashSet::new();
-            while seen.len() < 3 {
+            while seen.len() < if cfg!(feature = "tracing") { 3 } else { 2 } {
                 let (path, body) = rx.recv().await.unwrap();
+                assert!(cfg!(feature = "tracing") || path != "/v1/traces");
                 match path.as_str() {
                     "/v1/traces" => assert!(collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap()
                         .resource_spans.iter().flat_map(|r| &r.scope_spans).flat_map(|s| &s.spans)

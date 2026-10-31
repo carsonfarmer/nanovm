@@ -137,7 +137,7 @@ impl Node {
         });
         let mut span = self.telemetry.span("request", id, &parent);
         // Only immutable IDs cross tasks; the dispatch owns the SDK span.
-        let context = parent.with_remote_span_context(span.span_context().clone());
+        let context = if cfg!(feature = "tracing") { parent.with_remote_span_context(span.span_context().clone()) } else { parent };
         let enqueued = Instant::now();
         let (reply, rx) = oneshot::channel();
         let job = Job {
@@ -292,14 +292,19 @@ mod tests {
     /// An idle object is evictable only with no work queued or waiting.
     #[test]
     fn only_objects_without_work_are_evictable() {
+        #[cfg(feature = "tracing")]
         use opentelemetry::trace::{Tracer, TracerProvider};
+        #[cfg(feature = "tracing")]
         let tracer = opentelemetry_sdk::trace::SdkTracerProvider::default().tracer("test");
         let job = || Job {
             req: http::Request::new(Bytes::new()),
             reply: oneshot::channel().0,
             enqueued: Instant::now(),
             context: Default::default(),
+            #[cfg(feature = "tracing")]
             queue: tracer.start("queue"),
+            #[cfg(not(feature = "tracing"))]
+            queue: crate::telemetry::Span::DEFAULT,
         };
         let (tx, _rx) = mpsc::channel(4);
         let e = Entry {
