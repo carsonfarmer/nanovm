@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: 0
+      # CPU budgets count wall time inside guest polls. Avoid unrelated tests
+      # competing for the runner's cores; concurrency tests still run their load.
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            guests -> target
+      - name: Prepare host limits
+        run: sudo sysctl -w vm.max_map_count=1048576
+      - name: Build guests locally (no publishing)
+        run: cargo build --locked --release --target wasm32-wasip2 --manifest-path guests/Cargo.toml
+      - name: Check production build without dev features
+        run: cargo check --locked -p nanovm --bin nanovm
+      - name: Run unit and integration tests
+        run: |
+          ulimit -n 100000
+          env -u RUST_BACKTRACE cargo test --locked -p nanovm

@@ -302,6 +302,8 @@ cargo test --release -p nanovm
 
 There are 64 integration tests and 93 unit tests, plus one that needs external HTTPS and is ignored by default (example.com, through the webpki roots; it succeeded in the demo). They drive real components: [guests/counter](guests/counter) and [guests/hostile](guests/hostile). The hostile guest knows every attack in the storm.
 
+GitHub Actions runs **CI / Build and test** on pushes and pull requests: a production build check without dev features, locally built guests, then the locked unit/integration suite on Ubuntu 24.04. Tests run serially to avoid competing wall-clock CPU budgets; concurrency tests still exercise parallel requests. The workflow has read-only permissions and publishes nothing. Cgroup tests skip when controllers are unavailable; the external HTTPS test remains ignored by default.
+
 The tests cover:
 - one request at a time per object, with objects running in parallel
 - full queues

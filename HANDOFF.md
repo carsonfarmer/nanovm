@@ -4,6 +4,7 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## State (2026-10-31)
 
+- **Current work:** Amp is enabling build/test CI on `ci-checks` (W-16), then starting W-2. The old publishing workflow alone did not test runtime changes. New CI uses read-only permissions and never publishes guests; first remote run pending.
 - **`main`** has:
   - phase 1 (portable core);
   - phase 2 (the Linux jail);
