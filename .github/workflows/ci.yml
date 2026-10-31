@@ -40,5 +40,5 @@ jobs:
         run: cargo check --locked -p nanovm --bin nanovm
       - name: Run unit and integration tests
         run: |
-          ulimit -n 100000
+          ulimit -n "$(ulimit -Hn)"
           env -u RUST_BACKTRACE cargo test --locked -p nanovm
