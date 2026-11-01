@@ -217,7 +217,7 @@ impl StdoutStream for LogTail {
 impl tokio::io::AsyncWrite for LogTail {
     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
         if let Some((telemetry, object, stream)) = &self.export {
-            telemetry.log(&object.id, stream, data, &object.context.lock());
+            telemetry.log(&object.id, ("log.iostream", stream), data, &object.context.lock());
         }
         let mut buf = self.buf.lock();
         buf.extend(data.iter().rev().take(LOG_TAIL).rev());

@@ -162,19 +162,7 @@ impl Telemetry {
         self.logger.emit(record);
     }
 
-    pub fn log(&self, object: &str, stream: &'static str, bytes: &[u8], context: &Context) {
-        let mut record = self.record(object, bytes, context);
-        record.add_attribute("log.iostream", stream);
-        self.logger.emit(record);
-    }
-
-    pub fn event(&self, object: &str, kind: &'static str, detail: &str) {
-        let mut record = self.record(object, detail.as_bytes(), &Context::new());
-        record.add_attribute("event.name", kind);
-        self.logger.emit(record);
-    }
-
-    fn record(&self, object: &str, bytes: &[u8], context: &Context) -> logs::SdkLogRecord {
+    pub fn log(&self, object: &str, field: (&'static str, &'static str), bytes: &[u8], context: &Context) {
         // A guest write can be arbitrarily large. Export at most one bounded
         // record per write, including expansion of invalid UTF-8. The queue
         // retains at most 1 MiB of log bodies (plus attributes and SDK overhead).
@@ -182,11 +170,12 @@ impl Telemetry {
         let mut body = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
         body.truncate(body.floor_char_boundary(4096.min(body.len())));
         record.set_body(body.into());
+        record.add_attribute(field.0, field.1);
         record.add_attribute("nanovm.object", object.to_owned());
         let span = context.span();
         let sc = span.span_context();
         if sc.is_valid() { record.set_trace_context(sc.trace_id(), sc.span_id(), Some(sc.trace_flags())); }
-        record
+        self.logger.emit(record);
     }
 
     /// Call from a blocking task: SDK flushing waits for its export threads,
@@ -398,7 +387,7 @@ mod tests {
         let span = telemetry.span("last-request", "room", &Context::new());
         assert!(span.is_recording());
         drop(span);
-        telemetry.log("room", "stdout", b"last log", &Context::new());
+        telemetry.log("room", ("log.iostream", "stdout"), b"last log", &Context::new());
         let started = std::time::Instant::now();
         drop(telemetry);
         assert!(started.elapsed() < Duration::from_millis(250), "SDK shutdown blocked the runtime");
@@ -505,7 +494,7 @@ mod tests {
 
         // The producer must bound the UTF-8 body, not merely its input bytes.
         let telemetry = Telemetry::new(&endpoint, "real-app", "real-digest", None).unwrap();
-        telemetry.log("room", "stdout", &vec![0xff; 8192], &Context::new());
+        telemetry.log("room", ("log.iostream", "stdout"), &vec![0xff; 8192], &Context::new());
         tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
         let logs = collector::logs::v1::ExportLogsServiceRequest::decode(captured.lock()[2].clone()).unwrap();
         let record = &logs.resource_logs[0].scope_logs[0].log_records[0];

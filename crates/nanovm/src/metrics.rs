@@ -60,7 +60,7 @@ impl Metrics {
     pub fn event(&self, kind: &'static str, object: &str, detail: impl Into<String>) {
         let detail = detail.into();
         if let Some(telemetry) = self.telemetry.get().and_then(std::sync::Weak::upgrade) {
-            telemetry.event(object, kind, &detail);
+            telemetry.log(object, ("event.name", kind), detail.as_bytes(), &opentelemetry::Context::new());
         }
     }
 }
