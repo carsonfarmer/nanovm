@@ -317,7 +317,7 @@ mod tests {
         let output = Output(Arc::default());
         let writer = output.clone();
         let _subscriber = tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
-            .with_writer(move || writer.clone()).finish().set_default();
+            .with_ansi(false).with_writer(move || writer.clone()).finish().set_default();
         let mode = Arc::new(AtomicUsize::new(0));
         let behavior = mode.clone();
         let partial = collector::trace::v1::ExportTraceServiceResponse {
