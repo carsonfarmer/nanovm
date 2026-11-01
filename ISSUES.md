@@ -224,7 +224,10 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 ### W-1: per-object SQLite demo (priority)
 - **What:** a guest where every object is its own SQLite database on `/data`, committed with its response, and a demo that shows it (for example a room or a ledger per object, with a crash mid-request rolled back). The showcase for nanovm.
 - **Where:** `guests/` (a new guest), `demo/`, README. Adding or changing guests triggers `publish-guests.yml` on push to `main`, which publishes new versions: ask the owner first.
-- **Status:** open
+- **Experiment/proposal:** [SQLite over the existing filesystem](experiments/sqlite-filesystem/README.md). Real SQLite in Wasm with a P3 VFS works without runtime changes; 483 VFS cuts across DELETE/TRUNCATE/PERSIST/MEMORY recover SQL, files and KV together, as does a jailed worker SIGKILL. Candidate API: reuse `spin:sqlite/sqlite@3.0.0`, composed in Wasm, with object-private ownership.
+- **Journal follow-up:** a 32 KiB database exhausts the 1 MiB undo log under repeated autocommit writes. Propagated failures recover; handled failures preserve exactly the earlier successful statements after reopening, including a failed bulk-update case. Measure repeated-byte/sync amplification and investigate a generic first-write undo optimization before adding SQLite-specific journal integration. Preserve truncate/rename/unlink and recovery semantics.
+- **Remaining gates:** actual component composition, WAL/checkpoints, multi-connection locking, transactions crossing response boundaries, storage-error recovery, filesystem temp spill, and host-internal/power-loss faults. The fixture is not a production VFS or published interface.
+- **Status:** open; isolated experiment and pressure tests implemented, demo/interface not shipped
 
 ### W-2: OpenTelemetry by default; deprecate the stats and events APIs (high priority)
 - **What:** OTel traces (a span per request, with queue wait, instantiation, guest time, commit, calls), metrics (what `/_nanovm/stats` reports today) and guest logs (each object's stdout and stderr), on by default and tagged with app, object and version. Then remove `/_nanovm/stats` and `/_nanovm/events`.
