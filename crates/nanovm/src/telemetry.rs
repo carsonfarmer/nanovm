@@ -9,29 +9,38 @@ use http::{Request, Response};
 use http_body_util::{BodyExt, Full, Limited};
 use opentelemetry::{Context, KeyValue};
 use opentelemetry::logs::{LogRecord, Logger, LoggerProvider};
-use opentelemetry::metrics::MeterProvider;
 use opentelemetry::trace::TraceContextExt;
-#[cfg(feature = "tracing")]
 use opentelemetry::trace::{Tracer, TracerProvider};
 use opentelemetry_http::{HttpClient, HttpError};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
-use opentelemetry_proto::tonic::{collector, common::v1 as common, metrics::v1 as metrics, resource::v1::Resource};
-use opentelemetry_sdk::{logs, metrics as sdk_metrics};
-#[cfg(feature = "tracing")]
+use opentelemetry_proto::tonic::{collector, common::v1 as common, resource::v1::Resource};
+use opentelemetry_sdk::logs;
 use opentelemetry_sdk::trace;
 use prost::Message;
 
 use crate::egress::Upstream;
+
+pub fn duration(span: &mut Span, field: &'static str, since: std::time::Instant) {
+    use opentelemetry::trace::Span as _;
+    span.set_attribute(KeyValue::new(field, since.elapsed().as_secs_f64() * 1000.0));
+}
+
+pub fn response<B>(span: &mut Span, response: &Response<B>) {
+    use opentelemetry::trace::Span as _;
+    span.set_attribute(KeyValue::new("http.response.status_code", response.status().as_u16() as i64));
+    if response.status().is_server_error() {
+        span.set_status(opentelemetry::trace::Status::error("request failed"));
+        let reason = response.headers().get("x-nanovm-error").and_then(|v| v.to_str().ok()).unwrap_or("http-error");
+        span.set_attribute(KeyValue::new("error.type", reason.chars().take(128).collect::<String>()));
+    }
+}
 
 pub(crate) const PATH: &str = "/telemetry/";
 const MAX_BATCH: usize = 1 << 20;
 const DEADLINE: Duration = Duration::from_secs(2);
 const INTERVAL: Duration = Duration::from_secs(1);
 
-#[cfg(feature = "tracing")]
 pub type Span = trace::Span;
-#[cfg(not(feature = "tracing"))]
-pub type Span = opentelemetry::trace::noop::NoopSpan;
 
 fn identity(app: &str, digest: &str) -> [KeyValue; 3] {
     [KeyValue::new("service.name", "nanovm"), KeyValue::new("nanovm.app", app.to_owned()),
@@ -45,8 +54,6 @@ struct Client {
     runtime: tokio::runtime::Handle,
     upstream: Option<Upstream>,
     relay: Option<Arc<Relay>>,
-    app: String,
-    digest: String,
 }
 
 impl std::fmt::Debug for Client {
@@ -70,7 +77,7 @@ impl HttpClient for Client {
                     status.as_u16()
                 } else {
                     client.relay.as_ref().expect("direct client has relay")
-                        .send(&signal, request.into_body(), &client.app, &client.digest).await
+                        .send(&signal, request.into_body()).await
                 };
                 Ok::<_, HttpError>(Response::builder().status(status).body(Bytes::new())?)
             }).await.map_err(|e| -> HttpError { Box::new(e) })?
@@ -81,16 +88,11 @@ impl HttpClient for Client {
 
 pub struct Telemetry {
     runtime: tokio::runtime::Handle,
-    #[cfg(feature = "tracing")]
     traces: trace::SdkTracerProvider,
-    pub(crate) meters: sdk_metrics::SdkMeterProvider,
     logs: logs::SdkLoggerProvider,
-    #[cfg(feature = "tracing")]
     tracer: trace::SdkTracer,
     logger: logs::SdkLogger,
-    requests: opentelemetry::metrics::Counter<u64>,
-    latency: opentelemetry::metrics::Histogram<f64>,
-    instantiation: opentelemetry::metrics::Histogram<f64>,
+    snapshot: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Telemetry {
@@ -98,7 +100,7 @@ impl Telemetry {
         let client = Client {
             runtime: tokio::runtime::Handle::current(),
             relay: if upstream.is_none() { Some(Arc::new(Relay::new(endpoint)?)) } else { None },
-            upstream, app: app.into(), digest: digest.into(),
+            upstream,
         };
         let resource = opentelemetry_sdk::Resource::builder_empty().with_attributes(identity(app, digest)).build();
         // Programmatic bounds override SDK environment settings. No retries:
@@ -112,111 +114,85 @@ impl Telemetry {
                     .with_retry_policy(opentelemetry_otlp::RetryPolicy::default().with_max_retries(0)).build()?
             }
         }
-        #[cfg(feature = "tracing")]
         let traces = trace::SdkTracerProvider::builder().with_resource(resource.clone())
+            .with_sampler(trace::Sampler::AlwaysOn)
             .with_span_processor(trace::BatchSpanProcessor::builder(exporter!(SpanExporter, "traces"))
                 .with_batch_config(trace::BatchConfigBuilder::default().with_max_queue_size(1024)
-                    .with_max_export_batch_size(64).with_scheduled_delay(INTERVAL).build()).build())
+                    .with_max_export_batch_size(256).with_scheduled_delay(INTERVAL).build()).build())
             .build();
         let logs = logs::SdkLoggerProvider::builder().with_resource(resource.clone())
             .with_log_processor(logs::BatchLogProcessor::builder(exporter!(LogExporter, "logs"))
                 .with_batch_config(logs::BatchConfigBuilder::default().with_max_queue_size(256)
                     .with_max_export_batch_size(64).with_scheduled_delay(INTERVAL).build()).build())
             .build();
-        let meters = sdk_metrics::SdkMeterProvider::builder().with_resource(resource)
-            .with_reader(sdk_metrics::PeriodicReader::builder(exporter!(MetricExporter, "metrics"))
-                .with_interval(INTERVAL).build())
-            // Two histograms plus request counts with maximum-length object
-            // IDs must still fit together in the 1 MiB export budget.
-            .with_view(|_| sdk_metrics::Stream::builder().with_cardinality_limit(512).build().ok()).build();
-        let meter = meters.meter("nanovm");
-        let durations = |name| meter.f64_histogram(name).with_unit("s")
-            .with_boundaries(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0, 240.0]).build();
         Ok(Self {
             runtime: client.runtime.clone(),
-            #[cfg(feature = "tracing")]
             tracer: traces.tracer("nanovm"),
-            #[cfg(feature = "tracing")]
             traces,
             logger: logs.logger("nanovm"),
-            requests: meter.u64_counter("nanovm.requests").build(),
-            latency: durations("nanovm.request.duration"),
-            instantiation: durations("nanovm.instantiate.duration"),
-            meters, logs,
+            logs,
+            snapshot: Default::default(),
         })
     }
 
-    #[cfg(feature = "tracing")]
     pub fn span(&self, name: &'static str, object: &str, parent: &Context) -> Span {
-        // Requests append their response status on completion. Reserve its
-        // slot now rather than reallocating the attributes on every request.
-        let mut attributes = Vec::with_capacity(if name == "request" { 2 } else { 1 });
+        // Request metadata and phase durations stay on this one event.
+        let mut attributes = Vec::with_capacity(if name == "request" { 16 } else { 1 });
         attributes.push(KeyValue::new("nanovm.object", object.to_owned()));
         self.tracer.span_builder(name)
             .with_attributes(attributes)
             .start_with_context(&self.tracer, parent)
     }
 
-    #[cfg(not(feature = "tracing"))]
-    pub fn span(&self, _name: &'static str, _object: &str, _parent: &Context) -> Span {
-        Span::DEFAULT
+    /// The callback holds only a weak owner. Neither the timer nor SDK owns
+    /// a node/worker lifetime, and explicit flush includes a fresh snapshot.
+    pub fn snapshots(self: &Arc<Self>, snapshot: impl Fn() + Send + Sync + 'static) {
+        assert!(self.snapshot.set(Box::new(snapshot)).is_ok());
+        let weak = Arc::downgrade(self);
+        self.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(INTERVAL).await;
+                let Some(telemetry) = weak.upgrade() else { break };
+                telemetry.snapshot.get().unwrap()();
+            }
+        });
     }
 
-    pub fn request(&self, object: &str, status: u16, elapsed: Duration) {
-        let attrs = [KeyValue::new("nanovm.object", object.to_owned()), KeyValue::new("http.response.status_code", status as i64)];
-        self.requests.add(1, &attrs);
-        self.latency.record(elapsed.as_secs_f64(), &attrs);
+    pub fn snapshot(&self, attributes: Vec<(opentelemetry::Key, opentelemetry::logs::AnyValue)>) {
+        let mut record = self.logger.create_log_record();
+        record.add_attribute("event.name", "nanovm.snapshot");
+        record.add_attributes(attributes);
+        self.logger.emit(record);
     }
 
-    pub fn instantiated(&self, object: &str, elapsed: Duration) {
-        self.instantiation.record(elapsed.as_secs_f64(), &[KeyValue::new("nanovm.object", object.to_owned())]);
-    }
-
-    pub fn observe(&self, node: &Arc<crate::table::Node>) {
+    pub fn observe(self: &Arc<Self>, node: &Arc<crate::table::Node>) {
         use std::sync::atomic::Ordering::Relaxed;
-        let meter = self.meters.meter("nanovm");
-        macro_rules! counters {
-            ($($field:ident),* $(,)?) => { $(
-                let weak = Arc::downgrade(node);
-                meter.u64_observable_counter(concat!("nanovm.", stringify!($field)))
-                    .with_callback(move |o| {
-                        if let Some(node) = weak.upgrade() { o.observe(node.metrics.$field.load(Relaxed), &[]); }
-                    }).build();
-            )* }
-        }
-        counters!(instantiate_failures, evicted_idle, evicted_lru, rejected_busy,
-            rejected_capacity, egress_allowed, egress_denied, fs_denied, guest_cpu_ns);
         let weak = Arc::downgrade(node);
-        meter.u64_observable_counter("nanovm.poisons").with_callback(move |o| {
-            if let Some(node) = weak.upgrade() {
-                for p in crate::metrics::Poison::ALL {
-                    o.observe(node.metrics.poisons[p as usize].load(Relaxed), &[KeyValue::new("reason", p.as_str())]);
-                }
+        self.snapshots(move || {
+            let Some(node) = weak.upgrade() else { return };
+            let mut fields = vec![
+                ("process.pid".into(), (std::process::id() as i64).into()),
+                ("process.memory.usage".into(), (crate::metrics::rss_bytes() as i64).into()),
+                ("process.uptime".into(), node.started.elapsed().as_secs_f64().into()),
+                ("nanovm.stores.live".into(), node.metrics.stores_live.load(Relaxed).into()),
+                ("nanovm.stores.peak".into(), node.metrics.stores_peak.load(Relaxed).into()),
+                ("nanovm.objects.live".into(), (node.live_objects() as i64).into()),
+                ("nanovm.objects.limit".into(), (node.cfg.max_live_objects as i64).into()),
+            ];
+            macro_rules! counters {
+                ($($field:ident),* $(,)?) => { $(fields.push((concat!("nanovm.", stringify!($field)).into(),
+                    (node.metrics.$field.load(Relaxed) as i64).into()));)* }
             }
-        }).build();
-        macro_rules! gauge {
-            ($name:literal, $node:ident, $value:expr) => {
-                let weak = Arc::downgrade(node);
-                meter.u64_observable_gauge($name).with_callback(move |o| {
-                    if let Some($node) = weak.upgrade() { o.observe($value as u64, &[]); }
-                }).build();
+            counters!(instantiate_failures, evicted_idle, evicted_lru, rejected_busy,
+                rejected_capacity, egress_allowed, egress_denied, fs_denied, guest_cpu_ns);
+            for p in crate::metrics::Poison::ALL {
+                fields.push((format!("nanovm.poisons.{}", p.as_str()).into(), (node.metrics.poisons[p as usize].load(Relaxed) as i64).into()));
             }
-        }
-        gauge!("nanovm.stores.live", n, n.metrics.stores_live.load(Relaxed));
-        gauge!("nanovm.stores.peak", n, n.metrics.stores_peak.load(Relaxed));
-        gauge!("nanovm.objects.live", n, n.live_objects());
-        gauge!("nanovm.objects.limit", n, n.cfg.max_live_objects);
-        gauge!("process.memory.usage", _n, crate::metrics::rss_bytes());
-        gauge!("nanovm.uptime", n, n.started.elapsed().as_secs());
-        let weak = Arc::downgrade(node);
-        meter.u64_observable_gauge("nanovm.objects.phase").with_callback(move |o| {
-            if let Some(node) = weak.upgrade() {
-                let phases = node.phases();
-                for phase in crate::object::Phase::ALL {
-                    o.observe(*phases.get(phase.as_str()).unwrap_or(&0) as u64, &[KeyValue::new("phase", phase.as_str())]);
-                }
+            for (phase, count) in node.phases() {
+                fields.push((format!("nanovm.objects.phase.{phase}").into(), (count as i64).into()));
             }
-        }).build();
+            node.telemetry.snapshot(fields);
+        });
     }
 
     pub fn log(&self, object: &str, stream: &'static str, bytes: &[u8], context: &Context) {
@@ -249,10 +225,10 @@ impl Telemetry {
     /// Call from a blocking task: SDK flushing waits for its export threads,
     /// whose link operations still need the async runtime to be running.
     pub fn flush(&self) -> anyhow::Result<()> {
+        if let Some(snapshot) = self.snapshot.get() { snapshot(); }
         for result in [
-            #[cfg(feature = "tracing")]
             self.traces.force_flush(),
-            self.meters.force_flush(), self.logs.force_flush(),
+            self.logs.force_flush(),
         ] {
             result?;
         }
@@ -263,14 +239,11 @@ impl Telemetry {
 impl Drop for Telemetry {
     fn drop(&mut self) {
         // SDK shutdown waits for export threads. Keep that wait off both the
-        // async runtime and a metric callback dropping its last Node reference.
-        #[cfg(feature = "tracing")]
+        // async runtime and a snapshot callback dropping its last Node reference.
         let traces = self.traces.clone();
-        let (meters, logs) = (self.meters.clone(), self.logs.clone());
+        let logs = self.logs.clone();
         self.runtime.spawn_blocking(move || {
-            #[cfg(feature = "tracing")]
             let _ = traces.shutdown_with_timeout(DEADLINE);
-            let _ = meters.shutdown_with_timeout(DEADLINE);
             let _ = logs.shutdown_with_timeout(DEADLINE);
         });
     }
@@ -303,15 +276,16 @@ impl Relay {
         let Ok(_slot) = self.slots.try_acquire() else { return 429 };
         match tokio::time::timeout(DEADLINE, async {
             match Limited::new(req.into_body(), MAX_BATCH).collect().await {
-                Ok(body) => self.send(&signal, body.to_bytes(), app, digest).await,
+                Ok(body) => match stamp(&signal, &body.to_bytes(), app, digest) {
+                    Ok(body) => self.send(&signal, body.into()).await,
+                    Err(_) => 400,
+                },
                 Err(_) => 413,
             }
         }).await { Ok(status) => status, Err(_) => 504 }
     }
 
-    async fn send(&self, signal: &str, body: Bytes, app: &str, digest: &str) -> u16 {
-        if body.len() > MAX_BATCH { return 413 }
-        let body = match stamp(signal, &body, app, digest) { Ok(body) => body, Err(_) => return 400 };
+    async fn send(&self, signal: &str, body: Bytes) -> u16 {
         if body.len() > MAX_BATCH { return 413 }
         match self.http.post(format!("{}/v1/{signal}", self.endpoint))
             .header("content-type", "application/x-protobuf").body(body).send().await {
@@ -356,21 +330,6 @@ fn stamp(signal: &str, body: &[u8], app: &str, digest: &str) -> anyhow::Result<V
         "logs" => batch!(collector::logs::v1::ExportLogsServiceRequest, resource_logs, scope_logs, log_records, l, {
             scrub(&mut l.attributes);
         }),
-        "metrics" => batch!(collector::metrics::v1::ExportMetricsServiceRequest, resource_metrics, scope_metrics, metrics, m, {
-            macro_rules! points { ($data:expr) => { for p in &mut $data.data_points {
-                scrub(&mut p.attributes);
-                for e in &mut p.exemplars { scrub(&mut e.filtered_attributes); }
-            } } }
-            if let Some(data) = &mut m.data {
-                match data {
-                    metrics::metric::Data::Gauge(d) => points!(d),
-                    metrics::metric::Data::Sum(d) => points!(d),
-                    metrics::metric::Data::Histogram(d) => points!(d),
-                    metrics::metric::Data::ExponentialHistogram(d) => points!(d),
-                    metrics::metric::Data::Summary(d) => for p in &mut d.data_points { scrub(&mut p.attributes); },
-                }
-            }
-        }),
         _ => anyhow::bail!("unknown telemetry signal"),
     })
 }
@@ -404,18 +363,16 @@ mod tests {
         let telemetry = Telemetry::new(&endpoint, "lifecycle", "v1", None).unwrap();
         use opentelemetry::trace::Span as _;
         let span = telemetry.span("last-request", "room", &Context::new());
-        assert_eq!(span.is_recording(), cfg!(feature = "tracing"));
+        assert!(span.is_recording());
         drop(span);
         telemetry.log("room", "stdout", b"last log", &Context::new());
-        telemetry.request("room", 201, Duration::from_millis(3));
         let started = std::time::Instant::now();
         drop(telemetry);
         assert!(started.elapsed() < Duration::from_millis(250), "SDK shutdown blocked the runtime");
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut seen = std::collections::HashSet::new();
-            while seen.len() < if cfg!(feature = "tracing") { 3 } else { 2 } {
+            while seen.len() < 2 {
                 let (path, body) = rx.recv().await.unwrap();
-                assert!(cfg!(feature = "tracing") || path != "/v1/traces");
                 match path.as_str() {
                     "/v1/traces" => assert!(collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap()
                         .resource_spans.iter().flat_map(|r| &r.scope_spans).flat_map(|s| &s.spans)
@@ -423,55 +380,11 @@ mod tests {
                     "/v1/logs" => assert!(collector::logs::v1::ExportLogsServiceRequest::decode(body).unwrap()
                         .resource_logs.iter().flat_map(|r| &r.scope_logs).flat_map(|s| &s.log_records)
                         .any(|l| l.body.as_ref().and_then(|v| v.value.as_ref()) == Some(&common::any_value::Value::StringValue("last log".into())))),
-                    "/v1/metrics" => assert!(collector::metrics::v1::ExportMetricsServiceRequest::decode(body).unwrap()
-                        .resource_metrics.iter().flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics)
-                        .any(|m| m.name == "nanovm.requests" && matches!(&m.data, Some(metrics::metric::Data::Sum(s))
-                            if s.data_points.iter().any(|p| p.value == Some(metrics::number_data_point::Value::AsInt(1)))))),
                     _ => panic!("unexpected signal: {path}"),
                 }
                 seen.insert(path);
             }
         }).await.expect("all pending signals exported on drop");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn metric_cardinality_overflow_still_exports_complete_totals() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(crate::server::serve_http1(listener, move |req| {
-            let tx = tx.clone();
-            async move {
-                let body = req.into_body().collect().await.unwrap().to_bytes();
-                tx.send(body).unwrap();
-                http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
-            }
-        }));
-        let telemetry = Telemetry::new(&endpoint, "cardinality", "digest", None).unwrap();
-        for i in 0..4096 {
-            let object = format!("{i:0128}");
-            telemetry.request(&object, 200, Duration::from_millis(1));
-            telemetry.instantiated(&object, Duration::from_millis(2));
-        }
-        tokio::task::spawn_blocking(move || telemetry.flush()).await.unwrap().unwrap();
-        let body = rx.recv().await.unwrap();
-        assert!(body.len() <= MAX_BATCH);
-        let metrics = collector::metrics::v1::ExportMetricsServiceRequest::decode(body).unwrap();
-        assert_eq!(metrics.resource_metrics.iter().flat_map(|r| &r.scope_metrics).map(|s| s.metrics.len()).sum::<usize>(), 3);
-        for metric in metrics.resource_metrics.iter().flat_map(|r| &r.scope_metrics).flat_map(|s| &s.metrics) {
-            match metric.data.as_ref().unwrap() {
-                metrics::metric::Data::Sum(s) => {
-                    assert!(s.data_points.len() <= 513);
-                    assert_eq!(s.data_points.iter().map(|p| match p.value { Some(metrics::number_data_point::Value::AsInt(v)) => v, _ => 0 }).sum::<i64>(), 4096);
-                }
-                metrics::metric::Data::Histogram(h) => {
-                    assert!(h.data_points.len() <= 513);
-                    assert_eq!(h.data_points.iter().map(|p| p.count).sum::<u64>(), 4096);
-                }
-                other => panic!("unexpected metric: {other:?}"),
-            }
-        }
         server.abort();
     }
 
@@ -486,7 +399,7 @@ mod tests {
         let collector = tokio::spawn(crate::server::serve_http1(listener, move |req| {
             let output = output.clone();
             async move {
-                assert!(matches!(req.uri().path(), "/v1/traces" | "/v1/logs" | "/v1/metrics"));
+                assert!(matches!(req.uri().path(), "/v1/traces" | "/v1/logs"));
                 assert!(req.headers().get("nanovm-app").is_none());
                 let body = req.into_body().collect().await.unwrap().to_bytes();
                 output.lock().push(body);
@@ -536,29 +449,7 @@ mod tests {
         let logs = collector::logs::v1::ExportLogsServiceRequest::decode(captured.lock()[1].clone()).unwrap();
         assert_eq!(logs.resource_logs[0].resource, trusted);
         assert!(logs.resource_logs[0].scope_logs[0].log_records[0].attributes.is_empty());
-        let metrics = collector::metrics::v1::ExportMetricsServiceRequest {
-            resource_metrics: vec![metrics::ResourceMetrics {
-                resource: Some(Resource { attributes: forged.clone(), ..Default::default() }),
-                scope_metrics: vec![metrics::ScopeMetrics {
-                    metrics: vec![metrics::Metric {
-                        name: "requests".into(),
-                        data: Some(metrics::metric::Data::Gauge(metrics::Gauge {
-                            data_points: vec![metrics::NumberDataPoint {
-                                attributes: forged.clone(),
-                                exemplars: vec![metrics::Exemplar { filtered_attributes: forged, ..Default::default() }],
-                                ..Default::default()
-                            }],
-                        })), ..Default::default()
-                    }], ..Default::default()
-                }], ..Default::default()
-            }],
-        };
-        assert_eq!(http.post(format!("http://{addr}{PATH}metrics")).body(metrics.encode_to_vec()).send().await.unwrap().status(), 200);
-        let metrics = collector::metrics::v1::ExportMetricsServiceRequest::decode(captured.lock()[2].clone()).unwrap();
-        assert_eq!(metrics.resource_metrics[0].resource, trusted);
-        let Some(metrics::metric::Data::Gauge(g)) = &metrics.resource_metrics[0].scope_metrics[0].metrics[0].data else { panic!("gauge lost") };
-        assert!(g.data_points[0].attributes.is_empty());
-        assert!(g.data_points[0].exemplars[0].filtered_attributes.is_empty());
+        assert_eq!(http.post(format!("http://{addr}{PATH}metrics")).body("").send().await.unwrap().status(), 400);
         assert_eq!(http.post(&url).body(vec![0; (1 << 20) + 1]).send().await.unwrap().status(), 413);
         assert_eq!(http.post(&url).body("not protobuf").send().await.unwrap().status(), 400);
         let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -566,13 +457,13 @@ mod tests {
         let mut out = String::new();
         tokio::time::timeout(Duration::from_secs(4), slow.read_to_string(&mut out)).await.unwrap().unwrap();
         assert!(out.starts_with("HTTP/1.1 504"), "{out}");
-        assert_eq!(captured.lock().len(), 3, "invalid batches must never reach the collector");
+        assert_eq!(captured.lock().len(), 2, "invalid batches must never reach the collector");
 
         // The producer must bound the UTF-8 body, not merely its input bytes.
         let telemetry = Telemetry::new(&endpoint, "real-app", "real-digest", None).unwrap();
         telemetry.log("room", "stdout", &vec![0xff; 8192], &Context::new());
         tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
-        let logs = collector::logs::v1::ExportLogsServiceRequest::decode(captured.lock()[3].clone()).unwrap();
+        let logs = collector::logs::v1::ExportLogsServiceRequest::decode(captured.lock()[2].clone()).unwrap();
         let record = &logs.resource_logs[0].scope_logs[0].log_records[0];
         let Some(common::any_value::Value::StringValue(body)) = record.body.as_ref().and_then(|b| b.value.as_ref()) else { panic!("log body missing") };
         assert_eq!(body, &"\u{fffd}".repeat(1365));

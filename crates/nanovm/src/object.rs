@@ -15,6 +15,7 @@ use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use parking_lot::Mutex;
+use opentelemetry::trace::Span as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use wasmtime::component::{Accessor, ResourceTable, ResourceTableError};
 use wasmtime::{ResourceLimiter, Store, Trap, UpdateDeadline};
@@ -40,7 +41,7 @@ pub struct Job {
     pub reply: oneshot::Sender<http::Response<RespBody>>,
     pub enqueued: Instant,
     pub context: opentelemetry::Context,
-    pub queue: crate::telemetry::Span,
+    pub span: crate::telemetry::Span,
 }
 
 #[repr(u8)]
@@ -416,20 +417,40 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
 struct Pending {
     reply: Option<oneshot::Sender<http::Response<RespBody>>>,
     abort: Arc<AtomicBool>,
+    span: crate::telemetry::Span,
+    phase: &'static str,
+    since: Instant,
+}
+
+impl Pending {
+    fn phase(&mut self, phase: &'static str) {
+        crate::telemetry::duration(&mut self.span, self.phase, self.since);
+        self.phase = phase;
+        self.since = Instant::now();
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        crate::telemetry::duration(&mut self.span, self.phase, self.since);
+    }
 }
 
 pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Job>) {
     loop {
+        let Some(mut job) = rx.recv().await else { return };
+        *shared.context.lock() = job.context.clone();
         shared.set_phase(Phase::Starting);
         // A store holds a slot until it is dropped, and the pool has room for
         // every slot. An evicted object's store lives until its actor next
         // runs, so a new object waits here until that store is gone rather
         // than finding the pool full.
         let slot = node.slots.clone().acquire_owned().await.expect("slots is never closed");
+        crate::telemetry::duration(&mut job.span, "nanovm.queue.duration_ms", job.enqueued);
+        job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", true));
         shared.begin_start();
         let t0 = Instant::now();
         let started = async {
-            let _span = node.telemetry.span("instantiate", &shared.id, &shared.context.lock());
             let mut store = new_store(&node, &app, &shared)?;
             let svc = shared
                 .charged(&node.metrics, app.pre.instantiate_async(&mut store))
@@ -437,11 +458,10 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
             anyhow::Ok((store, svc))
         }
         .await;
+        crate::telemetry::duration(&mut job.span, "nanovm.instantiate.duration_ms", t0);
         match started {
             Ok((store, svc)) => {
-                node.metrics.instantiate.record(t0.elapsed());
-                node.telemetry.instantiated(&shared.id, t0.elapsed());
-                match serve(&node, &app, &shared, store, svc, &mut rx).await {
+                match serve(&node, &app, &shared, store, svc, job, &mut rx).await {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
                     Exit::Reset => node.metrics.event("rolled-back", &shared.id, "a request failed"),
@@ -455,9 +475,9 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                 let e = format!("{e:#}");
                 node.metrics.instantiate_failures.fetch_add(1, Relaxed);
                 node.metrics.event("instantiate-failed", &shared.id, &*e);
-                if let Ok(job) = rx.try_recv() {
-                    let _ = job.reply.send(error_response(503, "instantiate-failed", &e));
-                }
+                let response = error_response(503, "instantiate-failed", &e);
+                crate::telemetry::response(&mut job.span, &response);
+                let _ = job.reply.send(response);
             }
         }
         drop(slot);
@@ -474,29 +494,36 @@ async fn serve(
     shared: &Arc<ObjShared>,
     mut store: Store<ObjState>,
     svc: Service,
+    first: Job,
     rx: &mut mpsc::Receiver<Job>,
 ) -> Exit {
     let limits = &app.cfg.limits;
     let max_resp = limits.max_response_body_kb << 10;
     let pending: Arc<Mutex<Option<Pending>>> = Arc::default();
-    let metrics = node.metrics.clone();
 
     let inner = {
         let pending = pending.clone();
         let shared = shared.clone();
         let svc = &svc;
+        let mut first = Some(first);
         async move |acc: &Accessor<ObjState>| -> wasmtime::Result<()> {
             loop {
                 shared.set_phase(Phase::Idle);
-                let Some(job) = rx.recv().await else { return Ok(()) };
-                drop(job.queue);
+                let job = if let Some(job) = first.take() { job } else {
+                    let Some(mut job) = rx.recv().await else { return Ok(()) };
+                    crate::telemetry::duration(&mut job.span, "nanovm.queue.duration_ms", job.enqueued);
+                    job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", false));
+                    job
+                };
                 *shared.context.lock() = job.context.clone();
                 shared.begin_request();
-                metrics.requests.fetch_add(1, Relaxed);
                 let abort = Arc::new(AtomicBool::new(false));
                 *pending.lock() = Some(Pending {
                     reply: Some(job.reply),
                     abort: abort.clone(),
+                    span: job.span,
+                    phase: "nanovm.guest.duration_ms",
+                    since: Instant::now(),
                 });
 
                 let (parts, body) = job.req.into_parts();
@@ -504,7 +531,6 @@ async fn serve(
                 let (req, req_io) =
                     acc.with(|mut s| wasmtime_wasi_http::p3::Request::from_http(&mut s.data_mut().hooks, req));
 
-                let guest_span = node.telemetry.span("guest", &shared.id, &job.context);
                 let (resp, mut failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
                         let res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
@@ -520,17 +546,14 @@ async fn serve(
                     }
                     Err(code) => (error_response(500, "guest-error", &format!("{code:?}")), true),
                 };
-                drop(guest_span);
+                pending.lock().as_mut().unwrap().phase("nanovm.commit.duration_ms");
                 shared.set_phase(Phase::PostReturn);
                 // Nothing is heard of a request before its changes are
                 // durable. One that failed (as one that traps or runs out of
                 // time) restarts its instance, which rolls them back; an
                 // answer, whatever its status, commits them.
                 let resp = match failed {
-                    false => match {
-                        let _span = node.telemetry.span("commit", &shared.id, &job.context);
-                        commit(acc).await
-                    } {
+                    false => match commit(acc).await {
                         Ok(()) => resp,
                         Err(e) => {
                             failed = true;
@@ -539,22 +562,24 @@ async fn serve(
                     },
                     true => resp,
                 };
-                let status = resp.status().as_u16();
-                if let Some(tx) = pending.lock().as_mut().and_then(|p| p.reply.take()) {
-                    let _ = tx.send(resp);
+                {
+                    let mut guard = pending.lock();
+                    let p = guard.as_mut().unwrap();
+                    crate::telemetry::response(&mut p.span, &resp);
+                    crate::telemetry::duration(&mut p.span, "nanovm.response.duration_ms", job.enqueued);
+                    p.phase("nanovm.post_return.duration_ms");
+                    if let Some(tx) = p.reply.take() { let _ = tx.send(resp); }
                 }
-                metrics.status(status);
-                metrics.latency.record(job.enqueued.elapsed());
-
                 // Let tasks the guest left running (e.g. streaming the body)
                 // finish before taking the next request.
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
-                *pending.lock() = None;
+                pending.lock().as_mut().unwrap().phase("nanovm.post_return_commit.duration_ms");
                 // What it changed after answering commits now.
-                if failed || {
-                    let _span = node.telemetry.span("commit", &shared.id, &job.context);
-                    commit(acc).await.is_err()
-                } {
+                let reset = failed || commit(acc).await.is_err();
+                if let Some(mut p) = pending.lock().take() {
+                    if reset { p.span.set_status(opentelemetry::trace::Status::error("request rolled back")); }
+                }
+                if reset {
                     acc.with(|mut s| s.data_mut().reset = true);
                     return Ok(());
                 }
@@ -607,10 +632,14 @@ async fn serve(
         && let Some(mut pending) = pending.lock().take()
     {
         pending.abort.store(true, Relaxed);
+        pending.span.set_status(opentelemetry::trace::Status::error(p.as_str()));
         if let Some(tx) = pending.reply.take() {
             let status = if *p == Poison::Timeout { 504 } else { 500 };
-            node.metrics.status(status);
-            let _ = tx.send(error_response(status, p.as_str(), detail));
+            let response = error_response(status, p.as_str(), detail);
+            crate::telemetry::response(&mut pending.span, &response);
+            let _ = tx.send(response);
+        } else {
+            pending.span.set_attribute(opentelemetry::KeyValue::new("error.type", p.as_str()));
         }
     }
     drop(store);

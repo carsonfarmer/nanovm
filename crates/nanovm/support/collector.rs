@@ -1,13 +1,13 @@
 //! Small OTLP collector for integration tests and the local demo, not a server API.
 use std::collections::{BTreeMap, VecDeque};
 
-use opentelemetry_proto::tonic::{collector, common::v1::{KeyValue, any_value}, metrics::v1::{ResourceMetrics, metric, number_data_point}};
+use opentelemetry_proto::tonic::{collector, common::v1::{KeyValue, any_value}};
 use prost::Message;
 use serde_json::{Map, Value, json};
 
 #[derive(Default)]
 pub struct Collector {
-    metrics: BTreeMap<String, (ResourceMetrics, u128)>,
+    snapshots: BTreeMap<(String, String), (Map<String, Value>, u64, u128)>,
     pub logs: VecDeque<Value>,
 }
 
@@ -25,20 +25,21 @@ impl Collector {
     pub fn ingest(&mut self, path: &str, body: &[u8]) -> anyhow::Result<()> {
         match path {
             "/v1/traces" => { collector::trace::v1::ExportTraceServiceRequest::decode(body)?; }
-            "/v1/metrics" => {
-                for resource in collector::metrics::v1::ExportMetricsServiceRequest::decode(body)?.resource_metrics {
-                    let a = attrs(&resource.resource.as_ref().ok_or_else(|| anyhow::anyhow!("missing resource"))?.attributes);
-                    let app = a["nanovm.app"].as_str().unwrap_or_default().to_owned();
-                    if !self.metrics.contains_key(&app) && self.metrics.len() >= 1024 { self.metrics.pop_first(); }
-                    let received = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
-                    self.metrics.insert(app, (resource, received));
-                }
-            }
             "/v1/logs" => {
                 for resource in collector::logs::v1::ExportLogsServiceRequest::decode(body)?.resource_logs {
                     let a = attrs(&resource.resource.as_ref().ok_or_else(|| anyhow::anyhow!("missing resource"))?.attributes);
                     for log in resource.scope_logs.into_iter().flat_map(|s| s.log_records) {
-                        let fields = attrs(&log.attributes);
+                        let mut fields = attrs(&log.attributes);
+                        if fields.get("event.name").and_then(Value::as_str) == Some("nanovm.snapshot") {
+                            let key = (a["nanovm.app"].as_str().unwrap_or_default().to_owned(),
+                                fields.get("nanovm.worker.app").and_then(Value::as_str).unwrap_or_default().to_owned());
+                            if self.snapshots.get(&key).is_some_and(|(_, timestamp, _)| *timestamp > log.observed_time_unix_nano) { continue }
+                            if !self.snapshots.contains_key(&key) && self.snapshots.len() >= 1024 { self.snapshots.pop_first(); }
+                            fields.insert("service.version".into(), a["service.version"].clone());
+                            let received = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+                            self.snapshots.insert(key, (fields, log.observed_time_unix_nano, received));
+                            continue;
+                        }
                         let detail = match log.body.and_then(|b| b.value) {
                             Some(any_value::Value::StringValue(s)) => s, _ => String::new(),
                         };
@@ -53,73 +54,58 @@ impl Collector {
         Ok(())
     }
 
-    /// A projection for existing assertions and demo jq expressions. Every
-    /// value comes from decoded OTLP; no runtime introspection or stats HTTP.
+    /// Project decoded snapshot events for tests and demo jq expressions.
+    /// Never show a retired worker's snapshot as its replacement's state.
     pub fn snapshot(&self) -> Value {
         let mut root = json!({"workers": {}, "apps": {}, "rss_mb": 0});
-        for (app, (resource, _)) in &self.metrics {
-            for m in resource.scope_metrics.iter().flat_map(|s| &s.metrics) {
-                let points = match &m.data {
-                    Some(metric::Data::Gauge(g)) => &g.data_points,
-                    Some(metric::Data::Sum(s)) => &s.data_points,
-                    Some(metric::Data::Histogram(h)) => {
-                        let name = match m.name.as_str() {
-                            "nanovm.instantiate.duration" => "instantiate",
-                            "nanovm.request.duration" => "latency",
-                            _ => continue,
-                        };
-                        root["apps"][app][name] = json!({"count": h.data_points.iter().map(|p| p.count).sum::<u64>()});
-                        continue;
+        let mut received = BTreeMap::new();
+        let supervisor_time = self.snapshots.get(&("_supervisor".into(), String::new())).map_or(0, |(_, timestamp, _)| *timestamp);
+        for ((app, worker), (fields, timestamp, time)) in &self.snapshots {
+            if app == "_supervisor" {
+                if worker.is_empty() {
+                    root["rss_mb"] = json!(fields["process.memory.usage"].as_f64().unwrap_or(0.0) / 1048576.0);
+                    root["uptime_ms"] = json!(fields["process.uptime"].as_f64().unwrap_or(0.0) * 1000.0);
+                    received.insert(app.clone(), *time);
+                } else {
+                    // Each collection starts with the supervisor event. A
+                    // worker absent from that collection has been retired.
+                    if *timestamp < supervisor_time { continue }
+                    let w = &mut root["workers"][worker];
+                    for (key, attr) in [("up", "nanovm.worker.up"), ("pid", "process.pid"),
+                        ("digest", "nanovm.worker.digest"), ("version", "nanovm.worker.version"),
+                        ("policies", "nanovm.worker.policies"), ("starts", "nanovm.worker.starts"),
+                        ("link_errors", "nanovm.worker.link_errors")] {
+                        w[key] = fields[attr].clone();
                     }
-                    _ => continue,
-                };
-                for p in points {
-                    let value = match p.value {
-                        Some(number_data_point::Value::AsInt(n)) => n as f64,
-                        Some(number_data_point::Value::AsDouble(n)) => n,
-                        None => continue,
-                    };
-                    let a = attrs(&p.attributes);
-                    if app == "_supervisor" {
-                        if m.name == "process.memory.usage" { root["rss_mb"] = json!(value / 1048576.0); continue }
-                        if m.name == "process.uptime" { root["uptime_ms"] = json!(value * 1000.0); continue }
-                        let Some(worker) = a.get("nanovm.worker.app").and_then(Value::as_str) else { continue };
-                        let w = &mut root["workers"][worker];
-                        match m.name.as_str() {
-                            "nanovm.worker.up" => {
-                                w["up"] = json!(value != 0.0);
-                                for (key, attr) in [("pid", "process.pid"), ("digest", "nanovm.worker.digest"),
-                                    ("version", "nanovm.worker.version"), ("policies", "nanovm.worker.policies")] {
-                                    w[key] = a.get(attr).cloned().unwrap_or(Value::Null);
-                                }
-                            }
-                            "nanovm.worker.starts" => w["starts"] = json!(value as u64),
-                            "nanovm.worker.link_errors" => w["link_errors"] = json!(value as u64),
-                            _ => (),
-                        }
-                        continue;
-                    }
-                    let v = &mut root["apps"][app];
-                    match m.name.as_str() {
-                        "nanovm.poisons" => v["poisons"][a["reason"].as_str().unwrap()] = json!(value as u64),
-                        "nanovm.objects.phase" => v["phases"][a["phase"].as_str().unwrap()] = json!(value as u64),
-                        "process.memory.usage" => v["rss_mb"] = json!(value / 1048576.0),
-                        "nanovm.objects.live" => v["live_objects"] = json!(value as u64),
-                        "nanovm.objects.limit" => v["max_live_objects"] = json!(value as u64),
-                        "nanovm.stores.live" => v["stores_live"] = json!(value as u64),
-                        "nanovm.stores.peak" => v["stores_peak"] = json!(value as u64),
-                        "nanovm.requests" => v["requests"] = json!(v["requests"].as_u64().unwrap_or(0) + value as u64),
-                        name => if let Some(key) = name.strip_prefix("nanovm.") { v[key] = json!(value as u64); },
+                }
+                continue;
+            }
+            let v = &mut root["apps"][app];
+            for (name, value) in fields {
+                if let Some(reason) = name.strip_prefix("nanovm.poisons.") { v["poisons"][reason] = value.clone(); }
+                else if let Some(phase) = name.strip_prefix("nanovm.objects.phase.") { v["phases"][phase] = value.clone(); }
+                else {
+                    match name.as_str() {
+                        "process.memory.usage" => v["rss_mb"] = json!(value.as_f64().unwrap_or(0.0) / 1048576.0),
+                        "nanovm.objects.live" => v["live_objects"] = value.clone(),
+                        "nanovm.objects.limit" => v["max_live_objects"] = value.clone(),
+                        "nanovm.stores.live" => v["stores_live"] = value.clone(),
+                        "nanovm.stores.peak" => v["stores_peak"] = value.clone(),
+                        _ => if let Some(key) = name.strip_prefix("nanovm.") { v[key] = value.clone(); },
                     }
                 }
             }
+            received.insert(app.clone(), *time);
         }
-        // Retired workers' last resource batches are not live process state.
-        let active: Vec<_> = root["workers"].as_object().unwrap().iter()
-            .filter(|(_, w)| w["up"] == true).map(|(name, _)| name.clone()).collect();
-        root["apps"].as_object_mut().unwrap().retain(|name, _| active.contains(name));
-        root["collected_at_ms"] = json!(active.iter().map(String::as_str).chain(["_supervisor"])
-            .map(|app| self.metrics.get(app).map_or(0, |(_, received)| *received)).min().unwrap_or(0));
+        let workers = root["workers"].clone();
+        root["apps"].as_object_mut().unwrap().retain(|app, _| {
+            let fields = &self.snapshots[&(app.clone(), String::new())].0;
+            workers[app]["up"] == true && workers[app]["digest"] == fields["service.version"]
+                && workers[app]["pid"] == fields["process.pid"]
+        });
+        root["collected_at_ms"] = json!(workers.as_object().unwrap().iter().filter(|(_, w)| w["up"] == true)
+            .map(|(app, _)| if root["apps"].get(app).is_some() { *received.get(app).unwrap_or(&0) } else { 0 })
+            .chain([*received.get("_supervisor").unwrap_or(&0)]).min().unwrap_or(0));
         root
     }
 }

@@ -42,7 +42,3 @@ jobs:
         run: |
           ulimit -n "$(ulimit -Hn)"
           env -u RUST_BACKTRACE cargo test --locked -p nanovm
-      - name: Test without tracing (metrics and logs remain enabled)
-        run: |
-          ulimit -n "$(ulimit -Hn)"
-          env -u RUST_BACKTRACE cargo test --locked -p nanovm --no-default-features

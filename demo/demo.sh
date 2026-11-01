@@ -149,7 +149,7 @@ sort -n -k2 "$CANARY" | awk '{n++; if ($1 != 200) bad++; t[n] = $2 * 1000}
     END {printf "  %d requests over HTTP, %d not 200, p50 %.1f ms, p99 %.1f ms (curl per request)\n",
         n, bad, t[int(n * 0.5) + 1], t[int(n * 0.99) + 1]}'
 snapshot | jq -r '.workers as $w | .apps | to_entries[] |
-    "  \(.key) worker (pid \($w[.key].pid), started \($w[.key].starts)×): \(.value.live_objects) live objects, \(.value.instantiate.count) instantiations, \(.value.poisons | to_entries | map(select(.value > 0) | "\(.key) \(.value)") | join(", ")) killed"'
+    "  \(.key) worker (pid \($w[.key].pid), started \($w[.key].starts)×): \(.value.live_objects) live objects, \(.value.poisons | to_entries | map(select(.value > 0) | "\(.key) \(.value)") | join(", ")) killed"'
 
 if [ -n "$SERVER" ]; then
     say "node still running on $URL (Ctrl-C to stop)"

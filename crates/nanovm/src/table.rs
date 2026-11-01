@@ -136,24 +136,25 @@ impl Node {
                 .extract(&opentelemetry_http::HeaderExtractor(req.headers()))
         });
         let mut span = self.telemetry.span("request", id, &parent);
-        // Only immutable IDs cross tasks; the dispatch owns the SDK span.
-        let context = if cfg!(feature = "tracing") { parent.with_remote_span_context(span.span_context().clone()) } else { parent };
+        span.set_attribute(opentelemetry::KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
+        let path = req.uri().path();
+        span.set_attribute(opentelemetry::KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
+        // The actor owns the recording span through post-return work. Only
+        // immutable context is shared with guest logs and calls.
+        let context = parent.with_remote_span_context(span.span_context().clone());
         let enqueued = Instant::now();
         let (reply, rx) = oneshot::channel();
         let job = Job {
             req,
             reply,
             enqueued,
-            queue: self.telemetry.span("queue", id, &context),
+            span,
             context,
         };
-        let response = match self.enqueue(id, job) {
+        match self.enqueue(id, job) {
             Err(resp) => resp,
             Ok(()) => rx.await.unwrap_or_else(|_| error_response(503, "object-unavailable", "the object stopped before answering")),
-        };
-        span.set_attribute(opentelemetry::KeyValue::new("http.response.status_code", response.status().as_u16() as i64));
-        self.telemetry.request(id, response.status().as_u16(), enqueued.elapsed());
-        response
+        }
     }
 
     fn enqueue(self: &Arc<Self>, id: &str, mut job: Job) -> Result<(), http::Response<RespBody>> {
@@ -169,14 +170,16 @@ impl Node {
                     tokio::spawn(async move { tx.send(job).await });
                     return Ok(());
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(mpsc::error::TrySendError::Full(mut job)) => {
                     self.metrics.rejected_busy.fetch_add(1, Relaxed);
                     let max = app.cfg.limits.max_queue;
-                    return Err(error_response(
+                    let response = error_response(
                         503,
                         "object-busy",
                         &format!("queue full ({max} waiting)"),
-                    ));
+                    );
+                    crate::telemetry::response(&mut job.span, &response);
+                    return Err(response);
                 }
                 Err(mpsc::error::TrySendError::Closed(j)) => {
                     objects.remove(&key);
@@ -187,14 +190,15 @@ impl Node {
         if objects.len() >= self.cfg.max_live_objects && !self.evict_lru(&mut objects) {
             self.metrics.rejected_capacity.fetch_add(1, Relaxed);
             let max = self.cfg.max_live_objects;
-            return Err(error_response(
+            let response = error_response(
                 503,
                 "node-at-capacity",
                 &format!("{max} live objects, none idle"),
-            ));
+            );
+            crate::telemetry::response(&mut job.span, &response);
+            return Err(response);
         }
         let shared = Arc::new(ObjShared::new(app.name.clone(), id));
-        *shared.context.lock() = job.context.clone();
         let (tx, rx) = mpsc::channel(app.cfg.limits.max_queue.max(1));
         tx.try_send(job).ok().expect("fresh queue has room");
         objects.insert(
@@ -292,19 +296,14 @@ mod tests {
     /// An idle object is evictable only with no work queued or waiting.
     #[test]
     fn only_objects_without_work_are_evictable() {
-        #[cfg(feature = "tracing")]
         use opentelemetry::trace::{Tracer, TracerProvider};
-        #[cfg(feature = "tracing")]
         let tracer = opentelemetry_sdk::trace::SdkTracerProvider::default().tracer("test");
         let job = || Job {
             req: http::Request::new(Bytes::new()),
             reply: oneshot::channel().0,
             enqueued: Instant::now(),
             context: Default::default(),
-            #[cfg(feature = "tracing")]
-            queue: tracer.start("queue"),
-            #[cfg(not(feature = "tracing"))]
-            queue: crate::telemetry::Span::DEFAULT,
+            span: tracer.start("request"),
         };
         let (tx, _rx) = mpsc::channel(4);
         let e = Entry {

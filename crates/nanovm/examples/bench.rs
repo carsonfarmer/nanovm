@@ -129,14 +129,12 @@ async fn main() -> anyhow::Result<()> {
     let live = n.live_objects();
     let rss1 = rss_bytes();
     let per_obj_kb = rss1.saturating_sub(rss0) as f64 / live.max(1) as f64 / 1024.0;
-    let inst = n.metrics.instantiate.quantile(0.5);
     println!("\ncold start ({cold_n} new objects, {conc} concurrent)");
     row("first request to a new object", &cold, "");
     println!(
-        "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object · instantiate p50 ≤{} µs",
+        "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object",
         "",
         rss1 as f64 / 1e6,
-        inst
     );
     out.insert(
         "cold".into(),

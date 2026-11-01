@@ -158,46 +158,32 @@ impl Supervisor {
             publishes: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build()?,
             started: Instant::now(),
         });
-        use opentelemetry::{KeyValue, metrics::MeterProvider};
-        let meter = sup.telemetry.meters.meter("nanovm");
-        meter.u64_observable_gauge("process.memory.usage").with_unit("By")
-            .with_callback(|o| o.observe(rss_bytes(), &[])).build();
-        let started = sup.started;
-        meter.f64_observable_gauge("process.uptime").with_unit("s")
-            .with_callback(move |o| o.observe(started.elapsed().as_secs_f64(), &[])).build();
         let weak = Arc::downgrade(&sup);
-        meter.u64_observable_gauge("nanovm.worker.up").with_callback(move |o| {
-            if let Some(sup) = weak.upgrade() {
-                let workers: Vec<_> = sup.workers.lock().values().cloned().collect();
-                for w in workers {
-                    let live = w.live();
-                    o.observe(u64::from(live.is_some()), &[
-                        KeyValue::new("nanovm.worker.app", w.name.clone()),
-                        KeyValue::new("nanovm.worker.digest", live.as_ref().map_or(String::new(), |l| l.digest.clone())),
-                        KeyValue::new("nanovm.worker.version", live.as_ref().map_or(String::new(), |l| l.version.to_string())),
-                        KeyValue::new("process.pid", live.as_ref().map_or(0, |l| l.pid) as i64),
-                        KeyValue::new("nanovm.worker.policies", live.as_ref().map_or(0, |l| l.policies.lock().len()) as i64),
-                    ]);
-                }
+        sup.telemetry.snapshots(move || {
+            let Some(sup) = weak.upgrade() else { return };
+            sup.telemetry.snapshot(vec![
+                ("process.memory.usage".into(), (rss_bytes() as i64).into()),
+                ("process.uptime".into(), sup.started.elapsed().as_secs_f64().into()),
+            ]);
+            let workers: Vec<_> = sup.workers.lock().values().cloned().collect();
+            for w in workers {
+                let live = w.live();
+                sup.telemetry.snapshot(vec![
+                    ("nanovm.worker.app".into(), w.name.clone().into()),
+                    ("nanovm.worker.up".into(), live.is_some().into()),
+                    ("nanovm.worker.digest".into(), live.as_ref().map_or(String::new(), |l| l.digest.clone()).into()),
+                    ("nanovm.worker.version".into(), live.as_ref().map_or(String::new(), |l| l.version.to_string()).into()),
+                    ("process.pid".into(), (live.as_ref().map_or(0, |l| l.pid) as i64).into()),
+                    ("nanovm.worker.policies".into(), (live.as_ref().map_or(0, |l| l.policies.lock().len()) as i64).into()),
+                    ("nanovm.worker.starts".into(), (w.starts.load(Relaxed) as i64).into()),
+                    ("nanovm.worker.link_errors".into(), (w.link_errors.load(Relaxed) as i64).into()),
+                ]);
             }
-        }).build();
-        for (name, read) in [
-            ("nanovm.worker.starts", (|w: &Worker| w.starts.load(Relaxed)) as fn(&Worker) -> u64),
-            ("nanovm.worker.link_errors", |w: &Worker| w.link_errors.load(Relaxed)),
-        ] {
-            let weak = Arc::downgrade(&sup);
-            meter.u64_observable_counter(name).with_callback(move |o| {
-                if let Some(sup) = weak.upgrade() {
-                    for w in sup.workers.lock().values() {
-                        o.observe(read(w), &[KeyValue::new("nanovm.worker.app", w.name.clone())]);
-                    }
-                }
-            }).build();
-        }
+        });
         Ok(sup)
     }
 
-    /// Flush live workers and host metrics to the collector, without an HTTP
+    /// Flush live workers and host snapshots to the collector, without an HTTP
     /// snapshot API. Readiness and ordinary requests never call this.
     pub async fn flush_telemetry(&self) -> anyhow::Result<()> {
         let live: Vec<_> = self.workers.lock().values().filter_map(|w| w.live()).collect();
