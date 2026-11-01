@@ -718,9 +718,13 @@ fn registry() -> std::net::SocketAddr {
 /// Publishes `app` (its guest is the one its name says) to the test registry
 /// as `nanovm/<repo>`, and returns it by digest, as `nanovm-app` names it.
 async fn publish(repo: &str, app: &AppConfig) -> String {
+    publish_wasm(repo, app, guest(&app.name)).await
+}
+
+async fn publish_wasm(repo: &str, app: &AppConfig, wasm: Vec<u8>) -> String {
     use nanovm::registry::{APP_TYPE, CONFIG_TYPE, VERSION, WASM_TYPE};
     use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
-    let layer = ImageLayer::new(guest(&app.name), WASM_TYPE.into(), None);
+    let layer = ImageLayer::new(wasm, WASM_TYPE.into(), None);
     let spec = serde_json::json!({ "limits": app.limits, "env": app.env, "config": app.config });
     let config = Config::new(serde_json::to_vec(&spec).unwrap(), CONFIG_TYPE.into(), None);
     let mut manifest = oci_client::manifest::OciImageManifest::build(
@@ -1486,6 +1490,262 @@ async fn wasi_config_serves_the_apps_values() {
 }
 
 // ---- commits ---------------------------------------------------------------
+
+/// Opt-in experiment: build both fixtures with experiments/sqlite-filesystem/build.sh.
+/// No stock P2 filesystem import may bypass nanovm's journal to make SQLite work.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_over_the_existing_filesystem() {
+    let fixture = |name: &str| std::fs::read(repo().join("target/sqlite-filesystem").join(name)).unwrap();
+    let cfg = node_cfg("sqlite_filesystem", 2);
+    let mut app = app("counter");
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    let err = Node::new(cfg.clone(), &app, &fixture("stock.wasm"), None)
+        .err()
+        .expect("P2 must be refused");
+    let why = format!("{err:#}");
+    assert!(
+        why.contains("wasi:filesystem/") && why.contains("not permitted"),
+        "{why}"
+    );
+    println!("stock SQLite rejected: {why}");
+    let wasm = fixture("p3.wasm");
+    let node = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
+    let expected = |rows: &[&str], marker: &str| {
+        serde_json::json!({
+            "rows": rows, "file": marker, "key": marker, "integrity": "ok", "blob_bytes": 0
+        })
+    };
+    let r = get(&node, "a", "/?v=first").await;
+    assert_eq!(r.status, 200, "{:?}: {}", r.error, r.body);
+    assert_eq!(r.json(), expected(&["first"], "first"));
+    for then in ["error", "panic", "spin", "sql", "sleep"] {
+        let r = get(&node, "a", &format!("/?v=discard-{then}&then={then}")).await;
+        assert_eq!(
+            r.status,
+            if then == "sleep" { 504 } else { 500 },
+            "{then}: {:?}: {}",
+            r.error,
+            r.body
+        );
+        assert_eq!(
+            r.error.as_deref(),
+            Some(match then {
+                "error" => "guest-error",
+                "panic" => "trap",
+                "spin" | "sql" => "cpu",
+                "sleep" => "timeout",
+                _ => unreachable!(),
+            })
+        );
+        let read = get(&node, "a", "/").await;
+        assert_eq!(read.json(), expected(&["first"], "first"), "after {then}");
+        println!("{then}: SQL, file and KV rolled back; integrity_check=ok");
+    }
+    let denials = node.metrics.fs_denied.load(Relaxed);
+    let r = get(&node, "a", "/full?v=discard-full").await;
+    assert_eq!(r.status, 500, "{}", r.body);
+    assert!(node.metrics.fs_denied.load(Relaxed) > denials, "the host must enforce its disk quota");
+    assert!(
+        r.body.contains("sqlite:"),
+        "expected SQLite error, not unrelated kill: {}",
+        r.body
+    );
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first"));
+    println!("quota refusal: SQL, file and KV rolled back; integrity_check=ok");
+    let r = get(&node, "a", "/constraint?v=second&then=status").await;
+    assert_eq!(r.status, 507, "{}", r.body);
+    assert_eq!(r.json(), expected(&["first", "second"], "second"));
+    assert_eq!(
+        get(&node, "a", "/transaction").await.json(),
+        expected(&["first", "second"], "second")
+    );
+    let database = cfg.app_dirs(&app.name)[0].join("a/probe.db");
+    let before = std::fs::metadata(&database).unwrap().len();
+    let mut grown = expected(&["first", "second"], "second");
+    grown["blob_bytes"] = 262144.into();
+    assert_eq!(get(&node, "a", "/grow").await.json(), grown);
+    let large = std::fs::metadata(&database).unwrap().len();
+    assert!(large > before, "the blob must grow the file, not just SQLite's cache");
+    assert_eq!(
+        get(&node, "a", "/vacuum").await.json(),
+        expected(&["first", "second"], "second")
+    );
+    let compact = std::fs::metadata(&database).unwrap().len();
+    assert!(compact < large);
+    println!("database growth and VACUUM: {before} -> {large} -> {compact} bytes; inner SQL rollback passed");
+    assert_eq!(get(&node, "b", "/").await.json(), expected(&[], ""));
+    settle(&node).await;
+    assert_eq!(get(&node, "c", "/?v=other").await.status, 200);
+    settle(&node).await;
+    assert!(node.metrics.evicted_lru.load(Relaxed) > 0);
+    assert_eq!(
+        get(&node, "a", "/").await.json(),
+        expected(&["first", "second"], "second")
+    );
+    node.shutdown().await;
+    drop(node);
+    let restarted = Node::new(cfg, &app, &wasm, None).unwrap();
+    assert_eq!(
+        get(&restarted, "a", "/").await.json(),
+        expected(&["first", "second"], "second")
+    );
+    println!("handled constraint + HTTP 507 committed; VACUUM, isolation, eviction and node restart passed");
+    restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_survives_a_jailed_worker_crash() {
+    let cfg = node_cfg("sqlite_worker_crash", 8);
+    let (_sup, addr) = supervised_with(cfg.clone()).await;
+    let mut app = app("counter");
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 30_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
+    let image = publish_wasm("sqlite-probe", &app, wasm).await;
+    let (status, before) = app_get(addr, &image, "/a/?v=durable").await;
+    assert_eq!(status, 200, "{before}");
+    let name = worker(&image);
+    let pid = stats_json(addr).await["workers"][&name]["pid"].as_u64().unwrap() as i32;
+    let pending = tokio::spawn({
+        let image = image.clone();
+        async move { app_get(addr, &image, "/a/?v=uncommitted&then=sleep").await }
+    });
+    // Wait for actual writes, not a guessed delay. The marker is written
+    // after SQLite's INSERT has completed but before the response commits.
+    let marker = cfg.app_dirs(&name)[0].join("a/marker");
+    let key = cfg.app_dirs(&name)[0].join("a/.kv/default/bWFya2Vy");
+    eventually("SQLite, file and KV writes before SIGKILL", || {
+        std::fs::read(&marker).is_ok_and(|v| v == b"uncommitted")
+            && std::fs::read(&key).is_ok_and(|v| v == b"uncommitted")
+    })
+    .await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let _ = pending.await;
+    let start = Instant::now();
+    while stats_json(addr).await["workers"][&name]["up"] == true {
+        assert!(start.elapsed() < Duration::from_secs(5), "worker still up");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (status, after) = app_get(addr, &image, "/a/").await;
+    assert_eq!(status, 200, "{after}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&after).unwrap(),
+        serde_json::json!({"rows": ["durable"], "file": "durable", "key": "durable", "integrity": "ok", "blob_bytes": 0})
+    );
+    println!(
+        "jailed worker SIGKILL after SQLite commit, before response: SQL/file/KV recovered together; integrity_check=ok"
+    );
+}
+
+/// Faults at every VFS mutation/sync boundary of a multi-database transaction.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_journal_pressure_matrix() {
+    let cfg = node_cfg("sqlite_pressure", 8);
+    let mut app = app("counter");
+    app.limits.cpu_ms = 5000;
+    app.limits.request_timeout_ms = 15_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    let expected = |changed: bool| {
+        let rows: Vec<_> = (1..=16).map(|id| serde_json::json!([
+            id, id*3 + if changed { 7 } else { 0 }, if changed { 2048 } else { 1024 }
+        ])).collect();
+        let marker = if changed { "after" } else { "before" };
+        serde_json::json!({"rows": rows, "tally": if changed { 40 } else { 29 },
+            "file": marker, "key": marker, "integrity": "ok", "aux_integrity": "ok"})
+    };
+    for mode in ["DELETE", "TRUNCATE", "PERSIST", "MEMORY"] {
+        let url = |op: &str, cut: u64| format!("/pressure?mode={mode}&cache=1&op={op}&cut={cut}");
+        let control = format!("{mode}-control");
+        let init = get(&node, &control, &url("init", 0)).await;
+        assert_eq!(init.status, 200, "{mode}: {}", init.body);
+        assert_eq!(init.json()["state"], expected(false));
+        let r = get(&node, &control, &url("mutate", 0)).await;
+        assert_eq!(r.status, 200, "{mode}: {}", r.body);
+        let result = r.json();
+        assert_eq!(result["mode"], mode.to_lowercase());
+        assert_eq!(result["aux_mode"], mode.to_lowercase());
+        assert_eq!(result["state"], expected(true));
+        assert_eq!(result["reused"], true, "must exercise a cached connection");
+        let steps = result["steps"].as_u64().unwrap();
+        assert!(steps > 0 && steps < 512, "unexpected workload size: {result}");
+        assert_eq!(get(&node, &control, &url("read", 0)).await.json()["state"], expected(true));
+        for cut in 1..=steps {
+            let object = format!("{mode}-{cut}");
+            let init = get(&node, &object, &url("init", 0)).await;
+            assert_eq!(init.status, 200, "{mode} cut {cut}: {}", init.body);
+            let failed = get(&node, &object, &url("mutate", cut)).await;
+            assert_eq!(failed.error.as_deref(), Some("trap"), "{mode} cut {cut}: {}", failed.body);
+            assert!(failed.body.contains(&format!("SQLite VFS cut {cut} after")), "{}", failed.body);
+            let recovered = get(&node, &object, &url("read", 0)).await;
+            assert_eq!(recovered.status, 200, "{mode} cut {cut}: {}", recovered.body);
+            assert_eq!(recovered.json()["state"], expected(false), "{mode} cut {cut}");
+            assert_eq!(recovered.json()["reused"], false, "failed instance must lose its SQLite cache");
+        }
+        println!("{mode}: {steps} VFS cuts recovered exact rows in both databases + file/KV; {} SQLite write bytes", result["write_bytes"]);
+    }
+    assert_eq!(get(&node, "wal", "/pressure?op=init").await.status, 200);
+    let wal = get(&node, "wal", "/pressure?mode=WAL&op=mutate").await;
+    assert_eq!(wal.error.as_deref(), Some("guest-error"), "{}", wal.body);
+    assert!(wal.body.contains("disk I/O error"), "{}", wal.body);
+    assert_eq!(get(&node, "wal", "/pressure").await.json()["state"], expected(false));
+    println!("WAL: disk I/O error with this VFS; previous state recovered (not WAL support)");
+
+    let init = get(&node, "churn", "/pressure?op=init&cache=1").await;
+    assert_eq!(init.status, 200, "{}", init.body);
+    let denials = node.metrics.fs_denied.load(Relaxed);
+    let failed = get(&node, "churn", "/pressure?op=churn&n=1000&cache=1").await;
+    assert_eq!(failed.error.as_deref(), Some("guest-error"), "{}", failed.body);
+    assert!(node.metrics.fs_denied.load(Relaxed) > denials);
+    let objects = node.cfg.app_dirs(&app.name)[0].clone();
+    let db_bytes = std::fs::metadata(objects.join("churn/pressure.db")).unwrap().len();
+    let log_bytes = std::fs::metadata(objects.join("~journal/churn/log")).unwrap().len();
+    println!("churn failed: main database {db_bytes} bytes, outer undo log {log_bytes} bytes");
+    let recovered = get(&node, "churn", "/pressure?cache=1").await;
+    assert_eq!(recovered.status, 200, "{}", recovered.body);
+    assert_eq!(recovered.json()["state"], expected(false));
+    println!("1000 autocommit updates on a small database exhaust the 1 MiB request journal; full recovery verified");
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_handled_journal_exhaustion() {
+    let cfg = node_cfg("sqlite_handled_exhaustion", 8);
+    let mut app = app("counter");
+    app.limits.cpu_ms = 5000;
+    app.limits.request_timeout_ms = 15_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    for (object, query) in [("churn", "n=1000"), ("bulk", "n=119&bulk=1")] {
+        assert_eq!(get(&node, object, "/pressure?op=init&cache=1").await.status, 200);
+        let handled = get(&node, object, &format!("/pressure?op=churn&{query}&cache=1&handle=1")).await;
+        assert_eq!(handled.status, 200, "handled exhaustion: {}", handled.body);
+        let handled = handled.json();
+        assert!(handled["handled"].is_string(), "{handled}");
+        let completed = handled["completed"].as_i64().unwrap();
+        assert!(completed > 0 && completed < 1000);
+        if object == "bulk" {
+            assert_eq!(completed, 119);
+        }
+        let after = get(&node, object, "/pressure").await;
+        println!("handled: {handled}; next read {}: {}", after.status, after.body);
+        assert_eq!(after.status, 200, "{}", after.body);
+        let after = after.json();
+        let rows: Vec<_> = (1..=16).map(|id| serde_json::json!([
+            id, id*3 + if id == 1 { completed } else { 0 }, 1024
+        ])).collect();
+        assert_eq!(after["state"], serde_json::json!({"rows": rows, "tally": 29,
+            "file": "after", "key": "after", "integrity": "ok", "aux_integrity": "ok"}),
+            "a failed statement must not commit, including partial multi-page updates");
+        println!("handled exhaustion: {completed} successful statements committed without corruption");
+    }
+    node.shutdown().await;
+}
 
 /// A request's writes, to files and to key-value alike, take effect only if
 /// it answers, whatever the status; one that fails, traps or runs out of CPU
