@@ -16,6 +16,7 @@ use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_proto::tonic::{collector, common::v1 as common, resource::v1::Resource};
 use opentelemetry_sdk::logs;
 use opentelemetry_sdk::trace;
+pub use opentelemetry_sdk::trace::Span;
 use prost::Message;
 
 use crate::egress::Upstream;
@@ -39,8 +40,6 @@ pub(crate) const PATH: &str = "/telemetry/";
 const MAX_BATCH: usize = 1 << 20;
 const DEADLINE: Duration = Duration::from_secs(2);
 const INTERVAL: Duration = Duration::from_secs(1);
-
-pub type Span = trace::Span;
 
 fn identity(app: &str, digest: &str) -> [KeyValue; 3] {
     [KeyValue::new("service.name", "nanovm"), KeyValue::new("nanovm.app", app.to_owned()),
@@ -68,18 +67,16 @@ impl HttpClient for Client {
         let task = self.runtime.spawn(async move {
             tokio::time::timeout(DEADLINE, async {
                 let signal = request.uri().path().rsplit('/').next().unwrap_or("").to_owned();
-                let status = if let Some(upstream) = client.upstream {
+                if let Some(upstream) = client.upstream {
                     let req = Request::post(format!("http://nanovm{PATH}{signal}"))
                         .body(Full::new(request.into_body()).map_err(|e| match e {}).boxed_unsync())?;
                     let res = upstream.send(req).await?;
-                    let status = res.status();
-                    Limited::new(res.into_body(), 4096).collect().await?;
-                    status.as_u16()
+                    let (parts, body) = res.into_parts();
+                    Ok(Response::from_parts(parts, Limited::new(body, 4096).collect().await?.to_bytes()))
                 } else {
                     client.relay.as_ref().expect("direct client has relay")
-                        .send(&signal, request.into_body()).await
-                };
-                Ok::<_, HttpError>(Response::builder().status(status).body(Bytes::new())?)
+                        .send(&signal, request.into_body()).await.map_err(|status| format!("collector transport failed: {status}").into())
+                }
             }).await.map_err(|e| -> HttpError { Box::new(e) })?
         });
         task.await.map_err(|e| -> HttpError { Box::new(e) })?
@@ -165,36 +162,6 @@ impl Telemetry {
         self.logger.emit(record);
     }
 
-    pub fn observe(self: &Arc<Self>, node: &Arc<crate::table::Node>) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let weak = Arc::downgrade(node);
-        self.snapshots(move || {
-            let Some(node) = weak.upgrade() else { return };
-            let mut fields = vec![
-                ("process.pid".into(), (std::process::id() as i64).into()),
-                ("process.memory.usage".into(), (crate::metrics::rss_bytes() as i64).into()),
-                ("process.uptime".into(), node.started.elapsed().as_secs_f64().into()),
-                ("nanovm.stores.live".into(), node.metrics.stores_live.load(Relaxed).into()),
-                ("nanovm.stores.peak".into(), node.metrics.stores_peak.load(Relaxed).into()),
-                ("nanovm.objects.live".into(), (node.live_objects() as i64).into()),
-                ("nanovm.objects.limit".into(), (node.cfg.max_live_objects as i64).into()),
-            ];
-            macro_rules! counters {
-                ($($field:ident),* $(,)?) => { $(fields.push((concat!("nanovm.", stringify!($field)).into(),
-                    (node.metrics.$field.load(Relaxed) as i64).into()));)* }
-            }
-            counters!(instantiate_failures, evicted_idle, evicted_lru, rejected_busy,
-                rejected_capacity, egress_allowed, egress_denied, fs_denied, guest_cpu_ns);
-            for p in crate::metrics::Poison::ALL {
-                fields.push((format!("nanovm.poisons.{}", p.as_str()).into(), (node.metrics.poisons[p as usize].load(Relaxed) as i64).into()));
-            }
-            for (phase, count) in node.phases() {
-                fields.push((format!("nanovm.objects.phase.{phase}").into(), (count as i64).into()));
-            }
-            node.telemetry.snapshot(fields);
-        });
-    }
-
     pub fn log(&self, object: &str, stream: &'static str, bytes: &[u8], context: &Context) {
         let mut record = self.record(object, bytes, context);
         record.add_attribute("log.iostream", stream);
@@ -226,13 +193,7 @@ impl Telemetry {
     /// whose link operations still need the async runtime to be running.
     pub fn flush(&self) -> anyhow::Result<()> {
         if let Some(snapshot) = self.snapshot.get() { snapshot(); }
-        for result in [
-            self.traces.force_flush(),
-            self.logs.force_flush(),
-        ] {
-            result?;
-        }
-        Ok(())
+        self.traces.force_flush().and(self.logs.force_flush()).map_err(Into::into)
     }
 }
 
@@ -270,29 +231,24 @@ impl Relay {
         })
     }
 
-    pub async fn handle(&self, req: Request<hyper::body::Incoming>, app: &str, digest: &str) -> u16 {
-        if req.method() != http::Method::POST { return 405 }
+    pub async fn handle(&self, req: Request<hyper::body::Incoming>, app: &str, digest: &str) -> Result<Response<Bytes>, u16> {
+        if req.method() != http::Method::POST { return Err(405) }
         let signal = req.uri().path().strip_prefix(PATH).unwrap_or("").to_owned();
-        let Ok(_slot) = self.slots.try_acquire() else { return 429 };
+        let _slot = self.slots.try_acquire().map_err(|_| 429u16)?;
         match tokio::time::timeout(DEADLINE, async {
-            match Limited::new(req.into_body(), MAX_BATCH).collect().await {
-                Ok(body) => match stamp(&signal, &body.to_bytes(), app, digest) {
-                    Ok(body) => self.send(&signal, body.into()).await,
-                    Err(_) => 400,
-                },
-                Err(_) => 413,
-            }
-        }).await { Ok(status) => status, Err(_) => 504 }
+            let body = Limited::new(req.into_body(), MAX_BATCH).collect().await.map_err(|_| 413u16)?;
+            let body = stamp(&signal, &body.to_bytes(), app, digest).map_err(|_| 400u16)?;
+            self.send(&signal, body.into()).await
+        }).await { Ok(response) => response, Err(_) => Err(504) }
     }
 
-    async fn send(&self, signal: &str, body: Bytes) -> u16 {
-        if body.len() > MAX_BATCH { return 413 }
-        match self.http.post(format!("{}/v1/{signal}", self.endpoint))
-            .header("content-type", "application/x-protobuf").body(body).send().await {
-            Ok(res) if res.status().is_success() => 200,
-            Ok(res) => res.status().as_u16(),
-            Err(_) => 502,
-        }
+    async fn send(&self, signal: &str, body: Bytes) -> Result<Response<Bytes>, u16> {
+        if body.len() > MAX_BATCH { return Err(413) }
+        let res = self.http.post(format!("{}/v1/{signal}", self.endpoint))
+            .header("content-type", "application/x-protobuf").body(body).send().await.map_err(|_| 502u16)?;
+        let status = res.status();
+        let body = Limited::new(reqwest::Body::from(res), 4096).collect().await.map_err(|_| 502u16)?;
+        Ok(Response::builder().status(status).body(body.to_bytes()).unwrap())
     }
 }
 
@@ -302,9 +258,7 @@ fn scrub(attrs: &mut Vec<common::KeyValue>) {
 
 fn stamp(signal: &str, body: &[u8], app: &str, digest: &str) -> anyhow::Result<Vec<u8>> {
     let resource = Resource {
-        attributes: [("service.name", "nanovm"), ("nanovm.app", app), ("service.version", digest)].into_iter()
-            .map(|(key, value)| common::KeyValue { key: key.into(), value: Some(common::AnyValue {
-                value: Some(common::any_value::Value::StringValue(value.into())) }), ..Default::default() }).collect(),
+        attributes: opentelemetry_proto::transform::common::tonic::Attributes::from(identity(app, digest)).0,
         ..Default::default()
     };
     macro_rules! batch {
@@ -344,6 +298,85 @@ mod tests {
         common::KeyValue { key: key.into(), value: Some(common::AnyValue {
             value: Some(common::any_value::Value::StringValue(value.into())),
         }), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn collector_responses_reach_the_sdk_and_remain_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use opentelemetry_sdk::trace::SpanExporter as _;
+        use tracing_subscriber::util::SubscriberInitExt;
+        #[derive(Clone)]
+        struct Output(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let output = Output(Arc::default());
+        let writer = output.clone();
+        let _subscriber = tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_writer(move || writer.clone()).finish().set_default();
+        let mode = Arc::new(AtomicUsize::new(0));
+        let behavior = mode.clone();
+        let partial = collector::trace::v1::ExportTraceServiceResponse {
+            partial_success: Some(collector::trace::v1::ExportTracePartialSuccess {
+                rejected_spans: 7, error_message: "collector test rejection".into(),
+            }),
+        }.encode_to_vec();
+        let reply = partial.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = Arc::new(Relay::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap());
+        let collector = tokio::spawn(crate::server::serve_http1(listener, move |req| {
+            let behavior = behavior.clone();
+            let reply = reply.clone();
+            async move {
+                req.into_body().collect().await.unwrap();
+                let mode = behavior.load(Relaxed);
+                let body = if mode == 4 {
+                    http_body_util::StreamBody::new(futures::stream::pending::<Result<hyper::body::Frame<Bytes>, HttpError>>()).boxed_unsync()
+                } else {
+                    let bytes = if mode >= 2 { vec![42; 4094 + mode] } else { reply };
+                    Full::new(Bytes::from(bytes)).map_err(|e| match e {}).boxed_unsync()
+                };
+                Response::builder().status(if mode == 1 { 503 } else { 200 }).body(body).unwrap()
+            }
+        }));
+        let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let forwarded = relay.clone();
+        let link = tokio::spawn(crate::link::serve(tokio::net::UnixStream::from_std(peer).unwrap(), vec![], move |req| {
+            let relay = forwarded.clone();
+            async move { relay.handle(req, "app", "digest").await
+                .map(|r| r.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync()))
+                .unwrap_or_else(|s| crate::object::error_response(s, "", "")) }
+        }));
+        let upstream = crate::link::Dialer::new(ctl, 1);
+        for upstream in [None, Some(upstream)] {
+            let client = Client { runtime: tokio::runtime::Handle::current(), upstream, relay: Some(relay.clone()) };
+            for behavior in 0..5 {
+                mode.store(behavior, Relaxed);
+                let request = Request::post("http://nanovm/v1/traces").body(Bytes::new()).unwrap();
+                let response = tokio::time::timeout(Duration::from_secs(4), client.send_bytes(request)).await.expect("collector deadline");
+                if behavior < 3 {
+                    let response = response.unwrap();
+                    assert_eq!(response.status(), if behavior == 1 { 503 } else { 200 });
+                    assert_eq!(response.body().as_ref(), if behavior == 2 { vec![42; 4096] } else { partial.clone() });
+                } else if let Ok(response) = response {
+                    assert!(matches!(response.status().as_u16(), 502 | 504), "unbounded collector reply accepted");
+                }
+            }
+            mode.store(0, Relaxed);
+            output.0.lock().unwrap().clear();
+            let exporter = opentelemetry_otlp::SpanExporter::builder().with_http()
+                .with_endpoint("http://nanovm/v1/traces").with_http_client(client).build().unwrap();
+            exporter.export(Vec::new()).await.unwrap();
+            let diagnostic = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert!(diagnostic.contains("collector test rejection") && diagnostic.contains("rejected_spans=7"), "{diagnostic}");
+        }
+        link.abort();
+        collector.abort();
     }
 
     #[tokio::test]
@@ -396,14 +429,21 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let output = captured.clone();
+        let partial = collector::trace::v1::ExportTraceServiceResponse {
+            partial_success: Some(collector::trace::v1::ExportTracePartialSuccess {
+                rejected_spans: 1, error_message: "collector rejected a span".into(),
+            }),
+        }.encode_to_vec();
+        let reply = partial.clone();
         let collector = tokio::spawn(crate::server::serve_http1(listener, move |req| {
             let output = output.clone();
+            let reply = reply.clone();
             async move {
                 assert!(matches!(req.uri().path(), "/v1/traces" | "/v1/logs"));
                 assert!(req.headers().get("nanovm-app").is_none());
                 let body = req.into_body().collect().await.unwrap().to_bytes();
                 output.lock().push(body);
-                crate::server::ok_json(serde_json::json!({}))
+                Response::new(Full::new(Bytes::from(reply)).map_err(|e| match e {}).boxed_unsync())
             }
         }));
         let relay = Arc::new(Relay::new(&endpoint).unwrap());
@@ -411,7 +451,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(crate::server::serve_http1(listener, move |req| {
             let relay = relay.clone();
-            async move { crate::object::error_response(relay.handle(req, "real-app", "real-digest").await, "", "") }
+            async move { relay.handle(req, "real-app", "real-digest").await
+                .map(|r| r.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync()))
+                .unwrap_or_else(|status| crate::object::error_response(status, "", "")) }
         }));
         let forged = vec![attr("nanovm.app", "victim"), attr("nanovm.app", "other"), attr("service.version", "old")];
         let message = collector::trace::v1::ExportTraceServiceRequest {
@@ -426,8 +468,10 @@ mod tests {
         }.encode_to_vec();
         let http = reqwest::Client::new();
         let url = format!("http://{addr}{PATH}traces");
-        assert_eq!(http.post(&url).header("nanovm-app", "victim").header("nanovm-app", "other")
-            .body(message).send().await.unwrap().status(), 200);
+        let response = http.post(&url).header("nanovm-app", "victim").header("nanovm-app", "other")
+            .body(message).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), partial.as_slice(), "partial-success body must reach the exporter");
         let batch = collector::trace::v1::ExportTraceServiceRequest::decode(captured.lock()[0].clone()).unwrap();
         let r = &batch.resource_spans[0];
         assert_eq!(r.resource.as_ref().unwrap().attributes,

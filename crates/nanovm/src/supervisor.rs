@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use bytes::Bytes;
 use http::{Request, Response};
-use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -466,7 +466,9 @@ impl Supervisor {
                 }
                 if req.uri().path().starts_with(crate::telemetry::PATH) {
                     let Ok(_slot) = slots.try_acquire() else { return verdict_ok(429) };
-                    return verdict_ok(telemetry.handle(req, &app, &digest).await);
+                    return telemetry.handle(req, &app, &digest).await
+                        .map(|r| r.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync()))
+                        .unwrap_or_else(verdict_ok);
                 }
                 if req.method() != http::Method::POST || req.uri().path().trim_end_matches('/') != "/publish" {
                     return verdict_ok(404);

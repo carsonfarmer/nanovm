@@ -1837,6 +1837,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "toml 0.9.12+spec-1.1.0",
+ "tracing-subscriber",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-config",
@@ -1961,6 +1962,7 @@ dependencies = [
  "js-sys",
  "pin-project-lite",
  "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]

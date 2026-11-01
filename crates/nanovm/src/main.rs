@@ -7,6 +7,7 @@ use nanovm::config::NodeConfig;
 use nanovm::supervisor::Supervisor;
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::WARN).with_writer(std::io::stderr).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [cmd, flag, path] if cmd == "serve" && flag == "--config" => serve(NodeConfig::load(&PathBuf::from(path))?),

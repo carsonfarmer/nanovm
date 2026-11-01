@@ -34,6 +34,17 @@ jobs:
             guests -> target
       - name: Prepare host limits
         run: sudo sysctl -w vm.max_map_count=1048576
+      - name: Enforce runtime line budget
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          total = 0
+          for path in pathlib.Path('crates/nanovm/src').glob('*.rs'):
+              runtime = re.split(r'#\[cfg\(test\)\]\s*mod\s', path.read_text(), maxsplit=1)[0]
+              total += sum(bool(line.strip()) and not line.strip().startswith('//') for line in runtime.splitlines())
+          print(f'Runtime: {total} lines (must be below 5000)')
+          assert total < 5000, 'Runtime line budget exceeded'
+          PY
       - name: Build guests locally (no publishing)
         run: cargo build --locked --release --target wasm32-wasip2 --manifest-path guests/Cargo.toml
       - name: Check production build without dev features

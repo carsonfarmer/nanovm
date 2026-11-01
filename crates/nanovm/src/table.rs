@@ -65,7 +65,6 @@ pub struct Node {
     pub app: Arc<App>,
     pub metrics: Arc<Metrics>,
     pub telemetry: Arc<crate::telemetry::Telemetry>,
-    pub started: Instant,
     /// Cores CPU-heavy requests may occupy at once; see `heavy_lanes`.
     pub heavy: Arc<Semaphore>,
     /// One permit per live store, released only after the store is dropped.
@@ -98,13 +97,38 @@ impl Node {
             app,
             metrics: Arc::default(),
             telemetry,
-            started: Instant::now(),
             heavy,
             slots,
             objects: Mutex::default(),
         });
         node.metrics.telemetry.set(Arc::downgrade(&node.telemetry)).ok();
-        node.telemetry.observe(&node);
+        let started = Instant::now();
+        let weak = Arc::downgrade(&node);
+        node.telemetry.snapshots(move || {
+            let Some(node) = weak.upgrade() else { return };
+            let mut fields = vec![
+                ("process.pid".into(), (std::process::id() as i64).into()),
+                ("process.memory.usage".into(), (crate::metrics::rss_bytes() as i64).into()),
+                ("process.uptime".into(), started.elapsed().as_secs_f64().into()),
+                ("nanovm.stores.live".into(), node.metrics.stores_live.load(Relaxed).into()),
+                ("nanovm.stores.peak".into(), node.metrics.stores_peak.load(Relaxed).into()),
+                ("nanovm.objects.live".into(), (node.live_objects() as i64).into()),
+                ("nanovm.objects.limit".into(), (node.cfg.max_live_objects as i64).into()),
+            ];
+            macro_rules! counters {
+                ($($field:ident),* $(,)?) => { $(fields.push((concat!("nanovm.", stringify!($field)).into(),
+                    (node.metrics.$field.load(Relaxed) as i64).into()));)* }
+            }
+            counters!(instantiate_failures, evicted_idle, evicted_lru, rejected_busy,
+                rejected_capacity, egress_allowed, egress_denied, fs_denied, guest_cpu_ns);
+            for p in crate::metrics::Poison::ALL {
+                fields.push((format!("nanovm.poisons.{}", p.as_str()).into(), (node.metrics.poisons[p as usize].load(Relaxed) as i64).into()));
+            }
+            for (phase, count) in node.phases() {
+                fields.push((format!("nanovm.objects.phase.{phase}").into(), (count as i64).into()));
+            }
+            node.telemetry.snapshot(fields);
+        });
         Ok(node)
     }
 
