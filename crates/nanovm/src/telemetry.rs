@@ -114,7 +114,7 @@ impl Telemetry {
         let traces = trace::SdkTracerProvider::builder().with_resource(resource.clone())
             .with_sampler(trace::Sampler::AlwaysOn)
             .with_span_processor(trace::BatchSpanProcessor::builder(exporter!(SpanExporter, "traces"))
-                .with_batch_config(trace::BatchConfigBuilder::default().with_max_queue_size(1024)
+                .with_batch_config(trace::BatchConfigBuilder::default().with_max_queue_size(2048)
                     .with_max_export_batch_size(256).with_scheduled_delay(INTERVAL).build()).build())
             .build();
         let logs = logs::SdkLoggerProvider::builder().with_resource(resource.clone())
@@ -287,6 +287,43 @@ mod tests {
         common::KeyValue { key: key.into(), value: Some(common::AnyValue {
             value: Some(common::any_value::Value::StringValue(value.into())),
         }), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn brief_collector_stall_retains_a_request_burst() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let received = Arc::new(AtomicUsize::new(0));
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (count, first, gate) = (received.clone(), arrived.clone(), release.clone());
+        let server = tokio::spawn(crate::server::serve_http1(listener, move |req| {
+            let (count, first, gate) = (count.clone(), first.clone(), gate.clone());
+            async move {
+                let body = Limited::new(req.into_body(), MAX_BATCH).collect().await.unwrap().to_bytes();
+                let batch = collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap();
+                let n = batch.resource_spans.iter().flat_map(|r| &r.scope_spans).flat_map(|s| &s.spans).count();
+                if count.fetch_add(n, Relaxed) == 0 {
+                    first.notify_one();
+                    gate.notified().await;
+                }
+                Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            }
+        }));
+        for (burst, expected) in [(1536, 1792), (4096, 2304)] {
+            received.store(0, Relaxed);
+            let telemetry = Telemetry::new(&endpoint, "burst", "v1", None).unwrap();
+            for _ in 0..256 { drop(telemetry.span("request", "room", &Context::new())); }
+            tokio::time::timeout(Duration::from_secs(2), arrived.notified()).await.unwrap();
+            // Complete requests while an export is in flight. A short burst
+            // survives; overload drops at the bound instead of blocking.
+            for _ in 0..burst { drop(telemetry.span("request", "room", &Context::new())); }
+            release.notify_one();
+            tokio::task::spawn_blocking(move || telemetry.flush()).await.unwrap().unwrap();
+            assert_eq!(received.load(Relaxed), expected, "burst={burst}");
+        }
+        server.abort();
     }
 
     #[tokio::test]

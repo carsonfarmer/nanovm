@@ -6,6 +6,10 @@ use anyhow::{Context, bail};
 use nanovm::config::NodeConfig;
 use nanovm::supervisor::Supervisor;
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::WARN).with_writer(std::io::stderr).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
