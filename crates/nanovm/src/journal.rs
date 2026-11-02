@@ -3,10 +3,10 @@
 //!
 //! Before each change, what it would destroy is recorded and synced:
 //! - a file's size, the first time it is written or truncated;
-//! - the bytes a write or a truncation overwrites;
+//! - each original byte a write or truncation overwrites, once;
 //! - "remove this", for a new file or directory;
 //! - "rename it back", for a rename; a removed or replaced file is itself
-//!   renamed into the journal rather than deleted;
+//!   renamed into the journal if it existed before the request;
 //! - "recreate this", for a removed directory.
 //!
 //! Writes then happen in place, so open files stay valid. Committing syncs
@@ -21,12 +21,12 @@
 //! still writes after removing it. The log, and the removed files, may each
 //! hold as much as the object's quota.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use crate::object::ObjShared;
@@ -42,6 +42,14 @@ enum Undo {
     RemovedDir(PathBuf),
     /// The entry at the first path was renamed to the second.
     Renamed(PathBuf, PathBuf),
+    /// A rename that failed, durably cancelled before paths can be reused.
+    Cancelled,
+}
+
+struct Saved {
+    len: u64,
+    /// Sorted, disjoint ranges whose request-start bytes are durable.
+    ranges: Vec<std::ops::Range<u64>>,
 }
 
 pub struct Journal {
@@ -52,12 +60,19 @@ pub struct Journal {
     /// Open while the current request has changes.
     log: Option<File>,
     /// Files (by inode) whose size is recorded, and what to sync on commit.
-    sized: HashSet<u64>,
+    sized: HashMap<u64, Saved>,
+    /// Successful creations, with every guest open of that inode. Weak
+    /// handles include stream ownership without keeping the file alive.
+    created: HashMap<u64, Vec<Weak<File>>>,
+    /// Unlinked new files still held open: their removal-time bytes remain
+    /// charged to the retained-file budget until the last handle closes.
+    unlinked: Vec<(Vec<Weak<File>>, u64)>,
     touched: HashSet<PathBuf>,
     slots: u64,
     /// Bytes the log holds, and the removed files; each may reach `max`.
     held: (u64, u64),
     max: u64,
+    poisoned: bool,
     /// Waits for the disk aren't charged to its CPU budget.
     obj: Arc<ObjShared>,
 }
@@ -75,11 +90,14 @@ impl Journal {
             volume: volume.to_path_buf(),
             dir,
             log: None,
-            sized: HashSet::new(),
+            sized: HashMap::new(),
+            created: HashMap::new(),
+            unlinked: vec![],
             touched: HashSet::new(),
             slots: 0,
             held: (0, 0),
             max,
+            poisoned: false,
             obj,
         })
     }
@@ -114,10 +132,10 @@ impl Journal {
         (p.starts_with(&self.volume) || p.starts_with(&self.dir)).then(|| self.rel(&p))
     }
 
-    /// Whether `file` was removed into the journal, so it is no longer the
-    /// volume's.
+    /// Whether `file` was removed into the journal or unlinked, so its
+    /// removal has already credited the volume's quota.
     pub fn holds(&self, file: &File) -> bool {
-        fd_path(file).is_some_and(|p| p.starts_with(&self.dir))
+        file.metadata().is_ok_and(|m| m.nlink() == 0) || fd_path(file).is_some_and(|p| p.starts_with(&self.dir))
     }
 
     fn rel(&self, abs: &Path) -> PathBuf {
@@ -127,6 +145,14 @@ impl Journal {
     /// Counts `log` bytes more logged and `removed` more removed, or refuses
     /// as a full disk.
     fn charge(&mut self, log: u64, removed: u64) -> std::io::Result<()> {
+        self.unlinked.retain(|(handles, bytes)| {
+            if handles.iter().any(|h| h.strong_count() > 0) {
+                true
+            } else {
+                self.held.1 -= bytes;
+                false
+            }
+        });
         let held = (self.held.0 + log, self.held.1 + removed);
         if held.0 > self.max || held.1 > self.max {
             return Err(ErrorKind::StorageFull.into());
@@ -137,8 +163,12 @@ impl Journal {
 
     /// Appends `undo` and syncs it, before the change it undoes is made.
     fn record(&mut self, undo: Undo) -> std::io::Result<()> {
+        self.check()?;
         let rec = encode(&undo);
         self.charge(rec.len() as u64, 0)?;
+        // An I/O failure may leave a complete or partial record. Do not
+        // permit more mutations or a commit until recovery has run.
+        self.poisoned = true;
         let t0 = Instant::now();
         if self.log.is_none() {
             // The directories the log is first made in must be durable too.
@@ -152,29 +182,69 @@ impl Journal {
         let log = self.log.as_mut().expect("opened above");
         log.write_all(&rec)?;
         log.sync_data()?;
+        self.poisoned = false;
         self.obj.uncharge(t0.elapsed());
         Ok(())
     }
 
     /// Before `file` is written over `[at, end)`, if it is in the volume:
-    /// its size, the first time, and the bytes the write replaces.
+    /// its original size and any original bytes not already saved. A new
+    /// file needs neither: its `Created` record removes it on rollback.
     pub fn writing(&mut self, file: &File, at: u64, end: u64) -> std::io::Result<()> {
         let Some(p) = self.local_file(file) else { return Ok(()) };
         let md = file.metadata()?;
-        if !self.sized.contains(&md.ino()) {
+        if self.created.contains_key(&md.ino()) {
+            return Ok(());
+        }
+        if !self.sized.contains_key(&md.ino()) {
             self.record(Undo::Size(p.clone(), md.len()))?;
-            self.sized.insert(md.ino());
+            self.sized.insert(
+                md.ino(),
+                Saved {
+                    len: md.len(),
+                    ranges: vec![],
+                },
+            );
             self.touched.insert(p.clone());
         }
-        let (mut at, end) = (at, end.min(md.len()));
+        let saved = &self.sized[&md.ino()];
+        let (mut at, end) = (at, end.min(saved.len));
+        let ranges = saved.ranges.clone();
         if at < end {
             // Read through a handle of our own: the guest's may be write-only.
             let current = File::open(self.base.join(&p))?;
+            let mut ranges = ranges.into_iter().peekable();
             while at < end {
-                let mut old = vec![0; (end - at).min(CHUNK) as usize];
+                while ranges.peek().is_some_and(|r| r.end <= at) {
+                    ranges.next();
+                }
+                if let Some(r) = ranges.peek()
+                    && r.start <= at
+                {
+                    at = r.end;
+                    continue;
+                }
+                let until = ranges.peek().map_or(end, |r| end.min(r.start));
+                let mut old = vec![0; (until - at).min(CHUNK) as usize];
                 current.read_exact_at(&mut old, at)?;
                 let n = old.len() as u64;
                 self.record(Undo::Bytes(p.clone(), at, old))?;
+                // Only a durable record protects a range, including when a
+                // later chunk fails and the caller retries the whole write.
+                let saved = &mut self.sized.get_mut(&md.ino()).unwrap().ranges;
+                saved.push(at..at + n);
+                saved.sort_by_key(|r| r.start);
+                let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
+                for r in saved.drain(..) {
+                    if let Some(last) = merged.last_mut()
+                        && last.end == r.start
+                    {
+                        last.end = r.end;
+                    } else {
+                        merged.push(r);
+                    }
+                }
+                *saved = merged;
                 at += n;
             }
         }
@@ -191,6 +261,55 @@ impl Journal {
         self.record(Undo::Created(p.clone()))?;
         self.touched.insert(p.clone());
         self.touch_parent(&p);
+        Ok(())
+    }
+
+    /// After a file was successfully created under a durable `Created`
+    /// record. Callers must not use this for an open of an existing file.
+    pub fn created(&mut self, path: &Path) -> std::io::Result<()> {
+        self.created.insert(std::fs::metadata(path)?.ino(), vec![]);
+        Ok(())
+    }
+
+    /// Every successful guest open, including read-only opens. Streams
+    /// clone this same Arc, so their lifetimes are covered as well.
+    pub fn opened(&mut self, file: &Arc<File>) -> std::io::Result<()> {
+        if let Some(handles) = self.created.get_mut(&file.metadata()?.ino()) {
+            handles.retain(|h| h.strong_count() > 0);
+            handles.push(Arc::downgrade(file));
+        }
+        Ok(())
+    }
+
+    /// Unlinks a file. Only files present before the request need a slot
+    /// for recovery; new files with live descriptors still pay for storage.
+    pub fn unlink(&mut self, path: &Path, bytes: u64) -> std::io::Result<()> {
+        let ino = std::fs::metadata(path)?.ino();
+        if self.created.get(&ino).is_some_and(|hs| hs.iter().all(|h| h.strong_count() == 0)) {
+            std::fs::remove_file(path)?;
+            self.created.remove(&ino);
+            self.touch_parent(&self.rel(path));
+            return Ok(());
+        }
+        let slot = self.remove(path, bytes)?;
+        self.discard_created(&slot, bytes)
+    }
+
+    /// After a staged removal can no longer need restoring on syscall
+    /// failure (notably rename), discard its data if rollback never needs it.
+    pub fn discard_created(&mut self, slot: &Path, bytes: u64) -> std::io::Result<()> {
+        let ino = std::fs::metadata(slot)?.ino();
+        if self.created.contains_key(&ino) {
+            std::fs::remove_file(slot)?;
+            // Forget identity before the inode can be reused. No size or
+            // byte records are ever made for these files.
+            let handles = self.created.remove(&ino).unwrap();
+            if handles.iter().any(|h| h.strong_count() > 0) {
+                self.unlinked.push((handles, bytes));
+            } else {
+                self.held.1 -= bytes;
+            }
+        }
         Ok(())
     }
 
@@ -212,17 +331,28 @@ impl Journal {
         self.slots += 1;
         let slot = self.dir.join(self.slots.to_string());
         let p = self.rel(path);
-        self.record(Undo::Renamed(p.clone(), self.rel(&slot)))?;
-        std::fs::rename(path, &slot)?;
+        let result = self.record(Undo::Renamed(p.clone(), self.rel(&slot)))
+            .and_then(|()| std::fs::rename(path, &slot));
+        if let Err(e) = result {
+            self.held.1 -= bytes;
+            return Err(e);
+        }
         self.touch_parent(&p);
         Ok(slot)
     }
 
     /// Before `from` is renamed to `to`, where nothing is or an empty
     /// directory (removed with [`Self::removing_dir`]) is.
-    pub fn renaming(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+    pub fn renaming(&mut self, from: &Path, to: &Path) -> std::io::Result<u64> {
         let (from, to) = (self.rel(from), self.rel(to));
+        let at = self.held.0;
         self.record(Undo::Renamed(from.clone(), to.clone()))?;
+        Ok(at)
+    }
+
+    /// Only a successful syscall moves the dirty paths to their new names.
+    pub fn renamed(&mut self, from: &Path, to: &Path) {
+        let (from, to) = (self.rel(from), self.rel(to));
         // What is to be synced moves with it.
         let moved = |p: PathBuf| match p.strip_prefix(&from) {
             Ok(rest) if rest.as_os_str().is_empty() => to.clone(),
@@ -232,6 +362,48 @@ impl Journal {
         self.touched = self.touched.drain().map(moved).collect();
         self.touch_parent(&from);
         self.touch_parent(&to);
+    }
+
+    /// Restore a staged target before cancelling the attempted rename.
+    /// Sync both directories before invalidating any undo record: a crash
+    /// must see either the restored target or the undo that restores it.
+    pub fn restore(&mut self, slot: &Path, to: &Path, bytes: u64) -> std::io::Result<()> {
+        let t0 = Instant::now();
+        let result = (|| {
+            std::fs::rename(slot, to)?;
+            sync(to.parent().expect("volume entry"))?;
+            sync(&self.dir)?;
+            self.held.1 -= bytes;
+            Ok(())
+        })();
+        self.obj.uncharge(t0.elapsed());
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// The failed rename's record must not act on a later reuse of either
+    /// name. Replace only its tag, preserving framing and other concurrent
+    /// operations' records. Cancelled records still consume log budget.
+    pub fn cancel_rename(&mut self, at: u64) -> std::io::Result<()> {
+        let t0 = Instant::now();
+        let result = (|| {
+            let log = File::options().write(true).open(self.dir.join(LOG))?;
+            log.write_all_at(&[5], at + 8)?;
+            log.sync_data()
+        })();
+        self.obj.uncharge(t0.elapsed());
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    pub fn check(&self) -> std::io::Result<()> {
+        if self.poisoned {
+            return Err(std::io::Error::other("journal requires recovery"));
+        }
         Ok(())
     }
 
@@ -241,6 +413,7 @@ impl Journal {
 
     /// Makes the request's changes durable and forgets how to undo them.
     pub fn commit(&mut self) -> std::io::Result<()> {
+        self.check()?;
         let Some(log) = self.log.take() else { return Ok(()) };
         let t0 = Instant::now();
         for p in self.touched.drain() {
@@ -253,7 +426,8 @@ impl Journal {
         self.obj.uncharge(t0.elapsed());
         clear(&self.dir)?;
         self.sized.clear();
-        self.held = (0, 0);
+        self.created.clear();
+        self.held = (0, self.unlinked.iter().map(|(_, bytes)| bytes).sum());
         Ok(())
     }
 }
@@ -280,11 +454,12 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
             Undo::Created(p) => std::fs::remove_file(abs(p)).or_else(|_| std::fs::remove_dir(abs(p))),
             Undo::RemovedDir(p) => std::fs::create_dir(abs(p)),
             Undo::Renamed(from, to) if !abs(from).exists() => std::fs::rename(abs(to), abs(from)),
-            Undo::Renamed(..) => Ok(()),
+            Undo::Renamed(..) | Undo::Cancelled => Ok(()),
         };
         let p = match &undo {
             Undo::Size(p, _) | Undo::Bytes(p, ..) => p.as_path(),
             Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
+            Undo::Cancelled => Path::new(""),
         };
         sync_if_there(&base.join(p))?;
         #[cfg(test)]
@@ -312,6 +487,7 @@ fn encode(undo: &Undo) -> Vec<u8> {
         Undo::Created(a) => (2, vec![p(a)]),
         Undo::RemovedDir(a) => (3, vec![p(a)]),
         Undo::Renamed(a, b) => (4, vec![p(a), p(b)]),
+        Undo::Cancelled => unreachable!("only made by cancelling a rename's tag"),
     };
     put(&[tag]);
     fields.iter().for_each(|f| put(f));
@@ -343,6 +519,11 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
             [2] => Undo::Created(path(log)?),
             [3] => Undo::RemovedDir(path(log)?),
             [4] => Undo::Renamed(path(log)?, path(log)?),
+            [5] => {
+                path(log)?;
+                path(log)?;
+                Undo::Cancelled
+            }
             _ => return None,
         })
     };
@@ -455,11 +636,13 @@ mod tests {
     /// journal, then the rename is recorded and made.
     fn rename(j: &mut Journal, v: &Path, from: &str, to: &str) {
         let (from, to) = (v.join(from), v.join(to));
-        if let Ok(md) = std::fs::metadata(&to) {
-            j.remove(&to, md.len()).unwrap();
-        }
+        let replaced = std::fs::metadata(&to).ok().map(|md| (j.remove(&to, md.len()).unwrap(), md.len()));
         j.renaming(&from, &to).unwrap();
-        std::fs::rename(from, to).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        j.renamed(&from, &to);
+        if let Some((slot, bytes)) = replaced {
+            j.discard_created(&slot, bytes).unwrap();
+        }
     }
 
     thread_local! {
@@ -484,6 +667,7 @@ mod tests {
         f.set_len(0).unwrap();
         j.creating(&v.join("n")).unwrap();
         std::fs::write(v.join("n"), "new").unwrap();
+        j.created(&v.join("n")).unwrap();
         j.creating(&v.join("m")).unwrap();
         std::fs::create_dir(v.join("m")).unwrap();
         j.remove(&v.join("d/b"), 3).unwrap();
@@ -610,6 +794,74 @@ mod tests {
         assert_eq!(tree(&v), before);
     }
 
+    /// Failed overwrites keep both the dirty source and a restored new
+    /// target's inode/descriptor tracking intact.
+    #[test]
+    fn failed_rename_keeps_dirty_source_and_restored_creation_tracked() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        write(&mut j, &v, "a", 0, b"dirty");
+        let to = v.join("new");
+        j.creating(&to).unwrap();
+        std::fs::write(&to, b"new").unwrap();
+        j.created(&to).unwrap();
+        let handle = Arc::new(File::open(&to).unwrap());
+        j.opened(&handle).unwrap();
+        let ino = handle.metadata().unwrap().ino();
+        let slot = j.remove(&to, 3).unwrap();
+        let at = j.renaming(&v.join("a"), &to).unwrap();
+        assert!(
+            j.touched.contains(Path::new("o/a")),
+            "dirty source must still be synced after failure"
+        );
+        j.restore(&slot, &to, 3).unwrap();
+        j.cancel_rename(at).unwrap();
+        assert_eq!(j.held.1, 0);
+        assert_eq!(std::fs::metadata(&to).unwrap().ino(), ino);
+        assert!(j.created.contains_key(&ino));
+        j.unlink(&to, 3).unwrap();
+        assert_eq!(j.held.1, 3, "the open, discarded creation still occupies storage");
+        drop(handle);
+        j.charge(0, 0).unwrap();
+        assert_eq!(j.held.1, 0);
+        drop(j);
+        open(&v);
+        assert_eq!(tree(&v), before);
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
+    /// Cancellation must survive interrupted recovery, including later
+    /// discard and reuse of the failed rename's source and target paths.
+    #[test]
+    fn cancelled_renames_survive_interrupted_recovery() {
+        for after in 0..10 {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = open(&v);
+            let (from, to) = (v.join("new"), v.join("f"));
+            j.creating(&from).unwrap();
+            std::fs::write(&from, b"new").unwrap();
+            j.created(&from).unwrap();
+            let slot = j.remove(&to, 2).unwrap();
+            let at = j.renaming(&from, &to).unwrap();
+            j.restore(&slot, &to, 2).unwrap();
+            j.cancel_rename(at).unwrap();
+            j.unlink(&from, 3).unwrap();
+            j.unlink(&to, 2).unwrap();
+            j.creating(&to).unwrap();
+            std::fs::write(&to, b"replacement").unwrap();
+            j.created(&to).unwrap();
+            drop(j);
+            CRASH_AFTER.with(|c| c.set(Some(after)));
+            let _ = reopen(&v, 4096);
+            CRASH_AFTER.with(|c| c.set(None));
+            open(&v);
+            assert_eq!(tree(&v), before, "recovery interrupted at {after}");
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+        }
+    }
+
     /// A file opened write-only can be written over: the bytes it replaces
     /// are read through a handle of the journal's own.
     #[test]
@@ -649,13 +901,89 @@ mod tests {
     #[test]
     fn the_journal_is_bounded() {
         let v = volume();
-        let mut j = reopen(&v, 250).unwrap();
+        let mut j = reopen(&v, 100).unwrap();
         let a = File::options().read(true).write(true).open(v.join("a")).unwrap();
-        for _ in 0..3 {
-            j.writing(&a, 0, 11).unwrap();
+        j.writing(&a, 0, 5).unwrap();
+        for _ in 0..2 {
+            assert_eq!(j.writing(&a, 0, 11).unwrap_err().kind(), ErrorKind::StorageFull);
+            assert_eq!(j.remove(&v.join("f"), 2).unwrap_err().kind(), ErrorKind::StorageFull);
+            assert_eq!(j.held.1, 0, "a refused removal retains no bytes");
         }
-        assert_eq!(j.writing(&a, 0, 11).unwrap_err().kind(), ErrorKind::StorageFull);
-        assert_eq!(j.remove(&v.join("f"), 1 << 20).unwrap_err().kind(), ErrorKind::StorageFull);
+        assert_eq!(
+            j.remove(&v.join("f"), 1 << 20).unwrap_err().kind(),
+            ErrorKind::StorageFull
+        );
         assert!(v.join("f").exists());
+    }
+
+    /// Overlap, rename, and truncate/regrow must restore request-start
+    /// bytes, not intermediate versions. Repeat recovery at every record.
+    #[test]
+    fn original_bytes_are_saved_once() {
+        for after in 0..9 {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = reopen(&v, 512).unwrap();
+            write(&mut j, &v, "a", 3, b"XYZ");
+            write(&mut j, &v, "a", 1, b"12345678");
+            rename(&mut j, &v, "a", "renamed");
+            let f = File::options().write(true).open(v.join("renamed")).unwrap();
+            j.writing(&f, 2, 11).unwrap();
+            f.set_len(2).unwrap();
+            for _ in 0..1000 {
+                write(&mut j, &v, "renamed", 0, b"abcdefghijklmnop");
+            }
+            let payload: usize = decode(&std::fs::read(j.dir.join(LOG)).unwrap())
+                .iter()
+                .map(|(_, u)| match u {
+                    Undo::Bytes(_, _, bytes) => bytes.len(),
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(payload, 11, "each original byte once; extensions need no backup");
+            drop(j);
+            CRASH_AFTER.with(|c| c.set(Some(after)));
+            let _ = reopen(&v, 512);
+            CRASH_AFTER.with(|c| c.set(None));
+            open(&v);
+            assert_eq!(tree(&v), before, "recovery interrupted at {after}");
+        }
+    }
+
+    /// New identities can disappear, be replaced, and reuse the same
+    /// names without retaining their contents or confusing original files.
+    #[test]
+    fn discarded_creations_do_not_change_recovery() {
+        for after in 0..14 {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = reopen(&v, 4096).unwrap();
+            let create = |j: &mut Journal, name: &str| {
+                let p = v.join(name);
+                j.creating(&p).unwrap();
+                std::fs::write(&p, [9; 2048]).unwrap();
+                j.created(&p).unwrap();
+            };
+            create(&mut j, "new");
+            rename(&mut j, &v, "new", "moved");
+            create(&mut j, "new");
+            rename(&mut j, &v, "a", "new"); // Discard the new target, not original a.
+            write(&mut j, &v, "new", 0, b"CHANGED");
+            j.unlink(&v.join("new"), 11).unwrap(); // Original a must survive.
+            j.unlink(&v.join("moved"), 2048).unwrap();
+            create(&mut j, "new");
+            write(&mut j, &v, "new", 0, b"different");
+            j.unlink(&v.join("new"), 2048).unwrap();
+            assert_eq!(j.held.1, 11);
+            assert!(j.created.is_empty(), "no stale identity can survive inode reuse");
+            let count = decode(&std::fs::read(j.dir.join(LOG)).unwrap()).len();
+            assert!(count < 14, "exercise every recovery cut");
+            drop(j);
+            CRASH_AFTER.with(|c| c.set(Some(after)));
+            let _ = reopen(&v, 4096);
+            CRASH_AFTER.with(|c| c.set(None));
+            open(&v);
+            assert_eq!(tree(&v), before, "recovery interrupted at {after}");
+        }
     }
 }

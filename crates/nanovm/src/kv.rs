@@ -119,10 +119,11 @@ impl ObjState {
         self.quota.reserve(old, value.len() as u64)?;
         let trap = |e| Fail::Trap(wasmtime::Error::msg(format!("journal: {e:?}")));
         if let Some(old) = old {
-            self.quota.journal(|j| j.remove(&path, old)).map_err(trap)?;
+            self.quota.journal(|j| j.unlink(&path, old)).map_err(trap)?;
         }
         self.quota.journal(|j| j.creating(&path)).map_err(trap)?;
-        std::fs::write(&path, value).map_err(|e| Fail::Trap(e.into()))
+        std::fs::write(&path, value).map_err(|e| Fail::Trap(e.into()))?;
+        self.quota.journal(|j| j.created(&path)).map_err(trap)
     }
 
     fn delete_value(&self, bucket: &Resource<Bucket>, key: &str) -> Result<(), Fail> {
@@ -130,7 +131,7 @@ impl ObjState {
         if let Ok(md) = std::fs::symlink_metadata(&path)
             && md.is_file()
         {
-            self.quota.remove(&path, md.len())?;
+            self.quota.unlink(&path, md.len())?;
         }
         Ok(())
     }
@@ -407,9 +408,41 @@ mod tests {
         let b = ok(s.open_bucket(""));
         let big = vec![0; 600 << 10];
         ok(s.set_value(&b, "a", &big));
-        ok(s.set_value(&b, "a", &big));
-        // The journal now holds one removed value; a second won't fit.
-        assert!(matches!(s.set_value(&b, "a", b"small"), Err(Fail::Trap(_))));
+        ok(s.set_value(&b, "b", b"small"));
+        s.quota.commit().unwrap();
+        ok(s.delete_value(&b, "a"));
+        // Grow a different request-start inode through the filesystem.
+        // Its slot plus a's retained value no longer fits the journal.
+        let file = std::fs::File::options().write(true).open(ok(s.key_path(&b, "b"))).unwrap();
+        s.quota.journal(|j| j.writing(&file, 5, big.len() as u64)).unwrap();
+        file.set_len(big.len() as u64).unwrap();
+        s.quota.adjust(big.len() as i64 - 5, 0);
+        assert!(matches!(s.set_value(&b, "b", b"small"), Err(Fail::Trap(_))));
+    }
+
+    /// Replacing a key repeatedly retains only its request-start value,
+    /// even though each replacement is a different inode.
+    #[test]
+    fn intermediate_values_do_not_accumulate() {
+        for commit in [false, true] {
+            let limits = Limits { disk_mb: 1, ..Limits::default() };
+            let mut s = state(limits.clone());
+            let b = ok(s.open_bucket(""));
+            ok(s.set_value(&b, "k", b"original"));
+            s.quota.commit().unwrap();
+            for n in 0..1000 {
+                ok(s.set_value(&b, "k", &vec![n as u8; 8192]));
+                assert_eq!(s.quota.usage(), (8192, 3));
+            }
+            if commit { s.quota.commit().unwrap(); }
+            // Keep the old test state's temporary directory alive while
+            // opening a fresh journal/quota guard to recover and recount it.
+            let mut reopened = ObjState::for_test(s.volume.clone(), &limits);
+            let b = ok(reopened.open_bucket(""));
+            let expected = if commit { vec![999u16 as u8; 8192] } else { b"original".to_vec() };
+            assert_eq!(get(&reopened, &b, "k"), Some(expected.clone()));
+            assert_eq!(reopened.quota.usage(), (expected.len() as u64, 3));
+        }
     }
 
     /// A key whose file the guest replaced with something else through its

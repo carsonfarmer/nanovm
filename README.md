@@ -35,7 +35,7 @@ The real HTTP path has a separate unresolved limit ([N-36](ISSUES.md)): oha 1.16
 
 Further measurements point to serial export round-trip latency under load, not identity stamping alone. A stable-runtime sweep delivered all 200,000 spans at concurrency 64 (21.8k requests/s), versus 166,452 at concurrency 256 (26.1k/s). These are observations on this orb, not a safe-rate guarantee; production full export at 64k/s remains unproven.
 
-Runtime budget: fewer than 5,000 nonblank/noncomment lines before test modules (currently 4,993), enforced by CI. Guest and infrastructure logs share one bounded record-emission path. Collector responses are bounded to 4 KiB and passed intact to the SDK, including partial-success reports. The CLI writes SDK warnings to stderr rather than back into the failing export stream; library embedders install their own diagnostic subscriber.
+Runtime budget: fewer than 5,000 nonblank/noncomment lines before test modules, enforced by CI. The published W-2 checkpoint has 4,993; local integration of main's journal fixes raises this to 5,206 and cannot pass the budget check until simplified. Guest and infrastructure logs share one bounded record-emission path. Collector responses are bounded to 4 KiB and passed intact to the SDK, including partial-success reports. The CLI writes SDK warnings to stderr rather than back into the failing export stream; library embedders install their own diagnostic subscriber.
 
 One request span lasts through the final post-return commit. It carries HTTP method/path (no query), status/error, cold-start status and queue, instantiate, guest, commit and post-return durations in milliseconds. `nanovm.response.duration_ms` measures time to the response headers; span duration also includes subsequent work. Calls between objects remain child spans. Only immutable context crosses tasks. The tracing feature, metric exporters and local request histograms are removed; OpenTelemetry's SDK owns recording, batching and export. Requests record even when an incoming parent is unsampled: sampling belongs downstream. Guest-defined spans/enrichment are follow-up W-17.
 
@@ -237,6 +237,8 @@ A request's changes to `/data` (files and key-value alike) and what it publishes
 - **Safety:**
   - Guest paths reach only the volume. The journal sits beside it, out of reach.
   - An undo that can't be applied is skipped rather than leave the object unable to start.
+  - A failed rename restores its staged destination and storage accounting, keeps dirty-source sync tracking, and durably cancels its rename undo before paths can be reused. If restoration or cancellation fails, the request cannot commit and must recover. Cancelled records still consume log space.
+- **Downgrades:** cancelled renames use journal tag 5. This version reads older journals, but older binaries cannot recover a log containing that tag. Before downgrading, drain requests and finish any pending recovery with this version; never delete an uncommitted journal to make a downgrade work.
 - **`/tmp` is not journaled.** It is per-instance scratch, deleted with the instance, so it's the fast place for temporary files. A rename between `/tmp` and `/data` fails as cross-device, as between real filesystems.
 
 **Alternatives considered:**
