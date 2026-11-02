@@ -1076,8 +1076,25 @@ fn jail_probe() {
 /// without errors or restarts.
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_connection_outlives_many_requests() {
-    let (_sup, addr) = supervised("worker_connection_outlives_many_requests").await;
+    let (sup, addr) = supervised("worker_connection_outlives_many_requests").await;
     let counter = publish("counter", &app("counter")).await;
+    // A worker belongs to the supervisor's control runtime, not whichever
+    // front-end runtime happened to receive the request that started it.
+    let (ready, port) = tokio::sync::oneshot::channel();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let front = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            ready.send(listener.local_addr().unwrap()).unwrap();
+            tokio::spawn(nanovm::server::serve_http1(listener, move |req| sup.clone().handle(req)));
+            stopped.await.unwrap();
+        });
+    });
+    assert_eq!(app_get(port.await.unwrap(), &counter, "/c0/").await.0, 200);
+    let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].clone();
+    stop.send(()).unwrap();
+    tokio::task::spawn_blocking(move || front.join().unwrap()).await.unwrap();
     let tasks: Vec<_> = (0..32)
         .map(|t| {
             let counter = counter.clone();
@@ -1098,6 +1115,7 @@ async fn worker_connection_outlives_many_requests() {
     }
     assert_eq!(bad, 0);
     let v = stats_json(addr).await;
+    assert_eq!(v["workers"][worker(&counter).as_str()]["pid"], pid, "front-end shutdown must not stop its worker");
     assert_eq!(v["workers"][worker(&counter).as_str()]["starts"], 1, "{v}");
     assert_eq!(v["workers"][worker(&counter).as_str()]["link_errors"], 0, "{v}");
 }

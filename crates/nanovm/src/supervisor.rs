@@ -63,6 +63,7 @@ const MAX_POLICIES: usize = 16;
 
 pub struct Supervisor {
     cfg: NodeConfig,
+    runtime: tokio::runtime::Handle,
     /// Front-end threads, each with its own pool of connections per worker.
     threads: usize,
     /// The `nanovm` binary, run as `nanovm worker`.
@@ -138,10 +139,11 @@ impl Worker {
 }
 
 impl Supervisor {
-    /// Call within the front-end runtime. `threads` counts threads calling `handle`.
+    /// Call within the control/egress runtime. `threads` counts front-end threads.
     pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
         let sup = Arc::new(Supervisor {
+            runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
             threads,
             exe,
@@ -265,7 +267,7 @@ impl Supervisor {
         // In its own task: once begun, a switch finishes even if every
         // request waiting for it goes away.
         let (sup, w, want) = (self.clone(), w.clone(), want.clone());
-        match tokio::spawn(async move { sup.ensure(&w, &want).await }).await {
+        match self.runtime.spawn(async move { sup.ensure(&w, &want).await }).await {
             Ok(live) => live,
             Err(e) => Err(error_response(500, "worker-down", &e.to_string())),
         }

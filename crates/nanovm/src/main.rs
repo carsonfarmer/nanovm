@@ -44,7 +44,9 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
     let threads = cfg.front_threads();
     let t0 = std::time::Instant::now();
     let rt = runtime()?;
-    let sup = rt.block_on(async { Supervisor::new(cfg, std::env::current_exe()?, threads) })?;
+    let control = tokio::runtime::Builder::new_multi_thread().worker_threads(1)
+        .thread_name("nanovm-control").enable_all().build()?;
+    let sup = control.block_on(async { Supervisor::new(cfg, std::env::current_exe()?, threads) })?;
     let first = rt.block_on(async { listener(addr) })?;
     eprintln!("nanovm: ready in {:.0?} on http://{addr}/", t0.elapsed());
     for i in 1..threads {
@@ -57,7 +59,7 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
                 rt.block_on(async { front(sup, listener(addr)?).await })
             })?;
     }
-    // Thread 0 also runs the workers' reapers and egress links.
+    // Control/egress I/O has its own reactor, independent of front-end load.
     rt.block_on(front(sup, first))
 }
 
