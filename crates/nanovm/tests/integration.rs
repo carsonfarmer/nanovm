@@ -1491,6 +1491,51 @@ async fn wasi_config_serves_the_apps_values() {
 
 // ---- commits ---------------------------------------------------------------
 
+/// The SQLite engine is a separate component, not linked into the HTTP client.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SQLite build.sh --compose and wac 0.12.0"]
+async fn sqlite_composed_provider() {
+    let cfg = node_cfg("sqlite_composed", 2);
+    let mut app = app("counter");
+    app.limits.memory_mb = 64;
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    let client = std::fs::read(repo().join("target/sqlite-filesystem/wasm32-wasip2/release/sqlite_client.wasm")).unwrap();
+    let why = Node::new(cfg.clone(), &app, &client, None).err().expect("uncomposed SQL must not link");
+    assert!(format!("{why:#}").contains("spin:sqlite/sqlite@3.1.0"));
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/composed.wasm")).unwrap();
+    let node = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
+    let expected = |rows: &[&str], marker: &str, reused: bool| {
+        serde_json::json!({"rows": rows, "file": marker, "key": marker, "reused": reused})
+    };
+    let first = get(&node, "a", "/?v=first").await;
+    assert_eq!(first.status, 200, "{:?}: {}", first.error, first.body);
+    assert_eq!(first.json(), expected(&["first"], "first", false));
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", true));
+    for then in ["error", "trap"] {
+        let fail = get(&node, "a", &format!("/?v=discard&then={then}")).await;
+        assert_eq!(fail.error.as_deref(), Some(if then == "error" { "guest-error" } else { "trap" }), "{}", fail.body);
+        assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", false));
+    }
+    let denials = node.metrics.fs_denied.load(Relaxed);
+    let full = get(&node, "a", "/full?v=discard-full").await;
+    assert_eq!(full.error.as_deref(), Some("guest-error"), "{}", full.body);
+    assert!(full.body.contains("composed quota"));
+    assert!(node.metrics.fs_denied.load(Relaxed) > denials);
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", false));
+    let response = get(&node, "a", "/?v=second&then=status").await;
+    assert_eq!(response.status, 507);
+    assert_eq!(response.json(), expected(&["first", "second"], "second", true));
+    assert_eq!(get(&node, "a", "/close").await.json(), expected(&["first", "second"], "second", true));
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
+    assert_eq!(get(&node, "b", "/").await.json(), expected(&[], "", false));
+    node.shutdown().await;
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
+    node.shutdown().await;
+    println!("composed Spin SQLite: typed values, one connection, policy denial, drop/reopen, isolation, mixed rollback and restart passed");
+}
+
 /// Opt-in experiment: build both fixtures with experiments/sqlite-filesystem/build.sh.
 /// No stock P2 filesystem import may bypass nanovm's journal to make SQLite work.
 #[tokio::test(flavor = "multi_thread")]

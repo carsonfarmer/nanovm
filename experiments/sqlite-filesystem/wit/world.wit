@@ -1,0 +1,9 @@
+package nanovm-experiment:sqlite;
+
+world provider {
+    export spin:sqlite/sqlite@3.1.0;
+}
+
+world client {
+    import spin:sqlite/sqlite@3.1.0;
+}

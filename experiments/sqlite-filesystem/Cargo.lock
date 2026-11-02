@@ -332,6 +332,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
+name = "sqlite-client"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "util",
+ "wit-bindgen",
+]
+
+[[package]]
 name = "sqlite-filesystem"
 version = "0.0.0"
 dependencies = [
@@ -339,6 +348,16 @@ dependencies = [
  "serde_json",
  "sqlite-vfs",
  "util",
+]
+
+[[package]]
+name = "sqlite-provider"
+version = "0.0.0"
+dependencies = [
+ "rusqlite",
+ "sqlite-vfs",
+ "util",
+ "wit-bindgen",
 ]
 
 [[package]]

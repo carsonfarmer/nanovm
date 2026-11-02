@@ -13,11 +13,13 @@ Install the Rust `wasm32-wasip2` target and unpack
 From the repository root:
 
 ```sh
-WASI_SDK_PATH=/path/to/wasi-sdk-34.0-x86_64-linux bash experiments/sqlite-filesystem/build.sh
+cargo install wac-cli --version 0.12.0 --locked
+WASI_SDK_PATH=/path/to/wasi-sdk-34.0-x86_64-linux bash experiments/sqlite-filesystem/build.sh --compose
 cargo test --locked -p nanovm --test integration sqlite_ -- --ignored --nocapture --test-threads=1
 ```
 
-The script builds both variants under `target/sqlite-filesystem/`:
+The script builds the original variants under `target/sqlite-filesystem/` and,
+with `--compose`, the separate provider/client and `composed.wasm`:
 
 - `stock.wasm`: libsqlite3-sys's bundled WASI VFS, using libc file operations.
   Nanovm rejects its `wasi:filesystem/types@0.2.12` import. Do not allowlist it:
@@ -263,38 +265,69 @@ six correctness tests also pass, including all 689 fault cuts and the existing
 DELETE-mode worker SIGKILL test. No latency thresholds are asserted in CI;
 the benchmark is deliberately separate from the `sqlite_` correctness filter.
 
-**Decision:** keep DELETE as the initial, quota-predictable default. Offer
-exclusive WAL once connection ownership and checkpoint policy are enforced;
-it is worthwhile for cached write-heavy apps, but neither tested checkpoint
-threshold is a universal best setting. Do not weaken sync or outer request
-durability to obtain the measured benefit: both modes used FULL throughout.
+**Decision:** use DELETE internally, with no app-facing journal controls.
+WAL remains implementation research: neither tested checkpoint threshold is a
+universal best setting. Do not weaken sync or outer request durability to obtain
+the measured benefit: both modes used FULL throughout.
+
+## Component composition proof
+
+`provider/` contains SQLite and reuses the P3 VFS. `client/` contains only the
+HTTP application and generated Spin imports, with no SQLite dependency. `wac plug`
+connects them into `composed.wasm`. The uncomposed client is rejected by nanovm's
+unchanged import allowlist; the composed artifact runs on the real Node runtime.
+There is no host SQL handler or allowlist exception.
+
+**The original 3.0 interface recommendation did not survive this test.** A
+synchronous exported SQL call traps with `cannot block a synchronous task before
+returning` when SQLite waits for P3 I/O. Forcing async bindings for those same sync
+WIT functions is not valid either: composition rejects the async canonical option
+on a synchronous function type. Use Spin's existing **3.1 async methods**, not a
+modified 3.0 WIT. The vendored [upstream WIT](wit/deps/spin-sqlite/sqlite.wit) is
+byte-for-byte from [Spin commit 3f0ced5](https://github.com/spinframework/spin/blob/3f0ced5e2dcc1f9339f717f747b58c84d9afe3f0/wit/deps/spin-sqlite%403.1.0/sqlite.wit).
+
+The provider uses `open-async` and `execute-async`; legacy synchronous open/execute
+return an explicit unsupported-use error rather than trapping. The 3.1 result
+stream and completion future cross the component boundary. For this proof,
+SQLite fully executes and finalizes each statement before returning the stream;
+rows are materialized in guest memory, so a slow consumer cannot keep a SQL
+transaction open. This is not a large-result streaming implementation.
+
+`sqlite_composed_provider` verifies all five typed value variants, column names,
+41-row streaming, abandoned streams, errors followed by successful queries,
+unknown database names, rejection of a second connection, cached reuse,
+resource drop/reopen, policy denials, object isolation and restart. SQL/file/KV
+changes roll back together on guest error, trap and quota refusal; HTTP 507 still
+commits. The existing 689-cut matrix remains against the directly linked fixture,
+not the composed provider. This proof uses real in-process Node dispatch; the
+composed artifact has not separately undergone the jailed-worker SIGKILL campaign.
 
 ## Revised interface proposal
 
 **Keep SQLite in Wasm, backed by the existing filesystem. Reuse
-`spin:sqlite/sqlite@3.0.0` unchanged as the candidate public interface.**
+`spin:sqlite/sqlite@3.1.0` unchanged, using its async methods.**
 Do not add native SQLite storage calls to the host: they would bypass the P3
 quota/journal interception demonstrated here. The nontrivial integration is a
 P3 VFS, not teaching nanovm how SQLite commits.
 
 There is no mature WASI SQLite standard to adopt: [WASI SQL](https://github.com/WebAssembly/wasi-sql)
-is a Phase 1 proposal. [Spin's published SQLite WIT](https://github.com/spinframework/spin/blob/main/wit/deps/spin-sqlite%403.0.0/sqlite.wit)
-is an existing ecosystem interface, not a WASI standard. Its complete API is
-small enough; inventing `nanovm:sqlite` would add little:
+is a Phase 1 proposal. [Spin's published SQLite WIT](wit/deps/spin-sqlite/sqlite.wit)
+is an existing ecosystem interface, not a WASI standard. The supported entry points
+are:
 
-- `connection.open(database: string) -> result<connection, error>`
-- `connection.execute(statement: string, parameters: list<value>) -> result<query-result, error>`
-- `connection.last-insert-rowid() -> s64`
-- `connection.changes() -> u64`
+- `connection.open-async(database: string) -> result<connection, error>`
+- `connection.execute-async(statement: string, parameters: list<value>)`
+  returns column names, a row stream and a completion future, or an error.
+- `connection.last-insert-rowid-async() -> s64`
+- `connection.changes-async() -> u64`
 - `value`: `integer(s64)`, `real(f64)`, `text(string)`, `blob(list<u8>)`, `null`.
 - `query-result`: column names and rows, each row containing a list of values.
 - Errors: `no-such-database`, `access-denied`, `invalid-connection`,
   `database-full`, `io(string)`.
 
-Use the upstream WIT verbatim when implementing, not this prose as a new WIT
-definition. The resource/open/typed-values shape fits config/keyvalue's small
-capability interfaces. Prefer 3.0's materialized results over 3.1's async/stream
-extensions for the first implementation; results remain bounded by guest memory.
+Use the upstream WIT verbatim, not this prose as a new WIT definition. The
+resource/open/typed-values shape fits config/keyvalue's capability interfaces.
+Materialization can stay an implementation detail behind the 3.1 stream API.
 
 [Cloudflare's SQLite-backed Durable Objects](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)
 are the useful ownership model: a database belongs to one serialized object.
@@ -305,15 +338,13 @@ and returned rows already cover the basic use case.
 
 ### Small initial policy
 
-1. `open("default")` selects this object's private database. Do not accept
+1. `open-async("default")` selects this object's private database. Do not accept
    arbitrary filesystem paths or promise databases shared across objects.
    Other names return `no-such-database` until named databases are needed.
-2. Start with one connection per database, DELETE journaling, FULL sync and
-   in-memory temporary storage. Multiple resource handles must not silently
-   create independent connections with this fixture's no-op locking.
-   Exclusive WAL is now a verified alternative for that ownership model, but
-   adds checkpoint policy and has no concurrent-reader benefit here. The benchmark
-   justifies opt-in WAL for cached write-heavy workloads, not a universal switch.
+2. Exactly one live connection per provider instance/object. A second open returns
+   `invalid-connection`; dropping it allows reopening. DELETE journaling, FULL sync
+   and memory temporary storage are internal policy, with no app-facing controls.
+   Multi-connection WAL is outside the intended scope, not a shipping prerequisite.
 3. Execute one parameterized statement at a time. Ordinary SQL failures return
    the upstream error type; journal exhaustion must not leak the fixture's
    misleading `interrupted` classification as the intended API contract.
@@ -327,12 +358,9 @@ and returned rows already cover the basic use case.
    work; it does not solve transactions left open across a response. Broaden
    the policy only after specifying and testing request-boundary finalization.
 
-The intended packaging is a reusable SQLite Wasm component exporting the Spin
-interface and importing P3 filesystem, composed with an application. **This
-branch has not proved component composition:** the engine is compiled directly
-into an HTTP fixture. Prove composition and resource/async behavior before
-committing to that packaging; no new host import allowlist entry is needed if
-composition resolves the Spin interface internally.
+This packaging now runs as two composed Wasm components. The proof establishes
+the async/resource boundary, not full Spin behavioral equivalence or production
+readiness. The synchronous 3.0 API is not supported over this P3 VFS.
 
 ### Permanent support, and what to do with key-value/config
 
@@ -342,8 +370,8 @@ implementation is an optional composed provider using the upstream Spin SQLite
 WIT, one owned connection and a production-quality P3 VFS. Its contract tests
 must cover typed bindings/results, resource drop/reopen, multiple handles,
 bounded errors/results, traps and response commit/rollback. Keep the current
-SQL/file/KV recovery matrix against it. Prove composition first, before adding
-a host SQLite service or a new runtime import.
+SQL/file/KV recovery matrix against it. Extend the composed-provider tests rather
+than adding a host SQLite service or a new runtime import.
 
 The provider can cache its connection across successful requests, but a failed
 request must discard the whole instance before filesystem recovery. Until there
@@ -353,7 +381,7 @@ but avoids inventing an implicit commit protocol or pretending that the outer
 journal understands SQLite's in-memory transaction state. Explicit transactions
 and ATTACH can follow once their lifecycle is specified and tested.
 
-WAL should be an implementation/deployment policy, not new WIT methods. Reserve
+WAL is not an app option in this proposal. If it is adopted internally later, reserve
 disk headroom for database, WAL, undo and retained files; checkpoint thresholds
 are triggers, not hard size caps. Document database-path ownership and refuse
 unsupported concurrent opens; local no-op locks are not a production solution.
@@ -370,20 +398,21 @@ memory limits and mixed SQL/file/KV rollback, and measure the extra boundary
 crossings before removing the existing provider. Do not move KV into SQLite
 merely for implementation uniformity.
 
-**Config is different:** `crates/nanovm/src/app.rs` builds read-only, app-scoped
+**Config has different inputs:** `crates/nanovm/src/app.rs` builds read-only, app-scoped
 `WasiConfigVariables` from deployment configuration and shares it across objects.
-It is not per-object mutable state. Keep `wasi:config` and its small host provider;
-copying config into every object's journaled filesystem would add duplication
-and update semantics without solving a demonstrated problem. A future read-only
-mount could be an implementation detail, not a reason to abandon the standard API.
+It is not per-object mutable state. Keep `wasi:config` as the API; its implementation
+could move to Wasm if deployment values can be supplied through a simpler existing
+capability, such as a read-only mount. Evaluate that alongside KV in ISSUES.md W-17.
+The host must still supply deployment inputs and enforce capabilities; moving
+parsing/lookup code into Wasm does not eliminate that responsibility.
 
 ## Remaining gates, not established support
 
-- Normal-locking WAL shared-memory behavior and real multi-connection locks. The
-  fixture only records locks locally; serialized requests alone do not solve
-  multiple connections in one request.
-- Transactions left open across responses, successful cache reuse after storage
-  errors, and preventing raw-file interference with a live database.
+- Production result/error bounds, overlapping async calls within a request,
+  successful cache reuse after storage errors, and raw-file interference with a
+  live database. One connection does not by itself serialize overlapping calls.
+- Full recovery cuts against the composed provider; the direct-VFS results do not
+  establish every additional resource/stream boundary introduced by composition.
 - Filesystem-backed temporary spill and unique temp names. This build forces
   memory temp storage and the placeholder name is not a general temp-file API.
 - Power loss, host I/O failure, and crash injection inside nanovm commit/recovery.
@@ -394,7 +423,7 @@ mount could be an implementation detail, not a reason to abandon the standard AP
   not these products or production hardware.
 
 No runtime changes were necessary for the initial workloads; the generic fixes
-allow the repeated-update workload to fit its existing quota. The six SQLite
+allow the repeated-update workload to fit its existing quota. The seven SQLite
 tests are ignored by the ordinary suite because they need the separate fixture
 and C toolchain; this branch's CI explicitly builds and runs them. This is an
 experimental implementation and proposal, not a shipped interface or a claim of

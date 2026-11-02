@@ -51,7 +51,9 @@ jobs:
           tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
           echo "WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux" >> "$GITHUB_ENV"
       - name: Build SQLite experiment (no publishing)
-        run: bash experiments/sqlite-filesystem/build.sh
+        run: |
+          cargo install wac-cli --version 0.12.0 --locked
+          bash experiments/sqlite-filesystem/build.sh --compose
       - name: Pressure test SQLite against the journal
         run: |
           ulimit -n "$(ulimit -Hn)"

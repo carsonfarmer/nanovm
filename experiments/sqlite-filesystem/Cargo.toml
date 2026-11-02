@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [workspace]
+members = ["provider", "client"]
 
 [lib]
 crate-type = ["cdylib"]

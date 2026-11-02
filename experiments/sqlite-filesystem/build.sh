@@ -15,3 +15,10 @@ for variant in stock p3; do
         --release --target wasm32-wasip2 "${features[@]}"
     cp "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_filesystem.wasm" "$CARGO_TARGET_DIR/$variant.wasm"
 done
+if [[ ${1:-} == --compose ]]; then
+    cargo build --locked --manifest-path "$root/experiments/sqlite-filesystem/Cargo.toml" \
+        -p sqlite-provider -p sqlite-client --release --target wasm32-wasip2
+    wac plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_client.wasm" \
+        --plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_provider.wasm" \
+        -o "$CARGO_TARGET_DIR/composed.wasm"
+fi
