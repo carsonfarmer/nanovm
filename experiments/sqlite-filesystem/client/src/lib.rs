@@ -51,13 +51,22 @@ impl util::wasip3::exports::http::handler::Guest for Client {
         if req.path == "/nohooks" {
             assert!(query(&db, "SELECT nanovm_test_steps()".into(), vec![]).await.is_err());
         }
+        if req.path == "/invalid-text" {
+            assert!(matches!(
+                query(&db, "SELECT CAST(x'ff' AS TEXT)".into(), vec![]).await,
+                Err(Error::Io(_))
+            ));
+            let valid = query(&db, "SELECT 'héllo 世界', x'ff'".into(), vec![]).await.unwrap();
+            assert!(matches!(&valid.rows[0].values[0], Value::Text(s) if s == "héllo 世界"));
+            assert!(matches!(&valid.rows[0].values[1], Value::Blob(b) if b == &[255]));
+        }
         if req.path == "/overlap" {
             use std::{
                 future::{Future, poll_fn},
                 pin::pin,
                 task::Poll,
             };
-            let mut first = pin!(db.execute_async("SELECT nanovm_test_yield()".into(), vec![]));
+            let mut first = pin!(db.execute_async("SELECT nanovm_test_yield(10)".into(), vec![]));
             let mut second = pin!(db.execute_async("SELECT nanovm_test_yielding()".into(), vec![]));
             let (mut a, mut b) = (None, None);
             let (a, b) = poll_fn(|cx| {
@@ -301,6 +310,25 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 vec![],
             )
             .await;
+        }
+        if req.path == "/write-invalid-text" {
+            let _ = query(
+                &db,
+                "INSERT INTO ledger(value) VALUES ('invisible') RETURNING CAST(x'ff' AS TEXT)".into(),
+                vec![],
+            )
+            .await;
+        }
+        if req.path == "/cpu" {
+            let _ = query(
+                &db,
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n".into(),
+                vec![],
+            )
+            .await;
+        }
+        if req.path == "/timeout" {
+            let _ = query(&db, "SELECT nanovm_test_yield(60000)".into(), vec![]).await;
         }
         if req.path == "/constraint" {
             assert!(

@@ -1519,6 +1519,23 @@ async fn sqlite_composed_provider() {
     for then in ["error", "trap"] {
         let fail = get(&node, "a", &format!("/?v=discard&then={then}")).await;
         assert_eq!(fail.error.as_deref(), Some(if then == "error" { "guest-error" } else { "trap" }), "{}", fail.body);
+        if then == "trap" {
+            // Simulate an unwriteable database during host recovery. Neither
+            // a failed startup nor its retry may discard the remaining undo.
+            let base = node.cfg.app_dirs(&app.name)[0].clone();
+            let db = base.join("a/composed.db");
+            let parked = base.join("parked.db");
+            std::fs::rename(&db, &parked).unwrap();
+            std::fs::create_dir(&db).unwrap();
+            let log = base.join("~journal/a/log");
+            for _ in 0..2 {
+                let blocked = get(&node, "a", "/").await;
+                assert!(blocked.status >= 500, "{}", blocked.body);
+                assert!(std::fs::metadata(&log).unwrap().len() > 0, "keep undo for retry");
+            }
+            std::fs::remove_dir(&db).unwrap();
+            std::fs::rename(parked, db).unwrap();
+        }
         assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", false));
     }
     let denials = node.metrics.fs_denied.load(Relaxed);
@@ -1531,6 +1548,17 @@ async fn sqlite_composed_provider() {
     assert_eq!(limited.error.as_deref(), Some("trap"), "{}", limited.body);
     assert!(limited.body.contains("SQLite write result limit"));
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", false));
+    let invalid = get(&node, "a", "/write-invalid-text?v=discard-text").await;
+    assert_eq!(invalid.error.as_deref(), Some("trap"), "{}", invalid.body);
+    assert!(invalid.body.contains("SQLite write result conversion"));
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", false));
+    let response = get(&node, "a", "/invalid-text").await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(response.json(), expected(&["first"], "first", true));
+    let killed = get(&node, "a", "/cpu?v=discard-cpu").await;
+    assert_eq!(killed.error.as_deref(), Some("cpu"), "{}", killed.body);
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", false));
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", true));
     let response = get(&node, "a", "/constraint?v=second&then=status").await;
     assert_eq!(response.status, 507);
     assert_eq!(response.json(), expected(&["first", "second"], "second", true));
@@ -1557,6 +1585,14 @@ async fn sqlite_composed_recovery_cuts() {
     let overlap = get(&node, "overlap", "/overlap").await;
     assert_eq!(overlap.status, 200, "{}", overlap.body);
     assert_eq!(overlap.json()["scheduling"], "serialized");
+    assert_eq!(get(&node, "timeout", "/?v=before").await.status, 200);
+    let timed_out = get(&node, "timeout", "/timeout?v=discard-timeout").await;
+    assert_eq!(timed_out.error.as_deref(), Some("timeout"), "{}", timed_out.body);
+    let entered = node.cfg.app_dirs(&app.name)[0].join("timeout/sql-wait");
+    assert_eq!(std::fs::read(&entered).unwrap(), b"entered", "must reach SQLite's blocking wait");
+    let recovered = get(&node, "timeout", "/").await;
+    assert_eq!(recovered.json(), serde_json::json!({"rows":["before"],"file":"before","key":"before","reused":false}));
+    assert!(!entered.exists(), "the interrupted SQL function's write must roll back too");
     let expected = |changed: bool| {
         let mut rows: Vec<_> = (1..=if changed {12} else {16}).map(|i| {
             serde_json::json!([i, i*3 + if changed {7} else {0}, if changed {8192} else {1024}])

@@ -318,8 +318,13 @@ completion or cancellation cleanup releases it. This is not an exact RSS cap:
 allocation capacity, SQLite buffers and component-ABI copies remain subject to
 the guest memory quota.
 
-Read-only result overflow is catchable. Write RETURNING overflow traps: SQLite
-may already have changed data, so the caller must not commit unseen writes.
+Read-only result overflow or invalid UTF-8 is catchable. Write RETURNING overflow
+or result-conversion failure traps: SQLite may already have changed data, so the
+caller must not commit unseen writes. SQLite TEXT can contain invalid UTF-8;
+WIT strings cannot. Before the conversion fix, catching an error from
+`INSERT ... RETURNING CAST(x'ff' AS TEXT)` committed the inserted row and earlier
+SQL/file/KV writes. The regression now verifies exact request rollback, while
+read-only invalid text, valid Unicode and binary blobs exercise the controls.
 Storage errors (including quota exhaustion), interruption, corruption and other
 uncertain SQLite failures also trap and roll back the whole request. Syntax,
 constraint and policy errors remain catchable. This deliberately stricter
@@ -335,6 +340,20 @@ finished its blocking section. The current VFS uses blocking `waitable-set.wait`
 not an async yield permitting another call into the component. No new lock or
 explicit concurrent-call rejection was needed. This invariant must be revisited
 if execution starts yielding or cursors become lazy streams.
+
+Interruption tests now kill a recursive SQL query on its CPU budget and time out
+a test-injected host-clock wait inside a SQLite function. A filesystem marker
+confirms the function was entered before timeout; after recovery the marker is
+gone and SQL/file/KV state is exactly the prior committed state. These exercise
+the real composed provider and Node, not mocked rollback. The clock wait is an
+artificial blocked host operation, not an injected filesystem failure.
+
+A caller-side cancellation probe was discarded: the execute future returned
+ready on its first poll, so dropping it could not exercise mid-execution
+cancellation. Request interruption and abandoned result streams are tested;
+individual in-flight call cancellation is not established. Do not add an async
+yield merely to make that test possible: it would change the serialization
+assumption being tested.
 
 ## Revised interface proposal
 
@@ -381,7 +400,7 @@ and returned rows already cover the basic use case.
    Multi-connection WAL is outside the intended scope, not a shipping prerequisite.
 3. Execute one parameterized statement at a time, with the input/result bounds
    above. Ordinary SQL failures return the upstream error type. Storage failures
-   and write-result overflow trap, forcing whole-request rollback and instance
+   and write-result overflow/conversion failures trap, forcing rollback and instance
    disposal rather than catchable errors on a potentially suspect connection.
 4. Nanovm's response boundary remains the durable commit boundary for SQL,
    files and KV together. SQLite COMMIT alone is not a durable nanovm commit.
@@ -441,14 +460,72 @@ capability, such as a read-only mount. Evaluate that alongside KV in ISSUES.md W
 The host must still supply deployment inputs and enforce capabilities; moving
 parsing/lookup code into Wasm does not eliminate that responsibility.
 
-## Remaining gates, not established support
+## Scope for a production beta
+
+The four earlier gaps are not all release blockers. A beta can deliberately
+exclude individual query cancellation, direct database-file access and disk
+temporary spill. It cannot knowingly discard recovery data on host I/O errors.
+The host recovery fixes below are required before promoting this provider.
+
+- Compose exactly one provider instance per object, using the pinned build
+  script and upstream async interface. One connection, internal DELETE/FULL,
+  bounded materialized results, and no explicit SQL transaction control remain
+  the supported contract. This is not full Spin behavior or general SQLite VFS
+  support.
+- The provider owns `/data/composed.db` and its SQLite sidecars. Applications
+  must not read, write, rename, remove or independently open these files through
+  the raw filesystem, or compose another provider pointing at them. Other files
+  and KV continue sharing the outer transaction. This is a cooperative ownership
+  contract, not isolation from a malicious component with the same filesystem
+  capability. Hard isolation is required only if that becomes a product promise.
+- Temporary SQL storage stays in memory (`SQLITE_TEMP_STORE=3`, plus the fixed
+  connection policy). Large sorts/temporary tables consume guest memory and can
+  hit its quota; there is no promised filesystem spill. Supporting spill later
+  requires a real temporary-file implementation, not the placeholder filename.
+- Do not promise cancellation of one executing SQL call while continuing the
+  request. Request CPU/time interruption and process death discard the instance
+  and recover it; abandoned result streams release their budget. If execution
+  starts yielding, revalidate serialization, cancellation and resource lifetimes.
+- Deploy on local storage with working file/directory sync semantics. Keep the
+  volume and its sibling `~journal` together on the same filesystem. Take backups
+  only while the object is quiescent and recovery is complete; do not copy a live
+  database file and call that a consistent backup. Recovery errors must stop the
+  object until the storage problem is repaired, preserving its journal.
+- A guest failure before commit rolls back. A host commit error, crash at the
+  commit marker, or lost response can have an **unknown outcome** to the caller.
+  Use operation IDs and idempotent retries. Physical power-loss certification,
+  media corruption, and filesystems/devices that lie about sync are not covered.
+
+### Host recovery fixes required by the beta
+
+The old journal ignored an undo's filesystem error and retired its record anyway.
+A real filesystem obstruction reproduced successful startup with the undo lost.
+Recovery now stops and keeps the failing record. A composed-provider regression
+obstructs its database during two startup attempts, then repairs it and verifies
+exact SQL/file/KV recovery. Already-completed and never-performed namespace
+operations still replay safely, including discarded request-created files.
+
+Commit now refuses further use after failure: previously taking the log handle
+before a failed sync let a second commit falsely succeed. Reverse rename recovery
+also syncs both affected directories before dropping its undo, and cleanup now
+propagates directory-entry read errors instead of silently skipping them. These
+are generic journal changes; no SQLite-specific host handler or format change.
+
+The real-filesystem unit matrix injects `EIO` at every sync boundary in its
+workloads: recording (5), committing (6), and recovery (27). Retry restores exact
+contents, except that a commit error after log unlink leaves the new state in
+the running kernel, as documented by the unknown-outcome rule. This tests host
+error handling, not loss or reordering of cached writes after power failure.
+
+## Unproven behavior outside that beta contract
 
 - In-flight async-call cancellation, resource/stream fault boundaries beyond the
   tested cancellation cleanup, and raw-file interference with a live database.
   Storage-error cache reuse is deliberately unsupported: those failures trap.
 - Filesystem-backed temporary spill and unique temp names. This build forces
   memory temp storage and the placeholder name is not a general temp-file API.
-- Power loss, host I/O failure, and crash injection inside nanovm commit/recovery.
+- Physical power loss, arbitrary host I/O failures beyond the tested boundaries,
+  and further crash injection inside nanovm commit/recovery.
   VFS cuts are guest traps after completed host calls; SIGKILL is process death,
   not storage power loss. Neither proves every internal ordering boundary.
 - Total host I/O/CPU profiling, large result sets and workload comparisons against
@@ -456,7 +533,7 @@ parsing/lookup code into Wasm does not eliminate that responsibility.
   not these products or production hardware.
 
 No runtime changes were necessary for the initial workloads; the generic fixes
-allow the repeated-update workload to fit its existing quota. The eight SQLite
+bound repeated-update overhead and preserve recovery data on failure. The eight SQLite
 tests are ignored by the ordinary suite because they need the separate fixture
 and C toolchain; this branch's CI explicitly builds and runs them. This is an
 experimental implementation and proposal, not a shipped interface or a claim of

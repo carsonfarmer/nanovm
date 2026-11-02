@@ -122,9 +122,13 @@ impl GuestConnection for Database {
                 Ok(vfs::counts().0 as i64)
             })
             .map_err(error)?;
-            db.create_scalar_function("nanovm_test_yield", 0, FunctionFlags::SQLITE_UTF8, |_| {
+            db.create_scalar_function("nanovm_test_yield", 1, FunctionFlags::SQLITE_UTF8, |c| {
                 YIELDING.set(true);
-                util::wasip3::wit_bindgen::block_on(util::wasip3::clocks::monotonic_clock::wait_for(10_000_000));
+                util::wasip3::wit_bindgen::block_on(util::write_file("/data", "sql-wait", b"entered".to_vec()))
+                    .unwrap();
+                util::wasip3::wit_bindgen::block_on(util::wasip3::clocks::monotonic_clock::wait_for(
+                    c.get::<i64>(0)? as u64 * 1_000_000,
+                ));
                 YIELDING.set(false);
                 Ok(42)
             })
@@ -209,13 +213,23 @@ impl GuestConnection for Database {
                     _ => 0,
                 };
                 budget.reserve(payload, readonly)?;
-                values.push(match row.get::<_, SqlValue>(i).map_err(error)? {
-                    SqlValue::Integer(v) => Value::Integer(v),
-                    SqlValue::Real(v) => Value::Real(v),
-                    SqlValue::Text(v) => Value::Text(v),
-                    SqlValue::Blob(v) => Value::Blob(v),
-                    SqlValue::Null => Value::Null,
-                });
+                values.push(
+                    match row.get::<_, SqlValue>(i).map_err(|e| {
+                        // SQLite text need not be UTF-8, but WIT strings must be.
+                        // Like result overflow, conversion can fail after a write.
+                        assert!(
+                            readonly,
+                            "SQLite write result conversion: request rollback required: {e}"
+                        );
+                        error(e)
+                    })? {
+                        SqlValue::Integer(v) => Value::Integer(v),
+                        SqlValue::Real(v) => Value::Real(v),
+                        SqlValue::Text(v) => Value::Text(v),
+                        SqlValue::Blob(v) => Value::Blob(v),
+                        SqlValue::Null => Value::Null,
+                    },
+                );
             }
             rows.push(RowResult { values });
         }
