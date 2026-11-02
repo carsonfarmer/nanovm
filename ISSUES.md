@@ -233,7 +233,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### N-37: final post-return commit failures lose diagnostic classification
 - **Where:** `object.rs`, the final `commit(acc).await.is_err()` in `serve`
 - **From source:** after sending a successful response, a failed final commit marks the request span as error but discards the I/O error and supplies no `error.type` or failing-phase classification. The initial commit has a `commit-failed` classification; the final one should be equally diagnosable without changing the already-sent HTTP status.
-- **Status:** open within W-2, found by adversarial subagent review. Retain the result, record a bounded post-return-commit error classification and correlated diagnostic, and test failure of the second commit. Do not change published guests without approval.
+- **Status:** fixing in focused W-2 continuation (Amp thread T-01a19d62-f7ae-74bc-8ded-e9f5f74a78ec). Retain the result, record a bounded post-return-commit error classification and correlated diagnostic, and test failure of the second commit. Test-only components stay outside `guests/**`; published guests remain unchanged.
 
 ## Planned work
 
