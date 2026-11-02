@@ -2404,6 +2404,191 @@ async fn the_proxy_drops_hop_by_hop_headers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn front_door_events_cover_failures_and_link_to_worker() {
+    use http_body_util::BodyExt;
+    use opentelemetry_proto::tonic::{collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value::Value};
+    use prost::Message;
+    let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", sink.local_addr().unwrap());
+    let captured = spans.clone();
+    let collector = tokio::spawn(nanovm::server::serve_http1(sink, move |req| {
+        let spans = captured.clone();
+        async move {
+            let trace = req.uri().path() == "/v1/traces";
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            if trace {
+                assert!(!body.windows(7).any(|s| s == b"PRIVATE"));
+                spans.lock().extend(ExportTraceServiceRequest::decode(body).unwrap().resource_spans
+                    .into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
+            }
+            nanovm::server::ok_json(serde_json::json!({}))
+        }
+    }));
+    let mut cfg = node_cfg("front_door_events", 8);
+    cfg.telemetry_endpoint = endpoint.clone();
+    let (sup, node) = supervised_with(cfg).await;
+    let counter = publish("front-door", &app("counter")).await;
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    records.lock().insert("_nanovm.good.test".into(), vec![format!("app={}:latest; trust=dev dev", counter.split_once('@').unwrap().0)]);
+    let cfg = nanovm::config::ProxyConfig {
+        node: node.to_string(), resolver: doh(records).await, telemetry_endpoint: endpoint,
+        listen: "127.0.0.1:0".into(), dev: true, ..Default::default()
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let service = tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+    let missing = format!("{}@sha256:{}", counter.split_once('@').unwrap().0, "0".repeat(64));
+    let cases = [
+        (node, "x", "/obj/", String::new(), 400),
+        (node, "x", "/obj/", "nanovm-app: invalid\r\n".into(), 400),
+        (node, "x", "/../", names(&counter), 400),
+        (node, "x", "/obj/", names(&missing), 502),
+        (proxy, "absent.test", "/obj/", String::new(), 404),
+        (proxy, "good.test", "/obj/", "Content-Type: application/websocket-events\r\n".into(), 400),
+        (proxy, "good.test", "/obj/", String::new(), 200),
+    ];
+    for (i, (addr, host, path, headers, status)) in cases.iter().enumerate() {
+        let head = format!("GET {path}?secret=PRIVATE HTTP/1.1\r\nHost: {host}\r\n{headers}traceparent: 00-{:032x}-1111111111111111-01\r\nConnection: close\r\n\r\n", i + 1);
+        assert_eq!(raw(*addr, &head, b"").await.0, *status, "case {i}");
+    }
+    sup.flush_telemetry().await.unwrap();
+    eventually("front-door exports", || spans.lock().len() >= 9).await;
+    let spans = spans.lock();
+    assert_eq!(spans.len(), 9, "six rejections, one complete three-hop request");
+    for (i, (_, _, path, _, status)) in cases.iter().enumerate() {
+        let mut trace = vec![0; 16];
+        trace[15] = (i + 1) as u8;
+        let group: Vec<_> = spans.iter().filter(|s| s.trace_id == trace).collect();
+        let root = group.iter().find(|s| s.parent_span_id == [0x11; 8]).unwrap();
+        assert_eq!(group.len(), if *status == 200 { 3 } else { 1 });
+        assert_eq!(root.kind, 2);
+        assert_eq!(root.status.as_ref().map_or(0, |s| s.code), if *status == 502 { 2 } else { 0 });
+        for (key, value) in [("url.path", Value::StringValue((*path).into())),
+            ("http.response.status_code", Value::IntValue(*status as i64))] {
+            assert!(root.attributes.iter().any(|a| a.key == key && a.value.as_ref().and_then(|v| v.value.as_ref()) == Some(&value)));
+        }
+        if *status == 200 {
+            let supervisor = group.iter().find(|s| s.name == "supervisor.request").unwrap();
+            let worker = group.iter().find(|s| s.name == "request").unwrap();
+            assert_eq!(root.name, "proxy.request");
+            assert_eq!(supervisor.parent_span_id, root.span_id);
+            assert_eq!(worker.parent_span_id, supervisor.span_id);
+        }
+    }
+    service.abort();
+    collector.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_return_work_keeps_context_and_reports_commit_failure() {
+    use http_body_util::BodyExt;
+    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
+    use prost::Message;
+    // A private fixture, outside guests/** and its publishing workflow.
+    let build = std::process::Command::new("cargo").args([
+        "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
+        "crates/nanovm/tests/post-return/Cargo.toml", "--target-dir", "target/test-guest",
+    ]).current_dir(repo()).status().unwrap();
+    assert!(build.success());
+    let wasm = std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap();
+    let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let logs = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = node_cfg("post_return_context", 8);
+    cfg.telemetry_endpoint = format!("http://{}", sink.local_addr().unwrap());
+    let (captured, captured_logs) = (spans.clone(), logs.clone());
+    let collector = tokio::spawn(nanovm::server::serve_http1(sink, move |req| {
+        let (spans, logs) = (captured.clone(), captured_logs.clone());
+        async move {
+            let trace = req.uri().path() == "/v1/traces";
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            if trace {
+                spans.lock().extend(collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap()
+                    .resource_spans.into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
+            } else {
+                logs.lock().extend(collector::logs::v1::ExportLogsServiceRequest::decode(body).unwrap()
+                    .resource_logs.into_iter().flat_map(|r| r.scope_logs).flat_map(|s| s.log_records));
+            }
+            nanovm::server::ok_json(serde_json::json!({}))
+        }
+    }));
+    let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = gate.local_addr().unwrap();
+    let begin = Arc::new(tokio::sync::Semaphore::new(0));
+    let finish = Arc::new(tokio::sync::Semaphore::new(0));
+    let (arrived, mut arrivals) = tokio::sync::mpsc::channel(4);
+    let (b, f) = (begin.clone(), finish.clone());
+    let server = tokio::spawn(nanovm::server::serve_http1(gate, move |req| {
+        let gate = if req.uri().path() == "/begin" { b.clone() } else { f.clone() };
+        let arrived = arrived.clone();
+        async move {
+            arrived.send(req.uri().path().to_owned()).await.unwrap();
+            gate.acquire().await.unwrap().forget();
+            nanovm::server::ok_json(serde_json::json!({}))
+        }
+    }));
+    let mut app = app("hostile");
+    app.limits.egress = vec![address.to_string()];
+    app.limits.post_return_timeout_ms = 5000;
+    app.limits.cpu_ms = 1000;
+    let objects = cfg.app_dirs(&app.name)[0].clone();
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    for (i, fail) in [(1u8, false), (2, true)] {
+        let id = format!("parent{i}");
+        let req = http::Request::builder().uri(format!("/?gate={address}"))
+            .header("traceparent", format!("00-{i:032x}-1111111111111111-01"))
+            .body(bytes::Bytes::new()).unwrap();
+        let response = node.dispatch(&id, req).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/begin");
+        begin.add_permits(1);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/finish");
+        let journal = objects.join("~journal").join(&id).join("log");
+        assert!(journal.exists(), "post-return write has an uncommitted journal");
+        if fail { std::fs::rename(&journal, journal.with_file_name("saved-log")).unwrap(); }
+        finish.add_permits(1);
+        assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "finished");
+        eventually("final commit", || node.phases().keys().all(|p| *p == "idle" || *p == "cold")).await;
+        if fail { std::fs::rename(journal.with_file_name("saved-log"), &journal).unwrap(); }
+    }
+    node.shutdown().await;
+    let telemetry = node.telemetry.clone();
+    tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
+    let spans = spans.lock();
+    let logs = logs.lock();
+    let attr = |attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue], key: &str| {
+        attrs.iter().find(|a| a.key == key).and_then(|a| a.value.as_ref()).and_then(|v| v.value.clone())
+    };
+    for (i, fail) in [(1u8, false), (2, true)] {
+        let mut trace = vec![0; 16];
+        trace[15] = i;
+        let parent = spans.iter().find(|s| s.trace_id == trace && s.name == "request"
+            && attr(&s.attributes, "nanovm.object") == Some(Value::StringValue(format!("parent{i}")))).unwrap();
+        assert_eq!(attr(&parent.attributes, "http.response.status_code"), Some(Value::IntValue(200)));
+        assert_eq!(parent.status.as_ref().map_or(0, |s| s.code), if fail { 2 } else { 0 });
+        assert_eq!(attr(&parent.attributes, "error.type"), fail.then(|| Value::StringValue("post-return-commit-failed".into())));
+        let call = spans.iter().find(|s| s.trace_id == trace && s.name == "call").unwrap();
+        let child = spans.iter().find(|s| s.trace_id == trace && s.name == "request" && s.span_id != parent.span_id).unwrap();
+        assert_eq!(call.parent_span_id, parent.span_id);
+        assert_eq!(child.parent_span_id, call.span_id);
+        let response_ms = match attr(&parent.attributes, "nanovm.response.duration_ms").unwrap() {
+            Value::DoubleValue(ms) => ms, other => panic!("{other:?}"),
+        };
+        assert!(call.start_time_unix_nano > parent.start_time_unix_nano + (response_ms * 1e6) as u64);
+        assert!(parent.end_time_unix_nano >= call.end_time_unix_nano);
+        for (key, value) in [("log.iostream", "stderr")].into_iter()
+            .chain(fail.then_some(("event.name", "post-return-commit-failed"))) {
+            let log = logs.iter().find(|l| l.trace_id == trace && attr(&l.attributes, key) == Some(Value::StringValue(value.into()))).unwrap();
+            assert_eq!(log.span_id, parent.span_id);
+            assert!(matches!(log.body.as_ref().and_then(|v| v.value.as_ref()), Some(Value::StringValue(s)) if !s.is_empty() && s.len() <= 4096));
+        }
+    }
+    server.abort();
+    collector.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn jailed_workers_export_otel_without_guest_network_access() {
     use http_body_util::BodyExt;
     use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
@@ -2481,7 +2666,11 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
         assert_eq!(counter_spans.len(), 1, "one rich event, not separate phase spans");
         let request = counter_spans.iter().find(|s| s.name == "request").unwrap();
         assert_eq!(request.trace_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(2));
-        assert_eq!(request.parent_span_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        let hop = spans.iter().flat_map(|r| &r.scope_spans).flat_map(|s| &s.spans)
+            .find(|s| s.name == "supervisor.request" && s.trace_id == request.trace_id
+                && attr(&s.attributes, "nanovm.object") == "room").unwrap();
+        assert_eq!(request.parent_span_id, hop.span_id);
+        assert_eq!(hop.parent_span_id, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
         assert_eq!(attr(&request.attributes, "nanovm.object"), "room");
         assert_eq!(attr(&request.attributes, "http.request.method"), "GET");
         assert_eq!(attr(&request.attributes, "url.path"), "/");
@@ -2538,17 +2727,22 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
         }
     })).await;
     let mut calls = Vec::new();
+    let mut hops = Vec::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             _sup.flush_telemetry().await.unwrap();
             for (path, body) in std::mem::take(&mut *batches.lock()) {
                 if path != "/v1/traces" { continue }
                 for resource in collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap().resource_spans {
+                    if attr(&resource.resource.as_ref().unwrap().attributes, "nanovm.app") == "_supervisor" {
+                        hops.extend(resource.scope_spans.into_iter().flat_map(|s| s.spans));
+                        continue;
+                    }
                     assert_eq!(attr(&resource.resource.as_ref().unwrap().attributes, "nanovm.app"), worker(&hostile));
                     calls.extend(resource.scope_spans.into_iter().flat_map(|s| s.spans));
                 }
             }
-            if calls.len() >= 17 { break }
+            if calls.len() >= 17 && hops.len() >= 6 { break }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("all queued calls exported");
@@ -2560,7 +2754,9 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
         assert_eq!(group.len(), if i == 5 { 2 } else { 3 }, "a rejected cycle has no callee request");
         let caller = group.iter().find(|s| s.name == "request" && attr(&s.attributes, "nanovm.object") == "caller").unwrap();
         let call = group.iter().find(|s| s.name == "call").unwrap();
-        assert_eq!(caller.parent_span_id, [0x11; 8]);
+        let hop = hops.iter().find(|s| s.trace_id == trace).unwrap();
+        assert_eq!(caller.parent_span_id, hop.span_id);
+        assert_eq!(hop.parent_span_id, [0x11; 8]);
         assert_eq!(call.parent_span_id, caller.span_id);
         assert_eq!(caller.kind, 2, "SERVER request");
         assert_eq!(call.kind, 3, "CLIENT call");

@@ -107,6 +107,8 @@ config! {
         node: String = "127.0.0.1:8080",
         /// Private control listener; only nodes may reach it.
         publish_listen: String = "127.0.0.1:8444",
+        /// OTLP/HTTP Collector base URL for front-door request events.
+        telemetry_endpoint: String = "http://127.0.0.1:4318",
         max_sockets: usize = 10_000usize,
         max_sockets_per_app: usize = 1000usize,
         max_sockets_per_object: usize = 256usize,

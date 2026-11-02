@@ -53,6 +53,7 @@ struct Route {
 
 pub struct Proxy {
     cfg: Arc<ProxyConfig>,
+    telemetry: Arc<crate::telemetry::Telemetry>,
     http: reqwest::Client,
     registry: Oci,
     node: hyper_util::client::legacy::Client<hyper_util::client::legacy::connect::HttpConnector, Body>,
@@ -111,6 +112,7 @@ impl Proxy {
         let node = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build(hyper_util::client::legacy::connect::HttpConnector::new());
         Ok(Arc::new(Proxy {
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_proxy", env!("CARGO_PKG_VERSION"), None)?),
             registry: Oci::new(cfg.dev)?,
             cfg: Arc::new(cfg),
             http: reqwest::Client::new(),
@@ -123,10 +125,12 @@ impl Proxy {
     }
 
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
-        match self.forward(req).await {
-            Ok(res) => res,
-            Err((status, why)) => error_response(status.as_u16(), "proxy", &why),
-        }
+        self.telemetry.forward("proxy.request", req, |req| async {
+            match self.forward(req).await {
+                Ok(res) => res,
+                Err((status, why)) => error_response(status.as_u16(), "proxy", &why),
+            }
+        }).await
     }
 
     async fn resolve(&self, host: &str) -> Result<(String, http::HeaderMap), (StatusCode, String)> {

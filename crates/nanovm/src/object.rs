@@ -575,7 +575,17 @@ async fn serve(
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
                 pending.lock().as_mut().unwrap().phase("nanovm.post_return_commit.duration_ms");
                 // What it changed after answering commits now.
-                let reset = failed || commit(acc).await.is_err();
+                let reset = if failed { true } else {
+                    match commit(acc).await {
+                        Ok(()) => false,
+                        Err(e) => {
+                            pending.lock().as_mut().unwrap().span.set_attribute(opentelemetry::KeyValue::new(
+                                "error.type", "post-return-commit-failed"));
+                            node.metrics.event("post-return-commit-failed", &shared.id, e.to_string(), &job.context);
+                            true
+                        }
+                    }
+                };
                 if let Some(mut p) = pending.lock().take() {
                     if reset { p.span.set_status(opentelemetry::trace::Status::error("request rolled back")); }
                 }

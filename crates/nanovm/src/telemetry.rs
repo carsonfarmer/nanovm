@@ -142,6 +142,29 @@ impl Telemetry {
             .start_with_context(&self.tracer, parent)
     }
 
+    /// A forwarding hop ends at response headers; the worker's request event
+    /// separately owns the guest lifecycle through its final commit.
+    pub async fn forward<B, R, F, Fut>(&self, name: &'static str, mut req: Request<B>, send: F) -> Response<R>
+    where F: FnOnce(Request<B>) -> Fut, Fut: Future<Output = Response<R>> {
+        use opentelemetry::{propagation::TextMapPropagator, trace::Span as _};
+        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+        let parent = propagator.extract(&opentelemetry_http::HeaderExtractor(req.headers()));
+        let object = crate::table::route(req.uri().path()).map_or("", |(id, _)| id);
+        let mut span = scopeguard::guard(self.span(name, object, &parent, SpanKind::Server), |mut span| {
+            span.set_status(opentelemetry::trace::Status::error("cancelled"));
+            span.set_attribute(KeyValue::new("error.type", "cancelled"));
+        });
+        span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
+        let path = req.uri().path();
+        span.set_attribute(KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
+        let context = parent.with_remote_span_context(span.span_context().clone());
+        propagator.inject_context(&context, &mut opentelemetry_http::HeaderInjector(req.headers_mut()));
+        let res = send(req).await;
+        let mut span = scopeguard::ScopeGuard::into_inner(span);
+        response(&mut span, &res);
+        res
+    }
+
     /// The callback holds only a weak owner. Neither the timer nor SDK owns
     /// a node/worker lifetime, and explicit flush includes a fresh snapshot.
     pub fn snapshots(self: &Arc<Self>, snapshot: impl Fn() + Send + Sync + 'static) {
