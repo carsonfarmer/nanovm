@@ -1,5 +1,10 @@
 # SQLite over nanovm's existing filesystem
 
+For the packaged source beta and runnable app, start with
+[components/sqlite](../../components/sqlite/README.md). This document retains the
+experiments and design evidence; its broader SQLite modes are not the provider's
+supported contract. The pressure fixtures use the packaged provider/VFS source.
+
 An opt-in experiment, not a shipped SQLite interface. SQLite is compiled into
 the guest's Wasm with rusqlite. The initial experiment needed no runtime changes;
 this validation branch also includes the independent generic journal amplification
@@ -274,7 +279,7 @@ the measured benefit: both modes used FULL throughout.
 
 ## Component composition proof
 
-`provider/` contains SQLite and reuses the P3 VFS. `client/` contains only the
+[The provider](../../components/sqlite/provider/) contains SQLite and the P3 VFS. `client/` contains only the
 HTTP application and generated Spin imports, with no SQLite dependency. `wac plug`
 connects them into `composed.wasm`. The uncomposed client is rejected by nanovm's
 unchanged import allowlist; the composed artifact runs on the real Node runtime.
@@ -285,7 +290,7 @@ synchronous exported SQL call traps with `cannot block a synchronous task before
 returning` when SQLite waits for P3 I/O. Forcing async bindings for those same sync
 WIT functions is not valid either: composition rejects the async canonical option
 on a synchronous function type. Use Spin's existing **3.1 async methods**, not a
-modified 3.0 WIT. The vendored [upstream WIT](wit/deps/spin-sqlite/sqlite.wit) is
+modified 3.0 WIT. The vendored [upstream WIT](../../components/sqlite/wit/deps/spin-sqlite/sqlite.wit) is
 byte-for-byte from [Spin commit 3f0ced5](https://github.com/spinframework/spin/blob/3f0ced5e2dcc1f9339f717f747b58c84d9afe3f0/wit/deps/spin-sqlite%403.1.0/sqlite.wit).
 
 The provider uses `open-async` and `execute-async`; legacy synchronous open/execute
@@ -364,7 +369,7 @@ quota/journal interception demonstrated here. The nontrivial integration is a
 P3 VFS, not teaching nanovm how SQLite commits.
 
 There is no mature WASI SQLite standard to adopt: [WASI SQL](https://github.com/WebAssembly/wasi-sql)
-is a Phase 1 proposal. [Spin's published SQLite WIT](wit/deps/spin-sqlite/sqlite.wit)
+is a Phase 1 proposal. [Spin's published SQLite WIT](../../components/sqlite/wit/deps/spin-sqlite/sqlite.wit)
 is an existing ecosystem interface, not a WASI standard. The supported entry points
 are:
 

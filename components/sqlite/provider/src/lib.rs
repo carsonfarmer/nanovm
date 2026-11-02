@@ -1,11 +1,10 @@
-//! Composition proof, not a production SQLite provider.
+//! Single-connection SQLite provider; see ../README.md for its beta contract.
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use std::cell::Cell;
 
 #[allow(dead_code)]
-#[path = "../../src/vfs.rs"]
 mod vfs;
 
 mod bindings {

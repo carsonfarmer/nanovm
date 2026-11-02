@@ -2,7 +2,7 @@
 use std::cell::RefCell;
 use util::wasip3::http::types::{ErrorCode, Request, Response};
 mod bindings {
-    wit_bindgen::generate!({ path: "../wit", world: "client", generate_all });
+    wit_bindgen::generate!({ path: "../../../components/sqlite/wit", world: "client", generate_all });
 }
 use bindings::spin::sqlite::sqlite::{Connection, Error, QueryResult, Value};
 util::wasip3::http::service::export!(Client);

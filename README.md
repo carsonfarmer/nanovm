@@ -12,6 +12,16 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 
 Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
+## SQLite beta
+
+[Build and run the SQLite example](components/sqlite/README.md). A composed Wasm
+provider implements the upstream Spin async SQLite interface over the existing
+filesystem, quotas and request journal; there is no host SQLite service. The
+example demonstrates persistence, object isolation, and atomic SQL/file/KV
+rollback. One connection, provider-owned database files and memory-only temporary
+storage define the initial support contract; see the linked limitations before
+using it in an app.
+
 ## Try it
 
 ```bash

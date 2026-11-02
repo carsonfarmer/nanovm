@@ -8,6 +8,7 @@ mod bench;
 #[cfg(not(feature = "stock"))]
 mod pressure;
 #[cfg(not(feature = "stock"))]
+#[path = "../../../components/sqlite/provider/src/vfs.rs"]
 mod vfs;
 
 wasip3::http::service::export!(Sqlite);
