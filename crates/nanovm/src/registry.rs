@@ -102,7 +102,25 @@ impl AppRef {
     pub fn from_headers(h: &HeaderMap) -> anyhow::Result<Option<AppRef>> {
         let get = |name| h.get(name).map(|v| v.to_str().with_context(|| format!("{name} is not text")));
         let Some(app) = get(APP_HEADER) else { return Ok(None) };
-        let reference: Reference = app?.parse().context(APP_HEADER)?;
+        // OCI parsing is pure but expensive. Cache up to 16 references of at
+        // most 1 KiB per calling thread, not policy, host or authorization.
+        // Own the reference text, not a slice retaining an HTTP buffer.
+        thread_local! {
+            static REFERENCES: std::cell::RefCell<std::collections::VecDeque<(String, Reference)>> = const {
+                std::cell::RefCell::new(std::collections::VecDeque::new())
+            };
+        }
+        let app = app?;
+        let reference = REFERENCES.with(|cache| -> anyhow::Result<Reference> {
+            let mut cache = cache.borrow_mut();
+            if let Some((_, r)) = cache.iter().find(|(s, _)| s == app) { return Ok(r.clone()) }
+            let reference: Reference = app.parse()?;
+            if app.len() <= 1024 {
+                if cache.len() == 16 { cache.pop_front(); }
+                cache.push_back((app.to_owned(), reference.clone()));
+            }
+            Ok(reference)
+        }).context(APP_HEADER)?;
         let digest = reference.digest().context("nanovm-app must name a digest")?.to_string();
         check_digest(&digest)?;
         let trust = get(TRUST_HEADER)
@@ -544,6 +562,15 @@ mod tests {
         assert_eq!(r.policy.trust, pairs);
         assert_eq!(r.policy.min_version, None);
 
+        // Reusing a reference must not reuse the previous request's policy or host.
+        for host in ["first.example", "second.example"] {
+            let h = headers(&[(APP_HEADER, &app), (TRUST_HEADER, "other signer"),
+                (HOST_HEADER, host), (MIN_VERSION_HEADER, "2.3.4")]);
+            let r = AppRef::from_headers(&h).unwrap().unwrap();
+            assert_eq!(r.host, host);
+            assert_eq!(r.policy.trust, [("other".into(), "signer".into())]);
+            assert_eq!(r.policy.min_version.unwrap().to_string(), "2.3.4");
+        }
         for bad in ["", "i1", "i1 s1 extra", "i1 s1,", "i1 s1,,i2 s2", ","] {
             let h = headers(&[(APP_HEADER, &app), (TRUST_HEADER, bad)]);
             assert!(err(&h).contains("<issuer> <subject>"), "{bad:?}");

@@ -134,7 +134,7 @@ impl Telemetry {
 
     pub fn span(&self, name: &'static str, object: &str, parent: &Context, kind: SpanKind) -> Span {
         // Request metadata and phase durations stay on this one event.
-        let mut attributes = Vec::with_capacity(if name == "request" { 16 } else { 1 });
+        let mut attributes = Vec::with_capacity(if name == "request" { 16 } else { 4 });
         attributes.push(KeyValue::new("nanovm.object", object.to_owned()));
         self.tracer.span_builder(name)
             .with_kind(kind)
