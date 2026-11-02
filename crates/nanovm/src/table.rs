@@ -269,7 +269,7 @@ impl Node {
         let e = objects.remove(&k).unwrap();
         self.metrics.evicted_lru.fetch_add(1, Relaxed);
         self.metrics
-            .event("evicted-lru", &e.shared.id, "node at max_live_objects");
+            .event("evicted-lru", &e.shared.id, "node at max_live_objects", &opentelemetry::Context::new());
         true
     }
 

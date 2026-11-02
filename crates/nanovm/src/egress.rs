@@ -181,7 +181,7 @@ impl WasiHttpHooks for EgressHooks {
             use opentelemetry::{KeyValue, propagation::TextMapPropagator, trace::{Span, SpanKind, TraceContextExt}};
             let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
             let parent = obj.context.lock().clone();
-            let mut span = node.telemetry.span("http.client", &obj.id, &parent, SpanKind::Client);
+            let mut span = scopeguard::guard(node.telemetry.span("http.client", &obj.id, &parent, SpanKind::Client), cancelled);
             span.set_attribute(KeyValue::new("http.request.method", request.method().as_str().chars().take(32).collect::<String>()));
             span.set_attribute(KeyValue::new("url.path", request.uri().path().chars().take(1024).collect::<String>()));
             span.set_attribute(KeyValue::new("server.address", request.uri().host().unwrap_or("").chars().take(253).collect::<String>()));
@@ -210,10 +210,11 @@ impl WasiHttpHooks for EgressHooks {
                 Ok((res, io))
             }
             .await;
-            client_response(&mut span, res.as_ref().map(|(response, _)| response));
+            let mut span = scopeguard::ScopeGuard::into_inner(span);
+            client_response(&mut span, res.as_ref().map(|(response, _)| response), false);
             if let Err(e) = &res {
                 metrics.egress_denied.fetch_add(1, Relaxed);
-                metrics.event("egress-denied", &obj.id, format!("{} → {e}", target.host().unwrap_or("")));
+                metrics.event("egress-denied", &obj.id, format!("{} → {e}", target.host().unwrap_or("")), &context);
             } else {
                 metrics.egress_allowed.fetch_add(1, Relaxed);
             }
@@ -237,7 +238,7 @@ async fn call(
     use opentelemetry::{KeyValue, trace::{Span, SpanKind, TraceContextExt}};
     let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
     let parent = obj.context.lock().clone();
-    let mut span = node.telemetry.span("call", &obj.id, &parent, SpanKind::Client);
+    let mut span = scopeguard::guard(node.telemetry.span("call", &obj.id, &parent, SpanKind::Client), cancelled);
     span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
     span.set_attribute(KeyValue::new("url.path", req.uri().path().chars().take(1024).collect::<String>()));
     let result = async {
@@ -272,16 +273,27 @@ async fn call(
             .boxed_unsync()
         })))
     }.await;
-    client_response(&mut span, result.as_ref());
+    let mut span = scopeguard::ScopeGuard::into_inner(span);
+    client_response(&mut span, result.as_ref(), true);
     result
 }
 
-fn client_response<B>(span: &mut crate::telemetry::Span, result: Result<&http::Response<B>, &Error>) {
+fn cancelled(mut span: crate::telemetry::Span) {
+    use opentelemetry::trace::Span;
+    span.set_status(opentelemetry::trace::Status::error("call cancelled before response headers"));
+    span.set_attribute(opentelemetry::KeyValue::new("error.type", "cancelled"));
+}
+
+fn client_response<B>(span: &mut crate::telemetry::Span, result: Result<&http::Response<B>, &Error>, internal: bool) {
     use opentelemetry::{KeyValue, trace::{Span, Status}};
     match result {
         Ok(res) => {
-            crate::telemetry::response(span, res);
-            if res.status().is_client_error() {
+            if internal {
+                crate::telemetry::response(span, res);
+            } else {
+                span.set_attribute(KeyValue::new("http.response.status_code", res.status().as_u16() as i64));
+            }
+            if res.status().is_client_error() || (!internal && res.status().is_server_error()) {
                 span.set_status(Status::error(""));
                 span.set_attribute(KeyValue::new("error.type", res.status().as_u16().to_string()));
             }

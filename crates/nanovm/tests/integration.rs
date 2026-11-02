@@ -529,13 +529,15 @@ async fn egress_allowed_request_round_trips() {
     let server = tokio::spawn(nanovm::server::serve_http1(listener, move |req| {
         let received = received.clone();
         async move {
+            if req.uri().path() == "/stall" { return std::future::pending().await; }
             received.lock().push(req.headers().get("traceparent").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned());
             let status = req.uri().path().trim_start_matches('/').parse::<u16>().unwrap();
-            nanovm::object::error_response(status, "upstream", "hello")
+            nanovm::object::error_response(status, "PRIVATE", "hello")
         }
     }));
     let mut hostile = app("hostile");
     hostile.limits.egress.push(format!("127.0.0.1:{port}"));
+    hostile.limits.request_timeout_ms = 300;
     let node = node_with(cfg, hostile);
     for status in [201, 404, 503] {
         let r = get(&node, "n", &format!("/fetch?url=http://127.0.0.1:{port}/{status}?secret=PRIVATE")).await;
@@ -544,6 +546,8 @@ async fn egress_allowed_request_round_trips() {
     }
     let denied = get(&node, "n", "/fetch?url=http://127.0.0.1:1/denied?secret=PRIVATE").await;
     assert!(denied.body.contains("HttpRequestDenied"));
+    let timeout = get(&node, "n", &format!("/fetch?url=http://127.0.0.1:{port}/stall")).await;
+    assert_eq!(timeout.status, 504);
     node.shutdown().await;
     let telemetry = node.telemetry.clone();
     tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
@@ -552,7 +556,7 @@ async fn egress_allowed_request_round_trips() {
         s.attributes.iter().find(|a| a.key == key).and_then(|a| a.value.as_ref()).and_then(|v| v.value.clone())
     };
     let clients: Vec<_> = spans.iter().filter(|s| s.kind == 3).collect();
-    assert_eq!(clients.len(), 4, "every external call, including denial, has a CLIENT span");
+    assert_eq!(clients.len(), 5, "every external call, including denial and cancellation, has a CLIENT span");
     for (i, status) in [201, 404, 503].into_iter().enumerate() {
         let client = clients.iter().find(|s| attr(s, "url.path") == Some(Value::StringValue(format!("/{status}")))).unwrap();
         let parent = spans.iter().find(|s| s.span_id == client.parent_span_id).unwrap();
@@ -561,12 +565,19 @@ async fn egress_allowed_request_round_trips() {
         assert_eq!(attr(client, "http.response.status_code"), Some(Value::IntValue(status)));
         assert_eq!(attr(client, "server.address"), Some(Value::StringValue("127.0.0.1".into())));
         assert_eq!(client.status.as_ref().map_or(0, |s| s.code), if status >= 400 { 2 } else { 0 });
+        assert_eq!(attr(client, "error.type"), if status >= 400 { Some(Value::StringValue(status.to_string())) } else { None });
         let trace = opentelemetry::trace::TraceId::from_bytes(client.trace_id.clone().try_into().unwrap());
         let span = opentelemetry::trace::SpanId::from_bytes(client.span_id.clone().try_into().unwrap());
         assert_eq!(contexts.lock()[i], format!("00-{trace}-{span}-01"));
     }
     let denied = clients.iter().find(|s| attr(s, "url.path") == Some(Value::StringValue("/denied".into()))).unwrap();
     assert_eq!(denied.status.as_ref().unwrap().code, 2);
+    let cancelled = clients.iter().find(|s| attr(s, "url.path") == Some(Value::StringValue("/stall".into()))).unwrap();
+    assert_eq!(attr(cancelled, "error.type"), Some(Value::StringValue("cancelled".into())));
+    assert_eq!(cancelled.status.as_ref().unwrap().code, 2);
+    let parent = spans.iter().find(|s| s.span_id == cancelled.parent_span_id).unwrap();
+    assert_eq!(parent.trace_id, cancelled.trace_id);
+    assert_eq!(attr(parent, "error.type"), Some(Value::StringValue("timeout".into())));
     assert!(!leaked.load(Relaxed), "query secrets must not appear in spans or runtime logs");
     server.abort();
     collector.abort();
@@ -2486,6 +2497,10 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
     let panic = hostile_spans.iter().find(|s| attr(&s.attributes, "url.path") == "/panic").unwrap();
     assert_eq!(panic.status.as_ref().unwrap().code, 2);
     assert_eq!(attr(&panic.attributes, "error.type"), "trap");
+    let trap = logs.iter().flat_map(|r| &r.scope_logs).flat_map(|s| &s.log_records)
+        .find(|l| attr(&l.attributes, "event.name") == "trap").unwrap();
+    assert_eq!(trap.trace_id, panic.trace_id, "runtime diagnostics carry causal context too");
+    assert_eq!(trap.span_id, panic.span_id);
     let restarted = hostile_spans.iter().find(|s| attr(&s.attributes, "url.path") == "/fetch").unwrap();
     assert_ne!(panic.trace_id, restarted.trace_id, "restart must use the next request's context");
     assert!(restarted.attributes.iter().any(|a| a.key == "nanovm.cold_start"

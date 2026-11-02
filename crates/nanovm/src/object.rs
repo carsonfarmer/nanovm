@@ -464,17 +464,17 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                 match serve(&node, &app, &shared, store, svc, job, &mut rx).await {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
-                    Exit::Reset => node.metrics.event("rolled-back", &shared.id, "a request failed"),
+                    Exit::Reset => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),
                     Exit::Poisoned(p, detail) => {
                         node.metrics.poison(p);
-                        node.metrics.event(p.as_str(), &shared.id, detail);
+                        node.metrics.event(p.as_str(), &shared.id, detail, &shared.context.lock());
                     }
                 }
             }
             Err(e) => {
                 let e = format!("{e:#}");
                 node.metrics.instantiate_failures.fetch_add(1, Relaxed);
-                node.metrics.event("instantiate-failed", &shared.id, &*e);
+                node.metrics.event("instantiate-failed", &shared.id, &*e, &shared.context.lock());
                 let response = error_response(503, "instantiate-failed", &e);
                 crate::telemetry::response(&mut job.span, &response);
                 let _ = job.reply.send(response);

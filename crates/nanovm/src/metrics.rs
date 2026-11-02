@@ -57,10 +57,10 @@ impl Metrics {
         self.poisons[p as usize].fetch_add(1, Relaxed);
     }
 
-    pub fn event(&self, kind: &'static str, object: &str, detail: impl Into<String>) {
+    pub fn event(&self, kind: &'static str, object: &str, detail: impl Into<String>, context: &opentelemetry::Context) {
         let detail = detail.into();
         if let Some(telemetry) = self.telemetry.get().and_then(std::sync::Weak::upgrade) {
-            telemetry.log(object, ("event.name", kind), detail.as_bytes(), &opentelemetry::Context::new());
+            telemetry.log(object, ("event.name", kind), detail.as_bytes(), context);
         }
     }
 }

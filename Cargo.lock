@@ -1825,6 +1825,7 @@ dependencies = [
  "reqwest",
  "rustix",
  "rustls",
+ "scopeguard",
  "seccompiler",
  "semver",
  "serde",

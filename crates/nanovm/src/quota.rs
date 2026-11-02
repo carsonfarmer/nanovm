@@ -290,7 +290,7 @@ impl Inner {
         self.denials += 1;
         // A guest retrying in a loop shouldn't flood the event log.
         if self.denials == 1 || self.denials.is_multiple_of(1000) {
-            self.metrics.event("fs-denied", &self.obj.id, what);
+            self.metrics.event("fs-denied", &self.obj.id, what, &self.obj.context.lock());
         }
         code
     }
