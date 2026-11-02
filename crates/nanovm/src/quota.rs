@@ -179,6 +179,14 @@ impl QuotaGuard {
         Ok(slot)
     }
 
+    pub fn unlink(&self, path: &Path, bytes: u64) -> Result<(), ErrorCode> {
+        let mut q = self.0.lock();
+        q.journaled(|j| j.unlink(path, bytes))?;
+        q.bytes = q.bytes.saturating_sub(bytes);
+        q.files = q.files.saturating_sub(1);
+        Ok(())
+    }
+
     /// Makes the current request's changes durable.
     pub fn commit(&self) -> std::io::Result<()> {
         self.0.lock().journal.commit()
@@ -508,6 +516,22 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         }
         let new = WasiFilesystem::open_at(&inner, fd, path_flags, path, open_flags, flags).await?;
         quota.adjust(-(freed as i64), created as i64);
+        if let Some(path) = local {
+            // Register read-only opens too: any descriptor may keep an
+            // unlinked new file alive, as may a stream cloned from it.
+            let file = store.with(|mut s| match s.data_mut().filesystem().table.get(&new) {
+                Ok(Descriptor::File(f)) => Some(f.file.clone()),
+                _ => None,
+            });
+            if let Some(file) = file {
+                quota.journal(|j| {
+                    if created {
+                        j.created(&path)?;
+                    }
+                    j.opened(&file)
+                })?;
+            }
+        }
         if truncate && let Some((quota, file)) = store.with(|mut s| writable_file(s.data_mut(), &new)) {
             quota.set_size(&file, 0)?;
         }
@@ -544,6 +568,9 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
                         quota.adjust(bytes as i64, 1);
                     }
                     return Err(e);
+                }
+                if let Some((slot, bytes)) = file {
+                    quota.journal(|j| j.discard_created(&slot, bytes))?;
                 }
                 quota.adjust(0, -(dir as i64));
                 Ok(())
@@ -584,7 +611,7 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
             && let Ok(md) = std::fs::symlink_metadata(&p)
             && md.is_file()
         {
-            quota.remove(&p, md.len())?;
+            quota.unlink(&p, md.len())?;
             return Ok(());
         }
         let size = entry_size(&inner, &fd, &path).await.unwrap_or(0);
@@ -824,5 +851,50 @@ mod tests {
         g.set_size(&f, 4).unwrap();
         assert_eq!(usage(&g).0, 14, "growing it still costs");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Unlinked new files keep their data and removal-time storage charge
+    /// until every independent open and stream clone has gone away.
+    #[test]
+    fn new_unlinked_files_pay_until_the_last_handle_closes() {
+        let dir = tempdir("new-unlinked").canonicalize().unwrap();
+        let limits = Limits { disk_mb: 1, ..Limits::default() };
+        let obj = Arc::new(ObjShared::new("app".into(), "obj"));
+        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj).unwrap();
+        let create = |name: &str| {
+            let path = dir.join(name);
+            g.journal(|j| j.creating(&path)).unwrap();
+            let f = Arc::new(std::fs::File::options().create_new(true).read(true).write(true).open(&path).unwrap());
+            g.journal(|j| { j.created(&path)?; j.opened(&f) }).unwrap();
+            g.adjust(0, 1);
+            g.write(&f, Some(0), &vec![7; 600 << 10]).unwrap();
+            f
+        };
+        let a = create("a");
+        let reader = Arc::new(std::fs::File::open(dir.join("a")).unwrap());
+        g.journal(|j| j.opened(&reader)).unwrap();
+        let stream = a.clone();
+        g.unlink(&dir.join("a"), 600 << 10).unwrap();
+        assert_eq!(usage(&g), (0, 0));
+        let b = create("b");
+        assert!(matches!(g.unlink(&dir.join("b"), 600 << 10), Err(ErrorCode::InsufficientSpace)));
+        assert_eq!(usage(&g), (600 << 10, 1));
+        g.set_size(&a, 1).unwrap();
+        assert_eq!(usage(&g), (600 << 10, 1), "no second credit for truncation");
+        g.write(&a, Some(0), b"old").unwrap();
+        let mut data = [0; 3];
+        reader.read_exact_at(&mut data, 0).unwrap();
+        assert_eq!(&data, b"old");
+        assert_eq!(usage(&g).0, (600 << 10) + 2, "growth is still charged");
+        drop(a);
+        drop(reader);
+        assert!(matches!(g.unlink(&dir.join("b"), 600 << 10), Err(ErrorCode::InsufficientSpace)));
+        // A commit cannot forgive storage still owned by a live stream.
+        g.commit().unwrap();
+        assert!(matches!(g.unlink(&dir.join("b"), 600 << 10), Err(ErrorCode::InsufficientSpace)));
+        drop(stream);
+        g.unlink(&dir.join("b"), 600 << 10).unwrap();
+        assert_eq!(usage(&g), (2, 0), "post-removal growth keeps the existing conservative charge");
+        assert_eq!(b.metadata().unwrap().len(), 600 << 10);
     }
 }
