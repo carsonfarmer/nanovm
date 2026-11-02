@@ -10,7 +10,7 @@ use http_body_util::{BodyExt, Full, Limited};
 use opentelemetry::{Context, KeyValue};
 use opentelemetry::logs::{LogRecord, Logger, LoggerProvider};
 use opentelemetry::trace::TraceContextExt;
-use opentelemetry::trace::{Tracer, TracerProvider};
+use opentelemetry::trace::{SpanKind, Tracer, TracerProvider};
 use opentelemetry_http::{HttpClient, HttpError};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_proto::tonic::{collector, common::v1 as common, resource::v1::Resource};
@@ -132,11 +132,12 @@ impl Telemetry {
         })
     }
 
-    pub fn span(&self, name: &'static str, object: &str, parent: &Context) -> Span {
+    pub fn span(&self, name: &'static str, object: &str, parent: &Context, kind: SpanKind) -> Span {
         // Request metadata and phase durations stay on this one event.
         let mut attributes = Vec::with_capacity(if name == "request" { 16 } else { 1 });
         attributes.push(KeyValue::new("nanovm.object", object.to_owned()));
         self.tracer.span_builder(name)
+            .with_kind(kind)
             .with_attributes(attributes)
             .start_with_context(&self.tracer, parent)
     }
@@ -314,11 +315,11 @@ mod tests {
         for (burst, expected) in [(1536, 1792), (4096, 2304)] {
             received.store(0, Relaxed);
             let telemetry = Telemetry::new(&endpoint, "burst", "v1", None).unwrap();
-            for _ in 0..256 { drop(telemetry.span("request", "room", &Context::new())); }
+            for _ in 0..256 { drop(telemetry.span("request", "room", &Context::new(), SpanKind::Server)); }
             tokio::time::timeout(Duration::from_secs(2), arrived.notified()).await.unwrap();
             // Complete requests while an export is in flight. A short burst
             // survives; overload drops at the bound instead of blocking.
-            for _ in 0..burst { drop(telemetry.span("request", "room", &Context::new())); }
+            for _ in 0..burst { drop(telemetry.span("request", "room", &Context::new(), SpanKind::Server)); }
             let flush = tokio::task::spawn_blocking(move || telemetry.flush());
             tokio::time::sleep(Duration::from_millis(100)).await;
             assert!(!flush.is_finished(), "flush returned before the in-flight export completed");
@@ -424,7 +425,7 @@ mod tests {
         }));
         let telemetry = Telemetry::new(&endpoint, "lifecycle", "v1", None).unwrap();
         use opentelemetry::trace::Span as _;
-        let span = telemetry.span("last-request", "room", &Context::new());
+        let span = telemetry.span("last-request", "room", &Context::new(), SpanKind::Server);
         assert!(span.is_recording());
         drop(span);
         telemetry.log("room", ("log.iostream", "stdout"), b"last log", &Context::new());

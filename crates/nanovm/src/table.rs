@@ -159,7 +159,7 @@ impl Node {
             opentelemetry_sdk::propagation::TraceContextPropagator::new()
                 .extract(&opentelemetry_http::HeaderExtractor(req.headers()))
         });
-        let mut span = self.telemetry.span("request", id, &parent);
+        let mut span = self.telemetry.span("request", id, &parent, opentelemetry::trace::SpanKind::Server);
         span.set_attribute(opentelemetry::KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
         let path = req.uri().path();
         span.set_attribute(opentelemetry::KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));

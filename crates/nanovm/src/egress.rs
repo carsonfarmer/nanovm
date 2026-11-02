@@ -220,39 +220,58 @@ async fn call(
     obj: Arc<crate::object::ObjShared>,
     req: http::Request<WasiBody>,
 ) -> Result<http::Response<WasiBody>, Error> {
-    use opentelemetry::trace::{Span, TraceContextExt};
+    use opentelemetry::{KeyValue, trace::{Span, SpanKind, Status, TraceContextExt}};
     let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
     let parent = obj.context.lock().clone();
-    let span = node.telemetry.span("call", &obj.id, &parent);
-    let (mut parts, body) = req.into_parts();
-    parts.extensions.insert(parent.with_remote_span_context(span.span_context().clone()));
-    let target = parts.uri.clone();
-    let rest = target.path_and_query().map_or("", |p| p.as_str()).strip_prefix(CALLS).unwrap_or("");
-    let (id, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
-    let to_guest = |res: http::Response<crate::object::RespBody>| {
-        res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync())
-    };
-    if !node.wait_for(&obj, id) {
-        let why = format!("{id} is already waiting on {}", obj.id);
-        return Ok(to_guest(crate::object::error_response(508, "call-cycle", &why)));
+    let mut span = node.telemetry.span("call", &obj.id, &parent, SpanKind::Client);
+    span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
+    span.set_attribute(KeyValue::new("url.path", req.uri().path().chars().take(1024).collect::<String>()));
+    let result = async {
+        let (mut parts, body) = req.into_parts();
+        parts.extensions.insert(parent.with_remote_span_context(span.span_context().clone()));
+        let target = parts.uri.clone();
+        let rest = target.path_and_query().map_or("", |p| p.as_str()).strip_prefix(CALLS).unwrap_or("");
+        let (id, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+        span.set_attribute(KeyValue::new("nanovm.target_object", id.chars().take(128).collect::<String>()));
+        let to_guest = |res: http::Response<crate::object::RespBody>| {
+            res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync())
+        };
+        if !node.wait_for(&obj, id) {
+            let why = format!("{id} is already waiting on {}", obj.id);
+            return Ok(to_guest(crate::object::error_response(508, "call-cycle", &why)));
+        }
+        let _waiting = Waiting(obj.clone(), id.into());
+        let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
+        let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
+        let body = http_body_util::Limited::new(body, limit).collect().await;
+        let body = body.map_err(|_| Error::HttpRequestBodySize(None))?.to_bytes();
+        parts.uri = format!("http://{}/{}", crate::ws::PUBLISH_HOST, path.trim_start_matches('/'))
+            .parse()
+            .map_err(|_| Error::HttpRequestUriInvalid)?;
+        let res = node.dispatch(id, http::Request::from_parts(parts, body)).await;
+        // The permit lives as long as the response body, as for any request.
+        Ok(to_guest(res.map(|b| {
+            b.map_frame(move |f| {
+                let _ = &permit;
+                f
+            })
+            .boxed_unsync()
+        })))
+    }.await;
+    match &result {
+        Ok(res) => {
+            crate::telemetry::response(&mut span, res);
+            if res.status().is_client_error() {
+                span.set_status(Status::error(""));
+                span.set_attribute(KeyValue::new("error.type", res.status().as_u16().to_string()));
+            }
+        }
+        Err(e) => {
+            span.set_status(Status::error(""));
+            span.set_attribute(KeyValue::new("error.type", format!("{e:?}")));
+        }
     }
-    let _waiting = Waiting(obj.clone(), id.into());
-    let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
-    let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
-    let body = http_body_util::Limited::new(body, limit).collect().await;
-    let body = body.map_err(|_| Error::HttpRequestBodySize(None))?.to_bytes();
-    parts.uri = format!("http://{}/{}", crate::ws::PUBLISH_HOST, path.trim_start_matches('/'))
-        .parse()
-        .map_err(|_| Error::HttpRequestUriInvalid)?;
-    let res = node.dispatch(id, http::Request::from_parts(parts, body)).await;
-    // The permit lives as long as the response body, as for any request.
-    Ok(to_guest(res.map(|b| {
-        b.map_frame(move |f| {
-            let _ = &permit;
-            f
-        })
-        .boxed_unsync()
-    })))
+    result
 }
 
 /// A call `.0` waits on, until it is answered or given up.

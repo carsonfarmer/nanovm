@@ -2461,13 +2461,20 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
     }
     // Concurrent requests queue on one caller. Each object's outbound call
     // must inherit that request, not another queued request's context.
-    futures::future::join_all((1..=4).map(|i| {
+    futures::future::join_all((1..=6).map(|i| {
         let app = &hostile;
         async move {
-            let head = format!("GET /caller/fetch?url=http://nanovm/objects/callee{i}/sleep?ms=5 HTTP/1.1\r\nHost: x\r\n{}traceparent: 00-{i:032x}-1111111111111111-01\r\nConnection: close\r\n\r\n", names(app));
+            let target = match i {
+                4 => "callee4/panic".to_owned(),
+                5 => "caller/".to_owned(),
+                6 => "callee6/missing".to_owned(),
+                _ => format!("callee{i}/sleep?ms=5"),
+            };
+            let head = format!("GET /caller/fetch?url=http://nanovm/objects/{target} HTTP/1.1\r\nHost: x\r\n{}traceparent: 00-{i:032x}-1111111111111111-01\r\nConnection: close\r\n\r\n", names(app));
             let (status, body) = raw(addr, &head, b"").await;
             assert_eq!(status, 200, "{body}");
-            assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"], 200);
+            let expected = match i { 4 => 500, 5 => 508, 6 => 404, _ => 200 };
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"], expected);
         }
     })).await;
     let mut calls = Vec::new();
@@ -2481,22 +2488,38 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
                     calls.extend(resource.scope_spans.into_iter().flat_map(|s| s.spans));
                 }
             }
-            if calls.len() >= 12 { break }
+            if calls.len() >= 17 { break }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("all queued calls exported");
-    assert_eq!(calls.len(), 12);
-    for i in 1..=4 {
+    assert_eq!(calls.len(), 17);
+    for i in 1..=6 {
         let mut trace = vec![0; 16];
         trace[15] = i;
         let group: Vec<_> = calls.iter().filter(|s| s.trace_id == trace).collect();
-        assert_eq!(group.len(), 3, "each request has its own caller/call/callee trace");
+        assert_eq!(group.len(), if i == 5 { 2 } else { 3 }, "a rejected cycle has no callee request");
         let caller = group.iter().find(|s| s.name == "request" && attr(&s.attributes, "nanovm.object") == "caller").unwrap();
         let call = group.iter().find(|s| s.name == "call").unwrap();
-        let callee = group.iter().find(|s| s.name == "request" && attr(&s.attributes, "nanovm.object") == format!("callee{i}")).unwrap();
         assert_eq!(caller.parent_span_id, [0x11; 8]);
         assert_eq!(call.parent_span_id, caller.span_id);
-        assert_eq!(callee.parent_span_id, call.span_id);
+        assert_eq!(caller.kind, 2, "SERVER request");
+        assert_eq!(call.kind, 3, "CLIENT call");
+        let expected = match i { 4 => 500, 5 => 508, 6 => 404, _ => 200 };
+        assert!(call.attributes.iter().any(|a| a.key == "http.response.status_code"
+            && a.value.as_ref().and_then(|v| v.value.as_ref()) == Some(&Value::IntValue(expected))));
+        assert_eq!(attr(&call.attributes, "nanovm.target_object"), if i == 5 { "caller".to_owned() } else { format!("callee{i}") });
+        assert_eq!(attr(&call.attributes, "http.request.method"), "GET");
+        let path = match i { 4 => "/objects/callee4/panic".to_owned(), 5 => "/objects/caller/".to_owned(), 6 => "/objects/callee6/missing".to_owned(), _ => format!("/objects/callee{i}/sleep") };
+        assert_eq!(attr(&call.attributes, "url.path"), path, "query values are not exported");
+        assert_eq!(call.status.as_ref().map_or(0, |s| s.code), if i >= 4 { 2 } else { 0 });
+        assert_eq!(attr(&call.attributes, "error.type"), match i { 4 => "trap", 5 => "call-cycle", 6 => "404", _ => "" });
+        assert_eq!(caller.status.as_ref().map_or(0, |s| s.code), 0, "the caller handled the dependency failure");
+        if i != 5 {
+            let callee = group.iter().find(|s| s.name == "request" && attr(&s.attributes, "nanovm.object") == format!("callee{i}")).unwrap();
+            assert_eq!(callee.parent_span_id, call.span_id);
+            assert_eq!(callee.kind, 2);
+            assert_eq!(callee.status.as_ref().map_or(0, |s| s.code), if i == 4 { 2 } else { 0 }, "404 is not a server failure");
+        }
     }
     // Refuse exports on existing connections too, and prove an export failed
     // before checking that requests still succeed.
