@@ -21,7 +21,7 @@
 //! still writes after removing it. The log, and the removed files, may each
 //! hold as much as the object's quota.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -44,6 +44,12 @@ enum Undo {
     Renamed(PathBuf, PathBuf),
 }
 
+struct Saved {
+    len: u64,
+    /// Sorted, disjoint ranges whose request-start bytes are durable.
+    ranges: Vec<std::ops::Range<u64>>,
+}
+
 pub struct Journal {
     /// `<objects>`, which every path in the log is relative to.
     base: PathBuf,
@@ -52,7 +58,7 @@ pub struct Journal {
     /// Open while the current request has changes.
     log: Option<File>,
     /// Files (by inode) whose size is recorded, and what to sync on commit.
-    sized: HashSet<u64>,
+    sized: HashMap<u64, Saved>,
     touched: HashSet<PathBuf>,
     slots: u64,
     /// Bytes the log holds, and the removed files; each may reach `max`.
@@ -75,7 +81,7 @@ impl Journal {
             volume: volume.to_path_buf(),
             dir,
             log: None,
-            sized: HashSet::new(),
+            sized: HashMap::new(),
             touched: HashSet::new(),
             slots: 0,
             held: (0, 0),
@@ -161,20 +167,55 @@ impl Journal {
     pub fn writing(&mut self, file: &File, at: u64, end: u64) -> std::io::Result<()> {
         let Some(p) = self.local_file(file) else { return Ok(()) };
         let md = file.metadata()?;
-        if !self.sized.contains(&md.ino()) {
+        if !self.sized.contains_key(&md.ino()) {
             self.record(Undo::Size(p.clone(), md.len()))?;
-            self.sized.insert(md.ino());
+            self.sized.insert(
+                md.ino(),
+                Saved {
+                    len: md.len(),
+                    ranges: vec![],
+                },
+            );
             self.touched.insert(p.clone());
         }
-        let (mut at, end) = (at, end.min(md.len()));
+        let saved = &self.sized[&md.ino()];
+        let (mut at, end) = (at, end.min(saved.len));
+        let ranges = saved.ranges.clone();
         if at < end {
             // Read through a handle of our own: the guest's may be write-only.
             let current = File::open(self.base.join(&p))?;
+            let mut ranges = ranges.into_iter().peekable();
             while at < end {
-                let mut old = vec![0; (end - at).min(CHUNK) as usize];
+                while ranges.peek().is_some_and(|r| r.end <= at) {
+                    ranges.next();
+                }
+                if let Some(r) = ranges.peek()
+                    && r.start <= at
+                {
+                    at = r.end;
+                    continue;
+                }
+                let until = ranges.peek().map_or(end, |r| end.min(r.start));
+                let mut old = vec![0; (until - at).min(CHUNK) as usize];
                 current.read_exact_at(&mut old, at)?;
                 let n = old.len() as u64;
                 self.record(Undo::Bytes(p.clone(), at, old))?;
+                // Only a durable record protects a range, including when a
+                // later chunk fails and the caller retries the whole write.
+                let saved = &mut self.sized.get_mut(&md.ino()).unwrap().ranges;
+                saved.push(at..at + n);
+                saved.sort_by_key(|r| r.start);
+                let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
+                for r in saved.drain(..) {
+                    if let Some(last) = merged.last_mut()
+                        && last.end == r.start
+                    {
+                        last.end = r.end;
+                    } else {
+                        merged.push(r);
+                    }
+                }
+                *saved = merged;
                 at += n;
             }
         }
@@ -649,13 +690,50 @@ mod tests {
     #[test]
     fn the_journal_is_bounded() {
         let v = volume();
-        let mut j = reopen(&v, 250).unwrap();
+        let mut j = reopen(&v, 100).unwrap();
         let a = File::options().read(true).write(true).open(v.join("a")).unwrap();
-        for _ in 0..3 {
-            j.writing(&a, 0, 11).unwrap();
+        j.writing(&a, 0, 5).unwrap();
+        for _ in 0..2 {
+            assert_eq!(j.writing(&a, 0, 11).unwrap_err().kind(), ErrorKind::StorageFull);
         }
-        assert_eq!(j.writing(&a, 0, 11).unwrap_err().kind(), ErrorKind::StorageFull);
-        assert_eq!(j.remove(&v.join("f"), 1 << 20).unwrap_err().kind(), ErrorKind::StorageFull);
+        assert_eq!(
+            j.remove(&v.join("f"), 1 << 20).unwrap_err().kind(),
+            ErrorKind::StorageFull
+        );
         assert!(v.join("f").exists());
+    }
+
+    /// Overlap, rename, and truncate/regrow must restore request-start
+    /// bytes, not intermediate versions. Repeat recovery at every record.
+    #[test]
+    fn original_bytes_are_saved_once() {
+        for after in 0..9 {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = reopen(&v, 512).unwrap();
+            write(&mut j, &v, "a", 3, b"XYZ");
+            write(&mut j, &v, "a", 1, b"12345678");
+            rename(&mut j, &v, "a", "renamed");
+            let f = File::options().write(true).open(v.join("renamed")).unwrap();
+            j.writing(&f, 2, 11).unwrap();
+            f.set_len(2).unwrap();
+            for _ in 0..1000 {
+                write(&mut j, &v, "renamed", 0, b"abcdefghijklmnop");
+            }
+            let payload: usize = decode(&std::fs::read(j.dir.join(LOG)).unwrap())
+                .iter()
+                .map(|(_, u)| match u {
+                    Undo::Bytes(_, _, bytes) => bytes.len(),
+                    _ => 0,
+                })
+                .sum();
+            assert_eq!(payload, 11, "each original byte once; extensions need no backup");
+            drop(j);
+            CRASH_AFTER.with(|c| c.set(Some(after)));
+            let _ = reopen(&v, 512);
+            CRASH_AFTER.with(|c| c.set(None));
+            open(&v);
+            assert_eq!(tree(&v), before, "recovery interrupted at {after}");
+        }
     }
 }
