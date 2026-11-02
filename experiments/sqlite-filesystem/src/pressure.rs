@@ -22,6 +22,10 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
                 "wasi-p3",
             )
             .map_err(sql_error)?;
+            if req.q("exclusive") == Some("1") {
+                // Before ATTACH or any access to a persisted WAL database.
+                db.execute_batch("PRAGMA locking_mode=EXCLUSIVE;").map_err(sql_error)?;
+            }
             db.execute_batch("ATTACH 'aux.db' AS aux;").map_err(sql_error)?;
             db
         }
@@ -40,6 +44,11 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
     let aux_mode: String = db
         .query_row(&format!("PRAGMA aux.journal_mode={mode}"), [], |r| r.get(0))
         .map_err(sql_error)?;
+    if let Some(pages) = req.q("autocheckpoint") {
+        let pages: u32 = pages.parse().unwrap();
+        db.execute_batch(&format!("PRAGMA wal_autocheckpoint={pages};"))
+            .map_err(sql_error)?;
+    }
     db.execute_batch(
         "PRAGMA main.synchronous=FULL; PRAGMA aux.synchronous=FULL;
         PRAGMA cache_size=4; PRAGMA cache_spill=ON; PRAGMA temp_store=MEMORY;
@@ -61,6 +70,24 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
     vfs::arm(req.q_u64("cut", 0));
     let mut completed = 0u64;
     let mut handled = None;
+    let mut checkpoints = vec![];
+    if op == "checkpoint" {
+        let checkpoint = match req.q("checkpoint").unwrap_or("PASSIVE") {
+            "PASSIVE" => "PASSIVE",
+            "FULL" => "FULL",
+            "RESTART" => "RESTART",
+            "TRUNCATE" => "TRUNCATE",
+            _ => return util::text(400, "unsupported checkpoint"),
+        };
+        for name in ["main", "aux"] {
+            let result = db
+                .query_row(&format!("PRAGMA {name}.wal_checkpoint({checkpoint})"), [], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                })
+                .map_err(sql_error)?;
+            checkpoints.push(result);
+        }
+    }
     if op == "mutate" || op == "churn" {
         marker("after").await;
         if op == "mutate" {
@@ -86,8 +113,14 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
                     Err(e) => return Err(sql_error(e)),
                 }
             }
-            if handled.is_none() && req.q("bulk") == Some("1") {
-                if let Err(e) = db.execute("UPDATE items SET value=value+7,payload=zeroblob(2048)", []) {
+            if handled.is_none() && req.q("full").is_some() {
+                // Both statements exceed the unchanged 1 MiB volume quota.
+                let sql = if req.q("full") == Some("bulk") {
+                    "UPDATE items SET value=value+7,payload=zeroblob(131072)"
+                } else {
+                    "INSERT INTO items VALUES (99,999,zeroblob(2097152))"
+                };
+                if let Err(e) = db.execute(sql, []) {
                     if req.q("handle") == Some("1") {
                         handled = Some(e.to_string());
                     } else {
@@ -135,6 +168,11 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
     } else {
         db.close().map_err(|(_, e)| sql_error(e))?;
     }
+    if req.q("then") == Some("error") {
+        return Err(ErrorCode::InternalError(Some(format!(
+            "after {completed} completed statements"
+        ))));
+    }
     let (steps, bytes) = vfs::counts();
     util::json(
         200,
@@ -142,7 +180,7 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
             "state": {"rows": rows, "tally": tally, "integrity": integrity, "aux_integrity": aux_integrity,
                 "file": String::from_utf8(file).unwrap(), "key": String::from_utf8(key).unwrap()},
             "mode": main_mode, "aux_mode": aux_mode, "reused": reused, "steps": steps, "write_bytes": bytes,
-            "completed": completed, "handled": handled,
+            "completed": completed, "handled": handled, "checkpoints": checkpoints,
         })
         .to_string(),
     )

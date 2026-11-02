@@ -1,9 +1,10 @@
 # SQLite over nanovm's existing filesystem
 
 An opt-in experiment, not a shipped SQLite interface. SQLite is compiled into
-the guest's Wasm with rusqlite; nanovm's runtime, journal, quotas, and import
-allowlist are unchanged. This separate Cargo workspace does not change or
-publish the normal guests.
+the guest's Wasm with rusqlite. The initial experiment needed no runtime changes;
+this validation branch also includes the independent generic journal amplification
+fixes. Quotas and the import allowlist are unchanged. This separate Cargo
+workspace does not change or publish the normal guests.
 
 ## Reproduce
 
@@ -58,20 +59,58 @@ checks. Failed instances must discard their cached connection.
 | TRUNCATE | 143 |
 | PERSIST | 143 |
 | MEMORY | 62 |
-| Total | 483 |
+| WAL, exclusive locking | 92 |
+| Total transaction cuts | 575 |
 
-WAL fails with a disk I/O error in this VFS; the test verifies recovery, not WAL
-support. MEMORY passes these request-recovery checks because nanovm supplies
+Normal-locking WAL fails with a disk I/O error in this VFS. Exclusive-locking
+WAL works without a VFS or host change; see below. MEMORY passes these
+request-recovery checks because nanovm supplies
 the durable outer journal; this is not a general endorsement of MEMORY mode.
 
-### Journal capacity is a real limitation
+### WAL works without shared memory under exclusive ownership
 
-Repeated autocommit updates to one row exhaust the 1 MiB request journal even
-though the main database is only 32,768 bytes. The measured undo log reaches
-1,035,176 bytes. Propagating the error rolls back the entire request, including
-earlier SQLite, file and KV writes.
+SQLite documents [WAL without shared memory](https://sqlite.org/wal.html#use_of_wal_without_shared_memory):
+set `PRAGMA locking_mode=EXCLUSIVE` before the first WAL database access. The
+fixture sets it immediately after opening the connection, before ATTACH, on
+every fresh connection. SQLite maintains its WAL index in private memory and
+does not call the VFS shared-memory methods. Database and `-wal` writes still
+go through the unchanged P3 filesystem and nanovm journal. No `-shm` file is
+created. Both attached databases report `journal_mode=wal`.
 
-If the guest swallows the error, closes SQLite and returns HTTP 200, reopening
+In addition to 92 mutation cuts, checkpoints pass with exact state recovery
+after every successful VFS operation: PASSIVE 28 cuts, FULL 28, RESTART 28,
+TRUNCATE 30. Both database checkpoints report no busy result and all frames
+checkpointed; TRUNCATE leaves zero-length WAL files. These 114 checkpoint cuts
+reopen fresh connections against recovered database/WAL files, rebuilding the
+private index. Together with the earlier modes, this is 689 fault cuts.
+
+**Checkpoint policy matters under small quotas.** SQLite's default automatic
+checkpoint threshold cannot keep this workload within the 1 MiB object quota:
+the main WAL reaches 1,027,982 bytes and the request fails; full SQL/file/KV
+rollback succeeds. Setting `wal_autocheckpoint=16` lets 1,000 updates complete
+and commit or roll back exactly. That is a tested fixture setting, not a proposed
+universal threshold: it must fit the volume budget, and a single large transaction
+can still run out of space before an automatic checkpoint occurs.
+
+This is **single-connection WAL**, not general concurrent WAL. The fixture's
+locks are still local bookkeeping; exclusive ownership is an assumption, not
+enforced across multiple connections or raw-file writers. Normal-locking WAL
+would need shared index/locking support. SQLite WAL alone does not make an
+ATTACH transaction atomic across databases; nanovm's outer request journal is
+what provides that boundary here. WAL-specific tests cover guest traps, not a
+new jailed-worker SIGKILL or physical power-loss campaign.
+
+### Original amplification and the generic fixes
+
+On the original runtime, repeated autocommit updates to one row exhaust the
+request journal even though the main database is only 32,768 bytes. The undo
+log reaches 1,035,176 bytes, including 991,232 payload bytes covering only 8,192
+distinct database bytes. The retained-file budget is actually reached first:
+120 deleted SQLite journal files occupy 1,046,400 bytes, plus a 6-byte KV value.
+Both budgets are 1 MiB. Propagating the error rolls back the entire request,
+including earlier SQLite, file and KV writes.
+
+In that baseline, if the guest swallows the error, closes SQLite and returns HTTP 200, reopening
 preserves exactly the 120 completed statements, with no partial failed statement.
 A second case performs 119 updates, then exhausts the journal during an attempted
 multi-page update: all earlier updates survive, and none of the failed bulk
@@ -84,15 +123,151 @@ The exhausted connection returned `interrupted` on subsequent queries in an
 exploratory run. Closing/reopening is tested; continued use of that connection
 is not supported by this result. The VFS/error mapping needs production work.
 
-The journal records overwritten bytes repeatedly, not just their first value
-in the request, and SQLite maintains its own rollback journal too. This is an
-amplification problem worth addressing, but these tests do not justify replacing
-the journal or adding a SQLite-specific commit path. Benchmark bytes and syncs
-before choosing an optimization. A possible generic improvement is recording
-each original byte range once per request; that must still correctly handle
-overlapping writes, truncate/regrow, rename/unlink/recreate and open descriptors.
-Simply increasing the cap hides the problem, while disabling SQLite's journal
-would lose statement/savepoint rollback inside a request.
+The generic fix records each original byte range once per request and stops
+retaining deleted files created during that request, while charging live unlinked
+handles until their last owner closes. Those amplification fixes preserve the
+undo format, quotas, reverse recovery, sync ordering and request commit policy. SQLite retains
+its own rollback journal for statement/savepoint rollback inside a request.
+
+The separate rename-failure correction restores staged targets and their quota
+charges on both logging and syscall failure, preserves dirty-source sync tracking,
+and cancels failed rename records so path reuse cannot corrupt recovery. It adds
+journal tag 5; see the root README's downgrade restriction. Failed restoration,
+cancellation or journal append I/O prevents commit until recovery. A temporary
+real-WASI capability-denial probe changed from one `NotPermitted` followed by
+nine spurious `InsufficientSpace` errors to ten `NotPermitted` errors, with exact
+contents preserved through commit and rollback/restart. The probe was removed;
+generic regressions retain coverage of accounting, path reuse, restoration
+failure and interrupted recovery. Physical power-loss testing remains out of scope.
+
+The new 1,000-update check fails on the original runtime. With both fixes it
+passes in each mode, checking exact committed state and, separately, intentional
+whole-request failure and recovery. Measurements below are taken after all
+1,000 statements, before outer recovery:
+
+| Mode | Undo log bytes | Retained-file bytes |
+| --- | ---: | ---: |
+| DELETE | 56,662 | 6 |
+| TRUNCATE | 8,744 | 6 |
+| PERSIST | 8,735 | 6 |
+| MEMORY | 8,662 | 6 |
+| WAL, exclusive, autocheckpoint=16 | 51,466 | 78,350 |
+
+The 6 retained bytes are the original KV marker, which rollback must restore.
+WAL additionally retains its request-start WAL files when the connection closes;
+these are necessary for rollback, not accumulated intermediate journals.
+DELETE still records repeated creation metadata: this is reduced amplification,
+not an unbounded-work promise. Each budget remains capped. Tests also attempt
+an oversized INSERT and multi-page UPDATE after 1,000 successful updates;
+handled failures preserve exactly those earlier updates after reopening, and
+propagated failure restores the complete request-start state. These replace
+tests that expected the old 120-statement amplification failure.
+
+The generic changes remain independent of SQLite. Their regressions cover
+overlapping ranges, truncate/regrow, rename/recreate, interrupted recovery,
+repeated KV replacement, and live unlinked handles. General host I/O failure
+injection remains separate work.
+
+## DELETE versus exclusive WAL benchmark
+
+Run after building the fixture:
+
+```sh
+cargo test --locked -p nanovm --test integration benchmark_database_modes -- --ignored --nocapture --test-threads=1
+```
+
+This writes raw samples to `target/sqlite-filesystem/benchmark-results.json`.
+[Recorded results](benchmark-results.json) are from 2026-11-02, an E2B orb on
+Linux 6.1.158+ x86_64, ext4, Rust 1.99.1, WASI SDK 34 and the committed dependency
+lockfile. The runtime is main's generic journal fixes through `40c5895`;
+there are no SQLite-specific runtime modifications. These are single-client
+orb measurements, not a production-storage throughput or concurrency claim.
+
+Method: 1,024 rows with 512-byte payloads, FULL sync, 2 MiB SQLite page cache,
+memory temporary storage, 16 MiB volume quota and 64 MiB guest memory. Initialization
+is checkpointed with TRUNCATE before warmup so deferred creation work does not
+favor either mode. Each case has three warmup requests and 25 measured requests,
+repeated three times with mode order rotated: 108 fresh databases and 2,700 timed
+requests. Compare DELETE with exclusive WAL at 16 and 1,000 checkpoint pages,
+with a cached connection or one reopened/closed on every request. Compilation,
+initialization, warmup and verification are outside timing. Request time includes
+in-process Node dispatch and the outer journal commit, not TCP/HTTP transport.
+
+The workloads are indexed point lookup, scanning all payload lengths, one
+varying-row update, 100 varying-row updates in one SQL transaction, 100 separate
+autocommit updates to the same row, and a 64 KiB blob overwrite that changes
+every byte. The batched and autocommit cases intentionally exercise different
+page locality; they are not a controlled comparison of SQL batching alone.
+
+**Mean milliseconds per request, including final close/checkpoint amortized
+over the 25 measured requests:**
+
+| Connection | Workload | DELETE | WAL-16 | WAL-1000 |
+| --- | --- | ---: | ---: | ---: |
+| Cached | Point lookup | 0.24 | 0.22 | 0.24 |
+| Cached | Length scan | 0.59 | 0.63 | 0.55 |
+| Cached | One update | 5.46 | 3.13 | 3.06 |
+| Cached | 100-update transaction | 14.76 | 24.88 | 7.04 |
+| Cached | 100 autocommit updates | 206.58 | 41.29 | 103.87 |
+| Cached | 64 KiB overwrite | 16.04 | 30.96 | 3.33 |
+| Reopened | Point lookup | 0.63 | 2.47 | 2.47 |
+| Reopened | Length scan | 1.82 | 4.09 | 4.12 |
+| Reopened | One update | 5.60 | 5.62 | 5.56 |
+| Reopened | 100-update transaction | 14.16 | 14.72 | 13.69 |
+| Reopened | 100 autocommit updates | 207.75 | 33.44 | 64.55 |
+| Reopened | 64 KiB overwrite | 15.21 | 14.48 | 15.37 |
+
+Cached-connection request latency, **p50 / p95 milliseconds**, excluding the
+separate final close (75 samples per cell, nearest-rank p95):
+
+| Workload | DELETE | WAL-16 | WAL-1000 |
+| --- | ---: | ---: | ---: |
+| Point lookup | 0.21 / 0.42 | 0.14 / 0.24 | 0.13 / 0.26 |
+| Length scan | 0.57 / 0.82 | 0.53 / 0.74 | 0.45 / 0.65 |
+| One update | 5.27 / 7.16 | 2.29 / 4.13 | 2.23 / 3.03 |
+| 100-update transaction | 13.99 / 21.41 | 23.73 / 39.66 | 2.68 / 3.45 |
+| 100 autocommit updates | 200.92 / 275.33 | 39.67 / 54.59 | 108.15 / 142.96 |
+| 64 KiB overwrite | 14.37 / 26.57 | 29.95 / 46.49 | 2.73 / 6.16 |
+
+Final close for cached WAL-1000's batched updates costs 91–115 ms: ignoring it
+would overstate the improvement. Warmup is excluded, but any remaining warmup
+frames flushed by final close are included, conservatively charging WAL for them.
+WAL-16 is fastest for repeated same-row autocommits, but slower than DELETE for
+batched updates and large overwrites. WAL-1000 allows more deferred work and
+larger files. Closing every request removes most of WAL's write advantage and
+adds overhead even to reads.
+
+For cached 100-autocommit requests, mean SQLite VFS write traffic and sync calls,
+including amortized final close, are:
+
+| Mode | KiB written/request | VFS sync calls/request |
+| --- | ---: | ---: |
+| DELETE | 1,652.73 | 300.00 |
+| WAL-16 | 427.66 | 118.80 |
+| WAL-1000 | 402.83 | 100.32 |
+
+These are **SQLite's writes and sync calls, not total host writes/fsyncs**:
+nanovm also persists undo records, directories and its outer commit. Fewer VFS
+syncs do not guarantee less latency (WAL-1000 versus WAL-16 demonstrates that).
+The largest observed database+WAL size between requests is 4,619.47 KiB for
+WAL-1000; WAL-16 reaches 800.48 KiB in the blob case. This sampling excludes
+within-request peaks, transient DELETE journals and the outer undo/retained
+storage, so it is not a complete disk-budget bound. No host-fsync or CPU profile
+was collected; the exact source of the checkpoint-policy latency difference is
+not established by these measurements.
+
+All 108 cases check response values, final totals and SQLite integrity outside
+timing. Independent native SQLite validation additionally checked every final
+row value and complete blob payload: 110,592 rows across 108 databases. The
+six correctness tests also pass, including all 689 fault cuts and the existing
+DELETE-mode worker SIGKILL test. No latency thresholds are asserted in CI;
+the benchmark is deliberately separate from the `sqlite_` correctness filter.
+
+**Decision:** keep DELETE as the initial, quota-predictable default. Offer
+exclusive WAL once connection ownership and checkpoint policy are enforced;
+it is worthwhile for cached write-heavy apps, but neither tested checkpoint
+threshold is a universal best setting. Do not weaken sync or outer request
+durability to obtain the measured benefit: both modes used FULL throughout.
 
 ## Revised interface proposal
 
@@ -136,6 +311,9 @@ and returned rows already cover the basic use case.
 2. Start with one connection per database, DELETE journaling, FULL sync and
    in-memory temporary storage. Multiple resource handles must not silently
    create independent connections with this fixture's no-op locking.
+   Exclusive WAL is now a verified alternative for that ownership model, but
+   adds checkpoint policy and has no concurrent-reader benefit here. The benchmark
+   justifies opt-in WAL for cached write-heavy workloads, not a universal switch.
 3. Execute one parameterized statement at a time. Ordinary SQL failures return
    the upstream error type; journal exhaustion must not leak the fixture's
    misleading `interrupted` classification as the intended API contract.
@@ -156,9 +334,52 @@ into an HTTP fixture. Prove composition and resource/async behavior before
 committing to that packaging; no new host import allowlist entry is needed if
 composition resolves the Spin interface internally.
 
+### Permanent support, and what to do with key-value/config
+
+Make the filesystem/journal the shared durability mechanism, not the only
+application-facing API. Keep small WIT capabilities for apps. The smallest next
+implementation is an optional composed provider using the upstream Spin SQLite
+WIT, one owned connection and a production-quality P3 VFS. Its contract tests
+must cover typed bindings/results, resource drop/reopen, multiple handles,
+bounded errors/results, traps and response commit/rollback. Keep the current
+SQL/file/KV recovery matrix against it. Prove composition first, before adding
+a host SQLite service or a new runtime import.
+
+The provider can cache its connection across successful requests, but a failed
+request must discard the whole instance before filesystem recovery. Until there
+is a request-finalization hook, do not leave SQL transactions open across responses;
+initially deny transaction control as above. This costs some batching efficiency,
+but avoids inventing an implicit commit protocol or pretending that the outer
+journal understands SQLite's in-memory transaction state. Explicit transactions
+and ATTACH can follow once their lifecycle is specified and tested.
+
+WAL should be an implementation/deployment policy, not new WIT methods. Reserve
+disk headroom for database, WAL, undo and retained files; checkpoint thresholds
+are triggers, not hard size caps. Document database-path ownership and refuse
+unsupported concurrent opens; local no-op locks are not a production solution.
+The first support tier can forbid raw writes to provider-owned files by contract;
+hard isolation from the same app's raw filesystem access would need a separate
+capability boundary and is not supplied by composition alone.
+
+**Key-value already rides on this filesystem.** `crates/nanovm/src/kv.rs` stores
+one base64url-named file per key under `/data/.kv/<bucket>`, using the same
+QuotaGuard and Journal as raw filesystem operations. Keep `wasi:keyvalue` as the
+public API. Moving its provider from host Rust into Wasm might eventually simplify
+the host, but is a separate experiment: preserve atomics/batch/error semantics,
+memory limits and mixed SQL/file/KV rollback, and measure the extra boundary
+crossings before removing the existing provider. Do not move KV into SQLite
+merely for implementation uniformity.
+
+**Config is different:** `crates/nanovm/src/app.rs` builds read-only, app-scoped
+`WasiConfigVariables` from deployment configuration and shares it across objects.
+It is not per-object mutable state. Keep `wasi:config` and its small host provider;
+copying config into every object's journaled filesystem would add duplication
+and update semantics without solving a demonstrated problem. A future read-only
+mount could be an implementation detail, not a reason to abandon the standard API.
+
 ## Remaining gates, not established support
 
-- WAL shared-memory/checkpoint behavior and real multi-connection locks. The
+- Normal-locking WAL shared-memory behavior and real multi-connection locks. The
   fixture only records locks locally; serialized requests alone do not solve
   multiple connections in one request.
 - Transactions left open across responses, successful cache reuse after storage
@@ -168,10 +389,12 @@ composition resolves the Spin interface internally.
 - Power loss, host I/O failure, and crash injection inside nanovm commit/recovery.
   VFS cuts are guest traps after completed host calls; SIGKILL is process death,
   not storage power loss. Neither proves every internal ordering boundary.
-- Latency, CPU, journal bytes/sync amplification, large result sets and workload
-  comparisons against native SQLite/Spin/workerd.
+- Total host I/O/CPU profiling, large result sets and workload comparisons against
+  native SQLite/Spin/workerd. The measurements above compare modes within nanovm,
+  not these products or production hardware.
 
-No runtime changes were necessary for the tested workloads. The four SQLite
+No runtime changes were necessary for the initial workloads; the generic fixes
+allow the repeated-update workload to fit its existing quota. The six SQLite
 tests are ignored by the ordinary suite because they need the separate fixture
 and C toolchain; this branch's CI explicitly builds and runs them. This is an
 experimental implementation and proposal, not a shipped interface or a claim of

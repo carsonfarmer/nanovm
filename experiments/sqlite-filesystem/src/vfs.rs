@@ -13,12 +13,18 @@ thread_local! {
     static CUT: Cell<u64> = const { Cell::new(0) };
     static STEPS: Cell<u64> = const { Cell::new(0) };
     static BYTES: Cell<u64> = const { Cell::new(0) };
+    static SYNCS: Cell<u64> = const { Cell::new(0) };
 }
 
 pub fn arm(cut: u64) {
     CUT.set(cut);
     STEPS.set(0);
     BYTES.set(0);
+    SYNCS.set(0);
+}
+
+pub fn syncs() -> u64 {
+    SYNCS.get()
 }
 
 pub fn counts() -> (u64, u64) {
@@ -157,6 +163,7 @@ impl DatabaseHandle for File {
             }
         })
         .map_err(error)?;
+        SYNCS.set(SYNCS.get() + 1);
         checkpoint("sync", 0);
         Ok(())
     }

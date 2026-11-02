@@ -4,6 +4,8 @@ use util::wasip3;
 use wasip3::http::types::{ErrorCode, Request, Response};
 
 #[cfg(not(feature = "stock"))]
+mod bench;
+#[cfg(not(feature = "stock"))]
 mod pressure;
 #[cfg(not(feature = "stock"))]
 mod vfs;
@@ -14,6 +16,10 @@ struct Sqlite;
 impl wasip3::exports::http::handler::Guest for Sqlite {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
         let req = util::read_req(request).await;
+        #[cfg(not(feature = "stock"))]
+        if req.path == "/bench" {
+            return bench::run(req).await;
+        }
         #[cfg(not(feature = "stock"))]
         if req.path == "/pressure" {
             return pressure::run(req).await;

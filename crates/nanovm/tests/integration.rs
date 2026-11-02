@@ -1658,8 +1658,9 @@ async fn sqlite_journal_pressure_matrix() {
         serde_json::json!({"rows": rows, "tally": if changed { 40 } else { 29 },
             "file": marker, "key": marker, "integrity": "ok", "aux_integrity": "ok"})
     };
-    for mode in ["DELETE", "TRUNCATE", "PERSIST", "MEMORY"] {
-        let url = |op: &str, cut: u64| format!("/pressure?mode={mode}&cache=1&op={op}&cut={cut}");
+    for mode in ["DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL"] {
+        let exclusive = if mode == "WAL" { "&exclusive=1" } else { "" };
+        let url = |op: &str, cut: u64| format!("/pressure?mode={mode}&cache=1&op={op}&cut={cut}{exclusive}");
         let control = format!("{mode}-control");
         let init = get(&node, &control, &url("init", 0)).await;
         assert_eq!(init.status, 200, "{mode}: {}", init.body);
@@ -1693,45 +1694,40 @@ async fn sqlite_journal_pressure_matrix() {
     assert_eq!(wal.error.as_deref(), Some("guest-error"), "{}", wal.body);
     assert!(wal.body.contains("disk I/O error"), "{}", wal.body);
     assert_eq!(get(&node, "wal", "/pressure").await.json()["state"], expected(false));
-    println!("WAL: disk I/O error with this VFS; previous state recovered (not WAL support)");
+    println!("normal-locking WAL: disk I/O error with this VFS; previous state recovered");
 
     let init = get(&node, "churn", "/pressure?op=init&cache=1").await;
     assert_eq!(init.status, 200, "{}", init.body);
     let denials = node.metrics.fs_denied.load(Relaxed);
-    let failed = get(&node, "churn", "/pressure?op=churn&n=1000&cache=1").await;
+    let failed = get(&node, "churn", "/pressure?op=churn&n=1000&cache=1&full=insert").await;
     assert_eq!(failed.error.as_deref(), Some("guest-error"), "{}", failed.body);
     assert!(node.metrics.fs_denied.load(Relaxed) > denials);
-    let objects = node.cfg.app_dirs(&app.name)[0].clone();
-    let db_bytes = std::fs::metadata(objects.join("churn/pressure.db")).unwrap().len();
-    let log_bytes = std::fs::metadata(objects.join("~journal/churn/log")).unwrap().len();
-    println!("churn failed: main database {db_bytes} bytes, outer undo log {log_bytes} bytes");
     let recovered = get(&node, "churn", "/pressure?cache=1").await;
     assert_eq!(recovered.status, 200, "{}", recovered.body);
     assert_eq!(recovered.json()["state"], expected(false));
-    println!("1000 autocommit updates on a small database exhaust the 1 MiB request journal; full recovery verified");
+    println!("an oversized INSERT after repeated updates fails the volume quota; full recovery verified");
     node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
-async fn sqlite_handled_journal_exhaustion() {
+async fn sqlite_handled_storage_exhaustion() {
     let cfg = node_cfg("sqlite_handled_exhaustion", 8);
     let mut app = app("counter");
     app.limits.cpu_ms = 5000;
     app.limits.request_timeout_ms = 15_000;
     let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
     let node = Node::new(cfg, &app, &wasm, None).unwrap();
-    for (object, query) in [("churn", "n=1000"), ("bulk", "n=119&bulk=1")] {
+    for object in ["insert", "bulk"] {
         assert_eq!(get(&node, object, "/pressure?op=init&cache=1").await.status, 200);
-        let handled = get(&node, object, &format!("/pressure?op=churn&{query}&cache=1&handle=1")).await;
+        let denials = node.metrics.fs_denied.load(Relaxed);
+        let handled = get(&node, object, &format!("/pressure?op=churn&n=1000&full={object}&cache=1&handle=1")).await;
         assert_eq!(handled.status, 200, "handled exhaustion: {}", handled.body);
+        assert!(node.metrics.fs_denied.load(Relaxed) > denials);
         let handled = handled.json();
         assert!(handled["handled"].is_string(), "{handled}");
         let completed = handled["completed"].as_i64().unwrap();
-        assert!(completed > 0 && completed < 1000);
-        if object == "bulk" {
-            assert_eq!(completed, 119);
-        }
+        assert_eq!(completed, 1000);
         let after = get(&node, object, "/pressure").await;
         println!("handled: {handled}; next read {}: {}", after.status, after.body);
         assert_eq!(after.status, 200, "{}", after.body);
@@ -1744,6 +1740,194 @@ async fn sqlite_handled_journal_exhaustion() {
             "a failed statement must not commit, including partial multi-page updates");
         println!("handled exhaustion: {completed} successful statements committed without corruption");
     }
+    node.shutdown().await;
+}
+
+/// Repeated overwrites and short-lived journals must fit without raising quotas.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_repeated_updates_remain_bounded() {
+    let cfg = node_cfg("sqlite_bounded_churn", 8);
+    let mut app = app("counter");
+    app.limits.cpu_ms = 10_000;
+    app.limits.request_timeout_ms = 60_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    for mode in ["DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL"] {
+        for rollback in [false, true] {
+            let object = format!("{mode}-{rollback}");
+            let policy = if mode == "WAL" { "&exclusive=1&autocheckpoint=16" } else { "" };
+            let prefix = format!("/pressure?mode={mode}{policy}");
+            let init = get(&node, &object, &format!("{prefix}&op=init&cache=1")).await;
+            assert_eq!(init.status, 200, "{}", init.body);
+            let before = init.json()["state"].clone();
+            let then = if rollback { "&then=error" } else { "" };
+            let result = get(&node, &object, &format!("{prefix}&op=churn&n=1000{then}")).await;
+            if rollback {
+                assert_eq!(result.error.as_deref(), Some("guest-error"), "{}", result.body);
+                assert!(result.body.contains("after 1000 completed statements"), "{}", result.body);
+                let dir = node.cfg.app_dirs(&app.name)[0].join("~journal").join(&object);
+                let log = std::fs::metadata(dir.join("log")).unwrap().len();
+                let retained: u64 = std::fs::read_dir(&dir).unwrap().map(|entry| {
+                    let entry = entry.unwrap();
+                    if entry.file_name() == "log" { 0 } else { entry.metadata().unwrap().len() }
+                }).sum();
+                println!("{mode}: 1000 completed updates; undo log {log} bytes, retained files {retained} bytes");
+                assert!(log < 256 * 1024 && retained < 256 * 1024,
+                    "repeated changes must not approach the 1 MiB budget: log={log}, retained={retained}");
+            } else {
+                assert_eq!(result.status, 200, "{mode}: {}", result.body);
+                assert_eq!(result.json()["completed"], 1000);
+                assert!(result.json()["handled"].is_null());
+            }
+            let read = get(&node, &object, &prefix).await;
+            assert_eq!(read.status, 200, "{}", read.body);
+            let mut expected = before;
+            if !rollback {
+                expected["rows"][0][1] = 1003.into();
+                expected["file"] = "after".into();
+                expected["key"] = "after".into();
+            }
+            assert_eq!(read.json()["state"], expected, "{mode}, rollback={rollback}");
+        }
+    }
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_exclusive_wal_checkpoints() {
+    let cfg = node_cfg("sqlite_wal_checkpoints", 8);
+    let mut app = app("counter");
+    app.limits.cpu_ms = 10_000;
+    app.limits.request_timeout_ms = 30_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    let prefix = "/pressure?mode=WAL&exclusive=1&cache=1";
+    for checkpoint in ["PASSIVE", "FULL", "RESTART", "TRUNCATE"] {
+        let control = format!("{checkpoint}-control");
+        assert_eq!(get(&node, &control, &format!("{prefix}&op=init")).await.status, 200);
+        let changed = get(&node, &control, &format!("{prefix}&op=mutate")).await;
+        assert_eq!(changed.status, 200, "{}", changed.body);
+        let expected = changed.json()["state"].clone();
+        let volume = node.cfg.app_dirs(&app.name)[0].join(&control);
+        for db in ["pressure", "aux"] {
+            assert!(std::fs::metadata(volume.join(format!("{db}.db-wal"))).unwrap().len() > 32);
+            assert!(!volume.join(format!("{db}.db-shm")).exists());
+        }
+        let url = format!("{prefix}&op=checkpoint&checkpoint={checkpoint}");
+        let done = get(&node, &control, &url).await;
+        assert_eq!(done.status, 200, "{}", done.body);
+        let done = done.json();
+        assert_eq!(done["state"], expected);
+        for result in done["checkpoints"].as_array().unwrap() {
+            assert_eq!(result[0], 0, "checkpoint must not be busy");
+            assert_eq!(result[1], result[2], "all WAL frames must be checkpointed");
+            if checkpoint == "TRUNCATE" { assert_eq!(result[1], 0); }
+            else { assert!(result[1].as_i64().unwrap() > 0); }
+        }
+        if checkpoint == "TRUNCATE" {
+            for db in ["pressure", "aux"] {
+                assert_eq!(std::fs::metadata(volume.join(format!("{db}.db-wal"))).unwrap().len(), 0);
+            }
+        }
+        let steps = done["steps"].as_u64().unwrap();
+        assert!(steps > 0 && steps < 128);
+        for cut in 1..=steps {
+            let object = format!("{checkpoint}-{cut}");
+            assert_eq!(get(&node, &object, &format!("{prefix}&op=init")).await.status, 200);
+            assert_eq!(get(&node, &object, &format!("{prefix}&op=mutate")).await.json()["state"], expected);
+            let failed = get(&node, &object, &format!("{url}&cut={cut}")).await;
+            assert_eq!(failed.error.as_deref(), Some("trap"), "{}", failed.body);
+            assert!(failed.body.contains(&format!("SQLite VFS cut {cut} after")));
+            let read = get(&node, &object, prefix).await;
+            assert_eq!(read.status, 200, "{}", read.body);
+            assert_eq!(read.json()["state"], expected, "{checkpoint} cut {cut}");
+            assert_eq!(read.json()["reused"], false);
+        }
+        println!("exclusive WAL {checkpoint}: {steps} checkpoint cuts; exact SQL/file/KV state recovered");
+    }
+    let before = get(&node, "default-checkpoint", &format!("{prefix}&op=init")).await;
+    assert_eq!(before.status, 200, "{}", before.body);
+    let denials = node.metrics.fs_denied.load(Relaxed);
+    let failed = get(&node, "default-checkpoint", &format!("{prefix}&op=churn&n=1000")).await;
+    assert_eq!(failed.error.as_deref(), Some("guest-error"), "{}", failed.body);
+    assert!(node.metrics.fs_denied.load(Relaxed) > denials);
+    let wal = node.cfg.app_dirs(&app.name)[0].join("default-checkpoint/pressure.db-wal");
+    println!("default WAL autocheckpoint exhausts the 1 MiB volume: WAL {} bytes", std::fs::metadata(wal).unwrap().len());
+    let recovered = get(&node, "default-checkpoint", prefix).await;
+    assert_eq!(recovered.status, 200, "{}", recovered.body);
+    assert_eq!(recovered.json()["state"], before.json()["state"]);
+    node.shutdown().await;
+}
+
+/// Manual benchmark, deliberately outside the `sqlite_` correctness-test filter.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "manual SQLite benchmark; requires the separately built experiment"]
+async fn benchmark_database_modes() {
+    let cfg = node_cfg("sqlite_benchmark", 8);
+    let mut app = app("counter");
+    app.limits.memory_mb = 64;
+    app.limits.disk_mb = 16;
+    app.limits.cpu_ms = 10_000;
+    app.limits.request_timeout_ms = 30_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    let variants = [("DELETE", 1000), ("WAL", 16), ("WAL", 1000)];
+    let mut results = vec![];
+    for round in 0..3 {
+        for workload in ["point", "scan", "write", "batch", "autocommit", "blob"] {
+            for cache in [true, false] {
+                for j in 0..3 {
+                    let (mode, pages) = variants[(j + round) % 3];
+                    let object = format!("{round}-{workload}-{cache}-{mode}-{pages}");
+                    let prefix = format!("/bench?mode={mode}&pages={pages}&cache={}", u8::from(cache));
+                    let init = get(&node, &object, &format!("{prefix}&op=init")).await;
+                    assert_eq!(init.status, 200, "{}", init.body);
+                    let mut samples = vec![];
+                    let (mut bytes, mut syncs, mut peak) = (0u64, 0u64, 0u64);
+                    let writes = match workload { "batch" | "autocommit" => 100, "write" | "blob" => 1, _ => 0 };
+                    for seq in 0..28 {
+                        let start = Instant::now();
+                        let response = get(&node, &object, &format!("{prefix}&op={workload}&seq={seq}")).await;
+                        let us = start.elapsed().as_secs_f64() * 1_000_000.0;
+                        assert_eq!(response.status, 200, "{object}: {}", response.body);
+                        let body = response.json();
+                        let expected = match workload { "point" => 512, "scan" => 1024*512, _ => writes };
+                        assert_eq!(body["value"], expected);
+                        if seq >= 3 {
+                            samples.push(us);
+                            bytes += body["sqlite_write_bytes"].as_u64().unwrap();
+                            syncs += body["sqlite_syncs"].as_u64().unwrap();
+                        }
+                        let volume = node.cfg.app_dirs(&app.name)[0].join(&object);
+                        let live: u64 = std::fs::read_dir(volume).unwrap()
+                            .map(|e| e.unwrap().metadata().unwrap().len()).sum();
+                        peak = peak.max(live);
+                    }
+                    // Include deferred WAL cleanup in the lifecycle cost, not in p50/p95.
+                    let start = Instant::now();
+                    let close = get(&node, &object, &format!("{prefix}&op=close")).await;
+                    let close_us = start.elapsed().as_secs_f64()*1_000_000.0;
+                    assert_eq!(close.status, 200, "{}", close.body);
+                    let closed = close.json();
+                    let verify = get(&node, &object, &format!("{prefix}&op=verify")).await;
+                    assert_eq!(verify.status, 200, "{}", verify.body);
+                    assert_eq!(verify.json()["value"], 28*writes);
+                    assert_eq!(verify.json()["integrity"], "ok");
+                    let result = serde_json::json!({"round": round, "workload": workload, "cached": cache,
+                        "mode": mode, "checkpoint_pages": pages, "samples_us": samples,
+                        "close_us": close_us, "sqlite_write_bytes": bytes, "sqlite_syncs": syncs,
+                        "close_write_bytes": closed["sqlite_write_bytes"], "close_syncs": closed["sqlite_syncs"],
+                        "peak_live_file_bytes": peak});
+                    println!("benchmark {object}: {} us mean including close", (samples.iter().sum::<f64>()+close_us)/25.0);
+                    results.push(result);
+                }
+            }
+        }
+    }
+    std::fs::write(repo().join("target/sqlite-filesystem/benchmark-results.json"),
+        serde_json::to_vec_pretty(&results).unwrap()).unwrap();
     node.shutdown().await;
 }
 
