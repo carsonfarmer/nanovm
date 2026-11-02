@@ -1,6 +1,7 @@
 //! Composition proof, not a production SQLite provider.
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-use rusqlite::types::Value as SqlValue;
+use rusqlite::limits::Limit;
+use rusqlite::types::{Value as SqlValue, ValueRef};
 use std::cell::Cell;
 
 #[allow(dead_code)]
@@ -19,12 +20,55 @@ struct Provider;
 pub struct Database(rusqlite::Connection, Slot);
 // Reserve before any filesystem suspension; failed opens release the slot too.
 struct Slot;
-thread_local! { static OPEN: Cell<bool> = const { Cell::new(false) }; }
+thread_local! {
+    static OPEN: Cell<bool> = const { Cell::new(false) };
+    static RESULT_BYTES: Cell<usize> = const { Cell::new(0) };
+    #[cfg(feature = "test-hooks")]
+    static YIELDING: Cell<bool> = const { Cell::new(false) };
+}
+const MAX_RESULT_BYTES: usize = 1024 * 1024;
+const MAX_ROWS: usize = 4096;
+
+// Charged across outstanding streams, including streams from a dropped connection.
+struct ResultBudget(usize);
+impl ResultBudget {
+    fn reserve(&mut self, bytes: usize, readonly: bool) -> Result<(), Error> {
+        if bytes > MAX_RESULT_BYTES - RESULT_BYTES.get() {
+            return Err(result_limit(readonly));
+        }
+        RESULT_BYTES.set(RESULT_BYTES.get() + bytes);
+        self.0 += bytes;
+        Ok(())
+    }
+}
+impl Drop for ResultBudget {
+    fn drop(&mut self) {
+        RESULT_BYTES.set(RESULT_BYTES.get() - self.0);
+    }
+}
+fn result_limit(readonly: bool) -> Error {
+    // A RETURNING statement may already have written: never return a catchable
+    // limit error that lets the caller commit those otherwise invisible writes.
+    assert!(readonly, "SQLite write result limit: request rollback required");
+    Error::Io("SQLite result limit exceeded".into())
+}
 
 fn error(e: rusqlite::Error) -> Error {
+    use rusqlite::ErrorCode::*;
     match e.sqlite_error_code() {
-        Some(rusqlite::ErrorCode::DiskFull) => Error::DatabaseFull,
-        Some(rusqlite::ErrorCode::AuthorizationForStatementDenied) => Error::AccessDenied,
+        Some(
+            SystemIoFailure
+            | DiskFull
+            | OperationInterrupted
+            | DatabaseCorrupt
+            | NotADatabase
+            | OutOfMemory
+            | InternalMalfunction
+            | FileLockingProtocolFailed,
+        ) => {
+            panic!("SQLite storage failure: request rollback required: {e}");
+        }
+        Some(AuthorizationForStatementDenied) => Error::AccessDenied,
         _ => Error::Io(e.to_string()),
     }
 }
@@ -58,6 +102,38 @@ impl GuestConnection for Database {
         .map_err(error)?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY;")
             .map_err(error)?;
+        for (limit, value) in [
+            (Limit::SQLITE_LIMIT_LENGTH, 4 * 1024 * 1024),
+            (Limit::SQLITE_LIMIT_SQL_LENGTH, 64 * 1024),
+            (Limit::SQLITE_LIMIT_COLUMN, 128),
+            (Limit::SQLITE_LIMIT_VARIABLE_NUMBER, 128),
+        ] {
+            db.set_limit(limit, value).map_err(error)?;
+        }
+        #[cfg(feature = "test-hooks")]
+        {
+            use rusqlite::functions::FunctionFlags;
+            db.create_scalar_function("nanovm_test_arm", 1, FunctionFlags::SQLITE_UTF8, |c| {
+                vfs::arm(c.get::<i64>(0)? as u64);
+                Ok(0)
+            })
+            .map_err(error)?;
+            db.create_scalar_function("nanovm_test_steps", 0, FunctionFlags::SQLITE_UTF8, |_| {
+                Ok(vfs::counts().0 as i64)
+            })
+            .map_err(error)?;
+            db.create_scalar_function("nanovm_test_yield", 0, FunctionFlags::SQLITE_UTF8, |_| {
+                YIELDING.set(true);
+                util::wasip3::wit_bindgen::block_on(util::wasip3::clocks::monotonic_clock::wait_for(10_000_000));
+                YIELDING.set(false);
+                Ok(42)
+            })
+            .map_err(error)?;
+            db.create_scalar_function("nanovm_test_yielding", 0, FunctionFlags::SQLITE_UTF8, |_| {
+                Ok(i64::from(YIELDING.get()))
+            })
+            .map_err(error)?;
+        }
         db.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
             AuthAction::Transaction { .. }
             | AuthAction::Savepoint { .. }
@@ -86,6 +162,22 @@ impl GuestConnection for Database {
         ),
         Error,
     > {
+        // No async yield while SQLite is executing. The VFS's block_on waits
+        // for host I/O without letting another call re-enter this component.
+        if statement.len() > 64 * 1024
+            || parameters.len() > 128
+            || parameters
+                .iter()
+                .map(|v| match v {
+                    Value::Text(v) => v.len(),
+                    Value::Blob(v) => v.len(),
+                    _ => size_of::<Value>(),
+                })
+                .sum::<usize>()
+                > MAX_RESULT_BYTES
+        {
+            return Err(Error::Io("SQLite input limit exceeded".into()));
+        }
         let parameters: Vec<SqlValue> = parameters
             .into_iter()
             .map(|v| match v {
@@ -97,12 +189,26 @@ impl GuestConnection for Database {
             })
             .collect();
         let mut stmt = self.0.prepare(&statement).map_err(error)?;
+        let readonly = stmt.readonly();
+        let mut budget = ResultBudget(0);
+        for name in stmt.column_names() {
+            budget.reserve(size_of::<String>() + name.len(), readonly)?;
+        }
         let columns = stmt.column_names().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut cursor = stmt.query(rusqlite::params_from_iter(parameters)).map_err(error)?;
         let mut rows = Vec::new();
         while let Some(row) = cursor.next().map_err(error)? {
-            let mut values = Vec::new();
+            if rows.len() == MAX_ROWS {
+                return Err(result_limit(readonly));
+            }
+            budget.reserve(size_of::<RowResult>() + columns.len() * size_of::<Value>(), readonly)?;
+            let mut values = Vec::with_capacity(columns.len());
             for i in 0..columns.len() {
+                let payload = match row.get_ref(i).map_err(error)? {
+                    ValueRef::Text(v) | ValueRef::Blob(v) => v.len(),
+                    _ => 0,
+                };
+                budget.reserve(payload, readonly)?;
                 values.push(match row.get::<_, SqlValue>(i).map_err(error)? {
                     SqlValue::Integer(v) => Value::Integer(v),
                     SqlValue::Real(v) => Value::Real(v),
@@ -121,6 +227,7 @@ impl GuestConnection for Database {
         wit_bindgen::spawn_local(async move {
             let _ = tx.write_all(rows).await;
             drop(tx);
+            drop(budget);
             drop(done_tx);
         });
         Ok((columns, rx, done_rx))
@@ -132,10 +239,10 @@ impl GuestConnection for Database {
         self.0.changes()
     }
     async fn last_insert_rowid_async(&self) -> i64 {
-        self.0.last_insert_rowid()
+        self.last_insert_rowid()
     }
     async fn changes_async(&self) -> u64 {
-        self.0.changes()
+        self.changes()
     }
 }
 

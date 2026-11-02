@@ -21,4 +21,9 @@ if [[ ${1:-} == --compose ]]; then
     wac plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_client.wasm" \
         --plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_provider.wasm" \
         -o "$CARGO_TARGET_DIR/composed.wasm"
+    cargo build --locked --manifest-path "$root/experiments/sqlite-filesystem/Cargo.toml" \
+        -p sqlite-provider --features test-hooks --release --target wasm32-wasip2
+    wac plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_client.wasm" \
+        --plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_provider.wasm" \
+        -o "$CARGO_TARGET_DIR/composed-faults.wasm"
 fi

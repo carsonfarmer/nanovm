@@ -1512,6 +1512,10 @@ async fn sqlite_composed_provider() {
     assert_eq!(first.status, 200, "{:?}: {}", first.error, first.body);
     assert_eq!(first.json(), expected(&["first"], "first", false));
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", true));
+    let limits = get(&node, "a", "/limits").await;
+    assert_eq!(limits.status, 200, "{}", limits.body);
+    assert_eq!(limits.json(), expected(&["first"], "first", true));
+    assert_eq!(get(&node, "a", "/nohooks").await.json(), expected(&["first"], "first", true));
     for then in ["error", "trap"] {
         let fail = get(&node, "a", &format!("/?v=discard&then={then}")).await;
         assert_eq!(fail.error.as_deref(), Some(if then == "error" { "guest-error" } else { "trap" }), "{}", fail.body);
@@ -1519,11 +1523,15 @@ async fn sqlite_composed_provider() {
     }
     let denials = node.metrics.fs_denied.load(Relaxed);
     let full = get(&node, "a", "/full?v=discard-full").await;
-    assert_eq!(full.error.as_deref(), Some("guest-error"), "{}", full.body);
-    assert!(full.body.contains("composed quota"));
+    assert_eq!(full.error.as_deref(), Some("trap"), "{}", full.body);
+    assert!(full.body.contains("SQLite storage failure"));
     assert!(node.metrics.fs_denied.load(Relaxed) > denials);
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", false));
-    let response = get(&node, "a", "/?v=second&then=status").await;
+    let limited = get(&node, "a", "/write-result-limit?v=discard-limit").await;
+    assert_eq!(limited.error.as_deref(), Some("trap"), "{}", limited.body);
+    assert!(limited.body.contains("SQLite write result limit"));
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first"], "first", false));
+    let response = get(&node, "a", "/constraint?v=second&then=status").await;
     assert_eq!(response.status, 507);
     assert_eq!(response.json(), expected(&["first", "second"], "second", true));
     assert_eq!(get(&node, "a", "/close").await.json(), expected(&["first", "second"], "second", true));
@@ -1534,6 +1542,50 @@ async fn sqlite_composed_provider() {
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     node.shutdown().await;
     println!("composed Spin SQLite: typed values, one connection, policy denial, drop/reopen, isolation, mixed rollback and restart passed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SQLite build.sh --compose"]
+async fn sqlite_composed_recovery_cuts() {
+    let cfg = node_cfg("sqlite_composed_cuts", 2);
+    let mut app = app("counter");
+    app.limits.memory_mb = 64;
+    app.limits.cpu_ms = 5000;
+    app.limits.request_timeout_ms = 10_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/composed-faults.wasm")).unwrap();
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    let overlap = get(&node, "overlap", "/overlap").await;
+    assert_eq!(overlap.status, 200, "{}", overlap.body);
+    assert_eq!(overlap.json()["scheduling"], "serialized");
+    let expected = |changed: bool| {
+        let mut rows: Vec<_> = (1..=if changed {12} else {16}).map(|i| {
+            serde_json::json!([i, i*3 + if changed {7} else {0}, if changed {8192} else {1024}])
+        }).collect();
+        if changed { rows.push(serde_json::json!([17,51,3072])); }
+        rows
+    };
+    assert_eq!(get(&node, "control", "/cuts?op=init").await.status, 200);
+    let control = get(&node, "control", "/cuts?op=mutate").await;
+    assert_eq!(control.status, 200, "{}", control.body);
+    assert_eq!(control.json()["rows"], serde_json::json!(expected(true)));
+    assert_eq!(control.json()["file"], "after");
+    assert_eq!(control.json()["key"], "after");
+    let steps = control.json()["steps"].as_u64().unwrap();
+    assert!(steps > 0 && steps < 1000);
+    for cut in 1..=steps {
+        let object = format!("cut-{cut}");
+        assert_eq!(get(&node, &object, "/cuts?op=init").await.status, 200);
+        let failed = get(&node, &object, &format!("/cuts?op=mutate&cut={cut}")).await;
+        assert_eq!(failed.error.as_deref(), Some("trap"), "cut {cut}: {}", failed.body);
+        assert!(failed.body.contains(&format!("SQLite VFS cut {cut} after")), "{}", failed.body);
+        let recovered = get(&node, &object, "/cuts").await;
+        assert_eq!(recovered.status, 200, "{}", recovered.body);
+        assert_eq!(recovered.json()["rows"], serde_json::json!(expected(false)), "cut {cut}");
+        assert_eq!(recovered.json()["file"], "before");
+        assert_eq!(recovered.json()["key"], "before");
+    }
+    println!("composed provider: {steps} VFS cuts recovered exact SQL/file/KV state; concurrent calls serialized");
+    node.shutdown().await;
 }
 
 /// Opt-in experiment: build both fixtures with experiments/sqlite-filesystem/build.sh.
@@ -1643,46 +1695,49 @@ async fn sqlite_over_the_existing_filesystem() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
 async fn sqlite_survives_a_jailed_worker_crash() {
-    let cfg = node_cfg("sqlite_worker_crash", 8);
-    let (_sup, addr) = supervised_with(cfg.clone()).await;
-    let mut app = app("counter");
-    app.limits.cpu_ms = 2000;
-    app.limits.request_timeout_ms = 30_000;
-    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
-    let image = publish_wasm("sqlite-probe", &app, wasm).await;
-    let (status, before) = app_get(addr, &image, "/a/?v=durable").await;
-    assert_eq!(status, 200, "{before}");
-    let name = worker(&image);
-    let pid = stats_json(addr).await["workers"][&name]["pid"].as_u64().unwrap() as i32;
-    let pending = tokio::spawn({
-        let image = image.clone();
-        async move { app_get(addr, &image, "/a/?v=uncommitted&then=sleep").await }
-    });
-    // Wait for actual writes, not a guessed delay. The marker is written
-    // after SQLite's INSERT has completed but before the response commits.
-    let marker = cfg.app_dirs(&name)[0].join("a/marker");
-    let key = cfg.app_dirs(&name)[0].join("a/.kv/default/bWFya2Vy");
-    eventually("SQLite, file and KV writes before SIGKILL", || {
-        std::fs::read(&marker).is_ok_and(|v| v == b"uncommitted")
-            && std::fs::read(&key).is_ok_and(|v| v == b"uncommitted")
-    })
-    .await;
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-    let _ = pending.await;
-    let start = Instant::now();
-    while stats_json(addr).await["workers"][&name]["up"] == true {
-        assert!(start.elapsed() < Duration::from_secs(5), "worker still up");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    for fixture in ["p3", "composed"] {
+        let cfg = node_cfg(&format!("sqlite_worker_crash_{fixture}"), 8);
+        let (_sup, addr) = supervised_with(cfg.clone()).await;
+        let mut app = app("counter");
+        app.limits.memory_mb = 64;
+        app.limits.cpu_ms = 2000;
+        app.limits.request_timeout_ms = 30_000;
+        let wasm = std::fs::read(repo().join(format!("target/sqlite-filesystem/{fixture}.wasm"))).unwrap();
+        let image = publish_wasm("sqlite-probe", &app, wasm).await;
+        let (status, before) = app_get(addr, &image, "/a/?v=durable").await;
+        assert_eq!(status, 200, "{before}");
+        let name = worker(&image);
+        let pid = stats_json(addr).await["workers"][&name]["pid"].as_u64().unwrap() as i32;
+        let pending = tokio::spawn({
+            let image = image.clone();
+            async move { app_get(addr, &image, "/a/?v=uncommitted&then=sleep").await }
+        });
+        // Both clients write markers after SQLite's INSERT completes, before response commit.
+        let marker = cfg.app_dirs(&name)[0].join("a/marker");
+        let key = cfg.app_dirs(&name)[0].join("a/.kv/default/bWFya2Vy");
+        eventually("SQLite, file and KV writes before SIGKILL", || {
+            std::fs::read(&marker).is_ok_and(|v| v == b"uncommitted")
+                && std::fs::read(&key).is_ok_and(|v| v == b"uncommitted")
+        }).await;
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+        let _ = pending.await;
+        let start = Instant::now();
+        while stats_json(addr).await["workers"][&name]["up"] == true {
+            assert!(start.elapsed() < Duration::from_secs(5), "worker still up");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (status, after) = app_get(addr, &image, "/a/").await;
+        assert_eq!(status, 200, "{after}");
+        let mut expected = serde_json::json!({"rows": ["durable"], "file": "durable", "key": "durable"});
+        if fixture == "p3" {
+            expected["integrity"] = "ok".into();
+            expected["blob_bytes"] = 0.into();
+        } else {
+            expected["reused"] = false.into();
+        }
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&after).unwrap(), expected);
+        println!("{fixture}: jailed worker SIGKILL after SQLite commit, before response: SQL/file/KV recovered together; integrity_check=ok");
     }
-    let (status, after) = app_get(addr, &image, "/a/").await;
-    assert_eq!(status, 200, "{after}");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&after).unwrap(),
-        serde_json::json!({"rows": ["durable"], "file": "durable", "key": "durable", "integrity": "ok", "blob_bytes": 0})
-    );
-    println!(
-        "jailed worker SIGKILL after SQLite commit, before response: SQL/file/KV recovered together; integrity_check=ok"
-    );
 }
 
 /// Faults at every VFS mutation/sync boundary of a multi-database transaction.

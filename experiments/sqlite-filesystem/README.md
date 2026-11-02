@@ -19,7 +19,9 @@ cargo test --locked -p nanovm --test integration sqlite_ -- --ignored --nocaptur
 ```
 
 The script builds the original variants under `target/sqlite-filesystem/` and,
-with `--compose`, the separate provider/client and `composed.wasm`:
+with `--compose`, the separate provider/client, `composed.wasm` and
+`composed-faults.wasm`. Only the latter enables test-only SQL fault/scheduling
+hooks; the normal artifact is tested to reject those functions:
 
 - `stock.wasm`: libsqlite3-sys's bundled WASI VFS, using libc file operations.
   Nanovm rejects its `wasi:filesystem/types@0.2.12` import. Do not allowlist it:
@@ -298,9 +300,41 @@ transaction open. This is not a large-result streaming implementation.
 unknown database names, rejection of a second connection, cached reuse,
 resource drop/reopen, policy denials, object isolation and restart. SQL/file/KV
 changes roll back together on guest error, trap and quota refusal; HTTP 507 still
-commits. The existing 689-cut matrix remains against the directly linked fixture,
-not the composed provider. This proof uses real in-process Node dispatch; the
-composed artifact has not separately undergone the jailed-worker SIGKILL campaign.
+commits. The existing 689-cut matrix remains against the directly linked fixture.
+The composed provider additionally passes 114 VFS cuts during multi-page UPDATE,
+DELETE and INSERT, recovering exact original SQL/file/KV state and integrity.
+Both artifacts now pass the jailed-worker SIGKILL campaign after SQLite commits
+but before the response commits.
+
+### Provider hardening and its accounting
+
+Inputs are limited to 64 KiB SQL text, 128 parameters and 1 MiB of accounted
+parameter values. SQLite additionally limits SQL length to 64 KiB, columns and
+variables to 128, and individual values/encoded rows to 4 MiB. Results allow
+4,096 rows per query and 1 MiB of aggregate accounted bytes across outstanding
+streams, including streams from dropped connections. The accounting includes
+column names, row/value structures and text/blob payloads before copying them;
+completion or cancellation cleanup releases it. This is not an exact RSS cap:
+allocation capacity, SQLite buffers and component-ABI copies remain subject to
+the guest memory quota.
+
+Read-only result overflow is catchable. Write RETURNING overflow traps: SQLite
+may already have changed data, so the caller must not commit unseen writes.
+Storage errors (including quota exhaustion), interruption, corruption and other
+uncertain SQLite failures also trap and roll back the whole request. Syntax,
+constraint and policy errors remain catchable. This deliberately stricter
+provider policy avoids reusing a suspect connection; it does not change the
+host's response commit policy or the direct-linked experiment's behavior.
+
+Boundary tests cover accepted/rejected input sizes and row counts, large results,
+aggregate stream pressure, abandoned streams, and drop/reopen with an old stream
+still charged. The result-bound regression fails against the original composition
+proof. A test polls two async SQL calls concurrently while the first blocks for
+10 ms inside SQLite: both complete, and the second observes that the first has
+finished its blocking section. The current VFS uses blocking `waitable-set.wait`,
+not an async yield permitting another call into the component. No new lock or
+explicit concurrent-call rejection was needed. This invariant must be revisited
+if execution starts yielding or cursors become lazy streams.
 
 ## Revised interface proposal
 
@@ -345,9 +379,10 @@ and returned rows already cover the basic use case.
    `invalid-connection`; dropping it allows reopening. DELETE journaling, FULL sync
    and memory temporary storage are internal policy, with no app-facing controls.
    Multi-connection WAL is outside the intended scope, not a shipping prerequisite.
-3. Execute one parameterized statement at a time. Ordinary SQL failures return
-   the upstream error type; journal exhaustion must not leak the fixture's
-   misleading `interrupted` classification as the intended API contract.
+3. Execute one parameterized statement at a time, with the input/result bounds
+   above. Ordinary SQL failures return the upstream error type. Storage failures
+   and write-result overflow trap, forcing whole-request rollback and instance
+   disposal rather than catchable errors on a potentially suspect connection.
 4. Nanovm's response boundary remains the durable commit boundary for SQL,
    files and KV together. SQLite COMMIT alone is not a durable nanovm commit.
    Returning an error/trapping rolls all three back; an HTTP error status does not.
@@ -408,11 +443,9 @@ parsing/lookup code into Wasm does not eliminate that responsibility.
 
 ## Remaining gates, not established support
 
-- Production result/error bounds, overlapping async calls within a request,
-  successful cache reuse after storage errors, and raw-file interference with a
-  live database. One connection does not by itself serialize overlapping calls.
-- Full recovery cuts against the composed provider; the direct-VFS results do not
-  establish every additional resource/stream boundary introduced by composition.
+- In-flight async-call cancellation, resource/stream fault boundaries beyond the
+  tested cancellation cleanup, and raw-file interference with a live database.
+  Storage-error cache reuse is deliberately unsupported: those failures trap.
 - Filesystem-backed temporary spill and unique temp names. This build forces
   memory temp storage and the placeholder name is not a general temp-file API.
 - Power loss, host I/O failure, and crash injection inside nanovm commit/recovery.
@@ -423,7 +456,7 @@ parsing/lookup code into Wasm does not eliminate that responsibility.
   not these products or production hardware.
 
 No runtime changes were necessary for the initial workloads; the generic fixes
-allow the repeated-update workload to fit its existing quota. The seven SQLite
+allow the repeated-update workload to fit its existing quota. The eight SQLite
 tests are ignored by the ordinary suite because they need the separate fixture
 and C toolchain; this branch's CI explicitly builds and runs them. This is an
 experimental implementation and proposal, not a shipped interface or a claim of
