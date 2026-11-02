@@ -2459,6 +2459,45 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
                 attr(&l.attributes, "event.name") == "nanovm.snapshot" && l.attributes.iter().any(|a|
                     a.key == field && a.value.as_ref().and_then(|v| v.value.as_ref()) == Some(&Value::IntValue(expected)))), "{field}");
     }
+    // Concurrent requests queue on one caller. Each object's outbound call
+    // must inherit that request, not another queued request's context.
+    futures::future::join_all((1..=4).map(|i| {
+        let app = &hostile;
+        async move {
+            let head = format!("GET /caller/fetch?url=http://nanovm/objects/callee{i}/sleep?ms=5 HTTP/1.1\r\nHost: x\r\n{}traceparent: 00-{i:032x}-1111111111111111-01\r\nConnection: close\r\n\r\n", names(app));
+            let (status, body) = raw(addr, &head, b"").await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["status"], 200);
+        }
+    })).await;
+    let mut calls = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            _sup.flush_telemetry().await.unwrap();
+            for (path, body) in std::mem::take(&mut *batches.lock()) {
+                if path != "/v1/traces" { continue }
+                for resource in collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap().resource_spans {
+                    assert_eq!(attr(&resource.resource.as_ref().unwrap().attributes, "nanovm.app"), worker(&hostile));
+                    calls.extend(resource.scope_spans.into_iter().flat_map(|s| s.spans));
+                }
+            }
+            if calls.len() >= 12 { break }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("all queued calls exported");
+    assert_eq!(calls.len(), 12);
+    for i in 1..=4 {
+        let mut trace = vec![0; 16];
+        trace[15] = i;
+        let group: Vec<_> = calls.iter().filter(|s| s.trace_id == trace).collect();
+        assert_eq!(group.len(), 3, "each request has its own caller/call/callee trace");
+        let caller = group.iter().find(|s| s.name == "request" && attr(&s.attributes, "nanovm.object") == "caller").unwrap();
+        let call = group.iter().find(|s| s.name == "call").unwrap();
+        let callee = group.iter().find(|s| s.name == "request" && attr(&s.attributes, "nanovm.object") == format!("callee{i}")).unwrap();
+        assert_eq!(caller.parent_span_id, [0x11; 8]);
+        assert_eq!(call.parent_span_id, caller.span_id);
+        assert_eq!(callee.parent_span_id, call.span_id);
+    }
     // Refuse exports on existing connections too, and prove an export failed
     // before checking that requests still succeed.
     unavailable.store(true, Relaxed);

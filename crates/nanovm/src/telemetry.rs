@@ -319,8 +319,11 @@ mod tests {
             // Complete requests while an export is in flight. A short burst
             // survives; overload drops at the bound instead of blocking.
             for _ in 0..burst { drop(telemetry.span("request", "room", &Context::new())); }
+            let flush = tokio::task::spawn_blocking(move || telemetry.flush());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!flush.is_finished(), "flush returned before the in-flight export completed");
             release.notify_one();
-            tokio::task::spawn_blocking(move || telemetry.flush()).await.unwrap().unwrap();
+            flush.await.unwrap().unwrap();
             assert_eq!(received.load(Relaxed), expected, "burst={burst}");
         }
         server.abort();
