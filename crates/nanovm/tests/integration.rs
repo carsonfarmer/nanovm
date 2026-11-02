@@ -496,35 +496,80 @@ async fn egress_unlisted_host_denied() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn egress_allowed_request_round_trips() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use http_body_util::BodyExt;
+    use prost::Message;
+    use opentelemetry_proto::tonic::{collector::trace::v1::ExportTraceServiceRequest, common::v1::any_value::Value};
+    let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = node_cfg("egress_allowed_request_round_trips", 8);
+    cfg.telemetry_endpoint = format!("http://{}", sink.local_addr().unwrap());
+    let captured = spans.clone();
+    let leaked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let leak = leaked.clone();
+    let collector = tokio::spawn(nanovm::server::serve_http1(sink, move |req| {
+        let captured = captured.clone();
+        let leak = leak.clone();
+        async move {
+            let trace = req.uri().path() == "/v1/traces";
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            if body.windows(7).any(|s| s == b"PRIVATE") { leak.store(true, Relaxed); }
+            if trace {
+                captured.lock().extend(ExportTraceServiceRequest::decode(body).unwrap().resource_spans
+                    .into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
+            }
+            nanovm::server::ok_json(serde_json::json!({}))
+        }
+    }));
     // In dev mode an IP-literal allowlist entry may be private; this
     // exercises the whole send path.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        let (mut s, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 1024];
-        let n = s.read(&mut buf).await.unwrap();
-        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /hello HTTP/1.1"));
-        s.write_all(b"HTTP/1.1 201 Created\r\ncontent-length: 5\r\n\r\nhello")
-            .await
-            .unwrap();
-    });
+    let contexts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let received = contexts.clone();
+    let server = tokio::spawn(nanovm::server::serve_http1(listener, move |req| {
+        let received = received.clone();
+        async move {
+            received.lock().push(req.headers().get("traceparent").and_then(|v| v.to_str().ok()).unwrap_or("").to_owned());
+            let status = req.uri().path().trim_start_matches('/').parse::<u16>().unwrap();
+            nanovm::object::error_response(status, "upstream", "hello")
+        }
+    }));
     let mut hostile = app("hostile");
     hostile.limits.egress.push(format!("127.0.0.1:{port}"));
-    let node = node_with(node_cfg("egress_allowed_request_round_trips", 8), hostile);
-    let r = get(
-        &node,
-        "n",
-        &format!("/fetch?url=http://127.0.0.1:{port}/hello"),
-    )
-    .await;
-    assert_eq!(r.status, 200, "{}", r.body);
-    assert_eq!(
-        (r.json()["status"].as_u64(), r.json()["body"].as_str()),
-        (Some(201), Some("hello"))
-    );
-    server.await.unwrap();
+    let node = node_with(cfg, hostile);
+    for status in [201, 404, 503] {
+        let r = get(&node, "n", &format!("/fetch?url=http://127.0.0.1:{port}/{status}?secret=PRIVATE")).await;
+        assert_eq!(r.status, 200, "{}", r.body);
+        assert_eq!(r.json()["status"], status);
+    }
+    let denied = get(&node, "n", "/fetch?url=http://127.0.0.1:1/denied?secret=PRIVATE").await;
+    assert!(denied.body.contains("HttpRequestDenied"));
+    node.shutdown().await;
+    let telemetry = node.telemetry.clone();
+    tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
+    let spans = spans.lock();
+    let attr = |s: &opentelemetry_proto::tonic::trace::v1::Span, key: &str| {
+        s.attributes.iter().find(|a| a.key == key).and_then(|a| a.value.as_ref()).and_then(|v| v.value.clone())
+    };
+    let clients: Vec<_> = spans.iter().filter(|s| s.kind == 3).collect();
+    assert_eq!(clients.len(), 4, "every external call, including denial, has a CLIENT span");
+    for (i, status) in [201, 404, 503].into_iter().enumerate() {
+        let client = clients.iter().find(|s| attr(s, "url.path") == Some(Value::StringValue(format!("/{status}")))).unwrap();
+        let parent = spans.iter().find(|s| s.span_id == client.parent_span_id).unwrap();
+        assert_eq!(parent.trace_id, client.trace_id);
+        assert_eq!(parent.status.as_ref().map_or(0, |s| s.code), 0, "handled dependency failures don't fail the caller");
+        assert_eq!(attr(client, "http.response.status_code"), Some(Value::IntValue(status)));
+        assert_eq!(attr(client, "server.address"), Some(Value::StringValue("127.0.0.1".into())));
+        assert_eq!(client.status.as_ref().map_or(0, |s| s.code), if status >= 400 { 2 } else { 0 });
+        let trace = opentelemetry::trace::TraceId::from_bytes(client.trace_id.clone().try_into().unwrap());
+        let span = opentelemetry::trace::SpanId::from_bytes(client.span_id.clone().try_into().unwrap());
+        assert_eq!(contexts.lock()[i], format!("00-{trace}-{span}-01"));
+    }
+    let denied = clients.iter().find(|s| attr(s, "url.path") == Some(Value::StringValue("/denied".into()))).unwrap();
+    assert_eq!(denied.status.as_ref().unwrap().code, 2);
+    assert!(!leaked.load(Relaxed), "query secrets must not appear in spans or runtime logs");
+    server.abort();
+    collector.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

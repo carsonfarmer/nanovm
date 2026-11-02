@@ -176,7 +176,20 @@ impl WasiHttpHooks for EgressHooks {
             let (held, max) = (self.held.clone(), self.publish_max);
             return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
         }
+        let node = self.node.clone();
         Box::new(async move {
+            use opentelemetry::{KeyValue, propagation::TextMapPropagator, trace::{Span, SpanKind, TraceContextExt}};
+            let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
+            let parent = obj.context.lock().clone();
+            let mut span = node.telemetry.span("http.client", &obj.id, &parent, SpanKind::Client);
+            span.set_attribute(KeyValue::new("http.request.method", request.method().as_str().chars().take(32).collect::<String>()));
+            span.set_attribute(KeyValue::new("url.path", request.uri().path().chars().take(1024).collect::<String>()));
+            span.set_attribute(KeyValue::new("server.address", request.uri().host().unwrap_or("").chars().take(253).collect::<String>()));
+            if let Some(port) = request.uri().port_u16() { span.set_attribute(KeyValue::new("server.port", port as i64)); }
+            let context = parent.with_remote_span_context(span.span_context().clone());
+            let mut request = request;
+            opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                .inject_context(&context, &mut opentelemetry_http::HeaderInjector(request.headers_mut()));
             let target = request.uri().clone();
             let res = async {
                 let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
@@ -197,9 +210,10 @@ impl WasiHttpHooks for EgressHooks {
                 Ok((res, io))
             }
             .await;
+            client_response(&mut span, res.as_ref().map(|(response, _)| response));
             if let Err(e) = &res {
                 metrics.egress_denied.fetch_add(1, Relaxed);
-                metrics.event("egress-denied", &obj.id, format!("{target} → {e}"));
+                metrics.event("egress-denied", &obj.id, format!("{} → {e}", target.host().unwrap_or("")));
             } else {
                 metrics.egress_allowed.fetch_add(1, Relaxed);
             }
@@ -220,7 +234,7 @@ async fn call(
     obj: Arc<crate::object::ObjShared>,
     req: http::Request<WasiBody>,
 ) -> Result<http::Response<WasiBody>, Error> {
-    use opentelemetry::{KeyValue, trace::{Span, SpanKind, Status, TraceContextExt}};
+    use opentelemetry::{KeyValue, trace::{Span, SpanKind, TraceContextExt}};
     let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
     let parent = obj.context.lock().clone();
     let mut span = node.telemetry.span("call", &obj.id, &parent, SpanKind::Client);
@@ -258,9 +272,15 @@ async fn call(
             .boxed_unsync()
         })))
     }.await;
-    match &result {
+    client_response(&mut span, result.as_ref());
+    result
+}
+
+fn client_response<B>(span: &mut crate::telemetry::Span, result: Result<&http::Response<B>, &Error>) {
+    use opentelemetry::{KeyValue, trace::{Span, Status}};
+    match result {
         Ok(res) => {
-            crate::telemetry::response(&mut span, res);
+            crate::telemetry::response(span, res);
             if res.status().is_client_error() {
                 span.set_status(Status::error(""));
                 span.set_attribute(KeyValue::new("error.type", res.status().as_u16().to_string()));
@@ -271,7 +291,6 @@ async fn call(
             span.set_attribute(KeyValue::new("error.type", format!("{e:?}")));
         }
     }
-    result
 }
 
 /// A call `.0` waits on, until it is answered or given up.
