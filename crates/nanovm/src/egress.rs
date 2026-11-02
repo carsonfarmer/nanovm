@@ -255,7 +255,12 @@ async fn call(
             let why = format!("{id} is already waiting on {}", obj.id);
             return Ok(to_guest(crate::object::error_response(508, "call-cycle", &why)));
         }
-        let _waiting = Waiting(obj.clone(), id.into());
+        let _waiting = scopeguard::guard(id, |id| {
+            let mut waiting = obj.waiting_on.lock();
+            if let Some(i) = waiting.iter().position(|entry| entry.as_ref() == id) {
+                waiting.swap_remove(i);
+            }
+        });
         let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
         let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
         let body = http_body_util::Limited::new(body, limit).collect().await;
@@ -301,18 +306,6 @@ fn client_response<B>(span: &mut crate::telemetry::Span, result: Result<&http::R
         Err(e) => {
             span.set_status(Status::error(""));
             span.set_attribute(KeyValue::new("error.type", format!("{e:?}")));
-        }
-    }
-}
-
-/// A call `.0` waits on, until it is answered or given up.
-struct Waiting(Arc<crate::object::ObjShared>, Arc<str>);
-
-impl Drop for Waiting {
-    fn drop(&mut self) {
-        let mut waiting = self.0.waiting_on.lock();
-        if let Some(i) = waiting.iter().position(|id| *id == self.1) {
-            waiting.swap_remove(i);
         }
     }
 }
@@ -438,21 +431,15 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
         (_, Ok(ip)) if is_global(ip) => SocketAddr::new(ip, port),
         (_, Ok(_)) => return Err(Error::DestinationIpProhibited),
         (_, Err(_)) => {
-            let addrs: Vec<SocketAddr> =
-                match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port))).await {
-                    Ok(Ok(a)) => a.collect(),
-                    Ok(Err(_)) => return Err(Error::DestinationNotFound),
-                    Err(_) => return Err(Error::DnsTimeout),
-                };
+            let mut addrs = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port)))
+                .await.map_err(|_| Error::DnsTimeout)?.map_err(|_| Error::DestinationNotFound)?;
+            let first = addrs.next().ok_or(Error::DestinationNotFound)?;
             // Every resolved address must be public: a name that mixes in a
             // private address is treated as a rebinding attempt.
-            if addrs.is_empty() {
-                return Err(Error::DestinationNotFound);
-            }
-            if !addrs.iter().all(|a| is_global(a.ip())) {
+            if !is_global(first.ip()) || !addrs.all(|a| is_global(a.ip())) {
                 return Err(Error::DestinationIpProhibited);
             }
-            addrs[0]
+            first
         }
     };
 
