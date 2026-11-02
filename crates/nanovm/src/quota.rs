@@ -187,6 +187,67 @@ impl QuotaGuard {
         Ok(())
     }
 
+    /// Stage the target and undo before delegating the actual rename to WASI.
+    async fn rename(
+        &self,
+        from: &Path,
+        to: &Path,
+        operation: impl std::future::Future<Output = FilesystemResult<()>>,
+    ) -> FilesystemResult<()> {
+        let src = std::fs::symlink_metadata(from).map_err(|_| ErrorCode::NoEntry)?;
+        let (mut file, mut dir) = (None, false);
+        match std::fs::symlink_metadata(to) {
+            Ok(d) if d.is_file() && src.is_dir() => return Err(ErrorCode::NotDirectory.into()),
+            Ok(d) if d.is_file() => file = Some((self.remove(to, d.len())?, d.len())),
+            Ok(_) => {
+                self.journal(|j| j.removing_dir(to))?;
+                dir = true;
+            }
+            Err(_) => {}
+        }
+        let record = match self.journal(|j| j.renaming(from, to)) {
+            Ok(at) => at,
+            Err(e) => {
+                self.restore_rename(to, file, None)?;
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = operation.await {
+            self.restore_rename(to, file, Some(record))?;
+            return Err(e);
+        }
+        self.journal(|j| {
+            j.renamed(from, to);
+            Ok(())
+        })?;
+        if let Some((slot, bytes)) = file {
+            self.journal(|j| j.discard_created(&slot, bytes))?;
+        }
+        self.adjust(0, -(dir as i64));
+        Ok(())
+    }
+
+    /// Failed renames restore their staged target even when logging failed.
+    /// Restoration/cancellation errors poison the journal, so a guest cannot
+    /// catch the error and commit the missing target.
+    fn restore_rename(
+        &self,
+        to: &Path,
+        file: Option<(std::path::PathBuf, u64)>,
+        record: Option<u64>,
+    ) -> Result<(), ErrorCode> {
+        let mut q = self.0.lock();
+        if let Some((slot, bytes)) = file {
+            q.journal.restore(&slot, to, bytes).map_err(|_| ErrorCode::Io)?;
+            q.bytes += bytes;
+            q.files += 1;
+        }
+        if let Some(at) = record {
+            q.journal.cancel_rename(at).map_err(|_| ErrorCode::Io)?;
+        }
+        Ok(())
+    }
+
     /// Makes the current request's changes durable.
     pub fn commit(&self) -> std::io::Result<()> {
         self.0.lock().journal.commit()
@@ -210,10 +271,13 @@ impl Inner {
     /// Runs `f` on the journal: a full journal is a full disk to the guest,
     /// and anything else an I/O error.
     fn journaled<T>(&mut self, f: impl FnOnce(&mut Journal) -> std::io::Result<T>) -> Result<T, ErrorCode> {
-        f(&mut self.journal).map_err(|e| match e.kind() {
-            std::io::ErrorKind::StorageFull => self.full(),
-            _ => ErrorCode::Io,
-        })
+        self.journal
+            .check()
+            .and_then(|()| f(&mut self.journal))
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::StorageFull => self.full(),
+                _ => ErrorCode::Io,
+            })
     }
 
     fn full(&mut self) -> ErrorCode {
@@ -552,28 +616,13 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
             // The journal keeps what the rename replaces; the stock rename
             // makes it, with its own checks.
             (Some(from), Some(to)) => {
-                let src = std::fs::symlink_metadata(&from).map_err(|_| ErrorCode::NoEntry)?;
-                let (mut file, mut dir) = (None, false);
-                match std::fs::symlink_metadata(&to) {
-                    Ok(d) if d.is_file() && src.is_dir() => return Err(ErrorCode::NotDirectory.into()),
-                    Ok(d) if d.is_file() => file = Some((quota.remove(&to, d.len())?, d.len())),
-                    Ok(_) => dir = quota.journal(|j| j.removing_dir(&to)).is_ok(),
-                    Err(_) => {}
-                }
-                quota.journal(|j| j.renaming(&from, &to))?;
-                if let Err(e) = WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path).await {
-                    // Nothing was replaced after all.
-                    if let Some((slot, bytes)) = file {
-                        let _ = std::fs::rename(slot, &to);
-                        quota.adjust(bytes as i64, 1);
-                    }
-                    return Err(e);
-                }
-                if let Some((slot, bytes)) = file {
-                    quota.journal(|j| j.discard_created(&slot, bytes))?;
-                }
-                quota.adjust(0, -(dir as i64));
-                Ok(())
+                quota
+                    .rename(
+                        &from,
+                        &to,
+                        WasiFilesystem::rename_at(&inner, fd, old_path, new_fd, new_path),
+                    )
+                    .await
             }
             // `/data` and `/tmp` are separate filesystems to the guest.
             (Some(_), None) | (None, Some(_)) => Err(ErrorCode::CrossDevice.into()),
@@ -673,6 +722,140 @@ mod tests {
 
     fn usage(g: &QuotaGuard) -> (u64, u64) {
         g.usage()
+    }
+
+    fn volume_guard(v: &Path, max: u64) -> QuotaGuard {
+        let obj = Arc::new(ObjShared::new("app".into(), "obj"));
+        let g = QuotaGuard::new(v, &Limits::default(), Default::default(), obj.clone()).unwrap();
+        g.0.lock().journal = Journal::open(v, max, obj).unwrap();
+        g
+    }
+
+    #[tokio::test]
+    async fn rename_log_refusal_restores_target_and_usage() {
+        let base = tempdir("rename-log-full");
+        let v = base.join("o");
+        std::fs::create_dir(&v).unwrap();
+        let from = v.join("s".repeat(200));
+        let to = v.join("target");
+        std::fs::write(&from, b"source").unwrap();
+        std::fs::write(&to, b"target").unwrap();
+        // Enough for the target's staging record, not the long source name.
+        let g = volume_guard(&v, 180);
+        assert!(
+            g.rename(&from, &to, async { panic!("logging must refuse before the syscall") })
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&to).unwrap(), b"target");
+        assert_eq!(std::fs::read(&from).unwrap(), b"source");
+        assert_eq!(g.usage(), (12, 2));
+        g.commit().unwrap();
+        drop(g);
+        let g = volume_guard(&v, 180);
+        assert_eq!(g.usage(), (12, 2));
+        assert_eq!(std::fs::read(&to).unwrap(), b"target");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_renames_refund_retained_bytes_and_success_still_overwrites() {
+        let base = tempdir("rename-syscall");
+        let v = base.join("o");
+        std::fs::create_dir(&v).unwrap();
+        let (from, to) = (v.join("source"), v.join("target"));
+        std::fs::write(&from, b"source").unwrap();
+        std::fs::write(&to, vec![7; 600 << 10]).unwrap();
+        let g = volume_guard(&v, 1 << 20);
+        for _ in 0..10 {
+            let result = g
+                .rename(&from, &to, async {
+                    // An actual failing syscall after preflight and logging;
+                    // WASI can similarly reject a capability-relative path.
+                    std::fs::rename(from.join("child"), &to).map_err(|_| ErrorCode::NotDirectory.into())
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(g.usage(), (6 + (600 << 10), 2));
+            assert_eq!(std::fs::read(&to).unwrap(), vec![7; 600 << 10]);
+            assert_eq!(std::fs::read(&from).unwrap(), b"source");
+        }
+        assert_eq!(g.0.lock().denials, 0, "failed attempts must not exhaust retained quota");
+        g.rename(&from, &to, async {
+            std::fs::rename(&from, &to).map_err(|_| ErrorCode::Io.into())
+        })
+        .await
+        .unwrap();
+        assert_eq!(g.usage(), (6, 1));
+        assert_eq!(std::fs::read(&to).unwrap(), b"source");
+        g.commit().unwrap();
+        drop(g);
+        assert_eq!(volume_guard(&v, 1 << 20).usage(), (6, 1));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_rename_of_discarded_creation_cannot_steal_target_on_recovery() {
+        let base = tempdir("rename-recovery");
+        let v = base.join("o");
+        std::fs::create_dir(&v).unwrap();
+        let (from, to) = (v.join("new"), v.join("target"));
+        std::fs::write(&to, b"original").unwrap();
+        let g = volume_guard(&v, 4096);
+        g.journal(|j| j.creating(&from)).unwrap();
+        std::fs::write(&from, b"new").unwrap();
+        g.journal(|j| j.created(&from)).unwrap();
+        g.adjust(3, 1);
+        assert!(
+            g.rename(&from, &to, async { Err(ErrorCode::NotPermitted.into()) })
+                .await
+                .is_err()
+        );
+        g.unlink(&from, 3).unwrap();
+        // Reuse and discard both paths, leaving the original target only
+        // in a later slot. A stale failed rename would steal it on replay.
+        g.journal(|j| j.creating(&from)).unwrap();
+        std::fs::write(&from, b"reuse").unwrap();
+        g.journal(|j| j.created(&from)).unwrap();
+        g.adjust(5, 1);
+        g.unlink(&from, 5).unwrap();
+        g.unlink(&to, 8).unwrap();
+        drop(g);
+        let g = volume_guard(&v, 4096);
+        assert_eq!(g.usage(), (8, 1));
+        assert_eq!(std::fs::read(&to).unwrap(), b"original");
+        assert!(!from.exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restoration_failure_forbids_commit_and_keeps_recovery_data() {
+        let base = tempdir("rename-restore-failure");
+        let v = base.join("o");
+        std::fs::create_dir(&v).unwrap();
+        let (from, to) = (v.join("source"), v.join("target"));
+        std::fs::write(&from, b"source").unwrap();
+        std::fs::write(&to, b"target").unwrap();
+        let g = volume_guard(&v, 4096);
+        assert!(
+            g.rename(&from, &to, async {
+                // Simulate a host-side obstruction to restoring the staged file.
+                std::fs::create_dir(&to).unwrap();
+                Err(ErrorCode::NotPermitted.into())
+            })
+            .await
+            .is_err()
+        );
+        assert!(g.commit().is_err());
+        assert!(g.journal(|j| j.creating(&v.join("later"))).is_err());
+        assert_eq!(g.usage(), (6, 1), "no credit for a failed restoration");
+        std::fs::remove_dir(&to).unwrap(); // Repair the injected obstruction.
+        drop(g);
+        let g = volume_guard(&v, 4096);
+        assert_eq!(g.usage(), (12, 2));
+        assert_eq!(std::fs::read(&to).unwrap(), b"target");
+        assert_eq!(std::fs::read(&from).unwrap(), b"source");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// A new instance starts from what the volume already holds: every

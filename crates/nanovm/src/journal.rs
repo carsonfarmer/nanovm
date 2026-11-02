@@ -42,6 +42,8 @@ enum Undo {
     RemovedDir(PathBuf),
     /// The entry at the first path was renamed to the second.
     Renamed(PathBuf, PathBuf),
+    /// A rename that failed, durably cancelled before paths can be reused.
+    Cancelled,
 }
 
 struct Saved {
@@ -70,6 +72,7 @@ pub struct Journal {
     /// Bytes the log holds, and the removed files; each may reach `max`.
     held: (u64, u64),
     max: u64,
+    poisoned: bool,
     /// Waits for the disk aren't charged to its CPU budget.
     obj: Arc<ObjShared>,
 }
@@ -94,6 +97,7 @@ impl Journal {
             slots: 0,
             held: (0, 0),
             max,
+            poisoned: false,
             obj,
         })
     }
@@ -159,8 +163,12 @@ impl Journal {
 
     /// Appends `undo` and syncs it, before the change it undoes is made.
     fn record(&mut self, undo: Undo) -> std::io::Result<()> {
+        self.check()?;
         let rec = encode(&undo);
         self.charge(rec.len() as u64, 0)?;
+        // An I/O failure may leave a complete or partial record. Do not
+        // permit more mutations or a commit until recovery has run.
+        self.poisoned = true;
         let t0 = Instant::now();
         if self.log.is_none() {
             // The directories the log is first made in must be durable too.
@@ -174,6 +182,7 @@ impl Journal {
         let log = self.log.as_mut().expect("opened above");
         log.write_all(&rec)?;
         log.sync_data()?;
+        self.poisoned = false;
         self.obj.uncharge(t0.elapsed());
         Ok(())
     }
@@ -334,9 +343,16 @@ impl Journal {
 
     /// Before `from` is renamed to `to`, where nothing is or an empty
     /// directory (removed with [`Self::removing_dir`]) is.
-    pub fn renaming(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+    pub fn renaming(&mut self, from: &Path, to: &Path) -> std::io::Result<u64> {
         let (from, to) = (self.rel(from), self.rel(to));
+        let at = self.held.0;
         self.record(Undo::Renamed(from.clone(), to.clone()))?;
+        Ok(at)
+    }
+
+    /// Only a successful syscall moves the dirty paths to their new names.
+    pub fn renamed(&mut self, from: &Path, to: &Path) {
+        let (from, to) = (self.rel(from), self.rel(to));
         // What is to be synced moves with it.
         let moved = |p: PathBuf| match p.strip_prefix(&from) {
             Ok(rest) if rest.as_os_str().is_empty() => to.clone(),
@@ -346,6 +362,48 @@ impl Journal {
         self.touched = self.touched.drain().map(moved).collect();
         self.touch_parent(&from);
         self.touch_parent(&to);
+    }
+
+    /// Restore a staged target before cancelling the attempted rename.
+    /// Sync both directories before invalidating any undo record: a crash
+    /// must see either the restored target or the undo that restores it.
+    pub fn restore(&mut self, slot: &Path, to: &Path, bytes: u64) -> std::io::Result<()> {
+        let t0 = Instant::now();
+        let result = (|| {
+            std::fs::rename(slot, to)?;
+            sync(to.parent().expect("volume entry"))?;
+            sync(&self.dir)?;
+            self.held.1 -= bytes;
+            Ok(())
+        })();
+        self.obj.uncharge(t0.elapsed());
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    /// The failed rename's record must not act on a later reuse of either
+    /// name. Replace only its tag, preserving framing and other concurrent
+    /// operations' records. Cancelled records still consume log budget.
+    pub fn cancel_rename(&mut self, at: u64) -> std::io::Result<()> {
+        let t0 = Instant::now();
+        let result = (|| {
+            let log = File::options().write(true).open(self.dir.join(LOG))?;
+            log.write_all_at(&[5], at + 8)?;
+            log.sync_data()
+        })();
+        self.obj.uncharge(t0.elapsed());
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    pub fn check(&self) -> std::io::Result<()> {
+        if self.poisoned {
+            return Err(std::io::Error::other("journal requires recovery"));
+        }
         Ok(())
     }
 
@@ -355,6 +413,7 @@ impl Journal {
 
     /// Makes the request's changes durable and forgets how to undo them.
     pub fn commit(&mut self) -> std::io::Result<()> {
+        self.check()?;
         let Some(log) = self.log.take() else { return Ok(()) };
         let t0 = Instant::now();
         for p in self.touched.drain() {
@@ -395,11 +454,12 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
             Undo::Created(p) => std::fs::remove_file(abs(p)).or_else(|_| std::fs::remove_dir(abs(p))),
             Undo::RemovedDir(p) => std::fs::create_dir(abs(p)),
             Undo::Renamed(from, to) if !abs(from).exists() => std::fs::rename(abs(to), abs(from)),
-            Undo::Renamed(..) => Ok(()),
+            Undo::Renamed(..) | Undo::Cancelled => Ok(()),
         };
         let p = match &undo {
             Undo::Size(p, _) | Undo::Bytes(p, ..) => p.as_path(),
             Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
+            Undo::Cancelled => Path::new(""),
         };
         sync_if_there(&base.join(p))?;
         #[cfg(test)]
@@ -427,6 +487,7 @@ fn encode(undo: &Undo) -> Vec<u8> {
         Undo::Created(a) => (2, vec![p(a)]),
         Undo::RemovedDir(a) => (3, vec![p(a)]),
         Undo::Renamed(a, b) => (4, vec![p(a), p(b)]),
+        Undo::Cancelled => unreachable!("only made by cancelling a rename's tag"),
     };
     put(&[tag]);
     fields.iter().for_each(|f| put(f));
@@ -458,6 +519,11 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
             [2] => Undo::Created(path(log)?),
             [3] => Undo::RemovedDir(path(log)?),
             [4] => Undo::Renamed(path(log)?, path(log)?),
+            [5] => {
+                path(log)?;
+                path(log)?;
+                Undo::Cancelled
+            }
             _ => return None,
         })
     };
@@ -572,7 +638,8 @@ mod tests {
         let (from, to) = (v.join(from), v.join(to));
         let replaced = std::fs::metadata(&to).ok().map(|md| (j.remove(&to, md.len()).unwrap(), md.len()));
         j.renaming(&from, &to).unwrap();
-        std::fs::rename(from, to).unwrap();
+        std::fs::rename(&from, &to).unwrap();
+        j.renamed(&from, &to);
         if let Some((slot, bytes)) = replaced {
             j.discard_created(&slot, bytes).unwrap();
         }
@@ -725,6 +792,74 @@ mod tests {
         drop(j);
         open(&v);
         assert_eq!(tree(&v), before);
+    }
+
+    /// Failed overwrites keep both the dirty source and a restored new
+    /// target's inode/descriptor tracking intact.
+    #[test]
+    fn failed_rename_keeps_dirty_source_and_restored_creation_tracked() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        write(&mut j, &v, "a", 0, b"dirty");
+        let to = v.join("new");
+        j.creating(&to).unwrap();
+        std::fs::write(&to, b"new").unwrap();
+        j.created(&to).unwrap();
+        let handle = Arc::new(File::open(&to).unwrap());
+        j.opened(&handle).unwrap();
+        let ino = handle.metadata().unwrap().ino();
+        let slot = j.remove(&to, 3).unwrap();
+        let at = j.renaming(&v.join("a"), &to).unwrap();
+        assert!(
+            j.touched.contains(Path::new("o/a")),
+            "dirty source must still be synced after failure"
+        );
+        j.restore(&slot, &to, 3).unwrap();
+        j.cancel_rename(at).unwrap();
+        assert_eq!(j.held.1, 0);
+        assert_eq!(std::fs::metadata(&to).unwrap().ino(), ino);
+        assert!(j.created.contains_key(&ino));
+        j.unlink(&to, 3).unwrap();
+        assert_eq!(j.held.1, 3, "the open, discarded creation still occupies storage");
+        drop(handle);
+        j.charge(0, 0).unwrap();
+        assert_eq!(j.held.1, 0);
+        drop(j);
+        open(&v);
+        assert_eq!(tree(&v), before);
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
+    /// Cancellation must survive interrupted recovery, including later
+    /// discard and reuse of the failed rename's source and target paths.
+    #[test]
+    fn cancelled_renames_survive_interrupted_recovery() {
+        for after in 0..10 {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = open(&v);
+            let (from, to) = (v.join("new"), v.join("f"));
+            j.creating(&from).unwrap();
+            std::fs::write(&from, b"new").unwrap();
+            j.created(&from).unwrap();
+            let slot = j.remove(&to, 2).unwrap();
+            let at = j.renaming(&from, &to).unwrap();
+            j.restore(&slot, &to, 2).unwrap();
+            j.cancel_rename(at).unwrap();
+            j.unlink(&from, 3).unwrap();
+            j.unlink(&to, 2).unwrap();
+            j.creating(&to).unwrap();
+            std::fs::write(&to, b"replacement").unwrap();
+            j.created(&to).unwrap();
+            drop(j);
+            CRASH_AFTER.with(|c| c.set(Some(after)));
+            let _ = reopen(&v, 4096);
+            CRASH_AFTER.with(|c| c.set(None));
+            open(&v);
+            assert_eq!(tree(&v), before, "recovery interrupted at {after}");
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+        }
     }
 
     /// A file opened write-only can be written over: the bytes it replaces

@@ -223,6 +223,8 @@ A request's changes to `/data` (files and key-value alike) and what it publishes
 - **Safety:**
   - Guest paths reach only the volume. The journal sits beside it, out of reach.
   - An undo that can't be applied is skipped rather than leave the object unable to start.
+  - A failed rename restores its staged destination and storage accounting, keeps dirty-source sync tracking, and durably cancels its rename undo before paths can be reused. If restoration or cancellation fails, the request cannot commit and must recover. Cancelled records still consume log space.
+- **Downgrades:** cancelled renames use journal tag 5. This version reads older journals, but older binaries cannot recover a log containing that tag. Before downgrading, drain requests and finish any pending recovery with this version; never delete an uncommitted journal to make a downgrade work.
 - **`/tmp` is not journaled.** It is per-instance scratch, deleted with the instance, so it's the fast place for temporary files. A rename between `/tmp` and `/data` fails as cross-device, as between real filesystems.
 
 **Alternatives considered:**
