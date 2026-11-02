@@ -2,12 +2,12 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
-## State (2026-10-31)
+## State (2026-11-02)
 
-- **Current priority (Q68, owner-directed):** correctness of instrumentation before export optimization. The owner suspended the LOC budget; CI reports the count without failing on 5,000. Runtime is now 5,300 (5,255 before this continuation). Keep the implementation simple, but do not remove useful instrumentation to meet a numeric target.
+- **Current priority (Q68/Q70, owner-directed):** correctness and meaningful spans retained; optimized runtime is 5,315 lines. The hard LOC budget is suspended. Application-only matched overhead is 2.17%, colocated whole-system overhead 7.58%; parent is asking the owner about Collector CPU budgeting. Preserve this branch; do not merge without that decision. Latest evidence and reproduction are at the start of the W-2 section below; older checkpoints are history.
 - **Journal integration (2026-11-02):** `w2-observability` merged `origin/main` through `40c5895` without conflicts, preserving published history. Full locked serial suite passed (104 unit, 65 integration, one ignored) and production check passed. Main's three journal commits add 213 runtime lines. Keep their fixes. Earlier performance measurements predate this integration and must be rechecked on the combined baseline.
 - **CI enabled (W-16):** `ci-checks` passed GitHub run 41227208960 at `57d1595`: production check, 93 unit and 64 integration tests, one ignored. The initial run exposed a runner fd-limit mismatch; CI now uses its hard limit. Read-only permissions, no guest publishing. Branch protection was not changed.
-- **Current work:** W-2 on `w2-observability`, incorporating main's CI. Q62 replaces metrics and optional tracing with rich request spans, correlated logs and infrastructure snapshot events using the OTel SDK. Bounded OTLP/HTTP uses the existing jailed-worker egress link; the supervisor stamps app/digest identity. Collector response/error handling, further hostile/trace-parentage coverage, review and the performance gate remain; do not mark W-2 complete. Guests remain unchanged.
+- **Current work:** W-2 on `w2-observability`, incorporating main's CI. Q62 replaces metrics and optional tracing with rich request spans, correlated logs and infrastructure snapshot events using the OTel SDK. Bounded OTLP/HTTP uses the existing jailed-worker egress link; the supervisor stamps app/digest identity. Correctness/review follow-through, full suites, production check, demo and complete-export validation pass. Acceptance remains pending for Collector CPU provisioning; do not mark W-2 complete or merge. Guests remain unchanged.
 - **`main`** has:
   - phase 1 (portable core);
   - phase 2 (the Linux jail);
@@ -42,6 +42,27 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 - **Old branches** (`jail`, `simplify`, `oci`, `loc-reduction`, `linux-baseline`, `quota-rename-self-repro`) are merged or historical.
 
 ## Next up: W-2, OpenTelemetry
+
+**Post-commit verification (`9b8f8fb`, 2026-11-02):** correctness, bounds and complete-export checks pass. Three alternating 400k-request pairs with application CPUs 0–1 and Collector/oha CPUs 2–3 measure main **18,631.1/s** versus W-2 **18,227.3/s (2.17% lower)**. Both applications receive the same physical-core pair; the Collector's CPU is additional, not free. Fully colocated on all four logical CPUs, main **27,547.5/s** versus W-2 **25,459.2/s (7.58% lower)**. The latter is worse than the earlier 4.45%; do not select the favorable result or call colocated acceptance cleared. Active node+worker CPU is 103.45/105.00 µs/request isolated and 109.42/110.64 colocated, excluding the inactive node. Collector CPU adds 14.70 µs/request isolated, 13.62 colocated. Both matrices export every expected span (2.4m each), all HTTP200. Raw `committed-{core-,}{main,cache}-{1,2,3}.*` files retain counters, CPU snapshots and latency distributions. `GOMAXPROCS=1` reduced Collector CPU to 11.47 µs/request but worsened matched throughput (main 27,724/s, W-2 25,018/s); rejected, no config change. The application-only few-percent criterion is met here; shared-CPU whole-system overhead is not. The parent will ask the owner about separate Collector budgeting. Preserve the optimization and do not merge until that acceptance decision; no 2% whole-system cost claim.
+
+The committed binary was rebuilt with `cargo build --locked --release -p nanovm --bin nanovm --features dev`, copied to `nanovm-committed`, and tested without overlapping builds. Sustained **2,000,000 HTTP200 requests in 78.243s (25,561/s), p99 25.84ms**, exported **4,000,000/4,000,000 spans** with no Collector refusal/failure. Two 100k runs with 128-byte object IDs, 2048-byte paths and 505-byte valid tracestate each exported all 200k spans: one hot object deliberately hit queue overload (52,835 HTTP404 / 47,165 HTTP503); spreading across 100 objects returned all HTTP404. No body-limit loss. `long-fields*` and `committed-sustained*` retain evidence. The debug sink is not durable-backend validation.
+
+Full locked serial suite passed twice on restored optimized source: 104 unit, 67 integration, one ignored. Production check passes. Demo: 70k normal requests succeeded, 100 attacks contained, 601 canary requests with zero failures. Quick benchmark: cold 3096/s, warm 65890/s, serial GET 8653/s, concurrent/serial writes 691/285/s, recovery 786/s, churn 4281/s; zero request/instantiation failures, 117KB/object. Review follow-through covers the previous adversarial findings without claiming model attestation. Cache key/byte/count mutations fail as expected and were restored. No `guests/**` changes. Main remains `40c5895`, already included without rewriting history. Delivery/CI remain to record.
+
+**Reproduce without scratch files:** build baseline and branch in separate worktrees/target directories using the exact bin-only release command above; save each binary before switching trees. Build/run `dev-registry` and use its printed counter digest and `nanovm-trust: dev dev`. Both node configs use separate disposable roots, `dev=true`, `front_threads=1`, `max_live_objects=1100`, `memory_reservation_mb=64`; ports 18080/18082 (8081 belongs to the orb). Set W-2 `telemetry_endpoint` to loopback 4318. Run official Collector 0.164.0 with `demo/otel-collector.yaml` unchanged. Start services with `amp orb service start`; use `taskset` in service commands for the physical-core comparison after checking actual SMT topology. Warm each node with 100k requests, then alternate three measured pairs; no builds/tests during load. With `$APP` from the registry and `$PORT` selecting the node:
+
+```bash
+ulimit -n 100000
+curl -fsS http://127.0.0.1:8888/metrics > before.prom
+oha --no-tui --output-format json -n 400000 -c 256 \
+  -H "nanovm-app: $APP" -H 'nanovm-trust: dev dev' \
+  --rand-regex-url "http://127.0.0.1:$PORT/o[0-9]{2}/" > run.json
+sleep 2
+curl -fsS http://127.0.0.1:8888/metrics > after.prom
+jq -e '.statusCodeDistribution == {"200":400000} and .summary.successRate == 1' run.json
+```
+
+Sum `otelcol_receiver_accepted_spans` and `otelcol_exporter_sent_spans` across labels in each snapshot: each W-2 delta must be 800000, refusals/export failures zero. Main's span delta must be zero. Aggregate throughput is total requests divided by summed run durations, not the mean of rates. For CPU accounting snapshot `/proc/PID/task/TID/stat` user+system ticks before/after oha for the node, worker and Collector separately, divide by `getconf CLK_TCK`; retain the PID mapping and exclude the inactive control. For sustained validation use `-n 2000000` and expect 4m spans. Use the default unpinned configuration separately to measure whole-machine contention. The in-process `bench --export` is a different path and cannot replace this check.
 
 **Final optimization (2026-11-02):** retain every meaningful span (Q70). A native DWARF profile found OCI reference parsing at about 5.75% inclusive CPU (regex 4.9%), versus SDK encoding 1.9%, relay stamping 1.3% and SDK completion 1.7%. `AppRef::from_headers` now caches only pure parsing in a thread-local standard-library FIFO: at most 16 owned references, each input at most 1024 bytes. Host, trust, minimum version, digest checks and authorization still run per request. Non-worker spans reserve four attributes instead of one. No new dependency or export machinery; runtime 5,315 lines. This removes application hot-path work rather than suppressing instrumentation.
 
