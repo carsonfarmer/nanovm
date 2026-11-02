@@ -181,6 +181,8 @@ impl Journal {
         }
         let log = self.log.as_mut().expect("opened above");
         log.write_all(&rec)?;
+        #[cfg(test)]
+        tests::sync_point()?;
         log.sync_data()?;
         self.poisoned = false;
         self.obj.uncharge(t0.elapsed());
@@ -391,6 +393,8 @@ impl Journal {
         let result = (|| {
             let log = File::options().write(true).open(self.dir.join(LOG))?;
             log.write_all_at(&[5], at + 8)?;
+            #[cfg(test)]
+            tests::sync_point()?;
             log.sync_data()
         })();
         self.obj.uncharge(t0.elapsed());
@@ -415,6 +419,9 @@ impl Journal {
     pub fn commit(&mut self) -> std::io::Result<()> {
         self.check()?;
         let Some(log) = self.log.take() else { return Ok(()) };
+        // Any error leaves the outcome uncertain. In particular, taking the
+        // log must not make a second commit look like an empty successful one.
+        self.poisoned = true;
         let t0 = Instant::now();
         for p in self.touched.drain() {
             sync_if_there(&self.base.join(p))?;
@@ -428,13 +435,14 @@ impl Journal {
         self.sized.clear();
         self.created.clear();
         self.held = (0, self.unlinked.iter().map(|(_, bytes)| bytes).sum());
+        self.poisoned = false;
         Ok(())
     }
 }
 
-/// Rolls back the log in `dir` if there is one, then empties `dir`. An undo
-/// that can't be applied is skipped rather than leave the object unable to
-/// start.
+/// Rolls back the log in `dir` if there is one, then empties `dir`. Failure
+/// leaves the current undo intact and refuses to start the object. Only
+/// already-applied or never-performed operations may be skipped.
 fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
     let log = match std::fs::read(dir.join(LOG)) {
         Ok(log) => log,
@@ -448,23 +456,49 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
     for (at, undo) in decode(&log).into_iter().rev() {
         let abs = |p: &PathBuf| base.join(p);
         let open = |p: &PathBuf| File::options().write(true).open(abs(p));
-        let _ = match &undo {
+        match &undo {
             Undo::Size(p, n) => open(p).and_then(|f| f.set_len(*n)),
             Undo::Bytes(p, at, data) => open(p).and_then(|f| f.write_all_at(data, *at)),
-            Undo::Created(p) => std::fs::remove_file(abs(p)).or_else(|_| std::fs::remove_dir(abs(p))),
-            Undo::RemovedDir(p) => std::fs::create_dir(abs(p)),
-            Undo::Renamed(from, to) if !abs(from).exists() => std::fs::rename(abs(to), abs(from)),
-            Undo::Renamed(..) | Undo::Cancelled => Ok(()),
-        };
+            Undo::Created(p) => match std::fs::symlink_metadata(abs(p)) {
+                Ok(md) if md.is_dir() => std::fs::remove_dir(abs(p)),
+                Ok(_) => std::fs::remove_file(abs(p)),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            },
+            Undo::RemovedDir(p) => std::fs::create_dir(abs(p)).or_else(|e| {
+                if e.kind() == ErrorKind::AlreadyExists && std::fs::symlink_metadata(abs(p))?.is_dir() {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }),
+            Undo::Renamed(from, to) => {
+                // The source is present after an earlier replay or a failed
+                // syscall. Both may be absent for a discarded new file.
+                if abs(from).try_exists()? || !abs(to).try_exists()? {
+                    Ok(())
+                } else {
+                    std::fs::rename(abs(to), abs(from))
+                }
+            }
+            Undo::Cancelled => Ok(()),
+        }?;
         let p = match &undo {
             Undo::Size(p, _) | Undo::Bytes(p, ..) => p.as_path(),
             Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
             Undo::Cancelled => Path::new(""),
         };
         sync_if_there(&base.join(p))?;
+        if let Undo::Renamed(_, to) = &undo {
+            // A cross-directory rename changes both parents. Persist both
+            // before dropping its undo, including when replay runs twice.
+            sync_if_there(&base.join(to.parent().unwrap_or(Path::new(""))))?;
+        }
         #[cfg(test)]
         tests::crash_point()?;
         file.set_len(at)?;
+        #[cfg(test)]
+        tests::sync_point()?;
         file.sync_data()?;
     }
     std::fs::remove_file(dir.join(LOG))?;
@@ -541,7 +575,8 @@ fn clear(dir: &Path) -> std::io::Result<()> {
     match std::fs::read_dir(dir) {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
-        Ok(entries) => entries.flatten().try_for_each(|e| {
+        Ok(mut entries) => entries.try_for_each(|entry| {
+            let e = entry?;
             let p = e.path();
             if e.file_type()?.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }
         }),
@@ -550,6 +585,8 @@ fn clear(dir: &Path) -> std::io::Result<()> {
 
 /// Syncs a file or a directory.
 fn sync(p: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::sync_point()?;
     File::open(p)?.sync_all()
 }
 
@@ -648,6 +685,14 @@ mod tests {
     thread_local! {
         /// Undos recovery may apply before a simulated crash.
         static CRASH_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+        static FAIL_SYNC_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn sync_point() -> std::io::Result<()> {
+        FAIL_SYNC_AFTER.with(|c| match c.get() {
+            Some(0) => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            n => Ok(c.set(n.map(|n| n - 1))),
+        })
     }
 
     pub(super) fn crash_point() -> std::io::Result<()> {
@@ -703,6 +748,93 @@ mod tests {
         assert_eq!(std::fs::read(v.join("d/a2")).unwrap(), b"hello WORLD, again");
         assert_eq!(std::fs::read(v.join("f")).unwrap(), b"new");
         assert_eq!(std::fs::read_dir(&j.dir).unwrap().count(), 0, "the journal is empty");
+    }
+
+    /// A real filesystem error must preserve the undo, not turn a failed
+    /// rollback into a successful open. Repairing the obstruction permits retry.
+    #[test]
+    fn recovery_failure_preserves_the_undo() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        write(&mut j, &v, "a", 0, b"CHANGED");
+        let log = j.dir.join(LOG);
+        drop(j);
+        let parked = v.parent().unwrap().join("parked");
+        std::fs::rename(v.join("a"), &parked).unwrap();
+        // A directory is syncable but cannot receive a file's undo bytes.
+        std::fs::create_dir(v.join("a")).unwrap();
+        let saved = std::fs::read(&log).unwrap();
+        for _ in 0..2 {
+            assert!(reopen(&v, 1 << 30).is_err());
+            assert_eq!(std::fs::read(&log).unwrap(), saved);
+        }
+        std::fs::remove_dir(v.join("a")).unwrap();
+        std::fs::rename(parked, v.join("a")).unwrap();
+        open(&v);
+        assert_eq!(tree(&v), before);
+    }
+
+    #[test]
+    fn failed_commit_cannot_be_retried_as_success() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        write(&mut j, &v, "a", 0, b"CHANGED");
+        let parked = v.parent().unwrap().join("parked");
+        std::fs::rename(v.join("a"), &parked).unwrap();
+        std::os::unix::fs::symlink("a", v.join("a")).unwrap();
+        assert!(j.commit().is_err());
+        assert!(j.commit().is_err(), "an earlier sync failure must not look committed");
+        assert!(j.creating(&v.join("later")).is_err());
+        std::fs::remove_file(v.join("a")).unwrap();
+        std::fs::rename(parked, v.join("a")).unwrap();
+        drop(j);
+        open(&v);
+        assert_eq!(tree(&v), before);
+    }
+
+    /// Fail each host sync in turn. This exercises EIO handling on real
+    /// files, not loss of unsynced writes from the kernel's page cache.
+    #[test]
+    fn sync_failures_preserve_a_recoverable_state() {
+        for phase in ["record", "commit", "recover"] {
+            let mut cuts = 0;
+            for after in 0..64 {
+                let v = volume();
+                let before = tree(&v);
+                let mut j = open(&v);
+                if phase != "record" {
+                    change(&mut j, &v);
+                }
+                let changed = tree(&v);
+                let log = j.dir.join(LOG);
+                FAIL_SYNC_AFTER.set(Some(after));
+                let failed = match phase {
+                    "record" => {
+                        let f = File::options().write(true).open(v.join("a")).unwrap();
+                        j.writing(&f, 0, 7).is_err()
+                    }
+                    "commit" => j.commit().is_err(),
+                    _ => reopen(&v, 1 << 30).is_err(),
+                };
+                FAIL_SYNC_AFTER.set(None);
+                if failed && phase != "recover" {
+                    assert!(j.commit().is_err(), "{phase}: a failed sync poisons the instance");
+                }
+                // Once the log is unlinked, a failed commit sync has an
+                // ambiguous durable outcome; on this running kernel it is new.
+                let expected = if phase == "commit" && !log.exists() { &changed } else { &before };
+                drop(j);
+                open(&v);
+                assert_eq!(&tree(&v), expected, "{phase} sync cut {after}");
+                std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+                if !failed { break; }
+                cuts += 1;
+            }
+            assert!((4..64).contains(&cuts), "{phase}: must cover all sync boundaries, {cuts}");
+            println!("journal {phase}: {cuts} injected sync failures recovered correctly");
+        }
     }
 
     /// Recovery that crashes after any number of undos resumes from there,
