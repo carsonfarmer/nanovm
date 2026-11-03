@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sdk", "counter", "hostile"]
+members = ["sdk", "counter", "hostile", "../examples/chat"]
 
 [workspace.package]
 edition = "2024"

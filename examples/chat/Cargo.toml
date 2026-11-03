@@ -1,0 +1,15 @@
+[package]
+name = "chat"
+version = "0.1.0"
+edition = "2024"
+publish = false
+# Built with the test guests (one lockfile, one target directory, one CI step).
+# Your own app needs no such line: depend on nanovm-sdk and build.
+workspace = "../../guests"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nanovm-sdk = { workspace = true, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
