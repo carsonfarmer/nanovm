@@ -233,12 +233,52 @@ impl tokio::io::AsyncWrite for LogTail {
     }
 }
 
-/// Removes an instance's scratch directory when the instance goes away.
-struct TmpDir(PathBuf);
+/// The app's scratch directories, one per live instance, behind `/tmp`.
+/// One an instance leaves empty is handed to the next rather than removed:
+/// a mkdir and an rmdir cost more than the rest of a cold start's
+/// filesystem work, and an rmdir blocks for milliseconds on a disk mounted
+/// with `discard`.
+pub struct Scratch {
+    dir: PathBuf,
+    free: Mutex<Vec<PathBuf>>,
+}
+
+impl Scratch {
+    /// Scratch under `dir`, where whatever a previous run left is garbage.
+    /// `dir` itself stays: a jailed worker's Landlock rule names it.
+    pub fn new(dir: PathBuf) -> std::io::Result<Arc<Scratch>> {
+        std::fs::create_dir_all(&dir)?;
+        for e in std::fs::read_dir(&dir)? {
+            let _ = std::fs::remove_dir_all(e?.path());
+        }
+        Ok(Arc::new(Scratch { dir, free: Mutex::default() }))
+    }
+
+    fn take(self: &Arc<Self>) -> std::io::Result<TmpDir> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = match self.free.lock().pop() {
+            Some(path) => path,
+            None => {
+                let path = self.dir.join(N.fetch_add(1, Relaxed).to_string());
+                std::fs::create_dir(&path)?;
+                path
+            }
+        };
+        Ok(TmpDir(path, Some(self.clone())))
+    }
+}
+
+/// An instance's scratch directory: back to its [`Scratch`] when the
+/// instance goes away if the instance left it empty, else removed.
+struct TmpDir(PathBuf, Option<Arc<Scratch>>);
 
 impl Drop for TmpDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let empty = || std::fs::read_dir(&self.0).is_ok_and(|mut d| d.next().is_none());
+        match &self.1 {
+            Some(scratch) if empty() => scratch.free.lock().push(std::mem::take(&mut self.0)),
+            _ => _ = std::fs::remove_dir_all(&self.0),
+        }
     }
 }
 
@@ -288,17 +328,17 @@ impl WasiHttpView for ObjState {
 
 fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
     let limits = &app.cfg.limits;
-    // Each instance gets scratch of its own.
-    static INSTANCE: AtomicU64 = AtomicU64::new(0);
-    let n = INSTANCE.fetch_add(1, Relaxed);
-    let [objects, tmp, _] = node.cfg.app_dirs(&app.name);
-    let data_dir = objects.join(&*shared.id);
-    let tmp_dir = tmp.join(format!("{}.{n}", shared.id));
-    std::fs::create_dir_all(&data_dir)?;
-    // The journal compares it with where open files really are.
-    let data_dir = data_dir.canonicalize()?;
-    std::fs::create_dir_all(&tmp_dir)?;
-    let tmp = TmpDir(tmp_dir.clone());
+    // A volume made here, in a directory without symlinks, has none; one
+    // that was already there must not be one either.
+    let data_dir = app.objects.join(&*shared.id);
+    if let Err(e) = std::fs::create_dir(&data_dir) {
+        anyhow::ensure!(
+            e.kind() == std::io::ErrorKind::AlreadyExists && std::fs::symlink_metadata(&data_dir)?.is_dir(),
+            "volume {}: {e}",
+            data_dir.display()
+        );
+    }
+    let tmp = app.scratch.take()?;
 
     let stderr = LogTail::default();
     let mut b = WasiCtxBuilder::new();
@@ -311,7 +351,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     // pool's one mutex. Preopens capture this, so it must come first.
     b.allow_blocking_current_thread(true);
     b.preopened_dir(&data_dir, "/data", FsPerms::ReadWrite)?;
-    b.preopened_dir(&tmp_dir, "/tmp", FsPerms::ReadWrite)?;
+    b.preopened_dir(&tmp.0, "/tmp", FsPerms::ReadWrite)?;
     let output = |stream| LogTail {
         buf: stderr.buf.clone(), export: Some((node.telemetry.clone(), shared.clone(), stream)),
     };
@@ -320,7 +360,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     let mut table = ResourceTable::new();
     table.set_max_capacity(limits.max_resources);
 
-    // `/tmp` was just created, so only the persistent volume holds usage.
+    // `/tmp` starts empty, so only the persistent volume holds usage.
     let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone())?;
 
     let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
@@ -768,7 +808,7 @@ impl ObjState {
             quota: QuotaGuard::new(&volume, limits, metrics, shared).unwrap(),
             config: Default::default(),
             reset: false,
-            _tmp: TmpDir(volume.clone()),
+            _tmp: TmpDir(volume.clone(), None),
             volume,
         }
     }

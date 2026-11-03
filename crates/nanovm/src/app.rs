@@ -2,6 +2,7 @@
 //! cached compile), checks the component's imports against the capabilities
 //! the node offers, and pre-links it so instantiation is cheap.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -12,7 +13,7 @@ use wasmtime_wasi_http::p3::bindings::ServicePre;
 
 use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, Route, Upstream};
-use crate::object::ObjState;
+use crate::object::{ObjState, Scratch};
 
 /// Import prefixes a guest may use. Everything else (sockets, the WASIp2
 /// filesystem, anything custom) is refused at load time, so the only paths
@@ -39,6 +40,10 @@ pub struct App {
     pub egress: Route,
     /// Its `wasi:config` values, shared by every object of the app.
     pub config: Arc<WasiConfigVariables>,
+    /// Where its objects' volumes are, without symlinks: the journal
+    /// compares a volume's path with where its open files really are.
+    pub objects: PathBuf,
+    pub scratch: Arc<Scratch>,
 }
 
 pub fn linker(engine: &Engine) -> anyhow::Result<Linker<ObjState>> {
@@ -72,7 +77,8 @@ impl App {
         wasm: &[u8],
         upstream: Option<Upstream>,
     ) -> anyhow::Result<App> {
-        let [_, _, cache] = node.app_dirs(&cfg.name);
+        let [objects, tmp, cache] = node.app_dirs(&cfg.name);
+        std::fs::create_dir_all(&objects)?;
         let component = crate::engine::load_component(engine, wasm, &cache)
             .with_context(|| format!("app {:?}", cfg.name))?;
         check_imports(engine, &component).with_context(|| format!("app {:?}", cfg.name))?;
@@ -93,6 +99,8 @@ impl App {
             pre,
             egress,
             config: Arc::new(cfg.config.iter().collect()),
+            objects: objects.canonicalize()?,
+            scratch: Scratch::new(tmp)?,
         })
     }
 }

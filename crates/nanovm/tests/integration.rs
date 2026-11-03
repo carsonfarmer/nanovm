@@ -407,16 +407,48 @@ async fn disk_quota_and_tmp_wipe() {
     // A new instance gets an empty /tmp, which frees its share.
     assert_eq!(get(&node, "t", "/panic").await.status, 500);
     assert_eq!(fill("a", "tmp", 4).await.status, 200);
-    // and the old one's scratch directory is gone from the host.
+    // and the old one's scratch directory, which it left full, is gone from
+    // the host: the one there holds only the new instance's file.
     let scratch = node.cfg.data_dir.join("tmp/hostile");
-    eventually("old scratch dir removed", || {
-        std::fs::read_dir(&scratch)
-            .unwrap()
-            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("t."))
-            .count()
-            == 1
-    })
-    .await;
+    let dirs = entries(&scratch);
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    assert_eq!(entries(&scratch.join(&dirs[0])), ["a"]);
+}
+
+/// The names in directory `dir`.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    names.sort();
+    names
+}
+
+/// An instance that leaves its `/tmp` empty hands the scratch directory to
+/// the next instance, of whichever object (making and removing one per
+/// instance cost more than the rest of a cold start's file work); one that
+/// leaves anything there has its directory removed, so every instance
+/// starts with an empty `/tmp`.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_empty_scratch_is_reused() {
+    let node = node_with(node_cfg("only_empty_scratch_is_reused", 8), filler());
+    let scratch = node.cfg.data_dir.join("tmp/hostile");
+    assert_eq!(get(&node, "t", "/files?mount=tmp&n=2").await.status, 200);
+    assert_eq!(get(&node, "t", "/clean?mount=tmp&n=2").await.json()["removed"], 2);
+    let first = entries(&scratch);
+    assert_eq!(first.len(), 1, "{first:?}");
+    // The reply to a trap comes before the instance is gone.
+    let gone = || node.metrics.stores_live.load(Relaxed) == 0;
+    assert_eq!(get(&node, "t", "/panic").await.status, 500);
+    eventually("t's instance gone", gone).await;
+    assert_eq!(get(&node, "u", "/files?mount=tmp&n=1").await.status, 200);
+    assert_eq!(entries(&scratch), first, "u's instance reuses t's directory");
+    assert_eq!(entries(&scratch.join(&first[0])), ["f0"]);
+    // u leaves `f0` behind, so its directory is removed, not handed on.
+    assert_eq!(get(&node, "u", "/panic").await.status, 500);
+    eventually("u's instance gone", gone).await;
+    assert_eq!(get(&node, "v", "/").await.status, 200);
+    let now = entries(&scratch);
+    assert!(now.len() == 1 && now != first, "{now:?}");
+    assert!(entries(&scratch.join(&now[0])).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

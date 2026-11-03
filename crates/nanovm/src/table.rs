@@ -83,12 +83,6 @@ impl Node {
         let linker = crate::app::linker(&engine)?;
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
         let app = Arc::new(App::load(&engine, &linker, &cfg, app, wasm, upstream)?);
-        // Scratch from a previous run is garbage; volumes are kept. The
-        // directory itself stays: a jailed worker's Landlock rule names it.
-        let [_, tmp, _] = cfg.app_dirs(&app.name);
-        for e in std::fs::read_dir(&tmp).into_iter().flatten().flatten() {
-            let _ = std::fs::remove_dir_all(e.path());
-        }
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
         let node = Arc::new(Node {
