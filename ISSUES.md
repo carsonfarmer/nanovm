@@ -216,6 +216,10 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** real stalled headers and JSON body both fail the new regression without the fix.
 - **Status:** fixed in 225cfc4; a ten-second absolute route deadline covers cache waiting and resolver I/O. Full suite, mutation/restoration and demo pass.
 
+- **Reproduced:** from source, not a live stalled-resolver test
+- **Also (sec review):** the tag lookup that follows (`Oci::digest`, against the registry the record names) has the same gap: `read_timeout` is per read, so a registry trickling its manifest holds the lookup as long as a client waits. One deadline around `Cache::get`'s lookup covers both.
+- **Status:** open; bound the initial lookup and add a stalled-resolver test
+
 ### N-34 (tests): forged worker publish identity lacks a direct regression test
 - **Where:** `supervisor.rs`, the egress link's publish branch
 - **Scenario:** W-3 constructs fresh publish headers and stamps the worker's app, ignoring any worker-supplied `nanovm-app`, including duplicates. The review found no runtime flaw, but the normal-guest isolation tests do not exercise a compromised worker forging those headers.
@@ -268,6 +272,44 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `integration.rs`, `a_node_runs_at_most_max_apps`
 - **Observed:** branch CI 42313030490 returned 200 when the fixture expected a full-capacity refusal. It holds workers busy with 600/900 ms sleeps while loading another app, then assumes they are still busy. Runtime sources are unchanged by backup/restore.
 - **Status:** fixed on main through `1e5f18ad`, with passing CI: observed upstream requests stay gated until the capacity assertion completes. An injected 1100 ms delay reproduces the old failure and passes with the fix. Allowing eviction of busy workers fails the corrected regression; restored with `git checkout --` and empty unstaged diff verified. Restored full suite passes (99 unit, 69 integration, 12 ignored). Runtime and guests unchanged. Recovery's main CI 42313034048 passed independently; this fixes the race rather than relying on that rerun-equivalent success.
+
+### N-70: a jailed worker can send datagrams to any unix socket on the host
+- **Where:** `jail.rs` (the `socketpair` rule)
+- **Scenario:** found by the sec review at `491e790`. The seccomp filter allowed `socketpair(AF_UNIX)` of any type. A datagram socket's `sendto` takes a destination even when connected, so code that got out of Wasm could send datagrams (and `SCM_RIGHTS` descriptors) to any named or abstract unix datagram socket it has DAC access to: journald and syslog (`/run/systemd/journal/socket`, `/dev/log`, both world-writable), systemd's notify socket, abstract sockets of other services. Landlock's filesystem rules do not cover socket sends (ABI 6's abstract-socket scope would block only abstract ones), so the README's "a worker's only channels are its two control sockets" did not hold.
+- **Reproduced:** yes: `jail_probe` sent a datagram from the jail to an abstract socket the test bound (`probe unix_datagram=ok`); a Python PoC under the same Landlock ruleset also reached a pathname socket.
+- **Status:** fixed in 32de17e: `socketpair` is allowed for `SOCK_STREAM` only (tokio's signal driver uses one); `jail_blocks_escapes` expects `unix_datagram=denied` and checks nothing arrived.
+
+### N-71: a client can forge a WebSocket event by spelling its content type differently
+- **Where:** `ws.rs` (`is_event`), `proxy.rs` (`forward`)
+- **Scenario:** found by the sec review at `491e790`. The proxy refused a client request as a forged socket event only if its *first* `Content-Type` was exactly `application/websocket-events`. With `Content-Type: text/plain` followed by the events type, or the type in other case or with parameters, it reached the object, which may read any of them: the counter guest keeps the last header, and GRIP libraries strip parameters. The client also chooses `Connection-Id`, so it could speak as another user's socket, contrary to the README's "an object can trust `Connection-Id`".
+- **Reproduced:** yes: through the proxy, counter answered a forged `TEXT id` with `m:7`, the id the client sent.
+- **Status:** fixed in fdf0fee and bbc92f6: an event is any request with a `Content-Type` value (also each comma-joined part) whose media type is the events type, in any case, with any parameters. `the_proxy_routes_hosts_by_dns` sends two forgeries (400; 200 with `m:7` before), `upgrades_and_events_are_recognised` covers the spellings.
+
+### N-72: a guest's publish costs the shared proxy 24 times its size in memory
+- **Where:** `ws.rs` (`messages`), reached from `egress.rs` (`hold`, in the worker) and `Proxy::publish`
+- **Scenario:** found by the sec review at `491e790`. Every publish (up to `max_response_body_kb`, 8 MiB) was parsed as a `serde_json::Value`, by the guest's worker when held and by the proxy, which every app shares. 8 MiB of tiny values beside `"items": []` peaked at 192 MiB and 200–370 ms of a proxy thread, from plain Wasm, once per request.
+- **Reproduced:** yes (a counting allocator over the same parse): 8 MiB → 192 MiB peak.
+- **Status:** fixed in fd7dfe4: publishes are read into typed structs and the rest is skipped unbuilt (the same body: under 1 MiB, 21 ms; 8 MiB of minimal items: 42 MiB). `publishes_parse_in_bounded_memory` fails with the old parser (1 MiB held 25 MB). What the proxy buffers across all apps is still unbounded: W-35.
+
+### N-73: a compromised worker chooses the `Host` its allowed upstream sees
+- **Where:** `egress.rs` (`send`)
+- **Scenario:** found by the sec review at `491e790`. The supervisor matched a worker's request against the allowlist by its URI host, then sent the worker's own headers. Guests cannot set `Host` (wasi-http forbids it), but a compromised worker can: a request to an allowed name on a shared front end (a CDN), carrying the `Host` of a site the list never named, reaches that site (domain fronting). The public-address filter still held.
+- **Reproduced:** yes: `the_upstream_hears_the_allowed_host` saw `Host: elsewhere.example`.
+- **Status:** fixed in 9890e6d: `send` sets `Host` from the checked authority.
+
+### N-74: a compromised worker's telemetry batch costs the supervisor 200 times its size
+- **Where:** `telemetry.rs` (`Relay::handle` → `stamp`)
+- **Scenario:** found by the sec review at `491e790`. The relay decodes each worker batch (up to 1 MiB) into prost structs to replace its resource and scrub identity attributes. An empty span is 2 bytes on the wire and about 250 bytes decoded, so 1 MiB of them peaks at 198 MiB and takes 150–270 ms, on the supervisor's single control thread, which also carries every worker's egress, publishes and starts. A worker can send three at a time, back to back. Guests can't reach this (the worker refuses their `/telemetry/` requests); it needs code that got out of Wasm.
+- **Reproduced:** yes (scratch harness decoding `ExportTraceServiceRequest`): 1 MiB → 198 MiB peak.
+- **Fix (proposed):** stamp at the wire level: rewrite only `ResourceSpans`/`ResourceLogs` field 1 (the resource) and copy the rest as bytes, which costs about the batch's size; that means dropping the span/event/link/scope attribute scrub (span attributes named `service.name` are not resource identity in OTel). Or count submessages with a bounded wire walk before decoding. Owner's call (Q64).
+- **Status:** open
+
+### N-75: a guest can hold about 20 times its memory limit in host-side headers
+- **Where:** `object.rs` (`new_store`: `ResourceTable::set_max_capacity(max_resources)`; `WasiHttpCtx` default field size limit)
+- **Scenario:** found by the sec review at `491e790`. Each `wasi:http` `fields` resource may hold up to wasi-http's 128 KiB of names and values, in worker memory outside the object's `memory_mb`, and an instance may hold `max_resources` (10,000) resources across requests until it is evicted: about 1.25 GiB per object against a 64 MiB cap. Its own app's worker is the first to suffer (other objects, or its cgroup's OOM kill); without a worker cgroup, the node's memory.
+- **Reproduced:** no (from source and wasi-http's `FieldMap` limits; `hostile`'s `/leak` holds empty fields only, and a guest change needs the owner)
+- **Fix (proposed):** bound what headers may hold per instance: a smaller `set_field_size_limit` with a smaller default `max_resources`, so their product is near `memory_mb`, or count `fields` bytes against the instance's memory limit in our hooks.
+- **Status:** open
 
 ## Planned work
 
@@ -417,3 +459,9 @@ The checkpoints below are historical, not outstanding product decisions.
 - **Composition gate:** synchronous WIT calls cannot block on async P3 filesystem I/O, as W-1 demonstrated. Establish a valid standard-interface/ABI strategy or preload mechanism first; fewer host handlers must not come at the cost of a custom backchannel, a quota bypass or more lifecycle machinery. Report separately whether KV and config genuinely reduce host coupling.
 - **Acceptance:** run the existing KV/config integration contracts against composed providers, including KV quota/rollback cases and config isolation; inventory the host code removed and the bootstrap responsibilities retained. Compare against the current implementation and recommend keep/move independently for each.
 - **Status:** in progress (migration and filesystem evaluation requested by owner)
+
+- **Status:** open (exploration requested by owner)
+
+### W-35: bound what the proxy buffers for objects across all apps
+- **What:** each event answer and each publish is collected whole in the proxy, up to `max_response_body_kb` (8 MiB), with no bound across sockets, objects or apps: 1,000 sockets of one app answered at once is 8 GiB, and publishes are as many as objects committing at once. Answers also parse into about 6–14 times their size (`ws::parse`, a 40-byte `Event` per 6–7-byte `CLOSE\r\n`). One app's plain Wasm can so exhaust the proxy every app shares. Options: a proxy-wide byte semaphore around collection (an operator setting), per-app caps on answer and publish bytes in flight, or a smaller default answer cap. Found by the sec review; needs the owner's choice of limits.
+- **Status:** open
