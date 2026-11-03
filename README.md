@@ -238,6 +238,13 @@ See the [measurements and limitations](components/keyvalue/README.md#follow-up-m
 Tentative changes must be visible and rejectable; an undo log is the current
 implementation, not a requirement on future snapshots or replicated storage.
 
+The [bounded backend comparison](experiments/fs-backends/README.md) measures the
+actual journal against plain transactional pages and hash-addressed pages, outside
+Wasm. Plain pages improve small writes/batches but slow warm reads and often write
+more bytes; hashing helps shared-content batches, not unique large writes. The
+experiment includes rejection, restart and process-death checks, but is not a WASI
+filesystem replacement or production durability certification. Runtime is unchanged.
+
 **`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
 ## Calls between objects

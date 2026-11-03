@@ -1,0 +1,14 @@
+[package]
+name = "fs-backends"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+nanovm = { path = "../../crates/nanovm" }
+redb = "4.4"
+sha2 = "0.10"
+serde_json = "1"

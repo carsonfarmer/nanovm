@@ -428,6 +428,21 @@ Sibling temporary files now avoid extra directory syncs; small-call and remainin
 write costs still need attention. The dependency patch is not enabled. Publishing migrated guests on main remains a separate
 approval from safe branch milestone pushes.
 
+**Bounded backend screen (Q78):** [experiment and measurements](experiments/fs-backends/README.md)
+compare the real journal with redb COW pages and SHA-256-addressed pages. Plain
+pages reduce small-mutation/batch latency; hashing pays for repeated cross-file
+content but slows unique large writes. Both slow warm reads and have fixed
+per-store overhead. Fewer sync round trips can coexist with more bytes written.
+No production replacement is selected. A next bounded proof should establish
+inode/held-descriptor behavior, quota and per-object cache budgets before a WASI
+adapter and mixed SQL/KV/raw-file/end-to-end comparison. This supersedes any
+reading of the earlier storage plan as requiring the undo mechanism itself.
+For external durability, keep accepted-version ordering, data retention until
+replica acknowledgement, acknowledgement policy and writer fencing explicit.
+Content hashes only identify data; the prototype's immediate reference reclamation
+does not supply replica retention or an export protocol. Avoid Wasmtime patches
+unless a demonstrated bug/inefficiency warrants separate upstream work.
+
 For actor ownership, use sequential `run_concurrent` phases with timeouts outside
 each invocation, retaining event-loop driving while idle. For storage, expose
 complete `replace_value`/`delete_value`/`resize`/`rename` operations and represent
