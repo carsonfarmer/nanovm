@@ -5,7 +5,7 @@
   const S = Symbol('state');
   const enc = new TextEncoder();
   const dec = new TextDecoder();
-  const make = (C, state) => Object.assign(Object.create(C.prototype), { [S]: state });
+  const make = (C, state) => { const o = Object.create(C.prototype); o[S] = state; return o; };
 
   // ---- URLSearchParams (URL's own `searchParams` is a snapshot of `search`)
   const decode = (s) => { try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch { return s; } };
@@ -114,7 +114,7 @@
     constructor(input, init = {}) {
       super();
       const src = input instanceof Request ? unread(input[S]) : null;
-      const s = withBody(init.body, init.headers ?? src?.headers);
+      const s = withBody(init.body, init.headers ?? (src && input.headers));
       if (init.body === undefined && src) s.body = src.body;
       const m = String(init.method ?? src?.method ?? 'GET');
       s.method = METHODS.test(m) ? m.toUpperCase() : m;
@@ -124,8 +124,9 @@
     }
     get method() { return this[S].method; }
     get url() { return this[S].url; }
-    get headers() { return this[S].headers; }
-    clone() { const s = unread(this[S]); return make(Request, { ...s, headers: new Headers(s.headers) }); }
+    // An incoming request's headers stay a flat array until asked for.
+    get headers() { const s = this[S]; return Array.isArray(s.headers) ? (s.headers = unflat(s.headers)) : s.headers; }
+    clone() { const s = unread(this[S]); return make(Request, { ...s, headers: new Headers(this.headers) }); }
   }
 
   class Response extends Body {
@@ -163,7 +164,7 @@
     const s = req[S];
     const url = new URL(s.url);
     const [status, headers, body] = await host.send(
-      s.method, url.protocol.slice(0, -1), url.host, url.pathname + url.search, flat(s.headers), s.body);
+      s.method, url.protocol.slice(0, -1), url.host, url.pathname + url.search, flat(req.headers), s.body);
     return make(Response, { status, statusText: '', headers: unflat(headers), body, used: false, url: s.url });
   }
 
@@ -238,18 +239,22 @@
     },
   };
 
+  class ExecutionContext {
+    constructor() { this[S] = []; }
+    waitUntil(p) { this[S].push(p); }
+    passThroughOnException() {}
+  }
+
   return (app) => {
     if (typeof app?.fetch !== 'function') throw new TypeError('the module must `export default { fetch(request, env, ctx) }`');
     return async (id, method, url, headers, body) => {
       env.id = id;
-      const request = make(Request, { method, url, headers: unflat(headers), body: body.length ? body : null, used: false });
-      const after = [];
-      const ctx = { waitUntil(p) { after.push(p); }, passThroughOnException() {} };
+      const request = make(Request, { method, url, headers, body, used: false });
+      const ctx = new ExecutionContext();
       const res = await app.fetch(request, env, ctx);
       if (!(res instanceof Response)) throw new TypeError('fetch() must return a Response');
       const s = unread(res[S]);
-      const done = after.length ? Promise.all(after) : undefined;
-      return [s.status, flat(s.headers), s.body, done];
+      return [s.status, flat(s.headers), s.body, ctx[S].length ? Promise.all(ctx[S]) : undefined];
     };
   };
 }

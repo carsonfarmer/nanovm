@@ -180,11 +180,16 @@ async fn objects_call_objects() {
 #[tokio::test(flavor = "multi_thread")]
 async fn web_apis() {
     let node = node("js_web_apis", 8);
-    let r = request(&node, "POST", "w", "/echo?a=1&b=x%20y", "hi there").await;
-    assert_eq!(r.status, 201, "{}", r.body);
+    let req = http::Request::post("http://localhost/echo?a=1&b=x%20y")
+        .header("content-type", "text/plain")
+        .body(bytes::Bytes::from("hi there"))
+        .unwrap();
+    let resp = node.dispatch("w", req).await;
+    assert_eq!((resp.status().as_u16(), resp.headers()["x-echo"].to_str().unwrap()), (201, "1"));
+    let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
     assert_eq!(
-        r.json(),
-        serde_json::json!({"method": "POST", "path": "/echo", "q": {"a": "1", "b": "x y"}, "type": null, "body": "hi there"})
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"method": "POST", "path": "/echo", "q": {"a": "1", "b": "x y"}, "type": "text/plain", "body": "hi there"})
     );
     let r = get(&node, "w", "/web").await;
     assert_eq!(

@@ -162,7 +162,7 @@ impl Runtime {
                 JsString::from(method).into(),
                 JsString::from(url).into(),
                 to_js_headers(headers, ctx)?,
-                JsUint8Array::from_iter(body, ctx)?.into(),
+                if body.is_empty() { JsValue::null() } else { JsUint8Array::from_iter(body, ctx)?.into() },
             ];
             promise(&self.dispatch.call(&JsValue::undefined(), &args, ctx)?)?
         };
@@ -341,8 +341,20 @@ fn from_js_headers(v: &JsValue, ctx: &mut Context) -> JsResult<Headers> {
 
 // ---- host functions ------------------------------------------------------
 
-fn bucket() -> JsResult<kv::Bucket> {
-    kv::open("").map_err(kv_error)
+thread_local! {
+    /// Opened at first use, at run time: no handle may be in the snapshot.
+    static BUCKET: std::cell::OnceCell<kv::Bucket> = const { std::cell::OnceCell::new() };
+}
+
+fn with_bucket<T>(f: impl FnOnce(&kv::Bucket) -> Result<T, kv::Error>) -> JsResult<T> {
+    BUCKET
+        .with(|cell| {
+            if cell.get().is_none() {
+                let _ = cell.set(kv::open("")?);
+            }
+            f(cell.get().unwrap())
+        })
+        .map_err(kv_error)
 }
 
 fn kv_error(e: kv::Error) -> JsError {
@@ -351,7 +363,7 @@ fn kv_error(e: kv::Error) -> JsError {
 
 fn kv_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let key = string(args.get_or_undefined(0), ctx)?;
-    match bucket()?.get(&key).map_err(kv_error)? {
+    match with_bucket(|b| b.get(&key))? {
         Some(v) => Ok(JsUint8Array::from_iter(v, ctx)?.into()),
         None => Ok(JsValue::undefined()),
     }
@@ -360,13 +372,13 @@ fn kv_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue>
 fn kv_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let key = string(args.get_or_undefined(0), ctx)?;
     let value = bytes(args.get_or_undefined(1), ctx)?;
-    bucket()?.set(&key, &value).map_err(kv_error)?;
+    with_bucket(|b| b.set(&key, &value))?;
     Ok(JsValue::undefined())
 }
 
 fn kv_delete(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let key = string(args.get_or_undefined(0), ctx)?;
-    bucket()?.delete(&key).map_err(kv_error)?;
+    with_bucket(|b| b.delete(&key))?;
     Ok(JsValue::undefined())
 }
 
@@ -374,7 +386,7 @@ fn kv_delete(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsVal
 fn kv_list(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let cursor = args.get_or_undefined(0);
     let cursor = if cursor.is_undefined() { None } else { Some(cursor.to_number(ctx)? as u64) };
-    let page = bucket()?.list_keys(cursor).map_err(kv_error)?;
+    let page = with_bucket(|b| b.list_keys(cursor))?;
     let keys = JsArray::from_iter(page.keys.into_iter().map(|k| JsString::from(k).into()), ctx);
     let next = page.cursor.map_or(JsValue::undefined(), |c| JsValue::from(c as f64));
     Ok(JsArray::from_iter([keys.into(), next], ctx).into())
