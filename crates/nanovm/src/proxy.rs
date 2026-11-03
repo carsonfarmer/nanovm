@@ -229,7 +229,7 @@ impl Proxy {
         }
     }
 
-    async fn publish(&self, req: Request<Incoming>) -> Response<RespBody> {
+    async fn publish(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         let sockets = req.headers().get(APP_HEADER).and_then(|h| h.to_str().ok()).and_then(|app| self.sockets.lock().get(app).cloned());
         let status = if req.method() != http::Method::POST || req.uri().path() != "/publish" { 404 }
             else if let Some(s) = sockets { s.publish(req).await }
@@ -315,10 +315,7 @@ pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyh
 pub async fn serve_publish(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
     loop {
         let p = proxy.clone();
-        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| {
-            let p = p.clone();
-            async move { p.publish(req).await }
-        });
+        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| p.clone().publish(req));
     }
 }
 

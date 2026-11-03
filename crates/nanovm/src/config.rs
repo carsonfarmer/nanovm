@@ -189,20 +189,11 @@ impl NodeConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut cfg: NodeConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        // Relative paths are relative to the config file.
-        let base = path.parent().unwrap_or(Path::new("."));
-        cfg.resolve(base);
+        // A relative data_dir is relative to the config file (joining keeps
+        // an absolute one as it is).
+        cfg.data_dir = path.parent().unwrap_or(Path::new(".")).join(&cfg.data_dir);
         cfg.validate()?;
         Ok(cfg)
-    }
-
-    pub fn resolve(&mut self, base: &Path) {
-        let fix = |p: &mut PathBuf| {
-            if p.is_relative() {
-                *p = base.join(&*p);
-            }
-        };
-        fix(&mut self.data_dir);
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {

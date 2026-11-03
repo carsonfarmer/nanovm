@@ -57,10 +57,9 @@ impl Metrics {
         self.poisons[p as usize].fetch_add(1, Relaxed);
     }
 
-    pub fn event(&self, kind: &'static str, object: &str, detail: impl Into<String>, context: &opentelemetry::Context) {
-        let detail = detail.into();
+    pub fn event(&self, kind: &'static str, object: &str, detail: impl AsRef<[u8]>, context: &opentelemetry::Context) {
         if let Some(telemetry) = self.telemetry.get().and_then(std::sync::Weak::upgrade) {
-            telemetry.log(object, ("event.name", kind), detail.as_bytes(), context);
+            telemetry.log(object, ("event.name", kind), detail.as_ref(), context);
         }
     }
 }
@@ -89,10 +88,6 @@ pub fn rss_bytes() -> u64 {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         pages * unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        0
     }
 }
 
