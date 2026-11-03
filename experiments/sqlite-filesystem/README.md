@@ -543,3 +543,14 @@ tests are ignored by the ordinary suite because they need the separate fixture
 and C toolchain; this branch's CI explicitly builds and runs them. This is an
 experimental implementation and proposal, not a shipped interface or a claim of
 full SQLite compatibility.
+
+## Query cancellation investigation (2026-11-02)
+
+**Closed without implementation.** Query-only cancellation is outside the beta
+contract; whole-request CPU/time interruption and rollback remain supported.
+Wasmtime's blocking `thread.yield` intentionally does not deliver cancellation,
+as specified by the [canonical ABI](https://github.com/WebAssembly/component-model/blob/fed10b0b823b82553dd8363f16a640816f5eac65/design/mvp/CanonicalABI.md#-canon-threadyield).
+A SQLite-free control confirmed that callback-based yielding delivers cancellation
+while blocking yielding lets the work finish. This is not a Wasmtime bug to patch.
+The diagnostic code and reproducer were removed; no runtime fork, new host API,
+provider scheduling change or journal redesign is planned for this feature.
