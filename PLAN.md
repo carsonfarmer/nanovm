@@ -400,22 +400,26 @@ than centralize it in a new host API. Evaluate that experiment before committing
 to the host-storage redesign below. W-18 is distinct from W-9 replication. The
 selective-WASI results predate the SQLite integration and do not validate it.
 
-**W-18 KV-first probe (Q73):** env/config remain host-injected. The reproducible
-`experiments/kv-filesystem` probe composes unchanged synchronous KV and executes it
-through Node. Provider-selection and direct P3 filesystem controls pass; both KV
-get/set trap when suspension is required. Recovery restores the committed file.
-No runtime code is removed. A full composed provider requires a separately agreed
-async KV contract; otherwise centralize native KV mutations in filesystem-owned
-operations. Do not add a private preload/writeback cache or silently change WIT.
-See the experiment README for the ABI evidence, limitations and successor prompt.
+**W-18 migration (Q75, in progress):** owner authorizes migrating guests/tests,
+removing native KV and obsolete experiments, and revisiting the filesystem itself
+where measurements expose problems. `components/keyvalue` supplies unchanged
+Spin async CRUD and streaming WIT over `/data`; env/config remain injected.
+The earlier sync KV/P3 probe trapped when suspension was required (Q73); it is
+removed rather than retained as a compatibility implementation.
 
-**Spin follow-up (Q74):** owner chose existing Spin async KV semantics and does
-not require batch. `spin:key-value@3.0.0` composes successfully over P3 filesystem;
-the experimental provider forwards key listings incrementally with completion
-errors and backpressure. No native provider removal. See
-`experiments/kv-filesystem/SPIN.md` for passing probes and the remaining mutation
-cancellation, stream lifetime, deployment-policy and performance gates. Env/config
-remain injected; guest migration is not authorized.
+Mutations defer cancellation through temporary-file publication/cleanup; listing
+slots last through completion delivery. Executed regressions caught cancellation
+orphans, temporary-name collisions, and prematurely freed listing slots. Preserve
+raw-file visibility, old descriptors and both host commit gates. The provider is
+not a full Spin deployment implementation: valid labels address private object
+directories, not manifest-selected shared stores. See
+[the provider contract](components/keyvalue/README.md).
+
+Acceptance still requires full integration/SQL/crash tests, byte/file/journal
+pressure and listing scale, matched native/composed performance, complete source
+counts (host plus provider/build changes), demo and adversarial review. Do not
+declare a win merely by moving lines out of the host. Publishing migrated guests
+on main remains a separate approval from safe branch milestone pushes.
 
 For actor ownership, use sequential `run_concurrent` phases with timeouts outside
 each invocation, retaining event-loop driving while idle. For storage, expose

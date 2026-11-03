@@ -8,7 +8,6 @@ pub mod egress;
 pub mod engine;
 pub mod jail;
 pub mod journal;
-pub mod kv;
 pub mod link;
 pub mod metrics;
 pub mod object;

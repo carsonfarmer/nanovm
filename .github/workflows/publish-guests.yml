@@ -8,7 +8,7 @@ name: publish-guests
 on:
   push:
     branches: [main]
-    paths: [guests/**, .github/workflows/publish-guests.yml]
+    paths: [guests/**, components/keyvalue/**, scripts/build-guests.sh, .github/workflows/publish-guests.yml]
   workflow_dispatch:
 
 permissions:
@@ -32,6 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
+      - run: cargo install wac-cli --version 0.12.0 --locked
       - run: scripts/build-guests.sh
       - uses: oras-project/setup-oras@v1
       - run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin

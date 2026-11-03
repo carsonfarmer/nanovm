@@ -46,9 +46,9 @@ impl wasip3::exports::http::handler::Guest for Sqlite {
             util::write_file("/data", "marker", value.as_bytes().to_vec())
                 .await
                 .unwrap();
-            util::kv::store::open("")
+            util::kv::Store::open("default".into()).await
                 .unwrap()
-                .set("marker", value.as_bytes())
+                .set("marker".into(), value.as_bytes().to_vec()).await
                 .unwrap();
         }
         if req.path == "/full" {
@@ -103,9 +103,9 @@ impl wasip3::exports::http::handler::Guest for Sqlite {
             .query_row("SELECT coalesce(sum(length(value)),0) FROM blobs", [], |r| r.get(0))
             .map_err(sql_error)?;
         let file = util::read_file("/data", "marker").await.unwrap_or_default();
-        let key = util::kv::store::open("")
+        let key = util::kv::Store::open("default".into()).await
             .unwrap()
-            .get("marker")
+            .get("marker".into()).await
             .unwrap()
             .unwrap_or_default();
         db.close().map_err(|(_, e)| sql_error(e))?;

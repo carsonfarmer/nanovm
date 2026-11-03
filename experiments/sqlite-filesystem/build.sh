@@ -2,6 +2,7 @@
 # WASI SDK 34; keeps experiment artifacts out of the normal guest workspace.
 set -euo pipefail
 root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+bash "$root/components/keyvalue/build.sh"
 : "${WASI_SDK_PATH:?Set WASI_SDK_PATH to an unpacked WASI SDK 34}"
 export CC_wasm32_wasip2="$WASI_SDK_PATH/bin/clang"
 export AR_wasm32_wasip2="$WASI_SDK_PATH/bin/llvm-ar"
@@ -13,7 +14,7 @@ for variant in stock p3; do
     if [[ $variant == stock ]]; then features=(--features stock); fi
     cargo build --locked --manifest-path "$root/experiments/sqlite-filesystem/Cargo.toml" \
         --release --target wasm32-wasip2 "${features[@]}"
-    cp "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_filesystem.wasm" "$CARGO_TARGET_DIR/$variant.wasm"
+    wac plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_filesystem.wasm" --plug "$root/target/keyvalue/provider.wasm" -o "$CARGO_TARGET_DIR/$variant.wasm"
 done
 if [[ ${1:-} == --compose ]]; then
     bash "$root/components/sqlite/build.sh"
@@ -21,10 +22,12 @@ if [[ ${1:-} == --compose ]]; then
         -p sqlite-client --release --target wasm32-wasip2
     wac plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_client.wasm" \
         --plug "$root/target/sqlite/provider.wasm" \
+        --plug "$root/target/keyvalue/provider.wasm" \
         -o "$CARGO_TARGET_DIR/composed.wasm"
     CARGO_TARGET_DIR="$root/target/sqlite" cargo build --locked --manifest-path "$root/components/sqlite/Cargo.toml" \
         -p sqlite-provider --features test-hooks --release --target wasm32-wasip2
     wac plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/sqlite_client.wasm" \
         --plug "$root/target/sqlite/wasm32-wasip2/release/sqlite_provider.wasm" \
+        --plug "$root/target/keyvalue/provider.wasm" \
         -o "$CARGO_TARGET_DIR/composed-faults.wasm"
 fi

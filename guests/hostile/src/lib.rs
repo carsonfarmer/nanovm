@@ -56,8 +56,8 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             let v = req.q("v").unwrap_or("").to_string();
             if !v.is_empty() {
                 let _ = util::write_file("/data", "c.txt", v.clone().into_bytes()).await;
-                let bucket = util::kv::store::open("").unwrap();
-                let _ = bucket.set("c", v.as_bytes());
+                let bucket = util::kv::Store::open("default".into()).await.unwrap();
+                let _ = bucket.set("c".into(), v.as_bytes().to_vec()).await;
             }
             match req.q("then").unwrap_or("ok") {
                 "fail" => json(507, "{}"),
@@ -72,7 +72,7 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                 }
                 _ => {
                     let file = util::read_file("/data", "c.txt").await.unwrap_or_default();
-                    let key = util::kv::store::open("").unwrap().get("c").ok().flatten().unwrap_or_default();
+                    let key = util::kv::Store::open("default".into()).await.unwrap().get("c".into()).await.ok().flatten().unwrap_or_default();
                     json(200, format!("{{\"file\":{},\"key\":{}}}", js(&String::from_utf8_lossy(&file)), js(&String::from_utf8_lossy(&key))))
                 }
             }
@@ -290,14 +290,12 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             json(200, format!("{{\"held\":{}}}", held.len()))
         }
 
-        // wasi:keyvalue: `op` is fill (n keys of `size` bytes until refused),
-        // key (one key `len` bytes long), incr (`delta` on `key`), list (a
-        // page from `cursor`) or open (bucket `name`).
+        // Spin KV: fill, key, streamed list, or open store `name`.
         "/kv" => {
-            use util::kv::{atomics, store};
+            use util::kv::{Error, Store};
             let q = |k| req.q(k).unwrap_or("").to_string();
-            let err = |e: store::Error| js(&format!("{e:?}"));
-            let bucket = match store::open(&q("name")) {
+            let err = |e: Error| js(&format!("{e:?}"));
+            let bucket = match Store::open(req.q("name").unwrap_or("default").into()).await {
                 Ok(b) => b,
                 Err(e) => return json(200, format!("{{\"opened\":false,\"error\":{}}}", err(e))),
             };
@@ -307,7 +305,7 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                     let mut n = 0;
                     let mut error = String::from("null");
                     while n < req.q_u64("n", 1_000_000) {
-                        if let Err(e) = bucket.set(&format!("k{n}"), &value) {
+                        if let Err(e) = bucket.set(format!("k{n}"), value.clone()).await {
                             error = err(e);
                             break;
                         }
@@ -315,21 +313,19 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                     }
                     format!("{{\"set\":{n},\"error\":{error}}}")
                 }
-                "key" => match bucket.set(&"k".repeat(req.q_u64("len", 1) as usize), b"v") {
+                "key" => match bucket.set("k".repeat(req.q_u64("len", 1) as usize), b"v".to_vec()).await {
                     Ok(()) => "{\"set\":true}".to_string(),
                     Err(e) => format!("{{\"error\":{}}}", err(e)),
                 },
-                "incr" => match atomics::increment(&bucket, &q("key"), req.q_u64("delta", 1)) {
-                    Ok(n) => format!("{{\"value\":{n}}}"),
-                    Err(e) => format!("{{\"error\":{}}}", err(e)),
-                },
-                "list" => match bucket.list_keys(req.q("cursor").and_then(|c| c.parse().ok())) {
-                    Ok(r) => format!(
-                        "{{\"keys\":{},\"cursor\":{}}}",
-                        r.keys.len(),
-                        r.cursor.map_or("null".to_string(), |c| c.to_string())
-                    ),
-                    Err(e) => format!("{{\"error\":{}}}", err(e)),
+                "list" => {
+                    let (mut keys, done) = bucket.get_keys().await;
+                    let mut n = 0;
+                    while keys.next().await.is_some() { n += 1; }
+                    drop(keys);
+                    match done.await {
+                        Ok(()) => format!("{{\"keys\":{n}}}"),
+                        Err(e) => format!("{{\"error\":{}}}", err(e)),
+                    }
                 },
                 // Take key `k0`'s file name (base64url "azA") with a
                 // directory through the filesystem, then set the key.
@@ -338,16 +334,14 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                     for d in [".kv/default/azA", ".kv/default/azA/x"] {
                         let _ = data.create_directory_at(d.to_string()).await;
                     }
-                    match bucket.set("k0", &vec![1u8; 1 << 20]) {
+                    match bucket.set("k0".into(), vec![1u8; 1 << 20]).await {
                         Ok(()) => "{\"set\":true}".to_string(),
                         Err(e) => format!("{{\"error\":{}}}", err(e)),
                     }
                 }
-                // `get-many` of key `k0`, `n` times over.
-                "many" => {
-                    let keys = vec!["k0".to_string(); req.q_u64("n", 1) as usize];
-                    match util::kv::batch::get_many(&bucket, &keys) {
-                        Ok(v) => format!("{{\"got\":{}}}", v.iter().flatten().count()),
+                "get" => {
+                    match bucket.get("k0".into()).await {
+                        Ok(v) => format!("{{\"bytes\":{}}}", v.map_or(0, |v| v.len())),
                         Err(e) => format!("{{\"error\":{}}}", err(e)),
                     }
                 }

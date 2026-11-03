@@ -1,11 +1,14 @@
 [package]
-name = "kv-filesystem-probe"
+name = "spin-kv-provider"
 version = "0.0.0"
 edition = "2024"
 publish = false
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+test-hooks = []
 
 [dependencies]
 util = { path = "../../../guests/util" }

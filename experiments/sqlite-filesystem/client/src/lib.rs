@@ -120,9 +120,9 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 util::write_file("/data", "marker", marker.as_bytes().to_vec())
                     .await
                     .unwrap();
-                util::kv::store::open("")
+                util::kv::Store::open("default".into()).await
                     .unwrap()
-                    .set("marker", marker.as_bytes())
+                    .set("marker".into(), marker.as_bytes().to_vec()).await
                     .unwrap();
             }
             if op == "mutate" {
@@ -169,7 +169,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             let integrity = query(&db, "PRAGMA integrity_check".into(), vec![]).await.unwrap();
             assert!(matches!(&integrity.rows[0].values[0], Value::Text(s) if s == "ok"));
             let file = util::read_file("/data", "marker").await.unwrap();
-            let key = util::kv::store::open("").unwrap().get("marker").unwrap().unwrap();
+            let key = util::kv::Store::open("default".into()).await.unwrap().get("marker".into()).await.unwrap().unwrap();
             CONNECTION.with(|c| *c.borrow_mut() = Some(db));
             return util::json(200, serde_json::json!({"rows":rows,"file":String::from_utf8(file).unwrap(),"key":String::from_utf8(key).unwrap(),"steps":steps}).to_string());
         }
@@ -297,9 +297,9 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             util::write_file("/data", "marker", value.as_bytes().to_vec())
                 .await
                 .unwrap();
-            util::kv::store::open("")
+            util::kv::Store::open("default".into()).await
                 .unwrap()
-                .set("marker", value.as_bytes())
+                .set("marker".into(), value.as_bytes().to_vec()).await
                 .unwrap();
         }
         if req.path == "/write-result-limit" {
@@ -367,9 +367,9 @@ impl util::wasip3::exports::http::handler::Guest for Client {
         let integrity = query(&db, "PRAGMA integrity_check".into(), vec![]).await.unwrap();
         assert!(matches!(&integrity.rows[0].values[0], Value::Text(s) if s == "ok"));
         let file = util::read_file("/data", "marker").await.unwrap_or_default();
-        let key = util::kv::store::open("")
+        let key = util::kv::Store::open("default".into()).await
             .unwrap()
-            .get("marker")
+            .get("marker".into()).await
             .unwrap()
             .unwrap_or_default();
         if req.path == "/close" {

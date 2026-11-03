@@ -49,7 +49,7 @@ impl util::wasip3::exports::http::handler::Guest for Example {
             vec![],
         )
         .await;
-        let bucket = util::kv::store::open("").unwrap();
+        let bucket = util::kv::Store::open("default".into()).await.unwrap();
         if let Some(value) = value {
             query(
                 &db,
@@ -60,7 +60,7 @@ impl util::wasip3::exports::http::handler::Guest for Example {
             util::write_file("/data", "example.txt", value.as_bytes().to_vec())
                 .await
                 .unwrap();
-            bucket.set("example", value.as_bytes()).unwrap();
+            bucket.set("example".into(), value.as_bytes().to_vec()).await.unwrap();
             if req.q("rollback") == Some("1") {
                 // Returning an HTTP 500 would COMMIT. A guest error aborts.
                 return Err(ErrorCode::InternalError(Some("intentional example rollback".into())));
@@ -76,7 +76,7 @@ impl util::wasip3::exports::http::handler::Guest for Example {
             Err(util::wasip3::filesystem::types::ErrorCode::NoEntry) => None,
             Err(e) => panic!("read example file: {e:?}"),
         };
-        let kv = bucket.get("example").unwrap().map(|v| String::from_utf8(v).unwrap());
+        let kv = bucket.get("example".into()).await.unwrap().map(|v| String::from_utf8(v).unwrap());
         util::json(200, serde_json::json!({"sql": sql, "file": file, "kv": kv}).to_string())
     }
 }
