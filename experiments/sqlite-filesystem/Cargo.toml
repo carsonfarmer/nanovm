@@ -1,0 +1,25 @@
+[package]
+name = "sqlite-filesystem"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+members = ["client"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+stock = ["rusqlite/wasm32-wasi-vfs"]
+
+[dependencies]
+rusqlite = { version = "0.41.1", default-features = false, features = ["bundled"] }
+sqlite-vfs = "0.2.0"
+util = { path = "../../guests/util" }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

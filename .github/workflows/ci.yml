@@ -32,6 +32,7 @@ jobs:
           workspaces: |
             . -> target
             guests -> target
+            components/sqlite -> ../../target/sqlite
       - name: Prepare host limits
         run: sudo sysctl -w vm.max_map_count=1048576
       - name: Report runtime line count
@@ -52,3 +53,21 @@ jobs:
         run: |
           ulimit -n "$(ulimit -Hn)"
           env -u RUST_BACKTRACE cargo test --locked -p nanovm
+      - name: Install pinned WASI C toolchain for SQLite
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz \
+            -o "$RUNNER_TEMP/wasi-sdk.tar.gz"
+          echo "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4  $RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
+          echo "WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux" >> "$GITHUB_ENV"
+      - name: Build SQLite provider, example and pressure fixtures (no publishing)
+        run: |
+          cargo install wac-cli --version 0.12.0 --locked
+          bash experiments/sqlite-filesystem/build.sh --compose
+      - name: Run composed SQLite example
+        run: env -u RUST_BACKTRACE cargo run --locked -p nanovm --example sqlite
+      - name: Pressure test SQLite against the journal
+        run: |
+          ulimit -n "$(ulimit -Hn)"
+          env -u RUST_BACKTRACE cargo test --locked -p nanovm --test integration sqlite_ -- --ignored --nocapture

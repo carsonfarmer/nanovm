@@ -12,6 +12,16 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 
 Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
+## SQLite beta
+
+[Build and run the SQLite example](components/sqlite/README.md). A composed Wasm
+provider implements the upstream Spin async SQLite interface over the existing
+filesystem, quotas and request journal; there is no host SQLite service. The
+example demonstrates persistence, object isolation, and atomic SQL/file/KV
+rollback. One connection, provider-owned database files and memory-only temporary
+storage define the initial support contract; see the linked limitations before
+using it in an app.
+
 ## Try it
 
 ```bash
@@ -252,7 +262,9 @@ Sockets are indexed by object within each app; a publish visits that object's so
 
 ## Commits
 
-A request's changes to `/data` (files and key-value alike) and what it publishes to WebSockets take effect together when it answers, and are durable before anyone hears of them: Durable Objects' output gate. If the request fails, they never happened. "Fails" means a guest error, a trap, the CPU or time limit, or the worker crashing. An answer of any status commits.
+A request's changes to `/data` (files and key-value alike) and what it publishes to WebSockets take effect together when it answers, and are durable before anyone hears of them: Durable Objects' output gate. A guest error, trap, CPU/time limit or worker crash before commit rolls back those changes. An answer of any status commits.
+
+A host I/O failure during commit, a crash at its commit marker, or a lost response can leave the caller unsure whether the request committed. Do not interpret every error as a rollback: use application-level operation IDs for idempotent retries. Durability assumes a filesystem and device that honor successful file and directory syncs; process-crash tests do not certify physical power-loss behavior.
 
 **How:** an undo journal (`journal.rs`), as SQLite's rollback journal, under our `wasi:filesystem` host (`quota.rs`).
 - **Before each change, the host records what the change would destroy, and fsyncs it:**
@@ -272,7 +284,8 @@ A request's changes to `/data` (files and key-value alike) and what it publishes
   - The quota counts committed state. While a request runs, the log and the files it removed may each hold as much again, so an object's disk use peaks at three times its quota. Past that, a change is refused as a full disk.
 - **Safety:**
   - Guest paths reach only the volume. The journal sits beside it, out of reach.
-  - An undo that can't be applied is skipped rather than leave the object unable to start.
+  - A recovery error preserves the failing undo and refuses to start the object. Repair the storage problem and retry; never delete the journal to force startup. Already-applied or never-performed operations remain safe to replay.
+  - A commit failure poisons that journal instance, so retrying cannot falsely report success. Recovery syncs both parents of a reversed rename before retiring its record.
   - A failed rename restores its staged destination and storage accounting, keeps dirty-source sync tracking, and durably cancels its rename undo before paths can be reused. If restoration or cancellation fails, the request cannot commit and must recover. Cancelled records still consume log space.
 - **Downgrades:** cancelled renames use journal tag 5. This version reads older journals, but older binaries cannot recover a log containing that tag. Before downgrading, drain requests and finish any pending recovery with this version; never delete an uncommitted journal to make a downgrade work.
 - **`/tmp` is not journaled.** It is per-instance scratch, deleted with the instance, so it's the fast place for temporary files. A rename between `/tmp` and `/data` fails as cross-device, as between real filesystems.
