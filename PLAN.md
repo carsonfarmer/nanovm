@@ -409,6 +409,14 @@ async KV contract; otherwise centralize native KV mutations in filesystem-owned
 operations. Do not add a private preload/writeback cache or silently change WIT.
 See the experiment README for the ABI evidence, limitations and successor prompt.
 
+**Spin follow-up (Q74):** owner chose existing Spin async KV semantics and does
+not require batch. `spin:key-value@3.0.0` composes successfully over P3 filesystem;
+the experimental provider forwards key listings incrementally with completion
+errors and backpressure. No native provider removal. See
+`experiments/kv-filesystem/SPIN.md` for passing probes and the remaining mutation
+cancellation, stream lifetime, deployment-policy and performance gates. Env/config
+remain injected; guest migration is not authorized.
+
 For actor ownership, use sequential `run_concurrent` phases with timeouts outside
 each invocation, retaining event-loop driving while idle. For storage, expose
 complete `replace_value`/`delete_value`/`resize`/`rename` operations and represent

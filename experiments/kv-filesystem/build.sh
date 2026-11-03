@@ -7,3 +7,6 @@ cargo build --locked --release --target wasm32-wasip2 --manifest-path "$root/exp
 wac plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/kv_filesystem_client.wasm" \
     --plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/kv_filesystem_probe.wasm" \
     -o "$CARGO_TARGET_DIR/composed.wasm"
+wac plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/spin_kv_client.wasm" \
+    --plug "$CARGO_TARGET_DIR/wasm32-wasip2/release/spin_kv_provider.wasm" \
+    -o "$CARGO_TARGET_DIR/spin-composed.wasm"

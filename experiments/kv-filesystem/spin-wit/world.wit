@@ -1,0 +1,3 @@
+package nanovm-experiment:spin-kv;
+world provider { export spin:key-value/key-value@3.0.0; }
+world client { import spin:key-value/key-value@3.0.0; }
