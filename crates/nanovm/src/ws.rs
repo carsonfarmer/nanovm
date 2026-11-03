@@ -146,9 +146,13 @@ pub fn wants<B>(req: &Request<B>) -> bool {
 }
 
 /// Whether `req` claims to be a socket's event, which only the proxy may
-/// send.
+/// send: any of its content types is that type, in any case and with any
+/// parameters, since an object may read any of them in any of these ways.
 pub fn is_event<B>(req: &Request<B>) -> bool {
-    req.headers().get(CONTENT_TYPE).is_some_and(|v| v == EVENTS)
+    req.headers().get_all(CONTENT_TYPE).iter().any(|v| {
+        let essence = v.as_bytes().split(|&b| b == b';').next().unwrap_or_default();
+        essence.trim_ascii().eq_ignore_ascii_case(EVENTS.as_bytes())
+    })
 }
 
 /// One app's sockets, ordered by object so publishing visits only its own.
@@ -857,8 +861,8 @@ mod tests {
         assert!(rxs.iter_mut().all(|rx| drain(rx).is_empty()));
     }
 
-    /// An upgrade is any case of `websocket`; an event is exactly the events
-    /// content type.
+    /// An upgrade is any case of `websocket`; an event is any request one of
+    /// whose content types is the events type, however spelled.
     #[test]
     fn upgrades_and_events_are_recognised() {
         let req = |k: HeaderName, v: &'static str| Request::get("/").header(k, v).body(()).unwrap();
@@ -866,8 +870,12 @@ mod tests {
             assert!(wants(&req(http::header::UPGRADE, v)));
         }
         assert!(!wants(&req(http::header::UPGRADE, "h2c")) && !wants(&Request::new(())));
-        assert!(is_event(&req(CONTENT_TYPE, EVENTS)));
-        assert!(!is_event(&req(CONTENT_TYPE, "application/websocket-events; x=1")) && !is_event(&Request::new(())));
+        for v in [EVENTS, "application/websocket-events; x=1", " Application/WebSocket-Events "] {
+            assert!(is_event(&req(CONTENT_TYPE, v)), "{v}");
+        }
+        let second = Request::get("/").header(CONTENT_TYPE, "text/plain").header(CONTENT_TYPE, EVENTS).body(()).unwrap();
+        assert!(is_event(&second));
+        assert!(!is_event(&req(CONTENT_TYPE, "application/websocket-events-x")) && !is_event(&Request::new(())));
     }
 
     type Log = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;

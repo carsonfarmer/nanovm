@@ -2687,6 +2687,14 @@ async fn the_proxy_routes_hosts_by_dns() {
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&at("counter.test", &counter)), "{body}");
     assert_eq!(get("counter.test", "/_nanovm/stats", "").await.0, 400);
+    // Nor can it claim to be a socket's event (and pick its `Connection-Id`),
+    // however it spells the type: counter's own parsing reads the last one.
+    for types in ["text/plain\r\nContent-Type: application/websocket-events", "Application/WebSocket-Events; charset=utf-8"] {
+        let head = format!("POST /room/ws HTTP/1.1\r\nHost: counter.test\r\nContent-Type: {types}\r\n\
+            Connection-Id: 7\r\nContent-Length: 12\r\nConnection: close\r\n\r\n");
+        let (status, body) = raw(proxy, &head, b"TEXT 2\r\nid\r\n").await;
+        assert_eq!(status, 400, "{types}: {body}");
+    }
     // Another host naming the same repository runs an app of its own: it
     // can choose the version it runs, but not the one counter.test runs.
     record("other.test", &[&format!("app={tagged}; trust=dev dev")]);
