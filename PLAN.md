@@ -421,8 +421,11 @@ per-component allowances. Full-quota reopen is also fixed. Matched release KV
 performance regresses: 1 MiB GET 1.413 → 3.155 ms, PUT 4.614 → 7.126 ms.
 Actual host+provider runtime is 5,300 → 5,287 (13 lines saved), with additional
 build/CI wiring. See the provider README for all measurements and limitations.
-The performance acceptance gate remains unmet; profile ABI copying and journal
-operations before adopting. Publishing migrated guests on main remains a separate
+The performance acceptance gate remains unmet. Profiling isolated a generated
+Wasmtime byte-list copy loop: a diagnostic bulk-copy patch reduces 1 MiB GET
+3.149 → 1.600 ms versus native 1.404 ms, without changing guest WIT or storage.
+Sibling temporary files now avoid extra directory syncs; small-call and remaining
+write costs still need attention. The dependency patch is not enabled. Publishing migrated guests on main remains a separate
 approval from safe branch milestone pushes.
 
 For actor ownership, use sequential `run_concurrent` phases with timeouts outside
@@ -477,7 +480,7 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 6. **More guest languages and a publish command (Q47).** JS and Python guests through componentize-js and componentize-py; `nanovm publish` wrapping the `oras` push and keyless signing. (W-6, W-7)
 7. **Numbers against the alternatives (Q47).** Density, cold starts and warm latency against workerd and Spin. (W-8)
 8. **Toward many nodes (Q48–Q50).** Research and groundwork, after the proxy lands:
-   - **Change records shipped off the node** (Litestream-style): the journal already knows what each commit touched, so a commit can emit a self-contained record of it. Replicated, they make the node a cache of its volumes. (W-9)
+   - **Committed versions shipped off the node:** separate three concerns: coherent tentative state that can be rejected, local commit, and acknowledgement after the selected durability policy. Undo logging is today's implementation, not a requirement; snapshots, copy-on-write or transactional storage are valid candidates. Replication needs ordered committed content/namespace changes or immutable snapshot manifests, not merely the current undo log. Capture the committed version before subsequent writes can alter it. Include object identity, sequence and fencing epoch; replay must be idempotent. Decide whether success means local durability, remote backup or a regional quorum before promising failover guarantees. Async replication implies a nonzero loss window. (W-9)
    - **Placement and leases:** the proxy places each object on a home node (rendezvous hashing to start); a node takes a lease with an epoch before instantiating an object, and every commit carries the epoch, so a node that lost its lease can't commit. On one node the lease is always granted, so the hook can land early. (W-10)
    - **Requests that don't write can run in parallel** (Q50): stateless routes on any node, and read-only requests on read replicas of an object fed by committed change records. On one node it needs care: the undo journal writes in place, so a concurrent reader would see uncommitted data. (W-11)
 9. **Cleanups:** the rest of the review's removable-code list (registry cache and re-hash, config memory checks), for the agent doing the rewrite. (W-13)

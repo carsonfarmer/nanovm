@@ -116,7 +116,7 @@ impl GuestStore for Bucket {
             let (tmp, fd) = loop {
                 let n = TEMP.get();
                 TEMP.set(n.wrapping_add(1));
-                let tmp = format!(".kv/.spin-write-{n}");
+                let tmp = format!("{}/.spin-write-{n}", self.path);
                 match util::open(
                     "/data",
                     &tmp,
