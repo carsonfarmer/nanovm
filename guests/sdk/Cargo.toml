@@ -1,0 +1,16 @@
+[package]
+name = "nanovm-sdk"
+version = "0.1.0"
+edition.workspace = true
+description = "Write nanovm apps: WASIp3 HTTP handlers run as durable objects"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+wasip3.workspace = true
+wit-bindgen = "0.62"
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+# `Request::json`: parse a body with serde.
+json = ["dep:serde", "dep:serde_json"]

@@ -5,7 +5,7 @@ use std::io::{self, ErrorKind};
 use std::time::Duration;
 
 use sqlite_vfs::{DatabaseHandle, LockKind, OpenAccess, OpenOptions, Vfs, WalDisabled};
-use util::wasip3;
+use nanovm_sdk::{data, wasip3};
 use wasip3::filesystem::types::{Descriptor, DescriptorFlags, ErrorCode, OpenFlags, PathFlags};
 use wasip3::wit_bindgen::block_on;
 
@@ -84,7 +84,7 @@ impl Vfs for Files {
                 DescriptorFlags::READ | DescriptorFlags::WRITE,
             ),
         };
-        let fd = block_on(util::open("/data", name, oflags, flags)).map_err(error)?;
+        let fd = block_on(data().open(name, oflags, flags)).map_err(error)?;
         checkpoint("open", 0);
         Ok(File {
             fd,
@@ -92,14 +92,14 @@ impl Vfs for Files {
         })
     }
     fn delete(&self, name: &str) -> io::Result<()> {
-        block_on(util::mount("/data").unwrap().unlink_file_at(name.to_string())).map_err(error)?;
+        block_on(data().remove(name)).map_err(error)?;
         checkpoint("delete", 0);
         Ok(())
     }
     fn exists(&self, name: &str) -> io::Result<bool> {
         match block_on(
-            util::mount("/data")
-                .unwrap()
+            data()
+                .descriptor()
                 .stat_at(PathFlags::empty(), name.to_string()),
         ) {
             Ok(_) => Ok(true),
@@ -150,7 +150,7 @@ impl DatabaseHandle for File {
         })
     }
     fn write_all_at(&mut self, buf: &[u8], offset: u64) -> io::Result<()> {
-        block_on(util::write_all(&self.fd, buf.to_vec(), offset)).map_err(error)?;
+        block_on(nanovm_sdk::fs::write_at(&self.fd, buf.to_vec(), offset)).map_err(error)?;
         checkpoint("write", buf.len());
         Ok(())
     }

@@ -7,5 +7,4 @@ edition.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-wasip3.workspace = true
-util.workspace = true
+nanovm-sdk.workspace = true

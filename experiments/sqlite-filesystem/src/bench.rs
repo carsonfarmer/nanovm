@@ -2,13 +2,13 @@
 use crate::{sql_error, vfs};
 use rusqlite::Connection;
 use std::cell::RefCell;
-use util::wasip3::http::types::{ErrorCode, Response};
+use nanovm_sdk::wasip3::http::types::{ErrorCode, Response};
 
 thread_local! {
     static CONNECTION: RefCell<Option<Connection>> = const { RefCell::new(None) };
 }
 
-pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
+pub async fn run(req: nanovm_sdk::Request) -> Result<Response, ErrorCode> {
     vfs::arm(0);
     let cached = CONNECTION.with(|c| c.borrow_mut().take());
     let db = match cached {
@@ -20,7 +20,7 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
                 "wasi-p3",
             )
             .map_err(sql_error)?;
-            let mode = if req.q("mode") == Some("WAL") {
+            let mode = if req.query("mode") == Some("WAL") {
                 db.execute_batch("PRAGMA locking_mode=EXCLUSIVE;").map_err(sql_error)?;
                 "WAL"
             } else {
@@ -32,13 +32,13 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
             assert_eq!(actual, mode.to_lowercase());
             db.execute_batch(&format!(
                 "PRAGMA synchronous=FULL; PRAGMA cache_size=-2048; PRAGMA temp_store=MEMORY; PRAGMA wal_autocheckpoint={};",
-                req.q_u64("pages", 1000),
+                req.query_or("pages", 1000u64),
             )).map_err(sql_error)?;
             db
         }
     };
-    let op = req.q("op").unwrap_or("point");
-    let seq = req.q_u64("seq", 0);
+    let op = req.query("op").unwrap_or("point");
+    let seq = req.query_or("seq", 0u64);
     let mut value = 0i64;
     let mut integrity = None;
     match op {
@@ -104,18 +104,15 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
             );
         }
         "close" => (),
-        _ => return util::text(400, "unknown workload"),
+        _ => return nanovm_sdk::Response::text("unknown workload").status(400).into_wit(),
     }
-    if req.q("cache") == Some("1") && op != "close" && op != "verify" {
+    if req.query("cache") == Some("1") && op != "close" && op != "verify" {
         CONNECTION.with(|c| *c.borrow_mut() = Some(db));
     } else {
         db.close().map_err(|(_, e)| sql_error(e))?;
     }
     let (_, bytes) = vfs::counts();
-    util::json(
-        200,
-        serde_json::json!({"value": value, "integrity": integrity,
+    nanovm_sdk::Response::json(serde_json::json!({"value": value, "integrity": integrity,
         "sqlite_write_bytes": bytes, "sqlite_syncs": vfs::syncs()})
-        .to_string(),
-    )
+        .to_string()).status(200).into_wit()
 }

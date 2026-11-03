@@ -1,6 +1,6 @@
 //! Experiment only: real SQLite inside Wasm; no native SQLite host calls.
 use rusqlite::Connection;
-use util::wasip3;
+use nanovm_sdk::wasip3;
 use wasip3::http::types::{ErrorCode, Request, Response};
 
 #[cfg(not(feature = "stock"))]
@@ -16,13 +16,13 @@ struct Sqlite;
 
 impl wasip3::exports::http::handler::Guest for Sqlite {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
-        let req = util::read_req(request).await;
+        let req = nanovm_sdk::Request::read(request).await;
         #[cfg(not(feature = "stock"))]
-        if req.path == "/bench" {
+        if req.path() == "/bench" {
             return bench::run(req).await;
         }
         #[cfg(not(feature = "stock"))]
-        if req.path == "/pressure" {
+        if req.path() == "/pressure" {
             return pressure::run(req).await;
         }
         #[cfg(not(feature = "stock"))]
@@ -40,41 +40,41 @@ impl wasip3::exports::http::handler::Guest for Sqlite {
             CREATE TABLE IF NOT EXISTS blobs(value BLOB);",
         )
         .map_err(sql_error)?;
-        if let Some(value) = req.q("v") {
+        if let Some(value) = req.query("v") {
             db.execute("INSERT INTO ledger(value) VALUES (?)", [value])
                 .map_err(sql_error)?;
-            util::write_file("/data", "marker", value.as_bytes().to_vec())
+            nanovm_sdk::data().write("marker", value.as_bytes().to_vec())
                 .await
                 .unwrap();
-            util::kv::store::open("")
+            nanovm_sdk::kv::store::open("")
                 .unwrap()
                 .set("marker", value.as_bytes())
                 .unwrap();
         }
-        if req.path == "/full" {
+        if req.path() == "/full" {
             // More than the test object's entire quota. Propagate the error so
             // nanovm discards this request, including earlier mixed writes.
             db.execute("INSERT INTO blobs VALUES (zeroblob(2097152))", [])
                 .map_err(sql_error)?;
         }
-        if req.path == "/constraint" {
+        if req.path() == "/constraint" {
             db.execute("INSERT INTO ledger(id,value) VALUES (1,'duplicate')", [])
                 .unwrap_err();
         }
-        if req.path == "/grow" {
+        if req.path() == "/grow" {
             db.execute("INSERT INTO blobs VALUES (zeroblob(262144))", [])
                 .map_err(sql_error)?;
         }
-        if req.path == "/transaction" {
+        if req.path() == "/transaction" {
             db.execute_batch("BEGIN; INSERT INTO ledger(value) VALUES ('inner-rollback'); ROLLBACK;")
                 .map_err(sql_error)?;
         }
-        if req.path == "/vacuum" {
+        if req.path() == "/vacuum" {
             db.execute_batch("DELETE FROM blobs; VACUUM;").map_err(sql_error)?;
         }
         // Close SQLite before returning, just as a guest library would. For
         // trap/timeout tests leave it open to test instance teardown too.
-        match req.q("then") {
+        match req.query("then") {
             Some("panic") => panic!("after SQLite, file and KV writes"),
             Some("error") => return Err(ErrorCode::InternalError(Some("after writes".into()))),
             Some("sql") => {
@@ -102,19 +102,16 @@ impl wasip3::exports::http::handler::Guest for Sqlite {
         let blob_bytes: i64 = db
             .query_row("SELECT coalesce(sum(length(value)),0) FROM blobs", [], |r| r.get(0))
             .map_err(sql_error)?;
-        let file = util::read_file("/data", "marker").await.unwrap_or_default();
-        let key = util::kv::store::open("")
+        let file = nanovm_sdk::data().read("marker").await.ok().flatten().unwrap_or_default();
+        let key = nanovm_sdk::kv::store::open("")
             .unwrap()
             .get("marker")
             .unwrap()
             .unwrap_or_default();
         db.close().map_err(|(_, e)| sql_error(e))?;
-        util::json(
-            if req.q("then") == Some("status") { 507 } else { 200 },
-            serde_json::json!({"rows": rows, "integrity": integrity, "blob_bytes": blob_bytes,
+        nanovm_sdk::Response::json(serde_json::json!({"rows": rows, "integrity": integrity, "blob_bytes": blob_bytes,
                 "file": String::from_utf8(file).unwrap(), "key": String::from_utf8(key).unwrap()})
-            .to_string(),
-        )
+            .to_string()).status(if req.query("then") == Some("status") { 507 } else { 200 }).into_wit()
     }
 }
 

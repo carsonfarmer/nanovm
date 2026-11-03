@@ -3,16 +3,13 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use util::wasip3;
-use util::{FdFlags, OFlags, Req, js, json, read_req, text};
-use wasip3::filesystem::types::PathFlags;
-use wasip3::http::types::{ErrorCode, Fields, Method, Request, Response, Scheme};
-use wasip3::wit_future;
+use nanovm_sdk::fs::{self, DescriptorFlags as FdFlags, Dir, ErrorCode as FsError, OpenFlags, PathFlags};
+use nanovm_sdk::wasip3::http::types::Fields;
+use nanovm_sdk::{Error, Request, Response, Result, data, kv, quote, sleep, tmp};
 
-wasip3::http::service::export!(Hostile);
-
-struct Hostile;
+nanovm_sdk::serve!(handle);
 
 static HITS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
@@ -23,75 +20,58 @@ thread_local! {
     static LEAKED: RefCell<Vec<Fields>> = const { RefCell::new(Vec::new()) };
 }
 
-impl wasip3::exports::http::handler::Guest for Hostile {
-    async fn handle(request: Request) -> Result<Response, ErrorCode> {
-        let req = read_req(request).await;
-        HITS.fetch_add(1, Ordering::Relaxed);
-        let now = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
-        MAX_ACTIVE.fetch_max(now, Ordering::SeqCst);
-        let res = route(req).await;
-        ACTIVE.fetch_sub(1, Ordering::SeqCst);
-        res
-    }
+async fn handle(req: Request) -> Result {
+    HITS.fetch_add(1, Ordering::Relaxed);
+    let now = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+    MAX_ACTIVE.fetch_max(now, Ordering::SeqCst);
+    let res = route(req).await;
+    ACTIVE.fetch_sub(1, Ordering::SeqCst);
+    res
 }
 
-fn ms(n: u64) -> u64 {
-    n * 1_000_000
-}
-
-async fn route(req: Req) -> Result<Response, ErrorCode> {
-    match req.path.as_str() {
-        "/" => json(
-            200,
-            format!(
-                "{{\"object\":{},\"hits\":{}}}",
-                js(&util::env("NANOVM_OBJECT_ID")),
-                HITS.load(Ordering::Relaxed)
-            ),
-        ),
-        "/echo" => util::respond(200, "application/octet-stream", req.body),
+async fn route(req: Request) -> Result {
+    Ok(match req.path() {
+        "/" => Response::json(format!(r#"{{"object":{},"hits":{}}}"#, quote(&nanovm_sdk::id()), HITS.load(Ordering::Relaxed))),
+        "/echo" => Response::bytes("application/octet-stream", req.into_body()),
         // Writes `v` to `/data/c.txt` (in place) and to the key `c`, then
         // ends as `then` says: ok, fail (507), error, panic, spin or sleep.
         "/commit" => {
-            let v = req.q("v").unwrap_or("").to_string();
+            let v = req.query("v").unwrap_or("");
             if !v.is_empty() {
-                let _ = util::write_file("/data", "c.txt", v.clone().into_bytes()).await;
-                let bucket = util::kv::store::open("").unwrap();
-                let _ = bucket.set("c", v.as_bytes());
+                let _ = data().write("c.txt", v).await;
+                let _ = kv::set("c", v);
             }
-            match req.q("then").unwrap_or("ok") {
-                "fail" => json(507, "{}"),
+            match req.query("then").unwrap_or("ok") {
+                "fail" => Response::json("{}").status(507),
                 "panic" => panic!("after writing"),
-                "error" => Err(ErrorCode::InternalError(Some("after writing".into()))),
+                "error" => return Err(Error::new("after writing")),
                 "spin" => loop {
                     std::hint::black_box(0);
                 },
                 "sleep" => {
-                    wasip3::clocks::monotonic_clock::wait_for(ms(60_000)).await;
-                    json(200, "{}")
+                    sleep(Duration::from_secs(60)).await;
+                    Response::json("{}")
                 }
                 _ => {
-                    let file = util::read_file("/data", "c.txt").await.unwrap_or_default();
-                    let key = util::kv::store::open("").unwrap().get("c").ok().flatten().unwrap_or_default();
-                    json(200, format!("{{\"file\":{},\"key\":{}}}", js(&String::from_utf8_lossy(&file)), js(&String::from_utf8_lossy(&key))))
+                    let file = data().read_text("c.txt").await.ok().flatten().unwrap_or_default();
+                    let key = kv::get("c").ok().flatten().unwrap_or_default();
+                    Response::json(format!(r#"{{"file":{},"key":{}}}"#, quote(&file), quote(&String::from_utf8_lossy(&key))))
                 }
             }
         }
         // A body big enough that a client can stop reading it part way.
-        "/big" => util::respond(200, "application/octet-stream", vec![b'x'; (req.q_u64("mb", 4) as usize) << 20]),
+        "/big" => Response::bytes("application/octet-stream", vec![b'x'; req.query_or::<usize>("mb", 4) << 20]),
 
         // Grow linear memory by `mb` MiB, touching every page, and keep it.
         "/alloc" => {
-            let mb = req.q_u64("mb", 1024);
-            for _ in 0..mb {
+            for _ in 0..req.query_or::<u64>("mb", 1024) {
                 let mut v = vec![0u8; 1 << 20];
                 for i in (0..v.len()).step_by(4096) {
                     v[i] = 1;
                 }
                 HOARD.with(|h| h.borrow_mut().push(v));
             }
-            let held: usize = HOARD.with(|h| h.borrow().len());
-            json(200, format!("{{\"held_mb\":{held}}}"))
+            Response::json(format!(r#"{{"held_mb":{}}}"#, HOARD.with(|h| h.borrow().len())))
         }
 
         // Burn CPU forever.
@@ -104,77 +84,67 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
 
         // Sleep (async, no CPU) for `ms` milliseconds.
         "/sleep" => {
-            let n = req.q_u64("ms", 60_000);
-            wasip3::clocks::monotonic_clock::wait_for(ms(n)).await;
-            json(200, format!("{{\"slept_ms\":{n}}}"))
+            let n = req.query_or("ms", 60_000);
+            sleep(Duration::from_millis(n)).await;
+            Response::json(format!(r#"{{"slept_ms":{n}}}"#))
         }
 
         "/panic" => panic!("hostile guest panicked on purpose"),
 
         // Concurrency probe: hold the request for `ms`, report max overlap seen.
         "/concurrency" => {
-            wasip3::clocks::monotonic_clock::wait_for(ms(req.q_u64("ms", 20))).await;
-            json(200, format!("{{\"max_active\":{}}}", MAX_ACTIVE.load(Ordering::SeqCst)))
+            sleep(Duration::from_millis(req.query_or("ms", 20))).await;
+            Response::json(format!(r#"{{"max_active":{}}}"#, MAX_ACTIVE.load(Ordering::SeqCst)))
         }
 
         // Write 1 MiB chunks to `/{mount}/fill.bin` until `mb` or an error.
         "/fill" => {
-            let mount = format!("/{}", req.q("mount").unwrap_or("tmp"));
-            let mb = req.q_u64("mb", 1 << 20);
-            let name = req.q("name").unwrap_or("fill.bin").to_string();
-            let fd = match util::open(&mount, &name, OFlags::CREATE, FdFlags::READ | FdFlags::WRITE).await {
+            let name = req.query("name").unwrap_or("fill.bin");
+            let fd = match async { mount(&req)?.open(name, OpenFlags::CREATE, FdFlags::READ | FdFlags::WRITE).await }.await {
                 Ok(fd) => fd,
-                Err(e) => return fs_fail(0, &e),
+                Err(e) => return Ok(fs_fail(0, &e)),
             };
             let mut written = 0u64;
-            for i in 0..mb {
-                if let Err(e) = util::write_all(&fd, vec![0xAB; 1 << 20], i << 20).await {
-                    let st = fd.stat().await.map(|s| s.size).unwrap_or(written);
-                    return fs_fail(st, &e);
+            for i in 0..req.query_or("mb", 1 << 20) {
+                if let Err(e) = fs::write_at(&fd, vec![0xAB; 1 << 20], i << 20).await {
+                    return Ok(fs_fail(fd.stat().await.map(|s| s.size).unwrap_or(written), &e));
                 }
                 written += 1 << 20;
             }
-            json(200, format!("{{\"written\":{written}}}"))
+            Response::json(format!(r#"{{"written":{written}}}"#))
         }
 
         // One file of `mb` MiB in a single write.
         "/bigfile" => {
-            let mount = format!("/{}", req.q("mount").unwrap_or("tmp"));
-            let mb = req.q_u64("mb", 64);
-            match util::write_file(&mount, "big.bin", vec![7u8; (mb as usize) << 20]).await {
-                Ok(()) => json(200, format!("{{\"written\":{}}}", mb << 20)),
+            let mb = req.query_or::<u64>("mb", 64);
+            match async { mount(&req)?.write("big.bin", vec![7u8; (mb as usize) << 20]).await }.await {
+                Ok(()) => Response::json(format!(r#"{{"written":{}}}"#, mb << 20)),
                 Err(e) => fs_fail(0, &e),
             }
         }
 
         // Create `n` small files until the file-count limit.
         "/files" => {
-            let mount = format!("/{}", req.q("mount").unwrap_or("tmp"));
-            let n = req.q_u64("n", 1_000_000);
+            let n = req.query_or::<u64>("n", 1_000_000);
             for i in 0..n {
-                if let Err(e) = util::write_file(&mount, &format!("f{i}"), b"x".to_vec()).await {
-                    return json(507, format!("{{\"created\":{i},\"error\":{}}}", js(&util::fs_err(&e))));
+                if let Err(e) = async { mount(&req)?.write(&format!("f{i}"), "x").await }.await {
+                    return Ok(Response::json(format!(r#"{{"created":{i},"error":{}}}"#, quote(&fs::code(&e)))).status(507));
                 }
             }
-            json(200, format!("{{\"created\":{n}}}"))
+            Response::json(format!(r#"{{"created":{n}}}"#))
         }
 
         // Delete files created by /fill, /bigfile and /files.
         "/clean" => {
-            let mount = format!("/{}", req.q("mount").unwrap_or("tmp"));
-            let dir = util::mount(&mount).unwrap();
+            let dir = mount(&req).unwrap();
             let mut removed = 0;
-            for name in ["fill.bin", "big.bin"] {
-                if dir.unlink_file_at(name.to_string()).await.is_ok() {
+            let names = ["fill.bin".to_string(), "big.bin".to_string()];
+            for name in names.into_iter().chain((0..req.query_or::<u64>("n", 0)).map(|i| format!("f{i}"))) {
+                if dir.remove(&name).await.is_ok() {
                     removed += 1;
                 }
             }
-            for i in 0..req.q_u64("n", 0) {
-                if dir.unlink_file_at(format!("f{i}")).await.is_ok() {
-                    removed += 1;
-                }
-            }
-            json(200, format!("{{\"removed\":{removed}}}"))
+            Response::json(format!(r#"{{"removed":{removed}}}"#))
         }
 
         // Try to read outside the sandbox in every way we can think of.
@@ -186,229 +156,147 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
                 ("/tmp", "../"),
                 ("/tmp", "../../data"),
             ] {
-                let r = match util::read_file(mount, path).await {
-                    Ok(b) => format!("LEAKED {} bytes", b.len()),
-                    Err(e) => util::fs_err(&e),
+                let result = match Dir::at(mount).unwrap().read(path).await {
+                    Ok(Some(b)) => format!("LEAKED {} bytes", b.len()),
+                    Ok(None) => fs::code(&FsError::NoEntry),
+                    Err(e) => fs::code(&e),
                 };
-                results.push(format!(
-                    "{{\"mount\":{},\"path\":{},\"result\":{}}}",
-                    js(mount),
-                    js(path),
-                    js(&r)
-                ));
+                results.push(format!(r#"{{"mount":{},"path":{},"result":{}}}"#, quote(mount), quote(path), quote(&result)));
             }
             // Symlink pointing outside, then follow it.
-            let data = util::mount("/data").unwrap();
-            let sl = data
-                .symlink_at("/etc/passwd".to_string(), "evil-link".to_string())
-                .await;
-            let follow = match data
-                .open_at(
-                    PathFlags::SYMLINK_FOLLOW,
-                    "evil-link".to_string(),
-                    OFlags::empty(),
-                    FdFlags::READ,
-                )
-                .await
-            {
-                Ok(_) => "OPENED".to_string(),
-                Err(e) => util::fs_err(&e),
-            };
-            let _ = data.unlink_file_at("evil-link".to_string()).await;
-            results.push(format!(
-                "{{\"symlink\":{},\"follow\":{}}}",
-                js(&match sl {
-                    Ok(()) => "created".into(),
-                    Err(e) => util::fs_err(&e),
-                }),
-                js(&follow)
-            ));
+            let data = data().descriptor();
+            let link = data.symlink_at("/etc/passwd".into(), "evil-link".into()).await;
+            let follow = data.open_at(PathFlags::SYMLINK_FOLLOW, "evil-link".into(), OpenFlags::empty(), FdFlags::READ).await;
+            let _ = data.unlink_file_at("evil-link".into()).await;
+            let link = link.map_or_else(|e| fs::code(&e), |()| "created".into());
+            let follow = follow.map_or_else(|e| fs::code(&e), |_| "OPENED".into());
+            results.push(format!(r#"{{"symlink":{},"follow":{}}}"#, quote(&link), quote(&follow)));
             let leaked = results.iter().any(|r| r.contains("LEAKED") || r.contains("OPENED"));
-            json(if leaked { 200 } else { 403 }, format!("[{}]", results.join(",")))
+            Response::json(format!("[{}]", results.join(","))).status(if leaked { 200 } else { 403 })
         }
 
         // Rename `from` to `to` (default: onto itself, a POSIX no-op) `n` times.
         "/rename" => {
-            let mount = format!("/{}", req.q("mount").unwrap_or("tmp"));
-            let from = req.q("from").unwrap_or("fill.bin").to_string();
-            let to = req.q("to").unwrap_or(&from).to_string();
-            let dir = util::mount(&mount).unwrap();
-            for i in 0..req.q_u64("n", 1) {
-                if let Err(e) = dir.rename_at(from.clone(), dir, to.clone()).await {
-                    return json(507, format!("{{\"renamed\":{i},\"error\":{}}}", js(&util::fs_err(&e))));
+            let from = req.query("from").unwrap_or("fill.bin");
+            let to = req.query("to").unwrap_or(from);
+            let dir = mount(&req).unwrap().descriptor();
+            for i in 0..req.query_or::<u64>("n", 1) {
+                if let Err(e) = dir.rename_at(from.into(), dir, to.into()).await {
+                    return Ok(Response::json(format!(r#"{{"renamed":{i},"error":{}}}"#, quote(&fs::code(&e)))).status(507));
                 }
             }
-            json(200, "{\"renamed\":true}")
+            Response::json("{\"renamed\":true}")
         }
 
         "/cross-rename" => {
-            let _ = util::write_file("/tmp", "x.txt", b"x".to_vec()).await;
-            let tmp = util::mount("/tmp").unwrap();
-            let data = util::mount("/data").unwrap();
-            match tmp.rename_at("x.txt".to_string(), data, "x.txt".to_string()).await {
-                Ok(()) => json(200, "{\"renamed\":true}"),
+            let _ = tmp().write("x.txt", "x").await;
+            match tmp().descriptor().rename_at("x.txt".into(), data().descriptor(), "x.txt".into()).await {
+                Ok(()) => Response::json("{\"renamed\":true}"),
                 Err(e) => fs_fail(0, &e),
             }
         }
 
         // Outbound HTTP to an arbitrary URL.
         "/fetch" => {
-            let url = req
-                .q("url")
-                .unwrap_or("http://169.254.169.254/latest/meta-data/")
-                .to_string();
-            let method = req.q("method").unwrap_or("GET").to_string();
-            match fetch(&url, &method).await {
-                Ok((status, body)) => json(
-                    200,
-                    format!(
-                        "{{\"status\":{status},\"bytes\":{},\"body\":{}}}",
-                        body.len(),
-                        js(&String::from_utf8_lossy(&body[..body.len().min(200)]))
-                    ),
-                ),
-                Err(e) => json(502, format!("{{\"denied\":{}}}", js(&format!("{e:?}")))),
+            let url = req.query("url").unwrap_or("http://169.254.169.254/latest/meta-data/");
+            match nanovm_sdk::fetch(url).method(req.query("method").unwrap_or("GET")).send().await {
+                Ok(r) => Response::json(format!(
+                    r#"{{"status":{},"bytes":{},"body":{}}}"#,
+                    r.status,
+                    r.body.len(),
+                    quote(&String::from_utf8_lossy(&r.body[..r.body.len().min(200)]))
+                )),
+                Err(e) => Response::json(format!(r#"{{"denied":{}}}"#, quote(&format!("{e:?}")))).status(502),
             }
         }
 
         // Send `n` requests one after another, keeping every response body
         // open and unread: each one holds an outbound connection.
         "/hold" => {
-            let url = req.q("url").unwrap_or("http://example.com/").to_string();
+            let url = req.query("url").unwrap_or("http://example.com/");
             let mut held = Vec::new();
-            for _ in 0..req.q_u64("n", 3) {
-                match send(&url, "GET").await {
+            for _ in 0..req.query_or::<u64>("n", 3) {
+                match nanovm_sdk::fetch(url).open().await {
                     Ok(r) => held.push(r),
                     Err(e) => {
-                        return json(
-                            200,
-                            format!("{{\"held\":{},\"denied\":{}}}", held.len(), js(&format!("{e:?}"))),
-                        );
+                        return Ok(Response::json(format!(r#"{{"held":{},"denied":{}}}"#, held.len(), quote(&format!("{e:?}")))));
                     }
                 }
             }
-            json(200, format!("{{\"held\":{}}}", held.len()))
+            Response::json(format!(r#"{{"held":{}}}"#, held.len()))
         }
 
         // wasi:keyvalue: `op` is fill (n keys of `size` bytes until refused),
         // key (one key `len` bytes long), incr (`delta` on `key`), list (a
-        // page from `cursor`) or open (bucket `name`).
+        // page from `cursor`), plant, many, or open (bucket `name`).
         "/kv" => {
-            use util::kv::{atomics, store};
-            let q = |k| req.q(k).unwrap_or("").to_string();
-            let err = |e: store::Error| js(&format!("{e:?}"));
-            let bucket = match store::open(&q("name")) {
+            let err = |e: kv::Error| quote(&format!("{e:?}"));
+            let bucket = match kv::store::open(req.query("name").unwrap_or("")) {
                 Ok(b) => b,
-                Err(e) => return json(200, format!("{{\"opened\":false,\"error\":{}}}", err(e))),
+                Err(e) => return Ok(Response::json(format!(r#"{{"opened":false,"error":{}}}"#, err(e)))),
             };
-            let out = match q("op").as_str() {
+            Response::json(match req.query("op").unwrap_or("") {
                 "fill" => {
-                    let value = vec![7u8; req.q_u64("size", 1) as usize];
-                    let mut n = 0;
-                    let mut error = String::from("null");
-                    while n < req.q_u64("n", 1_000_000) {
+                    let value = vec![7u8; req.query_or("size", 1)];
+                    let (mut n, mut error) = (0u64, "null".to_string());
+                    while n < req.query_or("n", 1_000_000) {
                         if let Err(e) = bucket.set(&format!("k{n}"), &value) {
                             error = err(e);
                             break;
                         }
                         n += 1;
                     }
-                    format!("{{\"set\":{n},\"error\":{error}}}")
+                    format!(r#"{{"set":{n},"error":{error}}}"#)
                 }
-                "key" => match bucket.set(&"k".repeat(req.q_u64("len", 1) as usize), b"v") {
-                    Ok(()) => "{\"set\":true}".to_string(),
-                    Err(e) => format!("{{\"error\":{}}}", err(e)),
+                "key" => match bucket.set(&"k".repeat(req.query_or("len", 1)), b"v") {
+                    Ok(()) => r#"{"set":true}"#.into(),
+                    Err(e) => format!(r#"{{"error":{}}}"#, err(e)),
                 },
-                "incr" => match atomics::increment(&bucket, &q("key"), req.q_u64("delta", 1)) {
-                    Ok(n) => format!("{{\"value\":{n}}}"),
-                    Err(e) => format!("{{\"error\":{}}}", err(e)),
+                "incr" => match kv::atomics::increment(&bucket, req.query("key").unwrap_or(""), req.query_or("delta", 1)) {
+                    Ok(n) => format!(r#"{{"value":{n}}}"#),
+                    Err(e) => format!(r#"{{"error":{}}}"#, err(e)),
                 },
-                "list" => match bucket.list_keys(req.q("cursor").and_then(|c| c.parse().ok())) {
-                    Ok(r) => format!(
-                        "{{\"keys\":{},\"cursor\":{}}}",
-                        r.keys.len(),
-                        r.cursor.map_or("null".to_string(), |c| c.to_string())
-                    ),
-                    Err(e) => format!("{{\"error\":{}}}", err(e)),
+                "list" => match bucket.list_keys(req.query("cursor").and_then(|c| c.parse().ok())) {
+                    Ok(r) => format!(r#"{{"keys":{},"cursor":{}}}"#, r.keys.len(), r.cursor.map_or("null".into(), |c| c.to_string())),
+                    Err(e) => format!(r#"{{"error":{}}}"#, err(e)),
                 },
                 // Take key `k0`'s file name (base64url "azA") with a
                 // directory through the filesystem, then set the key.
                 "plant" => {
-                    let data = util::mount("/data").unwrap();
                     for d in [".kv/default/azA", ".kv/default/azA/x"] {
-                        let _ = data.create_directory_at(d.to_string()).await;
+                        let _ = data().descriptor().create_directory_at(d.into()).await;
                     }
                     match bucket.set("k0", &vec![1u8; 1 << 20]) {
-                        Ok(()) => "{\"set\":true}".to_string(),
-                        Err(e) => format!("{{\"error\":{}}}", err(e)),
+                        Ok(()) => r#"{"set":true}"#.into(),
+                        Err(e) => format!(r#"{{"error":{}}}"#, err(e)),
                     }
                 }
                 // `get-many` of key `k0`, `n` times over.
-                "many" => {
-                    let keys = vec!["k0".to_string(); req.q_u64("n", 1) as usize];
-                    match util::kv::batch::get_many(&bucket, &keys) {
-                        Ok(v) => format!("{{\"got\":{}}}", v.iter().flatten().count()),
-                        Err(e) => format!("{{\"error\":{}}}", err(e)),
-                    }
-                }
-                _ => "{\"opened\":true}".to_string(),
-            };
-            json(200, out)
+                "many" => match kv::batch::get_many(&bucket, &vec!["k0".to_string(); req.query_or("n", 1)]) {
+                    Ok(v) => format!(r#"{{"got":{}}}"#, v.iter().flatten().count()),
+                    Err(e) => format!(r#"{{"error":{}}}"#, err(e)),
+                },
+                _ => r#"{"opened":true}"#.into(),
+            })
         }
 
         // Hold `n` host resources forever.
         "/leak" => {
-            let n = req.q_u64("n", 1_000_000);
-            for _ in 0..n {
+            for _ in 0..req.query_or::<u64>("n", 1_000_000) {
                 LEAKED.with(|l| l.borrow_mut().push(Fields::new()));
             }
-            json(200, format!("{{\"leaked\":{}}}", LEAKED.with(|l| l.borrow().len())))
+            Response::json(format!(r#"{{"leaked":{}}}"#, LEAKED.with(|l| l.borrow().len())))
         }
 
-        _ => text(404, "not found"),
-    }
+        _ => Response::not_found(),
+    })
 }
 
-fn fs_fail(written: u64, e: &util::FsErrorCode) -> Result<Response, ErrorCode> {
-    json(
-        507,
-        format!("{{\"written\":{written},\"error\":{}}}", js(&util::fs_err(e))),
-    )
+/// The mount `?mount=` names (`tmp` by default).
+fn mount(req: &Request) -> core::result::Result<Dir, FsError> {
+    Dir::at(&format!("/{}", req.query("mount").unwrap_or("tmp"))).ok_or(FsError::NoEntry)
 }
 
-async fn fetch(url: &str, method: &str) -> Result<(u16, Vec<u8>), ErrorCode> {
-    let response = send(url, method).await?;
-    let status = response.get_status_code();
-    let (result_tx, result_rx) = wit_future::new(|| Ok(()));
-    let (body_rx, _trailers) = Response::consume_body(response, result_rx);
-    let body = body_rx.collect().await;
-    drop(result_tx);
-    Ok((status, body))
-}
-
-async fn send(url: &str, method: &str) -> Result<Response, ErrorCode> {
-    let (scheme, rest) = match url.split_once("://") {
-        Some(("https", r)) => (Scheme::Https, r),
-        Some(("http", r)) => (Scheme::Http, r),
-        _ => return Err(ErrorCode::HttpRequestUriInvalid),
-    };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    let (trailers_tx, trailers_rx) = wit_future::new(|| Ok(None));
-    let (request, _sent) = Request::new(Fields::new(), None, trailers_rx, None);
-    drop(trailers_tx);
-    let m = match method {
-        "GET" => Method::Get,
-        "POST" => Method::Post,
-        "DELETE" => Method::Delete,
-        "PUT" => Method::Put,
-        other => Method::Other(other.to_string()),
-    };
-    let _ = request.set_method(&m);
-    let _ = request.set_scheme(Some(&scheme));
-    let _ = request.set_authority(Some(authority));
-    let _ = request.set_path_with_query(Some(path));
-    wasip3::http::client::send(request).await
+fn fs_fail(written: u64, e: &FsError) -> Response {
+    Response::json(format!(r#"{{"written":{written},"error":{}}}"#, quote(&fs::code(e)))).status(507)
 }
