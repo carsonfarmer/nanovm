@@ -6,7 +6,7 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 - Each object has its own memory cap, CPU budget, deadlines and handle cap.
 - Each object has its own quota'd filesystem: scratch `/tmp` and a persistent `/data` volume.
 - Each app has an egress allowlist.
-- Each object has a `wasi:keyvalue` store in its volume, and each app its `wasi:config` values.
+- Each object has a composed Spin KV store in its volume, and each app its host-injected `wasi:config` values.
 - Objects accept WebSockets and publish to their own sockets.
 - Memory is lost on eviction; `/data` survives eviction and restarts.
 
@@ -222,13 +222,13 @@ What happens on the first request for a digest:
 
 ## Key-value and config
 
-**`wasi:keyvalue`** (`store`, `atomics` and `batch`, 0.2.0-draft) is implemented by the host on the object's own volume. Bucket `b` is the directory `/data/.kv/b`, and each key is one file in it, named by the key in unpadded base64url so that no key can name a path.
+**`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. This branch's migration is under validation, not released. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.
 - Values count against the object's disk budget and keys against its file limit, like any other file.
-- A value is written in place; its request's commit makes it durable, together with everything else the request changed (see Commits).
-- A read is bounded by the object's memory limit, and a batch names at most 1,000 keys. Host calls aren't interrupted by the CPU budget, so these bounds keep them short.
+- Replacement writes a temporary file and renames it over the key. It needs room for both values and a temporary entry; old descriptors retain the old value. Only the host commits, together with all the request's file/SQL changes.
+- Values are bounded to 1 MiB. Key enumeration streams with backpressure and an error completion. A combined 32-store/listing cap lasts through completion delivery; host resource limits also apply.
 - `wasi:filesystem` stays exposed. A guest can reach `.kv` through it; the store lists only well-formed key files, and refuses to write over anything else.
 
-Spin's store, by comparison, is one SQLite table per app shared by all its instances, with no per-store disk quota. Ours is per object, under the object's quotas, with no dependency. Commits give it what SQLite would: a request's values, files included, land together and durably, or not at all.
+We adopt Spin's WIT, not its deployment/storage model: all valid labels are allowed within each object's isolated volume, without a `spin.toml` allowlist or shared cross-object store. There is no SQLite dependency for KV. Caller cancellation is deferred across a mutation; traps, deadlines and crashes roll back through the host.
 
 **`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
@@ -477,10 +477,9 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 
 ## Layout
 
-W-18's [Spin KV prototype](experiments/kv-filesystem/SPIN.md) runs async CRUD and
-streaming key enumeration over the transactional filesystem. The earlier
-[synchronous ABI probe](experiments/kv-filesystem/README.md) remains a negative
-control. Both are experiments, not replacement providers; env/config stay injected.
+W-18's [Spin KV provider](components/keyvalue/README.md) replaces native KV on
+this branch. The obsolete synchronous experiment is removed; its negative ABI
+result remains recorded in HANDOFF Q73. Env/config stay injected.
 
 | Path | What it is |
 |---|---|
@@ -497,7 +496,7 @@ control. Both are experiments, not replacement providers; env/config stay inject
 | `crates/nanovm/src/proxy.rs` | `nanovm proxy`: DNS routing, tag resolution, forwarding |
 | `crates/nanovm/examples/dev-registry.rs` | A loopback registry with the guests published, for dev mode |
 | `crates/nanovm/src/link.rs` | HTTP/1.1 over socketpairs passed across a control socket |
-| `crates/nanovm/src/kv.rs` | `wasi:keyvalue` on the object's volume |
+| `components/keyvalue/` | Composed Spin async KV over the object's filesystem |
 | `crates/nanovm/src/journal.rs` | Per-request commits: the undo journal, commit and crash recovery |
 | `crates/nanovm/src/ws.rs` | WebSockets: the proxy's sockets, WebSocket-over-HTTP events and per-object channels |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |

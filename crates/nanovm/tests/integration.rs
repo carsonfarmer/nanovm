@@ -810,6 +810,10 @@ async fn publish(repo: &str, app: &AppConfig) -> String {
 }
 
 async fn publish_wasm(repo: &str, app: &AppConfig, wasm: Vec<u8>) -> String {
+    publish_version(repo, app, wasm, "1.0.0").await
+}
+
+async fn publish_version(repo: &str, app: &AppConfig, wasm: Vec<u8>, version: &str) -> String {
     use nanovm::registry::{APP_TYPE, CONFIG_TYPE, VERSION, WASM_TYPE};
     use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
     let layer = ImageLayer::new(wasm, WASM_TYPE.into(), None);
@@ -818,7 +822,7 @@ async fn publish_wasm(repo: &str, app: &AppConfig, wasm: Vec<u8>) -> String {
     let mut manifest = oci_client::manifest::OciImageManifest::build(
         std::slice::from_ref(&layer),
         &config,
-        Some([(VERSION.to_string(), "1.0.0".to_string())].into()),
+        Some([(VERSION.to_string(), version.to_string())].into()),
     );
     manifest.artifact_type = Some(APP_TYPE.into());
     manifest.media_type = Some(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.into());
@@ -1307,15 +1311,23 @@ async fn open_response_bodies_count_against_outbound_concurrency() {
 
 // ---- registry apps -------------------------------------------------------
 //
-// These run against the guests CI publishes (.github/workflows/
-// publish-guests.yml) to ghcr.io, signed by GitHub artifact attestations, and
-// skip, saying why, where those can't be reached.
+// Signature checks load the artifacts CI publishes to GHCR without running
+// their older guest interfaces. Worker drains use locally composed guests.
 
 const SIGNER: &str = "https://token.actions.githubusercontent.com \
     https://github.com/carsonfarmer/nanovm/.github/workflows/publish-guests.yml@refs/heads/main";
 
-/// The published versions of guest `name`, oldest first, as
-/// `(version, ghcr.io/…@digest)`.
+async fn drain_versions(repo: &str) -> (String, String) {
+    let mut hostile = app("hostile");
+    hostile.limits.cpu_ms = 500;
+    hostile.limits.request_timeout_ms = 2000;
+    hostile.limits.post_return_timeout_ms = 1000;
+    let old = publish_version(repo, &hostile, guest("hostile"), "1.0.0").await;
+    let new = publish_version(repo, &hostile, guest("hostile"), "2.0.0").await;
+    assert_ne!(old, new);
+    (old, new)
+}
+
 /// A drain that runs out of time kills the old worker even while a client
 /// still holds one of its responses unread, so it can't run beside the next
 /// version. (The rollback from the newest version to the one before is a
@@ -1323,21 +1335,16 @@ const SIGNER: &str = "https://token.actions.githubusercontent.com \
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_that_runs_out_of_time_kills_the_old_worker() {
     use tokio::io::AsyncWriteExt;
-    let versions = match published("hostile").await {
-        Ok(v) if v.len() >= 2 => v,
-        Ok(_) => return eprintln!("skipped: needs two published versions of hostile"),
-        Err(why) => return eprintln!("skipped: {why}"),
-    };
-    let (old, new) = (versions[versions.len() - 2].1.clone(), versions[versions.len() - 1].1.clone());
-    let (_sup, addr) = signed("drain_kills_the_old_worker").await;
+    let (old, new) = drain_versions("drain-timeout").await;
+    let (_sup, addr) = supervised("drain_kills_the_old_worker").await;
 
     // A client that reads a little of a 7 MiB answer, then stops.
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.set_recv_buffer_size(4096).unwrap();
     let mut held = sock.connect(addr).await.unwrap();
     let head = format!(
-        "GET /h/big?mb=7 HTTP/1.1\r\nHost: x\r\nnanovm-app: {new}\r\nnanovm-trust: {}\r\n\r\n",
-        SIGNER
+        "GET /h/big?mb=7 HTTP/1.1\r\nHost: x\r\n{}\r\n",
+        names(&new)
     );
     held.write_all(head.as_bytes()).await.unwrap();
     let mut response = [0; 64];
@@ -1346,7 +1353,7 @@ async fn a_drain_that_runs_out_of_time_kills_the_old_worker() {
     let pid = stats_json(addr).await["workers"][worker(&new).as_str()]["pid"].as_u64().unwrap();
 
     let t0 = Instant::now();
-    assert_eq!(reg_get(addr, "/x/", &old, SIGNER, None).await.0, 200);
+    assert_eq!(app_get(addr, &old, "/x/").await.0, 200);
     // The switch waited out the drain (hostile's 2 s + 1 s), then killed it.
     assert!(t0.elapsed() >= Duration::from_secs(3), "{:?}", t0.elapsed());
     let t1 = Instant::now();
@@ -1355,8 +1362,12 @@ async fn a_drain_that_runs_out_of_time_kills_the_old_worker() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     drop(held);
+    let v = stats_json(addr).await;
+    assert_eq!(v["workers"][worker(&old).as_str()]["version"], "1.0.0", "{v}");
+    assert_ne!(v["workers"][worker(&old).as_str()]["pid"].as_u64().unwrap(), pid);
 }
 
+/// Published versions, oldest first, as `(version, ghcr.io/…@digest)`.
 async fn published(name: &str) -> Result<Vec<(semver::Version, String)>, String> {
     use oci_client::{Reference, secrets::RegistryAuth};
     let repo = format!("ghcr.io/carsonfarmer/nanovm-{name}");
@@ -1391,56 +1402,51 @@ async fn signed(test: &str) -> (Arc<nanovm::supervisor::Supervisor>, std::net::S
     supervised_with(cfg).await
 }
 
-async fn reg_get(addr: std::net::SocketAddr, path: &str, app: &str, trust: &str, min: Option<&str>) -> (u16, String) {
-    let min = min.map(|m| format!("nanovm-min-version: {m}\r\n")).unwrap_or_default();
-    let head = format!(
-        "GET {path} HTTP/1.1\r\nHost: x\r\nnanovm-app: {app}\r\nnanovm-trust: {trust}\r\n{min}Connection: close\r\n\r\n"
-    );
-    raw(addr, &head, b"").await
-}
-
-/// A registry app runs from its signed artifact, and anything short of a
+/// A registry app loads from its signed artifact, and anything short of a
 /// trusted signature over that digest at an allowed version is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn registry_apps_need_a_trusted_signature() {
-    let counter = match published("counter").await {
-        Ok(v) => v.last().unwrap().clone(),
-        Err(why) => return eprintln!("skipped: {why}"),
+    use nanovm::registry::{AppRef, Registry};
+    let (version, app) = published("counter").await.expect("published signed counter is reachable").pop().unwrap();
+    let cfg = node_cfg("registry_apps_need_a_trusted_signature", 8);
+    let registry = Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, false).unwrap();
+    let reference = |app: &str, trust: &str, min: Option<&str>| {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("nanovm-app", app.parse().unwrap());
+        headers.insert("nanovm-trust", trust.parse().unwrap());
+        if let Some(min) = min {
+            headers.insert("nanovm-min-version", min.parse().unwrap());
+        }
+        AppRef::from_headers(&headers).unwrap().unwrap()
     };
-    let (_sup, addr) = signed("registry_apps_need_a_trusted_signature").await;
-    let (version, app) = counter;
-
-    let (status, body) = reg_get(addr, "/a/", &app, SIGNER, Some(&version.to_string())).await;
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains(&format!(r#""app":"{}""#, worker(&app))), "{body}");
-    let v = stats_json(addr).await;
-    assert_eq!(v["workers"][worker(&app).as_str()]["version"], version.to_string(), "{v}");
-    // The app's config values are served through wasi:config.
-    let (status, body) = reg_get(addr, "/a/config/greeting", &app, SIGNER, None).await;
-    assert_eq!((status, body.as_str()), (200, "from the registry"));
+    let accepted = reference(&app, SIGNER, Some(&version.to_string()));
+    let pulled = registry.load(&accepted).await.unwrap();
+    assert_eq!(pulled.version, version);
+    assert_eq!(pulled.spec.config["greeting"], "from the registry");
+    assert!(pulled.wasm.starts_with(b"\0asm"));
 
     let wrong_subject = SIGNER.replace("publish-guests.yml", "other.yml");
     let wrong_issuer = SIGNER.replace("token.actions", "evil");
     let unsigned = app.rsplit_once('@').unwrap().0.to_string() + "@sha256:" + &"0".repeat(64);
     let too_new = format!("{}.0.0", version.major + 1);
-    // The running version, under another policy, is checked again (twice:
+    // The cached artifact, under another policy, is checked again (twice:
     // a refusal is not remembered as an acceptance).
     for (name, a, trust, min, why) in [
         ("subject", app.as_str(), wrong_subject.as_str(), None, "not signed by a trusted identity"),
         ("subject", app.as_str(), wrong_subject.as_str(), None, "not signed by a trusted identity"),
         ("issuer", app.as_str(), wrong_issuer.as_str(), None, "not signed by a trusted identity"),
         ("floor", app.as_str(), SIGNER, Some(too_new.as_str()), "below the minimum"),
-        ("digest", unsigned.as_str(), SIGNER, None, "loading"),
+        ("digest", unsigned.as_str(), SIGNER, None, "not found"),
     ] {
-        let (status, body) = reg_get(addr, "/a/", a, trust, min).await;
-        assert_eq!(status, 502, "{name}: {body}");
-        assert!(body.contains(why), "{name}: {body}");
+        let error = registry.load(&reference(a, trust, min)).await.err().expect("untrusted artifact is refused");
+        assert!(format!("{error:#}").contains(why), "{name}: {error:#}");
     }
-    // None of that disturbed the running version.
-    assert_eq!(reg_get(addr, "/a/", &app, SIGNER, None).await.0, 200);
-    let v = stats_json(addr).await;
-    assert_eq!(v["workers"][worker(&app).as_str()]["starts"], 1, "{v}");
-    // Trust is required.
+    // Refusals do not poison an authorized reload.
+    let reloaded = registry.load(&accepted).await.unwrap();
+    assert_eq!(reloaded.version, version);
+    assert_eq!(reloaded.wasm, pulled.wasm);
+    // Trust is required at the HTTP boundary, before any instantiation.
+    let (_sup, addr) = signed("registry_trust_header").await;
     let head = format!("GET /a/ HTTP/1.1\r\nHost: x\r\nnanovm-app: {app}\r\nConnection: close\r\n\r\n");
     assert_eq!(raw(addr, &head, b"").await.0, 400);
 }
@@ -1449,28 +1455,21 @@ async fn registry_apps_need_a_trusted_signature() {
 /// worker finish, the new worker serves the same volumes.
 #[tokio::test(flavor = "multi_thread")]
 async fn registry_app_switches_versions_after_a_drain() {
-    let versions = match published("hostile").await {
-        Ok(v) if v.len() >= 2 => v,
-        Ok(_) => return eprintln!("skipped: needs two published versions of hostile"),
-        Err(why) => return eprintln!("skipped: {why}"),
-    };
-    let (old, new) = (&versions[versions.len() - 2], &versions[versions.len() - 1]);
-    let (_sup, addr) = signed("registry_app_switches_versions").await;
-    let (old_app, new_app) = (old.1.clone(), new.1.clone());
+    let (old_app, new_app) = drain_versions("drain-switch").await;
+    let (_sup, addr) = supervised("registry_app_switches_versions").await;
 
-    // Cache both signed versions before testing the drain: downloading or
+    // Cache both versions before testing the drain: downloading or
     // compiling the replacement could otherwise outlast the sleeping request.
-    let (status, body) = reg_get(addr, "/warm/", &new_app, SIGNER, None).await;
+    let (status, body) = app_get(addr, &new_app, "/warm/").await;
     assert_eq!(status, 200, "{body}");
-    // Persistence needs only a tiny file and key, not MiB of writes racing
-    // the signed app's 100 ms CPU limit. Quotas have their own tests.
+    // Persistence needs only a tiny file and key; quotas have their own tests.
     let expected = serde_json::json!({"file": "before-switch", "key": "before-switch"});
-    let (status, body) = reg_get(addr, "/w/commit?v=before-switch", &old_app, SIGNER, None).await;
+    let (status, body) = app_get(addr, &old_app, "/w/commit?v=before-switch").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), expected);
     let old_worker = worker(&old_app);
     let old_pid = stats_json(addr).await["workers"][&old_worker]["pid"].as_u64().unwrap();
-    let slow = tokio::spawn(async move { reg_get(addr, "/s/sleep?ms=1500", &old_app, SIGNER, None).await });
+    let slow = tokio::spawn(async move { app_get(addr, &old_app, "/s/sleep?ms=1500").await });
     let started = Instant::now();
     loop {
         let v = stats_json(addr).await;
@@ -1481,7 +1480,7 @@ async fn registry_app_switches_versions_after_a_drain() {
         assert!(started.elapsed() < Duration::from_secs(2), "old request never entered handling: {v}");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let (status, body) = reg_get(addr, "/w/commit", &new_app, SIGNER, None).await;
+    let (status, body) = app_get(addr, &new_app, "/w/commit").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), expected);
     // Observe worker lifetime, not the scheduling order of two HTTP clients.
@@ -1489,11 +1488,11 @@ async fn registry_app_switches_versions_after_a_drain() {
     let (slow_status, slow_body) = slow.await.unwrap();
     assert_eq!(slow_status, 200, "the old version's request finished: {slow_body}");
     let v = stats_json(addr).await;
-    assert_eq!(v["workers"][worker(&new.1).as_str()]["version"], new.0.to_string(), "{v}");
-    assert_eq!(v["workers"][worker(&new.1).as_str()]["starts"], 3, "{v}");
+    assert_eq!(v["workers"][worker(&new_app).as_str()]["version"], "2.0.0", "{v}");
+    assert_eq!(v["workers"][worker(&new_app).as_str()]["starts"], 3, "{v}");
 }
 
-// ---- wasi:keyvalue -------------------------------------------------------
+// ---- composed spin:key-value --------------------------------------------
 
 /// Values survive the instance, live in the object's own volume, and go away
 /// when deleted.
@@ -1533,7 +1532,7 @@ async fn kv_counts_against_the_disk_quota() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn kv_refuses_bad_names_and_pages_keys() {
+async fn kv_refuses_bad_names_and_streams_keys() {
     // Writing 1,500 keys takes real CPU; give it room on a loaded host.
     let mut hostile = app("hostile");
     hostile.limits.cpu_ms = 5_000;
@@ -1551,19 +1550,12 @@ async fn kv_refuses_bad_names_and_pages_keys() {
         let r = get(&node, "b", &format!("/kv?name={name}")).await;
         assert!(r.body.contains("NoSuchStore"), "{name}: {}", r.body);
     }
-    assert_eq!(call("/kv?op=incr&key=c&delta=5").await.json()["value"], 5);
-    assert_eq!(call("/kv?op=incr&key=c&delta=5").await.json()["value"], 10);
-    assert!(call("/kv?op=incr&key=c&delta=18446744073709551615").await.body.contains("overflow"));
-    let not_a_number = "k".repeat(180);
-    let r = get(&node, "b", &format!("/kv?op=incr&key={not_a_number}")).await;
-    assert!(r.body.contains("not a number"), "{}", r.body);
-
-    let r = get(&node, "p", "/kv?name=paged&op=fill&size=1&n=1500").await;
+    let r = get(&node, "p", "/kv?name=streamed&op=fill&size=1&n=1500").await;
     assert_eq!(r.json()["set"], 1500, "{}", r.body);
-    let page = get(&node, "p", "/kv?name=paged&op=list").await.json();
-    assert_eq!((page["keys"].as_u64(), page["cursor"].as_u64()), (Some(1000), Some(1000)));
-    let page = get(&node, "p", "/kv?name=paged&op=list&cursor=1000").await.json();
-    assert_eq!((page["keys"].as_u64(), page["cursor"].as_u64()), (Some(500), None));
+    let r = get(&node, "p", "/kv?name=streamed&op=list").await;
+    assert_eq!(r.json(), serde_json::json!({"keys": 1500}), "{}", r.body);
+    let r = get(&node, "p", "/kv?name=empty&op=list").await;
+    assert_eq!(r.json(), serde_json::json!({"keys": 0}), "{}", r.body);
 }
 
 /// Key-value works inside the jail (Landlock and seccomp allow its file calls).
@@ -1584,7 +1576,7 @@ async fn kv_works_in_a_jailed_worker() {
     // A directory planted over a key's file: the set is refused, and leaves
     // nothing behind that the quota doesn't count.
     let (_, body) = app_get(addr, &hostile, "/p/kv?op=plant").await;
-    assert!(body.contains("not a regular file"), "{body}");
+    assert!(body.contains("IsDirectory"), "{body}");
     let bucket = std::fs::read_dir(node_dir("kv_works_in_a_jailed_worker").join("objects").join(worker(&hostile)).join("p/.kv/default")).unwrap();
     let names: Vec<_> = bucket.flatten().map(|e| e.file_name()).collect();
     assert_eq!(names, ["azA"], "only the planted directory is there");
@@ -1594,19 +1586,25 @@ fn node_dir(test: &str) -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes").join(test)
 }
 
-/// Reads are bounded by what the guest could hold (its memory limit, 32 MiB
-/// here) and batches by size, so a host call can't run away.
+/// The provider bounds both writes and reads to 1 MiB per value, including
+/// files written outside the KV interface.
 #[tokio::test(flavor = "multi_thread")]
-async fn kv_reads_and_batches_are_bounded() {
+async fn kv_values_are_bounded() {
     let node = node("kv_bounded", "hostile", 8);
-    let r = get(&node, "m", "/kv?op=fill&size=4194304&n=1").await;
+    let r = get(&node, "m", "/kv?op=fill&size=1048576&n=1").await;
     assert_eq!(r.json()["set"], 1, "{}", r.body);
-    // 7 × 4 MiB fits in 32 MiB; 9 doesn't.
-    assert_eq!(get(&node, "m", "/kv?op=many&n=7").await.json()["got"], 7);
-    let r = get(&node, "m", "/kv?op=many&n=9").await;
-    assert!(r.body.contains("memory limit"), "{}", r.body);
-    let r = get(&node, "m", "/kv?op=many&n=1001").await;
-    assert!(r.body.contains("at most 1000 keys"), "{}", r.body);
+    assert_eq!(get(&node, "m", "/kv?op=get").await.json()["bytes"], 1 << 20);
+    let r = get(&node, "m", "/kv?op=fill&size=1048577&n=1").await;
+    assert_eq!(r.json()["set"], 0, "{}", r.body);
+    assert!(r.body.contains("value exceeds 1 MiB"), "{}", r.body);
+    assert_eq!(get(&node, "m", "/kv?op=get").await.json()["bytes"], 1 << 20, "failed write keeps old value");
+
+    node.shutdown().await;
+    let file = node.cfg.data_dir.join("objects/hostile/m/.kv/default/azA");
+    std::fs::write(file, vec![7u8; (1 << 20) + 1]).unwrap();
+    let r = get(&node, "m", "/kv?op=get").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(r.body.contains("value exceeds 1 MiB"), "{}", r.body);
 }
 
 /// An app's `config` values are what its guests read through `wasi:config`.

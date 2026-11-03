@@ -135,23 +135,6 @@ impl QuotaGuard {
         Ok(())
     }
 
-    /// Makes room to replace a file of `old` bytes (`None`: a new file) with
-    /// one of `new` bytes, or refuses as a full disk would.
-    pub fn reserve(&self, old: Option<u64>, new: u64) -> Result<(), ErrorCode> {
-        let mut q = self.0.lock();
-        if old.is_none() && q.files >= q.max_files {
-            let what = format!("entry limit reached ({} files)", q.max_files);
-            return Err(q.deny(ErrorCode::Quota, what));
-        }
-        let freed = old.unwrap_or(0).min(q.bytes);
-        if (q.bytes - freed).saturating_add(new) > q.max_bytes {
-            return Err(q.full());
-        }
-        q.bytes = q.bytes - freed + new;
-        q.files += u64::from(old.is_none());
-        Ok(())
-    }
-
     pub fn check_new_entry(&self) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
         if q.files >= q.max_files {
@@ -877,50 +860,13 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A new file costs an entry and its bytes; replacing one costs only the
-    /// difference, so a shrinking replacement frees space.
+    /// At the file limit no new entry is allowed until one is removed.
     #[test]
-    fn reserve_charges_new_files_and_replacements() {
-        let (g, _) = guard(100, 10);
-        g.reserve(None, 60).unwrap();
-        assert_eq!(usage(&g), (60, 1));
-        g.reserve(Some(60), 100).unwrap();
-        assert_eq!(usage(&g), (100, 1));
-        g.reserve(Some(100), 0).unwrap();
-        assert_eq!(usage(&g), (0, 1));
-        // A replaced file can't free more than is in use.
-        g.reserve(None, 5).unwrap();
-        g.reserve(Some(1000), 1).unwrap();
-        assert_eq!(usage(&g), (1, 2));
-    }
-
-    /// Past the byte limit a write is refused as a full disk would, leaving
-    /// usage as it was; filling it exactly is allowed.
-    #[test]
-    fn reserve_refuses_past_the_byte_limit() {
-        let (g, metrics) = guard(100, 10);
-        g.reserve(None, 70).unwrap();
-        assert!(matches!(g.reserve(None, 31), Err(ErrorCode::InsufficientSpace)));
-        assert!(matches!(g.reserve(Some(70), 101), Err(ErrorCode::InsufficientSpace)));
-        assert!(matches!(g.reserve(None, u64::MAX), Err(ErrorCode::InsufficientSpace)));
-        assert_eq!(usage(&g), (70, 1));
-        g.reserve(None, 30).unwrap();
-        assert_eq!(usage(&g), (100, 2));
-        assert_eq!(metrics.fs_denied.load(Relaxed), 3);
-    }
-
-    /// At the file limit no new entry is allowed, but existing files may
-    /// still be replaced.
-    #[test]
-    fn reserve_and_new_entries_stop_at_the_file_limit() {
+    fn new_entries_stop_at_the_file_limit() {
         let (g, _) = guard(100, 2);
         g.check_new_entry().unwrap();
-        g.reserve(None, 1).unwrap();
-        g.reserve(None, 1).unwrap();
-        assert!(matches!(g.reserve(None, 0), Err(ErrorCode::Quota)));
+        g.adjust(2, 2);
         assert!(matches!(g.check_new_entry(), Err(ErrorCode::Quota)));
-        g.reserve(Some(1), 50).unwrap();
-        assert_eq!(usage(&g), (51, 2));
         g.adjust(0, -1);
         g.check_new_entry().unwrap();
     }

@@ -1,6 +1,6 @@
 //! Executable contract probes; intentionally panic on violated expectations.
 mod bindings {
-    wit_bindgen::generate!({ path: "../spin-wit", world: "client", generate_all });
+    wit_bindgen::generate!({ path: "../wit", world: "client", generate_all });
 }
 use bindings::spin::key_value::key_value::Store;
 use util::wasip3::http::types::{ErrorCode, Request, Response};
@@ -23,6 +23,15 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             "/trap" => {
                 store.set("key".into(), b"rolled-back".to_vec()).await.expect("set");
                 panic!("rollback probe");
+            }
+            "/fault" => {
+                util::write_file("/data", "mixed", b"uncommitted".to_vec())
+                    .await
+                    .expect("mixed write");
+                store
+                    .set("key".into(), vec![b'f'; 1024 * 1024])
+                    .await
+                    .expect("fault write");
             }
             "/contracts" => {
                 assert!(Store::open("../bad".into()).await.is_err());
@@ -62,13 +71,6 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 assert_eq!(
                     util::read_file("/data", ".kv/default/a2V5").await.expect("KV -> file"),
                     b"replaced"
-                );
-                let native = util::kv::store::open("").expect("native");
-                assert_eq!(native.get("key").expect("native get"), Some(b"replaced".to_vec()));
-                native.set("key", b"native").expect("native set");
-                assert_eq!(
-                    store.get("key".into()).await.expect("native -> Spin"),
-                    Some(b"native".to_vec())
                 );
             }
             "/populate" => {
@@ -145,6 +147,88 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 right.expect("right write");
                 let got = store.get("race".into()).await.expect("race read").expect("present");
                 assert!(got == a || got == b, "concurrent writes produced torn data");
+            }
+            "/held-completions" => {
+                let empty = Store::open("empty".into()).await.expect("empty");
+                let mut held = Vec::new();
+                for _ in 0..30 {
+                    let (mut keys, done) = empty.get_keys().await;
+                    assert!(keys.next().await.is_none());
+                    drop(keys);
+                    held.push(done);
+                }
+                let (mut keys, done) = empty.get_keys().await;
+                assert!(keys.next().await.is_none());
+                drop(keys);
+                assert!(matches!(
+                    done.await,
+                    Err(bindings::spin::key_value::key_value::Error::StoreTableFull)
+                ));
+                drop(held);
+                // Endpoint closure wakes the producers; let their tasks unwind.
+                util::wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
+                let (mut keys, done) = empty.get_keys().await;
+                assert!(keys.next().await.is_none());
+                drop(keys);
+                done.await.expect("completion slots released");
+            }
+            "/collision" => {
+                let dir = util::mount("/data").expect("data");
+                // This route runs on a fresh instance, whose temporary counter is zero.
+                util::write_file("/data", ".kv/.spin-write-0", b"sentinel".to_vec())
+                    .await
+                    .expect("plant");
+                store
+                    .set("collision".into(), b"new".to_vec())
+                    .await
+                    .expect("collision retry");
+                assert_eq!(
+                    util::read_file("/data", ".kv/.spin-write-0").await.expect("sentinel"),
+                    b"sentinel"
+                );
+                dir.unlink_file_at(".kv/.spin-write-0".into())
+                    .await
+                    .expect("remove sentinel");
+            }
+            "/cancel-write" => {
+                use futures::future::{Either, select};
+                store.set("cancel".into(), b"old".to_vec()).await.expect("old value");
+                let started = async {
+                    loop {
+                        if util::read_file("/data", "kv-paused").await.is_ok() {
+                            break;
+                        }
+                        util::wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
+                    }
+                };
+                match select(
+                    Box::pin(store.set("cancel".into(), vec![b'n'; 1024 * 1024])),
+                    Box::pin(started),
+                )
+                .await
+                {
+                    Either::Right(((), pending)) => drop(pending),
+                    Either::Left(_) => panic!("test did not cancel a started write"),
+                }
+                util::wasip3::clocks::monotonic_clock::wait_for(150_000_000).await;
+                let value = store
+                    .get("cancel".into())
+                    .await
+                    .expect("read after cancellation")
+                    .expect("value");
+                assert!(value == b"old" || value == vec![b'n'; 1024 * 1024], "torn value");
+                let dir = util::open("/data", ".kv", util::OFlags::DIRECTORY, util::FdFlags::READ)
+                    .await
+                    .expect("kv directory");
+                let (mut entries, done) = dir.read_directory();
+                while let Some(entry) = entries.next().await {
+                    assert!(
+                        !entry.name.starts_with(".spin-write-"),
+                        "cancelled write left a temporary file"
+                    );
+                }
+                drop(entries);
+                done.await.expect("list completion");
             }
             "/empty" => {
                 let empty = Store::open("empty".into()).await.expect("empty");

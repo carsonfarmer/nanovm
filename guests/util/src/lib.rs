@@ -10,10 +10,10 @@ use wasip3::{wit_future, wit_stream};
 
 pub use wasip3;
 
-/// `wasi:keyvalue` (store, atomics, batch), as nanovm offers it.
+/// Spin async KV, supplied by a composed filesystem-backed provider.
 pub mod kv {
-    wit_bindgen::generate!({ path: "../../wit/keyvalue", world: "wasi:keyvalue/imports", generate_all });
-    pub use wasi::keyvalue::*;
+    wit_bindgen::generate!({ path: "../../components/keyvalue/wit", world: "client", generate_all });
+    pub use spin::key_value::key_value::{Error, Store};
 }
 
 /// `wasi:config/store`: the app's config values.

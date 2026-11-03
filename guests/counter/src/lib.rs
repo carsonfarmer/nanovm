@@ -83,25 +83,25 @@ async fn route(req: Req, hits: u64) -> Result<Response, ErrorCode> {
     }
 }
 
-/// The object's `wasi:keyvalue` default bucket.
+/// The object's filesystem-backed Spin KV default store.
 async fn kv(method: &str, key: &str, body: Vec<u8>) -> Result<Response, ErrorCode> {
-    use util::kv::store;
-    let bucket = match store::open("") {
+    use util::kv::{Error, Store};
+    let bucket = match Store::open("default".into()).await {
         Ok(b) => b,
         Err(e) => return text(500, format!("{e:?}")),
     };
-    let fail = |e: store::Error| json(507, format!("{{\"error\":{}}}", js(&format!("{e:?}"))));
+    let fail = |e: Error| json(507, format!("{{\"error\":{}}}", js(&format!("{e:?}"))));
     match method {
-        "GET" => match bucket.get(key) {
+        "GET" => match bucket.get(key.into()).await {
             Ok(Some(v)) => util::respond(200, "application/octet-stream", v),
             Ok(None) => text(404, "no such key"),
             Err(e) => fail(e),
         },
-        "PUT" | "POST" => match bucket.set(key, &body) {
+        "PUT" | "POST" => match bucket.set(key.into(), body).await {
             Ok(()) => text(204, ""),
             Err(e) => fail(e),
         },
-        "DELETE" => match bucket.delete(key) {
+        "DELETE" => match bucket.delete(key.into()).await {
             Ok(()) => text(204, ""),
             Err(e) => fail(e),
         },
@@ -156,8 +156,11 @@ async fn ws(req: Req) -> Result<Response, ErrorCode> {
             "TEXT" => out.extend(event("TEXT", format!("m:echo {text}").as_bytes())),
             "BINARY" => out.extend(event("BINARY", &content)),
             _ => {
-                let bucket = util::kv::store::open("").map_err(|e| ErrorCode::InternalError(Some(format!("{e:?}"))))?;
-                let _ = util::kv::atomics::increment(&bucket, "ws-ends", 1);
+                let bucket = util::kv::Store::open("default".into()).await.map_err(|e| ErrorCode::InternalError(Some(format!("{e:?}"))))?;
+                // Requests are serialized; this handler does not spawn concurrent writes.
+                let value = bucket.get("ws-ends".into()).await.map_err(|e| ErrorCode::InternalError(Some(format!("{e:?}"))))?;
+                let n = value.and_then(|v| String::from_utf8(v).ok()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                bucket.set("ws-ends".into(), (n + 1).to_string().into_bytes()).await.map_err(|e| ErrorCode::InternalError(Some(format!("{e:?}"))))?;
             }
         }
     }

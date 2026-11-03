@@ -12,8 +12,8 @@ mod load;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let wasm = std::fs::read(root.join("target/kv-filesystem/spin-composed.wasm"))
-        .context("run bash experiments/kv-filesystem/build.sh")?;
+    let wasm =
+        std::fs::read(root.join("target/keyvalue/tests.wasm")).context("run bash components/keyvalue/build.sh")?;
     let dir = root.join(format!(
         "target/spin-kv-probe-{}-{}",
         std::process::id(),
@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         ("/pressure", "ok"),
         ("/concurrent", "ok"),
         ("/empty", "ok"),
+        ("/held-completions", "ok"),
         ("/listing-error", "ok"),
         ("/set", "ok"),
     ] {
@@ -67,6 +68,8 @@ async fn main() -> anyhow::Result<()> {
     let r = load::request(&node, "GET", "one", "/get", "").await;
     ensure!(r.status == 200 && r.body == "committed", "restart: {}", r.body);
     println!("PASS restart persistence");
+    let r = load::request(&node, "GET", "collision", "/collision", "").await;
+    ensure!(r.status == 200, "collision: {}", r.body);
     let r = load::request(&node, "GET", "quota", "/quota", "").await;
     ensure!(
         r.status == 200 && r.body == "quota refused",
@@ -86,5 +89,52 @@ async fn main() -> anyhow::Result<()> {
     }
     std::fs::remove_dir_all(dir)?;
     println!("PASS quota refusal and temporary cleanup");
+    if std::env::args().any(|arg| arg == "--test-hooks") {
+        let wasm = std::fs::read(root.join("target/keyvalue/tests-faults.wasm"))?;
+        let cfg = NodeConfig {
+            data_dir: root.join("target/kv-cancel-probe"),
+            memory_reservation_mb: 64,
+            ..Default::default()
+        };
+        let _ = std::fs::remove_dir_all(&cfg.data_dir);
+        let node = Node::new(cfg.clone(), &app, &wasm, None)?;
+        let r = load::request(&node, "GET", "cancel", "/cancel-write", "").await;
+        ensure!(r.status == 200, "cancel-write: {}", r.body);
+        node.shutdown().await;
+        drop(node);
+        for stage in ["created", "partial", "written", "renamed"] {
+            let node = Node::new(cfg.clone(), &app, &wasm, None)?;
+            ensure!(load::request(&node, "GET", "cut", "/set", "").await.status == 200);
+            node.shutdown().await;
+            drop(node);
+            let mut armed = app.clone();
+            armed.config.insert("kv-cut".into(), stage.into());
+            let node = Node::new(cfg.clone(), &armed, &wasm, None)?;
+            let r = load::request(&node, "GET", "cut", "/fault", "").await;
+            ensure!(
+                r.error.as_deref() == Some("trap") && r.body.contains("KV recovery cut"),
+                "{stage}: {}",
+                r.body
+            );
+            node.shutdown().await;
+            drop(node);
+            let node = Node::new(cfg.clone(), &app, &wasm, None)?;
+            let r = load::request(&node, "GET", "cut", "/get", "").await;
+            ensure!(r.status == 200 && r.body == "committed", "{stage}: {}", r.body);
+            let volume = cfg.data_dir.join("objects/spin-kv/cut");
+            ensure!(!volume.join("mixed").exists(), "mixed file survived {stage}");
+            for entry in std::fs::read_dir(volume.join(".kv"))? {
+                ensure!(
+                    !entry?.file_name().to_string_lossy().starts_with(".spin-write-"),
+                    "temporary survived {stage}"
+                );
+            }
+            node.shutdown().await;
+            drop(node);
+            println!("PASS recovery cut {stage}");
+        }
+        std::fs::remove_dir_all(cfg.data_dir)?;
+        println!("PASS started write cancellation");
+    }
     Ok(())
 }

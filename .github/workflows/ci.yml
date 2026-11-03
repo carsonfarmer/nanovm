@@ -31,7 +31,8 @@ jobs:
         with:
           workspaces: |
             . -> target
-            guests -> target
+            guests -> ../target/guests
+            components/keyvalue -> ../../target/keyvalue
             components/sqlite -> ../../target/sqlite
       - name: Prepare host limits
         run: sudo sysctl -w vm.max_map_count=1048576
@@ -45,8 +46,10 @@ jobs:
               total += sum(bool(line.strip()) and not line.strip().startswith('//') for line in runtime.splitlines())
           print(f'Runtime: {total} lines')
           PY
+      - name: Install component composition tool
+        run: cargo install wac-cli --version 0.12.0 --locked
       - name: Build guests locally (no publishing)
-        run: cargo build --locked --release --target wasm32-wasip2 --manifest-path guests/Cargo.toml
+        run: bash scripts/build-guests.sh
       - name: Check production build without dev features
         run: cargo check --locked -p nanovm --bin nanovm
       - name: Run unit and integration tests
@@ -63,16 +66,14 @@ jobs:
           echo "WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux" >> "$GITHUB_ENV"
       - name: Build SQLite provider, example and pressure fixtures (no publishing)
         run: |
-          cargo install wac-cli --version 0.12.0 --locked
           bash experiments/sqlite-filesystem/build.sh --compose
       - name: Run composed SQLite example
         run: env -u RUST_BACKTRACE cargo run --locked -p nanovm --example sqlite
-      - name: Build and run KV composition probes (no publishing)
+      - name: Run composed KV contracts
         run: |
           ulimit -n "$(ulimit -Hn)"
-          bash experiments/kv-filesystem/build.sh
-          env -u RUST_BACKTRACE cargo run --locked -p nanovm --example kv_probe
-          env -u RUST_BACKTRACE cargo run --locked -p nanovm --example spin_kv_probe
+          bash components/keyvalue/build.sh --test-hooks
+          env -u RUST_BACKTRACE cargo run --locked -p nanovm --example spin_kv_probe -- --test-hooks
       - name: Pressure test SQLite against the journal
         run: |
           ulimit -n "$(ulimit -Hn)"

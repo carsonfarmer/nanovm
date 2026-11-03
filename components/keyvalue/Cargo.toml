@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["provider", "client", "spin-provider", "spin-client"]
+members = ["provider", "tests"]
 
 [profile.release]
 opt-level = "s"

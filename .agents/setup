@@ -35,7 +35,10 @@ cargo fetch --locked
 done_step
 
 step "build guests"
-(cd guests && cargo build --locked --release --target wasm32-wasip2)
+if [[ $(wac --version 2>/dev/null || true) != 'wac-cli 0.12.0' ]]; then
+	cargo install wac-cli --version 0.12.0 --locked
+fi
+bash scripts/build-guests.sh
 done_step
 
 # The release build (demo, bench, scripts/vm-test.sh) is left to the first

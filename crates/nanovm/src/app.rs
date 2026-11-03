@@ -26,9 +26,6 @@ const ALLOWED_IMPORTS: &[&str] = &[
     "wasi:filesystem/preopens@0.3",
     "wasi:http/types@0.3",
     "wasi:http/client@0.3",
-    "wasi:keyvalue/store@0.2.0-draft",
-    "wasi:keyvalue/atomics@0.2.0-draft",
-    "wasi:keyvalue/batch@0.2.0-draft",
     "wasi:config/store@0.2.0-rc.1",
 ];
 
@@ -45,7 +42,6 @@ pub fn linker(engine: &Engine) -> anyhow::Result<Linker<ObjState>> {
     let mut linker = Linker::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     crate::quota::add_to_linker(&mut linker)?;
-    crate::kv::add_to_linker(&mut linker)?;
     wasmtime_wasi_config::add_to_linker(&mut linker, |s| WasiConfig::from(&*s.config))?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;
     Ok(linker)

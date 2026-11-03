@@ -158,9 +158,9 @@ pub async fn run(req: util::Req) -> Result<Response, ErrorCode> {
         .query_row("PRAGMA aux.integrity_check", [], |r| r.get(0))
         .map_err(sql_error)?;
     let file = util::read_file("/data", "pressure-marker").await.unwrap();
-    let key = util::kv::store::open("")
+    let key = util::kv::Store::open("default".into()).await
         .unwrap()
-        .get("pressure-marker")
+        .get("pressure-marker".into()).await
         .unwrap()
         .unwrap();
     if req.q("cache") == Some("1") {
@@ -190,8 +190,8 @@ async fn marker(value: &str) {
     util::write_file("/data", "pressure-marker", value.as_bytes().to_vec())
         .await
         .unwrap();
-    util::kv::store::open("")
+    util::kv::Store::open("default".into()).await
         .unwrap()
-        .set("pressure-marker", value.as_bytes())
+        .set("pressure-marker".into(), value.as_bytes().to_vec()).await
         .unwrap();
 }
