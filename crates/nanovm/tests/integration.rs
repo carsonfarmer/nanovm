@@ -2930,7 +2930,7 @@ async fn the_proxy_outlasts_idle_and_excess_connections() {
     let start = |name: &str| {
         let addr = port();
         let cfg = dir.join(format!("{name}.toml"));
-        let toml = format!("listen = \"{addr}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\n");
+        let toml = format!("listen = \"{addr}\"\npublish_listen = \"{}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\n", port());
         std::fs::write(&cfg, toml).unwrap();
         let cmd = format!("ulimit -n 64 && exec {} proxy --config {}", env!("CARGO_BIN_EXE_nanovm"), cfg.display());
         let child = tokio::process::Command::new("sh").args(["-c", &cmd]).kill_on_drop(true).spawn().unwrap();
