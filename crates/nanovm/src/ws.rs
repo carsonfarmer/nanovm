@@ -404,23 +404,46 @@ pub fn well_formed(json: &[u8]) -> bool {
     messages(json).is_some()
 }
 
+/// The parts of GRIP's publish format a socket takes. Read into these rather
+/// than a `serde_json::Value`, which costs about 24 bytes of memory for each
+/// byte of a guest's publish; what isn't read is skipped, not built.
+#[derive(serde::Deserialize)]
+struct Publish {
+    items: Vec<Item>,
+}
+
+#[derive(serde::Deserialize)]
+struct Item {
+    channel: String,
+    formats: Formats,
+}
+
+#[derive(serde::Deserialize)]
+struct Formats {
+    #[serde(rename = "ws-message")]
+    ws: Option<WsMessage>,
+}
+
+#[derive(serde::Deserialize)]
+enum WsMessage {
+    #[serde(rename = "content")]
+    Text(String),
+    #[serde(rename = "content-bin")]
+    Binary(String),
+}
+
 /// The (channel, message) of each item of a publish that has one for a
 /// socket; `None` unless all are well formed.
 fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
-    let publish: Value = serde_json::from_slice(json).ok()?;
-    let items = publish.get("items")?.as_array().filter(|i| i.len() <= MAX_ITEMS)?;
-    let message = |item: &Value| -> Option<Option<(String, Message)>> {
-        let channel = item.get("channel")?.as_str()?.to_string();
-        let Some(m) = item.get("formats")?.get("ws-message") else { return Some(None) };
-        let m = m.as_object().filter(|m| m.len() == 1)?;
-        let m = match (m.get("content"), m.get("content-bin")) {
-            (Some(t), None) => Message::text(t.as_str()?),
-            (None, Some(b)) => Message::binary(B64.decode(b.as_str()?).ok()?),
-            _ => return None,
-        };
-        Some(Some((channel, m)))
+    let items = serde_json::from_slice::<Publish>(json).ok()?.items;
+    if items.len() > MAX_ITEMS {
+        return None;
+    }
+    let message = |(channel, m)| match m {
+        WsMessage::Text(t) => Some((channel, Message::text(t))),
+        WsMessage::Binary(b) => Some((channel, Message::binary(B64.decode(b).ok()?))),
     };
-    items.iter().map(message).collect::<Option<Vec<_>>>().map(|m| m.into_iter().flatten().collect())
+    items.into_iter().filter_map(|i| Some((i.channel, i.formats.ws?))).map(message).collect()
 }
 
 /// Serves a socket until it ends. The client's messages go to the object one
@@ -595,6 +618,48 @@ mod tests {
             [r#"{}"#, r#"{"items":[{"formats":{}}]}"#, r#"{"items":[{"channel":"a","formats":{"ws-message":{}}}]}"#]
         {
             assert!(messages(bad.as_bytes()).is_none(), "{bad}");
+        }
+    }
+
+    /// Counts what the calling thread holds allocated, and its peak, so a
+    /// test can bound what parsing costs.
+    struct Counting;
+    thread_local! {
+        static HELD: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+    unsafe impl std::alloc::GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+            HELD.with(|h| h.set((h.get().0 + l.size(), h.get().1.max(h.get().0 + l.size()))));
+            unsafe { std::alloc::System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+            HELD.with(|h| h.set((h.get().0.saturating_sub(l.size()), h.get().1)));
+            unsafe { std::alloc::System.dealloc(p, l) }
+        }
+    }
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    /// A publish is the guest's, and both its worker and the proxy parse it:
+    /// that holds a few times its size at most, whatever it holds (tiny
+    /// values parsed as `serde_json::Value` held 24 times).
+    #[test]
+    fn publishes_parse_in_bounded_memory() {
+        let filled = |head: &str, item: &str, tail: &str| {
+            let mut json = head.to_string();
+            while json.len() < 1 << 20 {
+                json += item;
+            }
+            json + tail
+        };
+        let unread = filled(r#"{"items":[],"x":["#, "0,", "0]}");
+        let items = filled(r#"{"items":["#, r#"{"channel":"a","formats":{}},"#, r#"{"channel":"a","formats":{}}]}"#);
+        for json in [unread, items] {
+            let before = HELD.with(|h| h.get().0);
+            HELD.with(|h| h.set((before, before)));
+            let _ = messages(json.as_bytes());
+            let peak = HELD.with(|h| h.get().1) - before;
+            assert!(peak < 8 * json.len(), "parsing {} bytes held {peak}", json.len());
         }
     }
 
