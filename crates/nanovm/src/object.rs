@@ -368,8 +368,13 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     };
     b.stdout(output("stdout")).stderr(output("stderr"));
 
+    // A resource can hold a header map of up to `MAX_HEAD` on the host (the
+    // guest's own, or a copy of one it was sent), so an instance holds no
+    // more than its memory limit has room for.
     let mut table = ResourceTable::new();
-    table.set_max_capacity(limits.max_resources);
+    table.set_max_capacity(limits.max_resources.min((limits.memory_mb << 20) as usize / crate::server::MAX_HEAD));
+    let mut http = WasiHttpCtx::new();
+    http.set_field_size_limit(crate::server::MAX_HEAD);
 
     // `/tmp` starts empty, so only the persistent volume holds usage.
     let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone())?;
@@ -377,7 +382,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     let state = ObjState {
         wasi: b.build(),
         table,
-        http: WasiHttpCtx::new(),
+        http,
         hooks: EgressHooks {
             route: app.egress.clone(),
             node: Arc::downgrade(node),

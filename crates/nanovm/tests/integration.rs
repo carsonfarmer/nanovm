@@ -3332,18 +3332,50 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     collector.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn post_return_work_keeps_context_and_reports_commit_failure() {
-    use http_body_util::BodyExt;
-    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
-    use prost::Message;
-    // A private fixture, outside guests/** and its publishing workflow.
+/// A private fixture, outside guests/** and its publishing workflow.
+fn probe() -> Vec<u8> {
     let build = std::process::Command::new("cargo").args([
         "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
         "crates/nanovm/tests/post-return/Cargo.toml", "--target-dir", "target/test-guest",
     ]).current_dir(repo()).status().unwrap();
     assert!(build.success());
-    let wasm = std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap();
+    std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap()
+}
+
+/// What the host holds for a guest's header maps stays within its memory
+/// limit: a map holds at most 64 KiB (its own, or a copy of one it was sent;
+/// bigger heads are refused before it), and an instance holds no more
+/// resources than its memory limit has room for at that size.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_header_maps_are_bounded_by_the_memory_limit() {
+    let mut app = app("hostile");
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    // 32 MiB: room for 512 maps of 64 KiB, of its 2,000 resources.
+    let node = Node::new(node_cfg("guest_header_maps", 8), &app, &probe(), None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| nanovm::server::handle(node.clone(), req)));
+    let get = async |path: &str, header: usize| {
+        let head = format!("GET {path} HTTP/1.1\r\nHost: x\r\nx-big: {}\r\nConnection: close\r\n\r\n", "x".repeat(header));
+        raw(addr, &head, b"").await
+    };
+    // 600 maps of 60 KiB, new or copies of a request's, are over 32 MiB.
+    for (path, header) in [("/a/headers?n=600&kb=60", 0), ("/b/headers?n=600", 60 << 10)] {
+        let (status, body) = get(path, header).await;
+        assert!(status == 500 && body.contains("resource-table"), "{path}: {status} {body}");
+    }
+    assert_eq!(get("/c/headers?n=1&kb=100", 0).await.0, 500, "a map over 64 KiB");
+    assert_eq!(get("/d/headers?n=0", 100 << 10).await.0, 431, "a head over 64 KiB");
+    assert_eq!(get("/e/headers?n=100&kb=60", 50 << 10).await, (200, "100".into()), "within the limits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_return_work_keeps_context_and_reports_commit_failure() {
+    use http_body_util::BodyExt;
+    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
+    use prost::Message;
+    let wasm = probe();
     let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let logs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

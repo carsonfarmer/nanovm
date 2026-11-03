@@ -1,12 +1,21 @@
 //! Test-only component; never included in the published guest workspace.
+use std::cell::RefCell;
+
 use util::wasip3;
 use wasip3::http::types::{ErrorCode, Fields, Request, Response};
 
 wasip3::http::service::export!(Probe);
 struct Probe;
 
+thread_local! {
+    static HELD: RefCell<Vec<Fields>> = RefCell::default();
+}
+
 impl wasip3::exports::http::handler::Guest for Probe {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
+        if request.get_path_with_query().is_some_and(|p| p.starts_with("/headers")) {
+            return headers(request);
+        }
         let req = util::read_req(request).await;
         if req.path == "/callee" {
             return util::text(200, "callee");
@@ -29,4 +38,22 @@ impl wasip3::exports::http::handler::Guest for Probe {
         });
         Ok(response)
     }
+}
+
+/// `/headers?n=…&kb=…`: holds `n` more header maps, for good: new ones with
+/// a `kb` KiB value, or (without `kb`) copies of the request's own. Answers
+/// how many it holds.
+fn headers(request: Request) -> Result<Response, ErrorCode> {
+    let q = request.get_path_with_query().unwrap_or_default();
+    let arg = |k: &str| q.split(['?', '&']).find_map(|kv| kv.strip_prefix(k)?.strip_prefix('=')?.parse().ok());
+    let (n, kb): (usize, Option<usize>) = (arg("n").unwrap_or(0), arg("kb"));
+    let fail = |e| ErrorCode::InternalError(Some(format!("{e:?}")));
+    let (theirs, value) = (request.get_headers(), vec![b'x'; kb.unwrap_or(0) << 10]);
+    for _ in 0..n {
+        let held = if kb.is_some() { Fields::new() } else { theirs.clone() };
+        // Changing a copy makes it one of its own.
+        held.append("x-held", &value).map_err(fail)?;
+        HELD.with(|h| h.borrow_mut().push(held));
+    }
+    util::text(200, HELD.with(|h| h.borrow().len()).to_string())
 }
