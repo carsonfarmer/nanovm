@@ -342,13 +342,19 @@ Built on branch `proxy` by one agent and finished by another. README's "The prox
 
 ## Runtime simplification analysis (2026-11-03)
 
-The whole-runtime review starts at **5,305 lines**. Estimated behavior-preserving
-savings are **100–200 lines**, not a promised result; estimates overlap and must
-survive implementation and benchmarks. Storage is 1,229 lines (23.2%); actor and
+The whole-runtime review starts at **5,305 lines**. The owner rejected the initial
+100–200-line estimate as an overly incremental analysis, not a demonstrated ceiling.
+The architectural reassessment identifies three ownership changes: the object task
+owns each entire request lifecycle; storage owns completed mutations rather than
+making KV/WASI coordinate transactions; and one dependency operation owns tracing,
+admission and response-body lifetime. These designs remain uncompiled proposals.
+Storage is 1,229 lines (23.2%); actor and
 admission code is 894 (16.9%). The established counter includes 36 test-only lines
 before a test module; moving those is not runtime simplification.
 
-Implement in separately verified slices:
+Start with actor ownership, then dependency calls and storage-owned mutations.
+The smaller substitutions below are supporting opportunities, not the scope of
+the redesign. Implement in separately verified slices:
 
 1. **Worker lifetime (`supervisor.rs`, estimated 10–20 lines):** replace the
    oneshot kill plus watch completion channels with one watch channel. Its
@@ -374,6 +380,20 @@ Implement in separately verified slices:
    checks, or remove recovery records. Reject a generic transaction abstraction
    that merely relocates the sequence. Run all recovery-cut, rename, open-unlinked
    descriptor, repeated-replacement and post-return failure tests.
+
+**Additional upstream-supported alternative:** register stock WASIp3 filesystem
+bindings and reopen the linker instance to shadow only guarded mutation methods.
+Wasmtime 50 supports this, potentially eliminating `QuotaFs` projection/delegation
+machinery and unmodified-method forwarding. Run a typed compile/instantiation
+probe first; preserve descriptor identity, error/trap mapping, stream concurrency
+and tracing, and test that no mutation import bypasses guards. Count replacement
+registration code against the existing 70 scaffold lines; no saving is proven.
+
+For actor ownership, use sequential `run_concurrent` phases with timeouts outside
+each invocation, retaining event-loop driving while idle. For storage, expose
+complete `replace_value`/`delete_value`/`resize`/`rename` operations and represent
+staged rename outcomes explicitly, while keeping journal format/recovery intact.
+These changes remove second owners of operations, not just helper boilerplate.
 
 Rejected as unproven or product changes: one universal HTTP client/cache, replacing
 the journal with SQLite, removing meaningful spans, and freezing idle guest work.
