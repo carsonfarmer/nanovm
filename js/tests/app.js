@@ -61,6 +61,8 @@ const routes = {
     return new Response("answered first");
   },
   "GET /later-value": async (req, env) => Response.json({ later: (await env.kv.get("later")) ?? null }),
+  // Nothing of the build's pre-initialization may be shared by instances.
+  "GET /fresh": () => Response.json({ random: Math.random(), uuid: crypto.randomUUID(), now: Date.now() }),
   "GET /web": async () => {
     const h = new Headers([["A", "1"], ["a", "2"], ["b", "3"]]);
     const bytes = new TextEncoder().encode("héllo");

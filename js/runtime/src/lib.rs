@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use boa_engine::builtins::promise::PromiseState;
-use boa_engine::context::time::JsDuration;
+use boa_engine::context::time::{Clock, JsDuration, JsInstant};
 use boa_engine::job::{GenericJob, Job, JobExecutor, NativeAsyncJob, PromiseJob};
 use boa_engine::object::ObjectInitializer;
 use boa_engine::object::builtins::{JsArray, JsFunction, JsPromise, JsUint8Array};
@@ -37,6 +37,22 @@ mod config {
 }
 
 wasip3::http::service::export!(Js);
+
+/// Pre-initialization (js/build.sh runs it through Wizer): starts the
+/// engine and evaluates the app, so the component's memory starts there
+/// and a cold start skips it. It must not touch the host.
+mod init {
+    wit_bindgen::generate!({
+        inline: "package nanovm:js; world init { export wizer-initialize: func() -> result<_, string>; }",
+    });
+    export!(Init);
+    struct Init;
+    impl Guest for Init {
+        fn wizer_initialize() -> Result<(), String> {
+            super::Runtime::get().map(|_| ()).map_err(|e| e.to_string())
+        }
+    }
+}
 
 struct Js;
 
@@ -102,7 +118,8 @@ impl Runtime {
 
     fn new() -> JsResult<Self> {
         let jobs = Rc::new(Jobs::default());
-        let ctx = Box::leak(Box::new(Context::builder().job_executor(jobs.clone()).build()?));
+        let ctx = Context::builder().job_executor(jobs.clone()).clock(Rc::new(HostClock)).build()?;
+        let ctx = Box::leak(Box::new(ctx));
         boa_runtime::register(boa_runtime::extensions::ConsoleExtension(boa_runtime::DefaultLogger), None, ctx)?;
         let host = ObjectInitializer::new(ctx)
             .function(NativeFunction::from_fn_ptr(kv_get), js_string!("kvGet"), 1)
@@ -257,6 +274,22 @@ impl JobExecutor for Jobs {
         }
         ctx.clear_kept_objects();
         Ok(())
+    }
+}
+
+/// Reads the host's clocks at each call (Boa's own clock reads one when the
+/// engine starts, which pre-initialization would freeze).
+struct HostClock;
+
+impl Clock for HostClock {
+    fn now(&self) -> JsInstant {
+        let ns = wasip3::clocks::monotonic_clock::now();
+        JsInstant::new(ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
+    }
+
+    fn system_time_millis(&self) -> i64 {
+        let t = wasip3::clocks::system_clock::now();
+        t.seconds * 1000 + i64::from(t.nanoseconds / 1_000_000)
     }
 }
 

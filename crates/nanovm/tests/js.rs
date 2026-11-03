@@ -206,3 +206,16 @@ async fn web_apis() {
     let r = get(&node, "w", "/later-value").await;
     assert_eq!(r.json()["later"], 5, "waitUntil work finished and committed before the next request");
 }
+
+/// The component starts from a snapshot taken at build time; nothing in it
+/// may be shared by instances or stale: randomness, the clock, the id.
+#[tokio::test(flavor = "multi_thread")]
+async fn instances_share_nothing_from_the_snapshot() {
+    let node = node("js_snapshot_fresh", 8);
+    let now_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let (a, b) = (get(&node, "a", "/fresh").await.json(), get(&node, "b", "/fresh").await.json());
+    assert_ne!(a["random"], b["random"], "Math.random is seeded per instance");
+    assert_ne!(a["uuid"], b["uuid"]);
+    assert!((a["now"].as_i64().unwrap() - now_ms()).abs() < 5000, "Date.now() is now: {a}");
+    assert_eq!(get(&node, "b", "/").await.json()["object"], "b");
+}
