@@ -4,7 +4,7 @@
 //!     scripts/build-guests.sh
 //!     cargo run --release --example bench [-- --quick] [-- --json out.json] [-- --cold N]
 //!     cargo run --release --example bench -- --export
-//!     cargo run --release --example bench -- --quick --only cold,churn
+//!     HEAP_COUNT=1 cargo run --release --example bench -- --quick --only cold,churn
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,7 +24,37 @@ use serde_json::{Value, json};
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
-static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static ALLOCATOR: Counting<tikv_jemallocator::Jemalloc> = Counting(tikv_jemallocator::Jemalloc);
+#[cfg(not(target_os = "linux"))]
+#[global_allocator]
+static ALLOCATOR: Counting<std::alloc::System> = Counting(std::alloc::System);
+
+/// Counts the bytes allocated and not yet freed, when `HEAP_COUNT` is set
+/// (one shared counter would otherwise slow every allocation).
+struct Counting<A>(A);
+static COUNTING: AtomicBool = AtomicBool::new(false);
+static HEAP: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for Counting<A> {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if COUNTING.load(Relaxed) {
+            HEAP.fetch_add(l.size() as isize, Relaxed);
+        }
+        unsafe { self.0.alloc(l) }
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if COUNTING.load(Relaxed) {
+            HEAP.fetch_sub(l.size() as isize, Relaxed);
+        }
+        unsafe { self.0.dealloc(p, l) }
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        if COUNTING.load(Relaxed) {
+            HEAP.fetch_add(new as isize - l.size() as isize, Relaxed);
+        }
+        unsafe { self.0.realloc(p, l, new) }
+    }
+}
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -119,6 +149,7 @@ fn row(name: &str, r: &Run, note: &str) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    COUNTING.store(std::env::var_os("HEAP_COUNT").is_some(), Relaxed);
     if args.iter().any(|a| a == "--export") { return full_export().await; }
     let quick = args.iter().any(|a| a == "--quick");
     let json_out = args
@@ -162,19 +193,22 @@ async fn main() -> anyhow::Result<()> {
         let n = node("main", "counter", cold_n + 64, None)?;
         once(&n, "warmup", "/").await;
         let rss0 = rss_bytes();
+        let heap0 = HEAP.load(Relaxed);
         let (fds0, maps0) = fds_and_maps();
         let cpu0 = cpu_us();
         let cold = load(&n, "GET", "/", cold_n, conc, |i| format!("o{i}")).await;
         let cpu = (cpu_us() - cpu0) as f64 / cold.lat_us.len().max(1) as f64;
         let live = n.live_objects();
         let rss1 = rss_bytes();
+        let heap_kb = (HEAP.load(Relaxed) - heap0) as f64 / live.max(1) as f64 / 1024.0;
+        let heap = if COUNTING.load(Relaxed) { format!(" (heap {heap_kb:.1} KB)") } else { String::new() };
         let (fds1, maps1) = fds_and_maps();
         let per_obj_kb = rss1.saturating_sub(rss0) as f64 / live.max(1) as f64 / 1024.0;
         let per = |a: usize, b: usize| b.saturating_sub(a) as f64 / live.max(1) as f64;
         println!("\ncold start ({cold_n} new objects, {conc} concurrent)");
         row("first request to a new object", &cold, &format!("{cpu:.0} µs CPU each"));
         println!(
-            "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object · {:.2} fds, {:.2} maps/object",
+            "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object{heap} · {:.2} fds, {:.2} maps/object",
             "",
             rss1 as f64 / 1e6,
             per(fds0, fds1),
@@ -183,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
         out.insert(
             "cold".into(),
             json!({ "run": cold.json(), "live": live, "rss_mb": rss1 as f64 / 1e6, "kb_per_object": per_obj_kb.round(),
+                "heap_kb_per_object": heap_kb,
                 "cpu_us_per_request": cpu.round(), "fds_per_object": per(fds0, fds1), "maps_per_object": per(maps0, maps1) }),
         );
 
