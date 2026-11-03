@@ -1,0 +1,31 @@
+--- a/crates/environ/src/fact/trampoline.rs
++++ b/crates/environ/src/fact/trampoline.rs
+@@ -2579,6 +2579,28 @@
+ 
+         let seq = self.begin_translate_sequence(src, dst, src_size, src_align, dst_size, dst_align);
+ 
++        // Diagnostic fast path: retain canonical range/allocation validation,
++        // but copy byte lists in bulk between wasm32 linear memories.
++        if matches!(src_element_ty, InterfaceType::U8)
++            && matches!(dst_element_ty, InterfaceType::U8)
++            && !src_mem_opts.memory64()
++            && !dst_mem_opts.memory64()
++        {
++            if let Some(ref state) = seq.loop_state {
++                self.instruction(LocalGet(state.cur_dst_ptr.idx));
++                self.instruction(LocalGet(state.cur_src_ptr.idx));
++                self.instruction(LocalGet(state.remaining.idx));
++                self.instruction(MemoryCopy {
++                    src_mem: src_mem_opts.memory.unwrap().0.as_u32(),
++                    dst_mem: dst_mem_opts.memory.unwrap().0.as_u32(),
++                });
++                self.instruction(I32Const(1));
++                self.instruction(LocalSet(state.remaining.idx));
++            }
++            self.end_translate_sequence(seq, dst);
++            return;
++        }
++
+         if let Some(ref loop_state) = seq.loop_state {
+             let element_src = Source::Memory(Memory {
+                 opts: seq.src_opts,

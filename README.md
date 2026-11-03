@@ -230,6 +230,14 @@ What happens on the first request for a digest:
 
 We adopt Spin's WIT, not its deployment/storage model: all valid labels are allowed within each object's isolated volume, without a `spin.toml` allowlist or shared cross-object store. There is no SQLite dependency for KV. Caller cancellation is deferred across a mutation; traps, deadlines and crashes roll back through the host.
 
+Profiling found a large-value cost in Wasmtime 50's byte-by-byte component-list
+adapter, not an inherent filesystem cost. An isolated bulk-copy experiment cuts
+1 MiB GET from 3.149 to 1.600 ms (native 1.404 ms); it is not an enabled dependency
+patch. The retained sibling-temp optimization removes extra directory syncs.
+See the [measurements and limitations](components/keyvalue/README.md#follow-up-measured-costs-not-inherent-wasm-overhead).
+Tentative changes must be visible and rejectable; an undo log is the current
+implementation, not a requirement on future snapshots or replicated storage.
+
 **`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
 ## Calls between objects

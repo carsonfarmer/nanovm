@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
     node.shutdown().await;
     drop(node);
     for id in ["one", "quota"] {
-        for entry in std::fs::read_dir(dir.join(format!("objects/spin-kv/{id}/.kv")))? {
+        for entry in std::fs::read_dir(dir.join(format!("objects/spin-kv/{id}/.kv/default")))? {
             ensure!(
                 !entry?.file_name().to_string_lossy().starts_with(".spin-write-"),
                 "temporary file leaked"
@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
             ensure!(r.status == 200 && r.body == "committed", "{stage}: {}", r.body);
             let volume = cfg.data_dir.join("objects/spin-kv/cut");
             ensure!(!volume.join("mixed").exists(), "mixed file survived {stage}");
-            for entry in std::fs::read_dir(volume.join(".kv"))? {
+            for entry in std::fs::read_dir(volume.join(".kv/default"))? {
                 ensure!(
                     !entry?.file_name().to_string_lossy().starts_with(".spin-write-"),
                     "temporary survived {stage}"

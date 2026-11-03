@@ -195,7 +195,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             "/collision" => {
                 let dir = util::mount("/data").expect("data");
                 // This route runs on a fresh instance, whose temporary counter is zero.
-                util::write_file("/data", ".kv/.spin-write-0", b"sentinel".to_vec())
+                util::write_file("/data", ".kv/default/.spin-write-0", b"sentinel".to_vec())
                     .await
                     .expect("plant");
                 store
@@ -203,10 +203,10 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                     .await
                     .expect("collision retry");
                 assert_eq!(
-                    util::read_file("/data", ".kv/.spin-write-0").await.expect("sentinel"),
+                    util::read_file("/data", ".kv/default/.spin-write-0").await.expect("sentinel"),
                     b"sentinel"
                 );
-                dir.unlink_file_at(".kv/.spin-write-0".into())
+                dir.unlink_file_at(".kv/default/.spin-write-0".into())
                     .await
                     .expect("remove sentinel");
             }
@@ -237,7 +237,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                     .expect("read after cancellation")
                     .expect("value");
                 assert!(value == b"old" || value == vec![b'n'; 1024 * 1024], "torn value");
-                let dir = util::open("/data", ".kv", util::OFlags::DIRECTORY, util::FdFlags::READ)
+                let dir = util::open("/data", ".kv/default", util::OFlags::DIRECTORY, util::FdFlags::READ)
                     .await
                     .expect("kv directory");
                 let (mut entries, done) = dir.read_directory();

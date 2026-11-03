@@ -25,7 +25,7 @@ scripts compose both providers. Old synchronous KV imports are no longer linked.
 - Keys are 1–180 UTF-8 bytes, encoded as unpadded base64url filenames. Values are
   at most 1 MiB. Empty values work. Missing reads return `none`; missing deletes
   succeed. No atomics or batch extension is supplied.
-- Set writes an exclusive temporary file, closes it, and renames it over the key.
+- Set writes an exclusive temporary sibling, closes it, and renames it over the key.
   Existing descriptors continue to see the old file. KV and direct file access
   see each other's successful changes immediately; neither maintains a cache.
 - Replacement needs space for the old and new values and one temporary entry.
@@ -89,7 +89,7 @@ objects. Medians are milliseconds/request:
 Reading into a bounded growing buffer avoids per-chunk allocation/copy but does
 not close the gap. Spin streams **keys**, not values: get/set still carry a
 `list<u8>` across component boundaries. Atomic rename also performs more journal
-operations than the old in-place KV write. These explain candidate costs, not a
+operations than the old unlink-and-create KV write. These explain candidate costs, not a
 completed attribution profile. The no-regression adoption gate is **not met**.
 
 Host count: 5,336 → 5,074 using the historical metric. That baseline accidentally
@@ -101,9 +101,78 @@ one mutation path, not an overall LOC win. Native atomics/batch were also remove
 so do not call the comparison feature-equivalent. The provider is 177,313 bytes;
 counter grows from 193,471 to 392,960 bytes after composition.
 
+## Follow-up: measured costs, not inherent Wasm overhead
+
+The native `set_value` first reserved quota, moved the old key into the journal,
+then created/wrote its final path directly. Failures after reservation trapped
+the request. It was **not** an in-place overwrite. The composed provider stages
+the new value first so a catchable failure preserves the old key without aborting
+other changes. Copying the native sequence into Wasm would require different
+error semantics or a filesystem operation that reserves and replaces atomically.
+
+Across `kv_bench`'s 703 sets, syscall counts were native/composed:
+`fdatasync` 1,507/2,210, `fsync` 4,420/5,022, and total rename calls 603/1,306.
+The retained optimization puts temporary files inside the bucket, avoiding a
+second modified directory: `fsync` returns to 4,420. It does not remove the extra
+undo record or weaken ordering. Small-write timing differences were noisy, so
+claim the syscall reduction, not a proven wall-time improvement. Longer temporary
+paths increase the 1,000-replacement undo log to about 238–243 KB (still 4 retained
+seed bytes); runtime LOC is unchanged.
+
+More importantly, a `perf record -e cpu-clock:u -F 997` sample attributed about
+one third of user CPU to generated adapter module 6, function 32. Wasmtime 50's
+`fact::translate_list` emits a per-element translation loop even for `list<u8>`.
+The [diagnostic patch](../../experiments/wasmtime-byte-list-copy.patch) replaces
+that loop with `memory.copy` for wasm32 byte lists, retaining allocation/range
+checks. This is **not enabled in Cargo.toml or Cargo.lock**. Three alternating
+native/stock/patched runs, identical composed guest for the last two, measured:
+
+| Operation | Native | Composed stock | Composed bulk-copy experiment |
+|---|---:|---:|---:|
+| GET 128 B | 0.108 | 0.185 | 0.206 |
+| GET 16 KiB | 0.127 | 0.232 | 0.230 |
+| GET 1 MiB | 1.404 | 3.149 | 1.600 |
+| PUT 128 B | 1.987 | 2.720 | 2.798 |
+| PUT 16 KiB | 2.509 | 3.247 | 3.290 |
+| PUT 1 MiB | 4.925 | 7.531 | 5.854 |
+| Cold PUT | 3.164 | 4.219 | 4.011 |
+
+An additional three pairs with sibling temporary files measured stock/patched
+1 MiB GET 3.161/1.390 ms and PUT 7.333/5.690 ms. They are a separate series, not
+a simultaneous native comparison. Small calls still carry filesystem capability
+resolution, WIT resource/async-call overhead and metadata work absent from the
+native shortcut. Both hosts already use inline filesystem calls; this was not a
+new `spawn_blocking` cost. A stat-sized read-buffer experiment did not improve
+large reads and was reverted.
+
+Reproduce the diagnostic dependency in a disposable checkout: copy the fetched
+`wasmtime-environ-50.0.0` crate into an isolated directory, apply the patch with
+`patch -p3` there, and build `kv_bench` with Cargo's
+`--config 'patch.crates-io.wasmtime-environ.path="/absolute/copied/crate"'`.
+Save that binary separately; restore Cargo.lock and build the stock control.
+Use the same composed `counter.wasm` for both. `kv_bench` creates a fresh compiled
+cache per run. Do not modify Cargo's registry cache. For profiling, temporarily
+enable `Config::profiler(ProfilingStrategy::PerfMap)` and correlate sampled PCs
+with `/tmp/perf-<pid>.map`; restore engine.rs afterwards.
+
+The patched engine passes the full component probe, including varied binary
+values, cancellation, quotas, interleaving and recovery cuts. This is not an
+upstream compiler test suite or validation of all aliasing, memory64 and malformed
+ABI cases. Prefer an upstream fix with those tests over silently shipping a fork.
+The retained sibling-temp change passes the stock full locked suite (91 unit,
+67 integration, eleven ignored), stock component probes and component clippy.
+Disabling collision retries fails the relocated sentinel test; restored with
+`git checkout --` and empty diff confirmed, then the complete probe passes again.
+
+The storage contract is coherent **tentative** state that can be rejected and
+committed state that meets the chosen durability policy, not an undo-log mandate.
+Snapshots, copy-on-write and transactional virtual filesystems remain candidates.
+For external durability/regions, separate tentative-state mechanics from ordered
+committed versions and acknowledgement policy; see PLAN's replication discussion.
+
 Successor prompt: continue `spin-kv-prototype`, read HANDOFF Q75 and W-18. Preserve
 filesystem-only persistence, Spin WIT and injected env/config. Do not merge on
-the strength of correctness alone: profile the remaining ABI/I/O/journal costs
-and decide whether the smaller trusted host justifies them. Do not batch undo
+the strength of correctness alone: validate/upstream the byte-list adapter fix,
+then profile small-call and remaining write costs. Do not batch undo
 records across mutations without proving recovery at every crash boundary.
 Branch pushes do not publish; merging guests into main needs owner approval.
