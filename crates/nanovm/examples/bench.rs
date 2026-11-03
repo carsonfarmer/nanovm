@@ -66,6 +66,19 @@ fn node(name: &str, app: &str, max_live: usize, endpoint: Option<String>) -> any
     Node::new(cfg, &app, &wasm, None)
 }
 
+/// CPU time (user + system) this process has used so far.
+fn cpu() -> Duration {
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
+    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+    tv(u.ru_utime) + tv(u.ru_stime)
+}
+
+/// CPU µs per request since `since`, load generator included.
+fn cpu_us(since: Duration, r: &Run) -> f64 {
+    (cpu() - since).as_secs_f64() * 1e6 / r.lat_us.len().max(1) as f64
+}
+
 async fn once(node: &Arc<Node>, id: &str, path: &str) -> Reply {
     request(node, "GET", id, path, "").await
 }
@@ -148,23 +161,27 @@ async fn main() -> anyhow::Result<()> {
         json!({ "run": cold.json(), "live": live, "rss_mb": rss1 as f64 / 1e6, "kb_per_object": per_obj_kb.round() }),
     );
 
+    let c0 = cpu();
     let warm = load(&n, "GET", "/", warm_n, conc, move |i| {
         format!("o{}", i % warm_objects)
     })
     .await;
+    let warm_cpu = cpu_us(c0, &warm);
+    let c0 = cpu();
     let serial = load(&n, "GET", "/", 20_000 / scale, 1, |_| "o0".into()).await;
+    let serial_cpu = cpu_us(c0, &serial);
     let incr = load(&n, "POST", "/incr", warm_n / 5, conc, move |i| {
         format!("o{}", i % warm_objects)
     })
     .await;
     let incr1 = load(&n, "POST", "/incr", 2_000 / scale, 1, |_| "o0".into()).await;
     println!("\nwarm ({warm_objects} live objects)");
-    row(&format!("GET, {conc} concurrent"), &warm, "");
-    row("GET, one client, one object", &serial, "");
+    row(&format!("GET, {conc} concurrent"), &warm, &format!("{warm_cpu:.1} µs CPU/request"));
+    row("GET, one client, one object", &serial, &format!("{serial_cpu:.1} µs CPU/request"));
     row(&format!("POST /incr (writes /data), {conc} conc"), &incr, "");
     row("POST /incr, one client, one object", &incr1, "");
-    out.insert("warm_get".into(), warm.json());
-    out.insert("warm_serial".into(), serial.json());
+    out.insert("warm_get".into(), json!({ "run": warm.json(), "cpu_us_per_request": warm_cpu }));
+    out.insert("warm_serial".into(), json!({ "run": serial.json(), "cpu_us_per_request": serial_cpu }));
     out.insert("warm_incr".into(), incr.json());
     out.insert("warm_incr_serial".into(), incr1.json());
     n.shutdown().await;
@@ -314,9 +331,11 @@ async fn full_export() -> anyhow::Result<()> {
     let cold = load(&n, "GET", "/", 1000, 64, |i| format!("o{i}")).await;
     anyhow::ensure!(cold.failed() == 0, "cold requests failed: {:?}", cold.failures);
     let started = Instant::now();
+    let c0 = cpu();
     for _ in 0..3 {
+        let c1 = cpu();
         let run = load(&n, "GET", "/", 200_000, 256, |i| format!("o{}", i % 100)).await;
-        row("warm GET with decoded OTLP", &run, "");
+        row("warm GET with decoded OTLP", &run, &format!("{:.1} µs CPU/request", cpu_us(c1, &run)));
         anyhow::ensure!(run.failed() == 0, "warm requests failed: {:?}", run.failures);
     }
     let elapsed = started.elapsed();
@@ -325,6 +344,8 @@ async fn full_export() -> anyhow::Result<()> {
     let telemetry = n.telemetry.clone();
     tokio::task::spawn_blocking(move || telemetry.flush()).await??;
     let received = received.load(Relaxed);
+    let cpu_us = (cpu() - c0).as_secs_f64() * 1e6 / 600_000.0;
+    println!("cpu_us_per_request={cpu_us:.1} (requests, export and sink, drain included)");
     println!("request_rps={:.0} drained_rps={:.0} received={received}/601000 bytes={} live_rss_mb={:.1} drained_rss_mb={:.1}",
         600_000.0 / elapsed.as_secs_f64(), 600_000.0 / started.elapsed().as_secs_f64(),
         bytes.load(Relaxed), live_rss as f64 / 1e6, rss_bytes() as f64 / 1e6);
