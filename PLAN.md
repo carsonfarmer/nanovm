@@ -340,6 +340,52 @@ Built on branch `proxy` by one agent and finished by another. README's "The prox
 - **A registry client of our own** (`registry::Oci`, over reqwest) replaced oci-client's downloads: every download has a size cap, digests are checked before they name a file, and only public addresses are reached (DNS answers and redirects included) unless in dev mode. The runtime now depends on `oci-spec` for reference parsing and reads the few manifest fields it needs itself; oci-client is a dev-dependency (tests, `examples/dev-registry.rs`).
 - **Review findings fixed here:** N-1, N-3, N-4, N-11, N-12, N-13 (and with it N-14, N-15), N-16, N-17, N-18, N-19. An adversarial review of the branch then found eleven more; the blocking ones were fixed before it landed (apps keyed by host, no unsigned manifests on disk, canonical registry addresses, proxy dev mode on loopback only, a bounded token and signature count), and the rest became N-22 to N-31 in ISSUES.md, fixed since: `max_apps` with idle apps' slots reused and registry fetches four at once with a deadline (N-22), accept loops that outlast fd exhaustion and proxy client timeouts (N-24), bounded single-flight proxy caches (N-25), bounded policy sets (N-26), a node-wide link cap (N-27), drains that wait for the old process (N-28), directory setup off the front end (N-29), hop-by-hop headers dropped (N-30), and oci-spec in place of oci-client (N-31, partly). Since then: dev mode needs the `dev` cargo feature (N-23) and the proxy has no TLS of its own (W-14).
 
+## Runtime simplification analysis (2026-11-03)
+
+The whole-runtime review starts at **5,305 lines**. Estimated behavior-preserving
+savings are **100–200 lines**, not a promised result; estimates overlap and must
+survive implementation and benchmarks. Storage is 1,229 lines (23.2%); actor and
+admission code is 894 (16.9%). The established counter includes 36 test-only lines
+before a test module; moving those is not runtime simplification.
+
+Implement in separately verified slices:
+
+1. **Worker lifetime (`supervisor.rs`, estimated 10–20 lines):** replace the
+   oneshot kill plus watch completion channels with one watch channel. Its
+   receiver must outlive child termination/reaping. Test natural exits, cancelled
+   switches and a gated reap barrier; preserve the control runtime and slot transfer.
+2. **Dependency calls (`egress.rs`, 25–50):** share span/cancellation, admission and
+   body-permit ownership around route-specific work. Preserve cycle rejection
+   precedence, external versus internal error trust, context propagation, counters
+   and permit lifetime. No generic operation framework.
+3. **Actor request ownership (`object.rs`, 45–90):** explore locally owned request
+   state instead of two queue loops, shared optional `Pending` and store reset
+   signalling. Keep deadline accounting unchanged initially. Wasmtime spawned
+   work only progresses while the event loop runs; a plain idle `recv` would be a
+   behavior change. Add private-fixture background-work coverage and measure warm
+   throughput/churn/memory. Stop if preserving semantics recreates the machinery.
+4. **Library substitutions:** Wasmtime `trappable_error_type` for KV's nested
+   error splitter (10–20), and `http_body_util::Limited` for response byte counting
+   (8–18). Preserve guest-error versus trap classification, streaming and aborts;
+   retain only real net reductions after conversion code is included.
+5. **Conditional storage experiment (20–60):** let the storage owner implement
+   concrete KV file replacement and share actual admission/removal accounting.
+   Do not merge quota, undo-log and retained-file budgets, weaken capability
+   checks, or remove recovery records. Reject a generic transaction abstraction
+   that merely relocates the sequence. Run all recovery-cut, rename, open-unlinked
+   descriptor, repeated-replacement and post-return failure tests.
+
+Rejected as unproven or product changes: one universal HTTP client/cache, replacing
+the journal with SQLite, removing meaningful spans, and freezing idle guest work.
+Keep the performance-sensitive socketpair links and pure OCI parse cache. Do not
+inflate application code with library-style builders or traits.
+
+No new product decision blocks this sequence. Full analysis and evidence:
+[runtime simplification review](https://ampcode.com/artifacts/nanovm-runtime-simplification-analysis-and-test-reliability-d937c6ea-f380-4eda-8719-307f9c4b875a).
+Use the workspace `writing-rust` and `grilling` skills. Every implemented slice
+needs targeted tests/mutations, full suites, demo and matched performance checks;
+keep proposals distinct from delivered savings.
+
 ## Roadmap (agreed with the owner, 2026-10-30)
 
 Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tracked; the decisions are Q41–Q51 in [HANDOFF.md](HANDOFF.md). In priority order:
@@ -347,7 +393,7 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 1. **WebSockets moved into the front proxy (Q42, Q53; W-3 done).** The proxy owns sockets and app/object-scoped channels; the node answers ordinary event POSTs. Each event resolves the current digest, so sockets and subscriptions survive worker exits and deployments. A private publish listener receives committed publishes, stamped with the app by the supervisor and object by the worker. Socket caps belong to the proxy, shared directly with socket managers; an object-keyed tree bounds fan-out work to that object's sockets (Q56). This supersedes Q31/Q35; full-suite, mutation, demo and benchmark results are in HANDOFF. Review follow-ups N-33/N-34 remain in ISSUES.
 2. **Observability by default (Q43, Q62, Q71; W-2 complete).** Always-on rich request-completion spans carry queue, instantiate, guest, commit and post-return timing fields; real object calls retain child spans. Guest logs correlate with their request. Infrastructure snapshots are structured OTLP logs, replacing metric instruments and local histograms. No tracing feature or compatibility endpoints remain. Use the OpenTelemetry SDK and configurable Collector, not a custom event framework.
    - Delivered on main in `49d0ae4`; main and branch CI passed. Recommend a separately budgeted standalone Collector (or dedicated physical cores), private ingress and TLS/access controls across hosts. Measured application overhead is 2.17%, versus 7.58% fully colocated; Collector CPU is additional. Remote-network and durable-backend behavior still require deployment-specific validation. See README's operator checks for configuration and alerts.
-   - Simplification follow-up on `w2-docs-simplification`: existing scope guards replace a custom wait-edge cleanup type; DNS results are checked without a second collection. Runtime 5,315 → 5,305. All meaningful spans and safety contracts remain. Targeted tests and production check pass; full-suite validation hit the intermittent registry CPU-budget test, which passed unchanged in isolation. See HANDOFF; no new performance claim or merge yet.
+   - Simplification follow-up: existing scope guards replace a custom wait-edge cleanup type; DNS results are checked without a second collection. Runtime 5,315 → 5,305. The reproduced registry drain test defect is fixed by testing persistence with a tiny file/key, waiting for observed handling, and checking worker lifetime instead of client scheduling order. No production budget or guest changes. Deep analysis above replaces the earlier narrow cleanup plan.
 
    <details>
    <summary>Historical implementation and validation checkpoints (not current blockers)</summary>
