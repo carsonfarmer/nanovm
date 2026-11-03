@@ -1458,25 +1458,39 @@ async fn registry_app_switches_versions_after_a_drain() {
     let (_sup, addr) = signed("registry_app_switches_versions").await;
     let (old_app, new_app) = (old.1.clone(), new.1.clone());
 
-    assert_eq!(reg_get(addr, "/w/fill?mount=data&mb=1", &old_app, SIGNER, None).await.0, 200);
-    let slow = tokio::spawn(async move {
-        let r = reg_get(addr, "/s/sleep?ms=1500", &old_app, SIGNER, None).await;
-        (r, Instant::now())
-    });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    // The new version sees the old one's volume: 1 of its 8 MiB is used.
-    let (status, body) = reg_get(addr, "/w/fill?mount=data&mb=8&name=more.bin", &new_app, SIGNER, None).await;
-    let switched = Instant::now();
-    assert_eq!(status, 507, "{body}");
-    assert!(body.contains(&format!(r#""written":{}"#, 7 << 20)), "{body}");
-    let ((slow_status, slow_body), slow_done) = slow.await.unwrap();
+    // Cache both signed versions before testing the drain: downloading or
+    // compiling the replacement could otherwise outlast the sleeping request.
+    let (status, body) = reg_get(addr, "/warm/", &new_app, SIGNER, None).await;
+    assert_eq!(status, 200, "{body}");
+    // Persistence needs only a tiny file and key, not MiB of writes racing
+    // the signed app's 100 ms CPU limit. Quotas have their own tests.
+    let expected = serde_json::json!({"file": "before-switch", "key": "before-switch"});
+    let (status, body) = reg_get(addr, "/w/commit?v=before-switch", &old_app, SIGNER, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), expected);
+    let old_worker = worker(&old_app);
+    let old_pid = stats_json(addr).await["workers"][&old_worker]["pid"].as_u64().unwrap();
+    let slow = tokio::spawn(async move { reg_get(addr, "/s/sleep?ms=1500", &old_app, SIGNER, None).await });
+    let started = Instant::now();
+    loop {
+        let v = stats_json(addr).await;
+        if v["apps"][&old_worker]["phases"]["handling"] == 1 {
+            break;
+        }
+        assert!(!slow.is_finished(), "old request finished before the switch: {v}");
+        assert!(started.elapsed() < Duration::from_secs(2), "old request never entered handling: {v}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let (status, body) = reg_get(addr, "/w/commit", &new_app, SIGNER, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), expected);
+    // Observe worker lifetime, not the scheduling order of two HTTP clients.
+    assert!(!Path::new(&format!("/proc/{old_pid}")).exists(), "old worker survived the switch");
+    let (slow_status, slow_body) = slow.await.unwrap();
     assert_eq!(slow_status, 200, "the old version's request finished: {slow_body}");
-    // Two workers never serve the app at once: the new one answers only
-    // after the old one's last request is done.
-    assert!(switched > slow_done, "the new version answered while the old one was still serving");
     let v = stats_json(addr).await;
     assert_eq!(v["workers"][worker(&new.1).as_str()]["version"], new.0.to_string(), "{v}");
-    assert_eq!(v["workers"][worker(&new.1).as_str()]["starts"], 2, "{v}");
+    assert_eq!(v["workers"][worker(&new.1).as_str()]["starts"], 3, "{v}");
 }
 
 // ---- wasi:keyvalue -------------------------------------------------------
