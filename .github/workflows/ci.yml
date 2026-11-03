@@ -67,6 +67,12 @@ jobs:
           bash experiments/sqlite-filesystem/build.sh --compose
       - name: Run composed SQLite example
         run: env -u RUST_BACKTRACE cargo run --locked -p nanovm --example sqlite
+      - name: Build and run KV composition probes (no publishing)
+        run: |
+          ulimit -n "$(ulimit -Hn)"
+          bash experiments/kv-filesystem/build.sh
+          env -u RUST_BACKTRACE cargo run --locked -p nanovm --example kv_probe
+          env -u RUST_BACKTRACE cargo run --locked -p nanovm --example spin_kv_probe
       - name: Pressure test SQLite against the journal
         run: |
           ulimit -n "$(ulimit -Hn)"

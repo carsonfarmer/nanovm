@@ -1,5 +1,9 @@
 # W-18: synchronous KV over P3 filesystem
 
+The sync ABI probe below is retained as a negative control. The successful
+[Spin async KV prototype](SPIN.md) uses the unchanged `spin:key-value@3.0.0` WIT
+over the same filesystem, including streaming key enumeration.
+
 This is an ABI feasibility probe, **not a replacement KV provider**. Env and
 config remain host-injected. No production provider, root WIT, or `guests/**`
 source is changed. The separate workspace is not published by guest CI.

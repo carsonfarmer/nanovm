@@ -477,9 +477,10 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 
 ## Layout
 
-W-18's [KV-over-filesystem ABI probe](experiments/kv-filesystem/README.md) is a
-reproducible experiment, not a replacement provider: unchanged synchronous KV
-cannot suspend for P3 filesystem I/O. Env/config remain host-injected.
+W-18's [Spin KV prototype](experiments/kv-filesystem/SPIN.md) runs async CRUD and
+streaming key enumeration over the transactional filesystem. The earlier
+[synchronous ABI probe](experiments/kv-filesystem/README.md) remains a negative
+control. Both are experiments, not replacement providers; env/config stay injected.
 
 | Path | What it is |
 |---|---|
