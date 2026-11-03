@@ -147,12 +147,11 @@ pub fn wants<B>(req: &Request<B>) -> bool {
 
 /// Whether `req` claims to be a socket's event, which only the proxy may
 /// send: any of its content types is that type, in any case and with any
-/// parameters, since an object may read any of them in any of these ways.
+/// parameters, since an object may read any of them in any of these ways
+/// (repeated headers are often joined with commas, so those split them too).
 pub fn is_event<B>(req: &Request<B>) -> bool {
-    req.headers().get_all(CONTENT_TYPE).iter().any(|v| {
-        let essence = v.as_bytes().split(|&b| b == b';').next().unwrap_or_default();
-        essence.trim_ascii().eq_ignore_ascii_case(EVENTS.as_bytes())
-    })
+    let types = req.headers().get_all(CONTENT_TYPE).into_iter().flat_map(|v| v.as_bytes().split(|&b| b == b','));
+    types.map(|t| t.split(|&b| b == b';').next().unwrap_or_default()).any(|t| t.trim_ascii().eq_ignore_ascii_case(EVENTS.as_bytes()))
 }
 
 /// One app's sockets, ordered by object so publishing visits only its own.
@@ -870,7 +869,7 @@ mod tests {
             assert!(wants(&req(http::header::UPGRADE, v)));
         }
         assert!(!wants(&req(http::header::UPGRADE, "h2c")) && !wants(&Request::new(())));
-        for v in [EVENTS, "application/websocket-events; x=1", " Application/WebSocket-Events "] {
+        for v in [EVENTS, "application/websocket-events; x=1", " Application/WebSocket-Events ", "text/plain, application/websocket-events"] {
             assert!(is_event(&req(CONTENT_TYPE, v)), "{v}");
         }
         let second = Request::get("/").header(CONTENT_TYPE, "text/plain").header(CONTENT_TYPE, EVENTS).body(()).unwrap();
