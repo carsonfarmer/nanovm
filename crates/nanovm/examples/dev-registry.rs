@@ -32,11 +32,12 @@ async fn main() -> anyhow::Result<()> {
         let version = [(VERSION.to_string(), "1.0.0".to_string())].into();
         let mut manifest = OciImageManifest::build(std::slice::from_ref(&layer), &config, Some(version));
         (manifest.media_type, manifest.artifact_type) = (Some(OCI_IMAGE_MEDIA_TYPE.into()), Some(APP_TYPE.into()));
-        let r = format!("{}/nanovm/{guest}:latest", running.bound_addr()).parse()?;
+        let name = format!("{}/nanovm/{guest}:latest", running.bound_addr());
         let auth = oci_client::secrets::RegistryAuth::Anonymous;
-        client.push(&r, &[layer], config, &auth, Some(manifest)).await?;
+        client.push(&name.parse()?, &[layer], config, &auth, Some(manifest)).await?;
+        let r: nanovm::registry::Reference = name.parse()?;
         let digest = Oci::new(true)?.digest(&r).await?;
-        println!("{guest} {}/{}@{digest}", r.registry(), r.repository());
+        println!("{guest} {}/{}@{digest}", r.registry, r.repository);
     }
     std::future::pending().await
 }

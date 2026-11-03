@@ -1708,7 +1708,6 @@ dependencies = [
  "libc",
  "nanovm",
  "oci-client",
- "oci-spec",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-otlp",

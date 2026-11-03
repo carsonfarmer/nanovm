@@ -25,13 +25,12 @@ use http::header::{CONNECTION, PROXY_AUTHORIZATION, TE, TRAILER, UPGRADE};
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
-use oci_spec::distribution::Reference;
 use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 
 use crate::config::ProxyConfig;
 use crate::object::{RespBody, error_response};
-use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
+use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, Reference, TRUST_HEADER};
 use crate::ws::{self, Sockets};
 
 /// How long a client may take over each request's headers (or idle between
@@ -139,7 +138,7 @@ impl Proxy {
         let route = route.ok_or((StatusCode::NOT_FOUND, format!("no app at {host}")))?;
         let digest = self.digest(&route.app).await.map_err(bad(StatusCode::BAD_GATEWAY))?;
         let mut headers = http::HeaderMap::new();
-        let app = format!("{}/{}@{digest}", route.app.registry(), route.app.repository());
+        let app = format!("{}/{}@{digest}", route.app.registry, route.app.repository);
         for (k, v) in [(APP_HEADER, Some(app.as_str())), (HOST_HEADER, Some(route.owner.as_str())),
             (TRUST_HEADER, Some(route.trust.as_str())), (MIN_VERSION_HEADER, route.min.as_deref())] {
             if let Some(v) = v {
@@ -265,7 +264,7 @@ impl Proxy {
 
     /// The digest `app`'s tag names, from the cache for `tag_ttl_s`.
     async fn digest(&self, app: &Reference) -> anyhow::Result<String> {
-        let key = app.whole();
+        let key = app.to_string();
         let lookup = async {
             let digest = self.registry.digest(app).await.with_context(|| format!("resolving {key}"))?;
             Ok((digest, Duration::from_secs(self.cfg.tag_ttl_s)))
@@ -294,7 +293,7 @@ fn parse(txt: &str) -> anyhow::Result<Route> {
         }
     }
     let app = app.context("no app=")?;
-    if app.digest().is_some() || app.tag().is_none() {
+    if app.digest.is_some() || app.tag.is_none() {
         bail!("app= names a tag, not a digest");
     }
     if trust.is_empty() {
@@ -365,7 +364,7 @@ mod tests {
     #[test]
     fn records_parse_strictly() {
         let r = parse("app=ghcr.io/org/app:prod; trust=https://i s1; trust=https://i s2; min=1.2.0").unwrap();
-        assert_eq!(r.app.whole(), "ghcr.io/org/app:prod");
+        assert_eq!(r.app.to_string(), "ghcr.io/org/app:prod");
         assert_eq!((r.trust.as_str(), r.min.as_deref()), ("https://i s1, https://i s2", Some("1.2.0")));
         for bad in [
             "trust=a b",
