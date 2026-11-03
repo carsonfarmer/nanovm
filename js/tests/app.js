@@ -32,6 +32,7 @@ const routes = {
     return Response.json({ status: r.status, callee: await r.json() });
   },
   "GET /config": (req, env) => Response.json(env.config),
+  "GET /kv": async (req, env) => Response.json(Object.fromEntries(await env.kv.list())),
   "POST /echo": async (req) => {
     const u = new URL(req.url);
     return Response.json({
@@ -83,5 +84,19 @@ export default {
     hits++;
     const route = routes[`${request.method} ${new URL(request.url).pathname}`];
     return route ? route(request, env, ctx) : new Response("not found", { status: 404 });
+  },
+  // A chat room: every socket of the object joins channel "room".
+  webSocketOpen(ws) {
+    if (ws.id === "refuse-me") return false;
+    ws.subscribe("room");
+  },
+  async webSocketMessage(ws, message, env) {
+    if (typeof message !== "string") return ws.send(message);
+    if (message.startsWith("pub ")) return env.publish("room", message.slice(4));
+    if (message === "bye") return ws.close(4000);
+    ws.send(`echo ${message} from ${ws.id}`);
+  },
+  async webSocketClose(ws, code, env) {
+    await env.kv.put("closed", code);
   },
 };

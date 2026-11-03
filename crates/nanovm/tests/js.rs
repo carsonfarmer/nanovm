@@ -224,3 +224,31 @@ async fn instances_share_nothing_from_the_snapshot() {
     assert!((a["now"].as_i64().unwrap() - now_ms()).abs() < 5000, "Date.now() is now: {a}");
     assert_eq!(get(&node, "b", "/").await.json()["object"], "b");
 }
+
+/// WebSocket events (as the proxy sends them) reach `webSocketOpen`,
+/// `webSocketMessage` and `webSocketClose`; their answer carries the
+/// socket's events, GRIP controls among them.
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_events() {
+    let node = node("js_websocket_events", 8);
+    let event = async |id: &str, body: &'static [u8]| {
+        let req = http::Request::post("http://localhost/ws")
+            .header("content-type", "application/websocket-events")
+            .header("connection-id", id)
+            .body(bytes::Bytes::from_static(body))
+            .unwrap();
+        let resp = node.dispatch("room", req).await;
+        let status = resp.status().as_u16();
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        (status, body.to_vec())
+    };
+    let sub = r#"c:{"type":"subscribe","channel":"room"}"#;
+    let open = format!("OPEN\r\nTEXT {:x}\r\n{sub}\r\n", sub.len()).into_bytes();
+    assert_eq!(event("1", b"OPEN\r\n").await, (200, open));
+    let echo = b"TEXT 10\r\nm:echo hi from 1\r\nBINARY 1\r\n\x07\r\n".to_vec();
+    assert_eq!(event("1", b"TEXT 2\r\nhi\r\nBINARY 1\r\n\x07\r\n").await, (200, echo));
+    assert_eq!(event("1", b"TEXT 3\r\nbye\r\n").await, (200, b"CLOSE 2\r\n\x0f\xa0\r\n".to_vec()), "close(4000)");
+    assert_eq!(event("refuse-me", b"OPEN\r\n").await.0, 403);
+    assert_eq!(event("1", b"CLOSE 2\r\n\x03\xe8\r\n").await, (200, vec![]));
+    assert_eq!(get(&node, "room", "/kv").await.json(), serde_json::json!({"closed": 1000}), "webSocketClose ran");
+}
