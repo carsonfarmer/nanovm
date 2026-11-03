@@ -237,6 +237,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **From source:** after sending a successful response, a failed final commit marks the request span as error but discards the I/O error and supplies no `error.type` or failing-phase classification. The initial commit has a `commit-failed` classification; the final one should be equally diagnosable without changing the already-sent HTTP status.
 - **Status:** fixed in the focused W-2 continuation: retain the I/O result, record `post-return-commit-failed` and a bounded correlated diagnostic, preserve HTTP status. A gated test-only component outside `guests/**` proves actual post-return calls/logs and fails the second commit by moving its journal log. The regression failed before the fix; the full locked suite passes. Published guests remain unchanged.
 
+### N-74: a compromised worker's telemetry batch costs the supervisor 200 times its size
+- **Where:** `telemetry.rs` (`Relay::handle` → `stamp`)
+- **Scenario:** found by the sec review at `491e790` (sec's entry has the full text). The relay decoded each worker batch (up to 1 MiB) into prost structs to replace its resource and drop identity attributes. 1 MiB of 2-byte empty spans allocated 278 MB and took 308 ms of the supervisor's single control thread per batch.
+- **Reproduced:** yes (`stamping_a_batch_costs_about_its_size` fails with the decoding stamp: 277,873,410 bytes allocated)
+- **Fix:** `stamp` rewrites the batch at the wire level: each `ResourceSpans`/`ResourceLogs` resource is replaced by the stamped one (repeated resource fields included), and identity attributes (`service.name`, `service.version`, `nanovm.app`, or any key by string-table index) are still dropped from scopes, spans, events, links and log records, judging a key given twice by the last one, as decoders do. Everything else is copied as bytes. The span-level scrub stays: the Collector's span-metrics connector reads `nanovm.app` and `service.version` from span attributes before resource attributes. Hostile batch: 278 MB → 3.1 MB allocated, 308 → 9.9 ms. A normal 256-span batch: 837 → 176 µs, 802 → 120 KB allocated (release, loaded machine). `stamping_matches_decoding_and_scrubbing` checks the output against decoding and scrubbing; mutations (decode again, skip event attributes, first key wins, keep the worker's resource, ignore string-table keys) each fail it.
+- **Status:** fixed in the perf branch (see `notes/perf.md`)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
