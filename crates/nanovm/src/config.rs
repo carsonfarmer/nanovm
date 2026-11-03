@@ -33,6 +33,8 @@ config! {
         max_live_objects: usize = 1000usize,
         /// Private proxy endpoint receiving committed publishes.
         publish_to: String = "http://127.0.0.1:8444/publish",
+        /// OTLP/HTTP collector base URL. Only the supervisor connects to it.
+        telemetry_endpoint: String = "http://127.0.0.1:4318",
         /// Virtual address space reserved per linear memory: no memory grows
         /// past it, whatever an app's `memory_mb`.
         memory_reservation_mb: u64 = 128u64,
@@ -81,6 +83,9 @@ config! {
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub name: String,
+    /// Manifest digest assigned by the supervisor, not the guest manifest.
+    #[serde(default)]
+    pub digest: String,
     /// Extra environment variables visible to the guest.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -102,6 +107,8 @@ config! {
         node: String = "127.0.0.1:8080",
         /// Private control listener; only nodes may reach it.
         publish_listen: String = "127.0.0.1:8444",
+        /// OTLP/HTTP Collector base URL for front-door request events.
+        telemetry_endpoint: String = "http://127.0.0.1:4318",
         max_sockets: usize = 10_000usize,
         max_sockets_per_app: usize = 1000usize,
         max_sockets_per_object: usize = 256usize,

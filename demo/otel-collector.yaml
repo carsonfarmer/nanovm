@@ -1,0 +1,59 @@
+# Reference pipeline for otelcol-contrib 0.164.0. No sampling.
+# debug is a validation sink, NOT durable storage. Replace/add an authenticated
+# backend exporter for production; credentials belong here, not in the worker.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+  batch:
+    timeout: 200ms
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+connectors:
+  span_metrics:
+    namespace: nanovm.spans
+    histogram:
+      unit: s
+      explicit:
+        buckets: [100us, 500us, 1ms, 5ms, 10ms, 50ms, 100ms, 500ms, 1s, 5s, 30s]
+    dimensions:
+      - name: nanovm.app
+      - name: service.version
+      - name: http.response.status_code
+    resource_metrics_key_attributes: [service.name, nanovm.app, service.version]
+    aggregation_cardinality_limit: 2048
+    resource_metrics_cache_size: 256
+    metrics_flush_interval: 5s
+    metrics_expiration: 10m
+exporters:
+  debug:
+    verbosity: basic
+  prometheus:
+    endpoint: 127.0.0.1:8889
+service:
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug, span_metrics]
+    metrics:
+      receivers: [span_metrics]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug]

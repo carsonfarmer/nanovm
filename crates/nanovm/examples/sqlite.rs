@@ -33,6 +33,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let app = AppConfig {
         name: "sqlite-example".into(),
+        digest: "example".into(),
         env: Default::default(),
         config: Default::default(),
         limits: serde_json::from_value(json!({

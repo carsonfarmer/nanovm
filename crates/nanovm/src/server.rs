@@ -1,7 +1,6 @@
-//! The node's HTTP surface: `/{object}/{rest}` goes to the object, and
-//! `/_nanovm/stats` and `/_nanovm/events` serve the node's metrics and event
-//! log. A worker serves it to its supervisor over a `link`; tests serve it
-//! on TCP.
+//! The node's HTTP surface: `/{object}/{rest}` goes to the object.
+//! Private readiness and telemetry flush routes serve the supervisor over
+//! a `link`; tests serve this surface on TCP.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -14,10 +13,8 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::metrics::rss_bytes;
 use crate::object::{RespBody, error_response};
 use crate::table::{BAD_OBJECT, Node, route};
 
@@ -74,7 +71,7 @@ where
 pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {
     let path = req.uri().path().to_string();
     if let Some(rest) = path.strip_prefix("/_nanovm") {
-        return admin(&node, rest, &req).await;
+        return admin(&node, rest).await;
     }
     let Some((id, rest)) = route(&path) else {
         return error_response(400, "bad-object-id", BAD_OBJECT);
@@ -122,22 +119,14 @@ fn full(b: impl Into<Bytes>) -> RespBody {
     Full::new(b.into()).map_err(|e| match e {}).boxed_unsync()
 }
 
-async fn admin(node: &Arc<Node>, path: &str, req: &Request<Incoming>) -> Response<RespBody> {
-    let since = req.uri().query().and_then(|q| q.strip_prefix("since=")?.parse().ok());
+async fn admin(node: &Arc<Node>, path: &str) -> Response<RespBody> {
     match path {
-        "/stats" => ok_json(stats(node)),
-        "/events" => ok_json(json!(node.metrics.events_since(since.unwrap_or(0)))),
+        "/ready" => Response::builder().status(204).body(full("")).unwrap(),
+        "/flush" => {
+            let telemetry = node.telemetry.clone();
+            let ok = tokio::task::spawn_blocking(move || telemetry.flush()).await.is_ok_and(|r| r.is_ok());
+            Response::builder().status(if ok { 204 } else { 503 }).body(full("")).unwrap()
+        }
         _ => error_response(404, "not-found", path),
     }
-}
-
-fn stats(node: &Node) -> serde_json::Value {
-    let mut v = serde_json::to_value(&*node.metrics).expect("metrics serialize");
-    v["uptime_ms"] = json!(node.started.elapsed().as_millis() as u64);
-    v["rss_mb"] = json!(rss_bytes() as f64 / 1048576.0);
-    v["live_objects"] = json!(node.live_objects());
-    v["max_live_objects"] = json!(node.cfg.max_live_objects);
-    v["phases"] = json!(node.phases());
-    v["app"] = json!({ "name": &*node.app.name, "limits": node.app.cfg.limits });
-    v
 }

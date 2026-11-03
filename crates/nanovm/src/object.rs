@@ -15,6 +15,7 @@ use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use parking_lot::Mutex;
+use opentelemetry::trace::Span as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use wasmtime::component::{Accessor, ResourceTable, ResourceTableError};
 use wasmtime::{ResourceLimiter, Store, Trap, UpdateDeadline};
@@ -39,6 +40,8 @@ pub struct Job {
     pub req: http::Request<Bytes>,
     pub reply: oneshot::Sender<http::Response<RespBody>>,
     pub enqueued: Instant,
+    pub context: opentelemetry::Context,
+    pub span: crate::telemetry::Span,
 }
 
 #[repr(u8)]
@@ -52,7 +55,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    const ALL: [Phase; 5] = [
+    pub(crate) const ALL: [Phase; 5] = [
         Phase::Starting,
         Phase::Idle,
         Phase::Handling,
@@ -82,6 +85,7 @@ pub struct ObjShared {
     lane: Mutex<Option<OwnedSemaphorePermit>>,
     /// The objects its calls are waiting on, one entry per call.
     pub waiting_on: Mutex<Vec<Arc<str>>>,
+    pub context: Mutex<opentelemetry::Context>,
 }
 
 impl ObjShared {
@@ -184,13 +188,16 @@ impl ResourceLimiter for MemLimiter {
 /// Keeps the last few KiB a guest wrote to stdout/stderr, so a trap can be
 /// reported with the panic message that preceded it.
 #[derive(Clone, Default)]
-pub struct LogTail(Arc<Mutex<VecDeque<u8>>>);
+pub struct LogTail {
+    buf: Arc<Mutex<VecDeque<u8>>>,
+    export: Option<(Arc<crate::telemetry::Telemetry>, Arc<ObjShared>, &'static str)>,
+}
 
 const LOG_TAIL: usize = 2048;
 
 impl LogTail {
     pub fn text(&self) -> String {
-        let buf: Vec<u8> = self.0.lock().iter().copied().collect();
+        let buf: Vec<u8> = self.buf.lock().iter().copied().collect();
         String::from_utf8_lossy(&buf).trim().to_string()
     }
 }
@@ -209,7 +216,10 @@ impl StdoutStream for LogTail {
 
 impl tokio::io::AsyncWrite for LogTail {
     fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
-        let mut buf = self.0.lock();
+        if let Some((telemetry, object, stream)) = &self.export {
+            telemetry.log(&object.id, ("log.iostream", stream), data, &object.context.lock());
+        }
+        let mut buf = self.buf.lock();
         buf.extend(data.iter().rev().take(LOG_TAIL).rev());
         let excess = buf.len().saturating_sub(LOG_TAIL);
         buf.drain(..excess);
@@ -302,7 +312,10 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     b.allow_blocking_current_thread(true);
     b.preopened_dir(&data_dir, "/data", FsPerms::ReadWrite)?;
     b.preopened_dir(&tmp_dir, "/tmp", FsPerms::ReadWrite)?;
-    b.stdout(stderr.clone()).stderr(stderr.clone());
+    let output = |stream| LogTail {
+        buf: stderr.buf.clone(), export: Some((node.telemetry.clone(), shared.clone(), stream)),
+    };
+    b.stdout(output("stdout")).stderr(output("stderr"));
 
     let mut table = ResourceTable::new();
     table.set_max_capacity(limits.max_resources);
@@ -404,16 +417,37 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
 struct Pending {
     reply: Option<oneshot::Sender<http::Response<RespBody>>>,
     abort: Arc<AtomicBool>,
+    span: crate::telemetry::Span,
+    phase: &'static str,
+    since: Instant,
+}
+
+impl Pending {
+    fn phase(&mut self, phase: &'static str) {
+        crate::telemetry::duration(&mut self.span, self.phase, self.since);
+        self.phase = phase;
+        self.since = Instant::now();
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        crate::telemetry::duration(&mut self.span, self.phase, self.since);
+    }
 }
 
 pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Job>) {
     loop {
+        let Some(mut job) = rx.recv().await else { return };
+        *shared.context.lock() = job.context.clone();
         shared.set_phase(Phase::Starting);
         // A store holds a slot until it is dropped, and the pool has room for
         // every slot. An evicted object's store lives until its actor next
         // runs, so a new object waits here until that store is gone rather
         // than finding the pool full.
         let slot = node.slots.clone().acquire_owned().await.expect("slots is never closed");
+        crate::telemetry::duration(&mut job.span, "nanovm.queue.duration_ms", job.enqueued);
+        job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", true));
         shared.begin_start();
         let t0 = Instant::now();
         let started = async {
@@ -424,26 +458,26 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
             anyhow::Ok((store, svc))
         }
         .await;
+        crate::telemetry::duration(&mut job.span, "nanovm.instantiate.duration_ms", t0);
         match started {
             Ok((store, svc)) => {
-                node.metrics.instantiate.record(t0.elapsed());
-                match serve(&node, &app, &shared, store, svc, &mut rx).await {
+                match serve(&node, &app, &shared, store, svc, job, &mut rx).await {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
-                    Exit::Reset => node.metrics.event("rolled-back", &app.name, &shared.id, "a request failed"),
+                    Exit::Reset => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),
                     Exit::Poisoned(p, detail) => {
                         node.metrics.poison(p);
-                        node.metrics.event(p.as_str(), &app.name, &shared.id, detail);
+                        node.metrics.event(p.as_str(), &shared.id, detail, &shared.context.lock());
                     }
                 }
             }
             Err(e) => {
                 let e = format!("{e:#}");
                 node.metrics.instantiate_failures.fetch_add(1, Relaxed);
-                node.metrics.event("instantiate-failed", &app.name, &shared.id, &*e);
-                if let Ok(job) = rx.try_recv() {
-                    let _ = job.reply.send(error_response(503, "instantiate-failed", &e));
-                }
+                node.metrics.event("instantiate-failed", &shared.id, &*e, &shared.context.lock());
+                let response = error_response(503, "instantiate-failed", &e);
+                crate::telemetry::response(&mut job.span, &response);
+                let _ = job.reply.send(response);
             }
         }
         drop(slot);
@@ -460,27 +494,36 @@ async fn serve(
     shared: &Arc<ObjShared>,
     mut store: Store<ObjState>,
     svc: Service,
+    first: Job,
     rx: &mut mpsc::Receiver<Job>,
 ) -> Exit {
     let limits = &app.cfg.limits;
     let max_resp = limits.max_response_body_kb << 10;
     let pending: Arc<Mutex<Option<Pending>>> = Arc::default();
-    let metrics = node.metrics.clone();
 
     let inner = {
         let pending = pending.clone();
         let shared = shared.clone();
         let svc = &svc;
+        let mut first = Some(first);
         async move |acc: &Accessor<ObjState>| -> wasmtime::Result<()> {
             loop {
                 shared.set_phase(Phase::Idle);
-                let Some(job) = rx.recv().await else { return Ok(()) };
+                let job = if let Some(job) = first.take() { job } else {
+                    let Some(mut job) = rx.recv().await else { return Ok(()) };
+                    crate::telemetry::duration(&mut job.span, "nanovm.queue.duration_ms", job.enqueued);
+                    job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", false));
+                    job
+                };
+                *shared.context.lock() = job.context.clone();
                 shared.begin_request();
-                metrics.requests.fetch_add(1, Relaxed);
                 let abort = Arc::new(AtomicBool::new(false));
                 *pending.lock() = Some(Pending {
                     reply: Some(job.reply),
                     abort: abort.clone(),
+                    span: job.span,
+                    phase: "nanovm.guest.duration_ms",
+                    since: Instant::now(),
                 });
 
                 let (parts, body) = job.req.into_parts();
@@ -503,6 +546,7 @@ async fn serve(
                     }
                     Err(code) => (error_response(500, "guest-error", &format!("{code:?}")), true),
                 };
+                pending.lock().as_mut().unwrap().phase("nanovm.commit.duration_ms");
                 shared.set_phase(Phase::PostReturn);
                 // Nothing is heard of a request before its changes are
                 // durable. One that failed (as one that traps or runs out of
@@ -518,19 +562,34 @@ async fn serve(
                     },
                     true => resp,
                 };
-                let status = resp.status().as_u16();
-                if let Some(tx) = pending.lock().as_mut().and_then(|p| p.reply.take()) {
-                    let _ = tx.send(resp);
+                {
+                    let mut guard = pending.lock();
+                    let p = guard.as_mut().unwrap();
+                    crate::telemetry::response(&mut p.span, &resp);
+                    crate::telemetry::duration(&mut p.span, "nanovm.response.duration_ms", job.enqueued);
+                    p.phase("nanovm.post_return.duration_ms");
+                    if let Some(tx) = p.reply.take() { let _ = tx.send(resp); }
                 }
-                metrics.status(status);
-                metrics.latency.record(job.enqueued.elapsed());
-
                 // Let tasks the guest left running (e.g. streaming the body)
                 // finish before taking the next request.
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
-                *pending.lock() = None;
+                pending.lock().as_mut().unwrap().phase("nanovm.post_return_commit.duration_ms");
                 // What it changed after answering commits now.
-                if failed || commit(acc).await.is_err() {
+                let reset = if failed { true } else {
+                    match commit(acc).await {
+                        Ok(()) => false,
+                        Err(e) => {
+                            pending.lock().as_mut().unwrap().span.set_attribute(opentelemetry::KeyValue::new(
+                                "error.type", "post-return-commit-failed"));
+                            node.metrics.event("post-return-commit-failed", &shared.id, e.to_string(), &job.context);
+                            true
+                        }
+                    }
+                };
+                if let Some(mut p) = pending.lock().take() {
+                    if reset { p.span.set_status(opentelemetry::trace::Status::error("request rolled back")); }
+                }
+                if reset {
                     acc.with(|mut s| s.data_mut().reset = true);
                     return Ok(());
                 }
@@ -583,10 +642,14 @@ async fn serve(
         && let Some(mut pending) = pending.lock().take()
     {
         pending.abort.store(true, Relaxed);
+        pending.span.set_status(opentelemetry::trace::Status::error(p.as_str()));
         if let Some(tx) = pending.reply.take() {
             let status = if *p == Poison::Timeout { 504 } else { 500 };
-            node.metrics.status(status);
-            let _ = tx.send(error_response(status, p.as_str(), detail));
+            let response = error_response(status, p.as_str(), detail);
+            crate::telemetry::response(&mut pending.span, &response);
+            let _ = tx.send(response);
+        } else {
+            pending.span.set_attribute(opentelemetry::KeyValue::new("error.type", p.as_str()));
         }
     }
     drop(store);
@@ -747,7 +810,7 @@ mod tests {
         w.write_all(b"end\n\xff").await.unwrap();
         let text = tail.text();
         assert!(text.starts_with("xxx") && text.ends_with("end\n\u{fffd}"), "{text:?}");
-        assert_eq!(tail.0.lock().len(), LOG_TAIL);
+        assert_eq!(tail.buf.lock().len(), LOG_TAIL);
         w.write_all(&[b'y'; 3 * LOG_TAIL]).await.unwrap();
         assert_eq!(tail.text(), "y".repeat(LOG_TAIL));
     }

@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # Builds everything, publishes the guests to a loopback registry, starts a
 # dev-mode nanovm node with demo/nanovm.toml (unless one is already
 # listening), and drives it over HTTP with curl while a canary object is
@@ -6,10 +6,11 @@
 # would set. Needs curl (7.84+) and jq. These numbers include
 # curl and the HTTP front end; `cargo run --release --example bench` measures
 # the node in-process.
-set -e
+set -eo pipefail
 cd "$(dirname "$0")/.."
 URL=${URL:-http://127.0.0.1:8080}
 LOG=target/demo-serve.log
+TELEMETRY=target/demo-telemetry.json
 mkdir -p target
 
 say() { printf '\n\033[1m%s\033[0m\n' "$*"; }
@@ -31,7 +32,29 @@ blast() {
 
 say "building guests and the node"
 scripts/build-guests.sh >/dev/null
-cargo build --release -p nanovm --features dev --bins --example dev-registry 2>&1 | tail -1
+cargo build --release -p nanovm --features dev --bins --example dev-registry --example dev-collector 2>&1 | tail -1
+
+say "collecting OTLP on 127.0.0.1:4318 into $TELEMETRY"
+rm -f "$TELEMETRY"
+./target/release/examples/dev-collector >target/demo-collector.log 2>&1 &
+COLLECTOR=$!
+trap 'kill $COLLECTOR ${REGISTRY:-} ${SERVER:-} ${PINGER:-} 2>/dev/null' INT TERM EXIT
+until [ -f "$TELEMETRY" ]; do
+    kill -0 $COLLECTOR 2>/dev/null || { cat target/demo-collector.log; exit 1; }
+    sleep 0.1
+done
+
+# Periodic exports are asynchronous. Wait for every live worker's next
+# metric batch, rather than silently printing stale data.
+snapshot() {
+    after=$(( $(date +%s%N) / 1000000 ))
+    until jq -e --argjson after "$after" '.collected_at_ms >= $after' "$TELEMETRY" >/dev/null; do
+        kill -0 $COLLECTOR 2>/dev/null || { cat target/demo-collector.log; exit 1; }
+        [ "$(( $(date +%s%N) / 1000000 - after ))" -lt 10000 ] || { echo 'missing fresh OTLP metrics' >&2; exit 1; }
+        sleep 0.1
+    done
+    cat "$TELEMETRY"
+}
 
 say "publishing the guests to a registry on 127.0.0.1:5000"
 : >target/demo-apps.txt
@@ -49,18 +72,18 @@ C="-H @target/demo-counter.h" H="-H @target/demo-hostile.h"
 cat target/demo-apps.txt | sed 's/^/  /'
 
 SERVER=
-if curl -sf "$URL/_nanovm/stats" >/dev/null 2>&1; then
+if curl -sf "$URL/_nanovm/ready" >/dev/null 2>&1; then
     say "using the node already listening on $URL"
 else
     say "starting a node on $URL (log: $LOG)"
     ./target/release/nanovm serve --config demo/nanovm.toml >"$LOG" 2>&1 &
     SERVER=$!
-    until curl -sf "$URL/_nanovm/stats" >/dev/null 2>&1; do
+    until curl -sf "$URL/_nanovm/ready" >/dev/null 2>&1; do
         kill -0 $SERVER 2>/dev/null || { cat "$LOG"; exit 1; }
         sleep 0.1
     done
 fi
-echo "  stats: $URL/_nanovm/stats, events: $URL/_nanovm/events?app=<worker>"
+echo "  metrics: $TELEMETRY (decoded OTLP)"
 
 # The canary: one benign object, pinged every 20 ms for the whole demo.
 CANARY=target/demo-canary.txt
@@ -72,7 +95,7 @@ CANARY=target/demo-canary.txt
     done
 ) &
 PINGER=$!
-trap 'kill $PINGER $REGISTRY 2>/dev/null; [ -n "$SERVER" ] && kill $SERVER 2>/dev/null; exit' INT TERM EXIT
+trap 'kill $PINGER $REGISTRY $COLLECTOR 2>/dev/null; [ -n "$SERVER" ] && kill $SERVER 2>/dev/null; exit' INT TERM EXIT
 
 say "every object is its own sandbox with its own /data"
 curl -s $C -XPOST "$URL/alice/incr" >/dev/null
@@ -85,9 +108,9 @@ echo "  egress to 169.254.169.254: $(curl -s $H "$URL/demo/fetch?url=http://169.
 say "cold-starting 5,000 new objects"
 # RSS of the supervisor plus every app's worker.
 rss='def rss: [.rss_mb, .apps[].rss_mb] | add;'
-before=$(curl -s "$URL/_nanovm/stats" | jq "$rss rss")
+before=$(snapshot | jq "$rss rss")
 blast 5000 64 5000 "s$$-%d/" $C
-curl -s "$URL/_nanovm/stats" | jq -r --argjson b "$before" "$rss"'
+snapshot | jq -r --argjson b "$before" "$rss"'
     "  \([.apps[].live_objects] | add) live objects, RSS \(rss | floor) MB, \((rss - $b) * 1024 / 5000 | floor) KB per new object"'
 
 say "hammering 1,000 warm objects (50,000 requests)"
@@ -125,11 +148,11 @@ say "the canary, pinged throughout"
 sort -n -k2 "$CANARY" | awk '{n++; if ($1 != 200) bad++; t[n] = $2 * 1000}
     END {printf "  %d requests over HTTP, %d not 200, p50 %.1f ms, p99 %.1f ms (curl per request)\n",
         n, bad, t[int(n * 0.5) + 1], t[int(n * 0.99) + 1]}'
-curl -s "$URL/_nanovm/stats" | jq -r '.workers as $w | .apps | to_entries[] |
-    "  \(.key) worker (pid \($w[.key].pid), started \($w[.key].starts)×): \(.value.live_objects) live objects, \(.value.instantiate.count) instantiations, \(.value.poisons | to_entries | map(select(.value > 0) | "\(.key) \(.value)") | join(", ")) killed"'
+snapshot | jq -r '.workers as $w | .apps | to_entries[] |
+    "  \(.key) worker (pid \($w[.key].pid), started \($w[.key].starts)×): \(.value.live_objects) live objects, \(.value.poisons | to_entries | map(select(.value > 0) | "\(.key) \(.value)") | join(", ")) killed"'
 
 if [ -n "$SERVER" ]; then
     say "node still running on $URL (Ctrl-C to stop)"
-    trap 'kill $SERVER $REGISTRY 2>/dev/null; exit' INT TERM EXIT
+    trap 'kill $SERVER $REGISTRY $COLLECTOR 2>/dev/null; exit' INT TERM EXIT
     wait $SERVER
 fi

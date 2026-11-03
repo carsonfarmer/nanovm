@@ -3,6 +3,7 @@
 //!
 //!     scripts/build-guests.sh
 //!     cargo run --release --example bench [-- --quick] [-- --json out.json] [-- --cold N]
+//!     cargo run --release --example bench -- --export
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,6 +21,10 @@ use nanovm::metrics::rss_bytes;
 use nanovm::table::Node;
 use serde_json::{Value, json};
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -28,7 +33,7 @@ fn repo() -> PathBuf {
 }
 
 /// An in-process node running the guest `app`, with its own data directory.
-fn node(name: &str, app: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
+fn node(name: &str, app: &str, max_live: usize, endpoint: Option<String>) -> anyhow::Result<Arc<Node>> {
     let root = repo().join("target/bench-data");
     let dir = root.join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -43,6 +48,7 @@ fn node(name: &str, app: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
     };
     let app = AppConfig {
         name: app.into(),
+        digest: "bench".into(),
         env: Default::default(),
         config: Default::default(),
         limits: serde_json::from_value(limits)?,
@@ -52,6 +58,7 @@ fn node(name: &str, app: &str, max_live: usize) -> anyhow::Result<Arc<Node>> {
         data_dir: dir,
         max_live_objects: max_live,
         memory_reservation_mb: 64,
+        telemetry_endpoint: endpoint.unwrap_or_else(|| NodeConfig::default().telemetry_endpoint),
         ..NodeConfig::default()
     };
     cfg.validate()?;
@@ -92,6 +99,7 @@ fn row(name: &str, r: &Run, note: &str) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--export") { return full_export().await; }
     let quick = args.iter().any(|a| a == "--quick");
     let json_out = args
         .iter()
@@ -121,21 +129,19 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ---- cold starts, then warm traffic on the same node ----
-    let n = node("main", "counter", cold_n + 64)?;
+    let n = node("main", "counter", cold_n + 64, None)?;
     once(&n, "warmup", "/").await;
     let rss0 = rss_bytes();
     let cold = load(&n, "GET", "/", cold_n, conc, |i| format!("o{i}")).await;
     let live = n.live_objects();
     let rss1 = rss_bytes();
     let per_obj_kb = rss1.saturating_sub(rss0) as f64 / live.max(1) as f64 / 1024.0;
-    let inst = n.metrics.instantiate.quantile(0.5);
     println!("\ncold start ({cold_n} new objects, {conc} concurrent)");
     row("first request to a new object", &cold, "");
     println!(
-        "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object · instantiate p50 ≤{} µs",
+        "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object",
         "",
         rss1 as f64 / 1e6,
-        inst
     );
     out.insert(
         "cold".into(),
@@ -165,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
     drop(n);
 
     // ---- kill and recover ----
-    let n = node("kill", "hostile", 256)?;
+    let n = node("kill", "hostile", 256, None)?;
     let kills = 300 / scale;
     let t0 = Instant::now();
     let mut recover = Run::default();
@@ -190,29 +196,21 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|i| args.get(i + 1))
         .map(|v| v.parse().expect("--churn-cap takes a number"))
         .unwrap_or(1_000 / scale);
-    let n = node("churn", "counter", cap)?;
+    let n = node("churn", "counter", cap, None)?;
     let churn = load(&n, "GET", "/", 20_000 / scale, 64, |i| format!("c{i}")).await;
     println!(
         "\nchurn ({} new objects through {cap} slots, 64 concurrent)",
         20_000 / scale
     );
     row("new object + LRU eviction", &churn, "");
-    for e in n
-        .metrics
-        .events_since(0)
-        .iter()
-        .filter(|e| e.kind == "instantiate-failed")
-        .take(3)
-    {
-        println!("    instantiate-failed: {}", e.detail);
-    }
+    println!("  {:<34} {} instantiation failures (details in OTLP logs)", "", n.metrics.instantiate_failures.load(Relaxed));
     println!("  {:<34} {} evicted", "", n.metrics.evicted_lru.load(Relaxed));
     out.insert("churn".into(), churn.json());
     n.shutdown().await;
     drop(n);
 
     // ---- neighbours under attack: other objects of the attackers' app ----
-    let n = node("attack", "hostile", 1_000)?;
+    let n = node("attack", "hostile", 1_000, None)?;
     let objs = 100 / scale.min(10);
     load(&n, "GET", "/", objs, 64, |i| format!("v{i}")).await;
     let window = Duration::from_millis(if quick { 1000 } else { 3000 });
@@ -279,5 +277,58 @@ async fn main() -> anyhow::Result<()> {
         std::fs::write(&path, serde_json::to_string_pretty(&Value::Object(out))?)?;
         println!("\nwrote {path}");
     }
+    Ok(())
+}
+
+/// Count actual decoded request spans, not just successful HTTP exports.
+/// The sink shares this process/CPU allocation; it is not a production Collector.
+async fn full_export() -> anyhow::Result<()> {
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full, Limited};
+    use opentelemetry_proto::tonic::collector::{trace::v1::ExportTraceServiceRequest, logs::v1::ExportLogsServiceRequest};
+    use prost::Message;
+    use std::sync::atomic::AtomicUsize;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}", listener.local_addr()?);
+    let received = Arc::new(AtomicUsize::new(0));
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let (count, volume) = (received.clone(), bytes.clone());
+    let sink = tokio::spawn(nanovm::server::serve_http1(listener, move |req| {
+        let (count, volume) = (count.clone(), volume.clone());
+        async move {
+            let traces = req.uri().path() == "/v1/traces";
+            let body = Limited::new(req.into_body(), 1 << 20).collect().await.unwrap().to_bytes();
+            volume.fetch_add(body.len(), Relaxed);
+            if traces {
+                let batch = ExportTraceServiceRequest::decode(body).unwrap();
+                count.fetch_add(batch.resource_spans.iter().flat_map(|r| &r.scope_spans)
+                    .flat_map(|s| &s.spans).filter(|s| s.name == "request").count(), Relaxed);
+            } else {
+                ExportLogsServiceRequest::decode(body).unwrap();
+            }
+            http::Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+        }
+    }));
+    let n = node("export", "counter", 1100, Some(endpoint))?;
+    let cold = load(&n, "GET", "/", 1000, 64, |i| format!("o{i}")).await;
+    anyhow::ensure!(cold.failed() == 0, "cold requests failed: {:?}", cold.failures);
+    let started = Instant::now();
+    for _ in 0..3 {
+        let run = load(&n, "GET", "/", 200_000, 256, |i| format!("o{}", i % 100)).await;
+        row("warm GET with decoded OTLP", &run, "");
+        anyhow::ensure!(run.failed() == 0, "warm requests failed: {:?}", run.failures);
+    }
+    let elapsed = started.elapsed();
+    let live_rss = rss_bytes();
+    n.shutdown().await;
+    let telemetry = n.telemetry.clone();
+    tokio::task::spawn_blocking(move || telemetry.flush()).await??;
+    let received = received.load(Relaxed);
+    println!("request_rps={:.0} drained_rps={:.0} received={received}/601000 bytes={} live_rss_mb={:.1} drained_rss_mb={:.1}",
+        600_000.0 / elapsed.as_secs_f64(), 600_000.0 / started.elapsed().as_secs_f64(),
+        bytes.load(Relaxed), live_rss as f64 / 1e6, rss_bytes() as f64 / 1e6);
+    sink.abort();
+    anyhow::ensure!(received == 601_000, "incomplete request export");
     Ok(())
 }

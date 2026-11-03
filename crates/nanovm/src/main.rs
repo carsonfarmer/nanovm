@@ -6,7 +6,12 @@ use anyhow::{Context, bail};
 use nanovm::config::NodeConfig;
 use nanovm::supervisor::Supervisor;
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt().with_max_level(tracing_subscriber::filter::LevelFilter::WARN).with_writer(std::io::stderr).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [cmd, flag, path] if cmd == "serve" && flag == "--config" => serve(NodeConfig::load(&PathBuf::from(path))?),
@@ -39,9 +44,11 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
     let threads = cfg.front_threads();
     let t0 = std::time::Instant::now();
     let rt = runtime()?;
-    let sup = Supervisor::new(cfg, std::env::current_exe()?, threads)?;
+    let control = tokio::runtime::Builder::new_multi_thread().worker_threads(1)
+        .thread_name("nanovm-control").enable_all().build()?;
+    let sup = control.block_on(async { Supervisor::new(cfg, std::env::current_exe()?, threads) })?;
     let first = rt.block_on(async { listener(addr) })?;
-    eprintln!("nanovm: ready in {:.0?} on http://{addr}/ (stats: /_nanovm/stats)", t0.elapsed());
+    eprintln!("nanovm: ready in {:.0?} on http://{addr}/", t0.elapsed());
     for i in 1..threads {
         let sup = sup.clone();
         std::thread::Builder::new()
@@ -52,7 +59,7 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
                 rt.block_on(async { front(sup, listener(addr)?).await })
             })?;
     }
-    // Thread 0 also runs the workers' reapers and egress links.
+    // Control/egress I/O has its own reactor, independent of front-end load.
     rt.block_on(front(sup, first))
 }
 

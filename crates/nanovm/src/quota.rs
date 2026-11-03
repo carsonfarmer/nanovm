@@ -290,7 +290,7 @@ impl Inner {
         self.denials += 1;
         // A guest retrying in a loop shouldn't flood the event log.
         if self.denials == 1 || self.denials.is_multiple_of(1000) {
-            self.metrics.event("fs-denied", &self.obj.app, &self.obj.id, what);
+            self.metrics.event("fs-denied", &self.obj.id, what, &self.obj.context.lock());
         }
         code
     }
@@ -942,20 +942,41 @@ mod tests {
 
     /// A guest refused in a loop is logged on its first denial and every
     /// thousandth after, though every denial is counted.
-    #[test]
-    fn denials_are_logged_sparingly() {
+    #[tokio::test]
+    async fn denials_are_logged_sparingly() {
+        use http_body_util::BodyExt;
+        use opentelemetry_proto::tonic::{collector::logs::v1::ExportLogsServiceRequest, common::v1::any_value::Value};
+        use prost::Message;
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let output = records.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(crate::server::serve_http1(listener, move |req| {
+            let output = output.clone();
+            async move {
+                let body = req.into_body().collect().await.unwrap().to_bytes();
+                let logs = ExportLogsServiceRequest::decode(body).unwrap();
+                output.lock().extend(logs.resource_logs.into_iter().flat_map(|r| r.scope_logs).flat_map(|s| s.log_records));
+                crate::server::ok_json(serde_json::json!({}))
+            }
+        }));
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&endpoint, "app", "digest", None).unwrap());
         let (g, metrics) = guard(0, 0);
+        metrics.telemetry.set(Arc::downgrade(&telemetry)).unwrap();
         for _ in 0..2000 {
             let _ = g.check_new_entry();
         }
         assert_eq!(metrics.fs_denied.load(Relaxed), 2000);
-        let events = metrics.events_since(0);
-        assert_eq!(events.len(), 3);
-        assert_eq!(
-            (events[0].kind, &*events[0].app, &*events[0].object),
-            ("fs-denied", "app", "obj")
-        );
-        assert!(events[0].detail.contains("entry limit reached (0 files)"));
+        tokio::task::spawn_blocking(move || telemetry.flush()).await.unwrap().unwrap();
+        let records = records.lock();
+        assert_eq!(records.len(), 3);
+        for record in &*records {
+            for (key, value) in [("event.name", "fs-denied"), ("nanovm.object", "obj")] {
+                assert!(record.attributes.iter().any(|a| a.key == key && a.value.as_ref().and_then(|v| v.value.as_ref()) == Some(&Value::StringValue(value.into()))));
+            }
+            assert!(matches!(record.body.as_ref().and_then(|v| v.value.as_ref()), Some(Value::StringValue(s)) if s.contains("entry limit reached (0 files)")));
+        }
+        server.abort();
     }
 
     /// Writes past the budget are cut short, then refused; overwriting

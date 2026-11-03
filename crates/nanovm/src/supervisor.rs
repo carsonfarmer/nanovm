@@ -28,10 +28,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use bytes::Bytes;
 use http::{Request, Response};
-use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use parking_lot::Mutex;
-use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
@@ -64,6 +63,7 @@ const MAX_POLICIES: usize = 16;
 
 pub struct Supervisor {
     cfg: NodeConfig,
+    runtime: tokio::runtime::Handle,
     /// Front-end threads, each with its own pool of connections per worker.
     threads: usize,
     /// The `nanovm` binary, run as `nanovm worker`.
@@ -79,6 +79,8 @@ pub struct Supervisor {
     /// Held while giving a new app its uid.
     uids: Arc<Mutex<()>>,
     publishes: reqwest::Client,
+    relay: Arc<crate::telemetry::Relay>,
+    telemetry: Arc<crate::telemetry::Telemetry>,
     started: Instant,
 }
 
@@ -137,10 +139,11 @@ impl Worker {
 }
 
 impl Supervisor {
-    /// `threads` is the number of front-end threads that will call `handle`.
+    /// Call within the control/egress runtime. `threads` counts front-end threads.
     pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
-        Ok(Arc::new(Supervisor {
+        let sup = Arc::new(Supervisor {
+            runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
             threads,
             exe,
@@ -151,13 +154,62 @@ impl Supervisor {
             // for clients and the rest.
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
             uids: Arc::default(),
+            relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
             cfg,
             publishes: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build()?,
             started: Instant::now(),
-        }))
+        });
+        let weak = Arc::downgrade(&sup);
+        sup.telemetry.snapshots(move || {
+            let Some(sup) = weak.upgrade() else { return };
+            sup.telemetry.snapshot(vec![
+                ("process.memory.usage".into(), (rss_bytes() as i64).into()),
+                ("process.uptime".into(), sup.started.elapsed().as_secs_f64().into()),
+            ]);
+            let workers: Vec<_> = sup.workers.lock().values().cloned().collect();
+            for w in workers {
+                let live = w.live();
+                sup.telemetry.snapshot(vec![
+                    ("nanovm.worker.app".into(), w.name.clone().into()),
+                    ("nanovm.worker.up".into(), live.is_some().into()),
+                    ("nanovm.worker.digest".into(), live.as_ref().map_or(String::new(), |l| l.digest.clone()).into()),
+                    ("nanovm.worker.version".into(), live.as_ref().map_or(String::new(), |l| l.version.to_string()).into()),
+                    ("process.pid".into(), (live.as_ref().map_or(0, |l| l.pid) as i64).into()),
+                    ("nanovm.worker.policies".into(), (live.as_ref().map_or(0, |l| l.policies.lock().len()) as i64).into()),
+                    ("nanovm.worker.starts".into(), (w.starts.load(Relaxed) as i64).into()),
+                    ("nanovm.worker.link_errors".into(), (w.link_errors.load(Relaxed) as i64).into()),
+                ]);
+            }
+        });
+        Ok(sup)
+    }
+
+    /// Flush live workers and host snapshots to the collector, without an HTTP
+    /// snapshot API. Readiness and ordinary requests never call this.
+    pub async fn flush_telemetry(&self) -> anyhow::Result<()> {
+        let live: Vec<_> = self.workers.lock().values().filter_map(|w| w.live()).collect();
+        let mut failed = false;
+        for l in live {
+            let ok = tokio::time::timeout(Duration::from_secs(10), l.link.send(get("/_nanovm/flush")))
+                .await.is_ok_and(|r| r.is_ok_and(|r| r.status() == 204));
+            failed |= !ok && l.alive();
+        }
+        let telemetry = self.telemetry.clone();
+        tokio::task::spawn_blocking(move || telemetry.flush()).await??;
+        anyhow::ensure!(!failed, "a live worker failed to flush telemetry");
+        Ok(())
     }
 
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
+        // Readiness is infrastructure traffic, not a tenant request.
+        if req.uri().path() == "/_nanovm/ready" && !req.headers().contains_key(APP_HEADER) {
+            return self.admin(req.map(|b| b.boxed_unsync())).await;
+        }
+        self.telemetry.forward("supervisor.request", req, |req| self.clone().handle_request(req)).await
+    }
+
+    async fn handle_request(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         let mut req = req.map(|b| b.boxed_unsync());
         let want = match AppRef::from_headers(req.headers()) {
             Ok(Some(w)) => w,
@@ -200,18 +252,8 @@ impl Supervisor {
     /// The node's own routes, for requests that name no app.
     async fn admin(&self, req: Request<Body>) -> Response<RespBody> {
         match req.uri().path() {
-            "/_nanovm/stats" => self.stats().await,
-            "/_nanovm/events" => {
-                let q: HashMap<_, _> = query(req.uri());
-                let w = q.get("app").and_then(|a| self.workers.lock().get(*a).cloned());
-                let Some((w, live)) = w.and_then(|w| Some((w.clone(), w.live()?))) else {
-                    return error_response(404, "no-such-app", "events take ?app=<running app>&since=<seq>");
-                };
-                let pq = format!("/_nanovm/events?since={}", q.get("since").unwrap_or(&"0"));
-                let (mut parts, body) = req.into_parts();
-                parts.uri = pq.parse().expect("a valid path");
-                forward(&w, live, Request::from_parts(parts, body)).await
-            }
+            "/_nanovm/ready" => Response::builder().status(204).body(Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap(),
+            path if path.starts_with("/_nanovm/") => error_response(404, "not-found", path),
             _ => error_response(400, "no-app", "requests name their app (nanovm-app)"),
         }
     }
@@ -225,7 +267,7 @@ impl Supervisor {
         // In its own task: once begun, a switch finishes even if every
         // request waiting for it goes away.
         let (sup, w, want) = (self.clone(), w.clone(), want.clone());
-        match tokio::spawn(async move { sup.ensure(&w, &want).await }).await {
+        match self.runtime.spawn(async move { sup.ensure(&w, &want).await }).await {
             Ok(live) => live,
             Err(e) => Err(error_response(500, "worker-down", &e.to_string())),
         }
@@ -321,6 +363,7 @@ impl Supervisor {
         let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
         let app = AppConfig {
             name: w.name.clone(),
+            digest: want.digest.clone(),
             env: p.spec.env,
             config: p.spec.config,
             limits: p.spec.limits.clamped(&self.cfg.limits),
@@ -420,13 +463,22 @@ impl Supervisor {
 
         let policy = Arc::new(policy);
         let (http, target, app) = (self.publishes.clone(), self.cfg.publish_to.clone(), w.name.clone());
+        let (telemetry, digest) = (self.relay.clone(), want.digest.clone());
+        let telemetry_slots = Arc::new(tokio::sync::Semaphore::new(3));
         egress.set_nonblocking(true)?;
         let link_caps = vec![Arc::new(tokio::sync::Semaphore::new(links)), self.links.clone()];
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, link_caps, move |req| {
             let (policy, http, target, app) = (policy.clone(), http.clone(), target.clone(), app.clone());
+            let (telemetry, digest, slots) = (telemetry.clone(), digest.clone(), telemetry_slots.clone());
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
                     return serve_forwarded(req, &policy).await;
+                }
+                if req.uri().path().starts_with(crate::telemetry::PATH) {
+                    let Ok(_slot) = slots.try_acquire() else { return verdict_ok(429) };
+                    return telemetry.handle(req, &app, &digest).await
+                        .map(|r| r.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync()))
+                        .unwrap_or_else(verdict_ok);
                 }
                 if req.method() != http::Method::POST || req.uri().path().trim_end_matches('/') != "/publish" {
                     return verdict_ok(404);
@@ -451,8 +503,8 @@ impl Supervisor {
             kill: Mutex::new(Some(kill)),
         });
         let ready = tokio::time::timeout(START_TIMEOUT, async {
-            let res = live.link.send(get("/_nanovm/stats")).await?;
-            anyhow::ensure!(res.status() == 200, "worker answered {}", res.status());
+            let res = live.link.send(get("/_nanovm/ready")).await?;
+            anyhow::ensure!(res.status() == 204, "worker answered {}", res.status());
             res.into_body().collect().await?;
             anyhow::Ok(())
         });
@@ -471,40 +523,6 @@ impl Supervisor {
         bail!("worker did not start ({e}): {}", words.ok().and_then(Result::ok).unwrap_or_default())
     }
 
-    async fn stats(&self) -> Response<RespBody> {
-        let mut workers = serde_json::Map::new();
-        let mut apps = serde_json::Map::new();
-        let all: Vec<_> = self.workers.lock().values().cloned().collect();
-        for w in all {
-            let name = w.name.clone();
-            let live = w.live();
-            workers.insert(
-                name.clone(),
-                json!({
-                    "pid": live.as_ref().map(|l| l.pid),
-                    "digest": live.as_ref().map(|l| l.digest.clone()),
-                    "version": live.as_ref().map(|l| l.version.to_string()),
-                    "policies": live.as_ref().map(|l| l.policies.lock().len()),
-                    "starts": w.starts.load(Relaxed),
-                    "up": live.is_some(),
-                    "link_errors": w.link_errors.load(Relaxed),
-                }),
-            );
-            if let Some(l) = live
-                && let Ok(res) = l.link.send(get("/_nanovm/stats")).await
-                && let Ok(body) = res.into_body().collect().await
-                && let Ok(v) = serde_json::from_slice::<Value>(&body.to_bytes())
-            {
-                apps.insert(name.clone(), v);
-            }
-        }
-        crate::server::ok_json(json!({
-            "uptime_ms": self.started.elapsed().as_millis() as u64,
-            "rss_mb": rss_bytes() as f64 / 1048576.0,
-            "workers": workers,
-            "apps": apps,
-        }))
-    }
 }
 
 async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
@@ -552,14 +570,6 @@ fn get(pq: &str) -> Request<Body> {
         .header(http::header::HOST, "worker")
         .body(Empty::new().map_err(|e| match e {}).boxed_unsync())
         .unwrap()
-}
-
-fn query(uri: &http::Uri) -> HashMap<&str, &str> {
-    uri.query()
-        .unwrap_or("")
-        .split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .collect()
 }
 
 /// Makes app `name`'s directories, and when the supervisor is root gives
@@ -665,24 +675,6 @@ pub fn worker_main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Query pairs are split on `&` and the first `=`, undecoded; a pair
-    /// without `=` is skipped and a repeated key keeps its last value.
-    #[test]
-    fn query_pairs() {
-        let q = |u: &str| {
-            query(&u.parse().unwrap())
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect::<Vec<_>>()
-        };
-        assert!(q("/_nanovm/events").is_empty());
-        assert!(q("/_nanovm/events?").is_empty());
-        let mut got = q("/e?app=a&since=5&flag&x=1=2&app=b&=v&s=%20");
-        got.sort();
-        let want = [("", "v"), ("app", "b"), ("s", "%20"), ("since", "5"), ("x", "1=2")];
-        assert_eq!(got, want.map(|(k, v)| (k.to_string(), v.to_string())));
-    }
 
     /// The supervisor's own answer to a forwarded request carries the
     /// verdict a worker trusts.

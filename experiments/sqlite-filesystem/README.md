@@ -461,7 +461,7 @@ merely for implementation uniformity.
 `WasiConfigVariables` from deployment configuration and shares it across objects.
 It is not per-object mutable state. Keep `wasi:config` as the API; its implementation
 could move to Wasm if deployment values can be supplied through a simpler existing
-capability, such as a read-only mount. Evaluate that alongside KV in ISSUES.md W-17.
+capability, such as a read-only mount. Evaluate that alongside KV in ISSUES.md W-18.
 The host must still supply deployment inputs and enforce capabilities; moving
 parsing/lookup code into Wasm does not eliminate that responsibility.
 

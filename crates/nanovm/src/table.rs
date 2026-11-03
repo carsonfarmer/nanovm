@@ -64,7 +64,7 @@ pub struct Node {
     pub cfg: NodeConfig,
     pub app: Arc<App>,
     pub metrics: Arc<Metrics>,
-    pub started: Instant,
+    pub telemetry: Arc<crate::telemetry::Telemetry>,
     /// Cores CPU-heavy requests may occupy at once; see `heavy_lanes`.
     pub heavy: Arc<Semaphore>,
     /// One permit per live store, released only after the store is dropped.
@@ -81,6 +81,7 @@ impl Node {
         let engine = crate::engine::build(&cfg)?;
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
         let app = Arc::new(App::load(&engine, &linker, &cfg, app, wasm, upstream)?);
         // Scratch from a previous run is garbage; volumes are kept. The
         // directory itself stays: a jailed worker's Landlock rule names it.
@@ -90,16 +91,45 @@ impl Node {
         }
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
-        Ok(Arc::new(Node {
+        let node = Arc::new(Node {
             engine,
             cfg,
             app,
             metrics: Arc::default(),
-            started: Instant::now(),
+            telemetry,
             heavy,
             slots,
             objects: Mutex::default(),
-        }))
+        });
+        node.metrics.telemetry.set(Arc::downgrade(&node.telemetry)).ok();
+        let started = Instant::now();
+        let weak = Arc::downgrade(&node);
+        node.telemetry.snapshots(move || {
+            let Some(node) = weak.upgrade() else { return };
+            let mut fields = vec![
+                ("process.pid".into(), (std::process::id() as i64).into()),
+                ("process.memory.usage".into(), (crate::metrics::rss_bytes() as i64).into()),
+                ("process.uptime".into(), started.elapsed().as_secs_f64().into()),
+                ("nanovm.stores.live".into(), node.metrics.stores_live.load(Relaxed).into()),
+                ("nanovm.stores.peak".into(), node.metrics.stores_peak.load(Relaxed).into()),
+                ("nanovm.objects.live".into(), (node.live_objects() as i64).into()),
+                ("nanovm.objects.limit".into(), (node.cfg.max_live_objects as i64).into()),
+            ];
+            macro_rules! counters {
+                ($($field:ident),* $(,)?) => { $(fields.push((concat!("nanovm.", stringify!($field)).into(),
+                    (node.metrics.$field.load(Relaxed) as i64).into()));)* }
+            }
+            counters!(instantiate_failures, evicted_idle, evicted_lru, rejected_busy,
+                rejected_capacity, egress_allowed, egress_denied, fs_denied, guest_cpu_ns);
+            for p in crate::metrics::Poison::ALL {
+                fields.push((format!("nanovm.poisons.{}", p.as_str()).into(), (node.metrics.poisons[p as usize].load(Relaxed) as i64).into()));
+            }
+            for (phase, count) in node.phases() {
+                fields.push((format!("nanovm.objects.phase.{phase}").into(), (count as i64).into()));
+            }
+            node.telemetry.snapshot(fields);
+        });
+        Ok(node)
     }
 
     /// Releases every object and waits until all their stores are gone.
@@ -123,18 +153,31 @@ impl Node {
         if !valid_object(id) {
             return error_response(400, "bad-object-id", BAD_OBJECT);
         }
+        use opentelemetry::propagation::TextMapPropagator;
+        use opentelemetry::trace::{Span, TraceContextExt};
+        let parent = req.extensions().get::<opentelemetry::Context>().cloned().unwrap_or_else(|| {
+            opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                .extract(&opentelemetry_http::HeaderExtractor(req.headers()))
+        });
+        let mut span = self.telemetry.span("request", id, &parent, opentelemetry::trace::SpanKind::Server);
+        span.set_attribute(opentelemetry::KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
+        let path = req.uri().path();
+        span.set_attribute(opentelemetry::KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
+        // The actor owns the recording span through post-return work. Only
+        // immutable context is shared with guest logs and calls.
+        let context = parent.with_remote_span_context(span.span_context().clone());
+        let enqueued = Instant::now();
         let (reply, rx) = oneshot::channel();
         let job = Job {
             req,
             reply,
-            enqueued: Instant::now(),
+            enqueued,
+            span,
+            context,
         };
-        if let Err(resp) = self.enqueue(id, job) {
-            return resp;
-        }
-        match rx.await {
-            Ok(resp) => resp,
-            Err(_) => error_response(503, "object-unavailable", "the object stopped before answering"),
+        match self.enqueue(id, job) {
+            Err(resp) => resp,
+            Ok(()) => rx.await.unwrap_or_else(|_| error_response(503, "object-unavailable", "the object stopped before answering")),
         }
     }
 
@@ -151,14 +194,16 @@ impl Node {
                     tokio::spawn(async move { tx.send(job).await });
                     return Ok(());
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(mpsc::error::TrySendError::Full(mut job)) => {
                     self.metrics.rejected_busy.fetch_add(1, Relaxed);
                     let max = app.cfg.limits.max_queue;
-                    return Err(error_response(
+                    let response = error_response(
                         503,
                         "object-busy",
                         &format!("queue full ({max} waiting)"),
-                    ));
+                    );
+                    crate::telemetry::response(&mut job.span, &response);
+                    return Err(response);
                 }
                 Err(mpsc::error::TrySendError::Closed(j)) => {
                     objects.remove(&key);
@@ -169,11 +214,13 @@ impl Node {
         if objects.len() >= self.cfg.max_live_objects && !self.evict_lru(&mut objects) {
             self.metrics.rejected_capacity.fetch_add(1, Relaxed);
             let max = self.cfg.max_live_objects;
-            return Err(error_response(
+            let response = error_response(
                 503,
                 "node-at-capacity",
                 &format!("{max} live objects, none idle"),
-            ));
+            );
+            crate::telemetry::response(&mut job.span, &response);
+            return Err(response);
         }
         let shared = Arc::new(ObjShared::new(app.name.clone(), id));
         let (tx, rx) = mpsc::channel(app.cfg.limits.max_queue.max(1));
@@ -222,7 +269,7 @@ impl Node {
         let e = objects.remove(&k).unwrap();
         self.metrics.evicted_lru.fetch_add(1, Relaxed);
         self.metrics
-            .event("evicted-lru", &e.shared.app, &e.shared.id, "node at max_live_objects");
+            .event("evicted-lru", &e.shared.id, "node at max_live_objects", &opentelemetry::Context::new());
         true
     }
 
@@ -273,10 +320,14 @@ mod tests {
     /// An idle object is evictable only with no work queued or waiting.
     #[test]
     fn only_objects_without_work_are_evictable() {
+        use opentelemetry::trace::{Tracer, TracerProvider};
+        let tracer = opentelemetry_sdk::trace::SdkTracerProvider::default().tracer("test");
         let job = || Job {
             req: http::Request::new(Bytes::new()),
             reply: oneshot::channel().0,
             enqueued: Instant::now(),
+            context: Default::default(),
+            span: tracer.start("request"),
         };
         let (tx, _rx) = mpsc::channel(4);
         let e = Entry {
