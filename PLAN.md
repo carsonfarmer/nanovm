@@ -381,13 +381,33 @@ the redesign. Implement in separately verified slices:
    that merely relocates the sequence. Run all recovery-cut, rename, open-unlinked
    descriptor, repeated-replacement and post-return failure tests.
 
-**Additional upstream-supported alternative:** register stock WASIp3 filesystem
-bindings and reopen the linker instance to shadow only guarded mutation methods.
-Wasmtime 50 supports this, potentially eliminating `QuotaFs` projection/delegation
-machinery and unmodified-method forwarding. Run a typed compile/instantiation
-probe first; preserve descriptor identity, error/trap mapping, stream concurrency
-and tracing, and test that no mutation import bypasses guards. Count replacement
-registration code against the existing 70 scaffold lines; no saving is proven.
+**Selective-WASI experiment (not adopted):** compiled and instantiated stock
+filesystem bindings with ten guarded-method overrides on `bc92343`. Runtime
+5,305 → 5,282 (−23); 105 unit/67 integration passed, one ignored; after tracing
+field adjustment, 16 quota tests and all 67 integration tests passed again.
+Production check passed; no benchmark. It removes forwarding but adds handwritten
+registration/tracing macros and an explicit versioned override list. The new
+registration test checks names exist, not that each stock method was intercepted;
+TRACE targets also change. This is feasibility evidence, not a clear maintenance
+win. Prototype saved outside tracked source and runtime changes restored.
+The owner correctly distinguishes this implementation's weaknesses from the
+underlying idea: selective registration remains worth exploring with safer
+registration and behavioral interception coverage; it is not rejected in principle.
+
+Incoming SQLite main `491e790` includes W-18: composed Wasm KV/config providers.
+KV over filesystem imports could eliminate native KV mutation coordination rather
+than centralize it in a new host API. Evaluate that experiment before committing
+to the host-storage redesign below. W-18 is distinct from W-9 replication. The
+selective-WASI results predate the SQLite integration and do not validate it.
+
+**W-18 KV-first probe (Q73):** env/config remain host-injected. The reproducible
+`experiments/kv-filesystem` probe composes unchanged synchronous KV and executes it
+through Node. Provider-selection and direct P3 filesystem controls pass; both KV
+get/set trap when suspension is required. Recovery restores the committed file.
+No runtime code is removed. A full composed provider requires a separately agreed
+async KV contract; otherwise centralize native KV mutations in filesystem-owned
+operations. Do not add a private preload/writeback cache or silently change WIT.
+See the experiment README for the ABI evidence, limitations and successor prompt.
 
 For actor ownership, use sequential `run_concurrent` phases with timeouts outside
 each invocation, retaining event-loop driving while idle. For storage, expose

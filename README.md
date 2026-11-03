@@ -477,6 +477,10 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 
 ## Layout
 
+W-18's [KV-over-filesystem ABI probe](experiments/kv-filesystem/README.md) is a
+reproducible experiment, not a replacement provider: unchanged synchronous KV
+cannot suspend for P3 filesystem I/O. Env/config remain host-injected.
+
 | Path | What it is |
 |---|---|
 | `crates/nanovm/src/engine.rs` | Engine config, pooling allocator, epoch ticker, `.cwasm` cache |
