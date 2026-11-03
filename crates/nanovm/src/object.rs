@@ -396,15 +396,22 @@ enum Exit {
 /// Makes the request's changes durable, then sends what it published (the
 /// changes stand whether or not a publish gets through).
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route) = acc.with(|mut s| {
+    let (quota, held, route, node) = acc.with(|mut s| {
         let s = s.data_mut();
-        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
+        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.hooks.node.clone())
     });
     quota.commit()?;
-    if let crate::egress::Route::Supervisor(up) = route {
-        for req in held {
-            if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
-                let _ = res.into_body().collect().await;
+    for req in held {
+        match &route {
+            crate::egress::Route::Supervisor(up) => {
+                if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
+                    let _ = res.into_body().collect().await;
+                }
+            }
+            crate::egress::Route::Direct(_) => {
+                if let Some(node) = node.upgrade() {
+                    node.sockets.publish(req.map(Full::new)).await;
+                }
             }
         }
     }

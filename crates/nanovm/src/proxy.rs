@@ -218,16 +218,7 @@ impl Proxy {
                 tokio::time::timeout(Duration::from_secs(240), event).await.unwrap_or(ws::Reply::Bad(502))
             })
         });
-        // Finish OPEN even when the client leaves, then deliver DISCONNECT.
-        let open = tokio::spawn(async move { sockets.open(&object, req, deliver).await });
-        match open.await.unwrap_or(Err((500, "opening the socket failed"))) {
-            Ok(res) => res.map(|()| Empty::new().map_err(|e| match e {}).boxed_unsync()),
-            Err((status, why)) => {
-                let mut res = error_response(status, "socket-refused", why);
-                res.headers_mut().insert(http::header::SEC_WEBSOCKET_VERSION, "13".parse().unwrap());
-                res
-            }
-        }
+        sockets.upgrade(object, req, deliver).await
     }
 
     async fn publish(&self, req: Request<Incoming>) -> Response<RespBody> {
