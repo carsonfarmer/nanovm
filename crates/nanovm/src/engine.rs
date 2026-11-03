@@ -27,19 +27,20 @@ pub fn build(cfg: &NodeConfig) -> anyhow::Result<Engine> {
     c.memory_guard_size(64 << 10);
     c.memory_reservation_for_growth(0);
 
-    // `Node::slots` keeps live stores to `max_live_objects`, one component
-    // instance each.
+    // Every admitted component can use its full per-component allowance.
+    // Composed providers add memories, tables and adapter core instances.
     let n = cfg.max_live_objects as u32 + 32;
+    let (cores, memories, tables) = (16, 4, 8);
     let mut pool = PoolingAllocationConfig::default();
     pool.total_component_instances(n);
-    pool.total_core_instances(n * 4);
-    pool.total_memories(n * 2);
-    pool.total_tables(n * 4);
+    pool.total_core_instances(n * cores);
+    pool.total_memories(n * memories);
+    pool.total_tables(n * tables);
     pool.total_stacks(n * 2);
     pool.max_memory_size(reservation as usize);
-    pool.max_memories_per_component(4);
-    pool.max_tables_per_component(8);
-    pool.max_core_instances_per_component(16);
+    pool.max_memories_per_component(memories);
+    pool.max_tables_per_component(tables);
+    pool.max_core_instances_per_component(cores);
     pool.table_elements(20_000);
     pool.max_unused_warm_slots(n.min(1000));
     c.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
@@ -50,10 +51,9 @@ pub fn build(cfg: &NodeConfig) -> anyhow::Result<Engine> {
 /// File descriptors a live object holds: its `/data` and `/tmp` preopens.
 /// Files a guest opens come on top.
 pub const FDS_PER_OBJECT: u64 = 2;
-/// Memory mappings per pool slot, measured on Linux: about 4 per slot once
-/// the pool is created (stacks and their guard pages) and 4 more per live
-/// instance (its memory and tables made accessible).
-pub const MAPS_PER_OBJECT: u64 = 8;
+/// Conservative Linux mapping allowance: stacks/guards plus up to four
+/// memories and eight tables per composed instance, including protection splits.
+pub const MAPS_PER_OBJECT: u64 = 24;
 
 /// Checks that the process can actually hold `max_live_objects`, raising the
 /// soft fd limit to the hard limit first. Without this a node that is too

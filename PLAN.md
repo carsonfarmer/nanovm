@@ -415,11 +415,15 @@ not a full Spin deployment implementation: valid labels address private object
 directories, not manifest-selected shared stores. See
 [the provider contract](components/keyvalue/README.md).
 
-Acceptance still requires full integration/SQL/crash tests, byte/file/journal
-pressure and listing scale, matched native/composed performance, complete source
-counts (host plus provider/build changes), demo and adversarial review. Do not
-declare a win merely by moving lines out of the host. Publishing migrated guests
-on main remains a separate approval from safe branch milestone pushes.
+Integration/SQL/crash tests, byte/file/journal pressure and 10,000-key scale pass.
+Review found pool exhaustion below configured object capacity; totals now match
+per-component allowances. Full-quota reopen is also fixed. Matched release KV
+performance regresses: 1 MiB GET 1.413 → 3.155 ms, PUT 4.614 → 7.126 ms.
+Actual host+provider runtime is 5,300 → 5,287 (13 lines saved), with additional
+build/CI wiring. See the provider README for all measurements and limitations.
+The performance acceptance gate remains unmet; profile ABI copying and journal
+operations before adopting. Publishing migrated guests on main remains a separate
+approval from safe branch milestone pushes.
 
 For actor ownership, use sequential `run_concurrent` phases with timeouts outside
 each invocation, retaining event-loop driving while idle. For storage, expose

@@ -60,12 +60,19 @@ impl GuestStore for Bucket {
             }
             let slot = Slot::reserve()?;
             let path = format!(".kv/{label}");
-            let dir = util::mount("/data").ok_or(Error::AccessDenied)?;
-            for name in [".kv".to_owned(), path.clone()] {
-                match dir.create_directory_at(name).await {
-                    Ok(()) | Err(ErrorCode::Exist) => (),
-                    Err(e) => return Err(error(e)),
+            // Opening an existing store must not need a free directory entry.
+            match util::open("/data", &path, OpenFlags::DIRECTORY, DescriptorFlags::READ).await {
+                Ok(_) => (),
+                Err(ErrorCode::NoEntry) => {
+                    let dir = util::mount("/data").ok_or(Error::AccessDenied)?;
+                    for name in [".kv".to_owned(), path.clone()] {
+                        match dir.create_directory_at(name).await {
+                            Ok(()) | Err(ErrorCode::Exist) => (),
+                            Err(e) => return Err(error(e)),
+                        }
+                    }
                 }
+                Err(e) => return Err(error(e)),
             }
             Ok(Store::new(Bucket { path, _slot: slot }))
         })
@@ -78,16 +85,20 @@ impl GuestStore for Bucket {
             Err(e) => return Err(error(e)),
         };
         let (mut stream, done) = fd.read_via_stream(0);
-        let mut value = Vec::new();
+        let mut value = Vec::with_capacity(4096);
         loop {
-            let (_, chunk) = stream.read(Vec::with_capacity(4096)).await;
-            if chunk.is_empty() {
-                break;
+            if value.len() == value.capacity() {
+                value.reserve_exact(value.len().min(MAX_VALUE + 1 - value.len()));
             }
-            if value.len() + chunk.len() > MAX_VALUE {
+            let before = value.len();
+            let (_, buffer) = stream.read(value).await;
+            value = buffer;
+            if value.len() > MAX_VALUE {
                 return Err(Error::Other("value exceeds 1 MiB".into()));
             }
-            value.extend(chunk);
+            if value.len() == before {
+                break;
+            }
         }
         drop(stream);
         done.await.map_err(error)?;

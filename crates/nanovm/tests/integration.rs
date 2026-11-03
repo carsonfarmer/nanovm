@@ -1529,6 +1529,8 @@ async fn kv_counts_against_the_disk_quota() {
     let r = get(&node, "f", "/kv?op=fill&size=1").await;
     assert_eq!(r.json()["set"], 198, "{}", r.body);
     assert!(r.body.contains("Quota"), "{}", r.body);
+    let r = get(&node, "f", "/kv?op=list").await;
+    assert_eq!(r.json(), serde_json::json!({"keys":198}), "full stores remain readable: {}", r.body);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1619,6 +1621,28 @@ async fn wasi_config_serves_the_apps_values() {
 }
 
 // ---- commits ---------------------------------------------------------------
+
+/// Composing HTTP, KV and SQL must not reduce configured live-object capacity.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SQLite build.sh --compose"]
+async fn sqlite_composed_pool_capacity() {
+    let cfg = node_cfg("sqlite_pool", 100);
+    let mut app = app("counter");
+    app.limits.memory_mb = 64;
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    app.limits.idle_timeout_ms = 600_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/composed.wasm")).unwrap();
+    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    for reused in [false, true] {
+        for i in 0..100 {
+            let r = get(&node, &format!("o{i}"), "/").await;
+            assert_eq!(r.status, 200, "object {i}: {}", r.body);
+            assert_eq!(r.json()["reused"], reused, "object {i}: {}", r.body);
+        }
+    }
+    node.shutdown().await;
+}
 
 /// The SQLite engine is a separate component, not linked into the HTTP client.
 #[tokio::test(flavor = "multi_thread")]

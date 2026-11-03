@@ -59,8 +59,8 @@ struct Inner {
     files: u64,
     /// What the current request changed in the volume, to commit or roll
     /// back. Its log and removed files may each hold as much as the volume,
-    /// so an object's disk use is at most three times its quota while a
-    /// request runs.
+    /// bounding logical content to three quotas. Filesystem block rounding
+    /// and metadata are additional physical storage costs.
     journal: Journal,
     denials: u64,
     metrics: Arc<Metrics>,
