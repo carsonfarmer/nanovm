@@ -1040,9 +1040,17 @@ fn jail_blocks_escapes() {
     if unsafe { libc::geteuid() } == 0 {
         std::os::unix::fs::chown(dir.join("mine"), Some(200_099), Some(200_099)).unwrap();
     }
+    // A host service's datagram socket, for the probe to try to reach.
+    let service = format!("nanovm-jail-probe-{}", std::process::id());
+    let service_sock = {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&service).unwrap();
+        std::os::unix::net::UnixDatagram::bind_addr(&addr).unwrap()
+    };
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "jail_probe", "--nocapture", "--test-threads", "1"])
         .env("NANOVM_JAIL_PROBE", &dir)
+        .env("NANOVM_JAIL_PROBE_SERVICE", &service)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1071,6 +1079,7 @@ fn jail_blocks_escapes() {
         ("list_root", "denied"),
         ("tcp_socket", "denied"),
         ("unix_socket", "denied"),
+        ("unix_datagram", "denied"),
         ("fork", "denied"),
         ("exec", "denied"),
         ("setuid_root", "denied"),
@@ -1085,6 +1094,8 @@ fn jail_blocks_escapes() {
     for (k, v) in expect {
         assert_eq!(results.get(k).copied(), Some(v), "{k}\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     }
+    service_sock.set_nonblocking(true).unwrap();
+    assert!(service_sock.recv(&mut [0; 8]).is_err(), "a datagram left the jail");
 }
 
 /// The jailed half of `jail_blocks_escapes`; a no-op when run directly.
@@ -1114,6 +1125,13 @@ fn jail_probe() {
     unsafe {
         report("tcp_socket", sys(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) as i64));
         report("unix_socket", sys(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) as i64));
+        // A datagram pair can send to any socket on the host with a name.
+        let service = std::env::var("NANOVM_JAIL_PROBE_SERVICE").unwrap();
+        let sent = std::os::unix::net::UnixDatagram::pair().and_then(|(a, _)| {
+            use std::os::linux::net::SocketAddrExt;
+            a.send_to_addr(b"x", &std::os::unix::net::SocketAddr::from_abstract_name(&service)?)
+        });
+        report("unix_datagram", sent.is_ok());
         let pid = libc::fork();
         if pid == 0 {
             libc::_exit(0);

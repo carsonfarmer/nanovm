@@ -163,6 +163,7 @@ A worker reads its config and component from stdin, then jails itself while it s
   - no memory that is writable and executable at once
   - limits can be read, never raised
   - `fcntl` for descriptor flags and OFD file locks, plus `flock`: no `F_SETOWN` or `F_SETSIG`, which would have the kernel signal another process of the same uid
+  - `socketpair` for a local stream pair only: a datagram socket could `sendto` any named or abstract socket on the host
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
