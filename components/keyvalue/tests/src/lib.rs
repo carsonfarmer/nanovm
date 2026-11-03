@@ -33,6 +33,26 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                     .await
                     .expect("fault write");
             }
+            "/repeat-seed" => store.set("repeat".into(), b"seed".to_vec()).await.expect("seed"),
+            "/repeat" => {
+                for n in 0..1000 {
+                    let value = vec![(n % 251) as u8; if n % 2 == 0 { 4097 } else { 8193 }];
+                    store.set("repeat".into(), value.clone()).await.expect("repeat set");
+                    assert_eq!(store.get("repeat".into()).await.expect("repeat get"), Some(value));
+                }
+                util::write_file("/data", "repeat-ready", vec![]).await.expect("ready");
+                util::wasip3::clocks::monotonic_clock::wait_for(200_000_000).await;
+                if req.q("trap") == Some("1") {
+                    panic!("repeated replacement rollback");
+                }
+            }
+            "/repeat-get" => {
+                return util::respond(
+                    200,
+                    "application/octet-stream",
+                    store.get("repeat".into()).await.expect("get").expect("value"),
+                );
+            }
             "/contracts" => {
                 assert!(Store::open("../bad".into()).await.is_err());
                 assert!(store.set("".into(), vec![]).await.is_err());

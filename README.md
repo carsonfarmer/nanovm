@@ -281,7 +281,7 @@ A host I/O failure during commit, a crash at its commit marker, or a lost respon
 - **Costs:**
   - One fsync per record that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request. Requests that change nothing pay nothing.
   - Fsync time isn't charged to the guest's CPU budget.
-  - The quota counts committed state. While a request runs, the log and the files it removed may each hold as much again, so an object's disk use peaks at three times its quota. Past that, a change is refused as a full disk.
+  - The byte quota counts logical file lengths, not allocated filesystem blocks or metadata. While a request runs, the log and retained files may each hold as much again: at most three quota-sized logical content budgets. Small files and filesystem metadata add physical overhead; `max_files` independently bounds directory entries. Size the backing disk for both limits, not just `3 × disk_mb`.
 - **Safety:**
   - Guest paths reach only the volume. The journal sits beside it, out of reach.
   - A recovery error preserves the failing undo and refuses to start the object. Repair the storage problem and retry; never delete the journal to force startup. Already-applied or never-performed operations remain safe to replay.
@@ -407,7 +407,7 @@ The tests cover:
 - apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, a switch that finishes when its request goes away, at most `max_apps` workers (taking only idle apps' slots), and slow registries held to four fetches at once and a deadline
 - the proxy hanging up on clients that stall their headers, and surviving running out of file descriptors
 - the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and proxy-owned WebSockets send events with the current digest
-- key-value: values persisting in the volume, counting against the disk and file quotas, bad names refused, keys paged, reads bounded by the memory limit and batches by size, and the store working in a jailed worker (including a key file the guest replaced through its filesystem)
+- key-value: persistence, shared filesystem byte/file quotas, bad names, 1 MiB read/write bounds, streamed keys/backpressure and completion lifetimes, cancellation-safe replacement, raw-file visibility and jailed execution. Optional probes cover mutation recovery cuts, 1,000 same-request replacements and 10,000-key scale.
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`
 - WebSockets through the proxy: echo, binary, committed fan-out scoped by app and object, a guest-initiated close, the object told how a socket ended, refusals by an object that doesn't answer `OPEN`; per-object, per-app and total caps, bounded messages and slow clients, publish deadlines, worker restart and version switches without reconnecting
 

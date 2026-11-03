@@ -62,6 +62,56 @@ async fn main() -> anyhow::Result<()> {
     let r = load::request(&node, "GET", "one", "/get", "").await;
     ensure!(r.status == 200 && r.body == "committed", "rollback: {}", r.body);
     println!("PASS trap rollback");
+    for abort in [false, true] {
+        let id = if abort { "repeat-abort" } else { "repeat-commit" };
+        ensure!(load::request(&node, "GET", id, "/repeat-seed", "").await.status == 200);
+        let writing = {
+            let node = node.clone();
+            tokio::spawn(async move {
+                load::request(&node, "GET", id, if abort { "/repeat?trap=1" } else { "/repeat" }, "").await
+            })
+        };
+        let ready = dir.join(format!("objects/spin-kv/{id}/repeat-ready"));
+        while !ready.exists() {
+            ensure!(
+                !writing.is_finished(),
+                "repeated write ended before inspection: {}",
+                writing.await?.body
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let journal = dir.join(format!("objects/spin-kv/~journal/{id}"));
+        let mut retained = 0;
+        for entry in std::fs::read_dir(&journal)? {
+            let entry = entry?;
+            if entry.file_name() != "log" {
+                retained += entry.metadata()?.len();
+            }
+        }
+        ensure!(
+            retained == 4,
+            "repeated replacements retained {retained} bytes, not just the seed"
+        );
+        println!(
+            "1000 replacements: undo {} bytes, retained {retained} bytes",
+            std::fs::metadata(journal.join("log"))?.len()
+        );
+        let r = writing.await?;
+        ensure!(
+            if abort {
+                r.error.as_deref() == Some("trap")
+            } else {
+                r.status == 200
+            },
+            "repeat: {}",
+            r.body
+        );
+        let r = load::request(&node, "GET", id, "/repeat-get", "").await;
+        // load::Reply converts binary to lossy UTF-8; inspect the file bytes independently.
+        ensure!(r.status == 200, "read after repeats: {}", r.body);
+        let expected = if abort { b"seed".to_vec() } else { vec![246; 8193] };
+        ensure!(std::fs::read(dir.join(format!("objects/spin-kv/{id}/.kv/default/cmVwZWF0")))? == expected);
+    }
     node.shutdown().await;
     drop(node);
     let node = Node::new(cfg, &app, &wasm, None)?;
