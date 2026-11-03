@@ -111,7 +111,8 @@ where
         }
         drop(theirs);
         mine.set_nonblocking(true)?;
-        let (tx, conn) = http1::handshake(TokioIo::new(UnixStream::from_std(mine)?)).await?;
+        let io = TokioIo::new(UnixStream::from_std(mine)?);
+        let (tx, conn) = http1::Builder::new().max_header_size(crate::server::MAX_HEAD).handshake(io).await?;
         Ok(Conn { tx, conn: Some(conn) })
     }
 

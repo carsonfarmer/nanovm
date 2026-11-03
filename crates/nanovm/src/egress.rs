@@ -474,7 +474,9 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
 
     let (mut sender, conn) = tokio::time::timeout(
         connect_timeout,
-        hyper::client::conn::http1::Builder::new().handshake(wasmtime_wasi_http::io::TokioIo::new(io)),
+        hyper::client::conn::http1::Builder::new()
+            .max_header_size(crate::server::MAX_HEAD)
+            .handshake(wasmtime_wasi_http::io::TokioIo::new(io)),
     )
     .await
     .map_err(|_| Error::ConnectionTimeout)??;
