@@ -192,8 +192,10 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
     // Making a received socket non-blocking (std uses this ioctl for it).
     rules.insert(libc::SYS_ioctl, vec![rule(vec![Cond::new(1, Dword, Eq, libc::FIONBIO)?])?]);
     // tokio's signal driver wakes itself through a local socketpair, which
-    // reaches nothing outside the process.
-    rules.insert(libc::SYS_socketpair, vec![rule(vec![Cond::new(0, Dword, Eq, libc::AF_UNIX as u64)?])?]);
+    // reaches nothing outside the process. A stream pair only: a datagram
+    // socket can `sendto` any named or abstract socket on the host.
+    let pair = vec![Cond::new(0, Dword, Eq, libc::AF_UNIX as u64)?, Cond::new(1, Dword, MaskedEq(0xf), libc::SOCK_STREAM as u64)?];
+    rules.insert(libc::SYS_socketpair, vec![rule(pair)?]);
     // abort() signals only this process.
     let pid = std::process::id() as u64;
     rules.insert(libc::SYS_tgkill, vec![rule(vec![Cond::new(0, Dword, Eq, pid)?])?]);
