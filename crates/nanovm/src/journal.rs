@@ -200,54 +200,36 @@ impl Journal {
         }
         if !self.sized.contains_key(&md.ino()) {
             self.record(Undo::Size(p.clone(), md.len()))?;
-            self.sized.insert(
-                md.ino(),
-                Saved {
-                    len: md.len(),
-                    ranges: vec![],
-                },
-            );
+            self.sized.insert(md.ino(), Saved { len: md.len(), ranges: vec![] });
             self.touched.insert(p.clone());
         }
+        // The parts of `[at, end)` within the original size not saved yet.
         let saved = &self.sized[&md.ino()];
-        let (mut at, end) = (at, end.min(saved.len));
-        let ranges = saved.ranges.clone();
-        if at < end {
-            // Read through a handle of our own: the guest's may be write-only.
-            let current = File::open(self.base.join(&p))?;
-            let mut ranges = ranges.into_iter().peekable();
-            while at < end {
-                while ranges.peek().is_some_and(|r| r.end <= at) {
-                    ranges.next();
-                }
-                if let Some(r) = ranges.peek()
-                    && r.start <= at
-                {
-                    at = r.end;
-                    continue;
-                }
-                let until = ranges.peek().map_or(end, |r| end.min(r.start));
-                let mut old = vec![0; (until - at).min(CHUNK) as usize];
+        let end = end.min(saved.len);
+        let (mut gaps, mut from) = (vec![], at);
+        for r in saved.ranges.iter().filter(|r| r.end > at && r.start < end) {
+            if r.start > from {
+                gaps.push(from..r.start);
+            }
+            from = r.end;
+        }
+        if from < end {
+            gaps.push(from..end);
+        }
+        if gaps.is_empty() {
+            return Ok(());
+        }
+        // Read through a handle of our own: the guest's may be write-only.
+        let current = File::open(self.base.join(&p))?;
+        for gap in gaps {
+            for at in gap.clone().step_by(CHUNK as usize) {
+                let mut old = vec![0; (gap.end - at).min(CHUNK) as usize];
                 current.read_exact_at(&mut old, at)?;
                 let n = old.len() as u64;
                 self.record(Undo::Bytes(p.clone(), at, old))?;
                 // Only a durable record protects a range, including when a
                 // later chunk fails and the caller retries the whole write.
-                let saved = &mut self.sized.get_mut(&md.ino()).unwrap().ranges;
-                saved.push(at..at + n);
-                saved.sort_by_key(|r| r.start);
-                let mut merged: Vec<std::ops::Range<u64>> = Vec::new();
-                for r in saved.drain(..) {
-                    if let Some(last) = merged.last_mut()
-                        && last.end == r.start
-                    {
-                        last.end = r.end;
-                    } else {
-                        merged.push(r);
-                    }
-                }
-                *saved = merged;
-                at += n;
+                save(&mut self.sized.get_mut(&md.ino()).expect("sized above").ranges, at..at + n);
             }
         }
         Ok(())
@@ -567,6 +549,19 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
             Some(u) => out.push((at, u)),
             None => return out,
         }
+    }
+}
+
+/// Adds `r`, disjoint from the sorted, disjoint `ranges`, merged with the
+/// ranges it touches.
+fn save(ranges: &mut Vec<std::ops::Range<u64>>, r: std::ops::Range<u64>) {
+    let i = ranges.partition_point(|x| x.start < r.start);
+    ranges.insert(i, r);
+    if i + 1 < ranges.len() && ranges[i].end == ranges[i + 1].start {
+        ranges[i].end = ranges.remove(i + 1).end;
+    }
+    if i > 0 && ranges[i - 1].end == ranges[i].start {
+        ranges[i - 1].end = ranges.remove(i).end;
     }
 }
 
@@ -1046,6 +1041,19 @@ mod tests {
             ErrorKind::StorageFull
         );
         assert!(v.join("f").exists());
+    }
+
+    /// Saved ranges stay sorted, disjoint and merged, whatever order they
+    /// are saved in, so the list stays as short as the file's gaps allow.
+    #[test]
+    fn saved_ranges_merge() {
+        let mut ranges = vec![];
+        for r in [4..6, 0..2, 8..9, 2..4, 6..8] {
+            save(&mut ranges, r);
+        }
+        assert_eq!(ranges, [0..9]);
+        save(&mut ranges, 10..12);
+        assert_eq!(ranges, [0..9, 10..12]);
     }
 
     /// Overlap, rename, and truncate/regrow must restore request-start
