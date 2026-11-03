@@ -132,9 +132,9 @@ impl ObjShared {
 
     /// Drives `fut`, charging the time spent inside each poll (where guest
     /// code runs) to the current request or start-up, never time spent
-    /// waiting to be scheduled.
-    async fn charged<F: Future>(&self, metrics: &Metrics, fut: F) -> F::Output {
-        let mut fut = pin!(fut);
+    /// waiting to be scheduled. Pinned by the caller: moved in, it was held
+    /// twice by this future, which made an idle object's actor 7 KB bigger.
+    async fn charged<F: Future>(&self, metrics: &Metrics, mut fut: Pin<&mut F>) -> F::Output {
         poll_fn(|cx| {
             let t0 = now_ns();
             self.poll_start_ns.store(t0, Relaxed);
@@ -441,12 +441,18 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
         (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
     });
     quota.commit()?;
-    if let crate::egress::Route::Supervisor(up) = route {
-        for req in held {
-            if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
-                let _ = res.into_body().collect().await;
+    if let crate::egress::Route::Supervisor(up) = route
+        && !held.is_empty()
+    {
+        // Boxed: inline, sending made every idle object's actor 2 KB bigger.
+        Box::pin(async move {
+            for req in held {
+                if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
+                    let _ = res.into_body().collect().await;
+                }
             }
-        }
+        })
+        .await;
     }
     Ok(())
 }
@@ -476,7 +482,7 @@ impl Drop for Pending {
     }
 }
 
-pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Job>) {
+pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Box<Job>>) {
     loop {
         let Some(mut job) = rx.recv().await else { return };
         *shared.context.lock() = job.context.clone();
@@ -493,7 +499,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         let started = async {
             let mut store = new_store(&node, &app, &shared)?;
             let svc = shared
-                .charged(&node.metrics, app.pre.instantiate_async(&mut store))
+                .charged(&node.metrics, pin!(app.pre.instantiate_async(&mut store)))
                 .await?;
             anyhow::Ok((store, svc))
         }
@@ -534,8 +540,8 @@ async fn serve(
     shared: &Arc<ObjShared>,
     mut store: Store<ObjState>,
     svc: Service,
-    first: Job,
-    rx: &mut mpsc::Receiver<Job>,
+    first: Box<Job>,
+    rx: &mut mpsc::Receiver<Box<Job>>,
 ) -> Exit {
     let limits = &app.cfg.limits;
     let max_resp = limits.max_response_body_kb << 10;
@@ -642,7 +648,8 @@ async fn serve(
     // runs outside the event loop because a guest spinning in a loop only
     // yields at epoch boundaries, never back into `inner`.
     let result: Result<wasmtime::Result<()>, Phase> = {
-        let mut fut = pin!(shared.charged(&node.metrics, store.run_concurrent(inner)));
+        let run = pin!(store.run_concurrent(inner));
+        let mut fut = pin!(shared.charged(&node.metrics, run));
         let mut timer = pin!(tokio::time::sleep(Duration::from_secs(3600)));
         let mut armed = None;
         poll_fn(|cx| {
@@ -871,6 +878,17 @@ mod tests {
         assert_eq!(e.to_string(), "instance terminated");
     }
 
+    /// The task of an idle object holds little: once, moved-in futures held
+    /// twice and an inline publish path made it 17 KB, every live object's.
+    #[test]
+    fn an_actor_is_small() {
+        fn returned<A, B, C, D, F>(_: fn(A, B, C, D) -> F) -> usize {
+            size_of::<F>()
+        }
+        let size = returned(run);
+        assert!(size < 4096, "{size} bytes");
+    }
+
     /// Errors are JSON naming the reason, which is also a header.
     #[tokio::test]
     async fn error_responses_are_json() {
@@ -893,12 +911,12 @@ mod tests {
         shared.begin_request();
         assert_eq!(shared.phase().0.as_str(), "handling");
         shared
-            .charged(&metrics, tokio::time::sleep(Duration::from_millis(50)))
+            .charged(&metrics, pin!(tokio::time::sleep(Duration::from_millis(50))))
             .await;
         let waited = shared.cpu_accum_ns.load(Relaxed);
         assert!(waited < 25_000_000, "waiting was charged {waited}ns");
         shared
-            .charged(&metrics, async { std::thread::sleep(Duration::from_millis(30)) })
+            .charged(&metrics, pin!(async { std::thread::sleep(Duration::from_millis(30)) }))
             .await;
         assert!(shared.cpu_accum_ns.load(Relaxed) >= 30_000_000);
         assert!(metrics.guest_cpu_ns.load(Relaxed) >= 30_000_000);

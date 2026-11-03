@@ -28,7 +28,9 @@ pub fn valid_name(s: &str) -> bool {
 }
 
 struct Entry {
-    tx: mpsc::Sender<Job>,
+    /// Boxed: a channel allocates room for 32 jobs up front, which unboxed
+    /// (about 600 bytes each) cost every live object 19 KB.
+    tx: mpsc::Sender<Box<Job>>,
     shared: Arc<ObjShared>,
 }
 
@@ -162,20 +164,20 @@ impl Node {
         let context = parent.with_remote_span_context(span.span_context().clone());
         let enqueued = Instant::now();
         let (reply, rx) = oneshot::channel();
-        let job = Job {
+        let job = Box::new(Job {
             req,
             reply,
             enqueued,
             span,
             context,
-        };
+        });
         match self.enqueue(id, job) {
             Err(resp) => resp,
             Ok(()) => rx.await.unwrap_or_else(|_| error_response(503, "object-unavailable", "the object stopped before answering")),
         }
     }
 
-    fn enqueue(self: &Arc<Self>, id: &str, mut job: Job) -> Result<(), http::Response<RespBody>> {
+    fn enqueue(self: &Arc<Self>, id: &str, mut job: Box<Job>) -> Result<(), http::Response<RespBody>> {
         let (app, key): (_, Arc<str>) = (&self.app, id.into());
         let mut objects = self.objects.lock();
         if let Some(e) = objects.get(&key) {
@@ -270,7 +272,7 @@ impl Node {
     /// Called by an actor whose instance went away. If nothing is queued for
     /// it, removes its table entry (if still its own) and tells it to exit;
     /// the table lock makes this atomic with respect to `enqueue`.
-    pub fn try_retire(&self, shared: &Arc<ObjShared>, rx: &mpsc::Receiver<Job>) -> bool {
+    pub fn try_retire(&self, shared: &Arc<ObjShared>, rx: &mpsc::Receiver<Box<Job>>) -> bool {
         let mut objects = self.objects.lock();
         if !rx.is_empty() {
             return false;
@@ -316,13 +318,13 @@ mod tests {
     fn only_objects_without_work_are_evictable() {
         use opentelemetry::trace::{Tracer, TracerProvider};
         let tracer = opentelemetry_sdk::trace::SdkTracerProvider::default().tracer("test");
-        let job = || Job {
+        let job = || Box::new(Job {
             req: http::Request::new(Bytes::new()),
             reply: oneshot::channel().0,
             enqueued: Instant::now(),
             context: Default::default(),
             span: tracer.start("request"),
-        };
+        });
         let (tx, _rx) = mpsc::channel(4);
         let e = Entry {
             tx,
