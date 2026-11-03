@@ -1,0 +1,85 @@
+// The JavaScript test app: a counter in the object's storage plus hostile
+// and API-surface routes for crates/nanovm/tests/js.rs.
+let hits = 0; // module state lives as long as the instance
+
+const routes = {
+  "GET /": async (req, env) => Response.json({ object: env.id, n: (await env.kv.get("n")) ?? 0, hits }),
+  "POST /incr": async (req, env) => {
+    const n = ((await env.kv.get("n")) ?? 0) + 1;
+    await env.kv.put("n", n);
+    return Response.json({ n, hits });
+  },
+  // The write must roll back with the request.
+  "POST /incr-then-throw": async (req, env) => {
+    await env.kv.put("n", ((await env.kv.get("n")) ?? 0) + 1);
+    throw new Error("boom");
+  },
+  "GET /spin": () => { for (;;) {} },
+  "GET /alloc": () => { const a = []; for (let s = "x"; ; s += s) a.push(s); },
+  "GET /never": () => new Promise(() => {}),
+  "GET /fetch": async (req) => {
+    const url = new URL(req.url).searchParams.get("url");
+    try {
+      const r = await fetch(url);
+      return Response.json({ status: r.status, body: await r.text() });
+    } catch (e) {
+      return Response.json({ denied: String(e) }, { status: 502 });
+    }
+  },
+  "POST /call": async (req, env) => {
+    const id = new URL(req.url).searchParams.get("id");
+    const r = await env.objects.get(id).fetch("/incr", { method: "POST" });
+    return Response.json({ status: r.status, callee: await r.json() });
+  },
+  "GET /config": (req, env) => Response.json(env.config),
+  "POST /echo": async (req) => {
+    const u = new URL(req.url);
+    return Response.json({
+      method: req.method,
+      path: u.pathname,
+      q: Object.fromEntries(u.searchParams),
+      type: req.headers.get("content-type"),
+      body: await req.text(),
+    }, { status: 201, headers: { "x-echo": "1" } });
+  },
+  "GET /timers": async () => {
+    const t0 = Date.now();
+    const order = [];
+    const cancelled = setTimeout(() => order.push("cancelled"), 5);
+    clearTimeout(cancelled);
+    await Promise.all([
+      new Promise((r) => setTimeout(() => { order.push("b"); r(); }, 30)),
+      new Promise((r) => setTimeout(() => { order.push("a"); r(); }, 10)),
+    ]);
+    return Response.json({ order, waited: Date.now() - t0 });
+  },
+  "GET /later": async (req, env, ctx) => {
+    ctx.waitUntil((async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      await env.kv.put("later", hits);
+    })());
+    return new Response("answered first");
+  },
+  "GET /later-value": async (req, env) => Response.json({ later: (await env.kv.get("later")) ?? null }),
+  "GET /web": async () => {
+    const h = new Headers([["A", "1"], ["a", "2"], ["b", "3"]]);
+    const bytes = new TextEncoder().encode("héllo");
+    return Response.json({
+      headers: [...h],
+      text: new TextDecoder().decode(bytes),
+      len: bytes.length,
+      uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID()),
+      b64: btoa("hi"),
+      clone: structuredClone({ a: [1, { b: 2 }] }),
+      form: String(new URLSearchParams({ q: "a b", x: "&" })),
+    });
+  },
+};
+
+export default {
+  async fetch(request, env, ctx) {
+    hits++;
+    const route = routes[`${request.method} ${new URL(request.url).pathname}`];
+    return route ? route(request, env, ctx) : new Response("not found", { status: 404 });
+  },
+};
