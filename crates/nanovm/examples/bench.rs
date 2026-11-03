@@ -4,6 +4,7 @@
 //!     scripts/build-guests.sh
 //!     cargo run --release --example bench [-- --quick] [-- --json out.json] [-- --cold N]
 //!     cargo run --release --example bench -- --export
+//!     cargo run --release --example bench -- --quick --only cold,churn
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,6 +82,25 @@ async fn load(
     load::run(node, method, path, n, None, conc, id).await
 }
 
+/// CPU (user + system) this process has used so far, in µs.
+fn cpu_us() -> u64 {
+    // SAFETY: `ru` is a valid out-pointer for getrusage.
+    let ru = unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru
+    };
+    let us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+    us(ru.ru_utime) + us(ru.ru_stime)
+}
+
+/// Open file descriptors and memory mappings of this process.
+fn fds_and_maps() -> (usize, usize) {
+    let fds = std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
+    let maps = std::fs::read_to_string("/proc/self/maps").map_or(0, |m| m.lines().count());
+    (fds, maps)
+}
+
 fn row(name: &str, r: &Run, note: &str) {
     println!(
         "  {name:<34} {:>9.0}/s   p50 {:>7.2} ms   p99 {:>7.2} ms   p99.9 {:>7.2} ms   {}{note}",
@@ -117,8 +137,17 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(10_000 / scale);
     let warm_objects = 1_000 / scale;
     let warm_n = 500_000 / scale;
-    let conc = 256;
+    // `--conc C` sets the concurrency of the cold-start and warm runs.
+    let conc = args
+        .iter()
+        .position(|a| a == "--conc")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| v.parse().expect("--conc takes a number"))
+        .unwrap_or(256);
     let mut out = serde_json::Map::new();
+    // `--only a,b` runs just those scenarios: cold, warm, kill, churn, attack.
+    let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).cloned();
+    let runs = |s: &str| only.as_ref().is_none_or(|o| o.split(',').any(|x| x == s));
 
     println!(
         "nanovm bench · {} {} · {} cores{}",
@@ -129,149 +158,171 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ---- cold starts, then warm traffic on the same node ----
-    let n = node("main", "counter", cold_n + 64, None)?;
-    once(&n, "warmup", "/").await;
-    let rss0 = rss_bytes();
-    let cold = load(&n, "GET", "/", cold_n, conc, |i| format!("o{i}")).await;
-    let live = n.live_objects();
-    let rss1 = rss_bytes();
-    let per_obj_kb = rss1.saturating_sub(rss0) as f64 / live.max(1) as f64 / 1024.0;
-    println!("\ncold start ({cold_n} new objects, {conc} concurrent)");
-    row("first request to a new object", &cold, "");
-    println!(
-        "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object",
-        "",
-        rss1 as f64 / 1e6,
-    );
-    out.insert(
-        "cold".into(),
-        json!({ "run": cold.json(), "live": live, "rss_mb": rss1 as f64 / 1e6, "kb_per_object": per_obj_kb.round() }),
-    );
+    if runs("cold") || runs("warm") {
+        let n = node("main", "counter", cold_n + 64, None)?;
+        once(&n, "warmup", "/").await;
+        let rss0 = rss_bytes();
+        let (fds0, maps0) = fds_and_maps();
+        let cpu0 = cpu_us();
+        let cold = load(&n, "GET", "/", cold_n, conc, |i| format!("o{i}")).await;
+        let cpu = (cpu_us() - cpu0) as f64 / cold.lat_us.len().max(1) as f64;
+        let live = n.live_objects();
+        let rss1 = rss_bytes();
+        let (fds1, maps1) = fds_and_maps();
+        let per_obj_kb = rss1.saturating_sub(rss0) as f64 / live.max(1) as f64 / 1024.0;
+        let per = |a: usize, b: usize| b.saturating_sub(a) as f64 / live.max(1) as f64;
+        println!("\ncold start ({cold_n} new objects, {conc} concurrent)");
+        row("first request to a new object", &cold, &format!("{cpu:.0} µs CPU each"));
+        println!(
+            "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object · {:.2} fds, {:.2} maps/object",
+            "",
+            rss1 as f64 / 1e6,
+            per(fds0, fds1),
+            per(maps0, maps1),
+        );
+        out.insert(
+            "cold".into(),
+            json!({ "run": cold.json(), "live": live, "rss_mb": rss1 as f64 / 1e6, "kb_per_object": per_obj_kb.round(),
+                "cpu_us_per_request": cpu.round(), "fds_per_object": per(fds0, fds1), "maps_per_object": per(maps0, maps1) }),
+        );
 
-    let warm = load(&n, "GET", "/", warm_n, conc, move |i| {
-        format!("o{}", i % warm_objects)
-    })
-    .await;
-    let serial = load(&n, "GET", "/", 20_000 / scale, 1, |_| "o0".into()).await;
-    let incr = load(&n, "POST", "/incr", warm_n / 5, conc, move |i| {
-        format!("o{}", i % warm_objects)
-    })
-    .await;
-    let incr1 = load(&n, "POST", "/incr", 2_000 / scale, 1, |_| "o0".into()).await;
-    println!("\nwarm ({warm_objects} live objects)");
-    row(&format!("GET, {conc} concurrent"), &warm, "");
-    row("GET, one client, one object", &serial, "");
-    row(&format!("POST /incr (writes /data), {conc} conc"), &incr, "");
-    row("POST /incr, one client, one object", &incr1, "");
-    out.insert("warm_get".into(), warm.json());
-    out.insert("warm_serial".into(), serial.json());
-    out.insert("warm_incr".into(), incr.json());
-    out.insert("warm_incr_serial".into(), incr1.json());
-    n.shutdown().await;
-    drop(n);
+        if runs("warm") {
+            let warm = load(&n, "GET", "/", warm_n, conc, move |i| {
+                format!("o{}", i % warm_objects)
+            })
+            .await;
+            let serial = load(&n, "GET", "/", 20_000 / scale, 1, |_| "o0".into()).await;
+            let incr = load(&n, "POST", "/incr", warm_n / 5, conc, move |i| {
+                format!("o{}", i % warm_objects)
+            })
+            .await;
+            let incr1 = load(&n, "POST", "/incr", 2_000 / scale, 1, |_| "o0".into()).await;
+            println!("\nwarm ({warm_objects} live objects)");
+            row(&format!("GET, {conc} concurrent"), &warm, "");
+            row("GET, one client, one object", &serial, "");
+            row(&format!("POST /incr (writes /data), {conc} conc"), &incr, "");
+            row("POST /incr, one client, one object", &incr1, "");
+            out.insert("warm_get".into(), warm.json());
+            out.insert("warm_serial".into(), serial.json());
+            out.insert("warm_incr".into(), incr.json());
+            out.insert("warm_incr_serial".into(), incr1.json());
+        }
+        n.shutdown().await;
+        drop(n);
+    }
 
     // ---- kill and recover ----
-    let n = node("kill", "hostile", 256, None)?;
-    let kills = 300 / scale;
-    let t0 = Instant::now();
-    let mut recover = Run::default();
-    for i in 0..kills {
-        let id = format!("k{}", i % 16);
-        once(&n, &id, "/panic").await;
-        recover.add(&once(&n, &id, "/").await);
+    if runs("kill") {
+        let n = node("kill", "hostile", 256, None)?;
+        let kills = 300 / scale;
+        let t0 = Instant::now();
+        let mut recover = Run::default();
+        for i in 0..kills {
+            let id = format!("k{}", i % 16);
+            once(&n, &id, "/panic").await;
+            recover.add(&once(&n, &id, "/").await);
+        }
+        recover.elapsed = t0.elapsed();
+        recover.lat_us.sort_unstable();
+        println!("\nkill and recover ({kills} traps, serial)");
+        row("next request after a trap", &recover, "(fresh instance)");
+        out.insert("recover".into(), recover.json());
+        n.shutdown().await;
+        drop(n);
     }
-    recover.elapsed = t0.elapsed();
-    recover.lat_us.sort_unstable();
-    println!("\nkill and recover ({kills} traps, serial)");
-    row("next request after a trap", &recover, "(fresh instance)");
-    out.insert("recover".into(), recover.json());
-    n.shutdown().await;
-    drop(n);
 
     // ---- churn past capacity: every request evicts an idle object ----
-    // `--churn-cap N` sets the slot count, to measure eviction near a large cap.
-    let cap = args
-        .iter()
-        .position(|a| a == "--churn-cap")
-        .and_then(|i| args.get(i + 1))
-        .map(|v| v.parse().expect("--churn-cap takes a number"))
-        .unwrap_or(1_000 / scale);
-    let n = node("churn", "counter", cap, None)?;
-    let churn = load(&n, "GET", "/", 20_000 / scale, 64, |i| format!("c{i}")).await;
-    println!(
-        "\nchurn ({} new objects through {cap} slots, 64 concurrent)",
-        20_000 / scale
-    );
-    row("new object + LRU eviction", &churn, "");
-    println!("  {:<34} {} instantiation failures (details in OTLP logs)", "", n.metrics.instantiate_failures.load(Relaxed));
-    println!("  {:<34} {} evicted", "", n.metrics.evicted_lru.load(Relaxed));
-    out.insert("churn".into(), churn.json());
-    n.shutdown().await;
-    drop(n);
+    if runs("churn") {
+        // `--churn-cap N` sets the slot count, to measure eviction near a large cap.
+        let cap = args
+            .iter()
+            .position(|a| a == "--churn-cap")
+            .and_then(|i| args.get(i + 1))
+            .map(|v| v.parse().expect("--churn-cap takes a number"))
+            .unwrap_or(1_000 / scale);
+        let n = node("churn", "counter", cap, None)?;
+        let cpu0 = cpu_us();
+        let churn = load(&n, "GET", "/", 20_000 / scale, 64, |i| format!("c{i}")).await;
+        let cpu = (cpu_us() - cpu0) as f64 / churn.lat_us.len().max(1) as f64;
+        println!(
+            "\nchurn ({} new objects through {cap} slots, 64 concurrent)",
+            20_000 / scale
+        );
+        row("new object + LRU eviction", &churn, &format!("{cpu:.0} µs CPU each"));
+        println!("  {:<34} {} instantiation failures (details in OTLP logs)", "", n.metrics.instantiate_failures.load(Relaxed));
+        println!("  {:<34} {} evicted", "", n.metrics.evicted_lru.load(Relaxed));
+        let mut churn_json = churn.json();
+        churn_json["cpu_us_per_request"] = json!(cpu.round());
+        out.insert("churn".into(), churn_json);
+        n.shutdown().await;
+        drop(n);
+    }
 
     // ---- neighbours under attack: other objects of the attackers' app ----
-    let n = node("attack", "hostile", 1_000, None)?;
-    let objs = 100 / scale.min(10);
-    load(&n, "GET", "/", objs, 64, |i| format!("v{i}")).await;
-    let window = Duration::from_millis(if quick { 1000 } else { 3000 });
-    let base = load::run(
-        &n,
-        "GET",
-        "/",
-        usize::MAX,
-        Some(Instant::now() + window),
-        64,
-        move |i| format!("v{}", i % objs),
-    )
-    .await;
-    let stop = Arc::new(AtomicBool::new(false));
-    let attackers: Vec<_> = (0..16)
-        .map(|a| {
-            let (n, stop) = (n.clone(), stop.clone());
-            tokio::spawn(async move {
-                let paths = ["/spin", "/alloc?mb=1024", "/panic", "/leak"];
-                let mut k = 0;
-                while !stop.load(Relaxed) {
-                    once(&n, &format!("a{a}"), paths[k % paths.len()]).await;
-                    k += 1;
-                }
-                k
+    if runs("attack") {
+        let n = node("attack", "hostile", 1_000, None)?;
+        let objs = 100 / scale.min(10);
+        load(&n, "GET", "/", objs, 64, |i| format!("v{i}")).await;
+        let window = Duration::from_millis(if quick { 1000 } else { 3000 });
+        let base = load::run(
+            &n,
+            "GET",
+            "/",
+            usize::MAX,
+            Some(Instant::now() + window),
+            64,
+            move |i| format!("v{}", i % objs),
+        )
+        .await;
+        let stop = Arc::new(AtomicBool::new(false));
+        let attackers: Vec<_> = (0..16)
+            .map(|a| {
+                let (n, stop) = (n.clone(), stop.clone());
+                tokio::spawn(async move {
+                    let paths = ["/spin", "/alloc?mb=1024", "/panic", "/leak"];
+                    let mut k = 0;
+                    while !stop.load(Relaxed) {
+                        once(&n, &format!("a{a}"), paths[k % paths.len()]).await;
+                        k += 1;
+                    }
+                    k
+                })
             })
-        })
-        .collect();
-    // Let the attackers get going before measuring.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let killed0: u64 = n.metrics.poisons.iter().map(|p| p.load(Relaxed)).sum();
-    let under = load::run(
-        &n,
-        "GET",
-        "/",
-        usize::MAX,
-        Some(Instant::now() + window),
-        64,
-        move |i| format!("v{}", i % objs),
-    )
-    .await;
-    let poisons = n.metrics.poisons.iter().map(|p| p.load(Relaxed)).sum::<u64>() - killed0;
-    stop.store(true, Relaxed);
-    let mut attacks = 0;
-    for a in attackers {
-        attacks += a.await?;
+            .collect();
+        // Let the attackers get going before measuring.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let killed0: u64 = n.metrics.poisons.iter().map(|p| p.load(Relaxed)).sum();
+        let under = load::run(
+            &n,
+            "GET",
+            "/",
+            usize::MAX,
+            Some(Instant::now() + window),
+            64,
+            move |i| format!("v{}", i % objs),
+        )
+        .await;
+        let poisons = n.metrics.poisons.iter().map(|p| p.load(Relaxed)).sum::<u64>() - killed0;
+        stop.store(true, Relaxed);
+        let mut attacks = 0;
+        for a in attackers {
+            attacks += a.await?;
+        }
+        println!(
+            "\nneighbours ({objs} objects, 64 concurrent, {} s each)",
+            window.as_secs_f64()
+        );
+        row("baseline", &base, "");
+        row(
+            "while 16 attackers loop",
+            &under,
+            &format!("({attacks} attacks, {poisons} instances killed)"),
+        );
+        out.insert(
+            "neighbours".into(),
+            json!({ "baseline": base.json(), "under_attack": under.json(), "attacks": attacks, "killed": poisons }),
+        );
     }
-    println!(
-        "\nneighbours ({objs} objects, 64 concurrent, {} s each)",
-        window.as_secs_f64()
-    );
-    row("baseline", &base, "");
-    row(
-        "while 16 attackers loop",
-        &under,
-        &format!("({attacks} attacks, {poisons} instances killed)"),
-    );
-    out.insert(
-        "neighbours".into(),
-        json!({ "baseline": base.json(), "under_attack": under.json(), "attacks": attacks, "killed": poisons }),
-    );
 
     if let Some(path) = json_out {
         std::fs::write(&path, serde_json::to_string_pretty(&Value::Object(out))?)?;
