@@ -313,7 +313,7 @@ async fn hold(
     let status = match http_body_util::Limited::new(body, max).collect().await.map(|b| b.to_bytes()) {
         Err(_) => 413,
         Ok(_) if parts.uri.path().trim_end_matches('/') != "/publish" => 404,
-        Ok(body) if !crate::ws::well_formed(&body) => 400,
+        Ok(body) if crate::ws::messages(&body).is_none() => 400,
         // What a request holds is bounded like one publish.
         Ok(body) if held.lock().iter().map(|r| r.body().len()).sum::<usize>() + body.len() > max => 413,
         Ok(body) => {

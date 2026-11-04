@@ -414,11 +414,6 @@ impl Sockets {
     }
 }
 
-/// Whether a publish's body is one [`Sockets::publish`] takes.
-pub fn well_formed(json: &[u8]) -> bool {
-    messages(json).is_some()
-}
-
 /// The parts of GRIP's publish format a socket takes. Read into these rather
 /// than a `serde_json::Value`, which costs about 24 bytes of memory for each
 /// byte of a guest's publish; what isn't read is skipped, not built.
@@ -448,8 +443,9 @@ enum WsMessage {
 }
 
 /// The (channel, message) of each item of a publish that has one for a
-/// socket; `None` unless all are well formed.
-fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
+/// socket; `None` unless all are well formed (then [`Sockets::publish`]
+/// takes it).
+pub(crate) fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
     let items = serde_json::from_slice::<Publish>(json).ok()?.items;
     if items.len() > MAX_ITEMS {
         return None;
