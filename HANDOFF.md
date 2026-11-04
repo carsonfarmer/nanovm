@@ -2,6 +2,20 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
+## State (2026-11-04)
+
+- **Improvement waves (owner request, decisions delegated):** branch `cf/optimistic-feynman-62f1a0` merges two
+  waves of parallel workstreams; [notes/README.md](notes/README.md) is the plain-language evidence index and PLAN's
+  "Improvement waves" the summary. Wave 1 merged (perf, cold, dx, sec, lean, js) and wasmtime 50.0.1; full serial
+  suite on an idle machine: 115 unit, 74 integration (10 ignored), 9 JavaScript; the SQLite `--ignored` suite 8/8.
+  Runtime grew to 5,652 counted lines with `nanovm run`, wire-level telemetry stamping and the reference parser;
+  wave 2's lean2 targets getting back under the 5,346 it started from.
+- **Not merged to `main`** and nothing published: merging `guests/**` changes republishes the test guests
+  (`publish-guests.yml`); the owner should confirm that first.
+- **Owner follow-ups:** W-8 (comparison against Spin, `wasmtime serve`, workerd) was refused by this environment's
+  permission policy because it runs third-party binaries; W-20 (thread-per-core workers) and W-25 (sharded volume
+  directories, an on-disk layout change) need the owner unless wave 2 settles them with evidence.
+
 ## State (2026-11-02)
 
 - **W-2 complete (Q71):** owner defers deployment to engineering judgment. Recommend a separately budgeted Collector; the demonstrated 2.17% matched application overhead satisfies that deployment's gate. Colocated whole-system overhead remains 7.58%, not an accepted few-percent result. Runtime is 5,315 lines versus main's 4,955 (+360, 7.3%); no LOC-only refactor. Latest evidence and reproduction are at the start of the W-2 section below; older checkpoints are history.
@@ -392,6 +406,21 @@ Several agents work on this repo at once, each in its own checkout.
 - **Land small, on top of `main`.** One finding or a small related group per branch; rebase onto `origin/main`, run the full suite (`env -u RUST_BACKTRACE cargo test -p nanovm`), fast-forward `main`, push. Never rewrite pushed history.
 - **Docs move with the code.** README (what exists, tests, bugs found), PLAN (design and roadmap), HANDOFF (state, decisions, how to work) and ISSUES are updated in the same push as the change they describe.
 
+## Environment gotchas: Claude Code cloud containers (2026-11)
+
+- **The container can reboot without warning**; files survive but processes don't, and `vm.max_map_count` resets
+  to 65,530 (`sysctl -qw vm.max_map_count=1048576`). The fd hard limit is 20,000.
+- **Disk is a fixed allowance (~40 GB).** A full build of this workspace is ~6 GB. Parallel worktrees can share the
+  dependency artifacts by hardlinking a warm `target/` (`cp -al`) and deleting the nanovm-specific artifacts; then
+  replace the hardlinked `.cargo-lock`/`.cargo-build-lock`/`.cargo-artifact-lock` files, or every worktree's builds
+  wait on one lock. Changing dependency features in one worktree rebuilds its dependencies (GBs).
+- **`git stash` is shared by all worktrees** (one `refs/stash`); a `stash pop` can take another agent's changes. Use
+  WIP commits.
+- **Wall-clock benchmarks are meaningless while other agents build**; compare CPU time per request with alternating
+  A/B runs, and rerun authoritative numbers on an idle machine. Timing-sensitive tests (`a_node_runs_at_most_max_apps`,
+  CPU-budget tests) fail at load averages above ~8 and pass when idle.
+- `perf` works as `/usr/lib/linux-tools-6.8.0-147/perf record -e cpu-clock -g` (no hardware counters).
+
 ## Environment gotchas: Amp orbs
 
 - **Setup is automatic.** `.agents/setup` installs stable Rust with the `wasm32-wasip2` target, fetches both workspaces' crates, builds the test guests and prebuilds the tests (about 8 minutes cold on 4 cores; a fresh orb usually starts from a snapshot where it's done). It leaves the release build to the first command that needs it (demo, bench, `scripts/vm-test.sh`).
@@ -430,7 +459,8 @@ Several agents work on this repo at once, each in its own checkout.
 - `crates/nanovm/tests/integration.rs`: the integration tests. Helpers: `node_cfg`, `supervised_with`, `http_get`, `test_cgroup`, `stalling_upstream`. `jail_probe` runs in a child process.
 - `crates/nanovm/support/load.rs`: the in-process load generator, used by the tests and the benchmark.
 - `crates/nanovm/examples/bench.rs`: the in-process benchmark. `examples/dev-registry.rs`: a loopback registry with the guests published, for the demo and local development.
-- `guests/`: `counter`, `hostile` and `util`; build them with `scripts/build-guests.sh`.
+- `guests/`: `counter`, `hostile`, the `chat` example's crate and `sdk` (`nanovm-sdk`); build them with `scripts/build-guests.sh`, which also builds the JavaScript test apps (`js/`).
+- `notes/`: per-workstream evidence (method, numbers, tests) for the 2026-11 improvement waves.
   - Hostile endpoints include `/hold` (keeps response bodies open), `/big` (a large body) and `/commit` (writes, then ends as `then=` says).
   - The counter guest has a chat room on `/ws` and `POST /publish`.
 - `demo/demo.sh` and `demo/nanovm.toml`.

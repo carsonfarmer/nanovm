@@ -65,7 +65,7 @@ nanovm/
   guests/                        separate workspace, target wasm32-wasip2, cdylib + wasip3 0.9
     counter/                     benign DO: in-memory hits + persisted counter + kv in /data
     hostile/                     attack endpoints (see Tests)
-    util/                        shared request/response and wasip3 filesystem helpers
+    sdk/                         nanovm-sdk: the Rust guest SDK (request/response, files, kv, config, fetch, calls, WebSockets)
   crates/nanovm/support/load.rs  in-process load generator, #[path]-included by bench and tests
   scripts/build-guests.sh        cargo build --target wasm32-wasip2 --release → guests/target/wasm32-wasip2/release/
   demo/nanovm.toml, demo/demo.sh
@@ -84,7 +84,7 @@ nanovm/
   With the default 4 GiB reservation, each memory slot takes about 4 GiB of virtual address space. Density mode uses a small reservation instead (for example 128 MiB). It costs explicit bounds checks but gives roughly 100k slots. The benchmark measures both modes.
 - **Precompiled cache:** components are precompiled to `.cwasm`, keyed by content hash plus `precompile_compatibility_hash`. They are loaded with `Component::deserialize_file`, which is required for copy-on-write memory images on macOS; Linux uses memfd.
 - **Deploy-time validation (`ALLOWED_IMPORTS` in app.rs):** a component is rejected if `component_type().imports()` contains anything outside these prefixes: `wasi:io/`, `wasi:clocks/`, `wasi:random/`, `wasi:cli/` (any version), `wasi:filesystem/{types,preopens}@0.3`, `wasi:http/{types,client}@0.3`. It must also export `wasi:http/handler@0.3`. Sockets, the WASI 0.2 filesystem, `wasi:http/outgoing-handler` and custom imports are all refused, and the error names the offending import.
-- **WASI 0.2 filesystem:** refused at load (above). Rust guests built for wasm32-wasip2 must use the wasip3 filesystem API (see `guests/util`), not `std::fs`, which imports the 0.2 filesystem. Quota support for 0.2 is a follow-up.
+- **WASI 0.2 filesystem:** refused at load (above). Rust guests built for wasm32-wasip2 must use the wasip3 filesystem API (see `guests/sdk`), not `std::fs`, which imports the 0.2 filesystem. Quota support for 0.2 is a follow-up.
 - `ServicePre::new(linker.instantiate_pre(&component))` is built once per app and cloned for each instantiation.
 
 ## Object actor (src/object.rs)
@@ -337,8 +337,21 @@ Built on branch `proxy` by one agent and finished by another. README's "The prox
 - **Apps come only from registries; one app per worker.** `[[app]]`, local components and the read-only `/app` directory are gone. A request's path is `/{object}/{rest}`, checked strictly (`table::route`).
 - **App identity:** an app's name on the node, its volumes and its uid come from its host and `registry/repository` (`registry::app_name`: a readable prefix and a hash of the whole). Keyed by repository alone, as first built, any domain could switch another's app to an old signed version on its data; the review caught it.
 - **Dev mode** (`dev = true`, refused unless `listen` is loopback): no signature check; registries and egress may be on private addresses; loopback registries are plain HTTP. Tests and the demo use it with a `container-registry` instance on loopback (`examples/dev-registry.rs`).
-- **A registry client of our own** (`registry::Oci`, over reqwest) replaced oci-client's downloads: every download has a size cap, digests are checked before they name a file, and only public addresses are reached (DNS answers and redirects included) unless in dev mode. The runtime now depends on `oci-spec` for reference parsing and reads the few manifest fields it needs itself; oci-client is a dev-dependency (tests, `examples/dev-registry.rs`).
+- **A registry client of our own** (`registry::Oci`, over reqwest) replaced oci-client's downloads: every download has a size cap, digests are checked before they name a file, and only public addresses are reached (DNS answers and redirects included) unless in dev mode. The runtime reads the few manifest fields it needs itself and, since 2026-11, parses references itself too (`registry::Reference`, differentially tested against oci-spec); oci-client and oci-spec are dev-dependencies (tests, `examples/dev-registry.rs`).
 - **Review findings fixed here:** N-1, N-3, N-4, N-11, N-12, N-13 (and with it N-14, N-15), N-16, N-17, N-18, N-19. An adversarial review of the branch then found eleven more; the blocking ones were fixed before it landed (apps keyed by host, no unsigned manifests on disk, canonical registry addresses, proxy dev mode on loopback only, a bounded token and signature count), and the rest became N-22 to N-31 in ISSUES.md, fixed since: `max_apps` with idle apps' slots reused and registry fetches four at once with a deadline (N-22), accept loops that outlast fd exhaustion and proxy client timeouts (N-24), bounded single-flight proxy caches (N-25), bounded policy sets (N-26), a node-wide link cap (N-27), drains that wait for the old process (N-28), directory setup off the front end (N-29), hop-by-hop headers dropped (N-30), and oci-spec in place of oci-client (N-31, partly). Since then: dev mode needs the `dev` cargo feature (N-23) and the proxy has no TLS of its own (W-14).
+
+## Improvement waves (2026-11-03/04)
+
+The owner asked for nanovm to be made as fast, minimal and elegant as possible, delegating decisions.
+Work ran as parallel workstreams on branches merged into `cf/optimistic-feynman-62f1a0`; [notes/](notes/README.md)
+has each one's method, numbers and tests, and ISSUES N-40..N-159 / W-20..W-74 their findings.
+- **Wave 1:** hot-path profiling and two cuts (perf); empty `/tmp` reuse and 23% less memory per object (cold);
+  `nanovm-sdk`, `nanovm run` and a live chat example (dx); five security fixes, N-70..N-75 (sec); trimmed dependency
+  features and a reference parser of our own (lean); JavaScript apps on an embedded engine, pre-initialized with Wizer (js).
+- **Wave 2:** the jailed HTTP path (hop), the runtime back under its pre-wave size (lean2), QuickJS against Boa for
+  JavaScript apps (qjs), and app cold start for scale-to-zero (cold2).
+- **Not done:** W-8 (comparison against Spin, `wasmtime serve` and workerd) needs running third-party binaries,
+  which this environment's permission policy refused; it waits for the owner.
 
 ## Roadmap (agreed with the owner, 2026-10-30)
 
@@ -351,7 +364,7 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
    - Final optimization (Q70): owner retains all meaningful spans; successful supervisor spans must not be consolidated. Native profiling found repeated OCI parsing; cache only pure parse results per thread (16 owned references, input ≤1024 bytes), with all trust/host/version/digest checks per request. Reserve common span attributes. Runtime 5,315 lines. Matched three-pair HTTP controls show 0.74% lower aggregate throughput with Collector physically isolated and 4.45% lower colocated, all 2.4m spans per matrix delivered. Cache mutations/full suite/production check/demo pass. Post-commit repeat and delivery remain; older measurements below describe earlier checkpoints, not current product decisions.
    - Correctness before optimization (Q68): instrument meaningful work, causal relationships and outcomes using Honeycomb's wide-event model and standard OpenTelemetry. Requests are SERVER spans; object and external HTTP calls are CLIENT spans with target/status/error context. External calls inject W3C context using the standard propagator; spans and denial logs omit queries. Finish pre-worker failures and background attribution coverage before throughput tuning. Sampling is an explicit trace policy, never accidental queue loss.
    - Q69 records cancelled dependencies, ignores untrusted external error headers and correlates runtime diagnostics using explicit context. N-37 now records final-commit failures without changing the sent status; a private test component verifies actual post-return call/log context. Proxy/supervisor SERVER events cover pre-worker failures and parent worker events, ending at headers. Select one layer for derived request counts. Full locked suite passes (104 unit, 67 integration, one ignored); performance and review follow-through remain.
-   - The owner suspended the hard LOC budget; CI reports size (currently 5,315) without enforcing 5,000. Guest and infrastructure logs use one bounded emission path. Preserve bounded Collector responses for the SDK's partial-success parser; SDK diagnostics go to stderr, not recursively into OTLP.
+   - The owner suspended the hard LOC budget; CI reports size without enforcing 5,000 (5,315 at W-2; see HANDOFF State for the current count). Guest and infrastructure logs use one bounded emission path. Preserve bounded Collector responses for the SDK's partial-success parser; SDK diagnostics go to stderr, not recursively into OTLP.
    - The supervisor stamps app/digest identity; no jail permission changed. Readiness is independent of telemetry. Request analytics and sampling belong downstream; bounded best-effort export is not exact accounting.
    - Q66 retains Q64's 256-span batches, 1 MiB body cap and stamping at the worker trust boundary, with a 2048-span bounded queue and jemalloc in the Linux CLI/benchmark, not the library. The reproducible `bench --export` receives all 601,000 request spans at 75–79k/s in three invocations, including sink decoding on the same cores. Retained memory increases; production Collector/jailed-worker capacity and matched main comparisons remain open. Favor library choices over custom export machinery.
    - Real HTTP validation uses off-the-shelf oha and the official OpenTelemetry Collector, not a custom HTTP load generator. N-36 records substantial worker export-queue loss despite successful HTTP requests. Reject the experimental concurrent SDK processor until its flush barrier is correct (Q67).
