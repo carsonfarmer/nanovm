@@ -350,14 +350,14 @@ const LEN: u64 = 2;
 
 /// Writes field `key` holding what `f` writes.
 fn nested(out: &mut Vec<u8>, key: u64, f: impl FnOnce(&mut Vec<u8>) -> anyhow::Result<()>) -> anyhow::Result<()> {
-    put_varint(key, out);
+    prost::encode_length_delimiter(key as usize, out)?;
     // Room for the length (5 bytes reach 32 GiB), shrunk to fit after.
     let at = out.len();
     out.extend([0; 5]);
     f(out)?;
-    let mut len = [0; 5];
-    let n = put_varint((out.len() - at - 5) as u64, &mut len.as_mut_slice());
-    out[at..at + n].copy_from_slice(&len[..n]);
+    let len = out.len() - at - 5;
+    let n = prost::length_delimiter_len(len);
+    prost::encode_length_delimiter(len, &mut &mut out[at..at + n])?;
     out.copy_within(at + 5.., at + n);
     out.truncate(out.len() - (5 - n));
     Ok(())
@@ -379,29 +379,9 @@ fn field<'a>(m: &mut &'a [u8]) -> anyhow::Result<(u64, &'a [u8])> {
     Ok((key, value))
 }
 
+/// A varint, which is how protobuf writes a length (`prost` reads one).
 fn varint(m: &mut &[u8]) -> anyhow::Result<u64> {
-    let mut v = 0;
-    for i in 0..10 {
-        let (&b, rest) = m.split_first().ok_or_else(|| anyhow::anyhow!("truncated telemetry batch"))?;
-        *m = rest;
-        v |= u64::from(b & 0x7f) << (7 * i);
-        if b < 0x80 {
-            return Ok(v);
-        }
-    }
-    anyhow::bail!("bad varint")
-}
-
-/// Writes `v` as a varint, returning its length.
-fn put_varint(mut v: u64, out: &mut impl std::io::Write) -> usize {
-    let mut n = 1;
-    while v >= 0x80 {
-        let _ = out.write_all(&[v as u8 | 0x80]);
-        v >>= 7;
-        n += 1;
-    }
-    let _ = out.write_all(&[v as u8]);
-    n
+    Ok(prost::decode_length_delimiter(m)? as u64)
 }
 
 #[cfg(test)]
@@ -420,8 +400,8 @@ mod tests {
     fn raw(fields: &[(u64, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         for (key, value) in fields {
-            put_varint(*key, &mut out);
-            if key & 7 == LEN { put_varint(value.len() as u64, &mut out); }
+            prost::encode_length_delimiter(*key as usize, &mut out).unwrap();
+            if key & 7 == LEN { prost::encode_length_delimiter(value.len(), &mut out).unwrap(); }
             out.extend_from_slice(value);
         }
         out
