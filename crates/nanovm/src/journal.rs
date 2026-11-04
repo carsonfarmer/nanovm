@@ -359,37 +359,35 @@ impl Journal {
     /// Sync both directories before invalidating any undo record: a crash
     /// must see either the restored target or the undo that restores it.
     pub fn restore(&mut self, slot: &Path, to: &Path, bytes: u64) -> std::io::Result<()> {
-        let t0 = Instant::now();
-        let result = (|| {
+        self.or_poison(|j| {
             std::fs::rename(slot, to)?;
             sync(to.parent().expect("volume entry"))?;
-            sync(&self.dir)?;
-            self.held.1 -= bytes;
+            sync(&j.dir)?;
+            j.held.1 -= bytes;
             Ok(())
-        })();
-        self.obj.uncharge(t0.elapsed());
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
+        })
     }
 
     /// The failed rename's record must not act on a later reuse of either
     /// name. Replace only its tag, preserving framing and other concurrent
     /// operations' records. Cancelled records still consume log budget.
     pub fn cancel_rename(&mut self, at: u64) -> std::io::Result<()> {
-        let t0 = Instant::now();
-        let result = (|| {
-            let log = File::options().write(true).open(self.dir.join(LOG))?;
+        self.or_poison(|j| {
+            let log = File::options().write(true).open(j.dir.join(LOG))?;
             log.write_all_at(&[5], at + 8)?;
             #[cfg(test)]
             tests::sync_point()?;
             log.sync_data()
-        })();
+        })
+    }
+
+    /// Runs `f`, whose waits for the disk aren't charged as CPU; if it
+    /// fails, the journal needs recovery.
+    fn or_poison(&mut self, f: impl FnOnce(&mut Self) -> std::io::Result<()>) -> std::io::Result<()> {
+        let t0 = Instant::now();
+        let result = f(self);
         self.obj.uncharge(t0.elapsed());
-        if result.is_err() {
-            self.poisoned = true;
-        }
+        self.poisoned |= result.is_err();
         result
     }
 
