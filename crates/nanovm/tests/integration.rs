@@ -3393,6 +3393,38 @@ async fn guest_header_maps_are_bounded_by_the_memory_limit() {
     assert_eq!(get("/e/headers?n=100&kb=60", 50 << 10).await, (200, "100".into()), "within the limits");
 }
 
+/// A guest that wakes itself in a tight loop (each wake goes back to the
+/// host, which runs it again at once) holds its thread at most a tick at a
+/// time, as a spinner does: on a one-thread runtime a neighbour's requests
+/// get through quickly, and it is killed at its CPU budget.
+#[tokio::test(flavor = "current_thread")]
+async fn a_self_waking_guest_yields_its_thread_at_each_tick() {
+    let mut app = app("hostile");
+    app.limits.cpu_ms = 500;
+    app.limits.request_timeout_ms = 5000;
+    let node = Node::new(node_cfg("a_self_waking_guest", 8), &app, &probe(), None).unwrap();
+    assert_eq!(get(&node, "neighbour", "/callee").await.status, 200);
+    let t0 = Instant::now();
+    // Spawned: the test's own future runs only once the queue is empty.
+    let n = node.clone();
+    let waker = tokio::spawn(async move { (get(&n, "waker", "/selfwake").await, t0.elapsed()) });
+    let neighbour = tokio::spawn(async move {
+        let mut slowest = Duration::ZERO;
+        for _ in 0..5 {
+            let r = get(&node, "neighbour", "/callee").await;
+            assert_eq!(r.status, 200, "{}", r.body);
+            slowest = slowest.max(r.elapsed);
+        }
+        (slowest, t0.elapsed())
+    });
+    let ((woke, woke_at), (slowest, neighbour_at)) = (waker.await.unwrap(), neighbour.await.unwrap());
+    assert_eq!(woke.error.as_deref(), Some("cpu"), "{}", woke.body);
+    assert!(
+        neighbour_at < woke_at && slowest < Duration::from_millis(50),
+        "the neighbour's slowest request took {slowest:?}, all five {neighbour_at:?}; the waker ran {woke_at:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn post_return_work_keeps_context_and_reports_commit_failure() {
     use http_body_util::BodyExt;
