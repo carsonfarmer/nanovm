@@ -28,6 +28,7 @@ use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
 use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream;
 
 use crate::object::BoxError;
@@ -38,9 +39,95 @@ const MAX_IDLE: usize = 256;
 /// control socket.
 const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A link's socket, registered with the reactor for reads only. A Unix
+/// stream socket signals writability whenever its peer reads, so with
+/// write interest every request woke the other process for nothing. A
+/// write that finds the socket full waits on a second descriptor for it,
+/// registered for writes until the write goes through.
+struct Io {
+    fd: AsyncFd<OwnedFd>,
+    full: Option<AsyncFd<OwnedFd>>,
+}
+
+impl Io {
+    fn new(sock: std::os::unix::net::UnixStream) -> std::io::Result<Io> {
+        sock.set_nonblocking(true)?;
+        Ok(Io { fd: register(sock.into(), Interest::READABLE)?, full: None })
+    }
+
+    fn poll_write_with(&mut self, cx: &mut Context<'_>, write: impl Fn(BorrowedFd<'_>) -> rustix::io::Result<usize>) -> Poll<std::io::Result<usize>> {
+        loop {
+            match write(self.fd.as_fd()) {
+                Err(rustix::io::Errno::AGAIN) => {}
+                done => {
+                    self.full = None;
+                    return Poll::Ready(done.map_err(Into::into));
+                }
+            }
+            let full = match &self.full {
+                Some(full) => full,
+                None => self.full.insert(register(self.fd.get_ref().try_clone()?, Interest::WRITABLE)?),
+            };
+            ready!(full.poll_write_ready(cx))?.clear_ready();
+        }
+    }
+}
+
+fn register(fd: OwnedFd, interest: Interest) -> std::io::Result<AsyncFd<OwnedFd>> {
+    // SAFETY: an `OwnedFd` stays open, with the same number, until dropped.
+    Ok(unsafe { AsyncFd::register_with_interest(fd, interest) }?)
+}
+
+impl tokio::io::AsyncRead for Io {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        loop {
+            let mut ready = ready!(self.fd.poll_read_ready(cx))?;
+            // SAFETY: `read` only writes to the buffer, and `n` bytes of it
+            // are initialized once it returns `n`.
+            let (len, dst) = (buf.remaining(), unsafe { buf.unfilled_mut() });
+            match ready.try_io(|fd| Ok(rustix::io::read(fd, dst)?.0.len())) {
+                Ok(Ok(n)) => {
+                    // A short read has emptied the socket: wait for the next
+                    // edge rather than read again to find out.
+                    if 0 < n && n < len {
+                        ready.clear_ready();
+                    }
+                    unsafe { buf.assume_init(n) };
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(e)) => return Poll::Ready(Err(e)),
+                Err(_would_block) => {}
+            }
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for Io {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+        self.get_mut().poll_write_with(cx, |fd| rustix::io::write(fd, data))
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
+        self.get_mut().poll_write_with(cx, |fd| rustix::io::writev(fd, data))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(rustix::net::shutdown(self.fd.get_ref(), rustix::net::Shutdown::Write).map_err(Into::into))
+    }
+}
+
 struct Conn<B: Body + 'static> {
     tx: http1::SendRequest<B>,
-    conn: Option<http1::Connection<TokioIo<UnixStream>, B>>,
+    conn: Option<http1::Connection<TokioIo<Io>, B>>,
 }
 
 impl<B> Conn<B>
@@ -110,8 +197,7 @@ where
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         drop(theirs);
-        mine.set_nonblocking(true)?;
-        let io = TokioIo::new(UnixStream::from_std(mine)?);
+        let io = TokioIo::new(Io::new(mine)?);
         let (tx, conn) = http1::Builder::new().max_header_size(crate::server::MAX_HEAD).handshake(io).await?;
         Ok(Conn { tx, conn: Some(conn) })
     }
@@ -194,9 +280,7 @@ where
         let Ok(permit) = caps.iter().map(|c| c.clone().try_acquire_owned()).collect::<Result<Vec<_>, _>>() else {
             continue;
         };
-        let sock = std::os::unix::net::UnixStream::from(fd);
-        sock.set_nonblocking(true)?;
-        let conn = crate::server::serve_conn(UnixStream::from_std(sock)?, None, f.clone());
+        let conn = crate::server::serve_conn(Io::new(fd.into())?, None, f.clone());
         tokio::spawn(async move {
             let _ = conn.await;
             drop(permit);
@@ -269,6 +353,25 @@ mod tests {
         for s in sends {
             assert_eq!(s.await.unwrap().unwrap(), "ok");
         }
+    }
+
+    /// Bodies larger than a socket's buffer go through both ways: a write
+    /// that finds the socket full waits until the peer has read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bodies_larger_than_the_socket_buffer_go_through() {
+        let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), vec![], |req: Request<Incoming>| async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            Response::new(Full::new(Bytes::from(body.repeat(2))))
+        }));
+        let dialer = Dialer::<Full<Bytes>>::new(ctl, 1);
+        let sent = async {
+            let res = dialer.send(Request::post("/").body(Full::new(Bytes::from(vec![7; 4 << 20]))).unwrap()).await?;
+            anyhow::Ok(res.into_body().collect().await?.to_bytes())
+        };
+        let echoed = tokio::time::timeout(std::time::Duration::from_secs(10), sent).await.expect("a full socket stalled").unwrap();
+        assert_eq!(echoed.len(), 8 << 20);
     }
 
     /// A dialer gets at most its own cap of connections served at once, and
