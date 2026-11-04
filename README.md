@@ -202,7 +202,7 @@ client ─► proxy ─► supervisor (nanovm serve): runs no guest code
                     └── fd 4: links for egress  ◄──  one Node for one app, jailed
 ```
 
-A worker reads its config and component from stdin, then jails itself while it still has one thread, before it compiles or runs anything:
+A worker reads the node's config from stdin and builds its engine from it alone; the supervisor keeps one such worker spawned ahead, waiting for its app. It then reads its app, opens its component's file in the registry's cache, and jails itself while it still has one thread (it refuses to otherwise), before it compiles or runs anything:
 
 - **Its own uid.** When the supervisor runs as root, app `i` runs as `jail_uid_base + i`, and its directories are chowned to it.
 - **Landlock.** It gets read-write access to the app's own `objects/`, `tmp/` and `cache/`, and nothing else.
@@ -271,11 +271,11 @@ The node trusts these headers because only the proxy can reach it, and strips th
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
 2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
-3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB header map on the host: 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
+3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB header map on the host: 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. A jailed worker gets the component's digest and its file in the cache, and compiles it, or loads its compile from the app's cache by that digest without reading the component.
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
 
-**How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight, whose worker is retired (its next request starts it again). Open proxy sockets do not pin workers. With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since anyone's DNS can name an app, this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
+**How many apps.** A node runs at most `max_apps` workers (100), plus one spare spawned ahead that has no app until a start takes it. A new app takes the slot of the least recently used idle app, one with no requests in flight, whose worker is retired (its next request starts it again). Open proxy sockets do not pin workers. With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since anyone's DNS can name an app, this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
 
 **Bounds.** Every registry read is bounded: a manifest, config, token or signature at 4 MiB, a component at `max_component_mb` (64), and 16 signatures per load. At most four registry fetches run at once across the node, each within `load_timeout_ms` (60 s) in all, so a registry that answers a byte at a time holds nothing for long. Digests are checked before they name anything. Registries, and their redirects and token servers, must be on public addresses: a deploy names the registry, so it must not reach the node's own network.
 

@@ -53,8 +53,7 @@ Runtime lines per file:
 
 ## The changes
 
-Each is one commit that builds and passes the suite on its own (pick list
-at the end).
+Each is one commit (pick list at the end, with dependencies).
 
 1. **kv: a bucket's directories are made by its first write (N-110).**
    Opening a bucket used to create `.kv` and `.kv/<bucket>`, journaled, so a
@@ -161,8 +160,11 @@ at the end).
 
 ## Pick list
 
-In order; each builds and passes the suite on its own unless a dependency
-is named. Δ is CI's runtime line count.
+In order. Each applies alone on `2ee94bc` except `9a6b99b`; `9a6b99b` and
+`238bf82` need `760b3e0` (its helpers). The suite was run on the stacked
+branch; building each commit alone was checked for the first three only
+(the run was cut short by a container restart). Δ is CI's runtime line
+count.
 
 | commit | change | depends on | Δ |
 |---|---|---|---|

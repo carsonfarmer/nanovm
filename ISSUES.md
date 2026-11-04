@@ -411,13 +411,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `object.rs` (`Scratch::new`)
 - **Scenario:** found by the cold2 workstream. A worker that is killed, retired or switched leaves one `/tmp` directory per live instance (N-50 keeps them for reuse). The next worker's start removed them all before serving, at about 3 ms of wall time each on a disk mounted with `discard` (N-50): its first request waited 0.1–0.6 s after 200 objects and 1.0–1.9 s after 1,000.
 - **Reproduced:** yes (phase marks in the worker; `notes/cold2.md`)
-- **Status:** fixed in <commit> (empty ones are handed out again, used ones removed): first request after 1,000 objects 1,211 → 51 ms
+- **Status:** fixed in e082357 (empty ones are handed out again, used ones removed): first request after 1,000 objects 1,211 → 51 ms
 
 ### N-151 (efficiency): every app start spawned a process and built its engine on the request's path
 - **Where:** `supervisor.rs` (`start`, `worker_main`), wasmtime's pooling allocator
 - **Scenario:** found by the cold2 workstream (W-29). A start (an idle app retired for another, a crash, a version switch) forked the supervisor, exec'd the 49 MB binary (dynamic relocation and glibc start-up: 3.4 ms of CPU) and built the engine: 7 ms, nearly all of it wasmtime creating the stack pool, one `mprotect` per stack slot (`2 × (max_live_objects + 32)` of them, so it grows with the node). Of a 21 ms restart, 11 ms was this, none of it app-specific.
 - **Reproduced:** yes (phase marks and perf; `notes/cold2.md`)
-- **Status:** fixed in <commit> (a worker is spawned ahead, builds its engine from the node's config, and waits for its app before its jail): restart 21.5 → 10.0 ms, LRU retirement 34 → 18 ms
+- **Status:** fixed in 99d0f55 (a worker is spawned ahead, builds its engine from the node's config, and waits for its app before its jail): restart 21.5 → 10.0 ms, LRU retirement 34 → 18 ms
 
 ### N-140: runaway recursion in JavaScript is a trap, not a RangeError
 - **Where:** QuickJS (rquickjs-sys 0.14): under `__wasi__` its stack limit is compiled out (`update_stack_limit` sets none)
@@ -438,6 +438,30 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `crates/nanovm/examples/js-bench.rs` (RSS delta over the cold phase)
 - **Reproduced:** each instance maps the component's memory image from the `.cwasm` file; a read fault maps up to 64 KiB of page cache around it (fault-around), and RSS counts those shared pages again for every instance. From `/proc/self/smaps` over 200 live objects: Boa 1220 KB RSS per object, of which 277 KB private; QuickJS 580 KB, 222 KB private (plus ~80 KB of anonymous memory each, as for Rust).
 - **Status:** fixed on cf/qjs (js-bench also reports private memory per object)
+### N-152 (tests): the jail test jailed one thread of a two-threaded process
+- **Where:** `tests/integration.rs` (`jail_blocks_escapes`, `jail_probe`), `jail.rs`
+- **Scenario:** found by the cold2 workstream. The uid, Landlock and seccomp bind only the calling thread and threads it starts later, so the jail must be entered with one thread (it said so in a comment). The probe called `Jail::enter` from a libtest test thread, so the harness's main thread stayed unjailed: the probes ran on the jailed thread and passed, but a jail entered with a thread too many would not have failed the test. Production was unaffected: `worker_main` jails before starting any thread.
+- **Reproduced:** yes (`Jail::enter` with a thread count check refused the probe: 2 threads)
+- **Status:** fixed in 99d0f55 (the jail refuses a process with more than one thread; the probe forks a single-threaded child, which its test stops and continues through the process group)
+
+### N-153 (efficiency): every worker start received and hashed its whole component
+- **Where:** `supervisor.rs` (`start`), `registry.rs` (`load`), `engine.rs` (`load_component`)
+- **Scenario:** found by the cold2 workstream. The supervisor read the cached component and piped it to the worker, which SHA-256'd it to find its cached compile, though the registry had checked the bytes when it fetched them. For the 5.4 MB JavaScript component that was 40 ms of worker CPU and 7.5 ms of supervisor CPU per restart (no SHA extensions on this VM's CPU).
+- **Reproduced:** yes (perf, phase marks)
+- **Status:** fixed in 77497df (the worker gets the digest and the cache file, opens it before its jail, and reads it only to compile): JavaScript restart 78 → 16 ms
+
+### N-154 (efficiency): a switch waits 5–12 ms for the old worker's address space to be torn down
+- **Where:** `supervisor.rs` (`drain` waits for `gone`), wasmtime's stack pool
+- **Scenario:** found by the cold2 workstream. After the kill, the process only reads as gone once the kernel has unmapped it, and a worker has about 4,500 mappings (two per pool stack slot, N-151) plus its instances' memory: dropping an engine alone took 4.5 ms in a probe. It is now the largest part of a switch to a cached version (about 10 of 21 ms), and of an LRU retirement. Waiting for full exit is what guarantees the old worker can no longer touch the volumes, so this is kept; fewer mappings would need wasmtime to stop splitting the stack pool per slot (W-71).
+- **Reproduced:** yes (phase marks around `drain`)
+- **Status:** open
+
+### N-155 (efficiency): a worker's telemetry set-up touches its whole span queue
+- **Where:** `telemetry.rs` (`Telemetry::new`: `BatchSpanProcessor` with `max_queue_size(2048)`)
+- **Scenario:** found by the cold2 workstream (perf over 30 restarts). The SDK's bounded channel initializes all 2,048 `SpanData` slots up front, so creating it page-faults its memory in: most of the 0.7–1.0 ms `Telemetry::new` takes at each worker start, and memory every worker keeps. A smaller queue risks dropped spans under load (N-36); not changed here.
+- **Reproduced:** yes (perf: page faults under `mpmc::array::Channel::with_capacity` from `BatchSpanProcessor::new`)
+- **Status:** open
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -587,7 +611,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-26: reuse warm memory slots without page faults (`pagemap_scan`)
 - **What:** on Linux ≥ 6.7, `PoolingAllocationConfig::pagemap_scan(Enabled::Auto)` with `linear_memory_keep_resident` / `table_keep_resident` resets only an instance's dirty pages in place instead of `madvise`-ing them away, so the next instance in that slot takes no page faults and no TLB shootdown (5% of cold-start CPU here). It helps churn, restarts and idle objects coming back, not first-ever cold starts (new slots). Cost: warm unused slots keep their dirty pages resident. Also try `decommit_batch_size`.
-- **Status:** open: read wasmtime 50's source, not measured (wrap-up came first). Measure with `bench --only churn,kill` and RSS after churn.
+- **Status:** open: read wasmtime 50's source, not measured (wrap-up came first). Measure with `bench --only churn,kill` and RSS after churn. cold2 did not get to it either; note that in a jailed worker the `PAGEMAP_SCAN` ioctl would need a seccomp rule, and wasmtime probes it when the pool is created, which a spare worker now does before its jail.
 
 ### W-27: remember an object's `/data` usage across its instances
 - **What:** skip the usage walk at instance start by keeping each object's committed usage in the node. Analysis: the counters mix `/data` and `/tmp` (an instance's `/tmp` is discarded), any drift in the counters would then persist instead of being corrected at every start, and a failed request's rollback changes the usage. The walk is 5 syscalls for the counter guest (2% of cold-start CPU) but O(files) for an object with many KV keys. Not adopted: not worth weakening exact accounting until a real workload shows the walk.
@@ -599,7 +623,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-29: worker cold start
 - **What:** not measured: process spawn, jail, reading the component, `.cwasm` deserialize, and the pool's creation (it `mprotect`s a guard page per stack slot, `2 × (max_live_objects + 32)` calls) before the first request after a worker (re)start. Measure supervisor spawn to `/_nanovm/ready`.
-- **Status:** open
+- **Status:** done by cold2: measured phase by phase (`notes/cold2.md`); N-150, N-151, N-153 fixed, N-154, N-155 and W-70–W-73 open
 
 ### W-30: publish `nanovm-sdk` to crates.io
 - **What:** today apps depend on it by git (`cargo add --git …/nanovm nanovm-sdk`). Publishing needs the `wit/keyvalue` and `wit/config` packages inside the crate (it reads `../../wit` now) and a version policy tied to `wasip3` 0.9 / WASI 0.3.0 until wasmtime hosts 0.3.2. Outward-facing: ask the owner.
@@ -670,3 +694,19 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-68: the per-request floor of a JavaScript app
 - **What:** a minimal app (`return new Response("hi")`) costs ~330k instructions per GET against ~160k for the same component answering from Rust (valgrind, notes/qjs.md); the rest is QuickJS's call and object machinery for the prelude's Request/Response objects and rquickjs's conversions. Building the request object lazily from Rust, and the response without the `Headers` class when the app passes none, are the next cuts.
 - **Status:** idea
+
+### W-70: registry round trips at each worker start in production
+- **What:** a start re-fetches the manifest and, outside dev mode, the referrers, each signature manifest and bundle, and checks them; `Oci::send` makes each fetch an anonymous request, a 401, a token request and a retry (tokens are not kept since the phase 7 review). For a signed app on ghcr.io that is about a dozen HTTP round trips per start, likely the largest part of a production app cold start; it could not be measured here (no outside network). Options, all owner decisions: keep a bearer token per (registry, repository) until it expires (bounded, unlike the map removed in phase 7); remember an accepted (digest, policy) across a worker's retirement for as long as a running worker remembers it (`Live::policies`), with the parsed manifest, so a restart of a known version needs no registry at all.
+- **Status:** open (idea; request counts from source)
+
+### W-71: wasmtime's stack pool: guard pages without one mapping each
+- **What:** wasmtime 50 creates the pool's stack guards with one `mprotect` per slot at engine creation (7 ms for 2,264 slots here, N-151, now off the request path) and they cost about 4.5 ms to unmap at exit (N-154). Linux 6.13's `MADV_GUARD_INSTALL` makes guard pages without splitting the mapping. An upstream change (or lazily protected slots) would remove both costs.
+- **Status:** open (upstream)
+
+### W-72: compile time for a never-seen version
+- **What:** compiling the 198 KB counter takes 370–450 ms of CPU (Cranelift: register allocation and e-graph passes), 160–450 ms of wall time on 4 shared cores; it is all of a never-seen digest's first request (a) and of a version switch (c). Faster settings (single-pass register allocation, no optimization, Winch) trade warm speed. Cranelift's incremental cache (wasmtime feature `incremental-cache`, a per-app `CacheStore` in the app's cache directory) could reuse unchanged functions across versions of an app. Not measured.
+- **Status:** open (idea)
+
+### W-73: start a switch's new worker while the old one exits
+- **What:** a switch could hand the spare its app (jail, runtime, telemetry, loading the component: about 3 ms) while the old worker is torn down (N-154), holding back only what touches volumes and scratch directories until the old one is gone. Needs a second step in the worker's start; saves about 3 ms of a 21 ms cached switch.
+- **Status:** open (idea)
