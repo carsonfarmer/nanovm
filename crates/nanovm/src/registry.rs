@@ -308,12 +308,7 @@ impl Registry {
     async fn fetch(&self, r: &AppRef, kind: &str, digest: &str, accept: &str, max: u64, cache: bool) -> anyhow::Result<Vec<u8>> {
         check_digest(digest)?;
         let path = self.dir.join(digest.replace(':', "-"));
-        if cache && let Ok(Ok(b)) = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || std::fs::read(path)
-        })
-        .await
-        {
+        if cache && let Ok(b) = tokio::fs::read(&path).await {
             return Ok(b);
         }
         let bytes = self.oci.get(&r.reference, kind, digest, accept, max).await?.with_context(|| format!("{digest} not found"))?;
@@ -323,15 +318,11 @@ impl Registry {
             return Ok(bytes);
         }
         // Written aside and renamed, so a reader only sees a complete file.
-        tokio::task::spawn_blocking(move || {
-            static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = path.with_extension(format!("tmp.{n}"));
-            std::fs::write(&tmp, &bytes)?;
-            std::fs::rename(&tmp, &path)?;
-            Ok(bytes)
-        })
-        .await?
+        static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = path.with_extension(format!("tmp.{}", WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        tokio::fs::write(&tmp, &bytes).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(bytes)
     }
 
     /// Checks the attached signatures against the trust policy. They are
