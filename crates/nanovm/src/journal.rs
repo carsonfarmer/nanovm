@@ -532,7 +532,6 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
         // SAFETY: written from an `OsStr`'s encoded bytes.
         Some(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes(log)?) }.into())
     }
-    let mut out = vec![];
     let next = |log: &mut &[u8]| -> Option<Undo> {
         Some(match bytes(log)?[..] {
             [0] => Undo::Size(path(log)?, num(log)?),
@@ -548,13 +547,11 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
             _ => return None,
         })
     };
-    loop {
+    std::iter::from_fn(|| {
         let at = (len - log.len()) as u64;
-        match next(&mut log) {
-            Some(u) => out.push((at, u)),
-            None => return out,
-        }
-    }
+        Some((at, next(&mut log)?))
+    })
+    .collect()
 }
 
 /// Adds `r`, disjoint from the sorted, disjoint `ranges`, merged with the
