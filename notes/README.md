@@ -1,5 +1,8 @@
 # What changed, and the evidence
 
+[IMPROVEMENTS.md](../IMPROVEMENTS.md) is the per-change catalogue (justification, tests, exact commits to
+cherry-pick, prerequisites, risk). This page is the evidence index.
+
 This folder records an improvement effort run as parallel workstreams, each on its own branch,
 merged into `cf/optimistic-feynman-62f1a0`. Every claim below links to a workstream note with the
 method, the raw numbers and the tests that prove it. Numbers are from one 4-core Linux VM; read them

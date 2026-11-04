@@ -20,7 +20,8 @@ it answers**, and roll back if it fails — so an app gets transactions without 
   `fetch(request, env)` module in JavaScript.
 
 [PLAN.md](PLAN.md) has the design and what comes next, [ISSUES.md](ISSUES.md) the known problems and
-planned work, and [notes/](notes/README.md) the evidence behind recent changes.
+planned work, [IMPROVEMENTS.md](IMPROVEMENTS.md) each recent change with its justification and how to take
+it, and [notes/](notes/README.md) the evidence behind them.
 
 ## Quickstart
 
