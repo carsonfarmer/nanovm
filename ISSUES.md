@@ -312,6 +312,34 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Also:** of the 35.7 KB heap an idle object keeps, wasmtime's own instance metadata is about 25 KB (15.7 KB for the counter's 4 core instances, plus its vectors and `Store`). Each idle store also keeps 2 fiber stacks resident (16 KB), and its tables 8 KB; wasmtime 50 has no public way to hand a store's cached fiber stack back to the pool.
 - **Status:** open; `local_at` belongs to the journal and request path (lean/perf), the rest to wasmtime upstream.
 
+### N-60: in-process nodes can't publish to WebSockets
+- **Where:** `egress.rs` (`send_request`, the `PUBLISH_HOST` branch), `object.rs` `commit`
+- **Reproduced:** yes. A node built with `Node::new(.., None)` (tests, the benchmark, any embedder, and now `nanovm run`) held publishes only for `Route::Supervisor`; a publish from an in-process node went to its egress policy and was denied (`HttpRequestDenied`, 502 to the guest). WebSockets could only be tested through a supervisor and proxy.
+- **Fix:** every node holds publishes until its request commits; an in-process node then delivers them to its own `Node::sockets` (the proxy's `ws::Sockets`). `run::nanovm_run_serves_requests_sockets_and_publishes` and `only_well_formed_publishes_are_held` fail without it.
+- **Status:** fixed on `cf/dx`
+
+### N-61: a publish to the wrong `http://nanovm/` path is accepted and dropped
+- **Where:** `egress.rs` `hold`
+- **Reproduced:** from source and test: the worker answered 200 to a POST to any `http://nanovm/<path>` with a well-formed body and held it; at commit the supervisor answered 404 for anything but `/publish`, and nothing told the guest.
+- **Fix:** `hold` answers 404 at once for other paths (the supervisor keeps its own check, since it cannot trust a worker). `only_well_formed_publishes_are_held` fails without it.
+- **Status:** fixed on `cf/dx`
+
+### N-62 (tests): `sqlite_repeated_updates_remain_bounded` fails on a loaded host
+- **Where:** `tests/integration.rs` (`--ignored`, mandatory in CI)
+- **Reproduced:** yes, 4/4 alternating runs with the baseline (`491e790`) and the SDK-ported `p3.wasm` alike, at load average 8–13 on 4 cores: 1,000 updates in one request exceed the 10 s CPU budget, which is wall time inside guest polls including inline disk syscalls. Passed earlier on an idle machine (CI). Same class as N-32.
+- **Status:** open (environmental; consider measuring guest CPU with thread CPU time, or a larger budget for this test)
+
+### N-63: a node with no Collector prints two export errors a second
+- **Where:** `telemetry.rs` (SDK exporters), `main.rs` (stderr at WARN)
+- **Reproduced:** yes: `nanovm serve` (or an in-process node) with nothing on `telemetry_endpoint` logs `Export.Failed.Exhausted` and `BatchLogProcessor.ExportError` every second, because infrastructure snapshots are exported every second whether or not anything happened. A developer's first impression of the node is a wall of errors.
+- **Fix in `run`:** `nanovm run` serves its own loopback OTLP sink and prints requests and guest output instead. `serve` is unchanged: rate-limit or deduplicate export-failure warnings, or skip snapshots that repeat the last one.
+- **Status:** open for `serve`
+
+### N-64 (tests): `a_node_runs_at_most_max_apps` is timing-sensitive
+- **Where:** `tests/integration.rs`, the max-apps test (the refusal check near line 2865)
+- **Reproduced:** yes, on `cf/dx` it failed 5 of 7 runs on its own, with the baseline and the SDK `hostile.wasm` alike, including on an idle machine (load 1.8). It gets 200 where it expects the 502 refusal: `b`'s 900 ms busy request has already finished, because starting `c`'s worker takes most of that time, so `b` is idle and `a` takes its slot. Not A/B'd against a baseline runtime, but the branch doesn't touch worker scheduling.
+- **Fix:** hold the busy requests open until the refusal has been checked (for example a gate the test releases), not for fixed sleeps.
+- **Status:** open
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -473,3 +501,15 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-29: worker cold start
 - **What:** not measured: process spawn, jail, reading the component, `.cwasm` deserialize, and the pool's creation (it `mprotect`s a guard page per stack slot, `2 × (max_live_objects + 32)` calls) before the first request after a worker (re)start. Measure supervisor spawn to `/_nanovm/ready`.
 - **Status:** open
+
+### W-30: publish `nanovm-sdk` to crates.io
+- **What:** today apps depend on it by git (`cargo add --git …/nanovm nanovm-sdk`). Publishing needs the `wit/keyvalue` and `wit/config` packages inside the crate (it reads `../../wit` now) and a version policy tied to `wasip3` 0.9 / WASI 0.3.0 until wasmtime hosts 0.3.2. Outward-facing: ask the owner.
+- **Status:** open
+
+### W-31: `nanovm run` restarts by draining, not crashing
+- **What:** a rebuild re-executes `run`, so requests in flight roll back and sockets close (the page reconnects). Draining in-flight requests first, or keeping sockets across the restart as the proxy keeps them across version switches, would make rebuilds invisible. Small only if it reuses the supervisor's drain; otherwise not worth it for development.
+- **Status:** idea
+
+### W-32: work after the response in the SDK
+- **What:** the SDK buffers whole bodies and answers when the handler returns. Durable Objects' `waitUntil` (post-return work, bounded by `post_return_timeout_ms`) and streamed bodies still need raw `wasip3` (see the post-return test probe). A `Response::then(future)` and a streaming body would cover both.
+- **Status:** idea

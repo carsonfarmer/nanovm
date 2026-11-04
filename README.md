@@ -12,6 +12,10 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 
 Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
+## Build an app
+
+`nanovm run app.wasm` serves one component on loopback, as a node and its proxy would (objects, volumes, commits, WebSockets), without a registry, signatures or jail, and restarts when the file changes. [guests/sdk](guests/sdk/README.md) has the five-minute quickstart; [examples/chat](examples/chat) is a live multi-room chat. Production nodes still run only signed registry apps.
+
 ## SQLite beta
 
 [Build and run the SQLite example](components/sqlite/README.md). A composed Wasm
@@ -242,7 +246,7 @@ An object calls another object of its own app with an ordinary outgoing request 
 
 The front proxy holds client sockets; the node only answers requests. Objects see sockets as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work. No separate Pushpin process is needed.
 
-Committed publishes travel from the supervisor to the proxy's private `publish_listen` (`127.0.0.1:8444`), at `POST /publish`. Set the node's `publish_to` accordingly (default `http://127.0.0.1:8444/publish`). **Only nodes may reach this control port**, just as only proxies may reach the node. The supervisor names the app, the worker names the object; channels cannot cross either boundary. Publish bodies have a 30 s deadline.
+Committed publishes travel from the supervisor to the proxy's private `publish_listen` (`127.0.0.1:8444`), at `POST /publish`. Set the node's `publish_to` accordingly (default `http://127.0.0.1:8444/publish`). **Only nodes may reach this control port**, just as only proxies may reach the node. The supervisor names the app, the worker names the object; channels cannot cross either boundary. Publish bodies have a 30 s deadline. An in-process node (`nanovm run`, the tests) holds sockets itself, with the same code, and delivers its committed publishes to them.
 Sockets are indexed by object within each app; a publish visits that object's sockets, not every socket in the app. CNAME aliases share channels and per-app caps; separate record owners remain isolated even when they name the same package.
 - **Opening.** A socket opened at `/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`; any other answer refuses the socket, with the object's own status if it is a 4xx or 5xx (so a `401` reaches the client).
 - **Events.** Each later event (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` queued with the object's other requests, so events are ordered with everything else the object serves. The answer carries events for that socket.
@@ -434,7 +438,7 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
   - `/app` is now one fd per app, shared read-only, and startup checks the fd and mapping limits.
 - **A CPU kill could kill the next instance at birth.** The CPU charge was reset only when a request began. Re-instantiation after a CPU kill started with the old charge already over budget, so an epoch tick during instantiation killed the new instance (a rare 503 `instantiate-failed`). A new object was also charged its time waiting for a slot.
   - Each instantiation now starts a fresh charge. `cpu_kill_does_not_poison_next_instance` fails on its first round without the fix.
-- **The counter could lose its count.** `/incr` truncated `/data/count` and rewrote it in place, so a kill in between left an empty file that read back as 0. Guest writes to `/data` now go to a temporary file that is renamed into place (`util::write_file_atomic`).
+- **The counter could lose its count.** `/incr` truncated `/data/count` and rewrote it in place, so a kill in between left an empty file that read back as 0. Guest writes to `/data` then went to a temporary file renamed into place; since per-request commits (below), a plain write is all-or-nothing, and the counter writes in place.
 - **The benchmark leaked nodes between scenarios.** Actors hold their node alive, so each scenario inherited the previous one's objects and fds. `Node::shutdown` now releases them.
 - **Filesystem calls queued on one mutex.** wasmtime-wasi sends every filesystem call through tokio's `spawn_blocking`, which has a single lock. Under 256 concurrent writers it collapsed throughput 10×.
   - The fix is `allow_blocking_current_thread(true)`, which runs small local-disk calls inline and charges them to the object's CPU budget. It has to be set before the preopens, which capture it.
@@ -494,7 +498,10 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `crates/nanovm/src/journal.rs` | Per-request commits: the undo journal, commit and crash recovery |
 | `crates/nanovm/src/ws.rs` | WebSockets: the proxy's sockets, WebSocket-over-HTTP events and per-object channels |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
-| `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |
+| `crates/nanovm/src/main.rs` | The CLI: `serve`, `proxy`, the jailed `worker`, and `run` for local development |
+| `guests/sdk` | `nanovm-sdk`, the Rust guest SDK ([quickstart](guests/sdk/README.md)) |
+| `guests/` | The test guests `counter` and `hostile`, built on the SDK (wasm32-wasip2 with wasip3 bindings) |
+| `examples/chat` | A live multi-room chat built on the SDK, run with `examples/chat/run.sh` |
 
 ## Known limits of this phase
 
