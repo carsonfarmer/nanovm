@@ -393,6 +393,7 @@ fn write_stream(
             result: Some(tx),
         },
     )?;
+    // A writer dropped without a failure to report reads as success.
     FutureReader::new(
         &mut store,
         async move { wasmtime::error::Ok(rx.await.unwrap_or(Ok(()))) },
@@ -404,14 +405,6 @@ struct QuotaWriter {
     at: Option<u64>,
     quota: QuotaGuard,
     result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
-}
-
-impl Drop for QuotaWriter {
-    fn drop(&mut self) {
-        if let Some(tx) = self.result.take() {
-            let _ = tx.send(Ok(()));
-        }
-    }
 }
 
 impl StreamConsumer<ObjState> for QuotaWriter {
