@@ -454,6 +454,23 @@ namespace-scan complexity and physical amplification must inform integration.
 This proof does not include WASI directories/streams, mixed SQL workloads, storage
 fault recovery or replica export; keep the production host unchanged.
 
+**Integration gate (Q80):** `hashed-fs-integration` owns the next implementation.
+First remove whole-namespace scans from orphan reclamation and exercise failed
+storage operations, then prove a stock-WASI resource adapter without a Wasmtime
+patch. Preserve directory confinement, descriptor identity, streaming bounds,
+ephemeral `/tmp` with shared quotas, and both host commit boundaries. Compare
+mixed KV/SQL/raw-file workloads through real jailed workers before switching.
+Count all replacement runtime and provider code, not only deleted journal lines;
+report latency, CPU, live-object memory, physical storage and ownership complexity.
+
+The separate improvement branch's source assessment is in HANDOFF (2026-11-04).
+Reuse its benchmark instrumentation and lazy-bucket idea, but measure any provider,
+scheduler or dependency change on both controls. Its SDK changes the guest's write
+strategy, so importing its guests would invalidate a storage-only comparison.
+Root-descriptor lookup caching is an optimized journal control; page directories
+should use stable IDs instead. Defer custom wakers, socket I/O wrappers and unrelated
+features from this slice. Security fixes need separate validation, not backend credit.
+
 For actor ownership, use sequential `run_concurrent` phases with timeouts outside
 each invocation, retaining event-loop driving while idle. For storage, expose
 complete `replace_value`/`delete_value`/`resize`/`rename` operations and represent

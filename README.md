@@ -251,6 +251,12 @@ measurements for both candidates. Hash addressing is preferred when measured cos
 are close; unique large writes remain slower. This is a flat-namespace proof, not
 a production filesystem or a guarantee that cache size bounds total memory.
 
+Integration is in progress on `hashed-fs-integration`; the production backend has
+not switched. Acceptance requires mixed KV/SQL/raw-file tests through the real
+WASI/jail path and measured total-code, latency/CPU and memory improvements.
+The separate improvement branch has been assessed for reusable ideas (HANDOFF,
+Q80); its combined scheduler/guest/runtime results are not filesystem benchmarks.
+
 **`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
 ## Calls between objects
