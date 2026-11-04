@@ -132,9 +132,9 @@ impl ObjShared {
 
     /// Drives `fut`, charging the time spent inside each poll (where guest
     /// code runs) to the current request or start-up, never time spent
-    /// waiting to be scheduled.
-    async fn charged<F: Future>(&self, metrics: &Metrics, fut: F) -> F::Output {
-        let mut fut = pin!(fut);
+    /// waiting to be scheduled. Pinned by the caller: moved in, it was held
+    /// twice by this future, which made an idle object's actor 7 KB bigger.
+    async fn charged<F: Future>(&self, metrics: &Metrics, mut fut: Pin<&mut F>) -> F::Output {
         poll_fn(|cx| {
             let t0 = now_ns();
             self.poll_start_ns.store(t0, Relaxed);
@@ -233,12 +233,52 @@ impl tokio::io::AsyncWrite for LogTail {
     }
 }
 
-/// Removes an instance's scratch directory when the instance goes away.
-struct TmpDir(PathBuf);
+/// The app's scratch directories, one per live instance, behind `/tmp`.
+/// One an instance leaves empty is handed to the next rather than removed:
+/// a mkdir and an rmdir cost more than the rest of a cold start's
+/// filesystem work, and an rmdir blocks for milliseconds on a disk mounted
+/// with `discard`.
+pub struct Scratch {
+    dir: PathBuf,
+    free: Mutex<Vec<PathBuf>>,
+}
+
+impl Scratch {
+    /// Scratch under `dir`, where whatever a previous run left is garbage.
+    /// `dir` itself stays: a jailed worker's Landlock rule names it.
+    pub fn new(dir: PathBuf) -> std::io::Result<Arc<Scratch>> {
+        std::fs::create_dir_all(&dir)?;
+        for e in std::fs::read_dir(&dir)? {
+            let _ = std::fs::remove_dir_all(e?.path());
+        }
+        Ok(Arc::new(Scratch { dir, free: Mutex::default() }))
+    }
+
+    fn take(self: &Arc<Self>) -> std::io::Result<TmpDir> {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = match self.free.lock().pop() {
+            Some(path) => path,
+            None => {
+                let path = self.dir.join(N.fetch_add(1, Relaxed).to_string());
+                std::fs::create_dir(&path)?;
+                path
+            }
+        };
+        Ok(TmpDir(path, Some(self.clone())))
+    }
+}
+
+/// An instance's scratch directory: back to its [`Scratch`] when the
+/// instance goes away if the instance left it empty, else removed.
+struct TmpDir(PathBuf, Option<Arc<Scratch>>);
 
 impl Drop for TmpDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let empty = || std::fs::read_dir(&self.0).is_ok_and(|mut d| d.next().is_none());
+        match &self.1 {
+            Some(scratch) if empty() => scratch.free.lock().push(std::mem::take(&mut self.0)),
+            _ => _ = std::fs::remove_dir_all(&self.0),
+        }
     }
 }
 
@@ -288,17 +328,17 @@ impl WasiHttpView for ObjState {
 
 fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
     let limits = &app.cfg.limits;
-    // Each instance gets scratch of its own.
-    static INSTANCE: AtomicU64 = AtomicU64::new(0);
-    let n = INSTANCE.fetch_add(1, Relaxed);
-    let [objects, tmp, _] = node.cfg.app_dirs(&app.name);
-    let data_dir = objects.join(&*shared.id);
-    let tmp_dir = tmp.join(format!("{}.{n}", shared.id));
-    std::fs::create_dir_all(&data_dir)?;
-    // The journal compares it with where open files really are.
-    let data_dir = data_dir.canonicalize()?;
-    std::fs::create_dir_all(&tmp_dir)?;
-    let tmp = TmpDir(tmp_dir.clone());
+    // A volume made here, in a directory without symlinks, has none; one
+    // that was already there must not be one either.
+    let data_dir = app.objects.join(&*shared.id);
+    if let Err(e) = std::fs::create_dir(&data_dir) {
+        anyhow::ensure!(
+            e.kind() == std::io::ErrorKind::AlreadyExists && std::fs::symlink_metadata(&data_dir)?.is_dir(),
+            "volume {}: {e}",
+            data_dir.display()
+        );
+    }
+    let tmp = app.scratch.take()?;
 
     let stderr = LogTail::default();
     let mut b = WasiCtxBuilder::new();
@@ -311,7 +351,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     // pool's one mutex. Preopens capture this, so it must come first.
     b.allow_blocking_current_thread(true);
     b.preopened_dir(&data_dir, "/data", FsPerms::ReadWrite)?;
-    b.preopened_dir(&tmp_dir, "/tmp", FsPerms::ReadWrite)?;
+    b.preopened_dir(&tmp.0, "/tmp", FsPerms::ReadWrite)?;
     let output = |stream| LogTail {
         buf: stderr.buf.clone(), export: Some((node.telemetry.clone(), shared.clone(), stream)),
     };
@@ -325,7 +365,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     let mut http = WasiHttpCtx::new();
     http.set_field_size_limit(crate::server::MAX_HEAD);
 
-    // `/tmp` was just created, so only the persistent volume holds usage.
+    // `/tmp` starts empty, so only the persistent volume holds usage.
     let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone())?;
 
     let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
@@ -406,12 +446,18 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
         (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
     });
     quota.commit()?;
-    if let crate::egress::Route::Supervisor(up) = route {
-        for req in held {
-            if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
-                let _ = res.into_body().collect().await;
+    if let crate::egress::Route::Supervisor(up) = route
+        && !held.is_empty()
+    {
+        // Boxed: inline, sending made every idle object's actor 2 KB bigger.
+        Box::pin(async move {
+            for req in held {
+                if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
+                    let _ = res.into_body().collect().await;
+                }
             }
-        }
+        })
+        .await;
     }
     Ok(())
 }
@@ -441,7 +487,7 @@ impl Drop for Pending {
     }
 }
 
-pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Job>) {
+pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Box<Job>>) {
     loop {
         let Some(mut job) = rx.recv().await else { return };
         *shared.context.lock() = job.context.clone();
@@ -458,7 +504,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         let started = async {
             let mut store = new_store(&node, &app, &shared)?;
             let svc = shared
-                .charged(&node.metrics, app.pre.instantiate_async(&mut store))
+                .charged(&node.metrics, pin!(app.pre.instantiate_async(&mut store)))
                 .await?;
             anyhow::Ok((store, svc))
         }
@@ -499,8 +545,8 @@ async fn serve(
     shared: &Arc<ObjShared>,
     mut store: Store<ObjState>,
     svc: Service,
-    first: Job,
-    rx: &mut mpsc::Receiver<Job>,
+    first: Box<Job>,
+    rx: &mut mpsc::Receiver<Box<Job>>,
 ) -> Exit {
     let limits = &app.cfg.limits;
     let max_resp = limits.max_response_body_kb << 10;
@@ -607,7 +653,8 @@ async fn serve(
     // runs outside the event loop because a guest spinning in a loop only
     // yields at epoch boundaries, never back into `inner`.
     let result: Result<wasmtime::Result<()>, Phase> = {
-        let mut fut = pin!(shared.charged(&node.metrics, store.run_concurrent(inner)));
+        let run = pin!(store.run_concurrent(inner));
+        let mut fut = pin!(shared.charged(&node.metrics, run));
         let mut timer = pin!(tokio::time::sleep(Duration::from_secs(3600)));
         let mut armed = None;
         poll_fn(|cx| {
@@ -773,7 +820,7 @@ impl ObjState {
             quota: QuotaGuard::new(&volume, limits, metrics, shared).unwrap(),
             config: Default::default(),
             reset: false,
-            _tmp: TmpDir(volume.clone()),
+            _tmp: TmpDir(volume.clone(), None),
             volume,
         }
     }
@@ -836,6 +883,17 @@ mod tests {
         assert_eq!(e.to_string(), "instance terminated");
     }
 
+    /// The task of an idle object holds little: once, moved-in futures held
+    /// twice and an inline publish path made it 17 KB, every live object's.
+    #[test]
+    fn an_actor_is_small() {
+        fn returned<A, B, C, D, F>(_: fn(A, B, C, D) -> F) -> usize {
+            size_of::<F>()
+        }
+        let size = returned(run);
+        assert!(size < 4096, "{size} bytes");
+    }
+
     /// Errors are JSON naming the reason, which is also a header.
     #[tokio::test]
     async fn error_responses_are_json() {
@@ -858,12 +916,12 @@ mod tests {
         shared.begin_request();
         assert_eq!(shared.phase().0.as_str(), "handling");
         shared
-            .charged(&metrics, tokio::time::sleep(Duration::from_millis(50)))
+            .charged(&metrics, pin!(tokio::time::sleep(Duration::from_millis(50))))
             .await;
         let waited = shared.cpu_accum_ns.load(Relaxed);
         assert!(waited < 25_000_000, "waiting was charged {waited}ns");
         shared
-            .charged(&metrics, async { std::thread::sleep(Duration::from_millis(30)) })
+            .charged(&metrics, pin!(async { std::thread::sleep(Duration::from_millis(30)) }))
             .await;
         assert!(shared.cpu_accum_ns.load(Relaxed) >= 30_000_000);
         assert!(metrics.guest_cpu_ns.load(Relaxed) >= 30_000_000);
