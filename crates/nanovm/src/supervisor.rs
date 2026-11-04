@@ -64,7 +64,8 @@ const MAX_POLICIES: usize = 16;
 pub struct Supervisor {
     cfg: NodeConfig,
     runtime: tokio::runtime::Handle,
-    /// Front-end threads, each with its own pool of connections per worker.
+    /// Front-end threads, each with its own pool of connections per worker;
+    /// the control runtime has the pool after theirs.
     threads: usize,
     /// The `nanovm` binary, run as `nanovm worker`.
     exe: PathBuf,
@@ -492,7 +493,7 @@ impl Supervisor {
         }));
 
         let live = Arc::new(Live {
-            link: Dialer::new(requests, self.threads),
+            link: Dialer::new(requests, self.threads + 1),
             pid,
             digest: want.digest.clone(),
             version: p.version,
