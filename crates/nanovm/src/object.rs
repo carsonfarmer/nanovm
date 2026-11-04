@@ -162,6 +162,7 @@ impl ObjShared {
 }
 
 /// Caps the sum of all linear memories of one instance.
+#[derive(Default)]
 pub struct MemLimiter {
     pub(crate) max_bytes: usize,
     used: usize,
@@ -383,11 +384,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
             held: Default::default(),
             publish_max: (limits.max_response_body_kb << 10) as usize,
         },
-        limiter: MemLimiter {
-            max_bytes: (limits.memory_mb << 20) as usize,
-            used: 0,
-            denied: false,
-        },
+        limiter: MemLimiter { max_bytes: (limits.memory_mb << 20) as usize, ..Default::default() },
         shared: shared.clone(),
         cpu_budget_ns: limits.cpu_ms * 1_000_000,
         cpu_exceeded: false,
