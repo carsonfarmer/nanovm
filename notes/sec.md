@@ -1,8 +1,8 @@
 # Security review (sec), from `491e790`
 
-A fresh adversarial pass over every trust boundary. Four bugs fixed, each with a
-hostile test that failed before the fix; two more recorded with measurements and a
-proposed fix for the owner; one piece of future work. Kernel 6.18 here offers
+A fresh adversarial pass over every trust boundary. Five bugs fixed, each with a
+hostile test that failed before the fix; one more measured and handed to the perf
+agent; one piece of future work with a concrete design. Kernel 6.18 here offers
 Landlock ABI 7.
 
 ## Fixed
@@ -13,6 +13,7 @@ Landlock ABI 7.
 | N-71 | client → proxy → object | A client could forge a WebSocket event, with a `Connection-Id` of its choosing, by sending the events content type second, in other case, with parameters, or comma-joined. The proxy checked only the first header, exactly. | Any `Content-Type` value (or comma-joined part) whose media type is the events type is refused. | `the_proxy_routes_hosts_by_dns`: the counter guest answered a forged `TEXT id` with `m:7` (the client's id); now 400. Unit test covers each spelling. |
 | N-72 | guest → shared proxy | A guest's 8 MiB publish parsed as a JSON `Value` held 192 MiB and 200–370 ms in the proxy every app shares (and again in its worker). | Parse into typed structs; unread parts are skipped. | `publishes_parse_in_bounded_memory` (counts allocations): 1 MiB held 25 MB before; now under 1× for unread data, 5× for a flood of minimal items. |
 | N-73 | worker → egress | A compromised worker could send an allowed CDN a `Host` the allowlist never named (domain fronting). | `Host` is set from the checked authority. | `the_upstream_hears_the_allowed_host`: the upstream heard `elsewhere.example` before. |
+| N-75 (98c1698) | guest → worker memory | A guest could keep 10,000 `wasi:http` header maps of 128 KiB each (~1.25 GiB), or copies of a received ~400 KB head (~4 GiB), against a 64 MiB `memory_mb`. | A head is at most 64 KiB at every hop (hyper `max_header_size`), a guest's map at most 64 KiB, and an instance holds at most `memory_mb × 16` resources (256 at 16 MiB, 1,024 at 64 MiB). | `guest_header_maps_are_bounded_by_the_memory_limit` (test-only probe route): at 32 MiB it held 600 maps of 60 KiB, new or copied, and a 100 KiB map; each part mutation-checked. |
 
 Measurements for N-72 and N-74 used a counting allocator in a scratch crate over the
 same crate versions (`serde_json` 1, `opentelemetry-proto` 0.33), on a busy machine:
@@ -24,17 +25,16 @@ many items typed:             8192 KiB -> peak 42 MiB (5x), 108 ms
 OTLP traces decode:           1023 KiB -> peak 198 MiB (198x), 146-270 ms
 ```
 
-## Recorded, not fixed (owner's call)
+## Recorded, not fixed
 
-- **N-74:** a compromised worker's 1 MiB telemetry batch of empty spans costs the
-  supervisor 198 MiB and up to 270 ms of its single control thread. Proposed: stamp
-  the resource at the wire level and drop the span-attribute scrub, or count
-  submessages before decoding.
-- **N-75:** a guest can hold about 1.25 GiB of `wasi:http` headers in worker memory
-  (10,000 resources × 128 KiB) against a 64 MiB `memory_mb`. Proposed: a smaller
-  field size limit and resource cap whose product is near `memory_mb`.
+- **N-74** (handed to the perf agent, who owns `telemetry.rs`): a compromised
+  worker's 1 MiB telemetry batch of empty spans costs the supervisor 198 MiB and up
+  to 270 ms of its single control thread. Proposed: stamp the resource at the wire
+  level and drop the span-attribute scrub, or count submessages before decoding.
 - **W-35:** nothing bounds what the proxy buffers for objects across sockets and
-  apps (each answer or publish up to 8 MiB).
+  apps (each answer or publish up to 8 MiB). Design in ISSUES: collect answers up
+  to `socket_backlog_kb` (a larger answer overflows the socket's backlog anyway),
+  and a proxy-wide semaphore of publish bytes in flight.
 - **N-33** (already open) also covers the proxy's tag lookup, which a registry can
   trickle.
 
@@ -119,8 +119,9 @@ OTLP traces decode:           1023 KiB -> peak 198 MiB (198x), 146-270 ms
 
 ## Docs to fold in
 
-README "The jail" (the `socketpair` bullet) and "WebSockets" (how events are
-recognised) were updated with the fixes. Nothing else changed.
+README "The jail" (the `socketpair` bullet), "WebSockets" (how events are
+recognised), the proxy list (64 KiB heads) and "Then the worker" (the resource cap),
+and PLAN's per-store caps and `max_resources` row, were updated with the fixes.
 
 ## Tests run
 
@@ -131,3 +132,17 @@ recognised) were updated with the fixes. Nothing else changed.
   `egress::` unit tests.
 - Mutation checks: each new assertion was run against the code without its fix
   and failed as shown above, then the fix was restored.
+- Full `cargo test --locked -p nanovm` with N-75 in: 109 unit tests pass; 67
+  integration tests pass, 10 are ignored (they need the internet or the WASI SDK).
+  The one failure, `a_node_runs_at_most_max_apps`, comes from host load. It also
+  failed in the run before N-75 (with `cpu_hogs_leave_cores_for_short_requests`),
+  Run alone back to back on this host (load ~16), it passed 4 of 11 times with
+  N-75 and 3 of 3 without it. Each instrumented failure had app `c`'s cold start
+  at 800–900 ms, and the passing run had it at 667 ms. The test needs that to be
+  under `b`'s 900 ms sleep minus its 200 ms wait, or `b` is idle when `a` arrives
+  and `a` takes its slot. Nothing in N-75 touches cold start, so this reads as
+  load, but rerun it on a quiet host to be sure.
+- The 16 MiB cap (256 resources) holds for the counter's whole suite: WebSockets,
+  key-value paging, calls between objects, the front end. Outbound fetches hold few
+  resources at once because `max_outbound_concurrency` (4) limits them. The
+  SQLite and JS suites still need a run against it.

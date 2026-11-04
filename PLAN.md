@@ -116,7 +116,7 @@ nanovm/
   - **Heavy lanes:** once a request has used 10 ms (`HEAVY_AFTER_NS`), the callback returns `YieldCustom`, which waits for one of `heavy_lanes` permits before the guest runs again. The permit is handed back at every tick. This stops CPU hogs from yielding straight back onto every worker.
   - The Store is per object and serves one request at a time, so per-store accounting is per-request accounting.
 - **Memory:** a custom `ResourceLimiter` holds the total across *all* linear memories of the object; upstream `StoreLimits` is per memory. Growing past it returns `Err(MemoryLimitExceeded)`. Table elements, instance count and table count are also capped.
-- **Other per-store caps:** `ResourceTable::set_max_capacity(max_resources)`. Header field size uses the `WasiHttpCtx` default (128 KiB).
+- **Other per-store caps:** `ResourceTable::set_max_capacity(min(max_resources, memory_mb × 16))`, and a guest's header map holds at most 64 KiB (`server::MAX_HEAD`, also hyper's head limit at every hop), so host-held header maps stay within `memory_mb` (N-75).
 - **Poisoning:**
   - Any `Err` from run_concurrent poisons the Store upstream, so we drop it.
   - The pending reply gets 500 or 504 with an `x-nanovm-error` reason: `cpu`, `memory`, `timeout`, `trap`, `resource-table`.
@@ -181,7 +181,7 @@ nanovm/
 | `disk_mb` / `max_files` | 64 / 1000 | QuotaGuard (shared by `/data` and `/tmp`) |
 | `max_queue` | 64 | bounded mailbox |
 | `max_outbound_concurrency` | 4 | egress semaphore |
-| `max_resources` | 10000 | ResourceTable + component handles |
+| `max_resources` | 10000 | ResourceTable + component handles; at most `memory_mb × 16` (256 at 16 MiB) |
 | `egress` | `[]` (deny all) | allowlist |
 
 Node-level settings: `max_live_objects` (1000), `memory_reservation_mb` (128), `listen` (127.0.0.1:8080), `data_dir` (nanovm-data), `epoch_tick_ms` (5), `heavy_lanes` (cores that requests past 10 ms of CPU may occupy at once; 0 means half the cores).
