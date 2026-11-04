@@ -286,7 +286,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** the test spawns a slow request to app `c`, sleeps 200 ms, and expects `c` to be busy when app `a` asks for a slot. At load average 8 to 20 (several agents compiling on 4 cores) the spawned request has not reached the worker yet, `c` looks idle, `a` takes its slot and gets 200 instead of the expected 502.
 - **Reproduced:** yes: fails alone, every time, at load average 18 to 20 on the unchanged `491e790` and on `cf/lean`; passes on an idle machine
 - **Fix:** wait until the worker reports the request in flight (or the app's `Live` is held by a request) instead of sleeping a fixed time
-- **Status:** open
+- **Status:** fixed in e27f59a (lean2): the test waits for the worker's snapshot to show the request `handling`, and its first slow request (2.5 s, request timeout 10 s) outlasts the next app's start. On two cores shared with four busy loops the old test failed 3/3, the new one passed 3/3; on one core with three loops both fail, since a start can still outlast the fixed-length request.
 
 ### N-92 (tests): `the_proxy_outlasts_idle_and_excess_connections` binds the default publish port
 - **Where:** `tests/integration.rs`, `the_proxy_outlasts_idle_and_excess_connections`
@@ -345,7 +345,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `kv.rs` `open_bucket` (creates `.kv` and `.kv/<bucket>`, journaled)
 - **Reproduced:** the JS counter's first `GET` on a new object (`env.kv.get`, nothing written) pays a journaled create and a commit: cold-start p50 25–36 ms against ~1 ms for a JS app that doesn't touch kv (js-bench, cf/js). Each new object also spends two of its `max_files` on empty directories.
 - **Fix:** create the directories on the first write; a missing bucket reads as empty and lists nothing.
-- **Status:** open (found by the js workstream; `kv.rs` is lean's)
+- **Status:** fixed in ad0ccaa (lean2): JS counter cold first GET p50 32–40 ms → 1.3–1.4 ms (js-bench, 3 alternating pairs). Fixing it exposed N-130.
 
 ### N-111: JavaScript apps share std's hash seed, fixed at build time
 - **Where:** `crates/nanovm/examples/js-wizer.rs` (pre-initialization gives `wasi:random/insecure-seed` a constant)
@@ -387,6 +387,26 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `journal.rs` (`local_at` → `fd_path`)
 - **Scenario:** found by the perf review: a `readlink` per open was 4.5% of in-process CPU (the counter's GET opens `/data/count`).
 - **Status:** fixed in be6ea35 (the volume's own descriptor resolves without asking; subdirectories still do)
+### N-130: a touched path under what became a file fails the commit
+- **Where:** `journal.rs` `sync_if_there` (commit and recovery)
+- **Scenario:** a request makes a directory inside a missing one (the stock call fails, but the journal has already recorded the path as touched), then makes a file where the missing directory would be. The commit syncs every touched path and skipped only `NotFound`; this one fails with `ENOTDIR`, so the commit failed and the request rolled back. A guest could only fail its own request this way; the hostile guest's kv `plant` did it once buckets stopped being made at open (N-110).
+- **Reproduced:** yes (`a_path_under_what_became_a_file_commits`, which fails without the fix)
+- **Status:** fixed in 62c5104 (lean2)
+
+### N-131: nanovm doesn't compile on macOS
+- **Where:** `link.rs` (`RecvFlags::CMSG_CLOEXEC` in `recv_fd`, `SendFlags::NOSIGNAL` in `send_fd`); also check the macOS branches of `metrics::rss_bytes` and `journal::fd_path`
+- **Scenario:** rustix 1.1.6 defines `MSG_CMSG_CLOEXEC` and `MSG_NOSIGNAL` only for Linux-like targets (`cfg(not(any(apple, ...)))`), so the crate fails to build on macOS, although PLAN.md says the core and the supervisor/worker split run there, and `nanovm run` on a developer's Mac is likely how people first try nanovm.
+- **Reproduced:** from source (rustix's `cfg`s); no macOS machine here
+- **Fix:** on Apple, set `FD_CLOEXEC` on the received fd after `recvmsg`, and use `SO_NOSIGPIPE` on the socketpairs instead of `MSG_NOSIGNAL`; then build and run the suite on a Mac (the rss/fd_path branches have never been compiled since). Owner decides whether macOS stays supported.
+- **Status:** open
+
+### N-132: a store stops counting as live before its scratch directory is released
+- **Where:** `object.rs` (`impl Drop for ObjState` decrements `stores_live`; the `_tmp: TmpDir` field drops after it)
+- **Scenario:** `stores_live == 0` (what `Node::shutdown` and tests wait for) can be seen while the last instance's `/tmp` directory is still being handed back or removed. `only_empty_scratch_is_reused` failed once this way in a full run at load ~12 (`["80", "81"]`).
+- **Reproduced:** yes, once (the test now waits for the directory itself, 6cf4798)
+- **Fix:** uncount the store after its fields drop (e.g. drop `_tmp` first in `Drop`, or a last field whose `Drop` uncounts). `object.rs` was the hop branch's this round.
+- **Status:** open (test fixed)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -515,15 +535,16 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-40: drop `parking_lot` for std's `Mutex`, and name tokio's features
 - **What:** the runtime uses `parking_lot::Mutex` only for its non-poisoning `lock()`, and tokio's `full` feature also turns on tokio's own `parking_lot` use. With std's `Mutex` (futex-based since Rust 1.62) and tokio's features listed (`rt`, `rt-multi-thread`, `net`, `time`, `sync`, `macros`, `process`, `io-util`), `parking_lot`, `parking_lot_core` and `lock_api` leave the build (3 crates; measured with `cargo tree`). Every `.lock()` in `object.rs`, `supervisor.rs`, `quota.rs`, `egress.rs`, `ws.rs`, `proxy.rs` and `table.rs` changes, so it waits for the branches on those files to land. Take locks through one small helper, `.lock().unwrap_or_else(PoisonError::into_inner)`, so a panic while holding one behaves as today. Needs an A/B of CPU per request: tokio's scheduler and timer locks change too.
-- **Status:** open (lean pass; not done because it touches files other branches own)
+- **Status:** open. lean2 measured it: 265 → 262 crates (`parking_lot`, `parking_lot_core`, `lock_api`), with tokio's features `rt-multi-thread, net, time, sync, macros, process, io-util, fs` and `parking_lot` kept as a dev-dependency for the tests. Not done in wave 2: half the lock sites are in files the hop branch was rewriting, a non-poisoning wrapper adds about 10 runtime lines, and tokio's own locks change, so it needs the HTTP A/B of CPU per request.
 
 ### W-41: one helper for the egress spans and the permit-holding body
 - **What:** in `egress.rs`, the `http.client` path (`send_request`) and `call` each set the same `http.request.method` and `url.path` attributes with the same truncation, and each wraps the response body in the same `map_frame(move |f| { let _ = &permit; f })` to tie the outbound permit to the body. One function for each would remove about ten lines and keep the two paths from drifting.
-- **Status:** open (lean pass; `egress.rs` belonged to the sec branch this round)
+- **Status:** done in 760b3e0 and 238bf82 (lean2): `telemetry::request`, `egress::holding`, `egress::to_guest`, `egress::verdict`.
 
 ### W-42: one TLS trust store for the node's own clients
 - **What:** guest egress verifies servers against the compiled-in `webpki-roots`, while the registry client and the proxy's DNS-over-HTTPS and registry calls use reqwest's `rustls` feature, which verifies against the host's certificate store through `rustls-platform-verifier`. Giving those clients a rustls `ClientConfig` built from `webpki-roots` (reqwest's `tls_backend_preconfigured`, as `egress::TLS` does) would make every TLS decision independent of the host's `/etc/ssl` and drop `rustls-platform-verifier`, `rustls-native-certs` and `openssl-probe`. It stops honouring CAs an operator installed, so it is the owner's call; registries must be on public addresses anyway.
-- **Status:** open (owner decision)
+- **Measured (lean2):** it drops no crate. `aws-lc-rs` stays because `sigstore-crypto` (signature verification) depends on it directly, and `rustls-platform-verifier` comes with reqwest's `rustls-no-provider` feature too, so only the trust decision would change.
+- **Status:** open (owner decision; no dependency or size win)
 
 ### W-43: decide which wasm proposals guests may use
 - **What:** wasmtime's `gc`, `threads` and `stack-switching` cargo features decide whether guests may use GC types and exceptions, shared memories and stack switching. They are on because they are wasmtime's defaults, not by decision; the lean pass kept them, since turning one off changes which components load. If the node doesn't want them, dropping them removes their runtime code from every worker binary (GC heaps are allocated lazily, so there is no reservation to win back). Measure binary size and cold starts before deciding.
@@ -590,3 +611,15 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-22: telemetry still costs about 10% of a production request
 - **What:** after N-74, the remaining cost is mostly the SDK: span creation and attributes, and OTLP encoding of the supervisor's own spans (about 3 µs per request) and the worker's (about 2.5 µs). Reducing it without a custom exporter (Q64/Q66) means fewer allocations per span (e.g. `Arc<str>` object ids instead of new `String`s).
+
+### W-60: simplifications left in files another branch had (lean2)
+- **What:** found in the lean2 pass, not done because the hop branch was changing these files:
+  - `supervisor.rs`: the egress link's closure clones six captures per request; one small struct with a `serve` method holds them (about −4 lines). `admin()` and `get()` build empty bodies by hand (−3 with a shared helper).
+  - `supervisor.rs` and `table.rs`: both snapshots start with the same process fields (pid, memory, uptime).
+  - `object.rs`: N-132's ordering.
+  - Done here as small, separate hunks: `forward` holds the worker through `egress::holding`, `verdict_ok` is `egress::verdict`, `dispatch` sets its span attributes with `telemetry::request`, `Worker` and `MemLimiter` take their zeroed fields from `Default`.
+- **Status:** open
+
+### W-61: `Supervisor::flush_telemetry` exists only for tests
+- **What:** `flush_telemetry` (14 lines) and the worker's `/_nanovm/flush` route (5 lines in `server.rs`) are called only by the integration tests' `stats_json` and span checks, to read fresh snapshots without waiting for the 1 s export interval. Without them the tests would wait for the next periodic export (about 20 s more per suite run). Options: keep (test support in the runtime), or gate both behind the `dev` feature (out of production builds, still counted).
+- **Status:** open (owner decision)
