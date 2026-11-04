@@ -2899,9 +2899,13 @@ async fn a_node_runs_at_most_max_apps() {
     let mut cfg = node_cfg("a_node_runs_at_most_max_apps", 8);
     cfg.max_apps = 2;
     let (_sup, addr) = supervised_with(cfg).await;
+    // Time for the slow requests below to outlast an app's start on a busy
+    // host.
+    let mut slow = app("hostile");
+    slow.limits.request_timeout_ms = 10_000;
     let mut apps = Vec::new();
     for repo in ["apps-a", "apps-b", "apps-c"] {
-        apps.push(publish(repo, &app("hostile")).await);
+        apps.push(publish(repo, &slow).await);
     }
     let [a, b, c] = &apps[..] else { unreachable!() };
     let busy = |app: &String, ms: u64| {
@@ -2909,17 +2913,26 @@ async fn a_node_runs_at_most_max_apps() {
         tokio::spawn(async move { app_get(addr, &app, &format!("/s/sleep?ms={ms}")).await })
     };
     let up = async |app: &str| stats_json(addr).await["workers"][worker(app).as_str()]["up"] == true;
+    // Until the worker reports the slow request in its guest, it may not
+    // have reached the worker yet, which then looks idle (N-91).
+    let handling = async |app: &str| {
+        let started = Instant::now();
+        while stats_json(addr).await["apps"][worker(app).as_str()]["phases"]["handling"] != 1 {
+            assert!(started.elapsed() < Duration::from_secs(10), "{}", stats_json(addr).await);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
 
     assert_eq!(app_get(addr, a, "/x/").await.0, 200);
     assert_eq!(app_get(addr, b, "/x/").await.0, 200);
     // `a` is idle and least recently used; `b` is busy.
-    let slow_b = busy(b, 900);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let slow_b = busy(b, 2500);
+    handling(b).await;
     assert_eq!(app_get(addr, c, "/x/").await.0, 200);
     assert!(!up(a).await && up(b).await && up(c).await, "{}", stats_json(addr).await);
     // Both running apps busy: `a` is refused, and neither is disturbed.
-    let slow_c = busy(c, 600);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let slow_c = busy(c, 1000);
+    handling(c).await;
     let (status, body) = app_get(addr, a, "/x/").await;
     assert!(status == 502 && body.contains("most apps (2)"), "{status} {body}");
     assert_eq!(slow_b.await.unwrap().0, 200);
