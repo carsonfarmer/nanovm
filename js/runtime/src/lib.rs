@@ -1,42 +1,32 @@
-//! nanovm's JavaScript runtime: a `wasi:http` handler that runs a
-//! Workers-style module (`export default { fetch(request, env, ctx) }`) on the
-//! Boa engine. The app's source is compiled in (see build.rs). `prelude.js`
-//! builds the Web APIs (Request, Response, Headers, fetch, env) on the few
-//! host functions here; this file drives the engine's jobs and maps the
-//! host's async calls (outgoing HTTP, timers) to promises.
+//! nanovm's JavaScript runtime: a guest-SDK app that runs a Workers-style
+//! module (`export default { fetch(request, env, ctx) }`) on QuickJS
+//! (QuickJS-NG, through rquickjs). The app's source is compiled in (see
+//! build.rs). `prelude.js` builds the Web APIs (Request, Response, Headers,
+//! URL, fetch, timers, env) on the host functions here; this file runs the
+//! engine's jobs and maps the host's async calls (outgoing HTTP, timers) to
+//! JavaScript callbacks.
 //!
 //! The engine lives as long as the instance, so module state persists
 //! between requests the way an object's memory does, and is lost with it.
 
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::cell::{Cell, OnceCell, RefCell};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
-use std::rc::Rc;
 use std::task::Poll;
 
-use boa_engine::builtins::promise::PromiseState;
-use boa_engine::context::time::{Clock, JsDuration, JsInstant};
-use boa_engine::job::{GenericJob, Job, JobExecutor, NativeAsyncJob, PromiseJob};
-use boa_engine::object::ObjectInitializer;
-use boa_engine::object::builtins::{JsArray, JsFunction, JsPromise, JsUint8Array};
-use boa_engine::{
-    Context, JsArgs, JsError, JsResult, JsString, JsValue, Module, NativeFunction, Source, js_error, js_string,
+use nanovm_sdk::wasip3::clocks::{monotonic_clock, system_clock};
+use nanovm_sdk::wasip3::random::random;
+use nanovm_sdk::{Error, Request, Response, kv};
+use rquickjs::context::intrinsic::{
+    Date, Eval, Json, MapSet, Promise as Promises, Proxy, RegExp, RegExpCompiler, TypedArrays, WeakRef,
 };
-use wasip3::http::types::{ErrorCode, Fields, Method, Request, Response, Scheme};
-use wasip3::{wit_future, wit_stream};
+use rquickjs::convert::List;
+use rquickjs::{
+    Array, Coerced, Context, Ctx, Exception, Function, Module, Object, Persistent, Promise, Runtime, TypedArray, Value,
+};
+use url::{Url, quirks};
 
-mod kv {
-    wit_bindgen::generate!({ path: "../../wit/keyvalue", world: "wasi:keyvalue/imports", generate_all });
-    pub use wasi::keyvalue::store::*;
-}
-
-mod config {
-    wit_bindgen::generate!({ path: "../../wit/config", world: "wasi:config/imports", generate_all });
-    pub use wasi::config::store::*;
-}
-
-wasip3::http::service::export!(Js);
+nanovm_sdk::serve!(handle);
 
 /// Pre-initialization (js/build.sh runs it through Wizer): starts the
 /// engine and evaluates the app, so the component's memory starts there
@@ -49,474 +39,472 @@ mod init {
     struct Init;
     impl Guest for Init {
         fn wizer_initialize() -> Result<(), String> {
-            super::Runtime::get().map(|_| ()).map_err(|e| e.to_string())
+            super::engine().map(|_| ())
         }
     }
 }
-
-struct Js;
 
 const APP: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
 const PRELUDE: &str = include_str!("prelude.js");
 
-thread_local! {
-    static RUNTIME: Cell<Option<&'static Runtime>> = const { Cell::new(None) };
-}
-
-type Headers = Vec<(String, Vec<u8>)>;
-
-impl wasip3::exports::http::handler::Guest for Js {
-    async fn handle(request: Request) -> Result<Response, ErrorCode> {
-        let (method, url, headers, body) = read(request).await;
-        let rt = Runtime::get().map_err(|e| uncaught(e.to_string()))?;
-        let id = std::env::var("NANOVM_OBJECT_ID").unwrap_or_default();
-        let answer = rt.serve(&id, method, url, headers, body).await;
-        let (status, headers, body, after) = answer.map_err(|e| uncaught(rt.describe(&e)))?;
-        // `ctx.waitUntil` work goes on after the answer, before the next
-        // request; anything else still pending is dropped.
-        match after {
-            Some(after) => wasip3::spawn_local(async move {
-                if let Err(e) = rt.settle(&after).await {
-                    eprintln!("waitUntil: {}", rt.describe(&e));
-                }
-                rt.cancel();
-            }),
-            None => rt.cancel(),
-        }
-        respond(status, headers, body)
+async fn handle(request: Request) -> nanovm_sdk::Result {
+    let js = engine().map_err(uncaught)?;
+    let (status, headers, body, after) = js.serve(request).await.map_err(uncaught)?;
+    // `ctx.waitUntil` work goes on after the answer, before the next
+    // request; anything else still pending is dropped.
+    match after {
+        Some(after) => nanovm_sdk::wasip3::spawn_local(async move {
+            if let Err(e) = js.settle(after).await {
+                eprintln!("waitUntil: {e}");
+            }
+            TASKS.take();
+        }),
+        None => drop(TASKS.take()),
     }
+    Ok(headers.chunks_exact(2).fold(Response::new(status).body(body), |r, kv| r.header(&kv[0], &kv[1])))
 }
 
 /// An uncaught exception fails the request, which rolls back its changes.
-fn uncaught(msg: String) -> ErrorCode {
-    eprintln!("Uncaught {msg}");
-    ErrorCode::InternalError(Some(format!("Uncaught {msg}")))
+fn uncaught(e: String) -> Error {
+    eprintln!("Uncaught {e}");
+    Error::new(format!("Uncaught {e}"))
 }
 
-/// Async jobs (host calls, timers) in flight.
-type Task = Pin<Box<dyn Future<Output = JsResult<JsValue>>>>;
-
-/// The engine and the app, for the instance's life (so leaked: the
-/// engine's async jobs borrow it for as long as they run).
-struct Runtime {
-    ctx: &'static RefCell<&'static mut Context>,
-    jobs: Rc<Jobs>,
-    /// The prelude's `(id, method, url, headers, body) => Promise<[status, headers, body, after]>`.
-    dispatch: JsFunction,
-    running: RefCell<Vec<Task>>,
+/// The engine and the app, for the instance's life.
+struct Engine {
+    rt: Runtime,
+    ctx: Context,
+    /// The prelude's `serve(id, method, url, headers, body)`: `[the app's
+    /// response or a promise of it, ctx]`.
+    serve: Persistent<Function<'static>>,
+    /// The prelude's `answer(response, ctx)`: `[status, headers, body, waitUntil promise or undefined]`.
+    answer: Persistent<Function<'static>>,
 }
 
-impl Runtime {
-    fn get() -> JsResult<&'static Self> {
-        if let Some(rt) = RUNTIME.get() {
-            return Ok(rt);
-        }
-        let rt = Box::leak(Box::new(Self::new()?));
-        RUNTIME.set(Some(rt));
-        Ok(rt)
+/// A host call in flight (an outgoing request, a timer). Once the host
+/// answers, it returns what to do in JavaScript with the answer.
+type Task = Pin<Box<dyn Future<Output = Settle>>>;
+type Settle = Box<dyn for<'js> FnOnce(Ctx<'js>) -> rquickjs::Result<()>>;
+
+thread_local! {
+    static ENGINE: OnceCell<&'static Engine> = const { OnceCell::new() };
+    static TASKS: RefCell<Vec<Task>> = const { RefCell::new(Vec::new()) };
+    /// Set while QuickJS starts its context (see `gettimeofday`).
+    static STARTING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn engine() -> Result<&'static Engine, String> {
+    if let Some(js) = ENGINE.with(|e| e.get().copied()) {
+        return Ok(js);
     }
+    let js: &'static Engine = Box::leak(Box::new(Engine::new()?));
+    ENGINE.with(|e| e.set(js)).ok();
+    Ok(js)
+}
 
-    fn new() -> JsResult<Self> {
-        let jobs = Rc::new(Jobs::default());
-        let ctx = Context::builder().job_executor(jobs.clone()).clock(Rc::new(HostClock)).build()?;
-        let ctx = Box::leak(Box::new(ctx));
-        boa_runtime::register(boa_runtime::extensions::ConsoleExtension(boa_runtime::DefaultLogger), None, ctx)?;
-        let host = ObjectInitializer::new(ctx)
-            .function(NativeFunction::from_fn_ptr(kv_get), js_string!("kvGet"), 1)
-            .function(NativeFunction::from_fn_ptr(kv_set), js_string!("kvSet"), 2)
-            .function(NativeFunction::from_fn_ptr(kv_delete), js_string!("kvDelete"), 1)
-            .function(NativeFunction::from_fn_ptr(kv_list), js_string!("kvList"), 1)
-            .function(NativeFunction::from_fn_ptr(config_all), js_string!("configAll"), 0)
-            .function(NativeFunction::from_fn_ptr(random), js_string!("random"), 1)
-            .function(NativeFunction::from_async_fn(send), js_string!("send"), 6)
-            .build();
-        let prelude = ctx.eval(Source::from_bytes(PRELUDE))?;
-        let bind = callable(&prelude)?.call(&JsValue::undefined(), &[host.into()], ctx)?;
-
-        let module = Module::parse(Source::from_bytes(APP), None, ctx)?;
-        let loaded = module.load_link_evaluate(ctx);
-        jobs.clone().run_jobs(ctx)?;
-        match loaded.state() {
-            PromiseState::Fulfilled(_) => {}
-            PromiseState::Rejected(e) => return Err(JsError::from_opaque(e)),
-            PromiseState::Pending => return Err(js_error!(Error: "the module's top-level code must not wait for I/O")),
-        }
-        let app = module.namespace(ctx).get(js_string!("default"), ctx)?;
-        let dispatch = callable(&callable(&bind)?.call(&JsValue::undefined(), &[app], ctx)?)?;
-        let ctx = Box::leak(Box::new(RefCell::new(ctx)));
-        Ok(Self { ctx, jobs, dispatch, running: RefCell::default() })
+impl Engine {
+    fn new() -> Result<Self, String> {
+        let rt = Runtime::new_with_alloc(Malloc).map_err(|e| e.to_string())?;
+        STARTING.set(true);
+        let ctx = Context::custom::<(
+            Date,
+            Eval,
+            RegExpCompiler,
+            RegExp,
+            Json,
+            Proxy,
+            MapSet,
+            TypedArrays,
+            Promises,
+            WeakRef,
+        )>(&rt);
+        STARTING.set(false);
+        let ctx = ctx.map_err(|e| e.to_string())?;
+        // atob and btoa (with DOMException), which rquickjs has no intrinsic for.
+        unsafe { rquickjs::qjs::JS_AddIntrinsicAToB(ctx.as_raw().as_ptr()) };
+        let (serve, answer) = ctx.with(|ctx| {
+            let start = || {
+                let host = Object::new(ctx.clone())?;
+                host.set("kvGet", Function::new(ctx.clone(), kv_get)?)?;
+                host.set("kvSet", Function::new(ctx.clone(), kv_set)?)?;
+                host.set("kvDelete", Function::new(ctx.clone(), kv_delete)?)?;
+                host.set("kvList", Function::new(ctx.clone(), kv_list)?)?;
+                host.set("configAll", Function::new(ctx.clone(), config_all)?)?;
+                host.set("random", Function::new(ctx.clone(), random_bytes)?)?;
+                host.set("mathRandom", Function::new(ctx.clone(), math_random)?)?;
+                host.set("encode", Function::new(ctx.clone(), encode)?)?;
+                host.set("decode", Function::new(ctx.clone(), decode)?)?;
+                host.set("url", Function::new(ctx.clone(), parse_url)?)?;
+                host.set("urlSet", Function::new(ctx.clone(), set_url)?)?;
+                host.set("print", Function::new(ctx.clone(), print)?)?;
+                host.set("send", Function::new(ctx.clone(), send)?)?;
+                host.set("sleep", Function::new(ctx.clone(), sleep)?)?;
+                let bind: Function = ctx.eval::<Function, _>(PRELUDE)?.call((host,))?;
+                let (module, evaluated) = Module::declare(ctx.clone(), "app.js", APP)?.eval()?;
+                while ctx.execute_pending_job() {}
+                match evaluated.result::<Value>() {
+                    Some(evaluated) => drop(evaluated?),
+                    None => {
+                        return Err(Exception::throw_message(
+                            &ctx,
+                            "the module's top-level code must not wait for I/O",
+                        ));
+                    }
+                }
+                let List((serve, answer)): List<(Function, Function)> =
+                    bind.call((module.get::<_, Value>("default")?,))?;
+                Ok((Persistent::save(&ctx, serve), Persistent::save(&ctx, answer)))
+            };
+            start().map_err(|e| thrown(&ctx, e))
+        })?;
+        Ok(Self { rt, ctx, serve, answer })
     }
 
     async fn serve(
         &'static self,
-        id: &str,
-        method: String,
-        url: String,
-        headers: Headers,
-        body: Vec<u8>,
-    ) -> JsResult<(u16, Headers, Vec<u8>, Option<JsPromise>)> {
-        let answer = {
-            let ctx = &mut self.ctx.borrow_mut();
-            let args = [
-                JsString::from(id).into(),
-                JsString::from(method).into(),
-                JsString::from(url).into(),
-                to_js_headers(headers, ctx)?,
-                if body.is_empty() { JsValue::null() } else { JsUint8Array::from_iter(body, ctx)?.into() },
-            ];
-            promise(&self.dispatch.call(&JsValue::undefined(), &args, ctx)?)?
-        };
-        let answer = self.settle(&answer).await?;
-        let ctx = &mut self.ctx.borrow_mut();
-        let answer = JsArray::from_object(object(&answer)?)?;
-        let status = answer.get(0, ctx)?.to_u32(ctx)? as u16;
-        let headers = from_js_headers(&answer.get(1, ctx)?, ctx)?;
-        let body = bytes(&answer.get(2, ctx)?, ctx)?;
-        let after = answer.get(3, ctx)?;
-        let after = if after.is_undefined() { None } else { Some(promise(&after)?) };
-        Ok((status, headers, body, after))
-    }
-
-    /// Runs the engine's jobs until `promise` settles, waiting on the host
-    /// whenever only host calls (and timers) are left.
-    async fn settle(&'static self, promise: &JsPromise) -> JsResult<JsValue> {
-        loop {
-            self.jobs.clone().run_jobs(&mut self.ctx.borrow_mut())?;
-            match promise.state() {
-                PromiseState::Fulfilled(v) => return Ok(v),
-                PromiseState::Rejected(e) => return Err(JsError::from_opaque(e)),
-                PromiseState::Pending => {}
-            }
-            let mut running = self.running.borrow_mut();
-            running.extend(self.jobs.tasks.take().into_iter().map(|t| Box::pin(t.call(self.ctx)) as Task));
-            if running.is_empty() {
-                return Err(js_error!(Error: "a promise the request waits on can never settle"));
-            }
-            poll_fn(|cx| {
-                let mut done = Ok(false);
-                running.retain_mut(|t| match t.as_mut().poll(cx) {
-                    Poll::Ready(r) => {
-                        done = done.clone().and(r.map(|_| true));
-                        false
-                    }
-                    Poll::Pending => true,
-                });
-                match done {
-                    Ok(false) => Poll::Pending,
-                    d => Poll::Ready(d),
-                }
-            })
-            .await?;
-        }
-    }
-
-    /// Drops the work still pending: a request's work ends with its answer
-    /// (and its `waitUntil` promises).
-    fn cancel(&self) {
-        self.running.take();
-        self.jobs.tasks.take();
-    }
-
-    fn describe(&self, e: &JsError) -> String {
-        match e.try_native(&mut self.ctx.borrow_mut()) {
-            Ok(native) => native.to_string(),
-            Err(_) => e.to_string(),
-        }
-    }
-}
-
-/// The engine's job queue. Host calls and timers are async jobs, which
-/// [`Runtime::settle`] polls.
-#[derive(Default)]
-struct Jobs {
-    promises: RefCell<VecDeque<PromiseJob>>,
-    generic: RefCell<VecDeque<GenericJob>>,
-    tasks: RefCell<Vec<NativeAsyncJob>>,
-}
-
-impl JobExecutor for Jobs {
-    fn enqueue_job(self: Rc<Self>, job: Job, _: &mut Context) {
-        let task = match job {
-            Job::PromiseJob(j) => return self.promises.borrow_mut().push_back(j),
-            Job::GenericJob(j) => return self.generic.borrow_mut().push_back(j),
-            Job::AsyncJob(j) => j,
-            Job::TimeoutJob(t) => NativeAsyncJob::new(async move |ctx| {
-                sleep(t.timeout()).await;
-                if t.cancelled() { Ok(JsValue::undefined()) } else { t.call(&mut ctx.borrow_mut()) }
-            }),
-            Job::IntervalJob(t) => NativeAsyncJob::new(async move |ctx| {
-                loop {
-                    sleep(t.interval()).await;
-                    if t.cancelled() {
-                        return Ok(JsValue::undefined());
-                    }
-                    t.call(&mut ctx.borrow_mut())?;
-                }
-            }),
-            // FinalizationRegistry callbacks never run, which the language allows.
-            _ => return,
-        };
-        self.tasks.borrow_mut().push(task);
-    }
-
-    fn run_jobs(self: Rc<Self>, ctx: &mut Context) -> JsResult<()> {
-        loop {
-            let promise = self.promises.borrow_mut().pop_front();
-            if let Some(job) = promise {
-                job.call(ctx)?;
-                continue;
-            }
-            let generic = self.generic.borrow_mut().pop_front();
-            match generic {
-                Some(job) => job.call(ctx)?,
-                None => break,
+        request: Request,
+    ) -> Result<(u16, Vec<String>, Vec<u8>, Option<Persistent<Value<'static>>>), String> {
+        let (response, js_ctx) = self.ctx.with(|ctx| {
+            let call = || {
+                let headers: Vec<&str> = request.headers().iter().flat_map(|(k, v)| [k.as_str(), v.as_str()]).collect();
+                let body = match request.body() {
+                    [] => Value::new_null(ctx.clone()),
+                    _ => TypedArray::<u8>::new(ctx.clone(), request.body())?.into_value(),
+                };
+                let args = (nanovm_sdk::id(), request.method(), request.url(), headers, body);
+                let List((response, js_ctx)): List<(Value, Value)> = self.serve.clone().restore(&ctx)?.call(args)?;
+                Ok((Persistent::save(&ctx, response), Persistent::save(&ctx, js_ctx)))
             };
+            call().map_err(|e| thrown(&ctx, e))
+        })?;
+        let response = self.settle(response).await?;
+        self.ctx.with(|ctx| {
+            let read = || {
+                let args = (response.restore(&ctx)?, js_ctx.restore(&ctx)?);
+                let answer: Array = self.answer.clone().restore(&ctx)?.call(args)?;
+                let body: Option<TypedArray<u8>> = answer.get(2)?;
+                let after: Option<Value> = answer.get(3)?;
+                Ok((
+                    answer.get(0)?,
+                    answer.get(1)?,
+                    body.map_or(Vec::new(), |b| bytes(&b)),
+                    after.map(|p| Persistent::save(&ctx, p)),
+                ))
+            };
+            read().map_err(|e| thrown(&ctx, e))
+        })
+    }
+
+    /// Runs the engine's jobs until `value`, if it is a promise, settles
+    /// (waiting on the host whenever only host calls and timers are left):
+    /// its value.
+    async fn settle(&self, value: Persistent<Value<'static>>) -> Result<Persistent<Value<'static>>, String> {
+        loop {
+            loop {
+                match self.rt.execute_pending_job() {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(job) => return Err(job.0.with(|ctx| exception(&ctx.catch()))),
+                }
+            }
+            let settled = self.ctx.with(|ctx| {
+                let value = value.clone().restore(&ctx).map_err(|e| e.to_string())?;
+                let Some(promise) = value.as_promise() else {
+                    return Ok(Some(Persistent::save(&ctx, value)));
+                };
+                match promise.result::<Value>() {
+                    None => Ok(None),
+                    Some(Ok(v)) => Ok(Some(Persistent::save(&ctx, v))),
+                    Some(Err(e)) => Err(thrown(&ctx, e)),
+                }
+            })?;
+            if let Some(v) = settled {
+                return Ok(v);
+            }
+            let done = poll_fn(|cx| {
+                TASKS.with_borrow_mut(|tasks| {
+                    let mut done = Vec::new();
+                    tasks.retain_mut(|t| match t.as_mut().poll(cx) {
+                        Poll::Ready(settle) => {
+                            done.push(settle);
+                            false
+                        }
+                        Poll::Pending => true,
+                    });
+                    match (done.is_empty(), tasks.is_empty()) {
+                        (true, true) => Poll::Ready(None),
+                        (true, false) => Poll::Pending,
+                        (false, _) => Poll::Ready(Some(done)),
+                    }
+                })
+            });
+            let done = done.await.ok_or("a promise the request waits on can never settle")?;
+            self.ctx
+                .with(|ctx| done.into_iter().try_for_each(|settle| settle(ctx.clone())).map_err(|e| thrown(&ctx, e)))?;
         }
-        ctx.clear_kept_objects();
-        Ok(())
     }
 }
 
-/// Reads the host's clocks at each call (Boa's own clock reads one when the
-/// engine starts, which pre-initialization would freeze).
-struct HostClock;
+fn spawn(task: impl Future<Output = Settle> + 'static) {
+    TASKS.with_borrow_mut(|tasks| tasks.push(Box::pin(task)));
+}
 
-impl Clock for HostClock {
-    fn now(&self) -> JsInstant {
-        let ns = wasip3::clocks::monotonic_clock::now();
-        JsInstant::new(ns / 1_000_000_000, (ns % 1_000_000_000) as u32)
+/// What the engine threw, as text.
+fn thrown(ctx: &Ctx, e: rquickjs::Error) -> String {
+    if e.is_exception() { exception(&ctx.catch()) } else { e.to_string() }
+}
+
+/// A JavaScript exception as `String(e)`, with its stack if it has one.
+fn exception(e: &Value) -> String {
+    let text = e.get::<Coerced<String>>().map_or_else(|_| "(an exception that can't be shown)".into(), |s| s.0);
+    match e.as_object().and_then(|o| o.get::<_, Option<String>>("stack").ok().flatten()) {
+        Some(stack) if !stack.is_empty() => format!("{text}\n{}", stack.trim_end()),
+        _ => text,
     }
+}
 
-    fn system_time_millis(&self) -> i64 {
-        let t = wasip3::clocks::system_clock::now();
-        t.seconds * 1000 + i64::from(t.nanoseconds / 1_000_000)
+/// A `Uint8Array`'s bytes.
+fn bytes(a: &TypedArray<u8>) -> Vec<u8> {
+    // Safety: copied before any JavaScript runs.
+    unsafe { a.as_bytes() }.unwrap_or_default().to_vec()
+}
+
+/// QuickJS's memory: libc's malloc, as for the rest of the runtime, but
+/// running out traps (as in Rust code, so the object's memory limit kills
+/// the instance) instead of becoming an exception the app could catch.
+struct Malloc;
+
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn calloc(count: usize, size: usize) -> *mut u8;
+    fn realloc(ptr: *mut u8, size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+    fn malloc_usable_size(ptr: *mut u8) -> usize;
+}
+
+fn or_trap(ptr: *mut u8) -> *mut u8 {
+    if ptr.is_null() {
+        std::process::abort();
+    }
+    ptr
+}
+
+unsafe impl rquickjs::allocator::Allocator for Malloc {
+    fn alloc(&mut self, size: usize) -> *mut u8 {
+        or_trap(unsafe { malloc(size) })
+    }
+    fn calloc(&mut self, count: usize, size: usize) -> *mut u8 {
+        or_trap(unsafe { calloc(count, size) })
+    }
+    unsafe fn dealloc(&mut self, ptr: *mut u8) {
+        unsafe { free(ptr) }
+    }
+    // QuickJS never asks for 0 bytes (it frees instead).
+    unsafe fn realloc(&mut self, ptr: *mut u8, size: usize) -> *mut u8 {
+        or_trap(unsafe { realloc(ptr, size) })
+    }
+    unsafe fn usable_size(ptr: *mut u8) -> usize {
+        unsafe { malloc_usable_size(ptr) }
     }
 }
 
-async fn sleep(d: JsDuration) {
-    wasip3::clocks::monotonic_clock::wait_for(d.as_nanos() as u64).await;
+/// QuickJS seeds Math.random and its Map hashes from the clock when it
+/// starts a context, which pre-initialization does at build time, where
+/// the clock must not be read and the seed would be frozen in the snapshot:
+/// so the clock reads 0 then. Math.random is replaced (`math_random`); the
+/// Map seed is xored onto finished hashes, so it never separated keys that
+/// collide. Every other read (`Date`) is the host's clock.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn gettimeofday(tv: *mut [i64; 2], _: *mut u8) -> i32 {
+    let now = if STARTING.get() {
+        [0, 0]
+    } else {
+        let t = system_clock::now();
+        [t.seconds, i64::from(t.nanoseconds / 1000)]
+    };
+    unsafe { tv.write(now) };
+    0
 }
 
-// ---- values between Rust and JavaScript --------------------------------
-
-fn object(v: &JsValue) -> JsResult<boa_engine::JsObject> {
-    v.as_object().ok_or_else(|| js_error!(TypeError: "expected an object"))
-}
-
-fn callable(v: &JsValue) -> JsResult<JsFunction> {
-    JsFunction::from_object(object(v)?).ok_or_else(|| js_error!(TypeError: "expected a function"))
-}
-
-fn promise(v: &JsValue) -> JsResult<JsPromise> {
-    JsPromise::from_object(object(v)?)
-}
-
-fn string(v: &JsValue, ctx: &mut Context) -> JsResult<String> {
-    Ok(v.to_string(ctx)?.to_std_string_escaped())
-}
-
-/// A `Uint8Array`'s bytes; `null` or `undefined` is empty.
-fn bytes(v: &JsValue, ctx: &mut Context) -> JsResult<Vec<u8>> {
-    if v.is_null_or_undefined() {
-        return Ok(Vec::new());
-    }
-    JsUint8Array::from_object(object(v)?)?.to_vec(ctx)
-}
-
-/// Headers cross as a flat array, `[name, value, name, value, …]`.
-fn to_js_headers(headers: Headers, ctx: &mut Context) -> JsResult<JsValue> {
-    let flat = headers.into_iter().flat_map(|(k, v)| {
-        [JsString::from(k).into(), JsString::from(String::from_utf8_lossy(&v).as_ref()).into()]
-    });
-    Ok(JsArray::from_iter(flat, ctx).into())
-}
-
-fn from_js_headers(v: &JsValue, ctx: &mut Context) -> JsResult<Headers> {
-    let flat = JsArray::from_object(object(v)?)?;
-    let n = flat.length(ctx)?;
-    (0..n / 2)
-        .map(|i| Ok((string(&flat.get(2 * i, ctx)?, ctx)?, string(&flat.get(2 * i + 1, ctx)?, ctx)?.into_bytes())))
-        .collect()
-}
-
-// ---- host functions ------------------------------------------------------
+// ---- host functions --------------------------------------------------------
 
 thread_local! {
     /// Opened at first use, at run time: no handle may be in the snapshot.
-    static BUCKET: std::cell::OnceCell<kv::Bucket> = const { std::cell::OnceCell::new() };
+    static BUCKET: OnceCell<kv::Bucket> = const { OnceCell::new() };
+    /// `Math.random`'s state, seeded at first use (0: not yet).
+    static SEED: Cell<u64> = const { Cell::new(0) };
 }
 
-fn with_bucket<T>(f: impl FnOnce(&kv::Bucket) -> Result<T, kv::Error>) -> JsResult<T> {
+fn with_bucket<T>(ctx: &Ctx, f: impl FnOnce(&kv::Bucket) -> Result<T, kv::Error>) -> rquickjs::Result<T> {
     BUCKET
         .with(|cell| {
             if cell.get().is_none() {
-                let _ = cell.set(kv::open("")?);
+                let _ = cell.set(kv::bucket()?);
             }
             f(cell.get().unwrap())
         })
-        .map_err(kv_error)
+        .map_err(|e| Exception::throw_message(ctx, &format!("kv: {e:?}")))
 }
 
-fn kv_error(e: kv::Error) -> JsError {
-    js_error!(Error: "kv: {:?}", e)
-}
-
-fn kv_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let key = string(args.get_or_undefined(0), ctx)?;
-    match with_bucket(|b| b.get(&key))? {
-        Some(v) => Ok(JsUint8Array::from_iter(v, ctx)?.into()),
-        None => Ok(JsValue::undefined()),
+/// `kvGet(key)`: the value stored at `key` (as JSON), or undefined.
+fn kv_get<'js>(ctx: Ctx<'js>, key: String) -> rquickjs::Result<Value<'js>> {
+    match with_bucket(&ctx, |b| b.get(&key))? {
+        Some(json) => ctx.json_parse(json),
+        None => Ok(Value::new_undefined(ctx)),
     }
 }
 
-fn kv_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let key = string(args.get_or_undefined(0), ctx)?;
-    let value = bytes(args.get_or_undefined(1), ctx)?;
-    with_bucket(|b| b.set(&key, &value))?;
-    Ok(JsValue::undefined())
+/// `kvSet(key, value)`: stores `value` as JSON.
+fn kv_set<'js>(ctx: Ctx<'js>, key: String, value: Value<'js>) -> rquickjs::Result<()> {
+    let json = ctx.json_stringify(value)?;
+    let json =
+        json.ok_or_else(|| Exception::throw_type(&ctx, "kv.put: the value can't be stored as JSON"))?.to_string()?;
+    with_bucket(&ctx, |b| b.set(&key, json.as_bytes()))
 }
 
-fn kv_delete(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let key = string(args.get_or_undefined(0), ctx)?;
-    with_bucket(|b| b.delete(&key))?;
-    Ok(JsValue::undefined())
+fn kv_delete(ctx: Ctx, key: String) -> rquickjs::Result<()> {
+    with_bucket(&ctx, |b| b.delete(&key))
 }
 
 /// `kvList(cursor)`: `[keys, next cursor or undefined]`.
-fn kv_list(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let cursor = args.get_or_undefined(0);
-    let cursor = if cursor.is_undefined() { None } else { Some(cursor.to_number(ctx)? as u64) };
-    let page = with_bucket(|b| b.list_keys(cursor))?;
-    let keys = JsArray::from_iter(page.keys.into_iter().map(|k| JsString::from(k).into()), ctx);
-    let next = page.cursor.map_or(JsValue::undefined(), |c| JsValue::from(c as f64));
-    Ok(JsArray::from_iter([keys.into(), next], ctx).into())
+fn kv_list(ctx: Ctx, cursor: Option<f64>) -> rquickjs::Result<List<(Vec<String>, Option<f64>)>> {
+    let page = with_bucket(&ctx, |b| b.list_keys(cursor.map(|c| c as u64)))?;
+    Ok(List((page.keys, page.cursor.map(|c| c as f64))))
 }
 
-fn config_all(_: &JsValue, _: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let all = config::get_all().map_err(|e| js_error!(Error: "config: {:?}", e))?;
-    let flat = all.into_iter().flat_map(|(k, v)| [JsString::from(k).into(), JsString::from(v).into()]);
-    Ok(JsArray::from_iter(flat, ctx).into())
+fn config_all(ctx: Ctx) -> rquickjs::Result<Vec<String>> {
+    let all = nanovm_sdk::config::get_all().map_err(|e| Exception::throw_message(&ctx, &format!("config: {e:?}")))?;
+    Ok(all.into_iter().flat_map(|(k, v)| [k, v]).collect())
 }
 
-fn random(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let n = args.get_or_undefined(0).to_index(ctx)?;
-    Ok(JsUint8Array::from_iter(wasip3::random::random::get_random_bytes(n), ctx)?.into())
+fn random_bytes(ctx: Ctx, n: u32) -> rquickjs::Result<TypedArray<u8>> {
+    TypedArray::new(ctx, random::get_random_bytes(n.into()))
 }
 
-/// `send(method, scheme, authority, path, headers, body)`: an outgoing
-/// request through the host (so under the app's egress policy); resolves to
-/// `[status, headers, body]`.
-async fn send(_: &JsValue, args: &[JsValue], ctx: &RefCell<&mut Context>) -> JsResult<JsValue> {
-    let (parts, headers, body) = {
-        let ctx = &mut ctx.borrow_mut();
-        let mut parts = [const { String::new() }; 4];
-        for (i, p) in parts.iter_mut().enumerate() {
-            *p = string(args.get_or_undefined(i), ctx)?;
+/// `Math.random`: xorshift64*, seeded from the host at first use.
+fn math_random() -> f64 {
+    let mut x = match SEED.get() {
+        0 => random::get_random_u64() | 1,
+        x => x,
+    };
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    SEED.set(x);
+    (x.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// `TextEncoder.encode` (the prelude passes well-formed strings).
+fn encode(ctx: Ctx, s: String) -> rquickjs::Result<TypedArray<u8>> {
+    TypedArray::new(ctx, s.into_bytes())
+}
+
+/// `TextDecoder.decode`: UTF-8, invalid bytes replaced unless `fatal`.
+fn decode<'js>(
+    ctx: Ctx<'js>,
+    b: TypedArray<'js, u8>,
+    fatal: bool,
+    ignore_bom: bool,
+) -> rquickjs::Result<rquickjs::String<'js>> {
+    // Safety: no JavaScript runs while `b` is borrowed.
+    let b = unsafe { b.as_bytes() }.unwrap_or_default();
+    let b = if ignore_bom { b } else { b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(b) };
+    match std::str::from_utf8(b) {
+        Ok(s) => rquickjs::String::from_str(ctx, s),
+        Err(_) if fatal => Err(Exception::throw_type(&ctx, "TextDecoder: the data is not valid UTF-8")),
+        Err(_) => rquickjs::String::from_str(ctx.clone(), &String::from_utf8_lossy(b)),
+    }
+}
+
+/// `new URL(input, base)`, by the WHATWG parser of the url crate: its parts,
+/// `[href, origin, protocol, username, password, host, hostname, port,
+/// pathname, search, hash]`.
+fn parse_url(ctx: Ctx, input: String, base: Option<String>) -> rquickjs::Result<Vec<String>> {
+    let url = match &base {
+        Some(base) => Url::parse(base).and_then(|base| base.join(&input)),
+        None => Url::parse(&input),
+    };
+    url.map(|u| parts(&u)).map_err(|e| Exception::throw_type(&ctx, &format!("Invalid URL {input:?}: {e}")))
+}
+
+/// A URL setter: the parts of `href` with `part` set to `value`. Like the
+/// browser's, setters other than `href` ignore values they can't take.
+fn set_url(ctx: Ctx, href: String, part: String, value: String) -> rquickjs::Result<Vec<String>> {
+    let mut url = Url::parse(&href).map_err(|e| Exception::throw_type(&ctx, &e.to_string()))?;
+    let _ = match part.as_str() {
+        "href" => {
+            quirks::set_href(&mut url, &value)
+                .map_err(|e| Exception::throw_type(&ctx, &format!("Invalid URL {value:?}: {e}")))?;
+            Ok(())
         }
-        (parts, from_js_headers(args.get_or_undefined(4), ctx)?, bytes(args.get_or_undefined(5), ctx)?)
+        "protocol" => quirks::set_protocol(&mut url, &value),
+        "username" => quirks::set_username(&mut url, &value),
+        "password" => quirks::set_password(&mut url, &value),
+        "host" => quirks::set_host(&mut url, &value),
+        "hostname" => quirks::set_hostname(&mut url, &value),
+        "port" => quirks::set_port(&mut url, &value),
+        "pathname" => Ok(quirks::set_pathname(&mut url, &value)),
+        "search" => Ok(quirks::set_search(&mut url, &value)),
+        "hash" => Ok(quirks::set_hash(&mut url, &value)),
+        _ => Ok(()),
     };
-    let [method, scheme, authority, path] = parts;
-    let url = format!("{scheme}://{authority}{path}");
-    let (status, headers, body) = outgoing(method, scheme, authority, path, headers, body)
-        .await
-        .map_err(|e| js_error!(TypeError: "fetch {}: {:?}", url, e))?;
-    let ctx = &mut ctx.borrow_mut();
-    let answer = [JsValue::from(status), to_js_headers(headers, ctx)?, JsUint8Array::from_iter(body, ctx)?.into()];
-    Ok(JsArray::from_iter(answer, ctx).into())
+    Ok(parts(&url))
 }
 
-// ---- wasi:http -------------------------------------------------------------
-
-fn internal(what: impl std::fmt::Debug) -> ErrorCode {
-    ErrorCode::InternalError(Some(format!("{what:?}")))
+fn parts(u: &Url) -> Vec<String> {
+    use quirks::*;
+    let parts =
+        [href(u), &origin(u), protocol(u), username(u), password(u), host(u), hostname(u), port(u), pathname(u)];
+    parts.into_iter().chain([search(u), hash(u)]).map(String::from).collect()
 }
 
-async fn read(request: Request) -> (String, String, Headers, Vec<u8>) {
-    let method = match request.get_method() {
-        Method::Get => "GET".into(),
-        Method::Head => "HEAD".into(),
-        Method::Post => "POST".into(),
-        Method::Put => "PUT".into(),
-        Method::Delete => "DELETE".into(),
-        Method::Connect => "CONNECT".into(),
-        Method::Options => "OPTIONS".into(),
-        Method::Trace => "TRACE".into(),
-        Method::Patch => "PATCH".into(),
-        Method::Other(m) => m,
-    };
-    let scheme = match request.get_scheme() {
-        Some(Scheme::Https) => "https",
-        _ => "http",
-    };
-    let authority = request.get_authority().unwrap_or_else(|| "localhost".into());
-    let path = request.get_path_with_query().unwrap_or_else(|| "/".into());
-    let headers = request.get_headers().copy_all();
-    let (done_tx, done_rx) = wit_future::new(|| Ok(()));
-    let (body, _trailers) = Request::consume_body(request, done_rx);
-    let body = body.collect().await;
-    drop(done_tx);
-    (method, format!("{scheme}://{authority}{path}"), headers, body)
+/// `console`: `fd` 1 is the object's stdout, 2 its stderr.
+fn print(fd: u32, text: String) {
+    if fd == 2 { eprintln!("{text}") } else { println!("{text}") }
 }
 
-/// A response whose body a spawned task writes once the host has it.
-fn respond(status: u16, mut headers: Headers, body: Vec<u8>) -> Result<Response, ErrorCode> {
-    headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-    headers.push(("content-length".into(), body.len().to_string().into_bytes()));
-    let fields = Fields::from_list(&headers).map_err(internal)?;
-    let (mut body_tx, body_rx) = wit_stream::new();
-    let (trailers_tx, trailers_rx) = wit_future::new(|| Ok(None));
-    let (response, _done) = Response::new(fields, Some(body_rx), trailers_rx);
-    drop(trailers_tx);
-    response.set_status_code(status).map_err(|()| internal(format!("status {status}")))?;
-    wasip3::spawn_local(async move {
-        let _ = body_tx.write_all(body).await;
-    });
-    Ok(response)
-}
-
-async fn outgoing(
+/// `send(method, url, headers, body)`: an outgoing request through the host
+/// (so under the app's egress policy). Resolves to `[status, headers, body]`,
+/// or to the error's text.
+fn send<'js>(
+    ctx: Ctx<'js>,
     method: String,
-    scheme: String,
-    authority: String,
-    path: String,
-    headers: Headers,
-    body: Vec<u8>,
-) -> Result<(u16, Headers, Vec<u8>), ErrorCode> {
-    let fields = Fields::from_list(&headers).map_err(internal)?;
-    let (mut body_tx, body_rx) = wit_stream::new();
-    let (trailers_tx, trailers_rx) = wit_future::new(|| Ok(None));
-    let (request, _sent) = Request::new(fields, Some(body_rx), trailers_rx, None);
-    drop(trailers_tx);
-    let method = match method.as_str() {
-        "GET" => Method::Get,
-        "HEAD" => Method::Head,
-        "POST" => Method::Post,
-        "PUT" => Method::Put,
-        "DELETE" => Method::Delete,
-        "PATCH" => Method::Patch,
-        "OPTIONS" => Method::Options,
-        "CONNECT" => Method::Connect,
-        "TRACE" => Method::Trace,
-        _ => Method::Other(method),
-    };
-    let scheme = match scheme.as_str() {
-        "http" => Scheme::Http,
-        "https" => Scheme::Https,
-        _ => Scheme::Other(scheme),
-    };
-    request.set_method(&method).map_err(|()| internal("method"))?;
-    request.set_scheme(Some(&scheme)).map_err(|()| internal("scheme"))?;
-    request.set_authority(Some(&authority)).map_err(|()| internal("authority"))?;
-    request.set_path_with_query(Some(&path)).map_err(|()| internal("path"))?;
-    wasip3::spawn_local(async move {
-        let _ = body_tx.write_all(body).await;
+    url: String,
+    headers: Vec<String>,
+    body: Option<TypedArray<'js, u8>>,
+) -> rquickjs::Result<Promise<'js>> {
+    let mut request = nanovm_sdk::fetch(url.clone()).method(&method);
+    for kv in headers.chunks_exact(2) {
+        request = request.header(&kv[0], &kv[1]);
+    }
+    if let Some(body) = body {
+        request = request.body(bytes(&body));
+    }
+    let (promise, resolve, _) = Promise::new(&ctx)?;
+    let resolve = Persistent::save(&ctx, resolve);
+    spawn(async move {
+        let reply = request.send().await;
+        let settle: Settle = Box::new(move |ctx| {
+            let resolve = resolve.restore(&ctx)?;
+            match reply {
+                Ok(r) => {
+                    let headers: Vec<String> = r.headers.into_iter().flat_map(|(k, v)| [k, v]).collect();
+                    resolve.call((List((r.status, headers, TypedArray::new(ctx.clone(), r.body)?)),))
+                }
+                Err(e) => resolve.call((format!("fetch {url}: {e:?}"),)),
+            }
+        });
+        settle
     });
-    let response = wasip3::http::client::send(request).await?;
-    let status = response.get_status_code();
-    let headers = response.get_headers().copy_all();
-    let (done_tx, done_rx) = wit_future::new(|| Ok(()));
-    let (body, _trailers) = Response::consume_body(response, done_rx);
-    let body = body.collect().await;
-    drop(done_tx);
-    Ok((status, headers, body))
+    Ok(promise)
+}
+
+/// `sleep(ms, then)`: calls `then` after `ms` milliseconds (timers).
+fn sleep<'js>(ctx: Ctx<'js>, ms: f64, then: Function<'js>) {
+    let then = Persistent::save(&ctx, then);
+    spawn(async move {
+        monotonic_clock::wait_for((ms.max(0.0) * 1e6) as u64).await;
+        let settle: Settle = Box::new(move |ctx| then.restore(&ctx)?.call(()));
+        settle
+    });
 }

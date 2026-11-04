@@ -154,6 +154,7 @@ pub async fn sleep(duration: std::time::Duration) {
 /// `max_request_body_kb`).
 pub struct Request {
     method: String,
+    url: String,
     path: String,
     query: Vec<(String, String)>,
     headers: Vec<(String, String)>,
@@ -176,7 +177,13 @@ impl Request {
         };
         let headers = request.get_headers().copy_all().into_iter();
         let headers = headers.map(|(k, v)| (k.to_ascii_lowercase(), String::from_utf8_lossy(&v).into_owned())).collect();
+        let scheme = match request.get_scheme() {
+            Some(wit::Scheme::Https) => "https",
+            _ => "http",
+        };
+        let authority = request.get_authority().unwrap_or_else(|| "localhost".into());
         let pq = request.get_path_with_query().unwrap_or_else(|| "/".into());
+        let url = format!("{scheme}://{authority}{pq}");
         let (path, query) = pq.split_once('?').unwrap_or((&pq, ""));
         let pair = |kv: &str| {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
@@ -188,12 +195,17 @@ impl Request {
         let (body, _trailers) = wit::Request::consume_body(request, result_rx);
         let body = body.collect().await;
         drop(result_tx);
-        Request { method, path, query, headers, body }
+        Request { method, url, path, query, headers, body }
     }
 
     /// `GET`, `POST`, ….
     pub fn method(&self) -> &str {
         &self.method
+    }
+
+    /// The whole URL, as received: `http://{host}/a/b?q=1` for `/{object}/a/b?q=1`.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// The path within the object: `/{object}/a/b` arrives as `/a/b`.
@@ -316,6 +328,7 @@ impl Response {
 
     /// The response as `wasip3`'s, for a handler written against it directly.
     pub fn into_wit(mut self) -> core::result::Result<wit::Response, wit::ErrorCode> {
+        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
         self.headers.push(("content-length".into(), self.body.len().to_string().into()));
         let headers = fields(&self.headers)?;
         let (response, _) = wit::Response::new(headers, Some(stream(self.body)), no_trailers());
