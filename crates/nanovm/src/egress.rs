@@ -157,37 +157,32 @@ type IoFuture = Box<dyn Future<Output = Result<(), Error>> + Send>;
 impl WasiHttpHooks for EgressHooks {
     fn send_request(
         &mut self,
-        request: http::Request<WasiBody>,
+        mut request: http::Request<WasiBody>,
         options: Option<RequestOptions>,
         _fut: Box<dyn Future<Output = Result<(), Error>> + Send>,
     ) -> Box<dyn Future<Output = Result<(http::Response<WasiBody>, IoFuture), Error>> + Send> {
-        let route = self.route.clone();
-        let sem = self.sem.clone();
-        let metrics = self.metrics.clone();
-        let obj = self.obj.clone();
-        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(crate::telemetry::PATH) {
-            return Box::new(async { Err(Error::HttpRequestDenied) });
-        }
-        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS) {
-            let node = self.node.clone();
-            return Box::new(async move { Ok((call(node, sem, obj, request).await?, Box::new(async { Ok(()) }) as IoFuture)) });
-        }
+        let (route, sem, metrics) = (self.route.clone(), self.sem.clone(), self.metrics.clone());
+        let (node, obj) = (self.node.clone(), self.obj.clone());
         if request.uri().host() == Some(crate::ws::PUBLISH_HOST) {
             let (held, max) = (self.held.clone(), self.publish_max);
-            return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
+            return Box::new(async move {
+                let res = match request.uri().path() {
+                    p if p.starts_with(crate::telemetry::PATH) => return Err(Error::HttpRequestDenied),
+                    p if p.starts_with(CALLS) => call(node, sem, obj, request).await?,
+                    _ => hold(request, &obj, &held, max).await,
+                };
+                Ok((res, Box::new(async { Ok(()) }) as IoFuture))
+            });
         }
-        let node = self.node.clone();
         Box::new(async move {
             use opentelemetry::{KeyValue, propagation::TextMapPropagator, trace::{Span, SpanKind, TraceContextExt}};
             let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
             let parent = obj.context.lock().clone();
             let mut span = scopeguard::guard(node.telemetry.span("http.client", &obj.id, &parent, SpanKind::Client), cancelled);
-            span.set_attribute(KeyValue::new("http.request.method", request.method().as_str().chars().take(32).collect::<String>()));
-            span.set_attribute(KeyValue::new("url.path", request.uri().path().chars().take(1024).collect::<String>()));
+            crate::telemetry::request(&mut span, &request);
             span.set_attribute(KeyValue::new("server.address", request.uri().host().unwrap_or("").chars().take(253).collect::<String>()));
             if let Some(port) = request.uri().port_u16() { span.set_attribute(KeyValue::new("server.port", port as i64)); }
             let context = parent.with_remote_span_context(span.span_context().clone());
-            let mut request = request;
             opentelemetry_sdk::propagation::TraceContextPropagator::new()
                 .inject_context(&context, &mut opentelemetry_http::HeaderInjector(request.headers_mut()));
             let target = request.uri().clone();
@@ -199,15 +194,7 @@ impl WasiHttpHooks for EgressHooks {
                 };
                 // The permit lives as long as the response body, so a guest
                 // holding bodies open holds that many connections.
-                let res = res.map(|b| {
-                    b.map_frame(move |f| {
-                        let _ = &permit;
-                        f
-                    })
-                    .boxed_unsync()
-                });
-                let io: IoFuture = Box::new(conn);
-                Ok((res, io))
+                Ok((res.map(|b| holding(b, permit).boxed_unsync()), Box::new(conn) as IoFuture))
             }
             .await;
             let mut span = scopeguard::ScopeGuard::into_inner(span);
@@ -221,6 +208,19 @@ impl WasiHttpHooks for EgressHooks {
             res
         })
     }
+}
+
+/// `body`, holding `guard` until it is dropped.
+pub fn holding<B: http_body::Body, G>(body: B, guard: G) -> impl http_body::Body<Data = B::Data, Error = B::Error> {
+    body.map_frame(move |f| {
+        let _ = &guard;
+        f
+    })
+}
+
+/// A response as the guest's HTTP client takes it.
+fn to_guest<B: http_body::Body<Data = bytes::Bytes> + Send + 'static>(res: http::Response<B>) -> http::Response<WasiBody> {
+    res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync())
 }
 
 /// Sends `req`, for `http://nanovm/objects/{id}/{path}`, to object `id` of
@@ -239,8 +239,7 @@ async fn call(
     let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
     let parent = obj.context.lock().clone();
     let mut span = scopeguard::guard(node.telemetry.span("call", &obj.id, &parent, SpanKind::Client), cancelled);
-    span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
-    span.set_attribute(KeyValue::new("url.path", req.uri().path().chars().take(1024).collect::<String>()));
+    crate::telemetry::request(&mut span, &req);
     let result = async {
         let (mut parts, body) = req.into_parts();
         parts.extensions.insert(parent.with_remote_span_context(span.span_context().clone()));
@@ -248,9 +247,6 @@ async fn call(
         let rest = target.path_and_query().map_or("", |p| p.as_str()).strip_prefix(CALLS).unwrap_or("");
         let (id, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
         span.set_attribute(KeyValue::new("nanovm.target_object", id.chars().take(128).collect::<String>()));
-        let to_guest = |res: http::Response<crate::object::RespBody>| {
-            res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync())
-        };
         if !node.wait_for(&obj, id) {
             let why = format!("{id} is already waiting on {}", obj.id);
             return Ok(to_guest(crate::object::error_response(508, "call-cycle", &why)));
@@ -265,13 +261,7 @@ async fn call(
             .map_err(|_| Error::HttpRequestUriInvalid)?;
         let res = node.dispatch(id, http::Request::from_parts(parts, body)).await;
         // The permit lives as long as the response body, as for any request.
-        Ok(to_guest(res.map(|b| {
-            b.map_frame(move |f| {
-                let _ = &permit;
-                f
-            })
-            .boxed_unsync()
-        })))
+        Ok(to_guest(res.map(|b| holding(b, permit))))
     }.await;
     let mut span = scopeguard::ScopeGuard::into_inner(span);
     client_response(&mut span, result.as_ref(), true);
@@ -338,8 +328,21 @@ async fn hold(
             200
         }
     };
+    empty(status)
+}
+
+/// An answer with no body.
+fn empty(status: u16) -> http::Response<WasiBody> {
     let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
     *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
+    res
+}
+
+/// The supervisor's own answer to a forwarded request, marked with
+/// `verdict` (see [`VERDICT`]).
+pub(crate) fn verdict(status: u16, verdict: &str) -> http::Response<WasiBody> {
+    let mut res = empty(status);
+    res.headers_mut().insert(VERDICT, verdict.parse().expect("verdicts are header values"));
     res
 }
 
@@ -361,10 +364,7 @@ async fn forward(mut req: http::Request<WasiBody>, options: Option<RequestOption
     let mut res = up.send(req).await.map_err(|_| Error::ConnectionTerminated)?;
     let verdict = res.headers_mut().remove(VERDICT);
     match verdict.as_ref().map(|v| v.as_bytes()) {
-        Some(b"ok") => Ok((
-            res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync()),
-            Box::pin(async { Ok(()) }),
-        )),
+        Some(b"ok") => Ok((to_guest(res), Box::pin(async { Ok(()) }))),
         Some(name) => Err(error_named(name)),
         None => Err(Error::ConnectionTerminated),
     }
@@ -414,11 +414,7 @@ pub async fn serve_forwarded(
         }
         Err(e) => {
             let name = format!("{e:?}");
-            let name = name.split(['(', ' ', '{']).next().unwrap_or("ConnectionTerminated");
-            let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
-            *res.status_mut() = http::StatusCode::BAD_GATEWAY;
-            res.headers_mut().insert(VERDICT, name.parse().unwrap());
-            res
+            verdict(502, name.split(['(', ' ', '{']).next().unwrap_or("ConnectionTerminated"))
         }
     }
 }
@@ -447,13 +443,10 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
                 };
             // Every resolved address must be public: a name that mixes in a
             // private address is treated as a rebinding attempt.
-            if addrs.is_empty() {
-                return Err(Error::DestinationNotFound);
-            }
             if !addrs.iter().all(|a| is_global(a.ip())) {
                 return Err(Error::DestinationIpProhibited);
             }
-            addrs[0]
+            *addrs.first().ok_or(Error::DestinationNotFound)?
         }
     };
 

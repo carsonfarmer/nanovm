@@ -36,6 +36,14 @@ pub fn response<B>(span: &mut Span, response: &Response<B>) {
     }
 }
 
+/// A request's method and path, as every span of one carries them.
+pub fn request<B>(span: &mut Span, req: &Request<B>) {
+    use opentelemetry::trace::Span as _;
+    span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
+    let path = req.uri().path();
+    span.set_attribute(KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
+}
+
 pub(crate) const PATH: &str = "/telemetry/";
 const MAX_BATCH: usize = 1 << 20;
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -154,9 +162,7 @@ impl Telemetry {
             span.set_status(opentelemetry::trace::Status::error("cancelled"));
             span.set_attribute(KeyValue::new("error.type", "cancelled"));
         });
-        span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
-        let path = req.uri().path();
-        span.set_attribute(KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
+        request(&mut span, &req);
         let context = parent.with_remote_span_context(span.span_context().clone());
         propagator.inject_context(&context, &mut opentelemetry_http::HeaderInjector(req.headers_mut()));
         let res = send(req).await;
