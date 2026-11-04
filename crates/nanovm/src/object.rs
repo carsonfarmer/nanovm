@@ -243,23 +243,37 @@ pub struct Scratch {
     free: Mutex<Vec<PathBuf>>,
 }
 
+/// The name of the next new scratch directory.
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
 impl Scratch {
-    /// Scratch under `dir`, where whatever a previous run left is garbage.
+    /// Scratch under `dir`. A previous run (a worker that was killed or
+    /// retired) leaves a directory for each instance it had: one left empty
+    /// is handed out again, anything else is removed. Removing them all made
+    /// a worker that had served 200 objects start half a second late.
     /// `dir` itself stays: a jailed worker's Landlock rule names it.
     pub fn new(dir: PathBuf) -> std::io::Result<Arc<Scratch>> {
         std::fs::create_dir_all(&dir)?;
+        let mut free = Vec::new();
         for e in std::fs::read_dir(&dir)? {
-            let _ = std::fs::remove_dir_all(e?.path());
+            let e = e?;
+            // New names start past those left.
+            let n = e.file_name().to_str().and_then(|n| n.parse::<u64>().ok());
+            NEXT.fetch_max(n.map_or(0, |n| n + 1), Relaxed);
+            if e.file_type()?.is_dir() && empty(&e.path()) {
+                free.push(e.path());
+            } else {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
         }
-        Ok(Arc::new(Scratch { dir, free: Mutex::default() }))
+        Ok(Arc::new(Scratch { dir, free: Mutex::new(free) }))
     }
 
     fn take(self: &Arc<Self>) -> std::io::Result<TmpDir> {
-        static N: AtomicU64 = AtomicU64::new(0);
         let path = match self.free.lock().pop() {
             Some(path) => path,
             None => {
-                let path = self.dir.join(N.fetch_add(1, Relaxed).to_string());
+                let path = self.dir.join(NEXT.fetch_add(1, Relaxed).to_string());
                 std::fs::create_dir(&path)?;
                 path
             }
@@ -274,12 +288,15 @@ struct TmpDir(PathBuf, Option<Arc<Scratch>>);
 
 impl Drop for TmpDir {
     fn drop(&mut self) {
-        let empty = || std::fs::read_dir(&self.0).is_ok_and(|mut d| d.next().is_none());
         match &self.1 {
-            Some(scratch) if empty() => scratch.free.lock().push(std::mem::take(&mut self.0)),
+            Some(scratch) if empty(&self.0) => scratch.free.lock().push(std::mem::take(&mut self.0)),
             _ => _ = std::fs::remove_dir_all(&self.0),
         }
     }
+}
+
+fn empty(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none())
 }
 
 pub struct ObjState {
@@ -838,6 +855,35 @@ impl ObjState {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    /// What a previous run left in an app's scratch: an empty directory is
+    /// handed out again as it is (not removed and made anew, which blocked
+    /// a restart for milliseconds per directory), one with anything in it is
+    /// removed, and new directories never take a name that is left.
+    #[test]
+    fn scratch_left_by_a_previous_run() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("nanovm-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["7", "900", "x"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(dir.join("x/f"), "left").unwrap();
+        let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+        let mut left = [ino(&dir.join("7")), ino(&dir.join("900"))];
+        left.sort();
+
+        let scratch = Scratch::new(dir.clone()).unwrap();
+        assert!(!dir.join("x").exists(), "a used directory is removed");
+        let mut taken: Vec<_> = (0..3).map(|_| scratch.take().unwrap()).collect();
+        let mut kept: Vec<_> = taken[..2].iter().map(|t| ino(&t.0)).collect();
+        kept.sort();
+        assert_eq!(kept, left, "the empty ones are reused first");
+        let new = taken[2].0.file_name().unwrap().to_str().unwrap().parse::<u64>().unwrap();
+        assert!(new > 900, "a new name is past those left: {new}");
+        taken.clear();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The limiter caps the sum of every memory's growth; a refused growth
     /// is remembered and leaves the usage as it was.

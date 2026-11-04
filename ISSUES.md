@@ -387,6 +387,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `journal.rs` (`local_at` → `fd_path`)
 - **Scenario:** found by the perf review: a `readlink` per open was 4.5% of in-process CPU (the counter's GET opens `/data/count`).
 - **Status:** fixed in be6ea35 (the volume's own descriptor resolves without asking; subdirectories still do)
+
+### N-150 (efficiency): a restarted worker removed every scratch directory its predecessor left
+- **Where:** `object.rs` (`Scratch::new`)
+- **Scenario:** found by the cold2 workstream. A worker that is killed, retired or switched leaves one `/tmp` directory per live instance (N-50 keeps them for reuse). The next worker's start removed them all before serving, at about 3 ms of wall time each on a disk mounted with `discard` (N-50): its first request waited 0.1–0.6 s after 200 objects and 1.0–1.9 s after 1,000.
+- **Reproduced:** yes (phase marks in the worker; `notes/cold2.md`)
+- **Status:** fixed in <commit> (empty ones are handed out again, used ones removed): first request after 1,000 objects 1,211 → 51 ms
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
