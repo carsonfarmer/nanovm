@@ -363,20 +363,21 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** found by the perf review at `491e790`. The probe's socket is registered with the control runtime's reactor and then pooled as thread 0's. Front thread 0 reuses it, so each request on it is woken through the control thread: in some supervisor instances the control thread made 2 voluntary context switches per request at c=1 (0.03 in others, depending on pool order).
 - **Reproduced:** yes (per-thread `voluntary_ctxt_switches` deltas over 3,000 requests at c=1)
 - **Fix (proposed):** give control threads their own pool index (`Dialer::new(requests, threads + 1)` and `link::set_thread(threads)` on the control runtime's threads), or don't pool the probe's connection.
-- **Status:** open
+- **Status:** fixed in e88acd5 (hop; the control runtime's threads use the pool after the front threads'; on a fresh supervisor at c=1 the control thread went from 1.90 to 0.03 voluntary context switches per request)
 
 ### N-41: a read on a link wakes the other process for nothing
 - **Where:** `link.rs` (tokio registers every `UnixStream` for readable and writable)
 - **Scenario:** found by the perf review. Unix stream sockets wake writers waiting for space (`unix_write_space`) every time the peer consumes data, unlike TCP, which only does so after the writer ran out of space. With writable interest always registered, the worker's read of each request wakes the supervisor's epoll thread, and the supervisor's read of each response wakes the worker's: one spurious wakeup per hop per request at low concurrency.
 - **Reproduced:** yes (`perf record -e sched:sched_wakeup` on the worker: one wakeup per request from the link read)
 - **Fix (proposed):** register link sockets for readable only (`AsyncFd` with `Interest::READABLE`) and wait for writability only while a write is blocked.
-- **Status:** open
+- **Status:** fixed in fb7055d (hop; a write that finds the socket full waits on a dup of the descriptor registered for writes)
 
 ### N-42: at low concurrency the worker wakes its idle runtime threads for every request
 - **Where:** `supervisor.rs` (`worker_main`'s multi-threaded runtime), `object.rs` (the actor's store poll)
 - **Scenario:** found by the perf review. At c=1 the worker made about 4 voluntary context switches per request (one per runtime thread) where 1 is needed: the actor wakes itself during its own poll (Wasmtime yields by self-wake, guest events wake it), Tokio queues it for stealing and wakes an idle thread, and a thread that finds work after searching wakes another. Per-request CPU at c=1 is about 3.5× that at c256. A waker that re-polls the actor on a self-wake did not remove them.
 - **Reproduced:** yes (per-thread context-switch deltas, strace and `sched_wakeup` traces)
-- **Status:** open; see W-20
+- **Cause (hop):** two things woke the actor during its own poll, and Tokio treats that as a yield (back of the queue, wake an idle thread to steal it). An object idle for over a tick had an expired epoch deadline, so its next request yielded at its first instruction; and Wasmtime wakes the store's task three times per request (the guest returning, its task ending, once in its event loop).
+- **Status:** fixed in 1b6b882 (the deadline is reset when a request starts) and 4c37fad (a wake during the store's own poll polls again at once; the epoch callback's yield, and any wake after a tick, still reach Tokio). At c=1 the worker now makes about 1.1 voluntary context switches per request (was 4-5); see notes/hop.md
 
 ### N-43: the supervisor redoes pure per-app work on every request
 - **Where:** `registry.rs` (`AppRef::name`: SHA-256 and six allocations; `from_headers`: clones the cached `Reference`, parses the trust list)
@@ -461,6 +462,18 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** found by the cold2 workstream (perf over 30 restarts). The SDK's bounded channel initializes all 2,048 `SpanData` slots up front, so creating it page-faults its memory in: most of the 0.7–1.0 ms `Telemetry::new` takes at each worker start, and memory every worker keeps. A smaller queue risks dropped spans under load (N-36); not changed here.
 - **Reproduced:** yes (perf: page faults under `mpmc::array::Channel::with_capacity` from `BatchSpanProcessor::new`)
 - **Status:** open
+
+### N-120: a heavy request with a free lane never gave up its thread
+- **Where:** `object.rs` (the epoch callback's `YieldCustom` for requests past `HEAVY_AFTER_NS`)
+- **Scenario:** found by hop. Past 10 ms of CPU a request hands back its heavy lane at every tick and takes it again. When a lane was free, taking it completed at once, so the request never returned to the executor between 10 ms and its CPU budget. Work stealing hid most of it (other threads take the tasks queued behind it), but not the task in Tokio's LIFO slot, and nothing on a one-thread runtime.
+- **Reproduced:** yes (`a_spinner_yields_its_thread_at_each_tick`: a short request beside a spinner on a one-thread runtime finished at 102.8 ms, with the spinner's CPU kill)
+- **Status:** fixed in 4805ba9 (the heavy path yields once before taking a lane)
+
+### N-121: a jailed worker drops request spans above roughly 25k spans per second
+- **Where:** the worker's `BatchSpanProcessor` (queue of 2048) exporting through the supervisor's relay
+- **Scenario:** found by hop. With oha at 256 clients on the 4-core VM (other agents loading it), runs at 20-28k req/s lost 0-11% of the worker's `request` spans ("BatchSpanProcessor dropped a Span due to queue full"); supervisor spans were all delivered. At a fixed 15k req/s nothing was lost, before or after hop's changes. The export path (one export at a time, through the link, the relay's three slots and the Python counting sink) is slower than the request path at that rate; whether the sink or the relay is the limit was not measured.
+- **Reproduced:** yes, in both the wave-1 build and hop's
+- **Status:** open (owner decision Q70 keeps every span; a larger queue or concurrent exports would be the next things to measure)
 
 ## Planned work
 
@@ -660,13 +673,13 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-20: thread-per-core workers
 - **What:** one current-thread runtime per core in the worker, each owning the objects that hash to it; the supervisor sends an object's requests on a link bound to that thread (the byte sent with each fd can name it). A request would then stay on one thread end to end in the worker, removing N-42's wakeups and the actor-to-connection hops.
 - **Trade-off:** no work stealing between threads: hash collisions and CPU hogs (which yield every epoch tick) would delay the other objects on their thread, so "neighbours under attack" and `cpu_hogs_leave_cores_for_short_requests` must be re-measured. Needs an owner decision.
+- **Status (hop):** not built. Its main motivation, N-42's wakeups, is fixed on the multi-threaded runtime (about 1.1 context switches per request in the worker at c=1), so what remains for it is cache locality under load. It would first need every tick to yield (N-120, done) and a way to keep heavy requests from delaying their thread's neighbours by a tick each.
 
 ### W-21: cheaper link framing
 - **What:** hyper's HTTP/1.1 client in the supervisor and server in the worker cost about 5% of a request (excluding the syscalls, which any framing keeps). A length-prefixed framing could save about 4%, but every link user (requests, egress, telemetry relay, publishes, drains, restarts) would need it. Not worth it yet.
 
 ### W-22: telemetry still costs about 10% of a production request
 - **What:** after N-74, the remaining cost is mostly the SDK: span creation and attributes, and OTLP encoding of the supervisor's own spans (about 3 µs per request) and the worker's (about 2.5 µs). Reducing it without a custom exporter (Q64/Q66) means fewer allocations per span (e.g. `Arc<str>` object ids instead of new `String`s).
-
 ### W-60: simplifications left in files another branch had (lean2)
 - **What:** found in the lean2 pass, not done because the hop branch was changing these files:
   - `supervisor.rs`: the egress link's closure clones six captures per request; one small struct with a `serve` method holds them (about −4 lines). `admin()` and `get()` build empty bodies by hand (−3 with a shared helper).
