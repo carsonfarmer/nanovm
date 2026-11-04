@@ -443,6 +443,17 @@ Content hashes only identify data; the prototype's immediate reference reclamati
 does not supply replica retention or an export protocol. Avoid Wasmtime patches
 unless a demonstrated bug/inefficiency warrants separate upstream work.
 
+**Inode proof (Q79):** both candidates now share a flat name-to-inode layer, held
+descriptor ownership, logical quotas and orphan reclamation. Namespace and data
+use one redb transaction; rejection invalidates all descriptors, while acceptance
+preserves them. Owner preference is hash-addressed pages when costs are close,
+not a blanket selection of plain pages. Range iteration and avoiding old-page
+reads on full-page writes bring reads/small writes close at a 1 MiB cache; unique
+large replacements still favor plain pages. Cache/RSS measurements, actual
+namespace-scan complexity and physical amplification must inform integration.
+This proof does not include WASI directories/streams, mixed SQL workloads, storage
+fault recovery or replica export; keep the production host unchanged.
+
 For actor ownership, use sequential `run_concurrent` phases with timeouts outside
 each invocation, retaining event-loop driving while idle. For storage, expose
 complete `replace_value`/`delete_value`/`resize`/`rename` operations and represent

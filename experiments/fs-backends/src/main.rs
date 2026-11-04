@@ -1,4 +1,6 @@
 //! Storage-only comparison, not a replacement WASI filesystem.
+mod inode;
+
 use anyhow::{Result, bail, ensure};
 use nanovm::{journal::Journal, object::ObjShared};
 use redb::{Database, Durability, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
@@ -76,6 +78,10 @@ impl Backend {
     }
 
     fn open(kind: &str, root: &Path) -> Result<Self> {
+        Self::open_cached(kind, root, 1 << 30)
+    }
+
+    fn open_cached(kind: &str, root: &Path, cache: usize) -> Result<Self> {
         fs::create_dir_all(root)?;
         if kind == "journal" {
             let root = root.canonicalize()?;
@@ -83,7 +89,9 @@ impl Backend {
             Ok(Self::Journal { root, journal })
         } else {
             ensure!(matches!(kind, "pages" | "hashed"), "unknown backend {kind}");
-            let db = Database::create(root.join("store.redb"))?;
+            let db = Database::builder()
+                .set_cache_size(cache)
+                .create(root.join("store.redb"))?;
             let mut tx = db.begin_write()?;
             tx.set_durability(Durability::Immediate)?;
             // Conservative untrusted-data policy, identical for both candidates.
@@ -128,10 +136,18 @@ impl Backend {
                     return Ok(None);
                 };
                 let mut result = vec![0; len];
-                for (i, dst) in result.chunks_mut(PAGE).enumerate() {
-                    let page = page(tx, *hashed, name, i as u64)?;
-                    let n = dst.len().min(page.len());
-                    dst[..n].copy_from_slice(&page[..n]);
+                let pages = tx.open_table(PAGES)?;
+                let blobs = if *hashed { Some(tx.open_table(BLOBS)?) } else { None };
+                for entry in pages.range((name, 0)..=(name, u64::MAX))? {
+                    let (key, stored) = entry?;
+                    let blob = match &blobs {
+                        Some(blobs) => Some(blobs.get(stored.value())?.expect("referenced blob")),
+                        None => None,
+                    };
+                    let bytes = blob.as_ref().map_or(stored.value(), |v| v.value());
+                    let start = key.value().1 as usize * PAGE;
+                    let n = bytes.len().min(len - start);
+                    result[start..start + n].copy_from_slice(&bytes[..n]);
                 }
                 Ok(Some(result))
             }
@@ -172,10 +188,14 @@ impl Backend {
                     let index = (at / PAGE) as u64;
                     let within = at % PAGE;
                     let n = rest.len().min(PAGE - within);
-                    let mut bytes = page(tx, *hashed, name, index)?;
-                    bytes.resize(bytes.len().max(within + n), 0);
-                    bytes[within..within + n].copy_from_slice(&rest[..n]);
-                    put_page(tx, *hashed, name, index, &bytes)?;
+                    if within == 0 && n == PAGE {
+                        put_page(tx, *hashed, name, index, &rest[..n])?;
+                    } else {
+                        let mut bytes = page(tx, *hashed, name, index)?;
+                        bytes.resize(bytes.len().max(within + n), 0);
+                        bytes[within..within + n].copy_from_slice(&rest[..n]);
+                        put_page(tx, *hashed, name, index, &bytes)?;
+                    }
                     at += n;
                     rest = &rest[n..];
                 }
@@ -561,6 +581,12 @@ fn bench(kind: &str, root: &Path, workload: &str, size: usize, count: usize, rou
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg.starts_with("inode") || arg == "density")
+    {
+        return inode::run(&args[1..]);
+    }
     if args.get(1).map(String::as_str) == Some("child") {
         return crash_child(&args[2], Path::new(&args[3]), &args[4]);
     }

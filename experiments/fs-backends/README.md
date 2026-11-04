@@ -164,3 +164,121 @@ does not retain replica history. Neither candidate exports versions yet.
 is enabled. Do not merge/publish migrated guests or claim WASI equivalence from
 these storage-only timings. Scope the descriptor/quota/cache-budget proof before
 implementing a broader filesystem replacement.
+
+## Inode, quota and cache proof (Q79, 2026-11-04)
+
+The owner prefers hash-addressed pages when timings are close, with simplicity
+also deciding. Both variants now share `inode.rs`: a **flat regular-file
+namespace**, persistent inode identities, explicit descriptor ownership, and
+logical byte/file/descriptor limits. Namespace entries and pages commit in the
+same redb transaction. An open descriptor continues to address its inode after
+rename-over or unlink; the last close reclaims an unlinked inode. Such inodes
+remain charged while held, including across commits. Restart reclaims committed
+orphans, because no descriptors survive process death. Reject discards the
+transaction and invalidates every descriptor, matching whole-instance disposal,
+not a savepoint that preserves guest execution.
+
+The same logical bytes are charged for duplicate content: deduplication never
+creates free logical capacity. Growth and handle/file quotas are checked before
+mutation; tests cover exact limits and one byte/entry beyond, sparse extension,
+zero-byte writes, shrink/regrow without old-tail exposure, aliases, commit-held
+descriptors, rejection of namespace changes, and orphan recovery. Six additional
+SIGKILL cuts test rename-over with a held old inode plus a companion file before,
+racing and after acceptance. These are process-death smoke tests, not power-loss
+certification. Storage errors terminate the probe; catchable storage-error and
+cancellation semantics are not implemented by this synchronous experiment.
+
+Two avoidable page-path costs were removed for **both** candidates: full-page
+writes no longer read the old page, and whole-file reads iterate the page range
+with tables opened once, copying directly into the output rather than allocating
+one intermediate vector per page. Partial writes still preserve untouched bytes.
+
+### Reproduce the bounded proof
+
+Build with the command above, then:
+
+```bash
+target/release/fs-backends inode
+target/release/fs-backends inode-bench > inode-bench.jsonl
+# Run each density invocation in its own fresh process.
+target/release/fs-backends density hashed 65536 64 1048576
+```
+
+`inode-bench` runs five workloads × two caches × two backends × three rotated
+rounds (60 rows), 40 transactions per row. Replacement now creates/writes/closes
+a fresh inode then renames it over the old name. This enforces real descriptor
+semantics; it is **not** the old path-keyed in-place replacement timing. Unaligned
+4 KiB writes start at byte 4093 in a 1 MiB file. Verification after reopen checks
+exact bytes, inode/byte counts and hash references. Cache limits are 64 KiB and
+1 MiB, not the old 1 GiB default. All acceptance remains immediate/two-phase.
+
+Median run means, microseconds; plain / hashed, after the page-path improvements:
+
+| Workload | 64 KiB cache | 1 MiB cache |
+|---|---:|---:|
+| Replace 128 B | 381.0 / 408.6 | 396.1 / 405.7 |
+| Replace 16 KiB | 505.6 / 656.2 | 531.0 / 541.8 |
+| Replace 1 MiB | 8039.3 / 13626.5 | 7089.4 / 10734.4 |
+| Read 1 MiB | 959.7 / 1025.5 | 962.3 / 945.4 |
+| Unaligned 4 KiB write | 427.9 / 639.2 | 415.6 / 577.1 |
+
+Before the improvements, 1 MiB reads at the 1 MiB cache measured
+1189.3 / 1328.9 µs. Raw pre/post matrices: `.amp/in/artifacts/inode-bench.jsonl`
+and `inode-bench-optimized.jsonl`. Do not compare these storage-only figures to
+HTTP/Wasm latency or call the new-inode replacement regression a hashing-only cost.
+Small writes and reads are close at the larger cache; unique large replacements
+and partial writes still are not. Keep hashing as the preferred candidate in the
+near-tie workloads, with plain pages as the control rather than choosing globally.
+
+### Memory and verification results
+
+`density KIND CACHE_BYTES 64 VALUE_BYTES` keeps 64 independent stores' writes
+uncommitted, samples RSS, accepts all transactions, checks their bytes, then
+samples RSS again. Three fresh processes per combination, 24 processes total.
+Median **incremental process RSS in KiB per store**, plain / hashed:
+
+| Cache | Value | All dirty | After acceptance/readback |
+|---|---|---:|---:|
+| 64 KiB | 128 B | 111.6 / 118.6 | 119.8 / 127.8 |
+| 64 KiB | 1 MiB | 231.1 / 234.2 | 259.9 / 235.1 |
+| 1 MiB | 128 B | 111.9 / 121.3 | 120.1 / 131.9 |
+| 1 MiB | 1 MiB | 1212.2 / 1212.1 | 1220.4 / 1225.3 |
+
+These include allocator retention, amortized process costs and active transaction
+metadata. They exclude the guest, Wasmtime, other host objects and kernel page
+cache. They are neither peaks nor hard bounds, and an apparent hashed memory win
+in one row is not a universal footprint advantage. The lower cache remains viable
+in these checks, at the latency cost shown above. Raw final matrix:
+`.amp/in/artifacts/inode-density-final.jsonl`. Earlier `inode-density` and
+`inode-density-optimized` files committed each store before creating the next;
+do not combine those with this dirty-transaction protocol.
+
+Six independent mutations failed: ignoring held references, removing file,
+descriptor or write-byte quota checks, retaining truncated tails, and failing to
+mark metadata-only changes dirty. Each was restored with `git checkout --` and
+an empty diff confirmed. Restored `check` and `inode` modes pass, as do rustfmt
+and strict experiment clippy. `env -u RUST_BACKTRACE cargo test --locked -p nanovm`
+passes 91 unit and 67 integration tests, eleven ignored. Host runtime remains
+5,074 lines; the shared inode/quota layer adds 228 nonblank/noncomment experiment
+lines before its checks, plus the validation and measurement code. No production
+code savings, new demo result or end-to-end performance claim.
+
+### What remains outside this proof
+
+No production host/guest/Wasmtime changes, directory traversal, links, permissions,
+WASI resources/streams, SQL, or remote export. Quotas are logical, not bounds on
+database allocation or retained COW versions. The cache setting is **not a total
+RSS limit**: transaction metadata, output buffers, allocator retention and other
+host state also consume memory. Directory membership currently scans the bounded
+name table on final close; restart can be quadratic in file count. Those choices
+avoid a second persisted index in this small proof, not an adoption-ready scale
+claim. Persistent inode numbers use the existing string-keyed page store to share
+the comparison code; no final filesystem format is selected.
+
+**Successor prompt:** continue `fs-page-semantics`; read Q79 and this section.
+Prefer hash-addressed pages where measured costs are close, without hiding its
+large-write cost or the cache/RSS distinction. Before building a production WASI
+adapter, settle total memory and physical-storage budgets, eliminate namespace
+scan scaling, and test storage failures. Then prove mixed SQL/KV/raw-file behavior
+through the actual host path. Keep production unchanged and do not merge migrated
+guests/publish packages without approval.

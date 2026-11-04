@@ -245,6 +245,12 @@ more bytes; hashing helps shared-content batches, not unique large writes. The
 experiment includes rejection, restart and process-death checks, but is not a WASI
 filesystem replacement or production durability certification. Runtime is unchanged.
 
+The [inode follow-up](experiments/fs-backends/README.md#inode-quota-and-cache-proof-q79-2026-11-04)
+adds shared descriptor/rename/unlink semantics, logical quotas and bounded-cache
+measurements for both candidates. Hash addressing is preferred when measured costs
+are close; unique large writes remain slower. This is a flat-namespace proof, not
+a production filesystem or a guarantee that cache size bounds total memory.
+
 **`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
 ## Calls between objects
