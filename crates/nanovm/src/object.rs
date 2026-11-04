@@ -409,7 +409,8 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
             st.cpu_exceeded = true;
             return Err(wasmtime::format_err!("cpu budget exceeded"));
         }
-        // Hand back the lane at every tick so heavy requests take turns.
+        // At every tick, let the other tasks on this thread run, and hand
+        // back the lane so heavy requests take turns.
         st.shared.lane.lock().take();
         if used < HEAVY_AFTER_NS {
             return Ok(UpdateDeadline::Yield(1));
@@ -418,6 +419,16 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
         Ok(UpdateDeadline::YieldCustom(
             1,
             Box::pin(async move {
+                // A free lane is taken at once, without a yield.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if std::mem::replace(&mut yielded, true) {
+                        return Poll::Ready(());
+                    }
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                })
+                .await;
                 if let Ok(p) = heavy.acquire_owned().await {
                     *shared.lane.lock() = Some(p);
                 }

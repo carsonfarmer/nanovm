@@ -367,6 +367,29 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
     );
 }
 
+/// A guest that has used a tick lets the other requests on its thread run:
+/// on a one-thread runtime, a short request started beside a spinning one
+/// finishes long before the spinner runs out of CPU.
+#[tokio::test(flavor = "current_thread")]
+async fn a_spinner_yields_its_thread_at_each_tick() {
+    let node = node("a_spinner_yields_its_thread_at_each_tick", "hostile", 8);
+    assert_eq!(get(&node, "canary", "/").await.status, 200);
+    let t0 = Instant::now();
+    // Spawned: the test's own future runs only once the queue is empty.
+    let timed = |id: &'static str, path: &'static str| {
+        let node = node.clone();
+        tokio::spawn(async move { (get(&node, id, path).await, t0.elapsed()) })
+    };
+    let (spinner, canary) = (timed("spinner", "/spin"), timed("canary", "/"));
+    let ((spun, spun_at), (canary, canary_at)) = (spinner.await.unwrap(), canary.await.unwrap());
+    assert_eq!(spun.error.as_deref(), Some("cpu"), "{}", spun.body);
+    assert_eq!(canary.status, 200, "{}", canary.body);
+    assert!(
+        canary_at < spun_at && canary_at < Duration::from_millis(50),
+        "the canary took {canary_at:?}, the spinner {spun_at:?}"
+    );
+}
+
 // ---- filesystem layout and quotas -------------------------------------
 
 /// `hostile` with room for heavy file work: writes and creates run inline
