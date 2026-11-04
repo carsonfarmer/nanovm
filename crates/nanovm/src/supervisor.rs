@@ -528,14 +528,7 @@ impl Supervisor {
 async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
     match live.link.send(req).await {
         // The body holds the worker until it has been read; see `drain`.
-        Ok(res) => res.map(|b| {
-            b.map_frame(move |f| {
-                let _ = &live;
-                f
-            })
-            .map_err(Into::into)
-            .boxed_unsync()
-        }),
+        Ok(res) => res.map(|b| crate::egress::holding(b, live).map_err(Into::into).boxed_unsync()),
         Err(e) => {
             w.link_errors.fetch_add(1, Relaxed);
             error_response(502, "worker-down", &e.to_string())
@@ -559,10 +552,7 @@ async fn drain(old: Arc<Live>) {
 
 /// A forwarded request's answer from the supervisor itself.
 fn verdict_ok(status: u16) -> Response<wasmtime_wasi_http::WasiBody> {
-    let mut res = Response::new(Empty::new().map_err(|e| match e {}).boxed_unsync());
-    *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
-    res.headers_mut().insert(crate::egress::VERDICT, "ok".parse().unwrap());
-    res
+    crate::egress::verdict(status, "ok")
 }
 
 fn get(pq: &str) -> Request<Body> {
