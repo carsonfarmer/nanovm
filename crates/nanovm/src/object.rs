@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use opentelemetry::trace::Span as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use wasmtime::component::{Accessor, ResourceTable, ResourceTableError};
-use wasmtime::{ResourceLimiter, Store, Trap, UpdateDeadline};
+use wasmtime::{AsContextMut, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::p3::bindings::Service;
@@ -576,6 +576,11 @@ async fn serve(
                 };
                 *shared.context.lock() = job.context.clone();
                 shared.begin_request();
+                // The next tick, not one that passed while the object was
+                // idle: a stale deadline made every request yield to the
+                // executor at its first instruction, and Tokio wakes an idle
+                // thread for a task that yields.
+                acc.with(|mut s| s.as_context_mut().set_epoch_deadline(1));
                 let abort = Arc::new(AtomicBool::new(false));
                 *pending.lock() = Some(Pending {
                     reply: Some(job.reply),
