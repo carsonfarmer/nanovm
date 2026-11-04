@@ -275,6 +275,25 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** yes: with `memory_mb = 32`, the test probe held 600 maps of 60 KiB, new or copied from a 60 KiB request header (36 MB each way), and a 100 KiB map.
 - **Status:** fixed in 98c1698: a head is at most 64 KiB at every hop (hyper's `max_header_size`, which also bounds trailers; over it a client gets 431), a guest's map at most 64 KiB, and an instance holds at most `memory_mb / 64 KiB` resources (`max_resources` is the lower of the two: 1,024 at 64 MiB, 256 at the counter's 16 MiB). So header maps the host holds for an instance stay within its memory limit, and 64 KiB is twice what nginx accepts by default (four 8 KiB header buffers). `guest_header_maps_are_bounded_by_the_memory_limit` (a test-only probe route) fails without each part.
 
+### N-90: references accepted non-ASCII tags
+- **Where:** `proxy.rs` `parse` (a `_nanovm` record's `app=`), through oci-spec's `Reference`
+- **Scenario:** oci-spec's reference regex matches tags with Unicode `\w`, so `app=ghcr.io/org/app:é` parsed, although the OCI distribution spec defines a tag as `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`. Harmless (no registry serves such a tag, and the proxy answered 502 either way), but the grammar and the spec disagreed. Found by the lean pass's differential test.
+- **Reproduced:** yes (unit test against oci-spec 0.10)
+- **Status:** fixed in d485694: the runtime parses references itself, with ASCII tags
+
+### N-91 (tests): `a_node_runs_at_most_max_apps` assumes a request reaches its worker within 200 ms
+- **Where:** `tests/integration.rs`, `a_node_runs_at_most_max_apps` (the `busy(c, 600)` then `sleep(200 ms)` step)
+- **Scenario:** the test spawns a slow request to app `c`, sleeps 200 ms, and expects `c` to be busy when app `a` asks for a slot. At load average 8 to 20 (several agents compiling on 4 cores) the spawned request has not reached the worker yet, `c` looks idle, `a` takes its slot and gets 200 instead of the expected 502.
+- **Reproduced:** yes: fails alone, every time, at load average 18 to 20 on the unchanged `491e790` and on `cf/lean`; passes on an idle machine
+- **Fix:** wait until the worker reports the request in flight (or the app's `Live` is held by a request) instead of sleeping a fixed time
+- **Status:** open
+
+### N-92 (tests): `the_proxy_outlasts_idle_and_excess_connections` binds the default publish port
+- **Where:** `tests/integration.rs`, `the_proxy_outlasts_idle_and_excess_connections`
+- **Scenario:** the proxies the test starts get a free `listen` port but no `publish_listen`, so each binds the default `127.0.0.1:8444`. Any other proxy on the host (a demo, another checkout's test run) makes the test fail with `Address already in use`.
+- **Reproduced:** yes, while another agent's tests ran
+- **Status:** fixed in dd2efa4 (the test gives each proxy a free publish port)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -400,3 +419,19 @@ The checkpoints below are historical, not outstanding product decisions.
 - **What:** each event answer and each publish is collected whole in the proxy, up to `max_response_body_kb` (8 MiB), with no bound across sockets, objects or apps: 1,000 sockets of one app answered at once is 8 GiB, and publishes are as many as objects committing at once. One app's plain Wasm can so exhaust the proxy every app shares. Parsing is not the problem: an answer is parsed and applied within one poll, so its parse (about 6–14 times its size, `ws::parse`) is bounded by the proxy's threads, and publishes now parse in about their size (N-72). Found by the sec review.
 - **Design:** (1) collect an answer up to `socket_backlog_kb`, not `max_response_body_kb` (in `Proxy::socket`'s `deliver`): `apply` queues an answer's messages at once, each costing its length plus 64, so an answer bigger than the socket's backlog overflows it and drops the socket anyway (only a flood of subscribe controls would fit). Answers then cost at most one backlog per socket, within the per-socket budgets the proxy already has. (2) publishes: a proxy-wide semaphore of publish bytes in flight (an operator setting, or `max_sockets_per_app × socket_backlog_kb` per app), acquired for the declared or collected size before buffering, so one app's commits wait rather than grow the proxy.
 - **Status:** open
+
+### W-40: drop `parking_lot` for std's `Mutex`, and name tokio's features
+- **What:** the runtime uses `parking_lot::Mutex` only for its non-poisoning `lock()`, and tokio's `full` feature also turns on tokio's own `parking_lot` use. With std's `Mutex` (futex-based since Rust 1.62) and tokio's features listed (`rt`, `rt-multi-thread`, `net`, `time`, `sync`, `macros`, `process`, `io-util`), `parking_lot`, `parking_lot_core` and `lock_api` leave the build (3 crates; measured with `cargo tree`). Every `.lock()` in `object.rs`, `supervisor.rs`, `quota.rs`, `egress.rs`, `ws.rs`, `proxy.rs` and `table.rs` changes, so it waits for the branches on those files to land. Take locks through one small helper, `.lock().unwrap_or_else(PoisonError::into_inner)`, so a panic while holding one behaves as today. Needs an A/B of CPU per request: tokio's scheduler and timer locks change too.
+- **Status:** open (lean pass; not done because it touches files other branches own)
+
+### W-41: one helper for the egress spans and the permit-holding body
+- **What:** in `egress.rs`, the `http.client` path (`send_request`) and `call` each set the same `http.request.method` and `url.path` attributes with the same truncation, and each wraps the response body in the same `map_frame(move |f| { let _ = &permit; f })` to tie the outbound permit to the body. One function for each would remove about ten lines and keep the two paths from drifting.
+- **Status:** open (lean pass; `egress.rs` belonged to the sec branch this round)
+
+### W-42: one TLS trust store for the node's own clients
+- **What:** guest egress verifies servers against the compiled-in `webpki-roots`, while the registry client and the proxy's DNS-over-HTTPS and registry calls use reqwest's `rustls` feature, which verifies against the host's certificate store through `rustls-platform-verifier`. Giving those clients a rustls `ClientConfig` built from `webpki-roots` (reqwest's `tls_backend_preconfigured`, as `egress::TLS` does) would make every TLS decision independent of the host's `/etc/ssl` and drop `rustls-platform-verifier`, `rustls-native-certs` and `openssl-probe`. It stops honouring CAs an operator installed, so it is the owner's call; registries must be on public addresses anyway.
+- **Status:** open (owner decision)
+
+### W-43: decide which wasm proposals guests may use
+- **What:** wasmtime's `gc`, `threads` and `stack-switching` cargo features decide whether guests may use GC types and exceptions, shared memories and stack switching. They are on because they are wasmtime's defaults, not by decision; the lean pass kept them, since turning one off changes which components load. If the node doesn't want them, dropping them removes their runtime code from every worker binary (GC heaps are allocated lazily, so there is no reservation to win back). Measure binary size and cold starts before deciding.
+- **Status:** open (owner decision)
