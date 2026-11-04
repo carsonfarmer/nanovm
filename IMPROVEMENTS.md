@@ -53,6 +53,22 @@ H3 is separable if you'd rather keep the old tail.
 | Production build without the `dev` feature (`cargo check --locked -p nanovm --bin nanovm`) | passes |
 | Baseline at `491e790` for comparison | 107 unit, 67 integration (10 ignored) |
 
+## Recommended: three verified bundles
+
+Each bundle below was cherry-picked onto `origin/main` in a scratch worktree, built, and run through the
+full serial suite. L1 (`868e006`, dependency features) goes first in each, because it is what the
+dependency build used; the bundles also apply without it.
+
+| Bundle | Commits, in order | Result on `main` |
+|---|---|---|
+| **Security** (S1–S6) | `868e006 32de17e fdf0fee bbc92f6 fd7dfe4 9890e6d 1ee35ae 98c1698 c5644bd 97dabf5 13db20e aa2d770`. `97dabf5` conflicts only in ISSUES.md (keep both sides); `13db20e` conflicts only in `examples/bench.rs` (keep `main`'s) and is needed because S3 and S6 each add a test-only global allocator; `git rm .seeded` after `32de17e` | 111 unit, 68 integration: pass |
+| **Speed** (P1, C1–C3, H1, H2, H5, K2, K5) | `868e006 be6ea35 f1e89d6 d0e85be e082357 1b6b882 4805ba9 e88acd5 62c5104 e27f59a` | applies cleanly; 111 unit, 69 integration: pass |
+| **Developer experience** (D1–D4, J1, J2) | `868e006 659bdbb 1392e99 309eb6f d73434b a26bfa7 c63b06f 9cde8c2 95d3212 70f9516 050885b 8575937 c8cd295 fef7cb4`. With L1 first, `c63b06f` conflicts only in `Cargo.lock` (keep `main`'s and let cargo add `wasmtime-wizer`) | 107 unit, 72 integration, 9 JavaScript: pass |
+
+Not in a bundle, and why: H3 (the store waker) and the N-121 export thread carry the in-process tail
+trade-off and touch test files wave 1 reshaped; H4 costs 64 lines; C4/C5 and most of K3 were written on
+top of wave 1. Take those in branch order after the bundles, or ask for them to be rebased onto `main`.
+
 ## Summary
 
 | ID | Change | Benefit | Runtime lines | Take on its own? |
