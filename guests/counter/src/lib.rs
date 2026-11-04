@@ -7,169 +7,96 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use util::wasip3;
-use util::{Req, js, json, read_req, text};
-use wasip3::http::types::{ErrorCode, Request, Response};
+use nanovm_sdk::{Request, Response, Result, data, fs, kv, quote, ws};
 
-wasip3::http::service::export!(Counter);
-
-struct Counter;
+nanovm_sdk::serve!(handle);
 
 static HITS: AtomicU64 = AtomicU64::new(0);
 
-impl wasip3::exports::http::handler::Guest for Counter {
-    async fn handle(request: Request) -> Result<Response, ErrorCode> {
-        let req = read_req(request).await;
-        let hits = HITS.fetch_add(1, Ordering::Relaxed) + 1;
-        route(req, hits).await
+async fn handle(req: Request) -> Result {
+    let hits = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    match (req.method(), req.path()) {
+        ("GET", "/") => Ok(Response::json(format!(
+            r#"{{"app":{},"object":{},"instance_hits":{hits},"count":{}}}"#,
+            quote(&nanovm_sdk::app()),
+            quote(&nanovm_sdk::id()),
+            count().await
+        ))),
+        ("POST", "/incr") => {
+            let n = count().await + 1;
+            Ok(match data().write("count", n.to_string()).await {
+                Ok(()) => Response::json(format!(r#"{{"count":{n},"instance_hits":{hits}}}"#)),
+                Err(e) => Response::json(format!(r#"{{"error":{}}}"#, quote(&fs::code(&e)))).status(507),
+            })
+        }
+        ("GET", p) if p.starts_with("/config/") => Ok(match nanovm_sdk::config::get(&p[8..]) {
+            Ok(Some(v)) => Response::text(v),
+            Ok(None) => Response::text("no such config key").status(404),
+            Err(e) => Response::text(format!("{e:?}")).status(500),
+        }),
+        ("POST", "/ws") if ws::events(&req).is_some() => socket(&req).await,
+        ("POST", "/publish") => {
+            let msg = req.query("msg").unwrap_or("");
+            Ok(Response::text("").status(ws::publish_all("room", vec![msg; req.query_or("n", 1)]).await?))
+        }
+        (m, p) if p.starts_with("/kv/") => Ok(store(m, &p[4..], req.body())),
+        _ => Ok(Response::not_found()),
     }
 }
 
 async fn count() -> u64 {
-    match util::read_file("/data", "count").await {
-        Ok(b) => String::from_utf8_lossy(&b).trim().parse().unwrap_or(0),
-        Err(_) => 0,
+    let n = data().read_text("count").await.ok().flatten();
+    n.and_then(|n| n.trim().parse().ok()).unwrap_or(0)
+}
+
+/// `/kv/{key}` on the default bucket.
+fn store(method: &str, key: &str, body: &[u8]) -> Response {
+    if key.is_empty() || key.len() > 64 || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Response::text("bad key").status(400);
     }
-}
-
-fn valid_key(k: &str) -> bool {
-    !k.is_empty() && k.len() <= 64 && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-async fn route(req: Req, hits: u64) -> Result<Response, ErrorCode> {
-    let path = req.path.clone();
-    match (req.method.as_str(), path.as_str()) {
-        ("GET", "/") => {
-            let n = count().await;
-            json(
-                200,
-                format!(
-                    "{{\"app\":{},\"object\":{},\"instance_hits\":{},\"count\":{}}}",
-                    js(&util::env("NANOVM_APP")),
-                    js(&util::env("NANOVM_OBJECT_ID")),
-                    hits,
-                    n
-                ),
-            )
-        }
-        ("POST", "/incr") => {
-            let n = count().await + 1;
-            match util::write_file_atomic("/data", "count", n.to_string().into_bytes()).await {
-                Ok(()) => json(200, format!("{{\"count\":{n},\"instance_hits\":{hits}}}")),
-                Err(e) => json(507, format!("{{\"error\":{}}}", js(&util::fs_err(&e)))),
-            }
-        }
-        ("GET", p) if p.starts_with("/config/") => match util::config::get(&p[8..]) {
-            Ok(Some(v)) => text(200, v),
-            Ok(None) => text(404, "no such config key"),
-            Err(e) => text(500, format!("{e:?}")),
-        },
-        ("POST", "/ws") if req.headers.get("content-type").is_some_and(|t| t == "application/websocket-events") => {
-            ws(req).await
-        }
-        ("POST", "/publish") => {
-            let msg = req.q("msg").unwrap_or("").to_string();
-            let n = req.q_u64("n", 1) as usize;
-            text(publish(&vec![msg; n]).await?, "")
-        }
-        (m, p) if p.starts_with("/kv/") => {
-            let key = &p[4..];
-            if !valid_key(key) {
-                return text(400, "bad key");
-            }
-            kv(m, key, req.body).await
-        }
-        _ => text(404, "not found"),
-    }
-}
-
-/// The object's `wasi:keyvalue` default bucket.
-async fn kv(method: &str, key: &str, body: Vec<u8>) -> Result<Response, ErrorCode> {
-    use util::kv::store;
-    let bucket = match store::open("") {
-        Ok(b) => b,
-        Err(e) => return text(500, format!("{e:?}")),
+    let done = match method {
+        "GET" => kv::get(key).map(|v| match v {
+            Some(v) => Response::bytes("application/octet-stream", v),
+            None => Response::text("no such key").status(404),
+        }),
+        "PUT" | "POST" => kv::set(key, body).map(|()| Response::text("").status(204)),
+        "DELETE" => kv::delete(key).map(|()| Response::text("").status(204)),
+        _ => return Response::text("method not allowed").status(405),
     };
-    let fail = |e: store::Error| json(507, format!("{{\"error\":{}}}", js(&format!("{e:?}"))));
-    match method {
-        "GET" => match bucket.get(key) {
-            Ok(Some(v)) => util::respond(200, "application/octet-stream", v),
-            Ok(None) => text(404, "no such key"),
-            Err(e) => fail(e),
-        },
-        "PUT" | "POST" => match bucket.set(key, &body) {
-            Ok(()) => text(204, ""),
-            Err(e) => fail(e),
-        },
-        "DELETE" => match bucket.delete(key) {
-            Ok(()) => text(204, ""),
-            Err(e) => fail(e),
-        },
-        _ => text(405, "method not allowed"),
-    }
+    done.unwrap_or_else(|e| Response::json(format!(r#"{{"error":{}}}"#, quote(&format!("{e:?}")))).status(507))
 }
 
-/// Pushpin's WebSocket-over-HTTP events: `KIND\r\n` or `KIND HEXLEN\r\n`
-/// with that much content and `\r\n`.
-fn events(mut body: &[u8]) -> Vec<(String, Vec<u8>)> {
-    let mut out = vec![];
-    while let Some(end) = body.windows(2).position(|w| w == b"\r\n") {
-        let head = String::from_utf8_lossy(&body[..end]).into_owned();
-        body = &body[end + 2..];
-        let (kind, content) = match head.split_once(' ') {
-            Some((k, n)) => {
-                let n = usize::from_str_radix(n, 16).unwrap_or(0).min(body.len());
-                let c = body[..n].to_vec();
-                body = &body[(n + 2).min(body.len())..];
-                (k.to_string(), c)
+async fn socket(req: &Request) -> Result {
+    let id = req.header("connection-id").unwrap_or_default();
+    let mut answer = ws::Answer::default();
+    for event in ws::events(req).unwrap_or_default() {
+        match event {
+            ws::Event::Open => {
+                answer.accept().subscribe("room");
             }
-            None => (head, vec![]),
-        };
-        out.push((kind, content));
-    }
-    out
-}
-
-fn event(kind: &str, content: &[u8]) -> Vec<u8> {
-    [format!("{kind} {:x}\r\n", content.len()).as_bytes(), content, b"\r\n"].concat()
-}
-
-async fn ws(req: Req) -> Result<Response, ErrorCode> {
-    let id = req.headers.get("connection-id").cloned().unwrap_or_default();
-    let mut out = vec![];
-    for (kind, content) in events(&req.body) {
-        let text = String::from_utf8_lossy(&content).into_owned();
-        match kind.as_str() {
-            "OPEN" => {
-                out.extend(b"OPEN\r\n");
-                out.extend(event("TEXT", br#"c:{"type":"subscribe","channel":"room"}"#));
+            ws::Event::Text(t) if t == "close" => {
+                answer.close(4000);
             }
-            "TEXT" if text == "close" => out.extend(event("CLOSE", &4000u16.to_be_bytes())),
-            "TEXT" if text == "id" => out.extend(event("TEXT", format!("m:{id}").as_bytes())),
-            "TEXT" if text.starts_with("pubpanic ") => {
-                publish(&[text[9..].to_string()]).await?;
+            ws::Event::Text(t) if t == "id" => {
+                answer.text(id);
+            }
+            ws::Event::Text(t) if t.starts_with("pubpanic ") => {
+                ws::publish("room", &t[9..]).await?;
                 panic!("after publishing");
             }
-            "TEXT" if text.starts_with("pub ") => {
-                publish(&[text[4..].to_string()]).await?;
+            ws::Event::Text(t) if t.starts_with("pub ") => {
+                ws::publish("room", &t[4..]).await?;
             }
-            "TEXT" => out.extend(event("TEXT", format!("m:echo {text}").as_bytes())),
-            "BINARY" => out.extend(event("BINARY", &content)),
-            _ => {
-                let bucket = util::kv::store::open("").map_err(|e| ErrorCode::InternalError(Some(format!("{e:?}"))))?;
-                let _ = util::kv::atomics::increment(&bucket, "ws-ends", 1);
+            ws::Event::Text(t) => {
+                answer.text(&format!("echo {t}"));
+            }
+            ws::Event::Binary(b) => {
+                answer.binary(&b);
+            }
+            ws::Event::Close(_) | ws::Event::Disconnect => {
+                kv::increment("ws-ends", 1)?;
             }
         }
     }
-    let headers = [("content-type", "application/websocket-events"), ("sec-websocket-extensions", "grip")];
-    util::respond_with(200, &headers, out)
-}
-
-/// Sends each of `msgs` to every socket in `room`; the status.
-async fn publish(msgs: &[String]) -> Result<u16, ErrorCode> {
-    let items: Vec<String> = msgs
-        .iter()
-        .map(|m| format!(r#"{{"channel":"room","formats":{{"ws-message":{{"content":{}}}}}}}"#, js(m)))
-        .collect();
-    util::post("nanovm", "/publish/", format!(r#"{{"items":[{}]}}"#, items.join(",")).into_bytes()).await
+    Ok(answer.into())
 }

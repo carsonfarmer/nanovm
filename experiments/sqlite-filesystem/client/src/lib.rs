@@ -1,11 +1,11 @@
 //! HTTP client with no SQLite engine: all SQL crosses the composed WIT boundary.
 use std::cell::RefCell;
-use util::wasip3::http::types::{ErrorCode, Request, Response};
+use nanovm_sdk::wasip3::http::types::{ErrorCode, Request, Response};
 mod bindings {
     wit_bindgen::generate!({ path: "../../../components/sqlite/wit", world: "client", generate_all });
 }
 use bindings::spin::sqlite::sqlite::{Connection, Error, QueryResult, Value};
-util::wasip3::http::service::export!(Client);
+nanovm_sdk::wasip3::http::service::export!(Client);
 struct Client;
 thread_local! { static CONNECTION: RefCell<Option<Connection>> = const { RefCell::new(None) }; }
 
@@ -24,9 +24,9 @@ async fn query(db: &Connection, sql: String, parameters: Vec<Value>) -> Result<Q
     Ok(QueryResult { columns, rows })
 }
 
-impl util::wasip3::exports::http::handler::Guest for Client {
+impl nanovm_sdk::wasip3::exports::http::handler::Guest for Client {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
-        let req = util::read_req(request).await;
+        let req = nanovm_sdk::Request::read(request).await;
         let cached = CONNECTION.with(|c| c.borrow_mut().take());
         let reused = cached.is_some();
         let mut db = match cached {
@@ -48,10 +48,10 @@ impl util::wasip3::exports::http::handler::Guest for Client {
         )
         .await
         .unwrap();
-        if req.path == "/nohooks" {
+        if req.path() == "/nohooks" {
             assert!(query(&db, "SELECT nanovm_test_steps()".into(), vec![]).await.is_err());
         }
-        if req.path == "/invalid-text" {
+        if req.path() == "/invalid-text" {
             assert!(matches!(
                 query(&db, "SELECT CAST(x'ff' AS TEXT)".into(), vec![]).await,
                 Err(Error::Io(_))
@@ -60,7 +60,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             assert!(matches!(&valid.rows[0].values[0], Value::Text(s) if s == "héllo 世界"));
             assert!(matches!(&valid.rows[0].values[1], Value::Blob(b) if b == &[255]));
         }
-        if req.path == "/overlap" {
+        if req.path() == "/overlap" {
             use std::{
                 future::{Future, poll_fn},
                 pin::pin,
@@ -101,9 +101,9 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             drop(rows);
             done.await.unwrap();
             assert!(query(&db, "SELECT 9".into(), vec![]).await.is_ok());
-            return util::json(200, serde_json::json!({"scheduling": "serialized"}).to_string());
+            return nanovm_sdk::Response::json(serde_json::json!({"scheduling": "serialized"}).to_string()).status(200).into_wit();
         }
-        if req.path == "/cuts" {
+        if req.path() == "/cuts" {
             query(
                 &db,
                 "CREATE TABLE IF NOT EXISTS pages(id INTEGER PRIMARY KEY,value INTEGER,payload BLOB)".into(),
@@ -111,16 +111,16 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             )
             .await
             .unwrap();
-            let op = req.q("op").unwrap_or("read");
+            let op = req.query("op").unwrap_or("read");
             if op == "init" {
                 query(&db, "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<16) INSERT INTO pages SELECT x,x*3,zeroblob(1024) FROM n".into(), vec![]).await.unwrap();
             }
             if op == "init" || op == "mutate" {
                 let marker = if op == "init" { "before" } else { "after" };
-                util::write_file("/data", "marker", marker.as_bytes().to_vec())
+                nanovm_sdk::data().write("marker", marker.as_bytes().to_vec())
                     .await
                     .unwrap();
-                util::kv::store::open("")
+                nanovm_sdk::kv::store::open("")
                     .unwrap()
                     .set("marker", marker.as_bytes())
                     .unwrap();
@@ -129,7 +129,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 query(
                     &db,
                     "SELECT nanovm_test_arm(?)".into(),
-                    vec![Value::Integer(req.q_u64("cut", 0) as i64)],
+                    vec![Value::Integer(req.query_or("cut", 0u64) as i64)],
                 )
                 .await
                 .unwrap();
@@ -168,12 +168,12 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             .collect::<Vec<_>>();
             let integrity = query(&db, "PRAGMA integrity_check".into(), vec![]).await.unwrap();
             assert!(matches!(&integrity.rows[0].values[0], Value::Text(s) if s == "ok"));
-            let file = util::read_file("/data", "marker").await.unwrap();
-            let key = util::kv::store::open("").unwrap().get("marker").unwrap().unwrap();
+            let file = nanovm_sdk::data().read("marker").await.unwrap().unwrap();
+            let key = nanovm_sdk::kv::store::open("").unwrap().get("marker").unwrap().unwrap();
             CONNECTION.with(|c| *c.borrow_mut() = Some(db));
-            return util::json(200, serde_json::json!({"rows":rows,"file":String::from_utf8(file).unwrap(),"key":String::from_utf8(key).unwrap(),"steps":steps}).to_string());
+            return nanovm_sdk::Response::json(serde_json::json!({"rows":rows,"file":String::from_utf8(file).unwrap(),"key":String::from_utf8(key).unwrap(),"steps":steps}).to_string()).status(200).into_wit();
         }
-        if req.path == "/limits" {
+        if req.path() == "/limits" {
             let mut sql = "SELECT 1".to_string();
             sql.push_str(&" ".repeat(65536 - sql.len()));
             assert!(query(&db, sql.clone(), vec![]).await.is_ok());
@@ -223,7 +223,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                     Err(Error::Io(_))
                 ));
                 drop(held);
-                util::wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
+                nanovm_sdk::wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
             }
             let held = db
                 .execute_async("SELECT zeroblob(700000)".into(), vec![])
@@ -236,7 +236,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 Err(Error::Io(_))
             ));
             drop(held);
-            util::wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
+            nanovm_sdk::wasip3::clocks::monotonic_clock::wait_for(1_000_000).await;
             assert!(query(&db, "SELECT zeroblob(700000)".into(), vec![]).await.is_ok());
         }
         // Verify all canonical-ABI value variants with asymmetric values.
@@ -284,7 +284,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 "{sql}"
             );
         }
-        if let Some(value) = req.q("v") {
+        if let Some(value) = req.query("v") {
             query(
                 &db,
                 "INSERT INTO ledger(value) VALUES (?)".into(),
@@ -294,15 +294,15 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             .unwrap();
             assert_eq!(db.changes_async().await, 1);
             assert!(db.last_insert_rowid_async().await > 0);
-            util::write_file("/data", "marker", value.as_bytes().to_vec())
+            nanovm_sdk::data().write("marker", value.as_bytes().to_vec())
                 .await
                 .unwrap();
-            util::kv::store::open("")
+            nanovm_sdk::kv::store::open("")
                 .unwrap()
                 .set("marker", value.as_bytes())
                 .unwrap();
         }
-        if req.path == "/write-result-limit" {
+        if req.path() == "/write-result-limit" {
             // Even if the app catches the result, this write must not commit.
             let _ = query(
                 &db,
@@ -311,7 +311,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             )
             .await;
         }
-        if req.path == "/write-invalid-text" {
+        if req.path() == "/write-invalid-text" {
             let _ = query(
                 &db,
                 "INSERT INTO ledger(value) VALUES ('invisible') RETURNING CAST(x'ff' AS TEXT)".into(),
@@ -319,7 +319,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             )
             .await;
         }
-        if req.path == "/cpu" {
+        if req.path() == "/cpu" {
             let _ = query(
                 &db,
                 "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT sum(x) FROM n".into(),
@@ -327,10 +327,10 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             )
             .await;
         }
-        if req.path == "/timeout" {
+        if req.path() == "/timeout" {
             let _ = query(&db, "SELECT nanovm_test_yield(60000)".into(), vec![]).await;
         }
-        if req.path == "/constraint" {
+        if req.path() == "/constraint" {
             assert!(
                 query(
                     &db,
@@ -341,7 +341,7 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 .is_err()
             );
         }
-        if req.path == "/full" {
+        if req.path() == "/full" {
             let result = query(
                 &db,
                 "INSERT INTO ledger(value) VALUES (zeroblob(2097152))".into(),
@@ -366,27 +366,27 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             .collect::<Vec<_>>();
         let integrity = query(&db, "PRAGMA integrity_check".into(), vec![]).await.unwrap();
         assert!(matches!(&integrity.rows[0].values[0], Value::Text(s) if s == "ok"));
-        let file = util::read_file("/data", "marker").await.unwrap_or_default();
-        let key = util::kv::store::open("")
+        let file = nanovm_sdk::data().read("marker").await.ok().flatten().unwrap_or_default();
+        let key = nanovm_sdk::kv::store::open("")
             .unwrap()
             .get("marker")
             .unwrap()
             .unwrap_or_default();
-        if req.path == "/close" {
+        if req.path() == "/close" {
             drop(db);
             // A dropped resource must release the one-connection slot.
             drop(Connection::open_async("default".into()).await.unwrap());
         } else {
             CONNECTION.with(|c| *c.borrow_mut() = Some(db));
         }
-        match req.q("then") {
+        match req.query("then") {
             Some("error") => return Err(ErrorCode::InternalError(Some("composed rollback".into()))),
             Some("trap") => panic!("composed trap"),
-            Some("sleep") => util::wasip3::clocks::monotonic_clock::wait_for(60_000_000_000).await,
+            Some("sleep") => nanovm_sdk::wasip3::clocks::monotonic_clock::wait_for(60_000_000_000).await,
             _ => (),
         }
-        util::json(if req.q("then") == Some("status") { 507 } else { 200 }, serde_json::json!({
+        nanovm_sdk::Response::json(serde_json::json!({
             "rows": rows, "file": String::from_utf8(file).unwrap(), "key": String::from_utf8(key).unwrap(), "reused": reused,
-        }).to_string())
+        }).to_string()).status(if req.query("then") == Some("status") { 507 } else { 200 }).into_wit()
     }
 }

@@ -13,5 +13,5 @@ test-hooks = ["rusqlite/functions"]
 [dependencies]
 rusqlite = { version = "0.41.1", default-features = false, features = ["bundled", "hooks", "limits"] }
 sqlite-vfs = "0.2.0"
-util = { path = "../../../guests/util" }
+nanovm-sdk = { path = "../../../guests/sdk" }
 wit-bindgen = "0.62"

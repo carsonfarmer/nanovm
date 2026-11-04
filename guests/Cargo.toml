@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["util", "counter", "hostile"]
+members = ["sdk", "counter", "hostile", "../examples/chat"]
 
 [workspace.package]
 edition = "2024"
 
 [workspace.dependencies]
 wasip3 = { version = "0.9.0", features = ["async-spawn"] }
-util = { path = "util" }
+nanovm-sdk = { path = "sdk" }
 
 [profile.release]
 opt-level = "s"

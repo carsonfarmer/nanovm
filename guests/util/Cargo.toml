@@ -1,8 +1,0 @@
-[package]
-name = "util"
-version = "0.1.0"
-edition.workspace = true
-
-[dependencies]
-wasip3.workspace = true
-wit-bindgen = "0.62"

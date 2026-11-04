@@ -2332,6 +2332,18 @@ async fn objects_call_objects() {
     assert_eq!(call("b", "http://nanovm/objects/a/").await["status"], 200);
 }
 
+/// What an object posts to `http://nanovm/` is held for its sockets only at
+/// `/publish`, and only if well formed; anything else is refused at once, as
+/// a supervisor would refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_well_formed_publishes_are_held() {
+    let node = node("only_well_formed_publishes_are_held", "hostile", 8);
+    for (url, status) in [("http://nanovm/elsewhere", 404), ("http://nanovm/publish/", 400)] {
+        let r = get(&node, "p", &format!("/fetch?method=POST&url={url}")).await;
+        assert_eq!(r.json()["status"], status, "{url}: {}", r.body);
+    }
+}
+
 // ---- WebSockets ----------------------------------------------------------
 
 mod sockets {
@@ -2339,7 +2351,7 @@ mod sockets {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{Error, Message, protocol::frame::coding::CloseCode};
 
-    type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    pub(super) type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
     type Records = Arc<parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>>;
 
     async fn front(label: &str, mut cfg: nanovm::config::ProxyConfig, apps: &[(&str, AppConfig)]) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, std::net::SocketAddr, Records) {
@@ -2386,7 +2398,7 @@ mod sockets {
     }
 
     /// The socket, or the refusal's status and body.
-    async fn open(addr: std::net::SocketAddr, app: &str, path: &str) -> Result<Ws, (u16, String)> {
+    pub(super) async fn open(addr: std::net::SocketAddr, app: &str, path: &str) -> Result<Ws, (u16, String)> {
         match tokio_tungstenite::connect_async(handshake(addr, app, path)).await {
             Ok((ws, _)) => Ok(ws),
             Err(Error::Http(res)) => {
@@ -2409,7 +2421,7 @@ mod sockets {
     }
 
     /// The next data message or close frame.
-    async fn next(ws: &mut Ws) -> Message {
+    pub(super) async fn next(ws: &mut Ws) -> Message {
         loop {
             let m = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a message in time");
             match m.expect("the socket is open").expect("a frame") {
@@ -2419,7 +2431,7 @@ mod sockets {
         }
     }
 
-    async fn say(ws: &mut Ws, text: &str) {
+    pub(super) async fn say(ws: &mut Ws, text: &str) {
         ws.send(Message::text(text)).await.unwrap();
     }
 
@@ -3474,4 +3486,225 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
     }).await.expect("collector must actually refuse an export");
     assert_eq!(tokio::time::timeout(Duration::from_secs(2), app_get(addr, &counter, "/room/")).await.unwrap().0, 200);
     collector.abort();
+}
+
+// ---- nanovm run -----------------------------------------------------------
+
+mod run {
+    use super::sockets::{next, open, say};
+    use super::*;
+    use std::ffi::OsStr;
+    use tokio::io::AsyncBufReadExt;
+    use tokio_tungstenite::tungstenite::{Message, protocol::frame::coding::CloseCode};
+
+    /// `nanovm run`, killed when dropped, and the lines it prints.
+    struct Running {
+        child: tokio::process::Child,
+        lines: tokio::sync::mpsc::UnboundedReceiver<String>,
+    }
+
+    fn start(args: &[&OsStr]) -> Running {
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_nanovm"))
+            .arg("run")
+            .args(args)
+            .args(["--listen", "127.0.0.1:0"])
+            .env_remove("RUST_BACKTRACE")
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stderr = tokio::io::BufReader::new(child.stderr.take().unwrap()).lines();
+        let (tx, lines) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = stderr.next_line().await {
+                eprintln!("nanovm run: {line}");
+                let _ = tx.send(line);
+            }
+        });
+        Running { child, lines }
+    }
+
+    impl Running {
+        /// The next line that contains `text`.
+        async fn line(&mut self, text: &str) -> String {
+            loop {
+                let line = tokio::time::timeout(Duration::from_secs(60), self.lines.recv()).await;
+                let line = line.unwrap_or_else(|_| panic!("no line with {text:?} in time")).expect("nanovm run exited");
+                if line.contains(text) {
+                    return line;
+                }
+            }
+        }
+
+        /// The address it says it serves on, next.
+        async fn addr(&mut self) -> std::net::SocketAddr {
+            let line = self.line(" on http://").await;
+            line.split("http://").nth(1).unwrap().split('/').next().unwrap().parse().unwrap()
+        }
+    }
+
+    fn wasm(name: &str) -> PathBuf {
+        repo().join("guests/target/wasm32-wasip2/release").join(format!("{name}.wasm"))
+    }
+
+    async fn post(addr: std::net::SocketAddr, path: &str, body: &str) -> (u16, String) {
+        let head = format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        raw(addr, &head, body.as_bytes()).await
+    }
+
+    /// Unsigned apps run outside the jail, so only on loopback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nanovm_run_listens_on_loopback_only() {
+        let mut run = tokio::process::Command::new(env!("CARGO_BIN_EXE_nanovm"));
+        run.args(["run".as_ref(), wasm("counter").as_os_str(), "--listen".as_ref(), "0.0.0.0:0".as_ref()]);
+        let out = tokio::time::timeout(Duration::from_secs(30), run.kill_on_drop(true).output()).await;
+        let out = out.expect("refused, not served").unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains("only on loopback"), "{stderr}");
+    }
+
+    /// One command serves an app as a node and its proxy would: objects with
+    /// their own volumes, the manifest's config, WebSockets whose publishes
+    /// arrive only once their request commits, and a line per request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nanovm_run_serves_requests_sockets_and_publishes() {
+        let data = node_cfg("nanovm_run_serves", 8).data_dir;
+        let manifest = repo().join("guests/counter/nanovm.json");
+        let args = [wasm("counter").into_os_string(), "--manifest".into(), manifest.into(), "--data".into(), data.into()];
+        let mut run = start(&args.iter().map(|a| a.as_os_str()).collect::<Vec<_>>());
+        let addr = run.addr().await;
+        assert_eq!(post(addr, "/alice/incr", "").await, (200, r#"{"count":1,"instance_hits":1}"#.into()));
+        assert!(http_get(addr, "/bob/").await.1.contains(r#""count":0"#), "objects have their own volumes");
+        assert_eq!(http_get(addr, "/alice/config/greeting").await, (200, "from the registry".into()));
+        let line = run.line("POST /alice/incr").await;
+        assert!(line.contains("→ 200 in") && line.ends_with("cold start"), "{line}");
+        let line = run.line("GET /alice/config/greeting").await;
+        assert!(line.contains("→ 200 in") && !line.contains("cold"), "{line}");
+
+        let (mut a, mut b) = (open(addr, "x", "/room/ws").await.unwrap(), open(addr, "x", "/room/ws").await.unwrap());
+        say(&mut a, "hello").await;
+        assert_eq!(next(&mut a).await, Message::text("echo hello"));
+        say(&mut a, "pub hi").await;
+        assert_eq!((next(&mut a).await, next(&mut b).await), (Message::text("hi"), Message::text("hi")));
+        assert_eq!(post(addr, "/room/publish?msg=yo", "").await.0, 200);
+        assert_eq!((next(&mut a).await, next(&mut b).await), (Message::text("yo"), Message::text("yo")));
+        // A request that fails publishes nothing, and its socket is closed.
+        say(&mut b, "pubpanic lost").await;
+        let Message::Close(Some(f)) = next(&mut b).await else { panic!("no close frame") };
+        assert_eq!(f.code, CloseCode::Error);
+        say(&mut a, "pub kept").await;
+        assert_eq!(next(&mut a).await, Message::text("kept"));
+        // Only the proxy, here `nanovm run`, sends socket events.
+        let forged = "POST /room/ws HTTP/1.1\r\nHost: x\r\nContent-Type: application/websocket-events\r\n\
+            Connection-Id: 1\r\nContent-Length: 12\r\nConnection: close\r\n\r\nDISCONNECT\r\n";
+        assert_eq!(raw(addr, forged, b"").await.0, 400);
+        drop(b);
+        a.close(None).await.unwrap();
+        let t0 = Instant::now();
+        while http_get(addr, "/room/kv/ws-ends").await != (200, "2".into()) {
+            assert!(t0.elapsed() < Duration::from_secs(10), "the object never heard both sockets end");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Rebuilding the component restarts `nanovm run` on the new one, with
+    /// the same data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nanovm_run_restarts_when_the_component_changes() {
+        let data = node_cfg("nanovm_run_restarts", 8).data_dir;
+        let app = data.join("app.wasm");
+        std::fs::copy(wasm("counter"), &app).unwrap();
+        let mut run = start(&[app.as_os_str(), "--data".as_ref(), data.as_os_str()]);
+        let addr = run.addr().await;
+        assert_eq!(post(addr, "/x/incr", "").await.0, 200);
+        std::fs::copy(wasm("hostile"), &app).unwrap();
+        run.line("changed; restarting").await;
+        let addr = run.addr().await;
+        assert_eq!(http_get(addr, "/x/").await, (200, r#"{"object":"x","hits":1}"#.into()));
+        assert_eq!(std::fs::read_to_string(data.join("objects/app/x/count")).unwrap(), "1");
+        drop(run.child);
+    }
+
+    /// The example chat: rooms are objects whose history survives eviction
+    /// and restarts, members are WebSockets, and the lobby indexes rooms
+    /// through calls between objects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chat_example_is_live_and_durable() {
+        let data = node_cfg("chat_example", 8).data_dir;
+        // The example's limits, with objects evicted after 300 ms idle.
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(repo().join("examples/chat/nanovm.json")).unwrap()).unwrap();
+        manifest["limits"]["idle_timeout_ms"] = 300.into();
+        std::fs::write(data.join("nanovm.json"), manifest.to_string()).unwrap();
+        let args = [wasm("chat").into_os_string(), "--manifest".into(), data.join("nanovm.json").into(), "--data".into(), data.clone().into()];
+        let args: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+        let message = |m: Message| -> serde_json::Value { serde_json::from_str(m.to_text().unwrap()).unwrap() };
+        let texts = |v: serde_json::Value| -> Vec<String> { v.as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap().into()).collect() };
+
+        let mut run = start(&args);
+        let addr = run.addr().await;
+        let (status, page) = http_get(addr, "/lobby/").await;
+        assert!(status == 200 && page.contains("<title>nanovm chat</title>"), "{status} {page}");
+
+        let mut ann = open(addr, "x", "/general/ws?name=ann").await.unwrap();
+        let mut bob = open(addr, "x", "/general/ws?name=bob").await.unwrap();
+        say(&mut ann, "hello").await;
+        for ws in [&mut ann, &mut bob] {
+            let m = message(next(ws).await);
+            assert_eq!((m["name"].as_str(), m["text"].as_str()), (Some("ann"), Some("hello")), "{m}");
+        }
+        assert_eq!(post(addr, "/general/messages?name=carl", "").await.0, 400);
+        assert_eq!(post(addr, "/general/messages?name=carl", "over http").await.0, 200);
+        for ws in [&mut ann, &mut bob] {
+            assert_eq!(message(next(ws).await)["text"], "over http");
+        }
+        // The lobby heard of each message through a call between objects.
+        let (status, rooms) = http_get(addr, "/lobby/rooms").await;
+        let rooms: serde_json::Value = serde_json::from_str(&rooms).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!((rooms[0]["room"].as_str(), rooms[0]["messages"].as_u64()), (Some("general"), Some(2)), "{rooms}");
+        assert_eq!(rooms[0]["last"]["name"], "carl");
+        let mut lobby = open(addr, "x", "/lobby/ws").await.unwrap();
+        assert_eq!(message(next(&mut lobby).await)["messages"], 2);
+        say(&mut bob, "and live").await;
+        assert_eq!(message(next(&mut lobby).await)["messages"], 3);
+        for ws in [&mut ann, &mut bob] {
+            assert_eq!(message(next(ws).await)["text"], "and live");
+        }
+
+        // Idle rooms are evicted. Their history is in their volume, and
+        // their sockets outlive them.
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let (status, history) = http_get(addr, "/general/messages").await;
+        assert_eq!((status, texts(serde_json::from_str(&history).unwrap())), (200, vec!["hello".into(), "over http".into(), "and live".into()]));
+        let line = run.line("GET /general/messages").await;
+        assert!(line.ends_with("cold start"), "evicted, so started again: {line}");
+        say(&mut ann, "after eviction").await;
+        for ws in [&mut ann, &mut bob] {
+            assert_eq!(message(next(ws).await)["text"], "after eviction");
+        }
+
+        // A restart keeps everything, and a new member gets the history.
+        drop(run);
+        let mut run = start(&args);
+        let addr = run.addr().await;
+        let mut dee = open(addr, "x", "/general/ws?name=dee").await.unwrap();
+        let mut seen = vec![];
+        for _ in 0..4 {
+            seen.push(message(next(&mut dee).await)["text"].as_str().unwrap().to_string());
+        }
+        assert_eq!(seen, ["hello", "over http", "and live", "after eviction"]);
+        let rooms: serde_json::Value = serde_json::from_str(&http_get(addr, "/lobby/rooms").await.1).unwrap();
+        assert_eq!((rooms[0]["messages"].as_u64(), rooms[0]["last"]["text"].as_str()), (Some(4), Some("after eviction")));
+        // Bad input is refused, not stored.
+        assert_eq!(post(addr, "/lobby/rooms/general", "not json").await.0, 400);
+        for bad in ["%3Cb%3E", "_x", ".x"] {
+            let entry = r#"{"messages":1,"last":{"name":"a","text":"b","at":1}}"#;
+            assert_eq!(post(addr, &format!("/lobby/rooms/{bad}"), entry).await.0, 400, "{bad}");
+        }
+        say(&mut dee, &"x".repeat(2001)).await;
+        assert!(message(next(&mut dee).await)["error"].is_string());
+        assert_eq!(texts(serde_json::from_str(&http_get(addr, "/general/messages").await.1).unwrap()).len(), 4);
+        drop(run);
+    }
 }

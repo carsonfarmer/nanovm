@@ -10,4 +10,4 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-util = { path = "../../../../guests/util" }
+nanovm-sdk = { path = "../../../../guests/sdk" }

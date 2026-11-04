@@ -123,11 +123,8 @@ impl GuestConnection for Database {
             .map_err(error)?;
             db.create_scalar_function("nanovm_test_yield", 1, FunctionFlags::SQLITE_UTF8, |c| {
                 YIELDING.set(true);
-                util::wasip3::wit_bindgen::block_on(util::write_file("/data", "sql-wait", b"entered".to_vec()))
-                    .unwrap();
-                util::wasip3::wit_bindgen::block_on(util::wasip3::clocks::monotonic_clock::wait_for(
-                    c.get::<i64>(0)? as u64 * 1_000_000,
-                ));
+                nanovm_sdk::wasip3::wit_bindgen::block_on(nanovm_sdk::data().write("sql-wait", "entered")).unwrap();
+                nanovm_sdk::wasip3::wit_bindgen::block_on(nanovm_sdk::sleep(std::time::Duration::from_millis(c.get::<i64>(0)? as u64)));
                 YIELDING.set(false);
                 Ok(42)
             })

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nanovm chat</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #fff; --ink: #1b1f24; --muted: #6a737d; --line: #e3e6ea; --accent: #2f6feb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1216; --card: #171b21; --ink: #e6e8eb; --muted: #8b949e; --line: #2a3038; --accent: #5b8cff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+  main { max-width: 720px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; align-items: baseline; gap: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 18px; margin: 0; }
+  a { color: var(--accent); text-decoration: none; }
+  #status { margin-left: auto; color: var(--muted); font-size: 13px; }
+  #list { flex: 1; overflow-y: auto; padding: 12px 0; display: flex; flex-direction: column; gap: 8px; }
+  .item { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .who { font-weight: 600; margin-right: 6px; }
+  form { display: flex; gap: 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+  input { flex: 1; min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink); font: inherit; }
+  button { padding: 10px 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1 id="title"></h1><a href="/lobby/" id="back">all rooms</a><span id="status">connecting…</span></header>
+  <div id="list"></div>
+  <form id="form"><input id="input" autocomplete="off" required><button>Send</button></form>
+</main>
+<script>
+const room = location.pathname.split('/')[1];
+const lobby = room === 'lobby';
+const $ = id => document.getElementById(id);
+const time = at => new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+function item(children) {
+  const div = document.createElement('div');
+  div.className = 'item';
+  for (const [cls, text] of children) {
+    const span = document.createElement(cls === 'link' ? 'a' : 'span');
+    span.className = cls;
+    span.textContent = text;
+    if (cls === 'link') span.href = `/${text}/`;
+    div.append(span);
+  }
+  return div;
+}
+
+// The socket reconnects after any drop; the object resends what it has on
+// each open, so the page starts from it again.
+let socket;
+function connect(path, onMessage) {
+  socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/${path}`);
+  socket.onopen = () => { $('list').replaceChildren(); $('status').textContent = 'live'; };
+  socket.onmessage = e => onMessage(JSON.parse(e.data));
+  socket.onclose = () => { $('status').textContent = 'reconnecting…'; setTimeout(() => connect(path, onMessage), 1000); };
+}
+
+if (lobby) {
+  $('title').textContent = 'nanovm chat';
+  $('back').hidden = true;
+  $('input').placeholder = 'Join or start a room: letters, digits, - _ .';
+  $('form').onsubmit = e => { e.preventDefault(); location.href = `/${encodeURIComponent($('input').value.trim())}/`; };
+  $('form').querySelector('button').textContent = 'Go';
+  const rows = new Map();
+  connect('lobby/ws', r => {
+    const row = item([['link', r.room], ['meta', ` ${r.messages} messages · ${r.last.name}: ${r.last.text}`]]);
+    rows.get(r.room)?.remove();
+    rows.set(r.room, row);
+    $('list').prepend(row);
+  });
+} else {
+  $('title').textContent = `# ${room}`;
+  let name = localStorage.getItem('name');
+  while (!name) name = (prompt('Your name?') || '').trim().slice(0, 32);
+  localStorage.setItem('name', name);
+  $('input').placeholder = `Message as ${name}`;
+  connect(`${room}/ws?name=${encodeURIComponent(name)}`, m => {
+    if (m.error) return alert(m.error);
+    $('list').append(item([['who', m.name], ['text', m.text], ['meta', ` ${time(m.at)}`]]));
+    $('list').scrollTop = $('list').scrollHeight;
+  });
+  $('form').onsubmit = e => {
+    e.preventDefault();
+    socket.send($('input').value);
+    $('input').value = '';
+  };
+}
+</script>
+</body>
+</html>
