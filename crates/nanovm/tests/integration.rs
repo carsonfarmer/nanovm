@@ -2372,8 +2372,7 @@ mod sockets {
         let proxy = nanovm::proxy::Proxy::new(cfg).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(nanovm::proxy::serve(proxy.clone(), listener));
-        tokio::spawn(nanovm::proxy::serve_publish(proxy, control));
+        tokio::spawn(nanovm::proxy::serve(proxy, listener, control));
         (sup, node, addr, records)
     }
 
@@ -2698,8 +2697,9 @@ async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::Sock
         ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let publish = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+    tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener, publish));
     addr
 }
 
@@ -3119,7 +3119,8 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = listener.local_addr().unwrap();
-    let service = tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+    let publish = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener, publish));
     let missing = format!("{}@sha256:{}", counter.split_once('@').unwrap().0, "0".repeat(64));
     let cases = [
         (node, "x", "/obj/", String::new(), 400),
