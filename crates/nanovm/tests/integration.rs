@@ -449,9 +449,10 @@ async fn only_empty_scratch_is_reused() {
     assert_eq!(get(&node, "u", "/files?mount=tmp&n=1").await.status, 200);
     assert_eq!(entries(&scratch), first, "u's instance reuses t's directory");
     assert_eq!(entries(&scratch.join(&first[0])), ["f0"]);
-    // u leaves `f0` behind, so its directory is removed, not handed on.
+    // u leaves `f0` behind, so its directory is removed, not handed on
+    // (just after the store stops counting as live: N-132).
     assert_eq!(get(&node, "u", "/panic").await.status, 500);
-    eventually("u's instance gone", gone).await;
+    eventually("u's directory removed", || entries(&scratch).is_empty()).await;
     assert_eq!(get(&node, "v", "/").await.status, 200);
     let now = entries(&scratch);
     assert!(now.len() == 1 && now != first, "{now:?}");
