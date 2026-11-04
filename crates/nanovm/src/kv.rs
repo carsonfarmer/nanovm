@@ -102,6 +102,16 @@ impl ObjState {
             Ok(_) => return fail("the key's file is not a regular file"),
             Err(_) => None,
         };
+        // A bucket's first write makes its directories, each an entry.
+        let dir = path.parent().expect("a key is in its bucket");
+        for d in [dir.parent().expect("buckets are in .kv"), dir] {
+            if old.is_none() && !d.exists() {
+                self.quota.check_new_entry()?;
+                self.quota.journal(|j| j.creating(d))?;
+                std::fs::create_dir(d)?;
+                self.quota.adjust(0, 1);
+            }
+        }
         // The old value goes into the request's journal and the new one is
         // written in its place; the request's commit makes it durable. Past
         // the reservation, a failure traps: the request rolls back, and the
@@ -126,23 +136,15 @@ impl ObjState {
         Ok(())
     }
 
-    /// Bucket `""` is `default`; others are `[A-Za-z0-9_-]{1,64}`.
+    /// Bucket `""` is `default`; others are `[A-Za-z0-9_-]{1,64}`. Opening
+    /// one touches nothing: until its first write it has no directory, and
+    /// reads as empty.
     fn open_bucket(&mut self, identifier: &str) -> Result<Resource<Bucket>, Fail> {
         let name = if identifier.is_empty() { "default" } else { identifier };
         if name.len() > 64 || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
             return Err(Fail::Guest(Error::NoSuchStore));
         }
-        let mut dir = self.volume.clone();
-        for part in [".kv", name] {
-            dir.push(part);
-            if !dir.exists() {
-                self.quota.check_new_entry()?;
-                self.quota.journal(|j| j.creating(&dir))?;
-                std::fs::create_dir(&dir)?;
-                self.quota.adjust(0, 1);
-            }
-        }
-        self.table.push(Bucket { dir }).map_err(trap)
+        self.table.push(Bucket { dir: self.volume.join(".kv").join(name) }).map_err(trap)
     }
 
     /// Keys in sorted order, a page at a time; the cursor is the offset of
@@ -151,7 +153,11 @@ impl ObjState {
     /// anything here).
     fn list(&self, bucket: &Resource<Bucket>, cursor: Option<u64>) -> Result<KeyResponse, Fail> {
         let dir = &self.table.get(bucket).map_err(trap)?.dir;
-        let mut keys: Vec<String> = std::fs::read_dir(dir)?
+        let entries = match std::fs::read_dir(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(KeyResponse { keys: vec![], cursor: None }),
+            entries => entries?,
+        };
+        let mut keys: Vec<String> = entries
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
             .filter_map(|e| {
@@ -292,33 +298,61 @@ mod tests {
         ok(s.get_value(b, key, &mut s.memory_budget()))
     }
 
+    /// Opens the default bucket and has a write make its directories.
+    fn made(s: &mut ObjState) -> Resource<Bucket> {
+        let b = ok(s.open_bucket(""));
+        ok(s.set_value(&b, "made", b""));
+        ok(s.delete_value(&b, "made"));
+        b
+    }
+
     /// `""` is the default bucket; other names are 1 to 64 of
-    /// `[A-Za-z0-9_-]`, so none is a path. Each directory made counts as an
-    /// entry, once.
+    /// `[A-Za-z0-9_-]`, so none is a path. Each directory a first write
+    /// makes counts as an entry, once.
     #[test]
     fn buckets_are_named_safely() {
         let mut s = state(Limits::default());
-        ok(s.open_bucket(""));
+        let b = ok(s.open_bucket(""));
+        ok(s.set_value(&b, "k", b""));
         assert!(s.volume.join(".kv/default").is_dir());
-        assert_eq!(s.quota.usage(), (0, 2));
-        ok(s.open_bucket("default"));
-        ok(s.open_bucket(&"a".repeat(64)));
-        ok(s.open_bucket("Mixed_case-1"));
-        assert_eq!(s.quota.usage(), (0, 4));
+        assert_eq!(s.quota.usage(), (0, 3));
+        for name in ["default", &"a".repeat(64), "Mixed_case-1"] {
+            let b = ok(s.open_bucket(name));
+            ok(s.set_value(&b, "k", b""));
+        }
+        assert_eq!(s.quota.usage(), (0, 7));
         for bad in [".", "..", "a/b", "a.b", "é", " ", &"a".repeat(65)] {
             assert!(why(s.open_bucket(bad)).contains("NoSuchStore"), "{bad:?}");
         }
-        assert_eq!(s.quota.usage(), (0, 4));
+        assert_eq!(s.quota.usage(), (0, 7));
     }
 
-    /// A bucket that would pass the file limit isn't made.
+    /// A bucket nothing was written to touches nothing: opening and reading
+    /// it makes no directory, so a request that only reads has nothing to
+    /// journal or commit (N-110).
+    #[test]
+    fn reading_a_new_bucket_makes_nothing() {
+        let mut s = state(Limits::default());
+        let b = ok(s.open_bucket("fresh"));
+        assert_eq!(get(&s, &b, "k"), None);
+        assert!(!ok(store::HostBucket::exists(&mut &mut s, Resource::new_borrow(b.rep()), "k".into())));
+        assert_eq!(ok(s.list(&b, None)).keys, Vec::<String>::new());
+        ok(s.delete_value(&b, "k"));
+        assert_eq!(std::fs::read_dir(&s.volume).unwrap().count(), 0);
+        assert_eq!(s.quota.usage(), (0, 0));
+        let journal = s.volume.parent().unwrap().join("~journal").join(s.volume.file_name().unwrap());
+        assert!(!journal.join("log").exists());
+    }
+
+    /// A bucket whose directories would pass the file limit isn't made.
     #[test]
     fn buckets_count_against_the_file_limit() {
         let mut s = state(Limits {
             max_files: 1,
             ..Limits::default()
         });
-        assert!(why(s.open_bucket("b")).contains("Quota"));
+        let b = ok(s.open_bucket("b"));
+        assert!(why(s.set_value(&b, "k", b"")).contains("Quota"));
         assert!(s.volume.join(".kv").is_dir() && !s.volume.join(".kv/b").exists());
         assert_eq!(s.quota.usage(), (0, 1));
     }
@@ -441,7 +475,7 @@ mod tests {
     #[test]
     fn keys_taken_by_a_directory_are_refused() {
         let mut s = state(Limits::default());
-        let b = ok(s.open_bucket(""));
+        let b = made(&mut s);
         std::fs::create_dir(ok(s.key_path(&b, "d"))).unwrap();
         assert_eq!(why(s.set_value(&b, "d", b"x")), "the key's file is not a regular file");
         assert!(s.get_value(&b, "d", &mut s.memory_budget()).is_err());
@@ -454,7 +488,7 @@ mod tests {
     #[test]
     fn guest_tmp_files_are_not_leaked() {
         let mut s = state(Limits::default());
-        let b = ok(s.open_bucket(""));
+        let b = made(&mut s);
         // What the guest's own `open_at` and write would have charged.
         std::fs::write(s.volume.join(".kv/default/.tmp"), [0; 100]).unwrap();
         s.quota.adjust(100, 1);
@@ -478,7 +512,7 @@ mod tests {
             memory_mb: 1,
             ..Limits::default()
         });
-        let b = ok(s.open_bucket(""));
+        let b = made(&mut s);
         std::fs::write(ok(s.key_path(&b, "a")), vec![0; 600 << 10]).unwrap();
         std::fs::write(ok(s.key_path(&b, "whole")), vec![0; 1 << 20]).unwrap();
         std::fs::write(ok(s.key_path(&b, "over")), vec![0; (1 << 20) + 1]).unwrap();
@@ -499,7 +533,7 @@ mod tests {
     #[test]
     fn list_pages_and_skips_foreign_files() {
         let mut s = state(Limits::default());
-        let b = ok(s.open_bucket(""));
+        let b = made(&mut s);
         let dir = s.volume.join(".kv/default");
         let mut want: Vec<String> = (0..2 * PAGE + 1).rev().map(|i| format!("k{i:05}")).collect();
         for k in &want {

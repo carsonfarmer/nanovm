@@ -224,7 +224,7 @@ What happens on the first request for a digest:
 
 ## Key-value and config
 
-**`wasi:keyvalue`** (`store`, `atomics` and `batch`, 0.2.0-draft) is implemented by the host on the object's own volume. Bucket `b` is the directory `/data/.kv/b`, and each key is one file in it, named by the key in unpadded base64url so that no key can name a path.
+**`wasi:keyvalue`** (`store`, `atomics` and `batch`, 0.2.0-draft) is implemented by the host on the object's own volume. Bucket `b` is the directory `/data/.kv/b`, made by the bucket's first write (opening or reading one touches nothing), and each key is one file in it, named by the key in unpadded base64url so that no key can name a path.
 - Values count against the object's disk budget and keys against its file limit, like any other file.
 - A value is written in place; its request's commit makes it durable, together with everything else the request changed (see Commits).
 - A read is bounded by the object's memory limit, and a batch names at most 1,000 keys. Host calls aren't interrupted by the CPU budget, so these bounds keep them short.
