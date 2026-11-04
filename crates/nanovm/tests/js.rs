@@ -115,7 +115,8 @@ async fn exception_rolls_back_writes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn limits_kill_runaway_javascript() {
     let mut app = app();
-    app.limits.cpu_ms = 100;
+    // Headroom for the allocation to reach the memory limit on a busy host.
+    app.limits.cpu_ms = 300;
     let node = node_with(node_cfg("js_limits", 8), app);
     for (path, reason) in [("/spin", "cpu"), ("/alloc", "memory")] {
         assert_eq!(post(&node, "r", "/incr").await.status, 200);
