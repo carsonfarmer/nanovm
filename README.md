@@ -220,16 +220,16 @@ A worker reads the node's config from stdin and builds its engine from it alone;
 
 Mount and network namespaces were left out on purpose: Landlock already confines the filesystem, and with no `socket()` there is no network to remove.
 
-**Links.** The supervisor and a worker talk HTTP/1.1, one request at a time per connection, over socketpairs. The dialing side passes one end of each pair to the other over its control socket (`SCM_RIGHTS`) and keeps the connections it has made in a pool. A request runs inline in the task that sent it, at both ends: on this path every handoff between tasks is a thread wakeup, and those cost more than the HTTP framing. Each front-end thread (`front_threads`, a quarter of the cores by default) has its own runtime, listener and pool. The supervisor serves a worker at most as many egress links as its objects can use at once (`max_live_objects × (max_outbound_concurrency + 1)`), and all workers together at most a quarter of its file descriptor limit, which it raises to the hard limit at start; a link past either cap is closed unserved.
+**Links.** The supervisor and a worker talk HTTP/1.1, one request at a time per connection, over socketpairs, registered with the reactor for reads only (a Unix socket signals writability whenever its peer reads). The dialing side passes one end of each pair to the other over its control socket (`SCM_RIGHTS`) and keeps the connections it has made in a pool. A request runs inline in the task that sent it, at both ends: on this path every handoff between tasks is a thread wakeup, and those cost more than the HTTP framing. Each front-end thread (`front_threads`, a quarter of the cores by default) has its own runtime, listener and pool. The supervisor serves a worker at most as many egress links as its objects can use at once (`max_live_objects × (max_outbound_concurrency + 1)`), and all workers together at most a quarter of its file descriptor limit, which it raises to the hard limit at start; a link past either cap is closed unserved.
 
 A worker that dies takes only its app with it. In-flight requests get `502 worker-down`, and the next request starts a fresh worker. Volumes survive.
 
 ### What the jail costs
 
-The hop between the processes costs two extra cross-process round trips, about 30–40 µs each in this VM, plus one more HTTP parse. On the 4-core sandbox:
+The hop between the processes costs two extra cross-process round trips plus one more HTTP parse. Measured on the 4-core VM in 2026-11 (oha, 100 objects; see [IMPROVEMENTS.md](IMPROVEMENTS.md)):
 
-- One client sees about 0.1 ms more latency, the warm GET p50 above.
-- At 64 in flight, throughput is about 25% lower. The supervisor needs about a fifth of a request's CPU, and here it shares 4 cores with the worker and with curl.
+- **One client:** about 220 µs of CPU per request across supervisor and worker, against about 70 µs for the same request in-process; p50 0.22 ms. Each process now wakes the minimum number of threads per request (2 in the supervisor, 1 in the worker): the store re-polls on its own wakes, links are registered for reads only, and the control runtime has its own link pool.
+- **256 clients:** about 110 µs of CPU per request (supervisor ≈ 30, worker ≈ 80), against about 50 µs in-process; the supervisor needs roughly a quarter of a request's CPU, sharing the 4 cores with the worker, the load generator and the telemetry sink.
 
 The in-process benchmark below measures the node inside a worker, and is unchanged.
 
@@ -373,11 +373,12 @@ cargo run --release -p nanovm --example bench -- --json target/bench.json
 
 Add `--quick` for a run that is 10× smaller; the warm, cold and churn rows also print CPU time per
 request, which stays meaningful on a busy machine. The latest before/after comparison is in
-[notes/README.md](notes/README.md): on a 4-core Linux VM, in-process, the current code serves warm GETs
-across 100 objects at about 48K/s (256 concurrent), starts 3.7K new objects per second, churns 4.7K
-objects per second through 100 slots, and holds about 90 KB per live object. Through the supervisor and
-a jailed worker over HTTP it serves about 17K requests per second (oha, 256 concurrent, the load
-generator and a counting OTLP sink on the same cores).
+[IMPROVEMENTS.md](IMPROVEMENTS.md): on a 4-core Linux VM, through the supervisor and a jailed worker over
+HTTP (oha, 100 objects, the load generator and a counting OTLP sink on the same cores), nanovm serves
+about 27K requests per second at 256 clients with p99 21 ms and 110 µs of CPU per request, and a single
+client at 3.8K requests per second with p50 0.22 ms. In-process it serves warm GETs at about 75K/s (256
+concurrent) and 16K/s (one client), starts about 3.8K new objects per second, churns 5.5K objects per
+second through 100 slots, and holds about 90 KB per live object.
 
 The tables below are earlier full runs, kept for comparison across machines. A full run on a Mac (14 cores) gave:
 

@@ -16,11 +16,39 @@ that prove it, the exact commits to cherry-pick, what it depends on, and its ris
   compare CPU time per request, which noise affects far less than throughput.
 - The per-workstream notes in [notes/](notes/README.md) have full methods and raw numbers.
 
+## The result in one table
+
+Same idle 4-core VM, old and new builds alternating; "baseline" is `491e790` (= `origin/main`).
+
+| What | Baseline | This branch | How measured |
+|---|---:|---:|---|
+| HTTP through supervisor + jailed worker, 256 clients | 23.5k req/s, p99 34.7 ms, 130 µs CPU | **27.2k req/s (+16%), p99 21.0 ms (−40%), 110 µs (−16%)** | oha, 100 objects, 6 alternating rounds |
+| HTTP through supervisor + jailed worker, one client | 2.8k req/s, p50 0.31 ms, 381 µs CPU | **3.8k req/s (+36%), p50 0.22 ms (−31%), 220 µs (−42%)** | oha, 3 rounds |
+| Request spans delivered at 256 clients | 99.9% | **100%** | counting OTLP sink |
+| In-process warm GET, one client | 8.6k req/s | **16.2k req/s (+87%)** | `bench --quick`, 4 rounds |
+| In-process warm GET, 256 clients | 65.9k req/s, p99 13.2 ms | 75.0k req/s (+14%), **p99 22.0 ms (worse)** | same |
+| Cold start (first request to a new object) | 3.31k/s | 3.78k/s (+14%) | same |
+| Churn (new object + eviction) | 2.59k/s | 5.47k/s (+111%) | same |
+| First request after a crash | 726/s | 1,172/s (+61%) | same |
+| Memory per live object | 117 KB | 90 KB (−23%) | same |
+| App restart (first request after its worker is gone) | 20.8 ms; JS app 73.5 ms | 7.0 ms; JS app 9.7 ms | dev supervisor, alternating builds (loaded) |
+| First request after a busy worker restarts (1,000 objects) | 1,211 ms | 51 ms | same |
+| JavaScript warm GET (CPU per request) | — (no JS before) | 218 µs on QuickJS (Boa: 438 µs) | js-bench (loaded) |
+| Security bugs fixed, each with a test that failed before | — | 5 (+ 2 found in wave 2) | see S1–S6, N-120, N-130 |
+| Distinct crates in a normal build | 302 | 251 (−17%) | `cargo tree -e normal` |
+| Release binary | 54.5 MB | 49.4 MB (−9%) | `cargo build --release` |
+| Runtime lines (CI count) | 5,346 | 5,687 (+6%) | buys `nanovm run`, wire stamping, spawn-ahead, the waker, read-only links |
+
+The one regression: under saturation in-process, p99 rises (warm GET at 256 clients 13 → 22 ms;
+neighbours 2.6 → 4.0 ms) because of the store waker (H3), while medians fall sharply (neighbours' p50
+0.49 → 0.10 ms). On the production HTTP path the same change lowers p99 (it is part of the −40%).
+H3 is separable if you'd rather keep the old tail.
+
 ## Verification of the whole branch
 
 | Check | Result |
 |---|---|
-| Full locked suite, serial, idle machine (`env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked -p nanovm`) | 115 unit, 74 integration (10 ignored), 9 JavaScript: all pass |
+| Full locked suite, serial, idle machine (`env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked -p nanovm`) | 120 unit, 78 integration (10 ignored), 9 JavaScript: all pass |
 | SQLite durability suite (`--ignored sqlite_`), including crash-cut matrices and a jailed worker killed mid-commit | 8 / 8 pass; composed SQLite example passes |
 | Production build without the `dev` feature (`cargo check --locked -p nanovm --bin nanovm`) | passes |
 | Baseline at `491e790` for comparison | 107 unit, 67 integration (10 ignored) |
@@ -51,14 +79,30 @@ that prove it, the exact commits to cherry-pick, what it depends on, and its ris
 | D2 | in-process nodes deliver WebSocket publishes (N-60, N-61) | publishes work in tests, bench and `run`; bad paths 404 at once | +13 | yes |
 | D3 | `nanovm run app.wasm` | one command to run an app locally, with sockets and reload | +103 | after D2 |
 | D4 | `examples/chat` live multi-room chat | showcase, tested end to end | 0 | after D1, D3 |
-| J1 | JavaScript apps (`fetch(request, env)`) | apps in JavaScript; zero runtime lines | 0 | yes (wave 2 updates it) |
+| J1 | JavaScript apps (`fetch(request, env)`) | apps in JavaScript; zero runtime lines | 0 | yes |
+| J2 | JavaScript on QuickJS instead of Boa | warm CPU −50%, memory −27%, component 5.4 → 1.5 MB | 0 | after J1, D1 |
+| **Wave 2: the jailed HTTP path** | | | | |
+| H1 | reset the epoch deadline when a request starts | warm requests stop moving threads; one client −20% CPU (loaded) | +1 | yes |
+| H2 | heavy requests yield at every tick (N-120) | a short request beside a spinner: 103 ms → <50 ms | +9 | yes |
+| H3 | re-poll the store on self-wakes, bounded at a tick (N-42) + export thread (N-121) | worker context switches 4.05 → 1.82 per request; most of the HTTP gain | +66 | after H2; take both commits |
+| H4 | register link sockets for reads only (N-41) | one fewer cross-process wakeup per request; adds two `unsafe` blocks | +64 | after S5 |
+| H5 | the control runtime's own link pool (N-40) | control thread 1.9 → 0.03 wakeups per request | +1 | yes |
+| **Wave 2: app cold start** | | | | |
+| C3 | reuse a previous worker's empty scratch directories (N-150) | first request after a busy worker restarts: 1,211 → 51 ms | +10 | after C1 |
+| C4 | spawn the next worker ahead; jail refuses >1 thread (N-151, N-152) | app restart 21 → 10 ms | +54 | branch order |
+| C5 | open the cached component file instead of piping and hashing it (N-153) | JS app restart 78 → 16 ms | +21 | after C4 |
+| **Wave 2: smaller, and fixes found on the way** | | | | |
+| K1 | kv buckets made by their first write (N-110) | read-only first request: 32 → 1.4 ms p50 (JS) | +3 | after D1, J1 (tests) |
+| K2 | journal: a path under what became a file no longer fails the commit (N-130) | a guest can't make its own commits fail | 0 | yes |
+| K3 | 14 simplifications (helpers, prost varints, `tokio::fs`, `Default`, …) | −102 runtime lines | −102 | see list |
+| K4 | test-only code moved below CI's count | the count stops including 87 lines of tests | −87 | see list |
+| K5 | deterministic tests (N-91, N-132) | no load flakes | 0 | yes / after C1 |
 | **Maintenance** | | | | |
 | M1 | wasmtime and WASI crates 50.0.1 | five security advisories fixed upstream | 0 | yes (regenerate the lockfile) |
 | M2 | bench prints CPU per request, fds/maps/heap per object | A/B on a busy machine | 0 | yes |
 | M3 | test fixes: free publish port (N-92) | no failures when port 8444 is taken | 0 | yes |
 | M4 | docs: README front door, notes, PLAN/HANDOFF | clearer | 0 | with the changes they describe |
 
-Wave 2 (in progress at the time of writing) adds entries below the wave-1 ones.
 
 ---
 
@@ -293,8 +337,170 @@ the old code and failed.
   real node: routing and storage across eviction, rollback on throw, CPU and memory kills of runaway JS,
   egress denial, calls between objects, Web APIs, timers, WebSockets, nothing shared across instances
   from the snapshot (mutation-checked).
-- **Pick.** `a26bfa7 c63b06f 9cde8c2 95d3212 70f9516 050885b` — applies cleanly. Wave 2 (Q1 below)
-  replaces the engine; take its commits on top.
+- **Pick.** `a26bfa7 c63b06f 9cde8c2 95d3212 70f9516 050885b` — applies cleanly. J2 replaces the
+  engine; take its commits on top.
+
+### J2. JavaScript runs on QuickJS instead of Boa
+
+- **Problem.** With Boa, a warm JavaScript request cost ~440 µs of CPU (Rust: ~40–130 µs), the
+  component was 5.4 MB and building an app took ~45 s; the runtime also duplicated the SDK's bindings.
+- **Change.** `js/` embeds QuickJS-NG through rquickjs, built with the WASI SDK 34 (`WASI_SDK_PATH`;
+  CI already pins it for SQLite). Same app API; the runtime is now an SDK app (no bindings of its own).
+  Snapshot guarantees hold: the clock QuickJS reads at context start answers 0 only during that call,
+  `Math.random` is seeded from the host at first use, and an out-of-memory allocation traps so the
+  memory limit still kills the instance (both mutation-checked).
+- **Evidence (loaded, 6 alternating rounds; instructions by valgrind).** Warm GET 438 → 218 µs CPU,
+  1,566k → 428k instructions; private memory per object 352 → 257 KB; component 5.4 → 1.5 MB; each app
+  builds in ~10 s instead of ~45 s. All nine JavaScript tests pass, extended for URL, TextDecoder,
+  structuredClone, timers and runaway recursion.
+- **Pick.** `8575937 c8cd295 fef7cb4` (SDK `Request::url()`, js-bench memory column, the switch), after
+  D1 and J1 — `659bdbb a26bfa7 c63b06f 9cde8c2 95d3212 70f9516 050885b 8575937 c8cd295 fef7cb4`
+  applies cleanly. Runtime 0. **Limits:** runaway recursion is a trap, not a catchable `RangeError`
+  (N-140); no `performance` yet (W-65).
+
+## Wave 2: the jailed HTTP path
+
+Wave 1 left the production path unchanged. Profiling showed why: at one client a request crossed
+threads several times in each process for nothing. Together H1–H5 and the N-121 fix give the HTTP
+rows of the table at the top. Notes: [notes/hop.md](notes/hop.md).
+
+### H1. Reset the epoch deadline when a request starts
+
+- **Problem.** An object's epoch deadline was one tick after its last callback, so an object idle for
+  more than 5 ms hit an expired deadline at its next request's first instruction and yielded; tokio
+  treats a task that wakes itself as a yield, queues it at the back and wakes another thread to steal
+  it. Nearly every warm request moved threads.
+- **Change.** `object.rs`: the deadline is one tick from the start of each request. Budgets, heavy lanes
+  and per-tick yields are unchanged.
+- **Evidence (loaded).** One client: 504 → 404 µs CPU per request, p50 0.449 → 0.388 ms, worker context
+  switches 4.59 → 3.98 per request.
+- **Pick.** `1b6b882` — applies cleanly. Runtime +1.
+
+### H2. Heavy requests yield their thread at every tick (N-120)
+
+- **Problem.** Past 10 ms of CPU a request must hold a heavy lane. When a lane was free it was taken
+  without returning to the executor, so a heavy request kept its thread from 10 ms until its CPU budget
+  killed it; tasks behind it in tokio's unstealable LIFO slot (or on a one-thread runtime) waited.
+- **Change.** The heavy path yields once before taking a lane.
+- **Evidence.** `a_spinner_yields_its_thread_at_each_tick`: a short request beside a spinner on a
+  one-thread runtime finished at 102.8 ms before (with the spinner's kill), under 50 ms after.
+- **Pick.** `4805ba9` — applies cleanly. Runtime +9.
+
+### H3. The store re-polls on its own wakes, within a tick; the worker exports from its own thread (N-42, N-121)
+
+- **Problem.** Wasmtime wakes the store's task during its own poll about three times per request;
+  tokio takes each for a yield and wakes idle threads to steal it, so a request woke two or three threads
+  for nothing and usually finished on another one.
+- **Change.** `object.rs`: the store gets its own waker; a wake during the poll polls again at once,
+  while a wake from outside goes to tokio. Two bounds keep it fair: the epoch callback's yield always
+  reaches tokio, and so does any wake once a poll has run for a tick (5 ms), which also bounds a self-wake
+  loop that runs no guest code. Because a task can now hold its thread for up to a tick, the worker's
+  telemetry export, which shared those threads, could queue behind guest work and drop spans under
+  saturation; `932be36` gives it a current-thread runtime of its own with its own link pool (the
+  worker-side twin of the supervisor's N-36 fix).
+- **Evidence.** Worker context switches per request at one client 4.05 → 1.82 (perf: the `yield_now` and
+  stealing wakeups are gone). HTTP A/B at 256 clients, idle machine, 6 rounds: with the waker but no
+  export thread 4.6% of request spans were lost; with both, none (27.2k req/s, p99 21.0 ms). Hostile test
+  `a_self_waking_guest_yields_its_thread_at_each_tick` (three guest tasks waking themselves in a loop):
+  a neighbour's requests still get through in under 50 ms each and the waker is killed at its CPU
+  budget; removing both bounds fails it (the neighbour waited 533 ms).
+- **Trade-off.** In-process under saturation, p99 rises (warm GET c256 ~15 → 22 ms; neighbours 2.6 →
+  4.0 ms) while p50 and throughput improve; on the HTTP path p99 falls. A variant that yields between
+  queued requests was tried and did not help.
+- **Pick.** `4c37fad` and `932be36`, after H2. The runtime hunks apply; the test hunks touch the
+  probe component and integration tests, which wave 1 reshaped (D1, S5): take them in branch order or
+  resolve by keeping both probe routes. Runtime +49 and +17.
+
+### H4. Link sockets are registered for reads only (N-41)
+
+- **Problem.** tokio registers each `UnixStream` for read and write readiness, and a Unix stream
+  socket signals writability whenever its peer reads, so each request's read woke the other process.
+- **Change.** `link.rs`: a small `Io` over `AsyncFd`, registered for reads; a write that finds the socket
+  full waits on a duplicate descriptor registered for writes, dropped once it goes through. Two
+  `unsafe` blocks: tokio 1.54 made `AsyncFd`'s registration `unsafe`, and reads fill tokio's uninitialised
+  buffer through rustix.
+- **Evidence (loaded).** One client: context switches supervisor 2.59 → 2.02, worker 2.03 → 1.18; CPU
+  452 → 375 µs. `bodies_larger_than_the_socket_buffer_go_through` (4 MiB up, 8 MiB back) stalls if the
+  full-socket wait is registered for reads.
+- **Pick.** `fb7055d`, after S5 (`1ee35ae 98c1698`) — applies cleanly. Runtime +64: the costliest
+  wave-2 change per line; optional.
+
+### H5. The supervisor's control runtime has its own pool of links (N-40)
+
+- **Problem.** The readiness probe ran on the control runtime but put its link in front thread 0's pool,
+  so front thread 0 served requests over a socket the control runtime's reactor drove.
+- **Change.** The control runtime uses pool index `threads` (`Dialer::new(requests, threads + 1)`).
+- **Evidence.** Control thread wakeups 1.90 → 0.03 per request on a fresh supervisor at one client.
+- **Pick.** `e88acd5` — applies cleanly. Runtime +1.
+
+## Wave 2: app cold start
+
+Scale to zero means the first request to an app whose worker isn't running matters. Measured on the
+production path (dev-mode supervisor, jailed worker, loopback registry); notes:
+[notes/cold2.md](notes/cold2.md).
+
+### C3. A new worker reuses the empty scratch directories the last one left (N-150)
+
+- **Problem.** A worker that was killed, retired or switched leaves one `/tmp` directory per live
+  instance; the next worker removed them all before its first request, ~3 ms each on this disk.
+- **Change.** Empty ones are handed out again (as C1 does within a worker); used ones are removed as
+  before; new names start past those left.
+- **Evidence (loaded).** First request after the worker served 1,000 objects and was killed: 1,211 →
+  51 ms; after 200: 119 → 37 ms. `scratch_left_by_a_previous_run` fails without it.
+- **Pick.** `e082357`, after C1 (`f1e89d6 e082357` applies cleanly). Runtime +10.
+
+### C4. The next worker is spawned ahead, and the jail checks it has one thread (N-151, N-152)
+
+- **Problem.** Of a ~21 ms app restart, 11 ms was app-independent: fork and exec, and building the
+  engine (wasmtime's stack pool takes one `mprotect` per slot).
+- **Change.** A worker reads the node's config, builds its engine and linker (no guest input), and waits
+  for an app; the supervisor keeps one such spare and spawns the next after each start. A spare gets no
+  app, uid, cgroup or jail until taken; it exits when its supervisor does. The jail now refuses a process
+  with more than one thread instead of relying on a comment — which revealed that the jail test's probe
+  ran two threads and jailed only one (N-152, tests only); it now forks a single-threaded child.
+- **Evidence (loaded).** Restart after a kill 21.5 → 10.0 ms (worker CPU on the path 20.1 → 8.1 ms);
+  LRU retirement 34.2 → 18.0 ms; a switch with a cached compile 24.1 → 15.8 ms. Tests
+  `workers_are_spawned_ahead`, `the_jail_needs_one_thread`.
+- **Pick.** `99d0f55` — written on top of wave 1; take it in branch order. Runtime +54. A spare costs
+  ~2.2 MB of memory per node.
+
+### C5. A worker opens its cached component instead of receiving and re-hashing it (N-153)
+
+- **Problem.** Every worker start piped the whole component through stdin and hashed it to find its
+  cached compile, though the registry had checked it against its digest.
+- **Change.** The registry hands over the component's digest and cache file; the worker keys its compile
+  cache by the digest and reads the file only on a compile miss. The compile cache stays per app.
+- **Evidence (loaded, on top of C4).** JavaScript app (5.4 MB): 78 → 16 ms, worker CPU 40 → 7 ms;
+  counter 10.6 → 9.0 ms. `a_cached_compile_is_used_without_reading_the_component`.
+- **Pick.** `77497df`, after C4. Runtime +21.
+
+## Wave 2: smaller, and fixes found on the way
+
+Notes: [notes/lean2.md](notes/lean2.md). Lean2 targeted getting the runtime back under 5,346 lines and
+got from 5,652 to 5,466 before wave 2's features landed; it says so plainly.
+
+- **K1** `ad0ccaa` — opening a kv bucket no longer creates its directories, so a request that only reads
+  pays no journaled create and commit, and a new object doesn't spend two of its `max_files` on empty
+  directories (N-110). JS counter's first GET p50 32 → 1.4 ms, CPU per cold start 4.7 → 1.6 ms (loaded).
+  `reading_a_new_bucket_makes_nothing`. Needs `659bdbb a26bfa7` for its test hunks. Runtime +3.
+- **K2** `62c5104` — a journal commit failed with `ENOTDIR` when a touched path's parent had become a
+  file, so a guest could make its own commits fail (N-130). `a_path_under_what_became_a_file_commits`.
+  Applies cleanly. Runtime 0.
+- **K3** simplifications, each behaviour-preserving with the suite green (runtime Δ in brackets):
+  `760b3e0` egress helpers (W-41) [−12, after D2 `1392e99`], `238bf82` the same helpers in supervisor and
+  table [−12], `0e23bbe` quota entry-limit check [−5], `cb0e049` config defaults [−6], `e205632` prost
+  varints [−19, after S6], `d8e3a9f` journal `or_poison` [−5], `cefdfcd` quota writer without `Drop`
+  [−7], `cf16c73` registry I/O through `tokio::fs` [−9], `9a6b99b` one `cancelled` guard [−3, after
+  `760b3e0`], `9b39f93` ws publish check [−3, after S3], `c356402` one proxy serve loop [−2, after L5
+  `29c8ddd`], `c898bee` `delegate!` for two stock calls [−5], `7f7f18d` `Default` for two structs [−11],
+  `1872b6a` journal `iter::from_fn` [−3]. Those marked "applies cleanly" in testing: `0e23bbe cb0e049
+  d8e3a9f cefdfcd cf16c73 c898bee 7f7f18d 1872b6a 238bf82`; the others need the commit named, or branch
+  order.
+- **K4** `aa2d770`, `1122832` — test-only code (the counting allocator, `ObjState::for_test`,
+  `server::ok_json`, quota's `usage()`) moved below the line CI counts. This corrects the count by 87
+  lines; it simplifies nothing.
+- **K5** `e27f59a` (N-91: wait for the in-flight requests instead of sleeping 200 ms; applies cleanly)
+  and `6cf4798` (N-132: wait for the directory, after C1).
 
 ## Maintenance
 
@@ -314,5 +520,13 @@ the old code and failed.
 
 - **W-8, comparison against Spin, `wasmtime serve` and workerd.** It needs downloading and running
   third-party runtimes, which this environment's permission policy refused. Nothing was worked around.
-- **The production HTTP path did not get faster in wave 1** (idle A/B: 17.5k vs 17.4k req/s, 178 vs
-  176 µs CPU per request). Wave 2's hop workstream targets it.
+- **macOS.** nanovm no longer compiles on macOS (rustix's Linux-only link flags, N-131). It was found,
+  not caused, here; fixing it needs a Mac to verify, and whether macOS stays supported is the owner's call.
+- **Runtime size.** The runtime ends 6% larger than it started (5,346 → 5,687), net of 137 lines removed
+  by simplification (L3–L5, K3) and 87 lines of tests no longer counted; the growth buys the features and speed in
+  the table at the top. W-60/W-61 list further candidates.
+- **Open findings** worth a look next: N-131 (macOS), N-132 (store counted gone before its `/tmp` is
+  released), N-140 (JS recursion is a trap), N-154/N-155 (app switch and worker start leftovers), W-20
+  (thread-per-core, not built: its main motivation is gone), W-35 (proxy-wide buffer bound, designed).
+- **One unexplained HTTP 500** in 1.2M requests at 256 clients on the final build (likely a CPU-budget
+  kill under saturation; the budget is wall time inside polls, which inflates when oversubscribed).

@@ -5,16 +5,16 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 ## State (2026-11-04)
 
 - **Improvement waves (owner request, decisions delegated):** branch `cf/optimistic-feynman-62f1a0` merges two
-  waves of parallel workstreams; [notes/README.md](notes/README.md) is the plain-language evidence index and PLAN's
-  "Improvement waves" the summary. Wave 1 merged (perf, cold, dx, sec, lean, js) and wasmtime 50.0.1; full serial
-  suite on an idle machine: 115 unit, 74 integration (10 ignored), 9 JavaScript; the SQLite `--ignored` suite 8/8.
-  Runtime grew to 5,652 counted lines with `nanovm run`, wire-level telemetry stamping and the reference parser;
-  wave 2's lean2 targets getting back under the 5,346 it started from.
+  waves of parallel workstreams. [IMPROVEMENTS.md](IMPROVEMENTS.md) is the per-change catalogue (justification,
+  evidence, tests, commits to cherry-pick, prerequisites); [notes/README.md](notes/README.md) the evidence index.
+- **Verified on the final branch, idle machine:** 120 unit, 78 integration (10 ignored), 9 JavaScript tests; the
+  SQLite `--ignored` suite 8/8; production check. Runtime 5,687 counted lines (5,346 at the start).
 - **Not merged to `main`** and nothing published: merging `guests/**` changes republishes the test guests
   (`publish-guests.yml`); the owner should confirm that first.
 - **Owner follow-ups:** W-8 (comparison against Spin, `wasmtime serve`, workerd) was refused by this environment's
-  permission policy because it runs third-party binaries; W-20 (thread-per-core workers) and W-25 (sharded volume
-  directories, an on-disk layout change) need the owner unless wave 2 settles them with evidence.
+  permission policy because it runs third-party binaries; N-131 (nanovm doesn't compile on macOS; keep macOS?);
+  H3's in-process p99 trade-off (IMPROVEMENTS); W-25 (sharded volume directories, an on-disk layout change).
+- **JavaScript apps** need `WASI_SDK_PATH` (a WASI SDK 34) to build (`js/build.sh`); CI installs it.
 
 ## State (2026-11-02)
 

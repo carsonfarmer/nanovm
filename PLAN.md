@@ -348,8 +348,13 @@ has each one's method, numbers and tests, and ISSUES N-40..N-159 / W-20..W-74 th
 - **Wave 1:** hot-path profiling and two cuts (perf); empty `/tmp` reuse and 23% less memory per object (cold);
   `nanovm-sdk`, `nanovm run` and a live chat example (dx); five security fixes, N-70..N-75 (sec); trimmed dependency
   features and a reference parser of our own (lean); JavaScript apps on an embedded engine, pre-initialized with Wizer (js).
-- **Wave 2:** the jailed HTTP path (hop), the runtime back under its pre-wave size (lean2), QuickJS against Boa for
-  JavaScript apps (qjs), and app cold start for scale-to-zero (cold2).
+- **Wave 2:** the jailed HTTP path (hop: through the jail +16% throughput and −40% p99 at 256 clients, −42% CPU
+  per request at one client, with the worker's telemetry export on its own thread so no spans drop); app cold start
+  (cold2: spawn-ahead workers, cached component files, scratch reuse across workers: app restart 21 → 7 ms); JavaScript
+  on QuickJS instead of Boa (qjs: half the CPU, a quarter of the size); kv buckets made by their first write, a journal
+  commit fix and 14 simplifications (lean2; the runtime ends at 5,687 lines, +6% for all of the above).
+- **The catalogue:** [IMPROVEMENTS.md](IMPROVEMENTS.md) lists every change with its justification, evidence, tests,
+  commits to cherry-pick and prerequisites, for taking them into `main` one at a time.
 - **Not done:** W-8 (comparison against Spin, `wasmtime serve` and workerd) needs running third-party binaries,
   which this environment's permission policy refused; it waits for the owner.
 

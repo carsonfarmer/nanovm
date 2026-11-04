@@ -31,9 +31,24 @@ compares only the runtime (both builds served the same guests). `POST /incr` row
 table because the counter guest itself changed (it now writes in place, since commits already make a
 request's writes all-or-nothing; see [dx.md](dx.md)).
 
-**The production HTTP path did not get faster in wave 1.** The process hop between supervisor and
-worker dominates it: at one client a request costs about 455 µs of CPU across the two processes,
-against about 160 µs in-process. That is the target of wave 2.
+**The production HTTP path did not get faster in wave 1** (the process hop dominates it). Wave 2 fixed
+that; see below.
+
+## Wave 2 at a glance (final branch against `491e790`, same idle VM)
+
+| Area | Before | After | How we know |
+|---|---|---|---|
+| HTTP through supervisor + jailed worker, 256 clients | 23.5k req/s, p99 34.7 ms, 130 µs CPU/request | 27.2k req/s (+16%), p99 21.0 ms (−40%), 110 µs (−16%) | oha, 6 alternating rounds |
+| HTTP, one client | 2.8k req/s, p50 0.31 ms, 381 µs CPU/request | 3.8k req/s (+36%), p50 0.22 ms (−31%), 220 µs (−42%) | oha, 3 rounds |
+| Request spans delivered at 256 clients | 99.9% | 100% | counting OTLP sink |
+| In-process warm GET, one client | 8.6k req/s | 16.2k req/s (+87%) | `bench --quick`, 4 rounds |
+| In-process warm GET, 256 clients: throughput / p99 | 65.9k / 13.2 ms | 75.0k (+14%) / 22.0 ms (worse) | same |
+| App restart (first request after its worker is gone) | 20.8 ms; JS app 73.5 ms | 7.0 ms; JS app 9.7 ms | [cold2.md](cold2.md) (loaded) |
+| JavaScript warm GET | Boa 438 µs CPU, 5.4 MB component | QuickJS 218 µs, 1.5 MB | [qjs.md](qjs.md) (loaded) |
+| Read-only first request using key-value | 32 ms p50 | 1.4 ms | [lean2.md](lean2.md) |
+
+The only regression is the in-process p99 under saturation (the store waker, H3 in
+[IMPROVEMENTS.md](../IMPROVEMENTS.md)); its medians and the HTTP p99 improve.
 
 ## Workstreams
 
@@ -49,10 +64,16 @@ against about 160 µs in-process. That is the target of wave 2.
 - [dx.md](dx.md): the `nanovm-sdk` crate, `nanovm run`, the live chat example.
 - [js.md](js.md): JavaScript apps with a Workers-style `fetch(request, env)` API, pre-initialized so a
   cold start skips engine start-up.
+- [hop.md](hop.md): the jailed HTTP path: epoch deadline, heavy-lane yields, the store waker, read-only
+  link registration, the control runtime's link pool.
+- [cold2.md](cold2.md): app cold start: scratch reuse across workers, spawn-ahead workers, cached
+  component files.
+- [lean2.md](lean2.md): kv buckets made on first write, a journal commit fix, 14 simplifications.
+- [qjs.md](qjs.md): JavaScript on QuickJS instead of Boa.
 
 ## Verification of the merged branch
 
-- Full locked suite, serial, idle machine: 115 unit, 74 integration (10 ignored), 9 JavaScript; 0 failures.
+- Full locked suite, serial, idle machine: 120 unit, 78 integration (10 ignored), 9 JavaScript; 0 failures.
 - SQLite durability suite (`--ignored`): 8 of 8, including the crash-cut matrices and a jailed worker
   killed mid-commit; the composed SQLite example passes.
 - Production build without the `dev` feature checks.
