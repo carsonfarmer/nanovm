@@ -17,6 +17,13 @@ mod collector;
 use load::{Reply, request};
 use nanovm::table::Node;
 
+/// A JSON answer, as the test servers give.
+fn ok_json(v: serde_json::Value) -> http::Response<nanovm::object::RespBody> {
+    use http_body_util::BodyExt;
+    let body = http_body_util::Full::new(bytes::Bytes::from(v.to_string())).map_err(|e| match e {}).boxed_unsync();
+    http::Response::builder().header("content-type", "application/json").body(body).unwrap()
+}
+
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -549,7 +556,7 @@ async fn egress_allowed_request_round_trips() {
                 captured.lock().extend(ExportTraceServiceRequest::decode(body).unwrap().resource_spans
                     .into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     // In dev mode an IP-literal allowlist entry may be private; this
@@ -2680,7 +2687,7 @@ async fn doh(records: Arc<parking_lot::Mutex<std::collections::HashMap<String, V
         answer.extend(records.lock().get(&name).into_iter().flatten().map(|txt| {
             serde_json::json!({ "name": format!("{name}."), "type": 16, "TTL": 1, "data": format!("\"{txt}\"") })
         }));
-        async move { nanovm::server::ok_json(serde_json::json!({ "Status": 0, "Answer": answer })) }
+        async move { ok_json(serde_json::json!({ "Status": 0, "Answer": answer })) }
     }));
     format!("http://{addr}/dns-query")
 }
@@ -3064,7 +3071,7 @@ async fn the_proxy_drops_hop_by_hop_headers() {
     let echo = listener.local_addr().unwrap();
     tokio::spawn(nanovm::server::serve_http1(listener, |req: http::Request<hyper::body::Incoming>| {
         let names: Vec<_> = req.headers().keys().map(|k| k.to_string()).collect();
-        async move { nanovm::server::ok_json(serde_json::json!(names)) }
+        async move { ok_json(serde_json::json!(names)) }
     }));
     let records = Arc::new(parking_lot::Mutex::default());
     let proxy = proxied(echo, doh(records.clone()).await).await;
@@ -3104,7 +3111,7 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
                 spans.lock().extend(ExportTraceServiceRequest::decode(body).unwrap().resource_spans
                     .into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut cfg = node_cfg("front_door_events", 8);
@@ -3225,7 +3232,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
                 logs.lock().extend(collector::logs::v1::ExportLogsServiceRequest::decode(body).unwrap()
                     .resource_logs.into_iter().flat_map(|r| r.scope_logs).flat_map(|s| s.log_records));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3240,7 +3247,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         async move {
             arrived.send(req.uri().path().to_owned()).await.unwrap();
             gate.acquire().await.unwrap().forget();
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut app = app("hostile");
@@ -3326,7 +3333,7 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
                 return nanovm::object::error_response(503, "collector-down", "");
             }
             received.lock().push((path, body));
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut cfg = node_cfg("jailed_workers_export_otel_without_guest_network_access", 8);

@@ -796,45 +796,6 @@ where
 }
 
 #[cfg(test)]
-impl ObjState {
-    /// A state with `/data` at `volume` (removed when it drops), for testing
-    /// host calls without a store or a guest.
-    pub(crate) fn for_test(volume: PathBuf, limits: &crate::config::Limits) -> ObjState {
-        std::fs::create_dir_all(&volume).unwrap();
-        let metrics = Arc::new(Metrics::default());
-        let shared = Arc::new(ObjShared::new("app".into(), "obj"));
-        ObjState {
-            wasi: WasiCtxBuilder::new().build(),
-            table: ResourceTable::new(),
-            http: WasiHttpCtx::new(),
-            hooks: EgressHooks {
-                route: crate::egress::Route::Direct(Default::default()),
-                node: Default::default(),
-                sem: Arc::new(Semaphore::new(1)),
-                metrics: metrics.clone(),
-                obj: shared.clone(),
-                held: Default::default(),
-                publish_max: 0,
-            },
-            limiter: MemLimiter {
-                max_bytes: (limits.memory_mb << 20) as usize,
-                used: 0,
-                denied: false,
-            },
-            shared: shared.clone(),
-            cpu_budget_ns: 0,
-            cpu_exceeded: false,
-            stderr: LogTail::default(),
-            quota: QuotaGuard::new(&volume, limits, metrics, shared).unwrap(),
-            config: Default::default(),
-            reset: false,
-            _tmp: TmpDir(volume.clone(), None),
-            volume,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
@@ -937,5 +898,44 @@ mod tests {
         assert!(shared.cpu_used_ns() < 25_000_000);
         let names = Phase::ALL.map(Phase::as_str);
         assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold"]);
+    }
+}
+
+#[cfg(test)]
+impl ObjState {
+    /// A state with `/data` at `volume` (removed when it drops), for testing
+    /// host calls without a store or a guest.
+    pub(crate) fn for_test(volume: PathBuf, limits: &crate::config::Limits) -> ObjState {
+        std::fs::create_dir_all(&volume).unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let shared = Arc::new(ObjShared::new("app".into(), "obj"));
+        ObjState {
+            wasi: WasiCtxBuilder::new().build(),
+            table: ResourceTable::new(),
+            http: WasiHttpCtx::new(),
+            hooks: EgressHooks {
+                route: crate::egress::Route::Direct(Default::default()),
+                node: Default::default(),
+                sem: Arc::new(Semaphore::new(1)),
+                metrics: metrics.clone(),
+                obj: shared.clone(),
+                held: Default::default(),
+                publish_max: 0,
+            },
+            limiter: MemLimiter {
+                max_bytes: (limits.memory_mb << 20) as usize,
+                used: 0,
+                denied: false,
+            },
+            shared: shared.clone(),
+            cpu_budget_ns: 0,
+            cpu_exceeded: false,
+            stderr: LogTail::default(),
+            quota: QuotaGuard::new(&volume, limits, metrics, shared).unwrap(),
+            config: Default::default(),
+            reset: false,
+            _tmp: TmpDir(volume.clone(), None),
+            volume,
+        }
     }
 }
