@@ -987,6 +987,32 @@ async fn killed_worker_is_restarted_and_keeps_its_volumes() {
     assert_ne!(v["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap(), pid);
 }
 
+/// A worker whose compile of its component is cached starts from that alone:
+/// the registry's copy of the component is neither read nor hashed again
+/// (it was checked when fetched). Here that copy is overwritten, and a
+/// restart still serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_compile_is_used_without_reading_the_component() {
+    use sha2::Digest;
+    let test = "a_cached_compile_is_used_without_reading_the_component";
+    let (_sup, addr) = supervised(test).await;
+    let counter = publish("counter", &app("counter")).await;
+    assert_eq!(app_get(addr, &counter, "/k/").await.0, 200);
+    let wasm = guest("counter");
+    let blob = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes").join(test).join("registry")
+        .join(format!("sha256-{:x}", sha2::Sha256::digest(&wasm)));
+    std::fs::write(&blob, vec![0; wasm.len()]).unwrap();
+    let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let t0 = Instant::now();
+    while stats_json(addr).await["workers"][worker(&counter).as_str()]["up"] == true {
+        assert!(t0.elapsed() < Duration::from_secs(2), "worker still up");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (status, body) = app_get(addr, &counter, "/k/").await;
+    assert_eq!(status, 200, "{body}");
+}
+
 /// A start takes a worker spawned ahead of need, which has built its engine
 /// and waits for its app (that was 11 of a restart's 21 ms), and the next
 /// one is spawned after it.
