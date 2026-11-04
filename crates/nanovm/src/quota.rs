@@ -430,11 +430,17 @@ impl StreamConsumer<ObjState> for QuotaWriter {
     }
 }
 
-/// Methods that need no quota check: forwarded to the stock implementation.
+/// Methods that need no quota check: forwarded to the stock implementation
+/// (`sync` ones take the store's `Access`).
 macro_rules! delegate {
     ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
         async fn $name(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>, $($arg: $ty),*) -> $ret {
             WasiFilesystem::$name(&stock(store), fd, $($arg),*).await
+        }
+    )*};
+    (sync $($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
+        fn $name(mut store: Access<'_, ObjState, Self>, fd: Resource<Descriptor>, $($arg: $ty),*) -> $ret {
+            WasiFilesystem::$name(stock_access(&mut store), fd, $($arg),*)
         }
     )*};
 }
@@ -456,19 +462,9 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         metadata_hash_at(flags: PathFlags, path: String) -> FilesystemResult<MetadataHashValue>;
     }
 
-    fn read_via_stream(
-        mut store: Access<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        offset: Filesize,
-    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        WasiFilesystem::read_via_stream(stock_access(&mut store), fd, offset)
-    }
-
-    fn read_directory(
-        mut store: Access<'_, ObjState, Self>,
-        fd: Resource<Descriptor>,
-    ) -> wasmtime::Result<(StreamReader<DirectoryEntry>, FutureReader<Result<(), ErrorCode>>)> {
-        WasiFilesystem::read_directory(stock_access(&mut store), fd)
+    delegate! { sync
+        read_via_stream(offset: Filesize) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)>;
+        read_directory() -> wasmtime::Result<(StreamReader<DirectoryEntry>, FutureReader<Result<(), ErrorCode>>)>;
     }
 
     fn write_via_stream(

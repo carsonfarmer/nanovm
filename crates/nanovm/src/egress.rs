@@ -345,12 +345,13 @@ type Sent = (http::Response<WasiBody>, futures::future::BoxFuture<'static, Resul
 /// Hands a request to the supervisor and maps its verdict back to the error
 /// the guest would have seen from a direct send.
 async fn forward(mut req: http::Request<WasiBody>, options: Option<RequestOptions>, up: Upstream) -> Result<Sent, Error> {
+    // A copy the guest set itself is worth no more than the option it could
+    // pass instead: `send` caps both.
     let h = req.headers_mut();
     for (name, d) in [
         (CONNECT_TIMEOUT, options.and_then(|o| o.connect_timeout)),
         (FIRST_BYTE_TIMEOUT, options.and_then(|o| o.first_byte_timeout)),
     ] {
-        h.remove(name);
         if let Some(d) = d {
             h.insert(name, d.as_millis().to_string().parse().unwrap());
         }
