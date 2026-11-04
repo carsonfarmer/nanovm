@@ -46,6 +46,11 @@ pub async fn accept(listener: &TcpListener) -> TcpStream {
     }
 }
 
+/// The most a request's or response's head may be, at every hop: so any
+/// header map the host holds for a guest, its own or a copy of one it was
+/// sent, is at most this (see `object::new_store`).
+pub const MAX_HEAD: usize = 64 << 10;
+
 /// Serves HTTP/1.1 on one connection, in its own task. With `header_timeout`,
 /// a client that takes longer to send a request's headers (or leaves the
 /// connection idle that long between requests) is hung up on.
@@ -62,6 +67,7 @@ where
         async move { Ok::<_, Infallible>(res.await) }
     });
     let mut builder = http1::Builder::new();
+    builder.max_header_size(MAX_HEAD);
     if header_timeout.is_some() {
         builder.timer(TokioTimer::new()).header_read_timeout(header_timeout);
     }

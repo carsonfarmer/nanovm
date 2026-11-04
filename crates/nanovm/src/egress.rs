@@ -474,7 +474,9 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
 
     let (mut sender, conn) = tokio::time::timeout(
         connect_timeout,
-        hyper::client::conn::http1::Builder::new().handshake(wasmtime_wasi_http::io::TokioIo::new(io)),
+        hyper::client::conn::http1::Builder::new()
+            .max_header_size(crate::server::MAX_HEAD)
+            .handshake(wasmtime_wasi_http::io::TokioIo::new(io)),
     )
     .await
     .map_err(|_| Error::ConnectionTimeout)??;
@@ -483,6 +485,10 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
         .path_and_query(uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"))
         .build()
         .map_err(|_| Error::HttpRequestUriInvalid)?;
+    // The host the policy allowed, not whatever `Host` a worker sent: a shared
+    // front end (a CDN) routes by it.
+    let authority = uri.authority().map_or("", |a| a.as_str().rsplit_once('@').map_or(a.as_str(), |(_, h)| h));
+    req.headers_mut().insert(http::header::HOST, authority.parse().map_err(|_| Error::HttpRequestUriInvalid)?);
 
     // The connection runs as its own task; it ends once the request and
     // response bodies are done or dropped.
@@ -694,6 +700,26 @@ mod tests {
             .map_err(|e| match e {})
             .boxed_unsync();
         http::Request::get(uri).body(body).unwrap()
+    }
+
+    /// The upstream hears the host the policy allowed, whatever `Host` a
+    /// (compromised) worker's request carries: a shared front end, as on a
+    /// CDN, would route by that header to a host the list never named.
+    #[tokio::test]
+    async fn the_upstream_hears_the_allowed_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(crate::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| {
+            let _ = tx.send(req.headers().get_all(http::header::HOST).iter().cloned().collect::<Vec<_>>());
+            async { crate::server::ok_json(serde_json::json!({})) }
+        }));
+        let p = policy(&[&format!("127.0.0.1:{port}")]);
+        let mut req = get(&format!("http://127.0.0.1:{port}/"));
+        req.headers_mut().insert(http::header::HOST, "elsewhere.example".parse().unwrap());
+        let (res, _conn) = send(req, None, &p).await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(heard.recv().await.unwrap(), [format!("127.0.0.1:{port}")]);
     }
 
     /// Requests are checked before any connection: not on the list (with

@@ -968,9 +968,17 @@ fn jail_blocks_escapes() {
     if unsafe { libc::geteuid() } == 0 {
         std::os::unix::fs::chown(dir.join("mine"), Some(200_099), Some(200_099)).unwrap();
     }
+    // A host service's datagram socket, for the probe to try to reach.
+    let service = format!("nanovm-jail-probe-{}", std::process::id());
+    let service_sock = {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&service).unwrap();
+        std::os::unix::net::UnixDatagram::bind_addr(&addr).unwrap()
+    };
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "jail_probe", "--nocapture", "--test-threads", "1"])
         .env("NANOVM_JAIL_PROBE", &dir)
+        .env("NANOVM_JAIL_PROBE_SERVICE", &service)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -999,6 +1007,7 @@ fn jail_blocks_escapes() {
         ("list_root", "denied"),
         ("tcp_socket", "denied"),
         ("unix_socket", "denied"),
+        ("unix_datagram", "denied"),
         ("fork", "denied"),
         ("exec", "denied"),
         ("setuid_root", "denied"),
@@ -1013,6 +1022,8 @@ fn jail_blocks_escapes() {
     for (k, v) in expect {
         assert_eq!(results.get(k).copied(), Some(v), "{k}\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     }
+    service_sock.set_nonblocking(true).unwrap();
+    assert!(service_sock.recv(&mut [0; 8]).is_err(), "a datagram left the jail");
 }
 
 /// The jailed half of `jail_blocks_escapes`; a no-op when run directly.
@@ -1042,6 +1053,13 @@ fn jail_probe() {
     unsafe {
         report("tcp_socket", sys(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) as i64));
         report("unix_socket", sys(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) as i64));
+        // A datagram pair can send to any socket on the host with a name.
+        let service = std::env::var("NANOVM_JAIL_PROBE_SERVICE").unwrap();
+        let sent = std::os::unix::net::UnixDatagram::pair().and_then(|(a, _)| {
+            use std::os::linux::net::SocketAddrExt;
+            a.send_to_addr(b"x", &std::os::unix::net::SocketAddr::from_abstract_name(&service)?)
+        });
+        report("unix_datagram", sent.is_ok());
         let pid = libc::fork();
         if pid == 0 {
             libc::_exit(0);
@@ -2669,6 +2687,14 @@ async fn the_proxy_routes_hosts_by_dns() {
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&at("counter.test", &counter)), "{body}");
     assert_eq!(get("counter.test", "/_nanovm/stats", "").await.0, 400);
+    // Nor can it claim to be a socket's event (and pick its `Connection-Id`),
+    // however it spells the type: counter's own parsing reads the last one.
+    for types in ["text/plain\r\nContent-Type: application/websocket-events", "Application/WebSocket-Events; charset=utf-8"] {
+        let head = format!("POST /room/ws HTTP/1.1\r\nHost: counter.test\r\nContent-Type: {types}\r\n\
+            Connection-Id: 7\r\nContent-Length: 12\r\nConnection: close\r\n\r\n");
+        let (status, body) = raw(proxy, &head, b"TEXT 2\r\nid\r\n").await;
+        assert_eq!(status, 400, "{types}: {body}");
+    }
     // Another host naming the same repository runs an app of its own: it
     // can choose the version it runs, but not the one counter.test runs.
     record("other.test", &[&format!("app={tagged}; trust=dev dev")]);
@@ -3078,18 +3104,50 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     collector.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn post_return_work_keeps_context_and_reports_commit_failure() {
-    use http_body_util::BodyExt;
-    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
-    use prost::Message;
-    // A private fixture, outside guests/** and its publishing workflow.
+/// A private fixture, outside guests/** and its publishing workflow.
+fn probe() -> Vec<u8> {
     let build = std::process::Command::new("cargo").args([
         "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
         "crates/nanovm/tests/post-return/Cargo.toml", "--target-dir", "target/test-guest",
     ]).current_dir(repo()).status().unwrap();
     assert!(build.success());
-    let wasm = std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap();
+    std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap()
+}
+
+/// What the host holds for a guest's header maps stays within its memory
+/// limit: a map holds at most 64 KiB (its own, or a copy of one it was sent;
+/// bigger heads are refused before it), and an instance holds no more
+/// resources than its memory limit has room for at that size.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_header_maps_are_bounded_by_the_memory_limit() {
+    let mut app = app("hostile");
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    // 32 MiB: room for 512 maps of 64 KiB, of its 2,000 resources.
+    let node = Node::new(node_cfg("guest_header_maps", 8), &app, &probe(), None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| nanovm::server::handle(node.clone(), req)));
+    let get = async |path: &str, header: usize| {
+        let head = format!("GET {path} HTTP/1.1\r\nHost: x\r\nx-big: {}\r\nConnection: close\r\n\r\n", "x".repeat(header));
+        raw(addr, &head, b"").await
+    };
+    // 600 maps of 60 KiB, new or copies of a request's, are over 32 MiB.
+    for (path, header) in [("/a/headers?n=600&kb=60", 0), ("/b/headers?n=600", 60 << 10)] {
+        let (status, body) = get(path, header).await;
+        assert!(status == 500 && body.contains("resource-table"), "{path}: {status} {body}");
+    }
+    assert_eq!(get("/c/headers?n=1&kb=100", 0).await.0, 500, "a map over 64 KiB");
+    assert_eq!(get("/d/headers?n=0", 100 << 10).await.0, 431, "a head over 64 KiB");
+    assert_eq!(get("/e/headers?n=100&kb=60", 50 << 10).await, (200, "100".into()), "within the limits");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_return_work_keeps_context_and_reports_commit_failure() {
+    use http_body_util::BodyExt;
+    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
+    use prost::Message;
+    let wasm = probe();
     let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let logs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
