@@ -198,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
         let (fds0, maps0) = fds_and_maps();
         let cpu0 = cpu();
         let cold = load(&n, "GET", "/", cold_n, conc, |i| format!("o{i}")).await;
-        let cpu = cpu_us(cpu0, &cold);
+        let cold_cpu = cpu_us(cpu0, &cold);
         let live = n.live_objects();
         let rss1 = rss_bytes();
         let heap_kb = (HEAP.load(Relaxed) - heap0) as f64 / live.max(1) as f64 / 1024.0;
@@ -207,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
         let per_obj_kb = rss1.saturating_sub(rss0) as f64 / live.max(1) as f64 / 1024.0;
         let per = |a: usize, b: usize| b.saturating_sub(a) as f64 / live.max(1) as f64;
         println!("\ncold start ({cold_n} new objects, {conc} concurrent)");
-        row("first request to a new object", &cold, &format!("{cpu:.0} µs CPU each"));
+        row("first request to a new object", &cold, &format!("{cold_cpu:.0} µs CPU each"));
         println!(
             "  {:<34} {live} live · RSS {:.0} MB · {per_obj_kb:.0} KB/object{heap} · {:.2} fds, {:.2} maps/object",
             "",
@@ -219,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
             "cold".into(),
             json!({ "run": cold.json(), "live": live, "rss_mb": rss1 as f64 / 1e6, "kb_per_object": per_obj_kb.round(),
                 "heap_kb_per_object": heap_kb,
-                "cpu_us_per_request": cpu.round(), "fds_per_object": per(fds0, fds1), "maps_per_object": per(maps0, maps1) }),
+                "cpu_us_per_request": cold_cpu.round(), "fds_per_object": per(fds0, fds1), "maps_per_object": per(maps0, maps1) }),
         );
 
         if runs("warm") {
@@ -283,16 +283,16 @@ async fn main() -> anyhow::Result<()> {
         let n = node("churn", "counter", cap, None)?;
         let cpu0 = cpu();
         let churn = load(&n, "GET", "/", 20_000 / scale, 64, |i| format!("c{i}")).await;
-        let cpu = cpu_us(cpu0, &churn);
+        let churn_cpu = cpu_us(cpu0, &churn);
         println!(
             "\nchurn ({} new objects through {cap} slots, 64 concurrent)",
             20_000 / scale
         );
-        row("new object + LRU eviction", &churn, &format!("{cpu:.0} µs CPU each"));
+        row("new object + LRU eviction", &churn, &format!("{churn_cpu:.0} µs CPU each"));
         println!("  {:<34} {} instantiation failures (details in OTLP logs)", "", n.metrics.instantiate_failures.load(Relaxed));
         println!("  {:<34} {} evicted", "", n.metrics.evicted_lru.load(Relaxed));
         let mut churn_json = churn.json();
-        churn_json["cpu_us_per_request"] = json!(cpu.round());
+        churn_json["cpu_us_per_request"] = json!(churn_cpu.round());
         out.insert("churn".into(), churn_json);
         n.shutdown().await;
         drop(n);

@@ -20,3 +20,54 @@ pub mod supervisor;
 pub mod table;
 pub mod telemetry;
 pub mod ws;
+
+/// Per-thread allocation counts, for tests that bound what parsing costs.
+#[cfg(test)]
+pub(crate) mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Bytes allocated in all, bytes held now, and the most held.
+        static C: Cell<(usize, usize, usize)> = const { Cell::new((0, 0, 0)) };
+    }
+
+    struct Counting;
+
+    // `realloc` keeps its default: an `alloc` and a `dealloc`, both counted.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let _ = C.try_with(|c| {
+                let (all, held, peak) = c.get();
+                c.set((all + l.size(), held + l.size(), peak.max(held + l.size())))
+            });
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            let _ = C.try_with(|c| {
+                let (all, held, peak) = c.get();
+                c.set((all, held.saturating_sub(l.size()), peak))
+            });
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    /// Bytes this thread has allocated so far.
+    pub fn allocated() -> usize {
+        C.with(|c| c.get().0)
+    }
+
+    /// The most `f` held at once on this thread.
+    pub fn peak(f: impl FnOnce()) -> usize {
+        let held = C.with(|c| {
+            let (all, held, _) = c.get();
+            c.set((all, held, held));
+            held
+        });
+        f();
+        C.with(|c| c.get().2) - held
+    }
+}

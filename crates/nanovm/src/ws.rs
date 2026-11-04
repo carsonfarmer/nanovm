@@ -636,25 +636,6 @@ mod tests {
         }
     }
 
-    /// Counts what the calling thread holds allocated, and its peak, so a
-    /// test can bound what parsing costs.
-    struct Counting;
-    thread_local! {
-        static HELD: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
-    }
-    unsafe impl std::alloc::GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-            HELD.with(|h| h.set((h.get().0 + l.size(), h.get().1.max(h.get().0 + l.size()))));
-            unsafe { std::alloc::System.alloc(l) }
-        }
-        unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-            HELD.with(|h| h.set((h.get().0.saturating_sub(l.size()), h.get().1)));
-            unsafe { std::alloc::System.dealloc(p, l) }
-        }
-    }
-    #[global_allocator]
-    static COUNTING: Counting = Counting;
-
     /// A publish is the guest's, and both its worker and the proxy parse it:
     /// that holds a few times its size at most, whatever it holds (tiny
     /// values parsed as `serde_json::Value` held 24 times).
@@ -670,10 +651,7 @@ mod tests {
         let unread = filled(r#"{"items":[],"x":["#, "0,", "0]}");
         let items = filled(r#"{"items":["#, r#"{"channel":"a","formats":{}},"#, r#"{"channel":"a","formats":{}}]}"#);
         for json in [unread, items] {
-            let before = HELD.with(|h| h.get().0);
-            HELD.with(|h| h.set((before, before)));
-            let _ = messages(json.as_bytes());
-            let peak = HELD.with(|h| h.get().1) - before;
+            let peak = crate::counting::peak(|| _ = messages(json.as_bytes()));
             assert!(peak < 8 * json.len(), "parsing {} bytes held {peak}", json.len());
         }
     }

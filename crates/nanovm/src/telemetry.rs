@@ -411,27 +411,6 @@ mod tests {
         }), ..Default::default() }
     }
 
-    /// Bytes allocated by this thread, for bounding what stamping costs.
-    struct Counting;
-    thread_local! {
-        static ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    unsafe impl std::alloc::GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-            let _ = ALLOCATED.try_with(|a| a.set(a.get() + layout.size()));
-            unsafe { std::alloc::System.alloc(layout) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-            unsafe { std::alloc::System.dealloc(ptr, layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
-            let _ = ALLOCATED.try_with(|a| a.set(a.get() + new));
-            unsafe { std::alloc::System.realloc(ptr, layout, new) }
-        }
-    }
-    #[global_allocator]
-    static ALLOCATOR: Counting = Counting;
-
     fn raw(fields: &[(u64, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         for (key, value) in fields {
@@ -450,9 +429,9 @@ mod tests {
         let scope = vec![[2 << 3 | LEN as u8, 0]; (1 << 20) / 2 - 16].concat();
         let batch = raw(&[(1 << 3 | LEN, &raw(&[(2 << 3 | LEN, &scope)]))]);
         assert!(batch.len() <= MAX_BATCH);
-        let before = ALLOCATED.with(|a| a.get());
+        let before = crate::counting::allocated();
         let stamped = stamp("traces", &batch, "app", "digest").unwrap();
-        let allocated = ALLOCATED.with(|a| a.get()) - before;
+        let allocated = crate::counting::allocated() - before;
         assert!(allocated < 4 * MAX_BATCH, "stamping allocated {allocated} bytes");
         let resource = Resource { attributes: opentelemetry_proto::transform::common::tonic::Attributes::from(identity("app", "digest")).0, ..Default::default() };
         let expected = raw(&[(1 << 3 | LEN, &raw(&[(1 << 3 | LEN, &resource.encode_to_vec()), (2 << 3 | LEN, &scope)]))]);
