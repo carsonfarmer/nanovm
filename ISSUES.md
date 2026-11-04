@@ -340,6 +340,23 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** yes, on `cf/dx` it failed 5 of 7 runs on its own, with the baseline and the SDK `hostile.wasm` alike, including on an idle machine (load 1.8). It gets 200 where it expects the 502 refusal: `b`'s 900 ms busy request has already finished, because starting `c`'s worker takes most of that time, so `b` is idle and `a` takes its slot. Not A/B'd against a baseline runtime, but the branch doesn't touch worker scheduling.
 - **Fix:** hold the busy requests open until the refusal has been checked (for example a gate the test releases), not for fixed sleeps.
 - **Status:** open
+
+### N-110 (efficiency): opening a key-value bucket creates its directories, even to read
+- **Where:** `kv.rs` `open_bucket` (creates `.kv` and `.kv/<bucket>`, journaled)
+- **Reproduced:** the JS counter's first `GET` on a new object (`env.kv.get`, nothing written) pays a journaled create and a commit: cold-start p50 25–36 ms against ~1 ms for a JS app that doesn't touch kv (js-bench, cf/js). Each new object also spends two of its `max_files` on empty directories.
+- **Fix:** create the directories on the first write; a missing bucket reads as empty and lists nothing.
+- **Status:** open (found by the js workstream; `kv.rs` is lean's)
+
+### N-111: JavaScript apps share std's hash seed, fixed at build time
+- **Where:** `crates/nanovm/examples/js-wizer.rs` (pre-initialization gives `wasi:random/insecure-seed` a constant)
+- **From source:** Boa keys its shape-transition maps with std's `RandomState`, seeded once per instance. Pre-initialization snapshots that seed, so every instance of every JS app has the same keys, readable from the published component anyway. An attacker who can make an object build objects with chosen property names (`JSON.parse` of a body) could aim for collisions; the cost lands on that object's own requests, within `cpu_ms`. Low.
+- **Status:** accepted for now (reproducible builds); revisit with W-50
+
+### N-112: wasmtime-wizer 50.0.0 writes an invalid component when it drops the init export
+- **Where:** upstream `wasmtime-wizer` component rewrite
+- **Reproduced:** with the default (`keep_init_func` false), the snapshot of a `wasm-component-ld` component fails validation: "core instance 29 has no export named `wizer-initialize`": the core export is removed, the component's alias to it is not.
+- **Fix:** `js-wizer` keeps the export (`keep_init_func(true)`); calling it again is a no-op. Report upstream.
+- **Status:** worked around in cf/js
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -513,3 +530,23 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-32: work after the response in the SDK
 - **What:** the SDK buffers whole bodies and answers when the handler returns. Durable Objects' `waitUntil` (post-return work, bounded by `post_return_timeout_ms`) and streamed bodies still need raw `wasip3` (see the post-return test probe). A `Response::then(future)` and a streaming body would cover both.
 - **Status:** idea
+
+### W-50: QuickJS for JavaScript apps
+- **What:** A/B `rquickjs` against Boa in `js/runtime` (same prelude). Boa costs ~6× the Rust guest's CPU per warm request (253–298 µs against 38–48 µs), ~1.3 MB per live object and a 5.4 MB component; QuickJS is usually several times faster and much smaller. It needs a wasi-sdk sysroot, which CI already pins (wasi-sdk-34, for SQLite). Keep Boa unless the numbers say otherwise.
+- **Status:** open
+
+### W-51: share the JavaScript runtime's bindings with the guest SDK
+- **What:** `js/runtime/src/lib.rs` duplicates request reading, response writing and the kv/config bindings of `guests/util`; use the dx workstream's guest SDK once it lands.
+- **Status:** open
+
+### W-52: JavaScript API gaps
+- **What:** streaming bodies (`ReadableStream`), more than one module (bundling with esbuild works today), kv values beyond JSON (structured clone, bytes), batch get/put, a `/data` file API, alarms (W-4), and a supervised end-to-end test of a JS chat room (`env.publish` needs the supervisor).
+- **Status:** open
+
+### W-53: build JavaScript apps without a Rust toolchain
+- **What:** today each app relinks the runtime with its source compiled in (~1 min, needs Rust). Pass the source to the pre-initialization call instead, so one prebuilt runtime plus `js-wizer` packs any app in seconds; make it a `nanovm` build command once dx's CLI lands.
+- **Status:** open
+
+### W-54: memory per JavaScript object
+- **What:** a live JS object costs ~1.2 MB more than a Rust one. Boa writes to the header of every heap object it touches (reference counts), so serving a request copies much of the pre-initialized heap. Measure which pages a request dirties; compare with W-50.
+- **Status:** open
