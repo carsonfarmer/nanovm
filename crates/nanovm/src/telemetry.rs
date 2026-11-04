@@ -44,6 +44,13 @@ pub fn request<B>(span: &mut Span, req: &Request<B>) {
     span.set_attribute(KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
 }
 
+/// Ends a span dropped before its response headers.
+pub fn cancelled(mut span: Span) {
+    use opentelemetry::trace::Span as _;
+    span.set_status(opentelemetry::trace::Status::error("cancelled before response headers"));
+    span.set_attribute(KeyValue::new("error.type", "cancelled"));
+}
+
 pub(crate) const PATH: &str = "/telemetry/";
 const MAX_BATCH: usize = 1 << 20;
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -158,10 +165,7 @@ impl Telemetry {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent = propagator.extract(&opentelemetry_http::HeaderExtractor(req.headers()));
         let object = crate::table::route(req.uri().path()).map_or("", |(id, _)| id);
-        let mut span = scopeguard::guard(self.span(name, object, &parent, SpanKind::Server), |mut span| {
-            span.set_status(opentelemetry::trace::Status::error("cancelled"));
-            span.set_attribute(KeyValue::new("error.type", "cancelled"));
-        });
+        let mut span = scopeguard::guard(self.span(name, object, &parent, SpanKind::Server), cancelled);
         request(&mut span, &req);
         let context = parent.with_remote_span_context(span.span_context().clone());
         propagator.inject_context(&context, &mut opentelemetry_http::HeaderInjector(req.headers_mut()));

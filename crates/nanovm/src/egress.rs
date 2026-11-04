@@ -178,7 +178,7 @@ impl WasiHttpHooks for EgressHooks {
             use opentelemetry::{KeyValue, propagation::TextMapPropagator, trace::{Span, SpanKind, TraceContextExt}};
             let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
             let parent = obj.context.lock().clone();
-            let mut span = scopeguard::guard(node.telemetry.span("http.client", &obj.id, &parent, SpanKind::Client), cancelled);
+            let mut span = scopeguard::guard(node.telemetry.span("http.client", &obj.id, &parent, SpanKind::Client), crate::telemetry::cancelled);
             crate::telemetry::request(&mut span, &request);
             span.set_attribute(KeyValue::new("server.address", request.uri().host().unwrap_or("").chars().take(253).collect::<String>()));
             if let Some(port) = request.uri().port_u16() { span.set_attribute(KeyValue::new("server.port", port as i64)); }
@@ -238,7 +238,7 @@ async fn call(
     use opentelemetry::{KeyValue, trace::{Span, SpanKind, TraceContextExt}};
     let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
     let parent = obj.context.lock().clone();
-    let mut span = scopeguard::guard(node.telemetry.span("call", &obj.id, &parent, SpanKind::Client), cancelled);
+    let mut span = scopeguard::guard(node.telemetry.span("call", &obj.id, &parent, SpanKind::Client), crate::telemetry::cancelled);
     crate::telemetry::request(&mut span, &req);
     let result = async {
         let (mut parts, body) = req.into_parts();
@@ -266,12 +266,6 @@ async fn call(
     let mut span = scopeguard::ScopeGuard::into_inner(span);
     client_response(&mut span, result.as_ref(), true);
     result
-}
-
-fn cancelled(mut span: crate::telemetry::Span) {
-    use opentelemetry::trace::Span;
-    span.set_status(opentelemetry::trace::Status::error("call cancelled before response headers"));
-    span.set_attribute(opentelemetry::KeyValue::new("error.type", "cancelled"));
 }
 
 fn client_response<B>(span: &mut crate::telemetry::Span, result: Result<&http::Response<B>, &Error>, internal: bool) {
