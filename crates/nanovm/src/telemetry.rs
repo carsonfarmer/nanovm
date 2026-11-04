@@ -13,7 +13,7 @@ use opentelemetry::trace::TraceContextExt;
 use opentelemetry::trace::{SpanKind, Tracer, TracerProvider};
 use opentelemetry_http::{HttpClient, HttpError};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
-use opentelemetry_proto::tonic::{collector, common::v1 as common, resource::v1::Resource};
+use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_sdk::logs;
 use opentelemetry_sdk::trace;
 pub use opentelemetry_sdk::trace::Span;
@@ -265,45 +265,143 @@ impl Relay {
     }
 }
 
-fn scrub(attrs: &mut Vec<common::KeyValue>) {
-    attrs.retain(|kv| kv.key_strindex == 0 && !matches!(kv.key.as_str(), "service.name" | "service.version" | "nanovm.app"));
-}
-
+/// Replaces each resource of a worker's OTLP batch with the stamped one and
+/// drops identity attributes from scopes, spans, events, links and log
+/// records, at the wire level: the rest is copied as bytes. Decoding the
+/// batch instead cost up to 200 times its size, as 2-byte empty spans (N-74).
 fn stamp(signal: &str, body: &[u8], app: &str, digest: &str) -> anyhow::Result<Vec<u8>> {
+    let top = match signal {
+        "traces" => Kind::Batch(true),
+        "logs" => Kind::Batch(false),
+        _ => anyhow::bail!("unknown telemetry signal"),
+    };
     let resource = Resource {
         attributes: opentelemetry_proto::transform::common::tonic::Attributes::from(identity(app, digest)).0,
         ..Default::default()
-    };
-    macro_rules! batch {
-        ($ty:ty, $resources:ident, $scopes:ident, $records:ident, $record:ident, $clean:block) => {{
-            let mut batch = <$ty>::decode(body)?;
-            anyhow::ensure!(batch.$resources.len() <= 16, "too many telemetry resources");
-            for r in &mut batch.$resources {
-                r.resource = Some(resource.clone());
-                for scope in &mut r.$scopes {
-                    if let Some(s) = &mut scope.scope { scrub(&mut s.attributes); }
-                    for $record in &mut scope.$records $clean
-                }
-            }
-            batch.encode_to_vec()
-        }}
+    }.encode_to_vec();
+    let mut out = Vec::with_capacity(body.len() + 64);
+    rewrite(top, body, &resource, &mut out)?;
+    Ok(out)
+}
+
+/// An OTLP message holding resources, scopes or attributes; `true` for
+/// traces, `false` for logs.
+#[derive(Clone, Copy)]
+enum Kind { Batch(bool), Resource(bool), Scope(bool), ScopeInfo, Span, Event, Link, Log }
+
+fn rewrite(kind: Kind, mut m: &[u8], resource: &[u8], out: &mut Vec<u8>) -> anyhow::Result<()> {
+    use Kind::*;
+    if let Resource(_) = kind {
+        nested(out, 1 << 3 | LEN, |out| Ok(out.extend_from_slice(resource)))?;
     }
-    Ok(match signal {
-        "traces" => batch!(collector::trace::v1::ExportTraceServiceRequest, resource_spans, scope_spans, spans, s, {
-            scrub(&mut s.attributes);
-            for e in &mut s.events { scrub(&mut e.attributes); }
-            for l in &mut s.links { scrub(&mut l.attributes); }
-        }),
-        "logs" => batch!(collector::logs::v1::ExportLogsServiceRequest, resource_logs, scope_logs, log_records, l, {
-            scrub(&mut l.attributes);
-        }),
-        _ => anyhow::bail!("unknown telemetry signal"),
-    })
+    let mut resources = 0;
+    while !m.is_empty() {
+        let start = m;
+        let (key, value) = field(&mut m)?;
+        if let (Batch(_), 1) = (kind, key >> 3) {
+            resources += 1;
+            anyhow::ensure!(resources <= 16, "too many telemetry resources");
+        }
+        let child = match (kind, key >> 3) {
+            (Batch(traces), 1) => Some(Resource(traces)),
+            (Resource(_), 1) => continue,
+            (Resource(traces), 2) => Some(Scope(traces)),
+            (Scope(_), 1) => Some(ScopeInfo),
+            (Scope(true), 2) => Some(Span),
+            (Scope(false), 2) => Some(Log),
+            (Span, 11) => Some(Event),
+            (Span, 13) => Some(Link),
+            (ScopeInfo, 3) | (Span, 9) | (Event, 3) | (Link, 4) | (Log, 6) if !trusted(key, value)? => continue,
+            _ => None,
+        };
+        match child {
+            Some(kind) if key & 7 == LEN => nested(out, key, |out| rewrite(kind, value, resource, out))?,
+            Some(_) => anyhow::bail!("bad telemetry message"),
+            None => out.extend_from_slice(&start[..start.len() - m.len()]),
+        }
+    }
+    Ok(())
+}
+
+/// Whether an attribute (`KeyValue`) may pass: its key, as decoders read it
+/// (the last), is not one the supervisor stamps, and is not a string-table
+/// index.
+fn trusted(key: u64, mut kv: &[u8]) -> anyhow::Result<bool> {
+    anyhow::ensure!(key & 7 == LEN, "bad attribute");
+    let (mut name, mut index) = (&[][..], 0);
+    while !kv.is_empty() {
+        match field(&mut kv)? {
+            (k, value) if k == 1 << 3 | LEN => name = value,
+            (k, mut value) if k == 3 << 3 => index = varint(&mut value)?,
+            (k, _) if matches!(k >> 3, 1 | 3) => anyhow::bail!("bad attribute"),
+            _ => {}
+        }
+    }
+    Ok(index == 0 && !matches!(name, b"service.name" | b"service.version" | b"nanovm.app"))
+}
+
+const LEN: u64 = 2;
+
+/// Writes field `key` holding what `f` writes.
+fn nested(out: &mut Vec<u8>, key: u64, f: impl FnOnce(&mut Vec<u8>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    put_varint(key, out);
+    // Room for the length (5 bytes reach 32 GiB), shrunk to fit after.
+    let at = out.len();
+    out.extend([0; 5]);
+    f(out)?;
+    let mut len = [0; 5];
+    let n = put_varint((out.len() - at - 5) as u64, &mut len.as_mut_slice());
+    out[at..at + n].copy_from_slice(&len[..n]);
+    out.copy_within(at + 5.., at + n);
+    out.truncate(out.len() - (5 - n));
+    Ok(())
+}
+
+/// The next field: its key, and its contents (a varint's bytes, for one).
+fn field<'a>(m: &mut &'a [u8]) -> anyhow::Result<(u64, &'a [u8])> {
+    let key = varint(m)?;
+    let n = match key & 7 {
+        0 => m.iter().position(|b| b & 0x80 == 0).map_or(m.len() + 1, |i| i + 1),
+        1 => 8,
+        LEN => varint(m)? as usize,
+        5 => 4,
+        _ => anyhow::bail!("unsupported wire type"),
+    };
+    anyhow::ensure!(n <= m.len(), "truncated telemetry batch");
+    let (value, rest) = m.split_at(n);
+    *m = rest;
+    Ok((key, value))
+}
+
+fn varint(m: &mut &[u8]) -> anyhow::Result<u64> {
+    let mut v = 0;
+    for i in 0..10 {
+        let (&b, rest) = m.split_first().ok_or_else(|| anyhow::anyhow!("truncated telemetry batch"))?;
+        *m = rest;
+        v |= u64::from(b & 0x7f) << (7 * i);
+        if b < 0x80 {
+            return Ok(v);
+        }
+    }
+    anyhow::bail!("bad varint")
+}
+
+/// Writes `v` as a varint, returning its length.
+fn put_varint(mut v: u64, out: &mut impl std::io::Write) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        let _ = out.write_all(&[v as u8 | 0x80]);
+        v >>= 7;
+        n += 1;
+    }
+    let _ = out.write_all(&[v as u8]);
+    n
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_proto::tonic::{collector, common::v1 as common};
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -311,6 +409,122 @@ mod tests {
         common::KeyValue { key: key.into(), value: Some(common::AnyValue {
             value: Some(common::any_value::Value::StringValue(value.into())),
         }), ..Default::default() }
+    }
+
+    /// Bytes allocated by this thread, for bounding what stamping costs.
+    struct Counting;
+    thread_local! {
+        static ALLOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    unsafe impl std::alloc::GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let _ = ALLOCATED.try_with(|a| a.set(a.get() + layout.size()));
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
+            let _ = ALLOCATED.try_with(|a| a.set(a.get() + new));
+            unsafe { std::alloc::System.realloc(ptr, layout, new) }
+        }
+    }
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    fn raw(fields: &[(u64, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (key, value) in fields {
+            put_varint(*key, &mut out);
+            if key & 7 == LEN { put_varint(value.len() as u64, &mut out); }
+            out.extend_from_slice(value);
+        }
+        out
+    }
+
+    /// A worker's 1 MiB batch of 2-byte empty spans costs the supervisor
+    /// about its size to stamp, not the 200 MiB that decoding it did (N-74).
+    #[test]
+    fn stamping_a_batch_costs_about_its_size() {
+        // A scope of empty spans: field 2, length 0, again and again.
+        let scope = vec![[2 << 3 | LEN as u8, 0]; (1 << 20) / 2 - 16].concat();
+        let batch = raw(&[(1 << 3 | LEN, &raw(&[(2 << 3 | LEN, &scope)]))]);
+        assert!(batch.len() <= MAX_BATCH);
+        let before = ALLOCATED.with(|a| a.get());
+        let stamped = stamp("traces", &batch, "app", "digest").unwrap();
+        let allocated = ALLOCATED.with(|a| a.get()) - before;
+        assert!(allocated < 4 * MAX_BATCH, "stamping allocated {allocated} bytes");
+        let resource = Resource { attributes: opentelemetry_proto::transform::common::tonic::Attributes::from(identity("app", "digest")).0, ..Default::default() };
+        let expected = raw(&[(1 << 3 | LEN, &raw(&[(1 << 3 | LEN, &resource.encode_to_vec()), (2 << 3 | LEN, &scope)]))]);
+        assert!(stamped == expected, "the spans pass unchanged under the stamped resource");
+    }
+
+    /// Stamping at the wire level gives what decoding, replacing the
+    /// resource and dropping identity attributes everywhere would: also for
+    /// repeated resources, a key given twice (decoders keep the last), keys
+    /// by string-table index, events, links, scopes and log records.
+    #[test]
+    fn stamping_matches_decoding_and_scrubbing() {
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
+        let forged = || vec![attr("nanovm.app", "victim"), attr("service.name", "x"), attr("service.version", "old"),
+            common::KeyValue { key_strindex: 7, ..attr("", "victim") }, attr("kept", "yes")];
+        let trusted = Resource { attributes: opentelemetry_proto::transform::common::tonic::Attributes::from(identity("app", "d")).0, ..Default::default() };
+        let scrub = |a: &mut Vec<common::KeyValue>| a.retain(|kv| kv.key_strindex == 0 && !matches!(kv.key.as_str(), "service.name" | "service.version" | "nanovm.app"));
+        // A key given twice: first forged, then harmless, and the other way round.
+        let twice = |a: &str, b: &str| raw(&[(1 << 3 | LEN, a.as_bytes()), (1 << 3 | LEN, b.as_bytes())]);
+        let span = Span {
+            name: "request".into(), attributes: forged(),
+            events: vec![Event { name: "e".into(), attributes: forged(), ..Default::default() }],
+            links: vec![Link { trace_id: vec![1; 16], attributes: forged(), ..Default::default() }],
+            ..Default::default()
+        }.encode_to_vec();
+        let span = [span, raw(&[(9 << 3 | LEN, &twice("nanovm.app", "fine")), (9 << 3 | LEN, &twice("fine", "nanovm.app"))])].concat();
+        let scope = common::InstrumentationScope { name: "nanovm".into(), attributes: forged(), ..Default::default() }.encode_to_vec();
+        let scope_spans = raw(&[(1 << 3 | LEN, &scope), (2 << 3 | LEN, &span), (2 << 3 | LEN, &span)]);
+        let resource = Resource { attributes: forged(), ..Default::default() }.encode_to_vec();
+        let resource_spans = raw(&[(1 << 3 | LEN, &resource), (2 << 3 | LEN, &scope_spans), (1 << 3 | LEN, &resource), (3 << 3 | LEN, b"schema")]);
+        let batch = raw(&[(1 << 3 | LEN, &resource_spans), (1 << 3 | LEN, &raw(&[(2 << 3 | LEN, &scope_spans)]))]);
+        let mut expected = collector::trace::v1::ExportTraceServiceRequest::decode(&*batch).unwrap();
+        for r in &mut expected.resource_spans {
+            r.resource = Some(trusted.clone());
+            for s in &mut r.scope_spans {
+                scrub(&mut s.scope.as_mut().unwrap().attributes);
+                for span in &mut s.spans {
+                    scrub(&mut span.attributes);
+                    span.events.iter_mut().for_each(|e| scrub(&mut e.attributes));
+                    span.links.iter_mut().for_each(|l| scrub(&mut l.attributes));
+                }
+            }
+        }
+        assert_eq!(expected.resource_spans[0].scope_spans[0].spans[0].attributes.iter().map(|kv| &*kv.key).collect::<Vec<_>>(), ["kept", "fine"]);
+        let stamped = stamp("traces", &batch, "app", "d").unwrap();
+        assert_eq!(collector::trace::v1::ExportTraceServiceRequest::decode(&*stamped).unwrap(), expected);
+
+        let logs = collector::logs::v1::ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource { attributes: forged(), ..Default::default() }),
+                scope_logs: vec![ScopeLogs {
+                    scope: Some(common::InstrumentationScope { attributes: forged(), ..Default::default() }),
+                    log_records: vec![LogRecord { attributes: forged(), event_name: "e".into(), ..Default::default() }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut expected = logs.clone();
+        let r = &mut expected.resource_logs[0];
+        r.resource = Some(trusted);
+        scrub(&mut r.scope_logs[0].scope.as_mut().unwrap().attributes);
+        scrub(&mut r.scope_logs[0].log_records[0].attributes);
+        let stamped = stamp("logs", &logs.encode_to_vec(), "app", "d").unwrap();
+        assert_eq!(collector::logs::v1::ExportLogsServiceRequest::decode(&*stamped).unwrap(), expected);
+
+        let many = raw(&vec![(1 << 3 | LEN, &[][..]); 17]);
+        assert!(stamp("traces", &many, "app", "d").is_err(), "more than 16 resources");
+        for bad in [&b"not protobuf"[..], &[0x0a, 5, 1], &raw(&[(1 << 3, &[1])]), &raw(&[(1 << 3 | LEN, &raw(&[(2 << 3 | 3, &[])]))])] {
+            assert!(stamp("traces", bad, "app", "d").is_err(), "{bad:?}");
+        }
     }
 
     #[tokio::test]
