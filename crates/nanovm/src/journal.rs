@@ -592,10 +592,11 @@ fn sync(p: &Path) -> std::io::Result<()> {
     File::open(p)?.sync_all()
 }
 
-/// Syncs `p` unless a later change removed it.
+/// Syncs `p` unless a later change removed it (or made a file of a
+/// directory it was in).
 fn sync_if_there(p: &Path) -> std::io::Result<()> {
     match sync(p) {
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(()),
         r => r,
     }
 }
@@ -682,6 +683,21 @@ mod tests {
         if let Some((slot, bytes)) = replaced {
             j.discard_created(&slot, bytes).unwrap();
         }
+    }
+
+    /// A path whose directory became a file before the commit is gone, as
+    /// a removed one is: it isn't synced, and the commit succeeds (N-130).
+    #[test]
+    fn a_path_under_what_became_a_file_commits() {
+        let v = volume();
+        let mut j = open(&v);
+        // A directory made in a missing one (its creation then fails), and
+        // a file made where the missing one would be.
+        j.creating(&v.join("n/m")).unwrap();
+        j.creating(&v.join("n")).unwrap();
+        std::fs::write(v.join("n"), "x").unwrap();
+        j.commit().unwrap();
+        j.check().unwrap();
     }
 
     thread_local! {
