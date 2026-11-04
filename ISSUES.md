@@ -237,6 +237,24 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **From source:** after sending a successful response, a failed final commit marks the request span as error but discards the I/O error and supplies no `error.type` or failing-phase classification. The initial commit has a `commit-failed` classification; the final one should be equally diagnosable without changing the already-sent HTTP status.
 - **Status:** fixed in the focused W-2 continuation: retain the I/O result, record `post-return-commit-failed` and a bounded correlated diagnostic, preserve HTTP status. A gated test-only component outside `guests/**` proves actual post-return calls/logs and fails the second commit by moving its journal log. The regression failed before the fix; the full locked suite passes. Published guests remain unchanged.
 
+### N-50 (efficiency): every instance made and removed its own `/tmp` directory
+- **Where:** `object.rs`, `new_store` and `TmpDir`
+- **Scenario:** each instance did `mkdir` for its scratch directory and `remove_dir_all` when it ended, plus a `canonicalize` of its volume (10 `readlink`s here). On this VM an `rmdir` costs about 70 µs of CPU and, on an ext4 disk mounted with `discard`, 3.3 ms of wall time, spent on the tokio worker that drops the store. Churn (new object plus LRU eviction) and every restart after a trap paid it.
+- **Reproduced:** yes (strace, perf, and a mkdir/rmdir microbenchmark; see `notes/cold.md`)
+- **Status:** fixed in f1e89d6 (empty scratch directories are reused, a used one is removed; the objects directory is resolved once). Churn 1,388 → 3,359/s, restart after a trap p50 0.8 → 0.3 ms.
+
+### N-51 (density): 30 KB of every live object's heap was our own padding
+- **Where:** `table.rs` (`Entry::tx`), `object.rs` (`charged`, `commit`)
+- **Scenario:** a tokio channel allocates 32 slots at creation and a `Job` is 592 bytes, so each mailbox was 19 KB. The actor task was 16.9 KB: `charged` held its 7.6 KB future twice (moved in, then pinned), and `commit`'s supervisor publish path sat inline.
+- **Reproduced:** yes (heaptrack peak consumers over 2,000 idle objects; `-Zprint-type-sizes`)
+- **Status:** fixed in d0e85be: 116 → 89 KB RSS and 67.6 → 35.7 KB heap per live object; the actor task is 2.9 KB, guarded by `an_actor_is_small`.
+
+### N-52 (efficiency): cold starts' remaining host costs
+- **Where:** `object.rs` `new_store`, `journal.rs` `local_at`, wasmtime
+- **From a profile** (perf, 3,000 cold starts after N-50/N-51): `mkdir` is still the biggest single cost, about 20% of cold-start CPU, because a brand-new object needs its volume and (while no scratch directory is free) a scratch directory. Here it is inflated by ext4's `recently_deleted` inode scan after the benchmark deletes the previous run's data. Page faults are about 11%; `Journal::local_at` (a `statx` and a `readlink` of `/proc/self/fd` for every open in `/data`, read-only ones included) about 3%; the `/data` usage walk 2%. A new object still costs 2 fds and 4 mappings.
+- **Also:** of the 35.7 KB heap an idle object keeps, wasmtime's own instance metadata is about 25 KB (15.7 KB for the counter's 4 core instances, plus its vectors and `Store`). Each idle store also keeps 2 fiber stacks resident (16 KB), and its tables 8 KB; wasmtime 50 has no public way to hand a store's cached fiber stack back to the pool.
+- **Status:** open; `local_at` belongs to the journal and request path (lean/perf), the rest to wasmtime upstream.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -357,3 +375,23 @@ The checkpoints below are historical, not outstanding product decisions.
 - **Composition gate:** synchronous WIT calls cannot block on async P3 filesystem I/O, as W-1 demonstrated. Establish a valid standard-interface/ABI strategy or preload mechanism first; fewer host handlers must not come at the cost of a custom backchannel, a quota bypass or more lifecycle machinery. Report separately whether KV and config genuinely reduce host coupling.
 - **Acceptance:** run the existing KV/config integration contracts against composed providers, including KV quota/rollback cases and config isolation; inventory the host code removed and the bootstrap responsibilities retained. Compare against the current implementation and recommend keep/move independently for each.
 - **Status:** open (exploration requested by owner)
+
+### W-25: shard object volume directories
+- **What:** every volume is a direct child of `objects/<app>`, so each new object's `mkdir` takes that one directory's lock and adds a link to it (N-35's link limit). Sharding (for example `objects/<app>/<2 hex chars>/<id>`) fixes both. It moves existing volumes, so it needs the owner's decision (no compatibility code). Scratch directories don't need it: they are reused (N-50).
+- **Status:** open (idea, not measured)
+
+### W-26: reuse warm memory slots without page faults (`pagemap_scan`)
+- **What:** on Linux ≥ 6.7, `PoolingAllocationConfig::pagemap_scan(Enabled::Auto)` with `linear_memory_keep_resident` / `table_keep_resident` resets only an instance's dirty pages in place instead of `madvise`-ing them away, so the next instance in that slot takes no page faults and no TLB shootdown (5% of cold-start CPU here). It helps churn, restarts and idle objects coming back, not first-ever cold starts (new slots). Cost: warm unused slots keep their dirty pages resident. Also try `decommit_batch_size`.
+- **Status:** open: read wasmtime 50's source, not measured (wrap-up came first). Measure with `bench --only churn,kill` and RSS after churn.
+
+### W-27: remember an object's `/data` usage across its instances
+- **What:** skip the usage walk at instance start by keeping each object's committed usage in the node. Analysis: the counters mix `/data` and `/tmp` (an instance's `/tmp` is discarded), any drift in the counters would then persist instead of being corrected at every start, and a failed request's rollback changes the usage. The walk is 5 syscalls for the counter guest (2% of cold-start CPU) but O(files) for an object with many KV keys. Not adopted: not worth weakening exact accounting until a real workload shows the walk.
+- **Status:** deferred: measured cheap for typical volumes
+
+### W-28: pre-initialized guests (`wasmtime-wizer`)
+- **What:** `wasmtime-wizer` 50.0.1 snapshots a component after its init function. Measured with a scratch in-process program (8 slots, 64 objects each re-instantiated 4 times): the counter guest costs 235–356 µs CPU for a re-instantiation plus first GET against 43–100 µs warm; the composed SQLite example 1.69 ms against 0.66–1.0 ms warm (it opens its database on every request). Its start functions are under 1% of cold-start CPU, so for Rust guests there is little to snapshot; the SQLite gap (about 0.7–1 ms) is the place to try. It is a guest build step (dx), not runtime code, and a snapshot must not share secret state (RNG seeds) between objects.
+- **Status:** open (measured the gap, not the snapshot)
+
+### W-29: worker cold start
+- **What:** not measured: process spawn, jail, reading the component, `.cwasm` deserialize, and the pool's creation (it `mprotect`s a guard page per stack slot, `2 × (max_live_objects + 32)` calls) before the first request after a worker (re)start. Measure supervisor spawn to `/_nanovm/ready`.
+- **Status:** open
