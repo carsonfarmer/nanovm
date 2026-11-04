@@ -706,7 +706,8 @@ pub fn worker_main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        let upstream = Dialer::new(upstream, 1);
+        // Pool 0 for the runtime's threads, 1 for the telemetry export thread.
+        let upstream = Dialer::new(upstream, 2);
         let node = Node::with_engine(engine, &linker, cfg, &app, Wasm::File(wasm, &digest), Some(upstream))?;
         let requests = tokio::net::UnixStream::from_std(requests)?;
         link::serve(requests, vec![], move |req| crate::server::handle(node.clone(), req)).await

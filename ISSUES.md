@@ -473,7 +473,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** the worker's `BatchSpanProcessor` (queue of 2048) exporting through the supervisor's relay
 - **Scenario:** found by hop. With oha at 256 clients on the 4-core VM (other agents loading it), runs at 20-28k req/s lost 0-11% of the worker's `request` spans ("BatchSpanProcessor dropped a Span due to queue full"); supervisor spans were all delivered. At a fixed 15k req/s nothing was lost, before or after hop's changes. The export path (one export at a time, through the link, the relay's three slots and the Python counting sink) is slower than the request path at that rate; whether the sink or the relay is the limit was not measured.
 - **Reproduced:** yes, in both the wave-1 build and hop's
-- **Status:** open (owner decision Q70 keeps every span; a larger queue or concurrent exports would be the next things to measure)
+- **Status:** fixed: the worker's telemetry export runs on a single-threaded runtime of its own, with its own pool of egress links, so a batch never queues behind guest work (the supervisor isolates its control runtime the same way, N-36). Idle-machine HTTP A/B, oha c256, 100 objects, 3 alternating rounds: request spans delivered 94.4–99.6% → 100% in every run, with throughput 28.9k → 28.6k req/s, p99 19.8 → 18.9 ms and CPU 108 → 107 µs/request (baseline 26.1k, 30.1 ms, 120 µs).
 
 ## Planned work
 

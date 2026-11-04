@@ -61,7 +61,7 @@ fn identity(app: &str, digest: &str) -> [KeyValue; 3] {
         KeyValue::new("service.version", digest.to_owned())]
 }
 
-/// Export threads poll outside Tokio. Spawn link I/O on the worker's runtime
+/// Export threads poll outside Tokio. Spawn link I/O on the export runtime (see `Telemetry::new`)
 /// and await its result without blocking that runtime or opening any sockets.
 #[derive(Clone)]
 struct Client {
@@ -109,8 +109,24 @@ pub struct Telemetry {
 
 impl Telemetry {
     pub fn new(endpoint: &str, app: &str, digest: &str, upstream: Option<Upstream>) -> anyhow::Result<Self> {
+        // A worker's export I/O runs on a thread of its own, so a batch never
+        // waits behind guest work on the node's threads, which can hold one
+        // for a tick (N-121); the supervisor isolates its control runtime the
+        // same way (N-36). It uses the egress dialer's second pool of links.
+        let runtime = match upstream {
+            Some(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+                let handle = rt.handle().clone();
+                std::thread::Builder::new().name("nanovm-export".into()).spawn(move || {
+                    crate::link::set_thread(1);
+                    rt.block_on(std::future::pending::<()>())
+                })?;
+                handle
+            }
+            None => tokio::runtime::Handle::current(),
+        };
         let client = Client {
-            runtime: tokio::runtime::Handle::current(),
+            runtime,
             relay: if upstream.is_none() { Some(Arc::new(Relay::new(endpoint)?)) } else { None },
             upstream,
         };
