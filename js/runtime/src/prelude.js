@@ -1,32 +1,101 @@
 // Workers-style Web APIs for nanovm apps, on the runtime's host functions
 // (lib.rs). Evaluated once per instance before the app's module; returns
-// `bind(app)`, which returns the function the runtime calls per request.
+// `bind(app)`, which returns `[serve, answer]`, the functions the runtime
+// calls per request. QuickJS brings the language, atob/btoa,
+// queueMicrotask and DOMException.
 (host) => {
   const S = Symbol('state');
+  const make = (C, state) => { const o = Object.create(C.prototype); o[S] = state; return o; };
+  const toBytes = (b) =>
+    b instanceof Uint8Array ? b
+    : ArrayBuffer.isView(b) ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength)
+    : new Uint8Array(b);
+
+  // QuickJS seeds its own when the engine starts: at build time.
+  Math.random = host.mathRandom;
+
+  // ---- TextEncoder / TextDecoder (UTF-8)
+  class TextEncoder {
+    get encoding() { return 'utf-8'; }
+    encode(s = '') { return host.encode(String(s).toWellFormed()); }
+  }
+  class TextDecoder {
+    constructor(label = 'utf-8', { fatal = false, ignoreBOM = false } = {}) {
+      if (!/^\s*(unicode-1-1-)?utf-?8\s*$/i.test(label)) throw new RangeError(`TextDecoder: ${label} is not supported`);
+      this[S] = [!!fatal, !!ignoreBOM];
+    }
+    get encoding() { return 'utf-8'; }
+    get fatal() { return this[S][0]; }
+    get ignoreBOM() { return this[S][1]; }
+    decode(b) { return b === undefined ? '' : host.decode(toBytes(b), this[S][0], this[S][1]); }
+  }
   const enc = new TextEncoder();
   const dec = new TextDecoder();
-  const make = (C, state) => { const o = Object.create(C.prototype); o[S] = state; return o; };
 
-  // ---- URLSearchParams (URL's own `searchParams` is a snapshot of `search`)
+  // ---- console: log, info and debug to the object's stdout; warn and error to its stderr
+  const show = (v) => {
+    if (typeof v === 'string') return v;
+    if (v instanceof Error) return v.stack ? `${v}\n${v.stack.trimEnd()}` : String(v);
+    if (typeof v === 'object' && v !== null) try { return JSON.stringify(v); } catch {}
+    return String(v);
+  };
+  const log = (fd) => (...a) => host.print(fd, a.map(show).join(' '));
+  const console = { log: log(1), info: log(1), debug: log(1), warn: log(2), error: log(2) };
+
+  // ---- timers: the host calls back; a timer still pending when the
+  // request (and its waitUntil work) is done is dropped.
+  const timers = new Set();
+  let timerId = 0;
+  const timer = (repeat) => (f, ms = 0, ...args) => {
+    const id = ++timerId;
+    const delay = Math.max(0, Number(ms) || 0);
+    const tick = () => {
+      if (!timers.has(id)) return;
+      if (repeat) host.sleep(delay, tick);
+      else timers.delete(id);
+      f(...args);
+    };
+    timers.add(id);
+    host.sleep(delay, tick);
+    return id;
+  };
+  const clearTimer = (id) => { timers.delete(id); };
+
+  // ---- structuredClone: plain data, Date, RegExp, Map, Set, binary
+  const clone = (v, seen) => {
+    if (typeof v === 'function' || typeof v === 'symbol') throw new DOMException(`a ${typeof v} could not be cloned`, 'DataCloneError');
+    if (typeof v !== 'object' || v === null) return v;
+    if (seen.has(v)) return seen.get(v);
+    const put = (c) => (seen.set(v, c), c);
+    if (v instanceof Date) return put(new Date(v));
+    if (v instanceof RegExp) return put(new RegExp(v.source, v.flags));
+    if (v instanceof ArrayBuffer) return put(v.slice(0));
+    if (ArrayBuffer.isView(v)) return put(new v.constructor(clone(v.buffer, seen), v.byteOffset, v instanceof DataView ? v.byteLength : v.length));
+    if (v instanceof Map) { const m = put(new Map()); for (const [k, x] of v) m.set(clone(k, seen), clone(x, seen)); return m; }
+    if (v instanceof Set) { const m = put(new Set()); for (const x of v) m.add(clone(x, seen)); return m; }
+    const o = put(Array.isArray(v) ? [] : {});
+    for (const k of Object.keys(v)) o[k] = clone(v[k], seen);
+    return o;
+  };
+  const structuredClone = (v) => clone(v, new Map());
+
+  // ---- URLSearchParams; a URL's own is live (changing either changes both)
   const decode = (s) => { try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch { return s; } };
-  const encode = (s) => encodeURIComponent(s).replace(/%20/g, '+');
+  const encode = (s) => encodeURIComponent(s).replace(/%20/g, '+').replace(/[!'()~]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  const pairs = (s) => s.replace(/^\?/, '').split('&').filter(Boolean).map((p) => {
+    const i = p.indexOf('=');
+    return i < 0 ? [decode(p), ''] : [decode(p.slice(0, i)), decode(p.slice(i + 1))];
+  });
+  const OWNER = Symbol('url');
   class URLSearchParams {
     constructor(init = '') {
       this[S] = [];
-      if (typeof init === 'string') {
-        for (const part of init.replace(/^\?/, '').split('&')) {
-          if (!part) continue;
-          const i = part.indexOf('=');
-          this[S].push(i < 0 ? [decode(part), ''] : [decode(part.slice(0, i)), decode(part.slice(i + 1))]);
-        }
-      } else {
-        const pairs = typeof init[Symbol.iterator] === 'function' ? init : Object.entries(init);
-        for (const [k, v] of pairs) this.append(k, v);
-      }
+      if (typeof init === 'string') this[S] = pairs(init);
+      else for (const [k, v] of typeof init[Symbol.iterator] === 'function' ? init : Object.entries(init)) this[S].push([String(k), String(v)]);
     }
     get size() { return this[S].length; }
-    append(k, v) { this[S].push([String(k), String(v)]); }
-    delete(k) { this[S] = this[S].filter(([n]) => n !== k); }
+    append(k, v) { this[S].push([String(k), String(v)]); this.#changed(); }
+    delete(k) { this[S] = this[S].filter(([n]) => n !== k); this.#changed(); }
     get(k) { return this[S].find(([n]) => n === k)?.[1] ?? null; }
     getAll(k) { return this[S].filter(([n]) => n === k).map(([, v]) => v); }
     has(k) { return this[S].some(([n]) => n === k); }
@@ -35,18 +104,43 @@
       if (i < 0) return this.append(k, v);
       this[S] = this[S].filter(([n], j) => n !== k || j === i);
       this[S][i][1] = String(v);
+      this.#changed();
     }
+    sort() { this[S].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)); this.#changed(); }
     forEach(f, self) { for (const [k, v] of this[S]) f.call(self, v, k, this); }
     entries() { return this[S].map(([k, v]) => [k, v])[Symbol.iterator](); }
     keys() { return this[S].map(([k]) => k)[Symbol.iterator](); }
     values() { return this[S].map(([, v]) => v)[Symbol.iterator](); }
     [Symbol.iterator]() { return this.entries(); }
     toString() { return this[S].map(([k, v]) => `${encode(k)}=${encode(v)}`).join('&'); }
+    #changed() {
+      const url = this[OWNER];
+      if (url) url[S] = host.urlSet(url[S][0], 'search', this.toString());
+    }
   }
-  Object.defineProperty(URL.prototype, 'searchParams', {
-    get() { return new URLSearchParams(this.search); },
+
+  // ---- URL: the url crate parses (WHATWG); host.url returns the parts
+  const PARTS = ['href', 'origin', 'protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'];
+  class URL {
+    constructor(url, base) { this[S] = host.url(String(url), base === undefined ? undefined : String(base)); }
+    static canParse(url, base) { try { new URL(url, base); return true; } catch { return false; } }
+    static parse(url, base) { try { return new URL(url, base); } catch { return null; } }
+    get searchParams() {
+      if (!this[OWNER]) this[OWNER] = Object.assign(new URLSearchParams(this[S][9]), { [OWNER]: this });
+      return this[OWNER];
+    }
+    toString() { return this[S][0]; }
+    toJSON() { return this[S][0]; }
+  }
+  PARTS.forEach((name, i) => Object.defineProperty(URL.prototype, name, {
+    get() { return this[S][i]; },
+    set: name === 'origin' ? undefined : function (v) {
+      this[S] = host.urlSet(this[S][0], name, String(v));
+      if (this[OWNER]) this[OWNER][S] = pairs(this[S][9]);
+    },
+    enumerable: true,
     configurable: true,
-  });
+  }));
 
   // ---- Headers: lower-case name → values, in insertion order
   class Headers {
@@ -63,7 +157,8 @@
     append(k, v) {
       k = String(k).toLowerCase();
       const vs = this[S].get(k);
-      vs ? vs.push(String(v)) : this[S].set(k, [String(v)]);
+      if (vs) vs.push(String(v));
+      else this[S].set(k, [String(v)]);
     }
     set(k, v) { this[S].set(String(k).toLowerCase(), [String(v)]); }
     get(k) { return this[S].get(String(k).toLowerCase())?.join(', ') ?? null; }
@@ -76,25 +171,31 @@
     *values() { for (const [, v] of this) yield v; }
     [Symbol.iterator]() { return this.entries(); }
   }
-  const flat = (h) => { const out = []; for (const [k, vs] of h[S]) for (const v of vs) out.push(k, v); return out; };
+  let flatOut;
+  const flatOne = (vs, k) => { for (let i = 0; i < vs.length; i++) flatOut.push(k, vs[i]); };
+  const flat = (h) => {
+    flatOut = [];
+    h[S].forEach(flatOne);
+    return flatOut;
+  };
   const unflat = (a) => { const h = new Headers(); for (let i = 0; i < a.length; i += 2) h.append(a[i], a[i + 1]); return h; };
 
   // ---- bodies are whole: a Uint8Array or null
-  const toBytes = (b) =>
-    b instanceof Uint8Array ? b
-    : ArrayBuffer.isView(b) ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength)
-    : new Uint8Array(b);
   const binary = (b) => b instanceof ArrayBuffer || ArrayBuffer.isView(b);
-  const withBody = (body, headers) => {
+  // A request's or response's state: its headers, and its body as a Uint8Array or null.
+  const withBody = (body, headers, type) => {
     const h = new Headers(headers);
-    let type = null;
     if (body == null) body = null;
     else if (binary(body)) body = toBytes(body).slice();
-    else if (body instanceof URLSearchParams) [body, type] = [enc.encode(String(body)), 'application/x-www-form-urlencoded;charset=UTF-8'];
-    else [body, type] = [enc.encode(String(body)), 'text/plain;charset=UTF-8'];
-    if (type && !h.has('content-type')) h.set('content-type', type);
+    else {
+      type ??= body instanceof URLSearchParams ? 'application/x-www-form-urlencoded;charset=UTF-8' : 'text/plain;charset=UTF-8';
+      body = host.encode(String(body).toWellFormed());
+    }
+    if (type && !h[S].has('content-type')) h[S].set('content-type', [type]);
     return { headers: h, body, used: false };
   };
+  // Request's and Response's body methods (a mixin: a base class would make
+  // every construction a derived one, which costs QuickJS a lot more).
   class Body {
     get bodyUsed() { return this[S].used; }
     async bytes() {
@@ -104,15 +205,14 @@
       return s.body ?? new Uint8Array(0);
     }
     async arrayBuffer() { return (await this.bytes()).slice().buffer; }
-    async text() { return dec.decode(await this.bytes()); }
+    async text() { return host.decode(await this.bytes(), false, false); }
     async json() { return JSON.parse(await this.text()); }
   }
   const unread = (s) => { if (s.used) throw new TypeError('the body was already read'); return s; };
 
   const METHODS = /^(delete|get|head|options|post|put)$/i;
-  class Request extends Body {
+  class Request {
     constructor(input, init = {}) {
-      super();
       const src = input instanceof Request ? unread(input[S]) : null;
       const s = withBody(init.body, init.headers ?? (src && input.headers));
       if (init.body === undefined && src) s.body = src.body;
@@ -129,21 +229,17 @@
     clone() { const s = unread(this[S]); return make(Request, { ...s, headers: new Headers(this.headers) }); }
   }
 
-  class Response extends Body {
-    constructor(body = null, init = {}) {
-      super();
-      const s = withBody(body, init.headers);
-      s.status = init.status ?? 200;
-      if (!(s.status >= 200 && s.status <= 599)) throw new RangeError(`status ${s.status} is not in 200-599`);
-      s.statusText = String(init.statusText ?? '');
-      s.url = '';
-      this[S] = s;
-    }
-    static json(data, init = {}) {
-      const headers = new Headers(init.headers);
-      if (!headers.has('content-type')) headers.set('content-type', 'application/json');
-      return new Response(JSON.stringify(data), { ...init, headers });
-    }
+  const response = (body, init, type) => {
+    const s = withBody(body, init.headers, type);
+    s.status = init.status ?? 200;
+    if (!(s.status >= 200 && s.status <= 599)) throw new RangeError(`status ${s.status} is not in 200-599`);
+    s.statusText = init.statusText === undefined ? '' : String(init.statusText);
+    s.url = '';
+    return s;
+  };
+  class Response {
+    constructor(body = null, init = {}) { this[S] = response(body, init); }
+    static json(data, init = {}) { return make(Response, response(JSON.stringify(data), init, 'application/json')); }
     static redirect(url, status = 302) {
       return new Response(null, { status, headers: { location: new URL(String(url)).href } });
     }
@@ -157,14 +253,17 @@
     clone() { const s = unread(this[S]); return make(Response, { ...s, headers: new Headers(s.headers) }); }
   }
 
+  const { constructor: _, ...bodyMethods } = Object.getOwnPropertyDescriptors(Body.prototype);
+  for (const C of [Request, Response]) Object.defineProperties(C.prototype, bodyMethods);
+
   // Outgoing requests go through the host: under the app's egress policy,
   // and to `http://nanovm/…` for calls between objects and publishes.
   async function fetch(input, init) {
     const req = new Request(input, init);
     const s = req[S];
-    const url = new URL(s.url);
-    const [status, headers, body] = await host.send(
-      s.method, url.protocol.slice(0, -1), url.host, url.pathname + url.search, flat(req.headers), s.body);
+    const answer = await host.send(s.method, s.url, flat(req.headers), s.body);
+    if (typeof answer === 'string') throw new TypeError(answer);
+    const [status, headers, body] = answer;
     return make(Response, { status, statusText: '', headers: unflat(headers), body, used: false, url: s.url });
   }
 
@@ -183,16 +282,16 @@
     },
   };
 
-  Object.assign(globalThis, { URLSearchParams, Headers, Request, Response, fetch, crypto });
+  Object.assign(globalThis, {
+    TextEncoder, TextDecoder, console, URL, URLSearchParams, Headers, Request, Response, fetch, crypto, structuredClone,
+    setTimeout: timer(false), setInterval: timer(true), clearTimeout: clearTimer, clearInterval: clearTimer,
+  });
 
   // ---- env: the object's storage, its app's other objects, and config
-  const parse = (b) => (b === undefined ? undefined : JSON.parse(dec.decode(b)));
+  // Values are stored as JSON.
   const kv = {
-    async get(key) { return parse(host.kvGet(String(key))); },
-    async put(key, value) {
-      if (value === undefined) throw new TypeError('kv.put: the value is undefined');
-      host.kvSet(String(key), enc.encode(JSON.stringify(value)));
-    },
+    async get(key) { return host.kvGet(String(key)); },
+    async put(key, value) { host.kvSet(String(key), value); },
     async delete(key) { host.kvDelete(String(key)); },
     async list({ prefix = '' } = {}) {
       const keys = [];
@@ -202,7 +301,7 @@
         keys.push(...page.filter((k) => k.startsWith(prefix)));
         cursor = next;
       } while (cursor !== undefined);
-      return new Map(keys.sort().map((k) => [k, parse(host.kvGet(k))]));
+      return new Map(keys.sort().map((k) => [k, host.kvGet(k)]));
     },
   };
   const objects = {
@@ -297,17 +396,23 @@
     passThroughOnException() {}
   }
 
+  // No async functions here: the runtime waits for the app's promise itself.
   return (app) => {
     if (typeof app?.fetch !== 'function') throw new TypeError('the module must `export default { fetch(request, env, ctx) }`');
-    return async (id, method, url, headers, body) => {
+    // `serve(id, method, url, headers, body)`: `[the app's response or a promise of it, ctx]`.
+    const serve = (id, method, url, headers, body) => {
       env.id = id;
       const request = make(Request, { method, url, headers, body, used: false });
       const ctx = new ExecutionContext();
       const ws = typeof app.webSocketMessage === 'function' && method === 'POST' && request.headers.get('content-type') === EVENTS;
-      const res = await (ws ? sockets(app, request, env, ctx) : app.fetch(request, env, ctx));
+      return [ws ? sockets(app, request, env, ctx) : app.fetch(request, env, ctx), ctx];
+    };
+    // `answer(response, ctx)`: `[status, headers, body, waitUntil promise or undefined]`.
+    const answer = (res, ctx) => {
       if (!(res instanceof Response)) throw new TypeError('fetch() must return a Response');
       const s = unread(res[S]);
       return [s.status, flat(s.headers), s.body, ctx[S].length ? Promise.all(ctx[S]) : undefined];
     };
+    return [serve, answer];
   };
 }

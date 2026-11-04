@@ -111,14 +111,15 @@ async fn exception_rolls_back_writes() {
 }
 
 /// A runaway loop and a runaway allocation are killed by the app's CPU and
-/// memory limits; the object then serves from a fresh instance.
+/// memory limits, and runaway recursion by the stack's; the object then
+/// serves from a fresh instance.
 #[tokio::test(flavor = "multi_thread")]
 async fn limits_kill_runaway_javascript() {
     let mut app = app();
     // Headroom for the allocation to reach the memory limit on a busy host.
     app.limits.cpu_ms = 300;
     let node = node_with(node_cfg("js_limits", 8), app);
-    for (path, reason) in [("/spin", "cpu"), ("/alloc", "memory")] {
+    for (path, reason) in [("/spin", "cpu"), ("/alloc", "memory"), ("/recurse", "trap")] {
         assert_eq!(post(&node, "r", "/incr").await.status, 200);
         let t0 = Instant::now();
         let r = get(&node, "r", path).await;
@@ -128,7 +129,7 @@ async fn limits_kill_runaway_javascript() {
         assert_eq!(after.status, 200, "{}", after.body);
         assert_eq!(after.json()["hits"], 1, "{path}: instance was replaced");
     }
-    assert_eq!(get(&node, "r", "/").await.json()["n"], 2, "storage survives kills");
+    assert_eq!(get(&node, "r", "/").await.json()["n"], 3, "storage survives kills");
 }
 
 /// `fetch()` goes through the host, under the app's egress policy.
@@ -198,12 +199,25 @@ async fn web_apis() {
         serde_json::json!({
             "headers": [["a", "1, 2"], ["b", "3"]], "text": "héllo", "len": 6, "uuid": true, "b64": "aGk=",
             "clone": {"a": [1, {"b": 2}]}, "form": "q=a+b&x=%26",
+            "url": {
+                "parts": [
+                    "https://user:pw@example.com:8443/b/c?y=2&z=3#h", "https://example.com:8443", "example.com:8443",
+                    "/b/c", "?y=2&z=3", "#h", "user", "8443",
+                ],
+                "after": "https://user:pw@example.com/q%20r?y=2&z=3", "all": ["1", "2"], "bad": false,
+            },
+            "decoded": "h\u{fffd}", "fatal": "TypeError", "cloned": [true, 5], "atob": "hi",
         }),
         "{}",
         r.body
     );
     let r = get(&node, "w", "/timers").await;
-    assert_eq!(r.json()["order"], serde_json::json!(["a", "b"]), "{}", r.body);
+    assert_eq!(
+        (&r.json()["order"], &r.json()["ticks"]),
+        (&serde_json::json!(["a", "b"]), &serde_json::json!(3)),
+        "{}",
+        r.body
+    );
     assert!(r.json()["waited"].as_u64().unwrap() >= 30, "{}", r.body);
     let r = get(&node, "w", "/config").await;
     assert_eq!(r.json(), serde_json::json!({"greeting": "hello from config"}));
@@ -211,6 +225,11 @@ async fn web_apis() {
     assert_eq!((r.status, r.body.as_str()), (200, "answered first"));
     let r = get(&node, "w", "/later-value").await;
     assert_eq!(r.json()["later"], 5, "waitUntil work finished and committed before the next request");
+    assert_eq!(post(&node, "w", "/put-bad").await.json()["error"], "TypeError", "kv values are JSON");
+    let resp =
+        node.dispatch("w", http::Request::get("http://localhost/length").body(bytes::Bytes::new()).unwrap()).await;
+    let lengths: Vec<_> = resp.headers().get_all("content-length").iter().collect();
+    assert_eq!(lengths, ["2"], "one content-length, the body's");
 }
 
 /// The component starts from a snapshot taken at build time; nothing in it

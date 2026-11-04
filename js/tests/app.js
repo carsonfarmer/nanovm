@@ -15,8 +15,9 @@ const routes = {
     throw new Error("boom");
   },
   "GET /spin": () => { for (;;) {} },
-  "GET /alloc": () => { const a = []; for (let s = "x"; ; s += s) a.push(s); },
+  "GET /alloc": () => { const a = []; for (;;) a.push(new Array(1 << 16).fill(a.length)); },
   "GET /never": () => new Promise(() => {}),
+  "GET /recurse": () => { const f = (n) => f(n + 1) + 1; return f(0); },
   "GET /fetch": async (req) => {
     const url = new URL(req.url).searchParams.get("url");
     try {
@@ -32,6 +33,8 @@ const routes = {
     return Response.json({ status: r.status, callee: await r.json() });
   },
   "GET /config": (req, env) => Response.json(env.config),
+  // The runtime sets content-length itself, whatever the app says.
+  "GET /length": () => new Response("hi", { headers: { "content-length": "99" } }),
   "GET /kv": async (req, env) => Response.json(Object.fromEntries(await env.kv.list())),
   "POST /echo": async (req) => {
     const u = new URL(req.url);
@@ -52,7 +55,9 @@ const routes = {
       new Promise((r) => setTimeout(() => { order.push("b"); r(); }, 30)),
       new Promise((r) => setTimeout(() => { order.push("a"); r(); }, 10)),
     ]);
-    return Response.json({ order, waited: Date.now() - t0 });
+    let ticks = 0;
+    await new Promise((r) => { const id = setInterval(() => { if (++ticks === 3) { clearInterval(id); r(); } }, 1); });
+    return Response.json({ order, waited: Date.now() - t0, ticks });
   },
   "GET /later": async (req, env, ctx) => {
     ctx.waitUntil((async () => {
@@ -75,7 +80,25 @@ const routes = {
       b64: btoa("hi"),
       clone: structuredClone({ a: [1, { b: 2 }] }),
       form: String(new URLSearchParams({ q: "a b", x: "&" })),
+      url: (() => {
+        const u = new URL("../b/c?x=1&y=2#h", "https://user:pw@example.com:8443/a/z");
+        u.searchParams.append("z", "3");
+        u.searchParams.delete("x");
+        const parts = [u.href, u.origin, u.host, u.pathname, u.search, u.hash, u.username, u.port];
+        u.pathname = "/q r";
+        u.hash = "";
+        u.port = "443";
+        return { parts, after: u.href, all: new URL("http://h/?a=1&a=2").searchParams.getAll("a"), bad: URL.canParse("nope") };
+      })(),
+      decoded: new TextDecoder().decode(new Uint8Array([0xef, 0xbb, 0xbf, 0x68, 0xff])),
+      fatal: (() => { try { new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array([0xff])); } catch (e) { return e.name; } })(),
+      cloned: (() => { const m = structuredClone(new Map([["d", new Date(5)]])); return [m instanceof Map, m.get("d").getTime()]; })(),
+      atob: atob("aGk="),
     });
+  },
+  "POST /put-bad": async (req, env) => {
+    try { await env.kv.put("f", () => 1); } catch (e) { return Response.json({ error: e.name }); }
+    return Response.json({ error: null });
   },
 };
 
