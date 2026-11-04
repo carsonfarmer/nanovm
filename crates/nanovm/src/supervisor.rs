@@ -12,11 +12,12 @@
 //!
 //! Each worker gets two control sockets (see `link`): on fd 3 the supervisor
 //! hands it connections for requests, and on fd 4 the worker hands the
-//! supervisor connections for its guests' outbound requests. Its config and
-//! component arrive on stdin, read before the worker jails itself.
+//! supervisor connections for its guests' outbound requests. Its spec
+//! arrives on stdin: the node's config, which it builds its engine from (see
+//! [`Spawned`]), then its app and the file in the registry's cache that holds
+//! its component, which it opens before it jails itself.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,7 @@ use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 
 use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
+use crate::engine::Wasm;
 use crate::jail::Jail;
 use crate::link::{self, Dialer};
 use crate::registry::{APP_HEADER, AppRef, HOST_HEADER, MIN_VERSION_HEADER, Policy, Registry, TRUST_HEADER};
@@ -80,6 +82,8 @@ pub struct Supervisor {
     /// Held while giving a new app its uid.
     uids: Arc<Mutex<()>>,
     publishes: reqwest::Client,
+    /// A worker spawned ahead of need: see [`Spawned`].
+    spare: tokio::sync::Mutex<Option<Spawned>>,
     relay: Arc<crate::telemetry::Relay>,
     telemetry: Arc<crate::telemetry::Telemetry>,
     started: Instant,
@@ -160,8 +164,10 @@ impl Supervisor {
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
             cfg,
             publishes: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build()?,
+            spare: Default::default(),
             started: Instant::now(),
         });
+        sup.clone().refill();
         let weak = Arc::downgrade(&sup);
         sup.telemetry.snapshots(move || {
             let Some(sup) = weak.upgrade() else { return };
@@ -260,7 +266,12 @@ impl Supervisor {
         // In its own task: once begun, a switch finishes even if every
         // request waiting for it goes away.
         let (sup, w, want) = (self.clone(), w.clone(), want.clone());
-        match self.runtime.spawn(async move { sup.ensure(&w, &want).await }).await {
+        let ensured = async move {
+            let live = sup.ensure(&w, &want).await;
+            sup.refill();
+            live
+        };
+        match self.runtime.spawn(ensured).await {
             Ok(live) => live,
             Err(e) => Err(error_response(500, "worker-down", &e.to_string())),
         }
@@ -350,8 +361,8 @@ impl Supervisor {
     }
 
     /// Gets the app version `want` names, retires the running worker, then
-    /// spawns a new one, places it in its cgroup, hands it its config and
-    /// component, and waits until it answers.
+    /// takes the spare worker (or spawns one), places it in its cgroup,
+    /// hands it its app and component, and waits until it answers.
     async fn start(&self, w: &Worker, want: &AppRef) -> anyhow::Result<Arc<Live>> {
         let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
         let app = AppConfig {
@@ -381,45 +392,25 @@ impl Supervisor {
         let (cfg, name, uids) = (self.cfg.clone(), w.name.clone(), self.uids.clone());
         let uid = tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
 
-        let (requests, worker_requests) = UnixStream::pair()?;
-        let (egress, worker_egress) = UnixStream::pair()?;
-        let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
-        let mut cmd = Command::new(&self.exe);
-        cmd.arg("worker")
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // SAFETY: only async-signal-safe calls between fork and exec. The
-        // sockets are first moved above fd 4 so neither dup2 clobbers the
-        // other, then dup2 puts them at 3 and 4 without close-on-exec.
-        unsafe {
-            cmd.pre_exec(move || {
-                let a = libc::fcntl(a, libc::F_DUPFD_CLOEXEC, 10);
-                let b = libc::fcntl(b, libc::F_DUPFD_CLOEXEC, 10);
-                if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn().with_context(|| format!("spawning {}", self.exe.display()))?;
-        drop((worker_requests, worker_egress));
+        let mut spare = self.spare.lock().await.take();
+        // One that has died meanwhile is replaced.
+        let Spawned { mut child, mut stdin, requests, egress } = match spare.take_if(|s| s.child.try_wait().is_ok_and(|s| s.is_none())) {
+            Some(s) => s,
+            None => self.spawn().await?,
+        };
         let pid = child.id().context("worker exited at once")?;
         if let Some(root) = &self.cfg.cgroup {
             place_in_cgroup(root, &app, pid)?;
         }
 
-        // The worker's spec: the node config, its app, and its uid.
+        // The rest of the worker's spec: its app, its uid and its component.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
         // As many links to the supervisor as its objects may use at once:
         // each its outbound requests and a publish.
         let links = self.cfg.max_live_objects * (app.limits.max_outbound_concurrency + 1);
-        let mut spec = serde_json::to_vec(&(&self.cfg, &app, uid))?;
+        let mut spec = serde_json::to_vec(&(&app, uid, &p.component))?;
         spec.push(b'\n');
-        let mut stdin = child.stdin.take().expect("piped");
         stdin.write_all(&spec).await?;
-        stdin.write_all(&p.wasm).await?;
         drop(stdin);
 
         // The worker's stderr goes to ours, tagged with its app, a line (of at
@@ -516,6 +507,64 @@ impl Supervisor {
         bail!("worker did not start ({e}): {}", words.ok().and_then(Result::ok).unwrap_or_default())
     }
 
+    /// Spawns a worker and gives it the node's config, from which it builds
+    /// its engine; it then waits for its app (see `worker_main`).
+    async fn spawn(&self) -> anyhow::Result<Spawned> {
+        let (requests, worker_requests) = UnixStream::pair()?;
+        let (egress, worker_egress) = UnixStream::pair()?;
+        let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
+        let mut cmd = Command::new(&self.exe);
+        cmd.arg("worker")
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // SAFETY: only async-signal-safe calls between fork and exec. The
+        // sockets are first moved above fd 4 so neither dup2 clobbers the
+        // other, then dup2 puts them at 3 and 4 without close-on-exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                let a = libc::fcntl(a, libc::F_DUPFD_CLOEXEC, 10);
+                let b = libc::fcntl(b, libc::F_DUPFD_CLOEXEC, 10);
+                if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().with_context(|| format!("spawning {}", self.exe.display()))?;
+        let mut stdin = child.stdin.take().expect("piped");
+        let mut spec = serde_json::to_vec(&self.cfg)?;
+        spec.push(b'\n');
+        stdin.write_all(&spec).await?;
+        Ok(Spawned { child, stdin, requests, egress })
+    }
+
+    /// Spawns the next worker ahead of need, unless one is waiting.
+    fn refill(self: Arc<Self>) {
+        self.runtime.clone().spawn(async move {
+            let mut spare = self.spare.lock().await;
+            if spare.is_none() {
+                match self.spawn().await {
+                    Ok(s) => *spare = Some(s),
+                    Err(e) => eprintln!("nanovm: spawning a worker: {e:#}"),
+                }
+            }
+        });
+    }
+}
+
+/// A worker process that has built its engine for this node (the pool
+/// alone took 7 ms) and waits for its app. One is kept spawned ahead, so a
+/// start skips spawning a process and building its engine. It is given
+/// nothing of an app's, nor any uid, cgroup or jail, until it is taken: what
+/// it holds comes from the node's config alone, which a supervisor never
+/// changes. It exits when its stdin closes, so with the supervisor too.
+struct Spawned {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    requests: UnixStream,
+    egress: UnixStream,
 }
 
 async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
@@ -625,18 +674,27 @@ fn place_in_cgroup(root: &Path, app: &AppConfig, pid: u32) -> anyhow::Result<()>
 /// `nanovm worker`: reads its spec and component from stdin, jails itself,
 /// then serves its app to the supervisor until the supervisor hangs up.
 pub fn worker_main() -> anyhow::Result<()> {
-    let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input)?;
-    let nl = input.iter().position(|&b| b == b'\n').context("no worker spec on stdin")?;
-    let (cfg, app, uid): (NodeConfig, AppConfig, Option<u32>) =
-        serde_json::from_slice(&input[..nl]).context("worker spec")?;
-    let wasm = input.split_off(nl + 1);
+    use std::io::BufRead;
+    let mut input = std::io::stdin().lock();
+    let mut line = Vec::new();
+    input.read_until(b'\n', &mut line)?;
+    let cfg: NodeConfig = serde_json::from_slice(&line).context("worker spec: the node")?;
+    // Before the jail, which stops raising the fd limit and reading sysctls.
+    crate::engine::preflight(&cfg)?;
+    // Before the app, which a spare worker waits for here. Neither starts
+    // a thread, so the jail is still entered with one.
+    let engine = crate::engine::build(&cfg)?;
+    let linker = crate::app::linker(&engine)?;
+    line.clear();
+    input.read_until(b'\n', &mut line)?;
+    let (app, uid, (digest, path)): (AppConfig, Option<u32>, (String, PathBuf)) =
+        serde_json::from_slice(&line).context("worker spec: the app")?;
+    // The registry's cache is outside the jail.
+    let wasm = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: the supervisor put these sockets at fds 3 and 4 and nothing
     // else in this process owns them.
     let (requests, upstream) = unsafe { (UnixStream::from_raw_fd(3), UnixStream::from_raw_fd(4)) };
     requests.set_nonblocking(true)?;
-    // Before the jail, which stops raising the fd limit and reading sysctls.
-    crate::engine::preflight(&cfg)?;
 
     Jail {
         uid,
@@ -649,7 +707,7 @@ pub fn worker_main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
         let upstream = Dialer::new(upstream, 1);
-        let node = Node::new(cfg, &app, &wasm, Some(upstream))?;
+        let node = Node::with_engine(engine, &linker, cfg, &app, Wasm::File(wasm, &digest), Some(upstream))?;
         let requests = tokio::net::UnixStream::from_std(requests)?;
         link::serve(requests, vec![], move |req| crate::server::handle(node.clone(), req)).await
     })
