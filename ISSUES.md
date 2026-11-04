@@ -357,6 +357,36 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** with the default (`keep_init_func` false), the snapshot of a `wasm-component-ld` component fails validation: "core instance 29 has no export named `wizer-initialize`": the core export is removed, the component's alias to it is not.
 - **Fix:** `js-wizer` keeps the export (`keep_init_func(true)`); calling it again is a no-op. Report upstream.
 - **Status:** worked around in cf/js
+
+### N-40: the supervisor's readiness probe leaves a link connection in front thread 0's pool, driven by the control runtime
+- **Where:** `supervisor.rs` (`start`: `live.link.send(get("/_nanovm/ready"))` runs on the control runtime), `link.rs` (`Dialer::pool` picks the pool by the `THREAD` thread-local, which is 0 on control threads too)
+- **Scenario:** found by the perf review at `491e790`. The probe's socket is registered with the control runtime's reactor and then pooled as thread 0's. Front thread 0 reuses it, so each request on it is woken through the control thread: in some supervisor instances the control thread made 2 voluntary context switches per request at c=1 (0.03 in others, depending on pool order).
+- **Reproduced:** yes (per-thread `voluntary_ctxt_switches` deltas over 3,000 requests at c=1)
+- **Fix (proposed):** give control threads their own pool index (`Dialer::new(requests, threads + 1)` and `link::set_thread(threads)` on the control runtime's threads), or don't pool the probe's connection.
+- **Status:** open
+
+### N-41: a read on a link wakes the other process for nothing
+- **Where:** `link.rs` (tokio registers every `UnixStream` for readable and writable)
+- **Scenario:** found by the perf review. Unix stream sockets wake writers waiting for space (`unix_write_space`) every time the peer consumes data, unlike TCP, which only does so after the writer ran out of space. With writable interest always registered, the worker's read of each request wakes the supervisor's epoll thread, and the supervisor's read of each response wakes the worker's: one spurious wakeup per hop per request at low concurrency.
+- **Reproduced:** yes (`perf record -e sched:sched_wakeup` on the worker: one wakeup per request from the link read)
+- **Fix (proposed):** register link sockets for readable only (`AsyncFd` with `Interest::READABLE`) and wait for writability only while a write is blocked.
+- **Status:** open
+
+### N-42: at low concurrency the worker wakes its idle runtime threads for every request
+- **Where:** `supervisor.rs` (`worker_main`'s multi-threaded runtime), `object.rs` (the actor's store poll)
+- **Scenario:** found by the perf review. At c=1 the worker made about 4 voluntary context switches per request (one per runtime thread) where 1 is needed: the actor wakes itself during its own poll (Wasmtime yields by self-wake, guest events wake it), Tokio queues it for stealing and wakes an idle thread, and a thread that finds work after searching wakes another. Per-request CPU at c=1 is about 3.5× that at c256. A waker that re-polls the actor on a self-wake did not remove them.
+- **Reproduced:** yes (per-thread context-switch deltas, strace and `sched_wakeup` traces)
+- **Status:** open; see W-20
+
+### N-43: the supervisor redoes pure per-app work on every request
+- **Where:** `registry.rs` (`AppRef::name`: SHA-256 and six allocations; `from_headers`: clones the cached `Reference`, parses the trust list)
+- **Scenario:** found by the perf review: about 4.7% of the supervisor front thread at c256. Both results are pure functions of the headers, cacheable like the reference parse (Q70), never the authorization.
+- **Status:** open (small; below the 2% bar for the whole request)
+
+### N-44: every guest open under `/data` read `/proc/self/fd` to locate the volume
+- **Where:** `journal.rs` (`local_at` → `fd_path`)
+- **Scenario:** found by the perf review: a `readlink` per open was 4.5% of in-process CPU (the counter's GET opens `/data/count`).
+- **Status:** fixed in be6ea35 (the volume's own descriptor resolves without asking; subdirectories still do)
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -550,3 +580,13 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-54: memory per JavaScript object
 - **What:** a live JS object costs ~1.2 MB more than a Rust one. Boa writes to the header of every heap object it touches (reference counts), so serving a request copies much of the pre-initialized heap. Measure which pages a request dirties; compare with W-50.
 - **Status:** open
+
+### W-20: thread-per-core workers
+- **What:** one current-thread runtime per core in the worker, each owning the objects that hash to it; the supervisor sends an object's requests on a link bound to that thread (the byte sent with each fd can name it). A request would then stay on one thread end to end in the worker, removing N-42's wakeups and the actor-to-connection hops.
+- **Trade-off:** no work stealing between threads: hash collisions and CPU hogs (which yield every epoch tick) would delay the other objects on their thread, so "neighbours under attack" and `cpu_hogs_leave_cores_for_short_requests` must be re-measured. Needs an owner decision.
+
+### W-21: cheaper link framing
+- **What:** hyper's HTTP/1.1 client in the supervisor and server in the worker cost about 5% of a request (excluding the syscalls, which any framing keeps). A length-prefixed framing could save about 4%, but every link user (requests, egress, telemetry relay, publishes, drains, restarts) would need it. Not worth it yet.
+
+### W-22: telemetry still costs about 10% of a production request
+- **What:** after N-74, the remaining cost is mostly the SDK: span creation and attributes, and OTLP encoding of the supervisor's own spans (about 3 µs per request) and the worker's (about 2.5 µs). Reducing it without a custom exporter (Q64/Q66) means fewer allocations per span (e.g. `Arc<str>` object ids instead of new `String`s).
