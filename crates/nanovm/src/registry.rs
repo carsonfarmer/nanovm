@@ -186,7 +186,8 @@ pub struct AppSpec {
 
 pub struct Pulled {
     pub spec: AppSpec,
-    pub wasm: Vec<u8>,
+    /// The component's digest, and the file in the cache that holds it.
+    pub component: (String, PathBuf),
     pub version: semver::Version,
 }
 
@@ -228,9 +229,16 @@ impl Registry {
         let [layer] = &manifest.layers[..] else { bail!("an app has exactly one layer") };
         ensure!(layer.media_type == WASM_TYPE, "the layer is not {WASM_TYPE}");
         let spec = self.blob(r, &manifest.config, MAX_METADATA).await?;
+        // Not read when cached: the worker reads it only if it has no
+        // compile of it.
+        let path = self.cached(&layer.digest)?;
+        let kept = tokio::fs::metadata(&path).await.is_ok_and(|m| m.len() == layer.size && m.len() <= self.max_component);
+        if !kept {
+            self.blob(r, layer, self.max_component).await.context("the component")?;
+        }
         Ok(Pulled {
             spec: serde_json::from_slice(&spec).context("the app's config")?,
-            wasm: self.blob(r, layer, self.max_component).await.context("the component")?,
+            component: (layer.digest.clone(), path),
             version,
         })
     }
@@ -247,6 +255,13 @@ impl Registry {
         Ok(())
     }
 
+    /// Where the cache keeps the bytes `digest` names, once it is checked
+    /// (a manifest's digest names a path only then).
+    fn cached(&self, digest: &str) -> anyhow::Result<PathBuf> {
+        check_digest(digest)?;
+        Ok(self.dir.join(digest.replace(':', "-")))
+    }
+
     async fn blob(&self, r: &AppRef, d: &Descriptor, max: u64) -> anyhow::Result<Vec<u8>> {
         ensure!(d.size <= max, "{} is {} bytes, over {max}", d.digest, d.size);
         let bytes = self.fetch(r, "blobs", &d.digest, "*/*", d.size, true).await?;
@@ -257,8 +272,7 @@ impl Registry {
     /// The bytes `digest` names, at most `max` of them, checked against it;
     /// from the cache if `cache` and it has them, else fetched (and kept).
     async fn fetch(&self, r: &AppRef, kind: &str, digest: &str, accept: &str, max: u64, cache: bool) -> anyhow::Result<Vec<u8>> {
-        check_digest(digest)?;
-        let path = self.dir.join(digest.replace(':', "-"));
+        let path = self.cached(digest)?;
         if cache && let Ok(Ok(b)) = tokio::task::spawn_blocking({
             let path = path.clone();
             move || std::fs::read(path)
