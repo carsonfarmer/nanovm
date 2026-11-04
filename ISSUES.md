@@ -350,7 +350,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### N-111: JavaScript apps share std's hash seed, fixed at build time
 - **Where:** `crates/nanovm/examples/js-wizer.rs` (pre-initialization gives `wasi:random/insecure-seed` a constant)
 - **From source:** Boa keys its shape-transition maps with std's `RandomState`, seeded once per instance. Pre-initialization snapshots that seed, so every instance of every JS app has the same keys, readable from the published component anyway. An attacker who can make an object build objects with chosen property names (`JSON.parse` of a body) could aim for collisions; the cost lands on that object's own requests, within `cpu_ms`. Low.
-- **Status:** accepted for now (reproducible builds); revisit with W-50
+- **Status:** fixed on cf/qjs: Boa is gone (W-50). The build-time std seed now keys only rquickjs's internal map from Rust types to prototypes, never app data. QuickJS hashes atoms and shapes without a seed and xors its Map/Set seed onto finished hashes, so no seed separates colliding keys there in any QuickJS embedding (N-141).
 
 ### N-112: wasmtime-wizer 50.0.0 writes an invalid component when it drops the init export
 - **Where:** upstream `wasmtime-wizer` component rewrite
@@ -387,6 +387,26 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `journal.rs` (`local_at` → `fd_path`)
 - **Scenario:** found by the perf review: a `readlink` per open was 4.5% of in-process CPU (the counter's GET opens `/data/count`).
 - **Status:** fixed in be6ea35 (the volume's own descriptor resolves without asking; subdirectories still do)
+### N-140: runaway recursion in JavaScript is a trap, not a RangeError
+- **Where:** QuickJS (rquickjs-sys 0.14): under `__wasi__` its stack limit is compiled out (`update_stack_limit` sets none)
+- **Reproduced:** `const f = (n) => f(n + 1) + 1` fails its request with `500 trap` ("wasm trap: call stack exhausted", wasmtime's `max_wasm_stack`) and the instance is replaced; the app can't catch it as it could a `RangeError` in a browser. Test `limits_kill_runaway_javascript` covers it.
+- **Status:** accepted (bounded, rolled back like any trap); a catchable error needs a QuickJS stack check that works under WASI (the shadow stack pointer is known; upstream sets no limit)
+
+### N-141 (low): QuickJS hashes can be flooded with chosen keys
+- **Where:** QuickJS atoms and shapes (no seed); Map/Set (`map_hash_key` xors the context's seed onto the finished hash, which never separates two keys that collide)
+- **From source:** an app that puts attacker-chosen strings into objects or Maps (`JSON.parse` of a body) can be fed keys that share a bucket; the cost lands on that object's own requests, within `cpu_ms`. True of every QuickJS embedding.
+- **Status:** accepted
+
+### N-142: QuickJS reads the clock when a context starts, which pre-initialization forbids
+- **Where:** `JS_NewContextRaw` seeds `Math.random` and the Map seed from `gettimeofday`; `JS_AddPerformance` reads the monotonic clock
+- **Reproduced:** with rquickjs's stock context, pre-initialization traps. The runtime defines `gettimeofday` itself: it answers 0 only while the context starts (any later build-time read traps, so top-level `Date.now()` still fails the build), and replaces `Math.random` with a generator seeded from the host at first use; it leaves out `performance` (W-65). Test `instances_share_nothing_from_the_snapshot` fails without the `Math.random` replacement (mutation-checked).
+- **Status:** worked around on cf/qjs
+
+### N-143: js-bench's "KB/object" counted shared memory-image pages once per instance
+- **Where:** `crates/nanovm/examples/js-bench.rs` (RSS delta over the cold phase)
+- **Reproduced:** each instance maps the component's memory image from the `.cwasm` file; a read fault maps up to 64 KiB of page cache around it (fault-around), and RSS counts those shared pages again for every instance. From `/proc/self/smaps` over 200 live objects: Boa 1220 KB RSS per object, of which 277 KB private; QuickJS 580 KB, 222 KB private (plus ~80 KB of anonymous memory each, as for Rust).
+- **Status:** fixed on cf/qjs (js-bench also reports private memory per object)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -563,11 +583,11 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-50: QuickJS for JavaScript apps
 - **What:** A/B `rquickjs` against Boa in `js/runtime` (same prelude). Boa costs ~6× the Rust guest's CPU per warm request (253–298 µs against 38–48 µs), ~1.3 MB per live object and a 5.4 MB component; QuickJS is usually several times faster and much smaller. It needs a wasi-sdk sysroot, which CI already pins (wasi-sdk-34, for SQLite). Keep Boa unless the numbers say otherwise.
-- **Status:** open
+- **Status:** done on cf/qjs: QuickJS won on every measure (notes/qjs.md) and replaced Boa.
 
 ### W-51: share the JavaScript runtime's bindings with the guest SDK
 - **What:** `js/runtime/src/lib.rs` duplicates request reading, response writing and the kv/config bindings of `guests/util`; use the dx workstream's guest SDK once it lands.
-- **Status:** open
+- **Status:** done on cf/qjs: the runtime is an SDK app (`serve!`, `Request`, `Response`, `fetch`, `kv`, `config`); the SDK gained `Request::url()`.
 
 ### W-52: JavaScript API gaps
 - **What:** streaming bodies (`ReadableStream`), more than one module (bundling with esbuild works today), kv values beyond JSON (structured clone, bytes), batch get/put, a `/data` file API, alarms (W-4), and a supervised end-to-end test of a JS chat room (`env.publish` needs the supervisor).
@@ -579,7 +599,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-54: memory per JavaScript object
 - **What:** a live JS object costs ~1.2 MB more than a Rust one. Boa writes to the header of every heap object it touches (reference counts), so serving a request copies much of the pre-initialized heap. Measure which pages a request dirties; compare with W-50.
-- **Status:** open
+- **Status:** measured on cf/qjs: most of the 1.2 MB was RSS counting shared pages (N-143); privately a Boa object cost ~350 KB, a QuickJS one ~250 KB, a Rust one ~50–80 KB. What is left is W-67.
 
 ### W-20: thread-per-core workers
 - **What:** one current-thread runtime per core in the worker, each owning the objects that hash to it; the supervisor sends an object's requests on a link bound to that thread (the byte sent with each fd can name it). A request would then stay on one thread end to end in the worker, removing N-42's wakeups and the actor-to-connection hops.
@@ -590,3 +610,19 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-22: telemetry still costs about 10% of a production request
 - **What:** after N-74, the remaining cost is mostly the SDK: span creation and attributes, and OTLP encoding of the supervisor's own spans (about 3 µs per request) and the worker's (about 2.5 µs). Reducing it without a custom exporter (Q64/Q66) means fewer allocations per span (e.g. `Arc<str>` object ids instead of new `String`s).
+
+### W-65: `performance.now()` for JavaScript apps
+- **What:** QuickJS's `performance` reads the clock when the context starts (N-142), so the runtime leaves it out. A prelude one over the host's monotonic clock, with the origin taken at the first call, would do; Workers freeze it during a request, which would be fine too.
+- **Status:** idea
+
+### W-66: streaming and the rest of W-52 on QuickJS
+- **What:** W-52's gaps are unchanged by the engine switch (bodies are whole, one module, JSON kv values, no `/data` API, no alarms). QuickJS has async iteration and `Symbol.asyncIterator`, so `ReadableStream` over the SDK's body streams is now a prelude feature rather than an engine one.
+- **Status:** idea
+
+### W-67: less private memory per JavaScript object
+- **What:** a QuickJS object's first request copies ~55 of the snapshot's ~150 heap pages (~220 KB, js-mem probe in notes/qjs.md): reference-count writes to the prelude's and the builtins' objects, spread over the whole heap, plus allocator metadata. A GC before the snapshot and `-O2` changed nothing. Ideas: lay the objects a request touches out together at build time (evaluate the prelude in a fresh arena), or keep QuickJS from writing to snapshot objects (immortal reference counts, an upstream change).
+- **Status:** idea
+
+### W-68: the per-request floor of a JavaScript app
+- **What:** a minimal app (`return new Response("hi")`) costs ~330k instructions per GET against ~160k for the same component answering from Rust (valgrind, notes/qjs.md); the rest is QuickJS's call and object machinery for the prelude's Request/Response objects and rquickjs's conversions. Building the request object lazily from Rust, and the response without the `Headers` class when the app passes none, are the next cuts.
+- **Status:** idea
