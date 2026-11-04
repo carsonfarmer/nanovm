@@ -1,100 +1,123 @@
 # nanovm
 
-A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Objects-style objects:
+nanovm runs untrusted WebAssembly HTTP apps as **durable objects**. Every object id gets exactly one
+live instance, serving one request at a time, with its own memory, CPU, disk and network limits and
+a persistent `/data` volume. A request's file and key-value changes **commit together, durably, when
+it answers**, and roll back if it fails — so an app gets transactions without a database.
 
-- Each `(app, object-id)` has exactly one live instance, which serves one request at a time.
-- Each object has its own memory cap, CPU budget, deadlines and handle cap.
-- Each object has its own quota'd filesystem: scratch `/tmp` and a persistent `/data` volume.
-- Each app has an egress allowlist.
-- Each object has a `wasi:keyvalue` store in its volume, and each app its `wasi:config` values.
-- Objects accept WebSockets and publish to their own sockets.
-- Memory is lost on eviction; `/data` survives eviction and restarts.
+- **Isolated in three layers.** The Wasm sandbox, with hard per-object limits; one jailed worker
+  process per app (its own uid, Landlock, and a seccomp filter with no sockets); and a supervisor that
+  runs no guest code and makes every outbound request under the app's allowlist.
+- **Stateful.** Real files on `/data`, a `wasi:keyvalue` store, and SQLite through a composed Wasm
+  provider — all inside the request's transaction. Memory is lost on eviction; `/data` survives.
+- **Live.** WebSockets are held by the front proxy and arrive at objects as ordinary requests, with
+  per-object channels; objects call each other like Durable Object stubs.
+- **Keyless deploys.** Apps are Sigstore-signed OCI artifacts named by a DNS TXT record: push, sign
+  from CI, point the record. No deploy API and no long-lived keys.
+- **Observable.** OpenTelemetry spans and correlated guest logs by default, exported through the
+  supervisor.
+- **Rust or JavaScript.** WASIp3 components written with a small Rust SDK, or a Workers-style
+  `fetch(request, env)` module in JavaScript.
 
-Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
+[PLAN.md](PLAN.md) has the design and what comes next, [ISSUES.md](ISSUES.md) the known problems and
+planned work, and [notes/](notes/README.md) the evidence behind recent changes.
 
-## Build an app
+## Quickstart
 
-`nanovm run app.wasm` serves one component on loopback, as a node and its proxy would (objects, volumes, commits, WebSockets), without a registry, signatures or jail, and restarts when the file changes. [guests/sdk](guests/sdk/README.md) has the five-minute quickstart; [examples/chat](examples/chat) is a live multi-room chat. Production nodes still run only signed registry apps.
+Build the CLI and add the WebAssembly target:
 
-## SQLite beta
+```bash
+rustup target add wasm32-wasip2
+cargo install --locked --git https://github.com/carsonfarmer/nanovm nanovm
+```
 
-[Build and run the SQLite example](components/sqlite/README.md). A composed Wasm
-provider implements the upstream Spin async SQLite interface over the existing
-filesystem, quotas and request journal; there is no host SQLite service. The
-example demonstrates persistence, object isolation, and atomic SQL/file/KV
-rollback. One connection, provider-owned database files and memory-only temporary
-storage define the initial support contract; see the linked limitations before
-using it in an app.
+**Rust** ([guests/sdk](guests/sdk/README.md)): one async function from a request to a response.
 
-## Try it
+```rust
+use nanovm_sdk::{Request, Response, Result, data};
+
+nanovm_sdk::serve!(handle);
+
+async fn handle(_req: Request) -> Result {
+    let visits: u64 = data().read_text("visits").await?.map_or(0, |n| n.parse().unwrap_or(0)) + 1;
+    data().write("visits", visits.to_string()).await?;
+    Ok(Response::text(format!("{} has had {visits} visits\n", nanovm_sdk::id())))
+}
+```
+
+```bash
+cargo build --release --target wasm32-wasip2
+nanovm run target/wasm32-wasip2/release/hello.wasm &
+curl http://127.0.0.1:8080/alice/   # alice has had 1 visits
+curl http://127.0.0.1:8080/alice/   # alice has had 2 visits
+curl http://127.0.0.1:8080/bob/     # bob has had 1 visits
+```
+
+**JavaScript** ([js/](js/), notes in [notes/js.md](notes/js.md)):
+
+```js
+export default {
+  async fetch(request, env) {
+    let n = (await env.kv.get("n")) ?? 0;
+    if (request.method === "POST") await env.kv.put("n", ++n);   // commits with the response
+    return Response.json({ object: env.id, n });
+  },
+};
+```
+
+```bash
+js/build.sh counter.js counter.wasm && nanovm run counter.wasm
+```
+
+`nanovm run` serves one component on loopback the way a node and its proxy would — objects, volumes,
+commits, WebSockets, calls between objects — without a registry, signatures or jail. It prints a line
+per request and whatever the app logs, keeps data in `./nanovm-data`, and restarts when the file
+changes. Limits, `env`, `config` and `egress` go in a `nanovm.json` (`--manifest`). Production nodes run
+only signed registry apps; see [Apps](#apps). [examples/chat](examples/chat) is a live multi-room chat:
+`examples/chat/run.sh`, then open `http://127.0.0.1:8080/lobby/`.
+
+## How it works
+
+```
+client ─► proxy ─► supervisor (nanovm serve): runs no guest code
+          DNS → app    │  HTTP/1.1 front end; routes /{object}/… to the app's worker
+          WebSockets   │  makes every outbound request: allowlist, DNS, public-IP filter
+                       ├── fd 3: request links ──► worker (one per app, jailed)
+                       └── fd 4: egress links  ◄──   one actor per live object:
+                                                      one instance, one request at a time,
+                                                      /data + /tmp + key-value, CPU/memory/disk limits
+```
+
+The proxy finds a host's app in a `_nanovm.<host>` TXT record and names its signed digest to the node
+with each request. The supervisor fetches and verifies the app on first use, starts a jailed worker
+for it, and forwards each request over a socketpair link. In the worker, each object is an actor that
+owns at most one instance; requests queue in its mailbox and run one at a time, with deadlines, a CPU
+budget and a memory cap. Before a response leaves, the request's changes to `/data` are made durable
+by an undo journal ([Commits](#commits)); a request that fails is rolled back by restarting its
+instance.
+
+## Try the whole node
 
 ```bash
 demo/demo.sh
 ```
 
-The script:
-1. Builds the guests and the node.
-2. Publishes a benign `counter` app and a `hostile` app to a registry on loopback (`cargo run --example dev-registry`).
-3. Starts a node in dev mode from [demo/nanovm.toml](demo/nanovm.toml), which runs them unsigned.
-4. Pings a canary object throughout.
-5. Drives it over HTTP with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm requests, `/data` writes, and a storm of 100 simultaneous attacks.
+The script builds the guests and the node, publishes a benign `counter` app and a `hostile` app to a
+registry on loopback (`cargo run --example dev-registry`), starts a node in dev mode from
+[demo/nanovm.toml](demo/nanovm.toml), pings a canary object throughout, and drives the node over HTTP
+with `curl --parallel`: per-object volumes, path escapes and egress, 5,000 cold starts, 50,000 warm
+requests, `/data` writes, and a storm of 100 simultaneous attacks. It leaves the node running, and its
+loopback `dev-collector` writes the decoded telemetry to `target/demo-telemetry.json`.
 
-It leaves the node running. Always-on OpenTelemetry exports rich request spans, correlated guest stdout/stderr and periodic infrastructure snapshot events to `telemetry_endpoint` (default `http://127.0.0.1:4318`). Point this OTLP/HTTP base URL at your Collector for enrichment, redaction, sampling and vendor routing. Jailed workers export over their existing link; the supervisor owns the destination and stamps app/manifest-digest identity. Object IDs appear on request records and logs. Export queues, batch sizes, concurrency and deadlines are bounded; a missing collector does not prevent requests or commits. Worker startup uses a separate private readiness response. The demo's loopback `dev-collector` writes decoded OTLP to `target/demo-telemetry.json`; it refuses stale snapshots. The stats/events HTTP APIs and event ring are removed, with no compatibility endpoints. W-2 validation is complete for the separately budgeted Collector deployment described below.
-
-HANDOFF records matched measurements and rejected experiments. The Linux CLI and benchmark use jemalloc; the library leaves allocator selection to its embedder. Controlled allocator swaps improved full-export throughput from roughly 54–59k/s to 79–84k/s, with about 20 MB more retained memory in that workload. SDK batches remain 256 spans with a 1 MiB body cap; the bounded queue now holds 2048 spans to absorb brief export stalls. No sampling or detail was removed.
-
-`cargo run --locked --release -p nanovm --example bench -- --export` measures three 200,000-request warm runs with a decoding OTLP sink, checks all 601,000 request spans including warmup, and fails on missing exports. Three complete invocations measured 75–79k/s (74.7–78.1k/s including shutdown/export drain), with no missing spans. The sink shares the orb's cores; this is not a production Collector or proxy/jailed-worker throughput claim, nor proof of being within a few percent of main.
-
-Earlier real HTTP validation exposed export loss ([N-36](ISSUES.md)): oha 1.16.0 drove the supervisor and jailed worker at 35–39k/s with no request failures, but OpenTelemetry Collector 0.164.0 received only 406,006 of 600,000 request spans. The worker's bounded queue overflowed. A concurrent SDK exporter eliminated those losses in one experiment but failed an in-flight flush regression, so it was not adopted. Those historical rates are not matched controls for the current build.
-
-The focused continuation isolates the supervisor's control/egress runtime from its HTTP frontends. Previously the first frontend also drove relay I/O; under load this delayed the serial SDK exporter and filled its bounded queue. Temporary timing probes measured mean worker export round trips falling from 12.6 ms to 3.5 ms with isolation. Three uninstrumented HTTP runs with the official Collector and derived metrics delivered all 1,200,000 expected spans at 26.0–26.4k requests/s. This fixes the reproduced scheduling-induced loss, not every possible overload; full-export HTTP throughput at 64k/s remains unproven.
-
-Matched benchmark paths must stay separate. On this 4-core orb, three 200,000-request runs at concurrency 256 over 100 warm objects measured:
-
-| Build | In-process requests/s | HTTP supervisor → jailed worker requests/s |
-|---|---:|---:|
-| Historical main `617668e` | 63,706–64,889 | 27,145–29,340 |
-| Current main `40c5895` | 62,888–63,981 | 23,812–25,237 |
-| W-2 with control-runtime isolation | 75,093–77,772 | 17,214–23,319 |
-
-Main has no OTLP export. W-2's in-process decoding sink received 601,000/601,000 spans including warmup (75,482/s including drain); HTTP used oha 1.16.0 and Collector 0.164.0 on the same cores, with two frontends and two spans per request. The table's current main/W-2 HTTP rows are three alternating clean-build runs; each W-2 run delivered all 400,000 spans. The historical main row was measured earlier in the session. Earlier W-2 runs were 26.0–26.4k/s; a longer 2,000,000-request run was 25,282/s with all 4,000,000 spans, p99 28.6 ms. All HTTP requests returned 200. This variation and the final paired regression prevent a performance-clearance claim. A shared-target Cargo cache reused a different worktree's benchmark once; that control was discarded and main explicitly rebuilt. The remembered ~64k main result is confirmed in-process, not over HTTP. These measurements neither establish a safe production rate nor include a durable remote storage backend.
-
-CI reports runtime size (currently 5,315 nonblank/noncomment lines before test modules); the hard LOC budget is suspended while correctness takes priority. Guest and infrastructure logs share one bounded record-emission path. Collector responses are bounded to 4 KiB and passed intact to the SDK, including partial-success reports. The CLI writes SDK warnings to stderr rather than back into the failing export stream; library embedders install their own diagnostic subscriber.
-
-One request span lasts through the final post-return commit. It carries HTTP method/path (no query), status/error, cold-start status and queue, instantiate, guest, commit and post-return durations in milliseconds. `nanovm.response.duration_ms` measures time to the response headers; span duration also includes subsequent work. Calls between objects remain child spans. Only immutable context crosses tasks. The tracing feature, metric exporters and local request histograms are removed; OpenTelemetry's SDK owns recording, batching and export. Requests record even when an incoming parent is unsampled: sampling belongs downstream. Guest-defined spans/enrichment are follow-up W-17.
-
-Requests use SERVER spans; inter-object and external HTTP calls use CLIENT spans with bounded method/path, response status and errors. External calls propagate W3C trace context and record destination host/port; object calls record the target object. Queries are omitted from spans and egress-denial logs. A failed dependency is visible even when its caller handles the failure successfully. Client 4xx/5xx responses are errors; server 4xx responses are not automatically failures. Call duration ends when response headers arrive. This follows the [OpenTelemetry HTTP conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/) within the [Honeycomb wide-event model](https://docs.honeycomb.io/get-started/observability/concepts/instrumentation).
-
-Dependency calls cancelled before response headers record `error.type = cancelled`. External HTTP errors use status codes, not untrusted upstream `x-nanovm-error` headers. Request-scoped runtime diagnostics (traps, quota/egress denials, rollback and instantiation failures) carry explicit trace/span IDs. Infrastructure-only events stay unparented. A failed final commit records `error.type = post-return-commit-failed` and a correlated, bounded I/O diagnostic while preserving the already-sent HTTP status. A gated test component verifies actual post-return calls, stderr and final-commit failures without changing published guests.
-
-`proxy.request` and `supervisor.request` spans cover forwarding through response headers, including pre-worker failures. They parent the worker's `request` lifecycle span. The proxy also accepts `telemetry_endpoint`; both default to the same Collector base URL. Readiness traffic is excluded. For counts and latency, select the layer you mean: proxy for client-facing requests, supervisor for node ingress, `request` for object execution. Summing them would double/triple count. Direct HTTP load now produces two spans per ordinary request; proxy traffic produces three. The 256-span batch, 2048-span queue and 1 MiB body bound are our implementation choices, not OTLP limits; the protobuf payload is the standard SDK wire format. The ~64k complete-export requests/s target is not an achieved production baseline.
-
-Infrastructure uses structured OTLP logs (`event.name = nanovm.snapshot`), not artificial request spans: memory, uptime, live stores/objects, phases, resource-limit counters, worker identity/state and restarts/link errors. Runtime events use `event.name`; guest logs use `log.iostream` and trace/span IDs. Derive request counts, latency distributions and SLOs from request events in the Collector/backend. Bounded queues can drop events under overload or collector outage; these are not an exact accounting ledger. Derive exact aggregates before tail sampling, or use a backend's supported weighted queries; a sample-rate field alone does not correct every sampling policy. SDK shutdown exports pending records off the async runtime thread; abrupt process kills can still lose buffered telemetry.
-
-The measurements above precede the final hot-path optimization. A native CPU profile identified repeated OCI reference parsing; a bounded per-thread cache now stores only pure parse results (16 entries, inputs ≤1024 bytes), never host, trust, version floor or authorization. Common span attributes reserve enough capacity upfront. All supervisor/worker/proxy/dependency spans remain; the owner rejected removing supervisor observations for throughput.
-
-Post-commit controls use three alternating 400,000-request runs per variant, c256 over 100 warm counter objects, one frontend, identical release build flags, oha 1.16.0 and official Collector 0.164.0 with derived metrics. Both applications receive the same CPU allocation. With physical SMT core pairs separated (application CPUs 0–1, Collector/load generator 2–3), main/optimized aggregate throughput is **18,631 / 18,227 requests/s (2.17% lower)**. Active node+worker CPU is 103.45 / 105.00 µs/request, with Collector another 14.70 µs/request. Fully colocated on all four logical CPUs, main/optimized is **27,548 / 25,459 requests/s (7.58% lower)**; application CPU 109.42 / 110.64 µs/request, Collector another 13.62. Each optimized matrix returned all 1.2m HTTP200 responses and exported all 2.4m spans. A sustained 2m-request run delivered all 4m spans at 25,561/s, p99 25.84ms; long-path/trace-state runs also delivered all spans, including explicit queue overload.
-
-The isolated application result meets the few-percent overhead gate for the recommended separately budgeted Collector deployment. Its additional CPU is real; the 7.58% colocated result does not meet that gate. W-2 host instrumentation is complete. Runtime is 5,315 lines versus main's 4,955 before W-2 (+360, 7.3%), using CI's nonblank/noncomment count before test modules. These are workload/environment observations, not universal capacity or durable-backend validation. HANDOFF retains earlier results (including the more favorable pre-commit 0.74% isolated / 4.45% colocated), exact reproduction steps and rejected experiments. The remembered ~64k is in-process, not an HTTP baseline.
-
-### Collector and operator checks
-
-**Recommended deployment:** run a separately budgeted Collector as a standalone service, following the standard [OpenTelemetry gateway pattern](https://opentelemetry.io/docs/collector/deployment/gateway/). Provision CPU/memory independently of the application; dedicated physical cores on the same host are also valid. This separates backend credentials/policy and resource contention from request serving. Our same-host physical-core test validates application overhead; it does **not** test a remote network or durable backend. Across hosts, configure private receiver ingress and TLS/access controls, then repeat completeness, latency and outage tests for that topology. The supervisor—not jailed workers—connects to the configured OTLP/HTTP endpoint. Keep SDK queue-loss/export alerts and separately monitor Collector saturation; adding a Collector does not make telemetry lossless.
-
-[demo/otel-collector.yaml](demo/otel-collector.yaml) is a validated reference for official `otelcol-contrib` 0.164.0. Run `otelcol-contrib --config demo/otel-collector.yaml` and point node/proxy `telemetry_endpoint` at its OTLP/HTTP base URL. It accepts traces/logs on loopback port 4318, derives bounded-cardinality request/error/duration metrics on port 8889, and exposes Collector health counters on port 8888. It does not sample. The `debug` exporter is a validation sink, **not durable storage**: replace it with your authenticated backend exporter, configure backend queue/retry/storage policy, and repeat the completeness/load check against that backend. Keep receiver and metrics ports private; credentials and redaction policy belong in the Collector, not jailed workers.
-
-For object execution, select `span_name="request"`; for node ingress select `supervisor.request`, or `proxy.request` for the public frontend. For example, `sum(rate(nanovm_spans_calls_total{span_name="request"}[5m]))` gives object executions/s; adding `status_code="STATUS_CODE_ERROR"` selects errors. `nanovm_spans_duration_seconds_bucket` supports latency quantiles for that same layer. These durations include post-return work only on the worker `request` span. Object IDs and raw paths are deliberately not metric dimensions. Overflow collapses extra dimension combinations, losing detail rather than silently discarding the aggregate; watch `otel_metric_overflow`. The pinned connector is upstream alpha, so validate configuration and metric names when upgrading.
-
-The reference pipeline's five-second metric flush is independent of the SDK export interval: wait for metric updates before comparing totals. A real-Collector check of 137 reads, 11 committed writes and 17 traps produced 148 successes and 17 errors in each selected layer, with matching histogram counts. Do not sum layers. Compare Collector `otelcol_receiver_accepted_spans` and `otelcol_exporter_sent_spans` against expected span counts, and alert on refusal/export failure counters and SDK stderr queue-drop/export warnings. Successful HTTP responses alone say nothing about telemetry completeness. Best-effort bounded export can still lose records during overload, backend outages or process kills; no silent sampling or lossless-accounting promise is made.
-
-A request names its app in the headers the proxy sets (see [Apps](#apps)), and its object in the path, `/{object}/{path}`:
+A request names its app in the headers the proxy sets (see [Apps](#apps)), and its object in the
+path, `/{object}/{path}`:
 
 ```bash
 curl -XPOST http://127.0.0.1:8080/alice/incr \
   -H 'nanovm-app: 127.0.0.1:5000/nanovm/counter@sha256:…' -H 'nanovm-trust: dev dev'
 ```
 
-## What a run of `demo/demo.sh` shows
+### What a run of `demo/demo.sh` shows
 
 On the 4-core Linux sandbox, with each app's worker capped at 8,000 objects (the sandbox's fd limit; see Host requirements). These numbers go through curl, which shares the 4 cores, and the HTTP front end; the in-process numbers are under Benchmarks. The second column is the same demo on the unjailed single-process node from before the jail, on the same machine.
 
@@ -125,6 +148,47 @@ Every attack in the storm, and how it ended:
 | `../` and symlink escapes | refused |
 | fetch cloud metadata (169.254.169.254) | denied (not on the allowlist) |
 | allowlisted name that resolves to 127.0.0.1 | denied by the resolved-IP check (in this sandbox, which has no DNS, it fails to resolve instead; the `localhost` integration test covers the IP check) |
+
+## Observability
+
+Telemetry is always on and goes to `telemetry_endpoint` (OTLP/HTTP, default `http://127.0.0.1:4318`):
+
+- **Spans.** `proxy.request` and `supervisor.request` cover forwarding up to the response headers,
+  including failures before a worker is reached; each parents the worker's `request` span, which lasts
+  through the final post-return commit and carries method, path (never the query), status or error,
+  cold start, and queue, instantiate, guest, commit and post-return durations in milliseconds.
+  Calls to other objects and external HTTP calls are CLIENT child spans; external calls propagate
+  W3C trace context. Pick one layer when counting: `request` for object executions,
+  `supervisor.request` for node ingress, `proxy.request` for the public front door.
+- **Logs.** Guest stdout/stderr and runtime diagnostics (traps, limit kills, denials, rollbacks) are
+  OTLP log records carrying the request's trace and span ids. Infrastructure snapshots
+  (`event.name = nanovm.snapshot`) report memory, live objects by phase, limit counters and worker
+  state.
+- **Trust.** Jailed workers export over their existing link; only the supervisor reaches the
+  collector, and it stamps each batch with the app and manifest digest, dropping identity attributes a
+  worker could forge.
+- **Bounded, best effort.** Queues, batches, bodies and deadlines are bounded; a missing collector never
+  blocks a request or a commit. Overload, collector outages or a killed process can lose records, so
+  derive exact counts from the Collector's own accepted/sent counters, not from HTTP successes.
+
+Run a separately budgeted Collector (the standard [gateway
+pattern](https://opentelemetry.io/docs/collector/deployment/gateway/)) or give it dedicated cores:
+measured application overhead was 2.2% that way, against 7.6% fully colocated (HANDOFF's W-2 section
+has the method and history). [demo/otel-collector.yaml](demo/otel-collector.yaml) is a validated
+reference for `otelcol-contrib` 0.164.0 that derives bounded-cardinality request, error and duration
+metrics — e.g. `sum(rate(nanovm_spans_calls_total{span_name="request"}[5m]))` is object executions per
+second. Replace its `debug` exporter with your authenticated backend, keep its ports private, and keep
+credentials and redaction in the Collector, never in workers.
+
+## SQLite beta
+
+[Build and run the SQLite example](components/sqlite/README.md). A composed Wasm
+provider implements the upstream Spin async SQLite interface over the existing
+filesystem, quotas and request journal; there is no host SQLite service. The
+example demonstrates persistence, object isolation, and atomic SQL/file/KV
+rollback. One connection, provider-owned database files and memory-only temporary
+storage define the initial support contract; see the linked limitations before
+using it in an app.
 
 ## The jail
 
@@ -306,7 +370,15 @@ A host I/O failure during commit, a crash at its commit marker, or a lost respon
 cargo run --release -p nanovm --example bench -- --json target/bench.json
 ```
 
-Add `--quick` for a run that is 10× smaller. A full run on the same Mac gave:
+Add `--quick` for a run that is 10× smaller; the warm, cold and churn rows also print CPU time per
+request, which stays meaningful on a busy machine. The latest before/after comparison is in
+[notes/README.md](notes/README.md): on a 4-core Linux VM, in-process, the current code serves warm GETs
+across 100 objects at about 48K/s (256 concurrent), starts 3.7K new objects per second, churns 4.7K
+objects per second through 100 slots, and holds about 90 KB per live object. Through the supervisor and
+a jailed worker over HTTP it serves about 17K requests per second (oha, 256 concurrent, the load
+generator and a counting OTLP sink on the same cores).
+
+The tables below are earlier full runs, kept for comparison across machines. A full run on a Mac (14 cores) gave:
 
 | Scenario | Throughput | p50 | p99 |
 |---|---|---|---|
@@ -477,6 +549,15 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
   - LRU eviction could pick an object that was idle but had a job queued, or a socket event waiting for room. Its actor drains its queue before exiting, so the next request started a second actor for the same object on the same volume. Only an object with no work queued or waiting is evicted now (N-10).
 - **Cold starts failed with `502 worker-down`.** A worker busy instantiating fell behind on its control socket, so the supervisor's non-blocking `sendmsg` failed with `EAGAIN`. Each failed request then made curl send another, which needed another new link. A dial now waits up to 5 s for the peer. The unit test `dials_wait_for_a_slow_acceptor` fails without it.
 
+- **From the 2026-11 security review** ([notes/sec.md](notes/sec.md), ISSUES N-70 to N-75). Each fix has a test that fails without it.
+  - Code that escaped Wasm could send datagrams, and file descriptors, to any unix datagram socket on the host (journald, syslog, systemd's notify socket): seccomp allowed `socketpair` of any type. Only stream pairs are allowed now (N-70).
+  - A client could forge a WebSocket event, with a `Connection-Id` of its choosing, by sending the events content type second, in another case, with parameters, or comma-joined (N-71).
+  - A guest's 8 MiB publish, parsed as a JSON value, held 192 MiB in the proxy every app shares; publishes are now parsed into typed structs (N-72).
+  - A compromised worker could send an allowed CDN the `Host` of a site the allowlist never named (domain fronting); egress now sets `Host` from the checked authority (N-73).
+  - A compromised worker's 1 MiB telemetry batch of empty spans cost the supervisor 278 MB and 308 ms to stamp; stamping now rewrites the batch at the wire level, in about its own size (N-74).
+  - A guest could hold about 1.25 GiB of `wasi:http` header maps against a 64 MiB memory limit; a head is now at most 64 KiB at every hop and an instance holds at most `memory_mb × 16` resources (N-75).
+- **In-process nodes couldn't publish to WebSockets** (tests, the benchmark, `nanovm run`): egress denied `http://nanovm/publish/`. They now hold publishes until commit and deliver them to their own sockets; a publish to any other `http://nanovm/` path gets 404 at once instead of being dropped (N-60, N-61).
+
 ## Layout
 
 | Path | What it is |
@@ -502,6 +583,8 @@ On Linux 7.0 (emulated, 4 vCPUs), the default set passes. Under `all`, 35 of 40 
 | `guests/sdk` | `nanovm-sdk`, the Rust guest SDK ([quickstart](guests/sdk/README.md)) |
 | `guests/` | The test guests `counter` and `hostile`, built on the SDK (wasm32-wasip2 with wasip3 bindings) |
 | `examples/chat` | A live multi-room chat built on the SDK, run with `examples/chat/run.sh` |
+| `js/` | The JavaScript runtime: a guest component embedding a JS engine, built and pre-initialized per app by `js/build.sh` |
+| `notes/` | Evidence for recent changes: method, before/after numbers and tests per workstream |
 
 ## Known limits of this phase
 
