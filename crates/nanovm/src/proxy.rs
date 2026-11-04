@@ -26,6 +26,7 @@ use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use parking_lot::Mutex;
+use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
 
 use crate::config::ProxyConfig;
@@ -293,20 +294,17 @@ fn parse(txt: &str) -> anyhow::Result<Route> {
     Ok(Route { owner: String::new(), app, trust: trust.join(", "), min })
 }
 
-/// Serves the proxy on `listener`, over plain HTTP: TLS is left to a
-/// terminator in front.
-pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+/// Serves the proxy on `listener`, over plain HTTP (TLS is left to a
+/// terminator in front), and nodes' publishes on `publish`, a private port
+/// network policy must restrict to nodes.
+pub async fn serve(proxy: Arc<Proxy>, listener: TcpListener, publish: TcpListener) -> anyhow::Result<()> {
+    use crate::server::{accept, serve_conn};
     loop {
         let p = proxy.clone();
-        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| p.clone().handle(req));
-    }
-}
-
-/// Private control port: network policy must restrict it to nodes.
-pub async fn serve_publish(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-    loop {
-        let p = proxy.clone();
-        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| p.clone().publish(req));
+        tokio::select! {
+            sock = accept(&listener) => serve_conn(sock, Some(CLIENT_TIMEOUT), move |req| p.clone().handle(req)),
+            sock = accept(&publish) => serve_conn(sock, Some(CLIENT_TIMEOUT), move |req| p.clone().publish(req)),
+        };
     }
 }
 

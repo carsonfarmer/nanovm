@@ -138,11 +138,10 @@ impl QuotaGuard {
     /// Makes room to replace a file of `old` bytes (`None`: a new file) with
     /// one of `new` bytes, or refuses as a full disk would.
     pub fn reserve(&self, old: Option<u64>, new: u64) -> Result<(), ErrorCode> {
-        let mut q = self.0.lock();
-        if old.is_none() && q.files >= q.max_files {
-            let what = format!("entry limit reached ({} files)", q.max_files);
-            return Err(q.deny(ErrorCode::Quota, what));
+        if old.is_none() {
+            self.check_new_entry()?;
         }
+        let mut q = self.0.lock();
         let freed = old.unwrap_or(0).min(q.bytes);
         if (q.bytes - freed).saturating_add(new) > q.max_bytes {
             return Err(q.full());
@@ -169,16 +168,6 @@ impl QuotaGuard {
         self.0.lock().journaled(f)
     }
 
-    /// Removes the volume's file at `path`, of `bytes`, into the journal:
-    /// where it now is.
-    pub fn remove(&self, path: &Path, bytes: u64) -> Result<std::path::PathBuf, ErrorCode> {
-        let mut q = self.0.lock();
-        let slot = q.journaled(|j| j.remove(path, bytes))?;
-        q.bytes = q.bytes.saturating_sub(bytes);
-        q.files = q.files.saturating_sub(1);
-        Ok(slot)
-    }
-
     pub fn unlink(&self, path: &Path, bytes: u64) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
         q.journaled(|j| j.unlink(path, bytes))?;
@@ -198,7 +187,11 @@ impl QuotaGuard {
         let (mut file, mut dir) = (None, false);
         match std::fs::symlink_metadata(to) {
             Ok(d) if d.is_file() && src.is_dir() => return Err(ErrorCode::NotDirectory.into()),
-            Ok(d) if d.is_file() => file = Some((self.remove(to, d.len())?, d.len())),
+            // Into the journal, where it now is, until the rename is made.
+            Ok(d) if d.is_file() => {
+                file = Some((self.journal(|j| j.remove(to, d.len()))?, d.len()));
+                self.adjust(-(d.len() as i64), -1);
+            }
             Ok(_) => {
                 self.journal(|j| j.removing_dir(to))?;
                 dir = true;
@@ -257,13 +250,6 @@ impl QuotaGuard {
         let mut q = self.0.lock();
         q.bytes = q.bytes.saturating_add_signed(bytes);
         q.files = q.files.saturating_add_signed(files);
-    }
-
-    /// Bytes and entries in use.
-    #[cfg(test)]
-    pub(crate) fn usage(&self) -> (u64, u64) {
-        let q = self.0.lock();
-        (q.bytes, q.files)
     }
 }
 
@@ -400,6 +386,7 @@ fn write_stream(
             result: Some(tx),
         },
     )?;
+    // A writer dropped without a failure to report reads as success.
     FutureReader::new(
         &mut store,
         async move { wasmtime::error::Ok(rx.await.unwrap_or(Ok(()))) },
@@ -411,14 +398,6 @@ struct QuotaWriter {
     at: Option<u64>,
     quota: QuotaGuard,
     result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
-}
-
-impl Drop for QuotaWriter {
-    fn drop(&mut self) {
-        if let Some(tx) = self.result.take() {
-            let _ = tx.send(Ok(()));
-        }
-    }
 }
 
 impl StreamConsumer<ObjState> for QuotaWriter {
@@ -451,11 +430,17 @@ impl StreamConsumer<ObjState> for QuotaWriter {
     }
 }
 
-/// Methods that need no quota check: forwarded to the stock implementation.
+/// Methods that need no quota check: forwarded to the stock implementation
+/// (`sync` ones take the store's `Access`).
 macro_rules! delegate {
     ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
         async fn $name(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>, $($arg: $ty),*) -> $ret {
             WasiFilesystem::$name(&stock(store), fd, $($arg),*).await
+        }
+    )*};
+    (sync $($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {$(
+        fn $name(mut store: Access<'_, ObjState, Self>, fd: Resource<Descriptor>, $($arg: $ty),*) -> $ret {
+            WasiFilesystem::$name(stock_access(&mut store), fd, $($arg),*)
         }
     )*};
 }
@@ -477,19 +462,9 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         metadata_hash_at(flags: PathFlags, path: String) -> FilesystemResult<MetadataHashValue>;
     }
 
-    fn read_via_stream(
-        mut store: Access<ObjState, Self>,
-        fd: Resource<Descriptor>,
-        offset: Filesize,
-    ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        WasiFilesystem::read_via_stream(stock_access(&mut store), fd, offset)
-    }
-
-    fn read_directory(
-        mut store: Access<'_, ObjState, Self>,
-        fd: Resource<Descriptor>,
-    ) -> wasmtime::Result<(StreamReader<DirectoryEntry>, FutureReader<Result<(), ErrorCode>>)> {
-        WasiFilesystem::read_directory(stock_access(&mut store), fd)
+    delegate! { sync
+        read_via_stream(offset: Filesize) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)>;
+        read_directory() -> wasmtime::Result<(StreamReader<DirectoryEntry>, FutureReader<Result<(), ErrorCode>>)>;
     }
 
     fn write_via_stream(
@@ -957,7 +932,7 @@ mod tests {
                 let body = req.into_body().collect().await.unwrap().to_bytes();
                 let logs = ExportLogsServiceRequest::decode(body).unwrap();
                 output.lock().extend(logs.resource_logs.into_iter().flat_map(|r| r.scope_logs).flat_map(|s| s.log_records));
-                crate::server::ok_json(serde_json::json!({}))
+                http::Response::new(http_body_util::Full::new(bytes::Bytes::from_static(b"{}")).map_err(|e| match e {}).boxed_unsync())
             }
         }));
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(&endpoint, "app", "digest", None).unwrap());
@@ -1048,7 +1023,7 @@ mod tests {
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
         let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj).unwrap();
         let f = std::fs::File::options().write(true).open(dir.join("f")).unwrap();
-        g.remove(&dir.join("f"), 10).unwrap();
+        g.unlink(&dir.join("f"), 10).unwrap();
         assert_eq!(usage(&g), (10, 1));
         g.set_size(&f, 0).unwrap();
         assert_eq!(usage(&g).0, 10);
@@ -1100,5 +1075,14 @@ mod tests {
         g.unlink(&dir.join("b"), 600 << 10).unwrap();
         assert_eq!(usage(&g), (2, 0), "post-removal growth keeps the existing conservative charge");
         assert_eq!(b.metadata().unwrap().len(), 600 << 10);
+    }
+}
+
+#[cfg(test)]
+impl QuotaGuard {
+    /// Bytes and entries in use.
+    pub(crate) fn usage(&self) -> (u64, u64) {
+        let q = self.0.lock();
+        (q.bytes, q.files)
     }
 }

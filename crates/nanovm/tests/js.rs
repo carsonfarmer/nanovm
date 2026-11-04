@@ -83,6 +83,9 @@ async fn counter_persists_across_eviction() {
         assert_eq!(r.status, 200, "{:?} {}", r.error, r.body);
         assert_eq!((r.json()["n"].as_u64(), r.json()["hits"].as_u64()), (Some(n), Some(n)));
     }
+    // `a` is idle (its post-return commit done) before `b` is used, so it
+    // is the least recently used: a read of `b` can finish first.
+    settle(&node).await;
     let r = get(&node, "b", "/").await;
     assert_eq!((r.json()["object"].as_str(), r.json()["n"].as_u64()), (Some("b"), Some(0)), "objects are separate");
     settle(&node).await;

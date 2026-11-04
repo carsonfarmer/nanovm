@@ -23,7 +23,7 @@ pub mod ws;
 
 /// Per-thread allocation counts, for tests that bound what parsing costs.
 #[cfg(test)]
-pub(crate) mod counting {
+mod counting {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 

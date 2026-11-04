@@ -78,23 +78,17 @@ config! {
 }
 
 /// An app as its worker runs it: from its registry config, within the
-/// node's limits.
+/// node's limits. Only the supervisor writes one (to its worker), whole.
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub name: String,
     /// Manifest digest assigned by the supervisor, not the guest manifest.
-    #[serde(default)]
     pub digest: String,
     /// Extra environment variables visible to the guest.
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Values the guest reads through `wasi:config/store`.
-    #[serde(default)]
     pub config: BTreeMap<String, String>,
-    #[serde(default)]
     pub limits: Limits,
-    #[serde(default)]
     pub worker: WorkerLimits,
 }
 

@@ -263,7 +263,7 @@ async fn route(req: Request) -> Result {
                 // Take key `k0`'s file name (base64url "azA") with a
                 // directory through the filesystem, then set the key.
                 "plant" => {
-                    for d in [".kv/default/azA", ".kv/default/azA/x"] {
+                    for d in [".kv", ".kv/default", ".kv/default/azA", ".kv/default/azA/x"] {
                         let _ = data().descriptor().create_directory_at(d.into()).await;
                     }
                     match bucket.set("k0", &vec![1u8; 1 << 20]) {

@@ -113,14 +113,6 @@ pub async fn handle<B: http_body::Body<Data = Bytes, Error = hyper::Error>>(node
     node.dispatch(id, Request::from_parts(parts, body)).await
 }
 
-pub fn ok_json(v: serde_json::Value) -> Response<RespBody> {
-    Response::builder()
-        .header("content-type", "application/json")
-        .header("cache-control", "no-store")
-        .body(full(v.to_string()))
-        .unwrap()
-}
-
 fn full(b: impl Into<Bytes>) -> RespBody {
     Full::new(b.into()).map_err(|e| match e {}).boxed_unsync()
 }

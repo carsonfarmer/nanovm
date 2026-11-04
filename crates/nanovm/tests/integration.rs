@@ -17,6 +17,13 @@ mod collector;
 use load::{Reply, request};
 use nanovm::table::Node;
 
+/// A JSON answer, as the test servers give.
+fn ok_json(v: serde_json::Value) -> http::Response<nanovm::object::RespBody> {
+    use http_body_util::BodyExt;
+    let body = http_body_util::Full::new(bytes::Bytes::from(v.to_string())).map_err(|e| match e {}).boxed_unsync();
+    http::Response::builder().header("content-type", "application/json").body(body).unwrap()
+}
+
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -442,9 +449,10 @@ async fn only_empty_scratch_is_reused() {
     assert_eq!(get(&node, "u", "/files?mount=tmp&n=1").await.status, 200);
     assert_eq!(entries(&scratch), first, "u's instance reuses t's directory");
     assert_eq!(entries(&scratch.join(&first[0])), ["f0"]);
-    // u leaves `f0` behind, so its directory is removed, not handed on.
+    // u leaves `f0` behind, so its directory is removed, not handed on
+    // (just after the store stops counting as live: N-132).
     assert_eq!(get(&node, "u", "/panic").await.status, 500);
-    eventually("u's instance gone", gone).await;
+    eventually("u's directory removed", || entries(&scratch).is_empty()).await;
     assert_eq!(get(&node, "v", "/").await.status, 200);
     let now = entries(&scratch);
     assert!(now.len() == 1 && now != first, "{now:?}");
@@ -549,7 +557,7 @@ async fn egress_allowed_request_round_trips() {
                 captured.lock().extend(ExportTraceServiceRequest::decode(body).unwrap().resource_spans
                     .into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     // In dev mode an IP-literal allowlist entry may be private; this
@@ -2372,8 +2380,7 @@ mod sockets {
         let proxy = nanovm::proxy::Proxy::new(cfg).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(nanovm::proxy::serve(proxy.clone(), listener));
-        tokio::spawn(nanovm::proxy::serve_publish(proxy, control));
+        tokio::spawn(nanovm::proxy::serve(proxy, listener, control));
         (sup, node, addr, records)
     }
 
@@ -2681,7 +2688,7 @@ async fn doh(records: Arc<parking_lot::Mutex<std::collections::HashMap<String, V
         answer.extend(records.lock().get(&name).into_iter().flatten().map(|txt| {
             serde_json::json!({ "name": format!("{name}."), "type": 16, "TTL": 1, "data": format!("\"{txt}\"") })
         }));
-        async move { nanovm::server::ok_json(serde_json::json!({ "Status": 0, "Answer": answer })) }
+        async move { ok_json(serde_json::json!({ "Status": 0, "Answer": answer })) }
     }));
     format!("http://{addr}/dns-query")
 }
@@ -2698,8 +2705,9 @@ async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::Sock
         ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let publish = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+    tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener, publish));
     addr
 }
 
@@ -2899,9 +2907,13 @@ async fn a_node_runs_at_most_max_apps() {
     let mut cfg = node_cfg("a_node_runs_at_most_max_apps", 8);
     cfg.max_apps = 2;
     let (_sup, addr) = supervised_with(cfg).await;
+    // Time for the slow requests below to outlast an app's start on a busy
+    // host.
+    let mut slow = app("hostile");
+    slow.limits.request_timeout_ms = 10_000;
     let mut apps = Vec::new();
     for repo in ["apps-a", "apps-b", "apps-c"] {
-        apps.push(publish(repo, &app("hostile")).await);
+        apps.push(publish(repo, &slow).await);
     }
     let [a, b, c] = &apps[..] else { unreachable!() };
     let busy = |app: &String, ms: u64| {
@@ -2909,17 +2921,26 @@ async fn a_node_runs_at_most_max_apps() {
         tokio::spawn(async move { app_get(addr, &app, &format!("/s/sleep?ms={ms}")).await })
     };
     let up = async |app: &str| stats_json(addr).await["workers"][worker(app).as_str()]["up"] == true;
+    // Until the worker reports the slow request in its guest, it may not
+    // have reached the worker yet, which then looks idle (N-91).
+    let handling = async |app: &str| {
+        let started = Instant::now();
+        while stats_json(addr).await["apps"][worker(app).as_str()]["phases"]["handling"] != 1 {
+            assert!(started.elapsed() < Duration::from_secs(10), "{}", stats_json(addr).await);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
 
     assert_eq!(app_get(addr, a, "/x/").await.0, 200);
     assert_eq!(app_get(addr, b, "/x/").await.0, 200);
     // `a` is idle and least recently used; `b` is busy.
-    let slow_b = busy(b, 900);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let slow_b = busy(b, 2500);
+    handling(b).await;
     assert_eq!(app_get(addr, c, "/x/").await.0, 200);
     assert!(!up(a).await && up(b).await && up(c).await, "{}", stats_json(addr).await);
     // Both running apps busy: `a` is refused, and neither is disturbed.
-    let slow_c = busy(c, 600);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let slow_c = busy(c, 1000);
+    handling(c).await;
     let (status, body) = app_get(addr, a, "/x/").await;
     assert!(status == 502 && body.contains("most apps (2)"), "{status} {body}");
     assert_eq!(slow_b.await.unwrap().0, 200);
@@ -3051,7 +3072,7 @@ async fn the_proxy_drops_hop_by_hop_headers() {
     let echo = listener.local_addr().unwrap();
     tokio::spawn(nanovm::server::serve_http1(listener, |req: http::Request<hyper::body::Incoming>| {
         let names: Vec<_> = req.headers().keys().map(|k| k.to_string()).collect();
-        async move { nanovm::server::ok_json(serde_json::json!(names)) }
+        async move { ok_json(serde_json::json!(names)) }
     }));
     let records = Arc::new(parking_lot::Mutex::default());
     let proxy = proxied(echo, doh(records.clone()).await).await;
@@ -3091,7 +3112,7 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
                 spans.lock().extend(ExportTraceServiceRequest::decode(body).unwrap().resource_spans
                     .into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut cfg = node_cfg("front_door_events", 8);
@@ -3106,7 +3127,8 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = listener.local_addr().unwrap();
-    let service = tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+    let publish = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let service = tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener, publish));
     let missing = format!("{}@sha256:{}", counter.split_once('@').unwrap().0, "0".repeat(64));
     let cases = [
         (node, "x", "/obj/", String::new(), 400),
@@ -3211,7 +3233,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
                 logs.lock().extend(collector::logs::v1::ExportLogsServiceRequest::decode(body).unwrap()
                     .resource_logs.into_iter().flat_map(|r| r.scope_logs).flat_map(|s| s.log_records));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3226,7 +3248,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         async move {
             arrived.send(req.uri().path().to_owned()).await.unwrap();
             gate.acquire().await.unwrap().forget();
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut app = app("hostile");
@@ -3312,7 +3334,7 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
                 return nanovm::object::error_response(503, "collector-down", "");
             }
             received.lock().push((path, body));
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut cfg = node_cfg("jailed_workers_export_otel_without_guest_network_access", 8);

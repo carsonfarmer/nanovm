@@ -359,37 +359,35 @@ impl Journal {
     /// Sync both directories before invalidating any undo record: a crash
     /// must see either the restored target or the undo that restores it.
     pub fn restore(&mut self, slot: &Path, to: &Path, bytes: u64) -> std::io::Result<()> {
-        let t0 = Instant::now();
-        let result = (|| {
+        self.or_poison(|j| {
             std::fs::rename(slot, to)?;
             sync(to.parent().expect("volume entry"))?;
-            sync(&self.dir)?;
-            self.held.1 -= bytes;
+            sync(&j.dir)?;
+            j.held.1 -= bytes;
             Ok(())
-        })();
-        self.obj.uncharge(t0.elapsed());
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
+        })
     }
 
     /// The failed rename's record must not act on a later reuse of either
     /// name. Replace only its tag, preserving framing and other concurrent
     /// operations' records. Cancelled records still consume log budget.
     pub fn cancel_rename(&mut self, at: u64) -> std::io::Result<()> {
-        let t0 = Instant::now();
-        let result = (|| {
-            let log = File::options().write(true).open(self.dir.join(LOG))?;
+        self.or_poison(|j| {
+            let log = File::options().write(true).open(j.dir.join(LOG))?;
             log.write_all_at(&[5], at + 8)?;
             #[cfg(test)]
             tests::sync_point()?;
             log.sync_data()
-        })();
+        })
+    }
+
+    /// Runs `f`, whose waits for the disk aren't charged as CPU; if it
+    /// fails, the journal needs recovery.
+    fn or_poison(&mut self, f: impl FnOnce(&mut Self) -> std::io::Result<()>) -> std::io::Result<()> {
+        let t0 = Instant::now();
+        let result = f(self);
         self.obj.uncharge(t0.elapsed());
-        if result.is_err() {
-            self.poisoned = true;
-        }
+        self.poisoned |= result.is_err();
         result
     }
 
@@ -534,7 +532,6 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
         // SAFETY: written from an `OsStr`'s encoded bytes.
         Some(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes(log)?) }.into())
     }
-    let mut out = vec![];
     let next = |log: &mut &[u8]| -> Option<Undo> {
         Some(match bytes(log)?[..] {
             [0] => Undo::Size(path(log)?, num(log)?),
@@ -550,13 +547,11 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
             _ => return None,
         })
     };
-    loop {
+    std::iter::from_fn(|| {
         let at = (len - log.len()) as u64;
-        match next(&mut log) {
-            Some(u) => out.push((at, u)),
-            None => return out,
-        }
-    }
+        Some((at, next(&mut log)?))
+    })
+    .collect()
 }
 
 /// Adds `r`, disjoint from the sorted, disjoint `ranges`, merged with the
@@ -592,10 +587,11 @@ fn sync(p: &Path) -> std::io::Result<()> {
     File::open(p)?.sync_all()
 }
 
-/// Syncs `p` unless a later change removed it.
+/// Syncs `p` unless a later change removed it (or made a file of a
+/// directory it was in).
 fn sync_if_there(p: &Path) -> std::io::Result<()> {
     match sync(p) {
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(()),
         r => r,
     }
 }
@@ -682,6 +678,21 @@ mod tests {
         if let Some((slot, bytes)) = replaced {
             j.discard_created(&slot, bytes).unwrap();
         }
+    }
+
+    /// A path whose directory became a file before the commit is gone, as
+    /// a removed one is: it isn't synced, and the commit succeeds (N-130).
+    #[test]
+    fn a_path_under_what_became_a_file_commits() {
+        let v = volume();
+        let mut j = open(&v);
+        // A directory made in a missing one (its creation then fails), and
+        // a file made where the missing one would be.
+        j.creating(&v.join("n/m")).unwrap();
+        j.creating(&v.join("n")).unwrap();
+        std::fs::write(v.join("n"), "x").unwrap();
+        j.commit().unwrap();
+        j.check().unwrap();
     }
 
     thread_local! {
