@@ -1,12 +1,13 @@
 //! A/B of JavaScript apps against the Rust counter guest: cold start, warm
-//! serial requests, writes, and memory per live object. Variants run
+//! serial requests, writes, and memory per live object (RSS, and private:
+//! what the objects don't share). Variants run
 //! alternately, round after round; CPU time per request (the whole
 //! process's user+sys over the phase) is the number to trust on a busy
 //! machine.
 //!
 //!     scripts/build-guests.sh
 //!     cargo run --release --example js-bench -- [--rounds 3] [--cold 200] [--warm 3000] \
-//!         [name=path.wasm …]
+//!         [--posts 600] [name=path.wasm …]
 //!
 //! Without `name=path` arguments it compares `guests/…/counter.wasm` with
 //! `js/target/counter.wasm` (js/examples/counter.js). Both serve
@@ -31,6 +32,15 @@ static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
+}
+
+/// Bytes mapped by this process alone (`Private_Clean` + `Private_Dirty`).
+/// Unlike RSS it doesn't count again, for every instance that reads them,
+/// the pages of a component's memory image that instances share.
+fn private_bytes() -> u64 {
+    let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+    let kb = |name: &str| rollup.lines().find_map(|l| l.strip_prefix(name)?.trim().strip_suffix(" kB")?.parse::<u64>().ok());
+    (kb("Private_Clean:").unwrap_or(0) + kb("Private_Dirty:").unwrap_or(0)) * 1024
 }
 
 /// Process CPU time (user + sys).
@@ -87,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map_or(default, |v| v.parse().unwrap())
     };
     let (rounds, cold, warm) = (flag("--rounds", 3), flag("--cold", 200), flag("--warm", 3000));
+    let posts = flag("--posts", warm / 5);
     let mut variants: Vec<(String, PathBuf)> = args
         .iter()
         .filter_map(|a| a.split_once('='))
@@ -99,26 +110,27 @@ async fn main() -> anyhow::Result<()> {
         ];
     }
     let wasms: Vec<Vec<u8>> = variants.iter().map(|(_, p)| std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))).collect();
-    println!("rounds {rounds} · {cold} cold starts · {warm} warm GETs, {} POSTs · serial, one client", warm / 5);
-    println!("{:<8} {:>9} {:>22} {:>22} {:>22} {:>10}", "", "load ms", "cold p50/p99 · cpu", "GET p50/p99 · cpu", "POST p50/p99 · cpu", "KB/object");
+    println!("rounds {rounds} · {cold} cold starts · {warm} warm GETs, {posts} POSTs · serial, one client");
+    println!("{:<8} {:>9} {:>22} {:>22} {:>22} {:>16}", "", "load ms", "cold p50/p99 · cpu", "GET p50/p99 · cpu", "POST p50/p99 · cpu", "KB/object rss/priv");
     for round in 0..rounds {
         for ((name, _), wasm) in variants.iter().zip(&wasms) {
             let (node, load) = node(name, wasm, cold + 8)?;
             run(&node, "GET", "/", 1, None, 1, |_| "warmup".into()).await;
-            let rss0 = rss_bytes();
+            let (rss0, priv0) = (rss_bytes(), private_bytes());
             let (c, c_cpu) = phase(&node, "GET", "/", cold, |i| format!("c{i}")).await;
             let kb = (rss_bytes().saturating_sub(rss0)) as f64 / cold as f64 / 1024.0;
+            let priv_kb = (private_bytes().saturating_sub(priv0)) as f64 / cold as f64 / 1024.0;
             let (g, g_cpu) = phase(&node, "GET", "/", warm, |_| "w".into()).await;
-            let (p, p_cpu) = phase(&node, "POST", "/incr", warm / 5, |_| "w".into()).await;
+            let (p, p_cpu) = phase(&node, "POST", "/incr", posts, |_| "w".into()).await;
             let cell = |r: &Run, cpu: Duration| format!("{:.2}/{:.2} · {:.0}µs", r.pct(0.5), r.pct(0.99), cpu.as_secs_f64() * 1e6);
             println!(
-                "{:<8} {:>9.0} {:>22} {:>22} {:>22} {:>10.0}   (round {})",
+                "{:<8} {:>9.0} {:>22} {:>22} {:>22} {:>16}   (round {})",
                 name,
                 load.as_secs_f64() * 1e3,
                 cell(&c, c_cpu),
                 cell(&g, g_cpu),
                 cell(&p, p_cpu),
-                kb,
+                format!("{kb:.0}/{priv_kb:.0}"),
                 round + 1
             );
             node.shutdown().await;
