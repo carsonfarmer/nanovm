@@ -393,6 +393,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** found by the cold2 workstream. A worker that is killed, retired or switched leaves one `/tmp` directory per live instance (N-50 keeps them for reuse). The next worker's start removed them all before serving, at about 3 ms of wall time each on a disk mounted with `discard` (N-50): its first request waited 0.1–0.6 s after 200 objects and 1.0–1.9 s after 1,000.
 - **Reproduced:** yes (phase marks in the worker; `notes/cold2.md`)
 - **Status:** fixed in <commit> (empty ones are handed out again, used ones removed): first request after 1,000 objects 1,211 → 51 ms
+
+### N-151 (efficiency): every app start spawned a process and built its engine on the request's path
+- **Where:** `supervisor.rs` (`start`, `worker_main`), wasmtime's pooling allocator
+- **Scenario:** found by the cold2 workstream (W-29). A start (an idle app retired for another, a crash, a version switch) forked the supervisor, exec'd the 49 MB binary (dynamic relocation and glibc start-up: 3.4 ms of CPU) and built the engine: 7 ms, nearly all of it wasmtime creating the stack pool, one `mprotect` per stack slot (`2 × (max_live_objects + 32)` of them, so it grows with the node). Of a 21 ms restart, 11 ms was this, none of it app-specific.
+- **Reproduced:** yes (phase marks and perf; `notes/cold2.md`)
+- **Status:** fixed in <commit> (a worker is spawned ahead, builds its engine from the node's config, and waits for its app before its jail): restart 21.5 → 10.0 ms, LRU retirement 34 → 18 ms
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

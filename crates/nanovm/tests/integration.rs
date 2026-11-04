@@ -987,6 +987,30 @@ async fn killed_worker_is_restarted_and_keeps_its_volumes() {
     assert_ne!(v["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap(), pid);
 }
 
+/// A start takes a worker spawned ahead of need, which has built its engine
+/// and waits for its app (that was 11 of a restart's 21 ms), and the next
+/// one is spawned after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn workers_are_spawned_ahead() {
+    let (_sup, addr) = supervised("workers_are_spawned_ahead").await;
+    let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
+    // In clock ticks since boot, as /proc has process start times.
+    let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let now = || std::fs::read_to_string("/proc/uptime").unwrap().split(' ').next().unwrap().parse::<f64>().unwrap() * tck;
+    let started = |pid: u64| {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        stat.rsplit(") ").next().unwrap().split(' ').nth(19).unwrap().parse::<f64>().unwrap()
+    };
+    for app in [&counter, &hostile] {
+        // Ticks are 10 ms; a spare is spawned within a few.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let asked = now();
+        assert_eq!(app_get(addr, app, "/k/").await.0, 200);
+        let pid = stats_json(addr).await["workers"][worker(app).as_str()]["pid"].as_u64().unwrap();
+        assert!(started(pid) < asked, "{app}'s worker was spawned when it was asked for");
+    }
+}
+
 /// Runs `jail_probe` in a child process (a jail cannot be left), then checks
 /// what the jail let it do.
 #[cfg(target_os = "linux")]
@@ -1008,7 +1032,10 @@ fn jail_blocks_escapes() {
         let addr = std::os::unix::net::SocketAddr::from_abstract_name(&service).unwrap();
         std::os::unix::net::UnixDatagram::bind_addr(&addr).unwrap()
     };
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut probe = std::process::Command::new(std::env::current_exe().unwrap());
+    // Its own process group, so the signals below reach its forked child.
+    std::os::unix::process::CommandExt::process_group(&mut probe, 0);
+    let child = probe
         .args(["--exact", "jail_probe", "--nocapture", "--test-threads", "1"])
         .env("NANOVM_JAIL_PROBE", &dir)
         .env("NANOVM_JAIL_PROBE_SERVICE", &service)
@@ -1020,9 +1047,9 @@ fn jail_blocks_escapes() {
     // job control would: the kernel resumes the sleep via restart_syscall.
     std::thread::sleep(Duration::from_millis(150));
     unsafe {
-        libc::kill(child.id() as i32, libc::SIGSTOP);
+        libc::kill(-(child.id() as i32), libc::SIGSTOP);
         std::thread::sleep(Duration::from_millis(20));
-        libc::kill(child.id() as i32, libc::SIGCONT);
+        libc::kill(-(child.id() as i32), libc::SIGCONT);
     }
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1060,12 +1087,29 @@ fn jail_blocks_escapes() {
 }
 
 /// The jailed half of `jail_blocks_escapes`; a no-op when run directly.
+/// The jail takes only a process with one thread, and the test harness has
+/// two, so it runs in a forked child.
 #[cfg(target_os = "linux")]
 #[test]
 fn jail_probe() {
     let Some(dir) = std::env::var_os("NANOVM_JAIL_PROBE").map(PathBuf::from) else {
         return;
     };
+    let pid = unsafe { libc::fork() };
+    if pid != 0 {
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the probe failed: {status}");
+        return;
+    }
+    let probed = std::panic::catch_unwind(|| jailed(&dir));
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    unsafe { libc::_exit(if probed.is_ok() { 0 } else { 1 }) }
+}
+
+#[cfg(target_os = "linux")]
+fn jailed(dir: &Path) {
     let root = unsafe { libc::geteuid() } == 0;
     nanovm::jail::Jail {
         uid: root.then_some(200_099),
@@ -1099,7 +1143,7 @@ fn jail_probe() {
         }
         report("fork", sys(pid as i64));
         report("exec", std::process::Command::new("/bin/true").status().is_ok());
-        // Raw: glibc's setuid broadcasts to every thread of the test harness.
+        // Raw: glibc's setuid broadcasts to every thread of the process.
         report("setuid_root", sys(libc::syscall(libc::SYS_setuid, 0)) && libc::getuid() == 0);
         report("ptrace", sys(libc::ptrace(libc::PTRACE_ATTACH, 1, 0, 0)));
         report("kill_init", sys(libc::kill(1, 0) as i64));

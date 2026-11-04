@@ -10,12 +10,13 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use wasmtime::Engine;
+use wasmtime::component::Linker;
 
 use crate::app::App;
 use crate::config::{AppConfig, NodeConfig};
 use crate::egress::Upstream;
 use crate::metrics::Metrics;
-use crate::object::{self, Job, ObjShared, Phase, RespBody, error_response};
+use crate::object::{self, Job, ObjShared, ObjState, Phase, RespBody, error_response};
 
 /// App, object and channel names: `[A-Za-z0-9_.-]{1,128}`, not starting
 /// with `.`.
@@ -84,10 +85,24 @@ impl Node {
     /// must, before it jails itself).
     pub fn new(cfg: NodeConfig, app: &AppConfig, wasm: &[u8], upstream: Option<Upstream>) -> anyhow::Result<Arc<Node>> {
         let engine = crate::engine::build(&cfg)?;
-        crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
+        Node::with_engine(engine, &linker, cfg, app, wasm, upstream)
+    }
+
+    /// [`Node::new`] with the engine and linker `engine::build` and
+    /// `app::linker` made for `cfg`, which a worker makes before it is
+    /// given its app.
+    pub fn with_engine(
+        engine: Engine,
+        linker: &Linker<ObjState>,
+        cfg: NodeConfig,
+        app: &AppConfig,
+        wasm: &[u8],
+        upstream: Option<Upstream>,
+    ) -> anyhow::Result<Arc<Node>> {
+        crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
-        let app = Arc::new(App::load(&engine, &linker, &cfg, app, wasm, upstream)?);
+        let app = Arc::new(App::load(&engine, linker, &cfg, app, wasm, upstream)?);
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
         let node = Arc::new(Node {
