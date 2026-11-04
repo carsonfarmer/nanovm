@@ -237,6 +237,25 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **From source:** after sending a successful response, a failed final commit marks the request span as error but discards the I/O error and supplies no `error.type` or failing-phase classification. The initial commit has a `commit-failed` classification; the final one should be equally diagnosable without changing the already-sent HTTP status.
 - **Status:** fixed in the focused W-2 continuation: retain the I/O result, record `post-return-commit-failed` and a bounded correlated diagnostic, preserve HTTP status. A gated test-only component outside `guests/**` proves actual post-return calls/logs and fails the second commit by moving its journal log. The regression failed before the fix; the full locked suite passes. Published guests remain unchanged.
 
+### N-90: references accepted non-ASCII tags
+- **Where:** `proxy.rs` `parse` (a `_nanovm` record's `app=`), through oci-spec's `Reference`
+- **Scenario:** oci-spec's reference regex matches tags with Unicode `\w`, so `app=ghcr.io/org/app:é` parsed, although the OCI distribution spec defines a tag as `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`. Harmless (no registry serves such a tag, and the proxy answered 502 either way), but the grammar and the spec disagreed. Found by the lean pass's differential test.
+- **Reproduced:** yes (unit test against oci-spec 0.10)
+- **Status:** fixed in d485694: the runtime parses references itself, with ASCII tags
+
+### N-91 (tests): `a_node_runs_at_most_max_apps` assumes a request reaches its worker within 200 ms
+- **Where:** `tests/integration.rs`, `a_node_runs_at_most_max_apps` (the `busy(c, 600)` then `sleep(200 ms)` step)
+- **Scenario:** the test spawns a slow request to app `c`, sleeps 200 ms, and expects `c` to be busy when app `a` asks for a slot. At load average 8 to 20 (several agents compiling on 4 cores) the spawned request has not reached the worker yet, `c` looks idle, `a` takes its slot and gets 200 instead of the expected 502.
+- **Reproduced:** yes: fails alone, every time, at load average 18 to 20 on the unchanged `491e790` and on `cf/lean`; passes on an idle machine
+- **Fix:** wait until the worker reports the request in flight (or the app's `Live` is held by a request) instead of sleeping a fixed time
+- **Status:** open
+
+### N-92 (tests): `the_proxy_outlasts_idle_and_excess_connections` binds the default publish port
+- **Where:** `tests/integration.rs`, `the_proxy_outlasts_idle_and_excess_connections`
+- **Scenario:** the proxies the test starts get a free `listen` port but no `publish_listen`, so each binds the default `127.0.0.1:8444`. Any other proxy on the host (a demo, another checkout's test run) makes the test fail with `Address already in use`.
+- **Reproduced:** yes, while another agent's tests ran
+- **Status:** fixed in dd2efa4 (the test gives each proxy a free publish port)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -357,3 +376,19 @@ The checkpoints below are historical, not outstanding product decisions.
 - **Composition gate:** synchronous WIT calls cannot block on async P3 filesystem I/O, as W-1 demonstrated. Establish a valid standard-interface/ABI strategy or preload mechanism first; fewer host handlers must not come at the cost of a custom backchannel, a quota bypass or more lifecycle machinery. Report separately whether KV and config genuinely reduce host coupling.
 - **Acceptance:** run the existing KV/config integration contracts against composed providers, including KV quota/rollback cases and config isolation; inventory the host code removed and the bootstrap responsibilities retained. Compare against the current implementation and recommend keep/move independently for each.
 - **Status:** open (exploration requested by owner)
+
+### W-40: drop `parking_lot` for std's `Mutex`, and name tokio's features
+- **What:** the runtime uses `parking_lot::Mutex` only for its non-poisoning `lock()`, and tokio's `full` feature also turns on tokio's own `parking_lot` use. With std's `Mutex` (futex-based since Rust 1.62) and tokio's features listed (`rt`, `rt-multi-thread`, `net`, `time`, `sync`, `macros`, `process`, `io-util`), `parking_lot`, `parking_lot_core` and `lock_api` leave the build (3 crates; measured with `cargo tree`). Every `.lock()` in `object.rs`, `supervisor.rs`, `quota.rs`, `egress.rs`, `ws.rs`, `proxy.rs` and `table.rs` changes, so it waits for the branches on those files to land. Take locks through one small helper, `.lock().unwrap_or_else(PoisonError::into_inner)`, so a panic while holding one behaves as today. Needs an A/B of CPU per request: tokio's scheduler and timer locks change too.
+- **Status:** open (lean pass; not done because it touches files other branches own)
+
+### W-41: one helper for the egress spans and the permit-holding body
+- **What:** in `egress.rs`, the `http.client` path (`send_request`) and `call` each set the same `http.request.method` and `url.path` attributes with the same truncation, and each wraps the response body in the same `map_frame(move |f| { let _ = &permit; f })` to tie the outbound permit to the body. One function for each would remove about ten lines and keep the two paths from drifting.
+- **Status:** open (lean pass; `egress.rs` belonged to the sec branch this round)
+
+### W-42: one TLS trust store for the node's own clients
+- **What:** guest egress verifies servers against the compiled-in `webpki-roots`, while the registry client and the proxy's DNS-over-HTTPS and registry calls use reqwest's `rustls` feature, which verifies against the host's certificate store through `rustls-platform-verifier`. Giving those clients a rustls `ClientConfig` built from `webpki-roots` (reqwest's `tls_backend_preconfigured`, as `egress::TLS` does) would make every TLS decision independent of the host's `/etc/ssl` and drop `rustls-platform-verifier`, `rustls-native-certs` and `openssl-probe`. It stops honouring CAs an operator installed, so it is the owner's call; registries must be on public addresses anyway.
+- **Status:** open (owner decision)
+
+### W-43: decide which wasm proposals guests may use
+- **What:** wasmtime's `gc`, `threads` and `stack-switching` cargo features decide whether guests may use GC types and exceptions, shared memories and stack switching. They are on because they are wasmtime's defaults, not by decision; the lean pass kept them, since turning one off changes which components load. If the node doesn't want them, dropping them removes their runtime code from every worker binary (GC heaps are allocated lazily, so there is no reservation to win back). Measure binary size and cold starts before deciding.
+- **Status:** open (owner decision)
