@@ -198,7 +198,8 @@ That is the repository and the tag deployed, each identity whose signature is ac
 - looks each host or tag up once however many requests ask at once, keeps a failed lookup's answer for 5 s rather than asking again, and remembers at most 10,000 of each;
 - drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards HTTP requests; it holds WebSockets itself and forwards their events;
 - speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
-- gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too).
+- gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too);
+- refuses a request head over 64 KiB (431), as every hop does (node, worker links, egress responses).
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
@@ -221,7 +222,7 @@ The node trusts these headers because only the proxy can reach it, and strips th
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
 2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
-3. **Then the worker.** The app's limits are clamped to the operator's `limits`, and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
+3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB header map on the host: 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
 
