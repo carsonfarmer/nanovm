@@ -163,8 +163,11 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
     let threads = cfg.front_threads();
     let t0 = std::time::Instant::now();
     let rt = runtime()?;
+    // Its own pool of links (the one after the front threads'): a link it
+    // opened, such as a readiness probe's, is driven by its reactor.
     let control = tokio::runtime::Builder::new_multi_thread().worker_threads(1)
-        .thread_name("nanovm-control").enable_all().build()?;
+        .thread_name("nanovm-control").on_thread_start(move || nanovm::link::set_thread(threads))
+        .enable_all().build()?;
     let sup = control.block_on(async { Supervisor::new(cfg, std::env::current_exe()?, threads) })?;
     let first = rt.block_on(async { listener(addr) })?;
     eprintln!("nanovm: ready in {:.0?} on http://{addr}/", t0.elapsed());

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use opentelemetry::trace::Span as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use wasmtime::component::{Accessor, ResourceTable, ResourceTableError};
-use wasmtime::{ResourceLimiter, Store, Trap, UpdateDeadline};
+use wasmtime::{AsContextMut, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::p3::bindings::Service;
@@ -86,6 +86,8 @@ pub struct ObjShared {
     /// The objects its calls are waiting on, one entry per call.
     pub waiting_on: Mutex<Vec<Arc<str>>>,
     pub context: Mutex<opentelemetry::Context>,
+    /// Set by the epoch callback when it makes the guest yield.
+    yielding: AtomicBool,
 }
 
 impl ObjShared {
@@ -406,8 +408,10 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
             st.cpu_exceeded = true;
             return Err(wasmtime::format_err!("cpu budget exceeded"));
         }
-        // Hand back the lane at every tick so heavy requests take turns.
+        // At every tick, let the other tasks on this thread run, and hand
+        // back the lane so heavy requests take turns.
         st.shared.lane.lock().take();
+        st.shared.yielding.store(true, Relaxed);
         if used < HEAVY_AFTER_NS {
             return Ok(UpdateDeadline::Yield(1));
         }
@@ -415,6 +419,16 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
         Ok(UpdateDeadline::YieldCustom(
             1,
             Box::pin(async move {
+                // A free lane is taken at once, without a yield.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if std::mem::replace(&mut yielded, true) {
+                        return Poll::Ready(());
+                    }
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                })
+                .await;
                 if let Ok(p) = heavy.acquire_owned().await {
                     *shared.lane.lock() = Some(p);
                 }
@@ -573,6 +587,11 @@ async fn serve(
                 };
                 *shared.context.lock() = job.context.clone();
                 shared.begin_request();
+                // The next tick, not one that passed while the object was
+                // idle: a stale deadline made every request yield to the
+                // executor at its first instruction, and Tokio wakes an idle
+                // thread for a task that yields.
+                acc.with(|mut s| s.as_context_mut().set_epoch_deadline(1));
                 let abort = Arc::new(AtomicBool::new(false));
                 *pending.lock() = Some(Pending {
                     reply: Some(job.reply),
@@ -662,8 +681,10 @@ async fn serve(
         let mut fut = pin!(shared.charged(&node.metrics, run));
         let mut timer = pin!(tokio::time::sleep(Duration::from_secs(3600)));
         let mut armed = None;
+        let wake = Arc::new(SelfWake { tick_ns: node.cfg.epoch_tick_ms * 1_000_000, ..Default::default() });
+        let waker = Waker::from(wake.clone());
         poll_fn(|cx| {
-            if let Poll::Ready(r) = fut.as_mut().poll(cx) {
+            if let Poll::Ready(r) = wake.poll(cx, &waker, &shared.yielding, fut.as_mut()) {
                 return Poll::Ready(Ok(r.and_then(|r| r)));
             }
             let t1 = now_ns();
@@ -711,6 +732,70 @@ async fn serve(
     }
     drop(store);
     exit
+}
+
+/// The store's waker. Wasmtime wakes the actor during its own poll a few
+/// times in an ordinary request (the guest returning, its task ending), and
+/// Tokio takes a task that wakes itself for one that yields: it queues it
+/// behind the others and wakes an idle thread to steal it, so each request
+/// woke threads for nothing and moved between them. A wake during the poll
+/// polls again at once instead.
+///
+/// So a poll holds its thread at most about a tick, as a guest that only
+/// computes does: the epoch callback's yield always reaches Tokio, and so
+/// does any wake once the poll has run for a tick, which bounds a loop of
+/// self-wakes that runs no guest code too. A guest that wakes itself in a
+/// tight loop (each wake goes back to the host, which runs it again) is
+/// charged for it and killed at its CPU budget like a spinner.
+#[derive(Default)]
+struct SelfWake {
+    /// `IDLE`, `POLLING`, or `WOKEN` during the poll.
+    state: AtomicU8,
+    task: Mutex<Option<Waker>>,
+    tick_ns: u64,
+}
+
+const IDLE: u8 = 0;
+const POLLING: u8 = 1;
+const WOKEN: u8 = 2;
+
+impl SelfWake {
+    fn poll<F: Future>(&self, cx: &mut Context<'_>, waker: &Waker, yielding: &AtomicBool, mut fut: Pin<&mut F>) -> Poll<F::Output> {
+        use std::sync::atomic::Ordering::SeqCst;
+        {
+            let mut task = self.task.lock();
+            if !task.as_ref().is_some_and(|t| t.will_wake(cx.waker())) {
+                *task = Some(cx.waker().clone());
+            }
+        }
+        let start = now_ns();
+        loop {
+            self.state.store(POLLING, SeqCst);
+            let poll = fut.as_mut().poll(&mut Context::from_waker(waker));
+            if poll.is_ready() || self.state.swap(IDLE, SeqCst) != WOKEN {
+                return poll;
+            }
+            if yielding.swap(false, Relaxed) || now_ns() - start >= self.tick_ns {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+impl Wake for SelfWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if let Err(IDLE) = self.state.compare_exchange(POLLING, WOKEN, SeqCst, SeqCst)
+            && let Some(task) = &*self.task.lock()
+        {
+            task.wake_by_ref();
+        }
+    }
 }
 
 fn classify(store: &Store<ObjState>, e: &wasmtime::Error) -> Exit {

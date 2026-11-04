@@ -374,6 +374,29 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
     );
 }
 
+/// A guest that has used a tick lets the other requests on its thread run:
+/// on a one-thread runtime, a short request started beside a spinning one
+/// finishes long before the spinner runs out of CPU.
+#[tokio::test(flavor = "current_thread")]
+async fn a_spinner_yields_its_thread_at_each_tick() {
+    let node = node("a_spinner_yields_its_thread_at_each_tick", "hostile", 8);
+    assert_eq!(get(&node, "canary", "/").await.status, 200);
+    let t0 = Instant::now();
+    // Spawned: the test's own future runs only once the queue is empty.
+    let timed = |id: &'static str, path: &'static str| {
+        let node = node.clone();
+        tokio::spawn(async move { (get(&node, id, path).await, t0.elapsed()) })
+    };
+    let (spinner, canary) = (timed("spinner", "/spin"), timed("canary", "/"));
+    let ((spun, spun_at), (canary, canary_at)) = (spinner.await.unwrap(), canary.await.unwrap());
+    assert_eq!(spun.error.as_deref(), Some("cpu"), "{}", spun.body);
+    assert_eq!(canary.status, 200, "{}", canary.body);
+    assert!(
+        canary_at < spun_at && canary_at < Duration::from_millis(50),
+        "the canary took {canary_at:?}, the spinner {spun_at:?}"
+    );
+}
+
 // ---- filesystem layout and quotas -------------------------------------
 
 /// `hostile` with room for heavy file work: writes and creates run inline
@@ -3207,6 +3230,38 @@ async fn guest_header_maps_are_bounded_by_the_memory_limit() {
     assert_eq!(get("/c/headers?n=1&kb=100", 0).await.0, 500, "a map over 64 KiB");
     assert_eq!(get("/d/headers?n=0", 100 << 10).await.0, 431, "a head over 64 KiB");
     assert_eq!(get("/e/headers?n=100&kb=60", 50 << 10).await, (200, "100".into()), "within the limits");
+}
+
+/// A guest that wakes itself in a tight loop (each wake goes back to the
+/// host, which runs it again at once) holds its thread at most a tick at a
+/// time, as a spinner does: on a one-thread runtime a neighbour's requests
+/// get through quickly, and it is killed at its CPU budget.
+#[tokio::test(flavor = "current_thread")]
+async fn a_self_waking_guest_yields_its_thread_at_each_tick() {
+    let mut app = app("hostile");
+    app.limits.cpu_ms = 500;
+    app.limits.request_timeout_ms = 5000;
+    let node = Node::new(node_cfg("a_self_waking_guest", 8), &app, &probe(), None).unwrap();
+    assert_eq!(get(&node, "neighbour", "/callee").await.status, 200);
+    let t0 = Instant::now();
+    // Spawned: the test's own future runs only once the queue is empty.
+    let n = node.clone();
+    let waker = tokio::spawn(async move { (get(&n, "waker", "/selfwake").await, t0.elapsed()) });
+    let neighbour = tokio::spawn(async move {
+        let mut slowest = Duration::ZERO;
+        for _ in 0..5 {
+            let r = get(&node, "neighbour", "/callee").await;
+            assert_eq!(r.status, 200, "{}", r.body);
+            slowest = slowest.max(r.elapsed);
+        }
+        (slowest, t0.elapsed())
+    });
+    let ((woke, woke_at), (slowest, neighbour_at)) = (waker.await.unwrap(), neighbour.await.unwrap());
+    assert_eq!(woke.error.as_deref(), Some("cpu"), "{}", woke.body);
+    assert!(
+        neighbour_at < woke_at && slowest < Duration::from_millis(50),
+        "the neighbour's slowest request took {slowest:?}, all five {neighbour_at:?}; the waker ran {woke_at:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
