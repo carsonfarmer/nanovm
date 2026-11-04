@@ -32,6 +32,7 @@ jobs:
           workspaces: |
             . -> target
             guests -> target
+            js -> target
             components/sqlite -> ../../target/sqlite
       - name: Prepare host limits
         run: sudo sysctl -w vm.max_map_count=1048576
@@ -47,6 +48,8 @@ jobs:
           PY
       - name: Build guests locally (no publishing)
         run: cargo build --locked --release --target wasm32-wasip2 --manifest-path guests/Cargo.toml
+      - name: Build the JavaScript test app (no publishing)
+        run: js/build.sh js/tests/app.js js/target/test-app.wasm
       - name: Check production build without dev features
         run: cargo check --locked -p nanovm --bin nanovm
       - name: Run unit and integration tests
