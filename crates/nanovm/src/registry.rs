@@ -22,7 +22,6 @@ use std::time::Duration;
 
 use anyhow::{Context, bail, ensure};
 use http::HeaderMap;
-use oci_spec::distribution::Reference;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sigstore_trust_root::{SIGSTORE_PRODUCTION_TRUSTED_ROOT, TrustedRoot};
@@ -102,26 +101,8 @@ impl AppRef {
     pub fn from_headers(h: &HeaderMap) -> anyhow::Result<Option<AppRef>> {
         let get = |name| h.get(name).map(|v| v.to_str().with_context(|| format!("{name} is not text")));
         let Some(app) = get(APP_HEADER) else { return Ok(None) };
-        // OCI parsing is pure but expensive. Cache up to 16 references of at
-        // most 1 KiB per calling thread, not policy, host or authorization.
-        // Own the reference text, not a slice retaining an HTTP buffer.
-        thread_local! {
-            static REFERENCES: std::cell::RefCell<std::collections::VecDeque<(String, Reference)>> = const {
-                std::cell::RefCell::new(std::collections::VecDeque::new())
-            };
-        }
-        let app = app?;
-        let reference = REFERENCES.with(|cache| -> anyhow::Result<Reference> {
-            let mut cache = cache.borrow_mut();
-            if let Some((_, r)) = cache.iter().find(|(s, _)| s == app) { return Ok(r.clone()) }
-            let reference: Reference = app.parse()?;
-            if app.len() <= 1024 {
-                if cache.len() == 16 { cache.pop_front(); }
-                cache.push_back((app.to_owned(), reference.clone()));
-            }
-            Ok(reference)
-        }).context(APP_HEADER)?;
-        let digest = reference.digest().context("nanovm-app must name a digest")?.to_string();
+        let reference: Reference = app?.parse().context(APP_HEADER)?;
+        let digest = reference.digest.clone().context("nanovm-app must name a digest")?;
         check_digest(&digest)?;
         let trust = get(TRUST_HEADER)
             .context("nanovm-trust is required")??
@@ -153,9 +134,9 @@ impl AppRef {
 /// controls a host chooses which version of a repository it runs, so every
 /// host gets the repository's app (its volumes, uid and worker) to itself.
 pub fn app_name(host: &str, r: &Reference) -> String {
-    let registry = r.registry().to_ascii_lowercase();
+    let registry = r.registry.to_ascii_lowercase();
     let registry = registry.strip_suffix(":443").unwrap_or(&registry);
-    let repo = format!("{host} {registry}/{}", r.repository()).trim_start().to_string();
+    let repo = format!("{host} {registry}/{}", r.repository).trim_start().to_string();
     let safe = |c: char| if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') { c } else { '_' };
     let readable: String = repo.chars().map(safe).take(100).collect();
     format!("{readable}-{}", &format!("{:x}", Sha256::digest(&repo))[..16])
@@ -170,6 +151,74 @@ fn check_digest(d: &str) -> anyhow::Result<()> {
         "bad digest {d:?}"
     );
     Ok(())
+}
+
+/// An image reference, `[registry/]repository[:tag][@digest]`, read as Docker
+/// and OCI tools read it (distribution's grammar and normalization): a first
+/// part without `.` or `:` that isn't `localhost` is not a registry but the
+/// start of a repository on `docker.io`, where a one-part repository is in
+/// `library/`; with neither tag nor digest, the tag is `latest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    pub registry: String,
+    pub repository: String,
+    pub tag: Option<String>,
+    pub digest: Option<String>,
+}
+
+impl std::str::FromStr for Reference {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Reference> {
+        let (rest, digest) = s.split_once('@').map_or((s, None), |(r, d)| (r, Some(d)));
+        let (name, tag) = match rest.rsplit_once(':') {
+            Some((name, tag)) if !tag.contains('/') => (name, Some(tag)),
+            _ => (rest, None),
+        };
+        // A repository's parts are lowercase alphanumeric runs joined by `.`,
+        // `_`, `__` or dashes; a registry is labels and an optional port.
+        let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+        let sep = |s: &str| matches!(s, "" | "." | "_" | "__") || s.bytes().all(|b| b == b'-');
+        let path = |p: &&str| p.starts_with(alnum) && p.ends_with(alnum) && p.split(alnum).all(sep);
+        let label = |l: &str| {
+            let inner = l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+            inner && !l.is_empty() && !l.starts_with('-') && !l.ends_with('-')
+        };
+        let domain = |d: &str| {
+            let (host, port) = d.split_once(':').map_or((d, None), |(h, p)| (h, Some(p)));
+            host.split('.').all(label) && port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let parts: Vec<&str> = name.split('/').collect();
+        let named = parts.iter().all(path) || parts.len() > 1 && domain(parts[0]) && parts[1..].iter().all(path);
+        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let tagged = tag.is_none_or(|t| {
+            t.len() <= 128 && t.bytes().next().is_some_and(word) && t.bytes().all(|b| word(b) || b == b'.' || b == b'-')
+        });
+        let digested = digest.is_none_or(|d| {
+            let (algorithm, hex) = d.split_once(':').unwrap_or_default();
+            let lengths = [("sha256", 64), ("sha384", 96), ("sha512", 128)];
+            lengths.contains(&(algorithm, hex.len())) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        });
+        ensure!(named && tagged && digested, "invalid reference format");
+        let (registry, repository) = match name.split_once('/') {
+            Some((r, rest)) if r.contains(['.', ':']) || r == "localhost" => (r, rest.to_string()),
+            _ => ("docker.io", name.to_string()),
+        };
+        let registry = if registry == "index.docker.io" { "docker.io" } else { registry };
+        let library = registry == "docker.io" && !repository.contains('/');
+        let repository = if library { format!("library/{repository}") } else { repository };
+        ensure!(repository.len() <= 255, "repository name must not be more than 255 characters");
+        let tag = tag.or(digest.is_none().then_some("latest")).map(Into::into);
+        Ok(Reference { registry: registry.into(), repository, tag, digest: digest.map(Into::into) })
+    }
+}
+
+impl std::fmt::Display for Reference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.registry, self.repository)?;
+        self.tag.iter().try_for_each(|t| write!(f, ":{t}"))?;
+        self.digest.iter().try_for_each(|d| write!(f, "@{d}"))
+    }
 }
 
 /// An app's config blob.
@@ -363,14 +412,14 @@ impl Oci {
     /// The digest of the manifest `r`'s tag names now: its hash, so no
     /// header has to be taken on trust.
     pub async fn digest(&self, r: &Reference) -> anyhow::Result<String> {
-        let tag = r.tag().context("no tag")?;
+        let tag = r.tag.as_deref().context("no tag")?;
         let manifest = self.get(r, "manifests", tag, MANIFEST_TYPE, MAX_METADATA).await?;
         Ok(format!("sha256:{:x}", Sha256::digest(manifest.context("no such tag")?)))
     }
 
     async fn send(&self, r: &Reference, kind: &str, what: &str, accept: &str) -> anyhow::Result<reqwest::Response> {
-        let host = r.resolve_registry();
-        let mut url = reqwest::Url::parse(&format!("https://{host}/v2/{}/{kind}/{what}", r.repository()))?;
+        let host = if r.registry == "docker.io" { "index.docker.io" } else { &r.registry };
+        let mut url = reqwest::Url::parse(&format!("https://{host}/v2/{}/{kind}/{what}", r.repository))?;
         // Checked as parsed, which is how it will be connected to: `127.1`
         // is 127.0.0.1 by then.
         ensure!(url.host_str().is_some_and(|h| allowed(h, self.dev)), "registry {host} is on a private address");
@@ -494,7 +543,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(r.digest, DIGEST);
-        assert_eq!(r.reference.repository(), "acme/app");
+        assert_eq!(r.reference.repository, "acme/app");
+    }
+
+    /// References parse as distribution's grammar has them, as oci-spec
+    /// (oci-client's) parses them: the same strings accepted, into the same
+    /// parts, over its own cases, edge cases and random strings. The one
+    /// difference: tags are ASCII, as the distribution spec defines them;
+    /// oci-spec's regex also takes any Unicode word character there.
+    #[test]
+    fn references_parse_as_distribution_does() {
+        let theirs = |s: &str| {
+            let r = s.parse::<oci_client::Reference>().ok()?;
+            Some((r.registry().to_string(), r.repository().to_string(), r.tag().map(str::to_string), r.digest().map(str::to_string), r.whole()))
+        };
+        let ours = |s: &str| {
+            let r = s.parse::<Reference>().ok()?;
+            Some((r.registry.clone(), r.repository.clone(), r.tag.clone(), r.digest.clone(), r.to_string()))
+        };
+        let hex = |n: usize| "0123456789abcdefABCDEF".chars().cycle().take(n).collect::<String>();
+        let digests = [64, 63, 65, 96, 128, 32].map(|n| format!("sha256:{}", hex(n)));
+        let mut cases: Vec<String> = [
+            "busybox", "test.com:tag", "test.com:5000", "test.com/repo:tag", "test:5000/repo", "test:5000/repo:tag",
+            "lowercase:Uppercase", "sub-dom1.foo.com/bar/baz/quux:some-long-tag", "b.gcr.io/test.example.com/my-app:test.example.com",
+            "xn--n3h.com/myimage:xn--n3h.com", "foo_bar.com:8080", "foo/foo_bar.com:8080", "opensuse/leap:15.3", "localhost/x",
+            "localhost:5000", "LOCALHOST/x", "Foo/bar", "foo/Bar", "index.docker.io/x", "index.docker.io/x/y", "docker.io/x",
+            "a__b/c", "a___b/c", "a--b", "a.-b", "a._b", "-a", "a-", "a.b/c-", "h-.com/x", "-h.com/x", "h..com/x", "h.com:/x",
+            "h.com:5x/x", "h.com:5:6/x", "h.com/x:", ":t", "/x", "x/", "x//y", "x@", "@sha256:x", "x:t@", "x::t", "x:t:u",
+            "x:-t", "x:_t", "x:.t", "x:é", "x:tag/y", "héllo", "", " ", "x y", "ghcr.io:443/acme/app:1", "GHCR.IO/acme/app:1",
+        ].map(String::from).into();
+        cases.push(format!("x:{}", "t".repeat(128)));
+        cases.push(format!("x:{}", "t".repeat(129)));
+        cases.push(format!("h.com/{}", "a".repeat(255)));
+        cases.push(format!("h.com/{}", "a".repeat(256)));
+        cases.push(format!("{}", "a".repeat(247)));
+        cases.push(format!("{}", "a".repeat(248)));
+        for d in &digests {
+            cases.extend([format!("x@{d}"), format!("h.com/x:t@{d}"), format!("x@{}", d.replace("sha256", "sha512"))]);
+        }
+        cases.extend(["sha384", "sha512", "md5", "Sha256", "a+b.c-d_e"].map(|a| format!("x@{a}:{}", hex(96))));
+        cases.push(format!("x@sha512:{}", hex(128)));
+        // Random strings of pieces that make up references.
+        let pieces = ["a", "b9", "Z", ".", "_", "__", "-", ":", ":5000", "/", "@", "localhost", "docker.io", "index.docker.io",
+            "ghcr.io", "latest", &digests[0], &digests[1]];
+        let mut x = 0x2545F4914F6CDD1Du64;
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut y = x;
+            let s: String = (0..1 + y % 9).map(|_| { y /= 19; pieces[(y % pieces.len() as u64) as usize] }).collect();
+            cases.push(s);
+        }
+        let accepted = cases.iter().filter(|c| theirs(c).is_some()).count();
+        assert!(accepted > 10_000, "the cases must exercise valid references too: {accepted}");
+        for c in &cases {
+            if c.contains('é') {
+                assert!(ours(c).is_none(), "{c:?}");
+                continue;
+            }
+            assert_eq!(ours(c), theirs(c), "{c:?}");
+        }
     }
 
     /// Only `sha256:` and 64 lowercase hex digits is a digest, so none can

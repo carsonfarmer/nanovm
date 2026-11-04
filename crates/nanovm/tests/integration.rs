@@ -822,14 +822,15 @@ async fn publish_wasm(repo: &str, app: &AppConfig, wasm: Vec<u8>) -> String {
     );
     manifest.artifact_type = Some(APP_TYPE.into());
     manifest.media_type = Some(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.into());
-    let r: oci_client::Reference = format!("{}/nanovm/{repo}:latest", registry()).parse().unwrap();
+    let name = format!("{}/nanovm/{repo}:latest", registry());
+    let r: oci_client::Reference = name.parse().unwrap();
     let client = oci_client::Client::new(ClientConfig {
         protocol: ClientProtocol::Http,
         ..Default::default()
     });
     let auth = oci_client::secrets::RegistryAuth::Anonymous;
     client.push(&r, &[layer], config, &auth, Some(manifest)).await.unwrap();
-    let digest = nanovm::registry::Oci::new(true).unwrap().digest(&r).await.unwrap();
+    let digest = nanovm::registry::Oci::new(true).unwrap().digest(&name.parse().unwrap()).await.unwrap();
     format!("{}/nanovm/{repo}@{digest}", registry())
 }
 
@@ -2955,7 +2956,7 @@ async fn the_proxy_outlasts_idle_and_excess_connections() {
     let start = |name: &str| {
         let addr = port();
         let cfg = dir.join(format!("{name}.toml"));
-        let toml = format!("listen = \"{addr}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\n");
+        let toml = format!("listen = \"{addr}\"\npublish_listen = \"{}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\n", port());
         std::fs::write(&cfg, toml).unwrap();
         let cmd = format!("ulimit -n 64 && exec {} proxy --config {}", env!("CARGO_BIN_EXE_nanovm"), cfg.display());
         let child = tokio::process::Command::new("sh").args(["-c", &cmd]).kill_on_drop(true).spawn().unwrap();

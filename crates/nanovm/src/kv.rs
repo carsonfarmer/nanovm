@@ -20,6 +20,7 @@ mod bindings {
         world: "wasi:keyvalue/imports",
         imports: { default: trappable },
         with: { "wasi:keyvalue/store.bucket": super::Bucket },
+        trappable_error_type: { "wasi:keyvalue/store.error" => super::Fail },
     });
 }
 use bindings::wasi::keyvalue::{atomics, batch, store};
@@ -34,8 +35,6 @@ pub struct Bucket {
     dir: PathBuf,
 }
 
-type KvResult<T> = wasmtime::Result<Result<T, Error>>;
-
 pub fn add_to_linker(linker: &mut Linker<ObjState>) -> wasmtime::Result<()> {
     store::add_to_linker::<_, Kv>(linker, |s| s)?;
     atomics::add_to_linker::<_, Kv>(linker, |s| s)?;
@@ -49,7 +48,7 @@ impl HasData for Kv {
 }
 
 /// Why a call failed: an error the guest sees, or a trap (a bad handle).
-enum Fail {
+pub enum Fail {
     Guest(Error),
     Trap(wasmtime::Error),
 }
@@ -66,15 +65,6 @@ fn fail<T>(why: impl Into<String>) -> Result<T, Fail> {
 
 fn trap(e: ResourceTableError) -> Fail {
     Fail::Trap(e.into())
-}
-
-/// Splits a result into what the guest sees and what traps.
-fn done<T>(r: Result<T, Fail>) -> KvResult<T> {
-    match r {
-        Ok(v) => Ok(Ok(v)),
-        Err(Fail::Guest(e)) => Ok(Err(e)),
-        Err(Fail::Trap(e)) => Err(e),
-    }
 }
 
 impl ObjState {
@@ -204,30 +194,38 @@ fn check_batch(n: usize) -> Result<(), Fail> {
 }
 
 impl store::Host for &mut ObjState {
-    fn open(&mut self, identifier: String) -> KvResult<Resource<Bucket>> {
-        done(self.open_bucket(&identifier))
+    fn open(&mut self, identifier: String) -> Result<Resource<Bucket>, Fail> {
+        self.open_bucket(&identifier)
+    }
+
+    /// What the guest sees of a failure, or the trap it is.
+    fn convert_error(&mut self, e: Fail) -> wasmtime::Result<Error> {
+        match e {
+            Fail::Guest(e) => Ok(e),
+            Fail::Trap(e) => Err(e),
+        }
     }
 }
 
 impl store::HostBucket for &mut ObjState {
-    fn get(&mut self, bucket: Resource<Bucket>, key: String) -> KvResult<Option<Vec<u8>>> {
-        done(self.get_value(&bucket, &key, &mut self.memory_budget()))
+    fn get(&mut self, bucket: Resource<Bucket>, key: String) -> Result<Option<Vec<u8>>, Fail> {
+        self.get_value(&bucket, &key, &mut self.memory_budget())
     }
 
-    fn set(&mut self, bucket: Resource<Bucket>, key: String, value: Vec<u8>) -> KvResult<()> {
-        done(self.set_value(&bucket, &key, &value))
+    fn set(&mut self, bucket: Resource<Bucket>, key: String, value: Vec<u8>) -> Result<(), Fail> {
+        self.set_value(&bucket, &key, &value)
     }
 
-    fn delete(&mut self, bucket: Resource<Bucket>, key: String) -> KvResult<()> {
-        done(self.delete_value(&bucket, &key))
+    fn delete(&mut self, bucket: Resource<Bucket>, key: String) -> Result<(), Fail> {
+        self.delete_value(&bucket, &key)
     }
 
-    fn exists(&mut self, bucket: Resource<Bucket>, key: String) -> KvResult<bool> {
-        done(self.key_path(&bucket, &key).map(|p| p.is_file()))
+    fn exists(&mut self, bucket: Resource<Bucket>, key: String) -> Result<bool, Fail> {
+        self.key_path(&bucket, &key).map(|p| p.is_file())
     }
 
-    fn list_keys(&mut self, bucket: Resource<Bucket>, cursor: Option<u64>) -> KvResult<KeyResponse> {
-        done(self.list(&bucket, cursor))
+    fn list_keys(&mut self, bucket: Resource<Bucket>, cursor: Option<u64>) -> Result<KeyResponse, Fail> {
+        self.list(&bucket, cursor)
     }
 
     fn drop(&mut self, bucket: Resource<Bucket>) -> wasmtime::Result<()> {
@@ -237,33 +235,26 @@ impl store::HostBucket for &mut ObjState {
 }
 
 impl atomics::Host for &mut ObjState {
-    fn increment(&mut self, bucket: Resource<Bucket>, key: String, delta: u64) -> KvResult<u64> {
-        done(self.increment_value(&bucket, &key, delta))
+    fn increment(&mut self, bucket: Resource<Bucket>, key: String, delta: u64) -> Result<u64, Fail> {
+        self.increment_value(&bucket, &key, delta)
     }
 }
 
 impl batch::Host for &mut ObjState {
-    fn get_many(
-        &mut self,
-        bucket: Resource<Bucket>,
-        keys: Vec<String>,
-    ) -> KvResult<Vec<Option<(String, Vec<u8>)>>> {
+    fn get_many(&mut self, bucket: Resource<Bucket>, keys: Vec<String>) -> Result<Vec<Option<(String, Vec<u8>)>>, Fail> {
+        check_batch(keys.len())?;
         let mut budget = self.memory_budget();
-        done(check_batch(keys.len()).and_then(|()| {
-            keys.into_iter()
-                .map(|k| Ok(self.get_value(&bucket, &k, &mut budget)?.map(|v| (k, v))))
-                .collect()
-        }))
+        keys.into_iter().map(|k| Ok(self.get_value(&bucket, &k, &mut budget)?.map(|v| (k, v)))).collect()
     }
 
-    fn set_many(&mut self, bucket: Resource<Bucket>, key_values: Vec<(String, Vec<u8>)>) -> KvResult<()> {
-        done(check_batch(key_values.len()).and_then(|()| {
-            key_values.iter().try_for_each(|(k, v)| self.set_value(&bucket, k, v))
-        }))
+    fn set_many(&mut self, bucket: Resource<Bucket>, key_values: Vec<(String, Vec<u8>)>) -> Result<(), Fail> {
+        check_batch(key_values.len())?;
+        key_values.iter().try_for_each(|(k, v)| self.set_value(&bucket, k, v))
     }
 
-    fn delete_many(&mut self, bucket: Resource<Bucket>, keys: Vec<String>) -> KvResult<()> {
-        done(check_batch(keys.len()).and_then(|()| keys.iter().try_for_each(|k| self.delete_value(&bucket, k))))
+    fn delete_many(&mut self, bucket: Resource<Bucket>, keys: Vec<String>) -> Result<(), Fail> {
+        check_batch(keys.len())?;
+        keys.iter().try_for_each(|k| self.delete_value(&bucket, k))
     }
 }
 
@@ -579,8 +570,10 @@ mod tests {
         let rep = b.rep();
         s.table.delete(b).unwrap();
         let stale = Resource::<Bucket>::new_borrow(rep);
-        assert!(done(s.key_path(&stale, "k")).is_err());
+        let trap = s.key_path(&stale, "k").err().expect("a stale handle fails");
+        assert!(store::Host::convert_error(&mut &mut s, trap).is_err());
         let b = ok(s.open_bucket(""));
-        assert!(matches!(done(s.key_path(&b, "")), Ok(Err(Error::Other(_)))));
+        let guest = s.key_path(&b, "").err().expect("an empty key fails");
+        assert!(matches!(store::Host::convert_error(&mut &mut s, guest), Ok(Error::Other(_))));
     }
 }

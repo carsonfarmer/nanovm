@@ -305,10 +305,6 @@ impl Sockets {
             return Err((431, "the handshake's headers are too large"));
         }
 
-        if self.total.fetch_add(1, Relaxed) >= cfg.max_sockets {
-            self.total.fetch_sub(1, Relaxed);
-            return Err((503, "the proxy has max_sockets open"));
-        }
         let (tx, rx) = mpsc::unbounded_channel();
         let out = Out {
             tx,
@@ -325,6 +321,10 @@ impl Sockets {
             sockets: self.clone(),
             out: out.clone(),
         };
+        // Counted from here on: dropping `conn` uncounts it.
+        if self.total.fetch_add(1, Relaxed) >= cfg.max_sockets {
+            return Err((503, "the proxy has max_sockets open"));
+        }
         {
             let mut socks = self.socks.lock();
             if socks.len() >= cfg.max_sockets_per_app {
