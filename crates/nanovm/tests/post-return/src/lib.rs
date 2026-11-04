@@ -20,6 +20,9 @@ impl wasip3::exports::http::handler::Guest for Probe {
         if req.path() == "/callee" {
             return nanovm_sdk::Response::text("callee").into_wit();
         }
+        if req.path() == "/selfwake" {
+            return selfwake().await;
+        }
         let gate = req.query("gate").unwrap().to_owned();
         let (mut tx, rx) = wasip3::wit_stream::new();
         let (trailers, trailers_rx) = wasip3::wit_future::new(|| Ok(None));
@@ -38,6 +41,21 @@ impl wasip3::exports::http::handler::Guest for Probe {
         });
         Ok(response)
     }
+}
+
+/// `/selfwake`: three tasks that wake themselves in a tight loop, forever.
+/// Each wake hands control back to the host (`CALLBACK_CODE_YIELD`), which
+/// runs it again at once.
+async fn selfwake() -> Result<Response, ErrorCode> {
+    let spin = || async {
+        loop {
+            wasip3::wit_bindgen::yield_async().await;
+        }
+    };
+    wasip3::spawn_local(spin());
+    wasip3::spawn_local(spin());
+    spin().await;
+    unreachable!()
 }
 
 /// `/headers?n=…&kb=…`: holds `n` more header maps, for good: new ones with
