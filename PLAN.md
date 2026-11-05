@@ -454,18 +454,36 @@ namespace-scan complexity and physical amplification must inform integration.
 This proof does not include WASI directories/streams, mixed SQL workloads, storage
 fault recovery or replica export; keep the production host unchanged.
 
-**Integration gate (Q80):** `hashed-fs-integration` owns the next implementation.
+**Decision (Q84):** retain journaling. Optimized plain pages also received a real
+matched comparison: small writes improve about 3× and unique 1 MiB writes reach
+parity, but cold/recovery/churn remain 3–5× slower and replacement runtime grows
+294 lines. This rejects the present per-object redb replacement, not pages in
+principle. Continue the source-supported journal/runtime improvements from the
+other branch with independent controls. [Decision and reproduction](experiments/fs-backends/README.md#adoption-decision-retain-journaling-2026-11-05).
+
+**Historical integration gate (Q80):** `hashed-fs-integration` owns the next implementation.
 Whole-namespace orphan scans are removed (Q81), and real-file I/O failure matrices
 cover mutations and orphan recovery with shared content. A real component now proves
 stock-WASI resource mapping and guest destruction without patches. Fixed file-length
 ceilings pass exhaustion/recovery/locking tests under the unchanged cap (Q82).
 They are not allocated-block or RSS caps, nor a guarantee of full-quota availability.
-The hierarchical inode core and real WASI adapter are in progress.
+The hierarchical inode core and real WASI adapter are integrated behind temporary
+`page-fs` (Q83), not selected by default. Actual runtime comparison finds faster
+writes but worse cold starts, recovery, density and total replacement LOC. These
+are failed adoption gates, not costs to hide with storage-only benchmarks.
 Preserve directory confinement, descriptor identity, streaming bounds,
 ephemeral `/tmp` with shared quotas, and both host commit boundaries. Compare
 mixed KV/SQL/raw-file workloads through real jailed workers before switching.
 Count all replacement runtime and provider code, not only deleted journal lines;
 report latency, CPU, live-object memory, physical storage and ownership complexity.
+The review's missing database-name sync is fixed with real syscall-error coverage;
+shutdown now waits for stream/database destruction and the actual capped adapter
+retains exclusive locks in the jail. Real reader/writer/directory streams now pass
+descriptor-drop, acceptance, quota-reclamation and rejection/restart coverage;
+premature inode release fails the regression, and restored code passes. Finish
+persistent-cap/RSS amplification, ancestor-directory durability and backend-neutral
+optional SQLite oracles. Investigate eager database creation/reopening before
+accepting cold/churn regressions. [Current evidence and successor prompt](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05).
 
 The separate improvement branch's source assessment is in HANDOFF (2026-11-04).
 Reuse its benchmark instrumentation and lazy-bucket idea, but measure any provider,

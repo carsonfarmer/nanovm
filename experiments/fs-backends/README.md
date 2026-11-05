@@ -3,7 +3,172 @@
 Storage screening for W-18/Q78, not a replacement WASI filesystem. The requirement
 is a coherent, immediately visible tentative view that the host can accept or
 reject. It does not prescribe an undo log. No production code, guests, root
-dependencies or Wasmtime patches change in this experiment.
+dependencies or Wasmtime patches changed in the original storage-only experiment.
+The separate runtime candidate below is now available for comparison, not adoption.
+
+## Adoption decision: retain journaling (2026-11-05)
+
+The goal is a fast, durable filesystem shared by KV, SQL and other interfaces.
+**Reject the current per-object redb replacement for adoption; keep journaling.**
+This does not reject transactional pages in principle. The candidate makes small
+durable writes substantially faster, but it does not satisfy the combined lifecycle,
+memory and implementation-size goals. No weaker durability setting was considered.
+
+Plain pages received a real runtime comparison on `plain-fs-evaluation`, not a
+rejection inferred from hashing. Removing content hashes/reference tables, keeping
+one table open per write, using range deletion, and raising the soft cache target
+from 64 KiB to 4 MiB brought unique 1 MiB PUT from 11.28 ms to roughly journal
+parity. Cache alone measured 8.91 ms; batching mattered. Startup now destroys an
+already-decoded orphan without a redundant lookup. An independent reviewer found
+no correctness blocker in these changes or demonstrated small fix for the remaining
+startup/namespace costs.
+
+Final three alternating runs, identical composed guests, no concurrent builds or
+tests, Immediate/two-phase commits throughout (medians):
+
+| Measurement | Journal | Optimized plain pages |
+|---|---:|---:|
+| PUT 128 B | 2.897 ms | 0.940 ms |
+| PUT 16 KiB | 3.436 ms | 0.997 ms |
+| PUT unique 1 MiB | 7.209 ms | 6.853 ms |
+| GET 1 MiB | 3.067 ms | 3.028 ms |
+| Cold objects/s | 3,040 | 989 |
+| Recovery after trap/s | 1,354 | 310 |
+| Churn objects/s | 4,562 | 849 |
+| Idle-object RSS increment | 143 KiB | 210 KiB |
+| RSS increment per additional 1 MiB object (32 objects) | 5,394 KiB | 7,607 KiB |
+| Estimated replacement runtime LOC | 5,074 | 5,368 |
+
+RSS includes guest linear memories and allocator retention; it is an observed
+process increment, not a per-object cap or pure database allocation measurement.
+Plain replacement modules are 611 adapter + 643 inode + 68 cap = 1,322 lines,
+versus journal/quota 476 + 564 = 1,040. Temporary feature wiring accounts for the
+remaining difference in the replacement estimate. Actual all-module tree: 6,408.
+Cold/recovery require opening a database, acquiring locks, opening tables/scanning
+inodes and syncing its directory per instance. Clean recovery already skips commit;
+deleting that commit is not a fix. Avoiding these costs needs a different database
+lifetime or a lazily materialized namespace, not leftover hash-code cleanup. The
+custom inode namespace and stream adapter replace services supplied by the OS and
+stock WASI in the journal path. Adding further lifetime machinery does not presently
+offer a demonstrated simpler implementation.
+
+Reproduce with release `kv_bench <composed-counter.wasm> --unique --density` and
+`bench --quick`, alternating saved journal/plain binaries on disposable roots.
+The density extension verifies all bytes in 32 additional 1 MiB objects. Logs and
+binaries are `.amp/in/fs-integrated/{journal,plain}-final-*`; earlier isolated
+cache/batch controls are alongside them. A syscall profile of the small-cache
+plain run recorded 602,566 reads and 264,177 writes; its traced wall times were not
+used as benchmark results.
+
+The plain full suite passed 88 unit/69 integration tests (11 ignored) on rerun.
+Another restored parallel run again failed `kv_counts_against_the_disk_quota`
+with an instance termination. This recurring failure is not claimed fixed or
+explained merely by passing a rerun. A mutation
+that retained truncated pages fails the held-handle/truncate regression, then was
+restored with `git checkout --` and an empty unstaged diff confirmed. This is not a
+claim of completed persistent-cap/runtime or ancestor-power-loss certification:
+those unfinished adoption checks are unnecessary to reject this implementation,
+and would still be required before reviving it. The historical hash results below
+remain valid for that candidate, not descriptions of the current plain branch.
+
+**Successor prompt:** retain the experimental branches and results, keep the journal
+as production storage, and implement the source-supported improvements from
+`cf/optimistic-feynman-62f1a0` as measured independent changes. Preserve confinement,
+both durable acceptance gates, immediate tentative visibility and rejection. Do not
+attribute scheduler/provider improvements to the filesystem comparison, publish
+migrated guests, or claim experimental-code removal as production LOC savings.
+
+## Runtime integration checkpoint (2026-11-05)
+
+`cargo test --locked -p nanovm --features page-fs` selects the real hash-addressed
+WASIp3 adapter; the default remains the journal. This temporary A/B feature is not
+a compatibility layer or a migration. Use separate disposable data roots: old
+ordinary-file volumes are not imported. No `guests/**` changes or Wasmtime patches
+are part of this integration.
+
+The candidate has hierarchical stable inode identities, bounded range streams,
+shared logical quotas, held-unlinked charging, and atomic DATA/TMP roots in one
+file-backed redb database. Opening clears TMP and reclaims unheld orphans. Both
+host acceptance gates use Immediate/two-phase commits; guest sync cannot publish.
+Read-only acceptance performs no storage writes. `storage_mb=256` is an independent,
+provisional database-file-length ceiling, not a proven multiplier of `disk_mb`.
+The redb cache target is 64 KiB, not a total-memory guarantee.
+
+Integration exposed two real issues: the actor's live counter retired before all
+database/stream resources dropped, and redb continued without exclusion when the
+jail returned ENOSYS for OFD locking. Retirement now follows complete teardown;
+the jail permits OFD locks and flock but still denies signal-owner commands.
+The jailed locking regression opens the real capped adapter, not just bare redb.
+
+Independent review caught a missing directory sync for the new database name.
+The real syscall-error regression failed with an acknowledged mutation before
+the fix; initialization now syncs database contents then its directory before
+running guest work. Failure rejects initialization. Removing that sync fails the
+test; restoration uses `git checkout --` and an empty unstaged diff. This is not
+physical power-loss certification. The post-return failure test now reopens twice,
+requiring earlier accepted bytes and a stable, wholly old-or-new later generation.
+The inode's persisted linkage replaces a redundant ORPHANS table; recovery already
+streams inode metadata for accounting, with no namespace cross-product scan.
+
+Restored full candidate validation passes 88 unit and 68 integration tests, with
+11 optional tests ignored. Default validation passes 91 unit and 67 integration
+tests on rerun: its first run hit N-32's setup CPU-budget failure, not a claimed
+fix. The opt-in composed SQL contract also passes, including mixed SQL/file/KV
+rejection, obstructed startup/retry and restart. The demo against the saved page
+binary and a fresh disposable root passes all 70,000 normal requests, contains
+100 attacks, and serves 486 canary requests without failure or reported counter
+kills. Services and disposable data were removed afterward. Remaining optional
+SQL, stream-lifetime, hostile resource-bound and ancestor-directory durability
+gates remain to be completed. In
+particular, old optional tests that inspect host-side guest filenames are not
+valid oracles for this backend and must be adapted, not silently skipped.
+
+Three alternating release pairs use the identical composed counter, Wasmtime
+50.0.0, the existing `kv_bench`, isolated disposable volumes, and no overlapping
+builds/tests. Medians in milliseconds per request:
+
+| Operation | Journal | Page candidate |
+|---|---:|---:|
+| GET 128 B | 0.190 | 0.207 |
+| GET 16 KiB | 0.232 | 0.266 |
+| GET 1 MiB | 3.033 | 3.032 |
+| PUT 128 B | 2.817 | 0.911 |
+| PUT 16 KiB | 3.291 | 0.948 |
+| PUT 1 MiB | 7.282 | 5.217 |
+| Cold PUT 4 B | 4.079 | 4.468 |
+
+These PUTs repeat one value and contain identical pages; they favor deduplication.
+`kv_bench <counter.wasm> --unique` now changes every page between PUTs, with data
+generation excluded from timing and final byte equality checked. Three additional
+alternating pairs on the simplified candidate give median PUT 128 B **2.884/0.914
+ms**, 16 KiB **3.421/1.170 ms**, and 1 MiB **7.154/16.764 ms** (journal/pages).
+Large unique writes are **2.34× slower**, despite small-write wins. GETs remain
+repeated-content controls: **0.187/0.192**, **0.234/0.256**, **2.970/2.994 ms**;
+cold PUT is **3.882/4.182 ms**. Neither benchmark uses network HTTP.
+
+One matched `bench --quick` pair reports journal/page cold starts **2,775/958 per
+second**, warm concurrent GET **90,527/85,829**, concurrent writes **754/4,131**,
+serial writes **394/1,077**, recovery **1,437/290**, churn **4,298/769**, and observed
+incremental density **144/210 KiB per object**. Both have no request or instantiation
+failures. These expose cold/reopen/memory regressions; write gains alone do not
+clear the gate. Raw logs and saved binaries are in `.amp/in/fs-integrated/`.
+The simplified candidate's final quick rerun confirms the regressions: cold 1,049/s,
+churn 830/s, recovery 278/s, density 211 KiB/object; concurrent/serial writes
+4,366/1,241 per second, with no request or instantiation failures.
+
+Count all replacement code: old quota+journal **564+476=1,040** lines versus
+adapter+inode+cap **611+699+68=1,378**. The checked-in A/B tree is 6,464 runtime
+lines. Deleting the old modules would give **5,424 versus 5,074 (+350)**, before
+removing temporary feature wiring. Provider code is unchanged. No LOC reduction
+or overall simplicity improvement is claimed.
+
+**Successor prompt:** continue `hashed-fs-integration`, not a production swap.
+Preserve the integrated correctness fixes and actual file-length cap; finish the
+review's real-stream and persistent-cap/runtime cases, replace SQL filename
+oracles with guest-visible assertions, and investigate eager database creation
+and reopen cost. Measure unique pages and density alongside writes, simplify
+actual ownership rather than formatting, and rerun both complete suites, demo
+and matched benchmarks before any merge. Guest publication still needs approval.
 
 ## Candidates and protocol
 
