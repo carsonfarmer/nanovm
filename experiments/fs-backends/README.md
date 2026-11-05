@@ -6,6 +6,73 @@ reject. It does not prescribe an undo log. No production code, guests, root
 dependencies or Wasmtime patches changed in the original storage-only experiment.
 The separate runtime candidate below is now available for comparison, not adoption.
 
+## Journal follow-through (2026-11-05)
+
+The storage decision is final for this candidate: journal stays. Follow-through
+on `journal-runtime-improvements` retains bounded actor/mailbox allocation,
+root-descriptor lookup, empty scratch reuse and reactor-local connection pools.
+KV buckets are now created by first write, not opening/reading; no guest source
+changed. Obsolete journal paths under a new regular file no longer fail commit,
+and supervisor setup syncs app ancestors before confining its worker.
+
+Three alternating release runtime pairs, same composed guests:
+
+| Measurement | Journal baseline | Improved runtime |
+|---|---:|---:|
+| Warm concurrent GET/s | 83,116 | 95,437 |
+| Serial GET/s | 12,075 | 13,097 |
+| Trap recovery/s | 1,310 | 1,680 |
+| Churn/s | 4,542 | 5,064 |
+| Idle KiB/object | 143 | 119 |
+| Cold objects/s | 3,202 | 3,139 |
+| Serial writes/s | 404 | 385 |
+
+Do not call the last two improvements. These are in-process benchmarks, not
+network-server capacity. A final quick run after all changes passed without
+request failures: cold 2,913/s, warm 93,893/s, serial GET 12,303/s, concurrent/
+serial writes 812/399/s, recovery 1,613/s and churn 5,163/s, 119 KiB/object.
+
+Three final whole-change KV pairs give median baseline/improved PUT 128 B
+2.714/2.767 ms, PUT unique 1 MiB 7.207/7.152 ms and GET 1 MiB 3.198/3.082 ms:
+no major durable-write gain. A separate same-runtime, old/new-provider comparison
+isolates lazy creation: fresh read-only KV requests 2.550/0.690 ms (3.7× faster).
+All byte comparisons and statuses pass. Zero-file-quota read-only tests create
+neither `.kv` nor a bucket. Cache/commit settings were not weakened.
+
+Runtime accounting: 5,074 → 5,021 cleanup → **5,082** with performance/durability
+work. The provider remains 242 nonblank/noncomment source lines including its
+test-hook blocks. This does **not** meet the overall LOC-reduction goal. No code
+removed from the experimental branches is counted as a production saving.
+
+Restored locked suite: 97 unit/68 integration, 11 ignored; all nine opt-in SQL
+tests pass. The composed KV probe passes zero-quota reads, cancellation, exact
+values, atomic rollback/restart and all four recovery cuts. Mutations of root
+identity, ancestor-sync error handling, dirty scratch reuse and actor boxing
+fail; each is restored with `git checkout --` and empty unstaged diff. Review
+found a counter/slot-handoff race, fixed before final validation, and no further
+blocker. Detached WASI directory tasks' complete host-descriptor lifetime is not
+claimed measured. Strict clippy retains seven pre-existing diagnostics.
+
+Demo on a fresh disposable root: all 70,000 normal requests succeeded, all 100
+attacks contained, 595 canary requests with zero failures. Supervised services
+were stopped afterward. These checks are not physical-power-loss certification.
+Embedded Node callers must prepare durable root ancestry themselves; the
+production supervisor now does so before the jail removes access to it.
+
+Reproduce: save release binaries and composed counter components for baseline
+`9da1fc6` and this branch in separate worktrees, then alternate three runs of
+`bench --quick` and `kv_bench <counter.wasm> --unique`, without simultaneous
+builds/tests/services. For the isolated lazy-provider comparison use this branch's
+same `kv_bench` binary with each composed counter, checking `cold-read` rows.
+Raw logs/binaries in this orb: `.amp/in/fs-integrated/compare-*`, `kv-final-*`,
+`cold-read-*`, `journal-delivery-*`, `journal-restored-final.log`.
+
+**Successor prompt:** retain journal and this decision; do not reopen the same
+page comparison as unfinished work. The improvement branch is not merged.
+Ask before main publication because inherited migrated guest changes publish
+packages. Any further write/LOC claim needs new evidence; investigate actual
+journal sync round trips or the separately scoped upstream byte-list-copy work.
+
 ## Adoption decision: retain journaling (2026-11-05)
 
 The goal is a fast, durable filesystem shared by KV, SQL and other interfaces.

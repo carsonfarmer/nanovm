@@ -89,6 +89,12 @@ async fn main() -> anyhow::Result<()> {
         ensure!(r.status == 204, "cold: {} {}", r.status, r.body);
     }
     println!("cold,4,100,{:.3}", start.elapsed().as_secs_f64() * 10.0);
+    let start = Instant::now();
+    for n in 0..100 {
+        let r = load::request(&node, "GET", &format!("read-only-{n}"), "/kv/missing", "").await;
+        ensure!(r.status == 404, "cold read: {} {}", r.status, r.body);
+    }
+    println!("cold-read,0,100,{:.3}", start.elapsed().as_secs_f64() * 10.0);
     if std::env::args().any(|arg| arg == "--density") {
         let before = nanovm::metrics::rss_bytes();
         let value = "x".repeat(1048576);

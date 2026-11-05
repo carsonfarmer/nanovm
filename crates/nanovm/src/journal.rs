@@ -56,6 +56,9 @@ pub struct Journal {
     /// `<objects>`, which every path in the log is relative to.
     base: PathBuf,
     volume: PathBuf,
+    /// The volume's device and inode: it never moves, so a descriptor for it
+    /// needs no asking where it is.
+    root: (u64, u64),
     dir: PathBuf,
     /// Open while the current request has changes.
     log: Option<File>,
@@ -85,9 +88,11 @@ impl Journal {
         let base = volume.parent().expect("a volume has a parent").to_path_buf();
         let dir = base.join("~journal").join(volume.file_name().expect("a volume has a name"));
         recover(&base, &dir)?;
+        let md = std::fs::metadata(volume)?;
         Ok(Journal {
             base,
             volume: volume.to_path_buf(),
+            root: (md.dev(), md.ino()),
             dir,
             log: None,
             sized: HashMap::new(),
@@ -118,8 +123,10 @@ impl Journal {
 
     /// The guest path `path` under the directory `dir`, if in the volume.
     pub fn local_at(&self, dir: &File, path: &str) -> Option<PathBuf> {
-        (dir.metadata().ok()?.nlink() > 0).then_some(())?;
-        self.local(&fd_path(dir)?.join(path))
+        let md = dir.metadata().ok()?;
+        (md.nlink() > 0).then_some(())?;
+        let at = if (md.dev(), md.ino()) == self.root { self.volume.clone() } else { fd_path(dir)? };
+        self.local(&at.join(path))
     }
 
     /// Where `file` is, relative to the base, if in the volume or (removed
@@ -580,10 +587,18 @@ fn sync(p: &Path) -> std::io::Result<()> {
     File::open(p)?.sync_all()
 }
 
-/// Syncs `p` unless a later change removed it.
+/// Persist newly created app ancestors before a worker loses access to them.
+pub(crate) fn sync_ancestors(dir: &Path) -> std::io::Result<()> {
+    for parent in dir.canonicalize()?.ancestors() {
+        sync(parent)?;
+    }
+    Ok(())
+}
+
+/// Syncs `p` unless a later change removed it or replaced an ancestor with a file.
 fn sync_if_there(p: &Path) -> std::io::Result<()> {
     match sync(p) {
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(()),
         r => r,
     }
 }
@@ -670,6 +685,31 @@ mod tests {
         if let Some((slot, bytes)) = replaced {
             j.discard_created(&slot, bytes).unwrap();
         }
+    }
+
+    #[test]
+    fn a_path_under_what_became_a_file_commits() {
+        let v = volume();
+        let mut j = open(&v);
+        j.creating(&v.join("n/m")).unwrap();
+        j.creating(&v.join("n")).unwrap();
+        std::fs::write(v.join("n"), "x").unwrap();
+        j.commit().unwrap();
+        assert_eq!(std::fs::read(v.join("n")).unwrap(), b"x");
+        open(&v).check().unwrap();
+    }
+
+    #[test]
+    fn ancestor_sync_failure_prevents_initialization() {
+        let v = volume();
+        let levels = v.canonicalize().unwrap().ancestors().count();
+        for cut in 0..levels {
+            FAIL_SYNC_AFTER.set(Some(cut as u32));
+            let result = sync_ancestors(&v);
+            FAIL_SYNC_AFTER.set(None);
+            assert!(result.is_err(), "sync failure at ancestor {cut} must propagate");
+        }
+        sync_ancestors(&v).unwrap();
     }
 
     thread_local! {
@@ -876,6 +916,19 @@ mod tests {
         assert_eq!(j.local(&v.join("../other/x")), None);
         assert_eq!(j.local(&v.join("../../../etc/passwd")), None);
         assert_eq!(j.local(Path::new("/tmp/x")), None);
+    }
+
+    /// A directory descriptor resolves to where the directory is now, even
+    /// after it moved; the volume's own descriptor resolves to the volume.
+    #[test]
+    fn directory_descriptors_resolve_where_they_are_now() {
+        let v = volume();
+        let j = open(&v);
+        let (root, d) = (File::open(&v).unwrap(), File::open(v.join("d")).unwrap());
+        std::fs::rename(v.join("d"), v.join("moved")).unwrap();
+        assert_eq!(j.local_at(&root, "x"), Some(v.join("x")));
+        assert_eq!(j.local_at(&d, "x"), Some(v.join("moved/x")));
+        assert_eq!(j.local_at(&d, "../../other"), None);
     }
 
     /// Creating what already exists, or removing a directory that isn't

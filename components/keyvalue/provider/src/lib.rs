@@ -48,34 +48,18 @@ impl Guest for Provider {
 }
 impl GuestStore for Bucket {
     async fn open(label: String) -> Result<Store, Error> {
-        wit_bindgen::block_on(async {
-            // Labels name private directories, not shared deployment stores.
-            if label.is_empty()
-                || label.len() > 64
-                || !label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
-                return Err(Error::NoSuchStore);
-            }
-            let slot = Slot::reserve()?;
-            let path = format!(".kv/{label}");
-            // Opening an existing store must not need a free directory entry.
-            match util::open("/data", &path, OpenFlags::DIRECTORY, DescriptorFlags::READ).await {
-                Ok(_) => (),
-                Err(ErrorCode::NoEntry) => {
-                    let dir = util::mount("/data").ok_or(Error::AccessDenied)?;
-                    for name in [".kv".to_owned(), path.clone()] {
-                        match dir.create_directory_at(name).await {
-                            Ok(()) | Err(ErrorCode::Exist) => (),
-                            Err(e) => return Err(error(e)),
-                        }
-                    }
-                }
-                Err(e) => return Err(error(e)),
-            }
-            Ok(Store::new(Bucket { path, _slot: slot }))
-        })
+        // Labels name private directories, not shared deployment stores.
+        if label.is_empty()
+            || label.len() > 64
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(Error::NoSuchStore);
+        }
+        let slot = Slot::reserve()?;
+        let path = format!(".kv/{label}");
+        Ok(Store::new(Bucket { path, _slot: slot }))
     }
     async fn get(&self, key: String) -> Result<Option<Vec<u8>>, Error> {
         let path = key_path(&self.path, &key)?;
@@ -111,6 +95,21 @@ impl GuestStore for Bucket {
             let path = key_path(&self.path, &key)?;
             if value.len() > MAX_VALUE {
                 return Err(Error::Other("value exceeds 1 MiB".into()));
+            }
+            // Only writes create buckets; opening/reading one never spends quota.
+            // Open first so an existing full store needs no free directory entry.
+            match util::open("/data", &self.path, OpenFlags::DIRECTORY, DescriptorFlags::READ).await {
+                Ok(_) => (),
+                Err(ErrorCode::NoEntry) => {
+                    let dir = util::mount("/data").ok_or(Error::AccessDenied)?;
+                    for name in [".kv".to_owned(), self.path.clone()] {
+                        match dir.create_directory_at(name).await {
+                            Ok(()) | Err(ErrorCode::Exist) => (),
+                            Err(e) => return Err(error(e)),
+                        }
+                    }
+                }
+                Err(e) => return Err(error(e)),
             }
             let mut attempts = 0;
             let (tmp, fd) = loop {
@@ -211,9 +210,11 @@ impl GuestStore for Bucket {
         wit_bindgen::spawn_local(async move {
             let _slot = slot;
             let result = async {
-                let dir = util::open("/data", &path, OpenFlags::DIRECTORY, DescriptorFlags::READ)
-                    .await
-                    .map_err(error)?;
+                let dir = match util::open("/data", &path, OpenFlags::DIRECTORY, DescriptorFlags::READ).await {
+                    Ok(dir) => dir,
+                    Err(ErrorCode::NoEntry) => return Ok(()),
+                    Err(e) => return Err(error(e)),
+                };
                 let (mut entries, done) = dir.read_directory();
                 while let Some(entry) = entries.next().await {
                     if !matches!(entry.type_, DescriptorType::RegularFile) {

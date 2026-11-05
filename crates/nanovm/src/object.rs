@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use opentelemetry::trace::Span as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use wasmtime::component::{Accessor, ResourceTable, ResourceTableError};
-use wasmtime::{ResourceLimiter, Store, Trap, UpdateDeadline};
+use wasmtime::{AsContextMut, ResourceLimiter, Store, Trap, UpdateDeadline};
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::p3::bindings::Service;
@@ -132,9 +132,9 @@ impl ObjShared {
 
     /// Drives `fut`, charging the time spent inside each poll (where guest
     /// code runs) to the current request or start-up, never time spent
-    /// waiting to be scheduled.
-    async fn charged<F: Future>(&self, metrics: &Metrics, fut: F) -> F::Output {
-        let mut fut = pin!(fut);
+    /// waiting to be scheduled. Pinned by the caller: moved in, it was held
+    /// twice by this future, which made an idle object's actor 7 KB bigger.
+    async fn charged<F: Future>(&self, metrics: &Metrics, mut fut: Pin<&mut F>) -> F::Output {
         poll_fn(|cx| {
             let t0 = now_ns();
             self.poll_start_ns.store(t0, Relaxed);
@@ -234,13 +234,71 @@ impl tokio::io::AsyncWrite for LogTail {
     }
 }
 
-/// Removes an instance's scratch directory when the instance goes away.
-struct TmpDir(PathBuf);
+/// The app's scratch directories, one per live instance, behind `/tmp`.
+/// One an instance leaves empty is handed to the next rather than removed:
+/// a mkdir and an rmdir cost more than the rest of a cold start's
+/// filesystem work, and an rmdir blocks for milliseconds on a disk mounted
+/// with `discard`.
+pub struct Scratch {
+    dir: PathBuf,
+    free: Mutex<Vec<PathBuf>>,
+}
+
+/// The name of the next new scratch directory.
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+impl Scratch {
+    /// Scratch under `dir`. A previous run (a worker that was killed or
+    /// retired) leaves a directory for each instance it had: one left empty
+    /// is handed out again, anything else is removed. Removing them all made
+    /// a worker that had served 200 objects start half a second late.
+    /// `dir` itself stays: a jailed worker's Landlock rule names it.
+    pub fn new(dir: PathBuf) -> std::io::Result<Arc<Scratch>> {
+        std::fs::create_dir_all(&dir)?;
+        let mut free = Vec::new();
+        for e in std::fs::read_dir(&dir)? {
+            let e = e?;
+            // New names start past those left.
+            let n = e.file_name().to_str().and_then(|n| n.parse::<u64>().ok());
+            NEXT.fetch_max(n.map_or(0, |n| n + 1), Relaxed);
+            if e.file_type()?.is_dir() && empty(&e.path()) {
+                free.push(e.path());
+            } else {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+        Ok(Arc::new(Scratch { dir, free: Mutex::new(free) }))
+    }
+
+    fn take(self: &Arc<Self>) -> std::io::Result<TmpDir> {
+        let path = match self.free.lock().pop() {
+            Some(path) => path,
+            None => {
+                let path = self.dir.join(NEXT.fetch_add(1, Relaxed).to_string());
+                std::fs::create_dir(&path)?;
+                path
+            }
+        };
+        Ok(TmpDir(path, self.clone()))
+    }
+}
+
+/// An instance's scratch directory: back to its [`Scratch`] when the
+/// instance goes away if the instance left it empty, else removed.
+struct TmpDir(PathBuf, Arc<Scratch>);
 
 impl Drop for TmpDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if empty(&self.0) {
+            self.1.free.lock().push(std::mem::take(&mut self.0));
+        } else {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
+}
+
+fn empty(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none())
 }
 
 pub struct ObjState {
@@ -258,12 +316,6 @@ pub struct ObjState {
     /// A request failed: the instance ends, and its restart rolls back.
     reset: bool,
     _tmp: TmpDir,
-}
-
-impl Drop for ObjState {
-    fn drop(&mut self) {
-        self.hooks.metrics.stores_live.fetch_sub(1, Relaxed);
-    }
 }
 
 impl WasiView for ObjState {
@@ -287,17 +339,17 @@ impl WasiHttpView for ObjState {
 
 fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
     let limits = &app.cfg.limits;
-    // Each instance gets scratch of its own.
-    static INSTANCE: AtomicU64 = AtomicU64::new(0);
-    let n = INSTANCE.fetch_add(1, Relaxed);
-    let [objects, tmp, _] = node.cfg.app_dirs(&app.name);
-    let data_dir = objects.join(&*shared.id);
-    let tmp_dir = tmp.join(format!("{}.{n}", shared.id));
-    std::fs::create_dir_all(&data_dir)?;
-    // The journal compares it with where open files really are.
-    let data_dir = data_dir.canonicalize()?;
-    std::fs::create_dir_all(&tmp_dir)?;
-    let tmp = TmpDir(tmp_dir.clone());
+    // A volume made here, in a directory without symlinks, has none; one
+    // that was already there must not be one either.
+    let data_dir = app.objects.join(&*shared.id);
+    if let Err(e) = std::fs::create_dir(&data_dir) {
+        anyhow::ensure!(
+            e.kind() == std::io::ErrorKind::AlreadyExists && std::fs::symlink_metadata(&data_dir)?.is_dir(),
+            "volume {}: {e}",
+            data_dir.display()
+        );
+    }
+    let tmp = app.scratch.take()?;
 
     let stderr = LogTail::default();
     let mut b = WasiCtxBuilder::new();
@@ -310,7 +362,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     // pool's one mutex. Preopens capture this, so it must come first.
     b.allow_blocking_current_thread(true);
     b.preopened_dir(&data_dir, "/data", FsPerms::ReadWrite)?;
-    b.preopened_dir(&tmp_dir, "/tmp", FsPerms::ReadWrite)?;
+    b.preopened_dir(&tmp.0, "/tmp", FsPerms::ReadWrite)?;
     let output = |stream| LogTail {
         buf: stderr.buf.clone(), export: Some((node.telemetry.clone(), shared.clone(), stream)),
     };
@@ -319,11 +371,9 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     let mut table = ResourceTable::new();
     table.set_max_capacity(limits.max_resources);
 
-    // `/tmp` was just created, so only the persistent volume holds usage.
+    // `/tmp` starts empty, so only the persistent volume holds usage.
     let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone())?;
 
-    let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
-    node.metrics.stores_peak.fetch_max(live, Relaxed);
     let state = ObjState {
         wasi: b.build(),
         table,
@@ -395,12 +445,18 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
         (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
     });
     quota.commit()?;
-    if let crate::egress::Route::Supervisor(up) = route {
-        for req in held {
-            if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
-                let _ = res.into_body().collect().await;
+    if let crate::egress::Route::Supervisor(up) = route
+        && !held.is_empty()
+    {
+        // Boxed: inline, sending made every idle object's actor 2 KB bigger.
+        Box::pin(async move {
+            for req in held {
+                if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
+                    let _ = res.into_body().collect().await;
+                }
             }
-        }
+        })
+        .await;
     }
     Ok(())
 }
@@ -430,7 +486,7 @@ impl Drop for Pending {
     }
 }
 
-pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Job>) {
+pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Box<Job>>) {
     loop {
         let Some(mut job) = rx.recv().await else { return };
         *shared.context.lock() = job.context.clone();
@@ -444,10 +500,18 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", true));
         shared.begin_start();
         let t0 = Instant::now();
+        // Retirement follows the store's fields and stream resources, not
+        // ObjState::drop, which runs before those fields are destroyed.
+        let mut counted = scopeguard::guard(false, |counted| {
+            if counted { node.metrics.stores_live.fetch_sub(1, Relaxed); }
+        });
         let started = async {
             let mut store = new_store(&node, &app, &shared)?;
+            *counted = true;
+            let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
+            node.metrics.stores_peak.fetch_max(live, Relaxed);
             let svc = shared
-                .charged(&node.metrics, app.pre.instantiate_async(&mut store))
+                .charged(&node.metrics, pin!(app.pre.instantiate_async(&mut store)))
                 .await?;
             anyhow::Ok((store, svc))
         }
@@ -474,6 +538,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                 let _ = job.reply.send(response);
             }
         }
+        drop(counted);
         drop(slot);
         shared.set_phase(Phase::Cold);
         if node.try_retire(&shared, &rx) {
@@ -488,8 +553,8 @@ async fn serve(
     shared: &Arc<ObjShared>,
     mut store: Store<ObjState>,
     svc: Service,
-    first: Job,
-    rx: &mut mpsc::Receiver<Job>,
+    first: Box<Job>,
+    rx: &mut mpsc::Receiver<Box<Job>>,
 ) -> Exit {
     let limits = &app.cfg.limits;
     let max_resp = limits.max_response_body_kb << 10;
@@ -511,6 +576,11 @@ async fn serve(
                 };
                 *shared.context.lock() = job.context.clone();
                 shared.begin_request();
+                // The next tick, not one that passed while the object was
+                // idle: a stale deadline made every request yield to the
+                // executor at its first instruction, and Tokio wakes an idle
+                // thread for a task that yields.
+                acc.with(|mut s| s.as_context_mut().set_epoch_deadline(1));
                 let abort = Arc::new(AtomicBool::new(false));
                 *pending.lock() = Some(Pending {
                     reply: Some(job.reply),
@@ -596,7 +666,8 @@ async fn serve(
     // runs outside the event loop because a guest spinning in a loop only
     // yields at epoch boundaries, never back into `inner`.
     let result: Result<wasmtime::Result<()>, Phase> = {
-        let mut fut = pin!(shared.charged(&node.metrics, store.run_concurrent(inner)));
+        let run = pin!(store.run_concurrent(inner));
+        let mut fut = pin!(shared.charged(&node.metrics, run));
         let mut timer = pin!(tokio::time::sleep(Duration::from_secs(3600)));
         let mut armed = None;
         poll_fn(|cx| {
@@ -734,6 +805,35 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    /// What a previous run left in an app's scratch: an empty directory is
+    /// handed out again as it is (not removed and made anew, which blocked
+    /// a restart for milliseconds per directory), one with anything in it is
+    /// removed, and new directories never take a name that is left.
+    #[test]
+    fn scratch_left_by_a_previous_run() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("nanovm-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in ["7", "900", "x"] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(dir.join("x/f"), "left").unwrap();
+        let ino = |p: &std::path::Path| std::fs::metadata(p).unwrap().ino();
+        let mut left = [ino(&dir.join("7")), ino(&dir.join("900"))];
+        left.sort();
+
+        let scratch = Scratch::new(dir.clone()).unwrap();
+        assert!(!dir.join("x").exists(), "a used directory is removed");
+        let mut taken: Vec<_> = (0..3).map(|_| scratch.take().unwrap()).collect();
+        let mut kept: Vec<_> = taken[..2].iter().map(|t| ino(&t.0)).collect();
+        kept.sort();
+        assert_eq!(kept, left, "the empty ones are reused first");
+        let new = taken[2].0.file_name().unwrap().to_str().unwrap().parse::<u64>().unwrap();
+        assert!(new > 900, "a new name is past those left: {new}");
+        taken.clear();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The limiter caps the sum of every memory's growth; a refused growth
     /// is remembered and leaves the usage as it was.
     #[test]
@@ -786,6 +886,17 @@ mod tests {
         assert_eq!(e.to_string(), "instance terminated");
     }
 
+    /// The task of an idle object holds little: once, moved-in futures held
+    /// twice and an inline publish path made it 17 KB, every live object's.
+    #[test]
+    fn an_actor_is_small() {
+        fn returned<A, B, C, D, F>(_: fn(A, B, C, D) -> F) -> usize {
+            size_of::<F>()
+        }
+        let size = returned(run);
+        assert!(size < 4096, "{size} bytes");
+    }
+
     /// Errors are JSON naming the reason, which is also a header.
     #[tokio::test]
     async fn error_responses_are_json() {
@@ -808,12 +919,12 @@ mod tests {
         shared.begin_request();
         assert_eq!(shared.phase().0.as_str(), "handling");
         shared
-            .charged(&metrics, tokio::time::sleep(Duration::from_millis(50)))
+            .charged(&metrics, pin!(tokio::time::sleep(Duration::from_millis(50))))
             .await;
         let waited = shared.cpu_accum_ns.load(Relaxed);
         assert!(waited < 25_000_000, "waiting was charged {waited}ns");
         shared
-            .charged(&metrics, async { std::thread::sleep(Duration::from_millis(30)) })
+            .charged(&metrics, pin!(async { std::thread::sleep(Duration::from_millis(30)) }))
             .await;
         assert!(shared.cpu_accum_ns.load(Relaxed) >= 30_000_000);
         assert!(metrics.guest_cpu_ns.load(Relaxed) >= 30_000_000);

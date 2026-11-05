@@ -38,6 +38,14 @@ async fn main() -> anyhow::Result<()> {
     };
     cfg.validate()?;
     nanovm::engine::preflight(&cfg)?;
+    let mut read_only = app.clone();
+    read_only.limits.max_files = 0;
+    let node = Node::new(cfg.clone(), &read_only, &wasm, None)?;
+    let r = load::request(&node, "GET", "fresh", "/empty", "").await;
+    ensure!(r.status == 200 && r.body == "ok", "zero-entry read: {}", r.body);
+    node.shutdown().await;
+    ensure!(!dir.join("objects/spin-kv/fresh/.kv").exists());
+    println!("PASS read-only bucket with zero file quota creates nothing");
     let node = Node::new(cfg.clone(), &app, &wasm, None)?;
     for (path, expected) in [
         ("/set", "ok"),

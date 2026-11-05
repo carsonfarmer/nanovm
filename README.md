@@ -271,13 +271,17 @@ latency, but cold/recovery/churn remain 3–5× slower and replacement code is 2
 lines larger. This rejects the current per-object redb design for adoption, not
 page-based filesystems in principle. [Simple comparison, costs and reproduction](experiments/fs-backends/README.md#adoption-decision-retain-journaling-2026-11-05).
 
-The journal improvement branch removes redundant range/poison/stream cleanup and
-unused configuration/ownership machinery: 5,074 → 5,021 runtime lines before
-performance changes. Existing durable recovery tests and a saved-range mutation
-check cover the refactor. Page adapters remain only on the experimental branches.
+The journal improvement branch reduces idle memory from 143 to 119 KiB/object
+and improves warm throughput about 15% in three matched runs. Lazy KV bucket
+creation reduces a fresh read-only request from 2.550 to 0.690 ms; opening or
+reading an empty bucket consumes no directory quota. Small durable writes and
+large-value writes remain essentially unchanged. Cleanup saved 53 runtime lines,
+but the complete performance/durability work ends at **5,082 versus 5,074**;
+this is not a net code reduction. [Measurements and limitations](experiments/fs-backends/README.md#journal-follow-through-2026-11-05).
+Page adapters remain only on the experimental branches.
 
 The historical [runtime candidate](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05)
-is now integrated behind temporary `page-fs`, using stock WASIp3 bindings and one
+was integrated on its experimental branch behind temporary `page-fs`, using stock WASIp3 bindings and one
 file-backed transactional database for `/data` and `/tmp`. Use disposable separate
 data roots; no migration or compatibility path exists. Its provisional `storage_mb`
 limit (default 256) bounds database file length independently of logical `disk_mb`;
@@ -329,6 +333,10 @@ Sockets are indexed by object within each app; a publish visits that object's so
 A request's changes to `/data` (files and key-value alike) and what it publishes to WebSockets take effect together when it answers, and are durable before anyone hears of them: Durable Objects' output gate. A guest error, trap, CPU/time limit or worker crash before commit rolls back those changes. An answer of any status commits.
 
 A host I/O failure during commit, a crash at its commit marker, or a lost response can leave the caller unsure whether the request committed. Do not interpret every error as a rollback: use application-level operation IDs for idempotent retries. Durability assumes a filesystem and device that honor successful file and directory syncs; process-crash tests do not certify physical power-loss behavior.
+
+The supervisor syncs app-directory ancestors before launching a jailed worker;
+the worker's journal cannot reach those ancestors after confinement. Embedded
+`Node` callers must arrange durable storage-root preparation themselves.
 
 **How:** an undo journal (`journal.rs`), as SQLite's rollback journal, under our `wasi:filesystem` host (`quota.rs`).
 - **Before each change, the host records what the change would destroy, and fsyncs it:**

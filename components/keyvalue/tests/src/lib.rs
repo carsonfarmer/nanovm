@@ -195,6 +195,8 @@ impl util::wasip3::exports::http::handler::Guest for Client {
             "/collision" => {
                 let dir = util::mount("/data").expect("data");
                 // This route runs on a fresh instance, whose temporary counter is zero.
+                dir.create_directory_at(".kv".into()).await.expect("kv root");
+                dir.create_directory_at(".kv/default".into()).await.expect("bucket");
                 util::write_file("/data", ".kv/default/.spin-write-0", b"sentinel".to_vec())
                     .await
                     .expect("plant");
@@ -251,19 +253,24 @@ impl util::wasip3::exports::http::handler::Guest for Client {
                 done.await.expect("list completion");
             }
             "/empty" => {
-                let empty = Store::open("empty".into()).await.expect("empty");
+                let empty = Store::open("read-only".into()).await.expect("empty");
+                assert!(empty.get("absent".into()).await.unwrap().is_none());
+                assert!(!empty.exists("absent".into()).await.unwrap());
+                empty.delete("absent".into()).await.unwrap();
                 let (mut keys, done) = empty.get_keys().await;
                 assert!(keys.next().await.is_none());
                 drop(keys);
                 done.await.expect("empty completion");
+                assert!(matches!(
+                    util::open("/data", ".kv/read-only", util::OFlags::DIRECTORY, util::FdFlags::READ).await,
+                    Err(util::wasip3::filesystem::types::ErrorCode::NoEntry)
+                ), "reading a new bucket must not create it");
             }
             "/listing-error" => {
                 let empty = Store::open("vanished".into()).await.expect("vanished");
-                util::mount("/data")
-                    .expect("mount")
-                    .remove_directory_at(".kv/vanished".into())
+                util::write_file("/data", ".kv/vanished", b"not a directory".to_vec())
                     .await
-                    .expect("remove dir");
+                    .expect("obstruct bucket");
                 let (mut keys, done) = empty.get_keys().await;
                 assert!(keys.next().await.is_none());
                 drop(keys);

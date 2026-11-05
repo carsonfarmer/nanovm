@@ -22,6 +22,9 @@ scripts compose both providers. Old synchronous KV imports are no longer linked.
   underscores or hyphens. All such labels are allowed within an object's own
   volume. This differs from Spin's deployment-manifest label allowlist; nanovm
   does not interpret `spin.toml` or offer cross-object/shared stores.
+- Opening a store only validates its label and reserves a resource slot. Its
+  first write creates the directories; reads, listings and deletes of an absent
+  store create nothing, including when the object's file quota is zero.
 - Keys are 1–180 UTF-8 bytes, encoded as unpadded base64url filenames. Values are
   at most 1 MiB. Empty values work. Missing reads return `none`; missing deletes
   succeed. No atomics or batch extension is supplied.

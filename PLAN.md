@@ -460,6 +460,17 @@ borrowed from the other branch. Keep performance/lifetime changes separate and
 measure against saved identical-guest controls. Do not import the registry's
 separate awaited write/rename cleanup: cancellation semantics differ.
 
+**Follow-through (Q85):** implemented bounded mailbox/actor storage, cached root
+resolution, empty scratch reuse, request deadline reset and reactor-local links.
+Lazy composed-KV buckets make fresh read-only requests 3.7× faster without
+spending file quota. Warm runtime throughput improves about 15%, idle memory
+143 → 119 KiB/object; durable writes remain essentially unchanged. Added
+supervisor ancestor-directory sync and obsolete-path ENOTDIR handling. Final
+runtime 5,082 versus 5,074: the overall LOC goal remains unmet, despite the initial
+53-line cleanup. Retain journal; do not present this as the proposed large
+filesystem simplification. Full suites, opt-in SQL and mutation evidence are in
+HANDOFF. Main publication still requires approval for inherited guest migration.
+
 **Decision (Q84):** retain journaling. Optimized plain pages also received a real
 matched comparison: small writes improve about 3× and unique 1 MiB writes reach
 parity, but cold/recovery/churn remain 3–5× slower and replacement runtime grows
