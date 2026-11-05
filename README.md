@@ -271,6 +271,11 @@ latency, but cold/recovery/churn remain 3–5× slower and replacement code is 2
 lines larger. This rejects the current per-object redb design for adoption, not
 page-based filesystems in principle. [Simple comparison, costs and reproduction](experiments/fs-backends/README.md#adoption-decision-retain-journaling-2026-11-05).
 
+The journal improvement branch removes redundant range/poison/stream cleanup and
+unused configuration/ownership machinery: 5,074 → 5,021 runtime lines before
+performance changes. Existing durable recovery tests and a saved-range mutation
+check cover the refactor. Page adapters remain only on the experimental branches.
+
 The historical [runtime candidate](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05)
 is now integrated behind temporary `page-fs`, using stock WASIp3 bindings and one
 file-backed transactional database for `/data` and `/tmp`. Use disposable separate

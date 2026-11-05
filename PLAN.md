@@ -454,6 +454,12 @@ namespace-scan complexity and physical amplification must inform integration.
 This proof does not include WASI directories/streams, mixed SQL workloads, storage
 fault recovery or replica export; keep the production host unchanged.
 
+**Improvement execution:** `journal-runtime-improvements` keeps the journal baseline
+and first reduces runtime 5,074 → 5,021 with behavior-preserving simplifications
+borrowed from the other branch. Keep performance/lifetime changes separate and
+measure against saved identical-guest controls. Do not import the registry's
+separate awaited write/rename cleanup: cancellation semantics differ.
+
 **Decision (Q84):** retain journaling. Optimized plain pages also received a real
 matched comparison: small writes improve about 3× and unique 1 MiB writes reach
 parity, but cold/recovery/churn remain 3–5× slower and replacement runtime grows

@@ -84,6 +84,7 @@ pub struct Supervisor {
     started: Instant,
 }
 
+#[derive(Default)]
 struct Worker {
     name: String,
     live: Mutex<Option<Arc<Live>>>,
@@ -230,16 +231,7 @@ impl Supervisor {
                 // their last failures.
                 workers.retain(|_, w| w.live.lock().is_some() || w.starting.try_lock().is_err());
             }
-            workers.entry(name.clone()).or_insert_with(|| {
-                Arc::new(Worker {
-                    name,
-                    live: Mutex::default(),
-                    starting: Default::default(),
-                    starts: AtomicU64::new(0),
-                    used: AtomicU64::new(0),
-                    link_errors: AtomicU64::new(0),
-                })
-            }).clone()
+            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, ..Default::default() })).clone()
         };
         w.used.store(self.started.elapsed().as_millis() as u64, Relaxed);
         let live = match self.live(&w, &want).await {
