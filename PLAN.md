@@ -455,8 +455,8 @@ This proof does not include WASI directories/streams, mixed SQL workloads, stora
 fault recovery or replica export; keep the production host unchanged.
 
 **Integration gate (Q80):** `hashed-fs-integration` owns the next implementation.
-First remove whole-namespace scans from orphan reclamation and exercise failed
-storage operations, then prove a stock-WASI resource adapter without a Wasmtime
+Whole-namespace orphan scans are removed (Q81), and real-file I/O failure matrices
+cover mutations and orphan recovery with shared content. Next prove a stock-WASI resource adapter without a Wasmtime
 patch. Preserve directory confinement, descriptor identity, streaming bounds,
 ephemeral `/tmp` with shared quotas, and both host commit boundaries. Compare
 mixed KV/SQL/raw-file workloads through real jailed workers before switching.

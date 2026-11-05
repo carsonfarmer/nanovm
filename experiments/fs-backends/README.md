@@ -269,16 +269,60 @@ No production host/guest/Wasmtime changes, directory traversal, links, permissio
 WASI resources/streams, SQL, or remote export. Quotas are logical, not bounds on
 database allocation or retained COW versions. The cache setting is **not a total
 RSS limit**: transaction metadata, output buffers, allocator retention and other
-host state also consume memory. Directory membership currently scans the bounded
-name table on final close; restart can be quadratic in file count. Those choices
-avoid a second persisted index in this small proof, not an adoption-ready scale
-claim. Persistent inode numbers use the existing string-keyed page store to share
+host state also consume memory. The initial namespace scans are replaced by the
+orphan index described below. Persistent inode numbers use the existing string-keyed page store to share
 the comparison code; no final filesystem format is selected.
 
-**Successor prompt:** continue `fs-page-semantics`; read Q79 and this section.
+**Successor prompt:** continue `hashed-fs-integration`; read Q79/Q80 and this section.
 Prefer hash-addressed pages where measured costs are close, without hiding its
 large-write cost or the cache/RSS distinction. Before building a production WASI
-adapter, settle total memory and physical-storage budgets, eliminate namespace
-scan scaling, and test storage failures. Then prove mixed SQL/KV/raw-file behavior
+adapter, settle total memory and physical-storage budgets and prove resource mapping.
+Then prove mixed SQL/KV/raw-file behavior
 through the actual host path. Keep production unchanged and do not merge migrated
 guests/publish packages without approval.
+
+### Hardening: orphan lookup and storage failures (2026-11-05)
+
+Unlink and rename-over record the disconnected inode in an `orphans` table in the
+same transaction as the name change. Collection checks that index and live handles,
+not every name. Startup counts lengths once and collects only indexed orphans.
+The experiment's data is disposable; there is no previous-prototype format migration.
+
+`inode-scale` creates 1,000/10,000 named one-byte files plus a committed held orphan,
+reopens, times 1,000 opens/closes of the last name, and checks every value and exact
+quota usage. With 64 KiB caches, the initial paired run at 10,000 files measured:
+
+| Operation | Scanning plain / hashed | Indexed plain / hashed |
+|---|---:|---:|
+| Reopen | 3,028 / 3,044 ms | 1.52 / 1.56 ms |
+| Open + close | 625 / 652 µs | 2.12 / 2.10 µs |
+
+The control restores the old name scans in the otherwise identical harness. These
+are storage-only observations, not full-node throughput or a repeated statistical
+benchmark. Removing rename-over orphan registration or restart collection fails
+the existing inode contracts. Each mutation was restored with `git checkout --`
+from the staged implementation, and an empty unstaged diff verified.
+
+`CARGO_TARGET_DIR=target cargo test --release --locked --manifest-path experiments/fs-backends/Cargo.toml -- --nocapture`
+runs 217 plain and 467 hashed mutation/commit failure cuts through a real `FileBackend`, preserving
+its file locks. Another 57 plain / 77 hashed cuts fail orphan recovery and its
+commit, with content shared by the orphan and a named file. It fails each read, write, growth or sync in turn; a failed write
+writes its first half before returning an error. After a caught mutation error,
+an attempted acceptance must fail and reopening must return the old state. A failed
+commit may recover either complete state, never mixed names/data. The successful
+control must recover the new state. Exact bytes, quota totals, orphan cleanup,
+hash reference counts and the same generation on a second reopen are checked. The
+review caught and fixed an oracle that had allowed either generation independently
+on each reopening. The test now observes the underlying commit result separately
+from starting the next transaction. Redb rejects the later
+commit after these I/O errors; no duplicate host poisoning mechanism was added.
+
+This does not simulate physical power loss, failed database initialization/locking,
+or every partial-write geometry, and
+does not yet establish a physical database-size or total-memory bound. The real
+WASI adapter and end-to-end acceptance gates remain pending. Production code and
+its 5,074-line count are unchanged; the shared experiment inode layer grows
+228 → 238 lines. Restored original/inode checks and strict all-target experiment
+clippy pass. Full locked host suite passes 91 unit/67 integration, eleven ignored.
+No demo rerun for this experiment-only milestone. Review found no bounded-slice
+implementation blocker; that is not approval of a production swap.

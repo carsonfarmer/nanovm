@@ -1,4 +1,8 @@
 //! Bounded flat-namespace inode proof; not a WASI adapter.
+#[cfg(test)]
+#[path = "failure.rs"]
+mod failure;
+
 use super::{Backend, LENGTHS, PAGE, page, payload, put_page, remove_page, storage};
 use anyhow::{Result, ensure};
 use redb::{ReadableTable, TableDefinition, WriteTransaction};
@@ -13,6 +17,7 @@ use std::{
 };
 
 const NAMES: TableDefinition<&str, u64> = TableDefinition::new("names");
+const ORPHANS: TableDefinition<u64, ()> = TableDefinition::new("orphans");
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -35,7 +40,10 @@ struct Volume {
 impl Volume {
     fn open(kind: &str, root: &Path, limits: Limits) -> Result<Self> {
         ensure!(matches!(kind, "pages" | "hashed"));
-        let mut backend = Backend::open_cached(kind, root, limits.cache)?;
+        Self::from_backend(Backend::open_cached(kind, root, limits.cache)?, limits)
+    }
+
+    fn from_backend(mut backend: Backend, limits: Limits) -> Result<Self> {
         backend.begin()?;
         let mut volume = Self {
             backend,
@@ -47,6 +55,7 @@ impl Volume {
             limits,
         };
         volume.tx().open_table(NAMES)?;
+        volume.tx().open_table(ORPHANS)?;
         volume.recover()?;
         Ok(volume)
     }
@@ -162,16 +171,12 @@ impl Volume {
     }
 
     fn collect(&mut self, inode: u64) -> Result<()> {
-        if self.handles.values().any(|&id| id == inode) {
+        if self.tx().open_table(ORPHANS)?.get(inode)?.is_none() || self.handles.values().any(|&id| id == inode) {
             return Ok(());
-        }
-        for entry in self.tx().open_table(NAMES)?.iter()? {
-            if entry?.1.value() == inode {
-                return Ok(());
-            }
         }
         let length = self.len(inode)?;
         self.backend.delete(&inode.to_string())?;
+        self.tx().open_table(ORPHANS)?.remove(inode)?;
         self.bytes -= length;
         self.files -= 1;
         Ok(())
@@ -188,6 +193,7 @@ impl Volume {
     fn unlink(&mut self, name: &str) -> Result<()> {
         let inode = self.named(name)?.ok_or_else(|| anyhow::anyhow!("not found"))?;
         self.tx().open_table(NAMES)?.remove(name)?;
+        self.tx().open_table(ORPHANS)?.insert(inode, ())?;
         self.dirty();
         self.collect(inode)
     }
@@ -209,6 +215,7 @@ impl Volume {
         }
         self.dirty();
         if let Some(old) = replaced {
+            self.tx().open_table(ORPHANS)?.insert(old, ())?;
             self.collect(old)?;
         }
         Ok(())
@@ -229,6 +236,14 @@ impl Volume {
         self.files = entries.len() as u64;
         for (id, _) in entries {
             self.next_inode = self.next_inode.max(id + 1);
+        }
+        let orphans = self
+            .tx()
+            .open_table(ORPHANS)?
+            .iter()?
+            .map(|entry| entry.map(|(id, _)| id.value()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for id in orphans {
             self.collect(id)?;
         }
         ensure!(
@@ -518,6 +533,49 @@ fn benchmark(kind: &str, root: &Path, cache: usize, workload: &str, size: usize,
     Ok(())
 }
 
+fn scale(kind: &str, root: &Path, count: u64) -> Result<()> {
+    let limits = Limits {
+        bytes: count + 16,
+        files: count + 8,
+        handles: 8,
+        cache: 65536,
+    };
+    let mut v = Volume::open(kind, root, limits)?;
+    for i in 0..count {
+        let h = v.create(&format!("f{i:05}"))?;
+        v.write(h, 0, &[i as u8])?;
+        v.close(h)?;
+    }
+    let h = v.create("orphan")?;
+    v.write(h, 0, b"lost")?;
+    v.unlink("orphan")?;
+    v.finish(true)?;
+    drop(v);
+    let start = Instant::now();
+    let mut v = Volume::open(kind, root, limits)?;
+    let reopen_us = start.elapsed().as_secs_f64() * 1e6;
+    ensure!(v.files == count && v.bytes == count, "recovery kept orphan data");
+    let start = Instant::now();
+    for _ in 0..1000 {
+        let h = v.open_file(&format!("f{:05}", count - 1))?;
+        v.close(h)?;
+    }
+    let open_close_us = start.elapsed().as_secs_f64() * 1e6 / 1000.;
+    // Check every file, not only the counters: collection must never remove named inodes.
+    for i in 0..count {
+        let h = v.open_file(&format!("f{i:05}"))?;
+        ensure!(v.read(h)? == [i as u8], "recovery changed named file {i}");
+        v.close(h)?;
+    }
+    v.backend.audit()?;
+    v.finish(true)?;
+    println!(
+        "{}",
+        serde_json::json!({"kind":kind,"files":count,"reopen_us":reopen_us,"open_close_us":open_close_us})
+    );
+    Ok(())
+}
+
 pub(super) fn run(args: &[String]) -> Result<()> {
     if args[0] == "inode-child" {
         return crash(&args[1], Path::new(&args[2]), Some(&args[3]));
@@ -525,7 +583,13 @@ pub(super) fn run(args: &[String]) -> Result<()> {
     let root = std::env::current_dir()?.join(format!("target/fs-inodes-{}", std::process::id()));
     ensure!(!root.exists());
     fs::create_dir_all(&root)?;
-    if args[0] == "density" {
+    if args[0] == "inode-scale" {
+        for kind in ["pages", "hashed"] {
+            for count in [1000, 10000] {
+                scale(kind, &root.join(format!("{kind}-{count}")), count)?;
+            }
+        }
+    } else if args[0] == "density" {
         let kind = &args[1];
         let cache: usize = args[2].parse()?;
         let count: usize = args[3].parse()?;

@@ -92,22 +92,25 @@ impl Backend {
             let db = Database::builder()
                 .set_cache_size(cache)
                 .create(root.join("store.redb"))?;
-            let mut tx = db.begin_write()?;
-            tx.set_durability(Durability::Immediate)?;
-            // Conservative untrusted-data policy, identical for both candidates.
-            tx.set_two_phase_commit(true);
-            tx.open_table(LENGTHS)?;
-            tx.open_table(PAGES)?;
-            tx.open_table(BLOBS)?;
-            tx.open_table(REFS)?;
-            tx.commit()?;
-            Ok(Self::Pages {
-                db,
-                tx: None,
-                hashed: kind == "hashed",
-                dirty: false,
-            })
+            Self::pages(db, kind == "hashed")
         }
+    }
+
+    fn pages(db: Database, hashed: bool) -> Result<Self> {
+        let mut tx = db.begin_write()?;
+        tx.set_durability(Durability::Immediate)?;
+        tx.set_two_phase_commit(true);
+        tx.open_table(LENGTHS)?;
+        tx.open_table(PAGES)?;
+        tx.open_table(BLOBS)?;
+        tx.open_table(REFS)?;
+        tx.commit()?;
+        Ok(Self::Pages {
+            db,
+            tx: None,
+            hashed,
+            dirty: false,
+        })
     }
 
     fn begin(&mut self) -> Result<()> {
