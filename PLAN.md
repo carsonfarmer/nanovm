@@ -471,7 +471,9 @@ Count all replacement runtime and provider code, not only deleted journal lines;
 report latency, CPU, live-object memory, physical storage and ownership complexity.
 The review's missing database-name sync is fixed with real syscall-error coverage;
 shutdown now waits for stream/database destruction and the actual capped adapter
-retains exclusive locks in the jail. Finish stream-after-descriptor-drop,
+retains exclusive locks in the jail. Real reader/writer/directory streams now pass
+descriptor-drop, acceptance, quota-reclamation and rejection/restart coverage;
+premature inode release fails the regression, and restored code passes. Finish
 persistent-cap/RSS amplification, ancestor-directory durability and backend-neutral
 optional SQLite oracles. Investigate eager database creation/reopening before
 accepting cold/churn regressions. [Current evidence and successor prompt](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05).

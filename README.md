@@ -278,6 +278,11 @@ density. All replacement code would raise
 runtime from 5,074 to about 5,424 lines; no reduction or overall simplicity win is
 claimed. The linked protocol records review gaps and matched results.
 
+The real-component stream regression now covers descriptor drop, unlink/replacement,
+acceptance, continued reader/writer/directory-stream use, exact entry-quota reclamation,
+rejection and restart. Premature inode release fails it; restored code passes.
+This test-only follow-up does not change runtime LOC or the adoption gates.
+
 **`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 
 ## Calls between objects

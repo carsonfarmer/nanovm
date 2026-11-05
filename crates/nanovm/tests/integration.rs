@@ -3171,19 +3171,64 @@ async fn database_creation_requires_durable_name() {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread")]
-async fn post_return_work_keeps_context_and_reports_commit_failure() {
-    use http_body_util::BodyExt;
-    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
-    use prost::Message;
-    let Some(marker) = sync_fault_process("post_return_work_keeps_context_and_reports_commit_failure") else { return };
+fn post_return_fixture() -> Vec<u8> {
     // A private fixture, outside guests/** and its publishing workflow.
     let build = std::process::Command::new("cargo").args([
         "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
         "crates/nanovm/tests/post-return/Cargo.toml", "--target-dir", "target/test-guest",
     ]).current_dir(repo()).status().unwrap();
     assert!(build.success());
-    let wasm = std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap();
+    std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap()
+}
+
+#[cfg(all(target_os = "linux", feature = "page-fs"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_retain_unlinked_inodes_across_acceptance() {
+    use http_body_util::BodyExt;
+    let wasm = post_return_fixture();
+    let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = gate.local_addr().unwrap();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let permit = release.clone();
+    let server = tokio::spawn(nanovm::server::serve_http1(gate, move |_| {
+        let permit = permit.clone();
+        async move {
+            permit.acquire().await.unwrap().forget();
+            nanovm::server::ok_json(serde_json::json!({}))
+        }
+    }));
+    let cfg = node_cfg("retained_streams", 2);
+    let mut app = app("counter");
+    app.limits.max_files = 4;
+    app.limits.egress = vec![address.to_string()];
+    let node = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
+    let response = node.dispatch("a", http::Request::builder()
+        .uri(format!("/retained?gate={address}")).body(bytes::Bytes::new()).unwrap()).await;
+    if response.status() != 200 {
+        panic!("retained-stream fixture failed: {:?}", response.into_body().collect().await.unwrap().to_bytes());
+    }
+    release.add_permits(1);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body, "retained");
+    assert_eq!(get(&node, "a", "/retained-state").await.body, "new/x");
+    let failed = get(&node, "a", "/retained-reject").await;
+    assert_eq!(failed.error.as_deref(), Some("guest-error"), "{}", failed.body);
+    assert_eq!(get(&node, "a", "/retained-state").await.body, "new/x");
+    node.shutdown().await;
+    let reopened = Node::new(cfg, &app, &wasm, None).unwrap();
+    assert_eq!(get(&reopened, "a", "/retained-state").await.body, "new/x");
+    reopened.shutdown().await;
+    server.abort();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn post_return_work_keeps_context_and_reports_commit_failure() {
+    use http_body_util::BodyExt;
+    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
+    use prost::Message;
+    let Some(marker) = sync_fault_process("post_return_work_keeps_context_and_reports_commit_failure") else { return };
+    let wasm = post_return_fixture();
     let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let logs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
