@@ -89,6 +89,20 @@ async fn main() -> anyhow::Result<()> {
         ensure!(r.status == 204, "cold: {} {}", r.status, r.body);
     }
     println!("cold,4,100,{:.3}", start.elapsed().as_secs_f64() * 10.0);
+    if std::env::args().any(|arg| arg == "--density") {
+        let before = nanovm::metrics::rss_bytes();
+        let value = "x".repeat(1048576);
+        for i in 0..32 {
+            let r = load::request(&node, "PUT", &format!("large-{i}"), "/kv/key", &value).await;
+            ensure!(r.status == 204, "large object: {} {}", r.status, r.body);
+            let r = load::request(&node, "GET", &format!("large-{i}"), "/kv/key", "").await;
+            ensure!(r.status == 200 && r.body == value, "large object read mismatch");
+        }
+        println!(
+            "large-object-rss-kib,32,{:.1}",
+            nanovm::metrics::rss_bytes().saturating_sub(before) as f64 / 32.0 / 1024.0
+        );
+    }
     node.shutdown().await;
     drop(node);
     std::fs::remove_dir_all(dir)?;

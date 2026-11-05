@@ -6,6 +6,78 @@ reject. It does not prescribe an undo log. No production code, guests, root
 dependencies or Wasmtime patches changed in the original storage-only experiment.
 The separate runtime candidate below is now available for comparison, not adoption.
 
+## Adoption decision: retain journaling (2026-11-05)
+
+The goal is a fast, durable filesystem shared by KV, SQL and other interfaces.
+**Reject the current per-object redb replacement for adoption; keep journaling.**
+This does not reject transactional pages in principle. The candidate makes small
+durable writes substantially faster, but it does not satisfy the combined lifecycle,
+memory and implementation-size goals. No weaker durability setting was considered.
+
+Plain pages received a real runtime comparison on `plain-fs-evaluation`, not a
+rejection inferred from hashing. Removing content hashes/reference tables, keeping
+one table open per write, using range deletion, and raising the soft cache target
+from 64 KiB to 4 MiB brought unique 1 MiB PUT from 11.28 ms to roughly journal
+parity. Cache alone measured 8.91 ms; batching mattered. Startup now destroys an
+already-decoded orphan without a redundant lookup. An independent reviewer found
+no correctness blocker in these changes or demonstrated small fix for the remaining
+startup/namespace costs.
+
+Final three alternating runs, identical composed guests, no concurrent builds or
+tests, Immediate/two-phase commits throughout (medians):
+
+| Measurement | Journal | Optimized plain pages |
+|---|---:|---:|
+| PUT 128 B | 2.897 ms | 0.940 ms |
+| PUT 16 KiB | 3.436 ms | 0.997 ms |
+| PUT unique 1 MiB | 7.209 ms | 6.853 ms |
+| GET 1 MiB | 3.067 ms | 3.028 ms |
+| Cold objects/s | 3,040 | 989 |
+| Recovery after trap/s | 1,354 | 310 |
+| Churn objects/s | 4,562 | 849 |
+| Idle-object RSS increment | 143 KiB | 210 KiB |
+| RSS increment per additional 1 MiB object (32 objects) | 5,394 KiB | 7,607 KiB |
+| Estimated replacement runtime LOC | 5,074 | 5,368 |
+
+RSS includes guest linear memories and allocator retention; it is an observed
+process increment, not a per-object cap or pure database allocation measurement.
+Plain replacement modules are 611 adapter + 643 inode + 68 cap = 1,322 lines,
+versus journal/quota 476 + 564 = 1,040. Temporary feature wiring accounts for the
+remaining difference in the replacement estimate. Actual all-module tree: 6,408.
+Cold/recovery require opening a database, acquiring locks, opening tables/scanning
+inodes and syncing its directory per instance. Clean recovery already skips commit;
+deleting that commit is not a fix. Avoiding these costs needs a different database
+lifetime or a lazily materialized namespace, not leftover hash-code cleanup. The
+custom inode namespace and stream adapter replace services supplied by the OS and
+stock WASI in the journal path. Adding further lifetime machinery does not presently
+offer a demonstrated simpler implementation.
+
+Reproduce with release `kv_bench <composed-counter.wasm> --unique --density` and
+`bench --quick`, alternating saved journal/plain binaries on disposable roots.
+The density extension verifies all bytes in 32 additional 1 MiB objects. Logs and
+binaries are `.amp/in/fs-integrated/{journal,plain}-final-*`; earlier isolated
+cache/batch controls are alongside them. A syscall profile of the small-cache
+plain run recorded 602,566 reads and 264,177 writes; its traced wall times were not
+used as benchmark results.
+
+The plain full suite passed 88 unit/69 integration tests (11 ignored) on rerun.
+Another restored parallel run again failed `kv_counts_against_the_disk_quota`
+with an instance termination. This recurring failure is not claimed fixed or
+explained merely by passing a rerun. A mutation
+that retained truncated pages fails the held-handle/truncate regression, then was
+restored with `git checkout --` and an empty unstaged diff confirmed. This is not a
+claim of completed persistent-cap/runtime or ancestor-power-loss certification:
+those unfinished adoption checks are unnecessary to reject this implementation,
+and would still be required before reviving it. The historical hash results below
+remain valid for that candidate, not descriptions of the current plain branch.
+
+**Successor prompt:** retain the experimental branches and results, keep the journal
+as production storage, and implement the source-supported improvements from
+`cf/optimistic-feynman-62f1a0` as measured independent changes. Preserve confinement,
+both durable acceptance gates, immediate tentative visibility and rejection. Do not
+attribute scheduler/provider improvements to the filesystem comparison, publish
+migrated guests, or claim experimental-code removal as production LOC savings.
+
 ## Runtime integration checkpoint (2026-11-05)
 
 `cargo test --locked -p nanovm --features page-fs` selects the real hash-addressed

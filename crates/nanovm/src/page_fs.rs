@@ -80,7 +80,7 @@ impl QuotaGuard {
                 .checked_mul(1 << 20)
                 .ok_or_else(|| anyhow::anyhow!("disk limit overflow"))?,
             limits.max_files,
-            65536,
+            4 << 20,
         )?;
         // File sync alone does not durably publish the database's name.
         File::open(path)?.sync_all()?;

@@ -265,7 +265,13 @@ blocks or host memory; the cache target is not an RSS cap.
 These are bounded storage checks, not production integration or physical
 power-loss certification; [protocol and remaining gates](experiments/fs-backends/README.md#hardening-orphan-lookup-and-storage-failures-2026-11-05).
 
-The [runtime candidate](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05)
+**Storage decision:** keep journaling after measuring both hash and optimized plain
+pages. Plain pages improve small durable writes about 3× and match large-write
+latency, but cold/recovery/churn remain 3–5× slower and replacement code is 294
+lines larger. This rejects the current per-object redb design for adoption, not
+page-based filesystems in principle. [Simple comparison, costs and reproduction](experiments/fs-backends/README.md#adoption-decision-retain-journaling-2026-11-05).
+
+The historical [runtime candidate](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05)
 is now integrated behind temporary `page-fs`, using stock WASIp3 bindings and one
 file-backed transactional database for `/data` and `/tmp`. Use disposable separate
 data roots; no migration or compatibility path exists. Its provisional `storage_mb`

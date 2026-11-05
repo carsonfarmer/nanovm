@@ -1,4 +1,4 @@
-//! Transactional inode namespace with shared, hash-addressed 4 KiB pages.
+//! Transactional inode namespace with directly addressed 4 KiB pages.
 //!
 //! One candidate write transaction owns both roots. Dropping it rejects the candidate;
 //! committing publishes it without invalidating retained inode identities. Storage
@@ -7,7 +7,6 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use redb::{Database, Durability, ReadableTable, StorageBackend, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -28,8 +27,6 @@ const NODES: TableDefinition<u64, &[u8]> = TableDefinition::new("inodes");
 const NAMES: TableDefinition<(u64, &str), u64> = TableDefinition::new("names");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const PAGES: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("pages");
-const BLOBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blobs");
-const REFS: TableDefinition<&[u8], u64> = TableDefinition::new("refs");
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 struct Stamp {
@@ -122,8 +119,6 @@ impl Volume {
         tx.open_table(NAMES)?;
         tx.open_table(META)?;
         tx.open_table(PAGES)?;
-        tx.open_table(BLOBS)?;
-        tx.open_table(REFS)?;
         let mut v = Self {
             tx: Some(tx),
             db,
@@ -170,13 +165,11 @@ impl Volume {
             after = id;
             v.bytes = v.bytes.checked_add(node.size).context("logical byte count overflow")?;
             v.files = v.files.checked_add(1).context("inode count overflow")?;
-            if node.root == TMP {
+            if node.root == TMP || !node.linked {
                 if node.linked {
                     v.tx().open_table(NAMES)?.remove((node.parent, node.name.as_str()))?;
                 }
                 v.destroy(id, &node)?;
-            } else if !node.linked {
-                v.collect(id)?;
             }
         }
         ensure!(
@@ -482,88 +475,38 @@ impl Volume {
         })
     }
 
-    fn page(&self, id: u64, index: u64, out: &mut [u8; PAGE]) -> Result<()> {
+    fn page(pages: &redb::Table<(u64, u64), &[u8]>, id: u64, index: u64, out: &mut [u8; PAGE]) -> Result<()> {
         out.fill(0);
-        let pages = self.tx().open_table(PAGES)?;
-        if let Some(hash) = pages.get((id, index))? {
-            let blobs = self.tx().open_table(BLOBS)?;
-            let blob = blobs.get(hash.value())?.context("missing referenced page")?;
+        if let Some(blob) = pages.get((id, index))? {
             ensure!(blob.value().len() == PAGE, "invalid page length");
             out.copy_from_slice(blob.value());
         }
         Ok(())
     }
 
-    fn remove_page(&self, id: u64, index: u64) -> Result<()> {
-        let hash = self
-            .tx()
-            .open_table(PAGES)?
-            .remove((id, index))?
-            .map(|h| h.value().to_vec());
-        if let Some(hash) = hash {
-            let mut refs = self.tx().open_table(REFS)?;
-            let count = refs
-                .get(hash.as_slice())?
-                .context("missing page reference count")?
-                .value();
-            ensure!(count > 0, "zero page reference count");
-            if count == 1 {
-                refs.remove(hash.as_slice())?;
-                self.tx().open_table(BLOBS)?.remove(hash.as_slice())?;
-            } else {
-                refs.insert(hash.as_slice(), count - 1)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn put_page(&self, id: u64, index: u64, bytes: &[u8; PAGE]) -> Result<()> {
-        let hash = Sha256::digest(bytes);
-        if self
-            .tx()
-            .open_table(PAGES)?
-            .get((id, index))?
-            .is_some_and(|old| old.value() == hash.as_slice())
-        {
+    fn put_page(pages: &mut redb::Table<(u64, u64), &[u8]>, id: u64, index: u64, bytes: &[u8; PAGE]) -> Result<()> {
+        if pages.get((id, index))?.is_some_and(|old| old.value() == bytes) {
             return Ok(());
         }
-        self.remove_page(id, index)?;
         // Holes need no physical page, but their logical length is still charged.
         if bytes.iter().all(|&b| b == 0) {
-            return Ok(());
+            pages.remove((id, index))?;
+        } else {
+            pages.insert((id, index), bytes.as_slice())?;
         }
-        let mut refs = self.tx().open_table(REFS)?;
-        let count = refs.get(hash.as_slice())?.map_or(0, |v| v.value());
-        if count == 0 {
-            self.tx().open_table(BLOBS)?.insert(hash.as_slice(), bytes.as_slice())?;
-        }
-        refs.insert(
-            hash.as_slice(),
-            count.checked_add(1).context("page reference count overflow")?,
-        )?;
-        self.tx().open_table(PAGES)?.insert((id, index), hash.as_slice())?;
         Ok(())
     }
 
     fn truncate_pages(&self, id: u64, size: u64) -> Result<()> {
         let first = size.div_ceil(PAGE as u64);
-        loop {
-            let next = self
-                .tx()
-                .open_table(PAGES)?
-                .range((id, first)..=(id, u64::MAX))?
-                .next()
-                .transpose()?
-                .map(|(key, _)| key.value().1);
-            let Some(index) = next else { break };
-            self.remove_page(id, index)?;
-        }
+        let mut pages = self.tx().open_table(PAGES)?;
+        pages.retain_in((id, first)..=(id, u64::MAX), |_, _| false)?;
         let tail = (size % PAGE as u64) as usize;
         if tail != 0 {
             let mut page = [0; PAGE];
-            self.page(id, size / PAGE as u64, &mut page)?;
+            Self::page(&pages, id, size / PAGE as u64, &mut page)?;
             page[tail..].fill(0);
-            self.put_page(id, size / PAGE as u64, &page)?;
+            Self::put_page(&mut pages, id, size / PAGE as u64, &page)?;
         }
         Ok(())
     }
@@ -598,10 +541,8 @@ impl Volume {
             let end = offset + count as u64;
             out[..count].fill(0);
             let pages = v.tx().open_table(PAGES)?;
-            let blobs = v.tx().open_table(BLOBS)?;
             for entry in pages.range((id, offset / PAGE as u64)..=(id, (end - 1) / PAGE as u64))? {
-                let (key, hash) = entry?;
-                let blob = blobs.get(hash.value())?.context("missing referenced page")?;
+                let (key, blob) = entry?;
                 ensure!(blob.value().len() == PAGE, "invalid page length");
                 let start = key.value().1 * PAGE as u64;
                 let within = offset.saturating_sub(start) as usize;
@@ -629,17 +570,19 @@ impl Volume {
             let size = node.size.max(offset + count as u64);
             let mut done = 0;
             let mut page = [0; PAGE];
+            let mut pages = v.tx().open_table(PAGES)?;
             while done < count {
                 let at = offset + done as u64;
                 let within = (at % PAGE as u64) as usize;
                 let n = (count - done).min(PAGE - within);
                 if within != 0 || n != PAGE {
-                    v.page(id, at / PAGE as u64, &mut page)?;
+                    Self::page(&pages, id, at / PAGE as u64, &mut page)?;
                 }
                 page[within..within + n].copy_from_slice(&bytes[done..done + n]);
-                v.put_page(id, at / PAGE as u64, &page)?;
+                Self::put_page(&mut pages, id, at / PAGE as u64, &page)?;
                 done += n;
             }
+            drop(pages);
             v.bytes += size - node.size;
             node.size = size;
             node.mtime = Stamp::now();

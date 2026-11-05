@@ -454,7 +454,14 @@ namespace-scan complexity and physical amplification must inform integration.
 This proof does not include WASI directories/streams, mixed SQL workloads, storage
 fault recovery or replica export; keep the production host unchanged.
 
-**Integration gate (Q80):** `hashed-fs-integration` owns the next implementation.
+**Decision (Q84):** retain journaling. Optimized plain pages also received a real
+matched comparison: small writes improve about 3× and unique 1 MiB writes reach
+parity, but cold/recovery/churn remain 3–5× slower and replacement runtime grows
+294 lines. This rejects the present per-object redb replacement, not pages in
+principle. Continue the source-supported journal/runtime improvements from the
+other branch with independent controls. [Decision and reproduction](experiments/fs-backends/README.md#adoption-decision-retain-journaling-2026-11-05).
+
+**Historical integration gate (Q80):** `hashed-fs-integration` owns the next implementation.
 Whole-namespace orphan scans are removed (Q81), and real-file I/O failure matrices
 cover mutations and orphan recovery with shared content. A real component now proves
 stock-WASI resource mapping and guest destruction without patches. Fixed file-length
