@@ -11,6 +11,16 @@ impl wasip3::exports::http::handler::Guest for Probe {
         if req.path == "/callee" {
             return util::text(200, "callee");
         }
+        if req.path == "/state" {
+            let mut state = Vec::new();
+            for file in ["before.txt", "after.txt", "other.txt"] {
+                state.push(String::from_utf8(util::read_file("/data", file).await.unwrap()).unwrap());
+            }
+            return util::text(200, state.join("/"));
+        }
+        for file in ["before.txt", "after.txt", "other.txt"] {
+            util::write_file("/data", file, b"old".to_vec()).await.unwrap();
+        }
         let gate = req.q("gate").unwrap().to_owned();
         let (mut tx, rx) = wasip3::wit_stream::new();
         let (trailers, trailers_rx) = wasip3::wit_future::new(|| Ok(None));
@@ -23,6 +33,7 @@ impl wasip3::exports::http::handler::Guest for Probe {
             eprintln!("post-return diagnostic");
             assert_eq!(util::post("nanovm", "/objects/child/callee", vec![]).await.unwrap(), 200);
             util::write_file("/data", "after.txt", b"after".to_vec()).await.unwrap();
+            util::write_file("/data", "other.txt", b"other".to_vec()).await.unwrap();
             assert_eq!(util::post(&gate, "/finish", vec![]).await.unwrap(), 200);
             assert!(tx.write_all(b"finished".to_vec()).await.is_empty());
         });

@@ -12,6 +12,14 @@ pub mod link;
 pub mod metrics;
 pub mod object;
 pub mod proxy;
+#[cfg(feature = "page-fs")]
+mod capped;
+#[cfg(feature = "page-fs")]
+mod page_store;
+#[cfg(feature = "page-fs")]
+#[path = "page_fs.rs"]
+pub mod quota;
+#[cfg(not(feature = "page-fs"))]
 pub mod quota;
 pub mod registry;
 pub mod server;

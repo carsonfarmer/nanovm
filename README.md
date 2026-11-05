@@ -146,7 +146,7 @@ A worker reads its config and component from stdin, then jails itself while it s
   - `clone` for threads only
   - no memory that is writable and executable at once
   - limits can be read, never raised
-  - `fcntl` for descriptor flags only: no `F_SETOWN` or `F_SETSIG`, which would have the kernel signal another process of the same uid
+  - `fcntl` for descriptor flags and OFD file locks, plus `flock`: no `F_SETOWN` or `F_SETSIG`, which would have the kernel signal another process of the same uid
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
@@ -256,7 +256,7 @@ not switched. Acceptance requires mixed KV/SQL/raw-file tests through the real
 WASI/jail path and measured total-code, latency/CPU and memory improvements.
 The separate improvement branch has been assessed for reusable ideas (HANDOFF,
 Q80); its combined scheduler/guest/runtime results are not filesystem benchmarks.
-The candidate now uses an atomic orphan index rather than namespace scans, and
+The storage experiment now uses an atomic orphan index rather than namespace scans, and
 passes 818 injected mutation/commit/recovery I/O failures, including partial
 writes. Six additional cases exhaust fixed database-file-length ceilings, reopen
 under the same cap, reclaim shared-content orphans, and retain usable small
@@ -264,6 +264,19 @@ writes/deletes and exclusive locks. The ceiling bounds file length, not allocate
 blocks or host memory; the cache target is not an RSS cap.
 These are bounded storage checks, not production integration or physical
 power-loss certification; [protocol and remaining gates](experiments/fs-backends/README.md#hardening-orphan-lookup-and-storage-failures-2026-11-05).
+
+The [runtime candidate](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05)
+is now integrated behind temporary `page-fs`, using stock WASIp3 bindings and one
+file-backed transactional database for `/data` and `/tmp`. Use disposable separate
+data roots; no migration or compatibility path exists. Its provisional `storage_mb`
+limit (default 256) bounds database file length independently of logical `disk_mb`;
+64 KiB is a cache target, not an RSS cap. Full candidate tests pass, including real
+directory-sync failure and jailed capped-adapter locking. **It is not ready to
+replace the journal:** repeated-value KV writes improve (128 B: 2.82 → 0.91 ms),
+but unique 1 MiB PUT regresses 7.15 → 16.76 ms, as do cold/reopen throughput and
+density. All replacement code would raise
+runtime from 5,074 to about 5,424 lines; no reduction or overall simplicity win is
+claimed. The linked protocol records review gaps and matched results.
 
 **`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
 

@@ -4,7 +4,10 @@ use nanovm::{
     config::{AppConfig, NodeConfig},
     table::Node,
 };
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 #[path = "../support/load.rs"]
 #[allow(dead_code)]
 mod load;
@@ -12,6 +15,7 @@ mod load;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let wasm = std::fs::read(std::env::args().nth(1).expect("counter wasm path"))?;
+    let unique = std::env::args().any(|arg| arg == "--unique");
     let dir = PathBuf::from(format!("/tmp/nanovm-kv-bench-{}", std::process::id()));
     let cfg = NodeConfig {
         data_dir: dir.clone(),
@@ -32,12 +36,26 @@ async fn main() -> anyhow::Result<()> {
     nanovm::engine::preflight(&cfg)?;
     let node = Node::new(cfg, &app, &wasm, None)?;
     for size in [128, 16384, 1048576] {
-        let value = "x".repeat(size);
+        let mut value = "x".repeat(size);
         let r = load::request(&node, "PUT", "warm", "/kv/key", &value).await;
         ensure!(r.status == 204, "warm: {} {}", r.status, r.body);
         for (method, count) in [("GET", 1000), ("PUT", 200)] {
-            let start = Instant::now();
-            for _ in 0..count {
+            let mut elapsed = Duration::ZERO;
+            for sequence in 0..count {
+                // Change every page, with little repeated content. Generation is
+                // outside request timing, identical for both backend controls.
+                if unique && method == "PUT" {
+                    let mut seed = sequence as u64 + 1;
+                    value = (0..size)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            char::from(b'!' + (seed % 90) as u8)
+                        })
+                        .collect();
+                }
+                let start = Instant::now();
                 let r = load::request(
                     &node,
                     method,
@@ -46,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
                     if method == "PUT" { &value } else { "" },
                 )
                 .await;
+                elapsed += start.elapsed();
                 ensure!(
                     r.status == if method == "GET" { 200 } else { 204 },
                     "{} {}",
@@ -58,9 +77,11 @@ async fn main() -> anyhow::Result<()> {
             }
             println!(
                 "{method},{size},{count},{:.3}",
-                start.elapsed().as_secs_f64() * 1000.0 / count as f64
+                elapsed.as_secs_f64() * 1000.0 / count as f64
             );
         }
+        let r = load::request(&node, "GET", "warm", "/kv/key", "").await;
+        ensure!(r.status == 200 && r.body == value, "final write mismatch");
     }
     let start = Instant::now();
     for n in 0..100 {

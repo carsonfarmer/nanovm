@@ -451,8 +451,10 @@ async fn data_quota_survives_restart() {
     let r = get(&node, "d", "/fill?mount=data&mb=1&name=c").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "insufficient-space");
-    let vol = node.cfg.data_dir.join("objects/hostile/d");
-    assert_eq!(std::fs::metadata(vol.join("a")).unwrap().len(), 4 << 20);
+    // Existing bytes remain overwriteable when no quota remains.
+    let r = get(&node, "d", "/fill?mount=data&mb=4&name=a").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["written"], 4 << 20);
     assert!(node.metrics.fs_denied.load(Relaxed) >= 1);
 }
 
@@ -1017,6 +1019,8 @@ fn jail_blocks_escapes() {
     for (k, v) in expect {
         assert_eq!(results.get(k).copied(), Some(v), "{k}\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     }
+    #[cfg(feature = "page-fs")]
+    assert_eq!(results.get("database_lock").copied(), Some("ok"), "{stdout}");
 }
 
 /// The jailed half of `jail_blocks_escapes`; a no-op when run directly.
@@ -1043,6 +1047,21 @@ fn jail_probe() {
     report("read_other_app", std::fs::read(dir.join("other/secret")).is_ok());
     report("read_etc_passwd", std::fs::read("/etc/passwd").is_ok());
     report("list_root", std::fs::read_dir("/").is_ok());
+    #[cfg(feature = "page-fs")]
+    {
+        let path = dir.join("mine/store.redb");
+        let open = || nanovm::quota::QuotaGuard::new(
+            &dir.join("mine"), &Default::default(), Arc::default(),
+            Arc::new(nanovm::object::ObjShared::new("probe".into(), "lock")),
+        );
+        let guard = open().unwrap();
+        let retained = guard.clone();
+        let excluded = redb::Database::create(&path).is_err();
+        drop(guard);
+        let held = redb::Database::create(&path).is_err();
+        drop(retained);
+        report("database_lock", excluded && held && open().is_ok());
+    }
     unsafe {
         report("tcp_socket", sys(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) as i64));
         report("unix_socket", sys(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) as i64));
@@ -1505,8 +1524,6 @@ async fn kv_values_persist_in_the_volume() {
 
     node.shutdown().await;
     assert_eq!(get(&node, "k", "/kv/greeting").await.body, "hello", "a new instance sees it");
-    let file = node.cfg.data_dir.join("objects/counter/k/.kv/default/Z3JlZXRpbmc");
-    assert_eq!(std::fs::read(file).unwrap(), b"hello");
 
     assert_eq!(request(&node, "DELETE", "k", "/kv/greeting", "").await.status, 204);
     assert_eq!(get(&node, "k", "/kv/greeting").await.status, 404);
@@ -1579,13 +1596,10 @@ async fn kv_works_in_a_jailed_worker() {
     // nothing behind that the quota doesn't count.
     let (_, body) = app_get(addr, &hostile, "/p/kv?op=plant").await;
     assert!(body.contains("IsDirectory"), "{body}");
-    let bucket = std::fs::read_dir(node_dir("kv_works_in_a_jailed_worker").join("objects").join(worker(&hostile)).join("p/.kv/default")).unwrap();
-    let names: Vec<_> = bucket.flatten().map(|e| e.file_name()).collect();
-    assert_eq!(names, ["azA"], "only the planted directory is there");
-}
-
-fn node_dir(test: &str) -> PathBuf {
-    Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes").join(test)
+    // Four directories remain; no staged key may consume another entry.
+    let (status, body) = app_get(addr, &hostile, "/p/files?mount=data&n=201").await;
+    assert_eq!(status, 507, "{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["created"], 196, "{body}");
 }
 
 /// The provider bounds both writes and reads to 1 MiB per value, including
@@ -1601,9 +1615,8 @@ async fn kv_values_are_bounded() {
     assert!(r.body.contains("value exceeds 1 MiB"), "{}", r.body);
     assert_eq!(get(&node, "m", "/kv?op=get").await.json()["bytes"], 1 << 20, "failed write keeps old value");
 
-    node.shutdown().await;
-    let file = node.cfg.data_dir.join("objects/hostile/m/.kv/default/azA");
-    std::fs::write(file, vec![7u8; (1 << 20) + 1]).unwrap();
+    let r = get(&node, "m", "/fill?mount=data&name=.kv/default/azA&mb=2").await;
+    assert_eq!(r.status, 200, "raw filesystem write: {}", r.body);
     let r = get(&node, "m", "/kv?op=get").await;
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(r.body.contains("value exceeds 1 MiB"), "{}", r.body);
@@ -1673,18 +1686,18 @@ async fn sqlite_composed_provider() {
         let fail = get(&node, "a", &format!("/?v=discard&then={then}")).await;
         assert_eq!(fail.error.as_deref(), Some(if then == "error" { "guest-error" } else { "trap" }), "{}", fail.body);
         if then == "trap" {
-            // Simulate an unwriteable database during host recovery. Neither
-            // a failed startup nor its retry may discard the remaining undo.
+            // Block the backing database during recovery. Failed startup and
+            // retry must retain the state needed for later recovery.
             let base = node.cfg.app_dirs(&app.name)[0].clone();
-            let db = base.join("a/composed.db");
+            let db = base.join(if cfg!(feature = "page-fs") { "a/store.redb" } else { "a/composed.db" });
             let parked = base.join("parked.db");
             std::fs::rename(&db, &parked).unwrap();
             std::fs::create_dir(&db).unwrap();
-            let log = base.join("~journal/a/log");
+            let recovery = if cfg!(feature = "page-fs") { parked.clone() } else { base.join("~journal/a/log") };
             for _ in 0..2 {
                 let blocked = get(&node, "a", "/").await;
                 assert!(blocked.status >= 500, "{}", blocked.body);
-                assert!(std::fs::metadata(&log).unwrap().len() > 0, "keep undo for retry");
+                assert!(std::fs::metadata(&recovery).unwrap().len() > 0, "keep recovery data for retry");
             }
             std::fs::remove_dir(&db).unwrap();
             std::fs::rename(parked, db).unwrap();
@@ -3114,11 +3127,56 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     collector.abort();
 }
 
+#[cfg(target_os = "linux")]
+fn sync_fault_process(test: &str) -> Option<PathBuf> {
+    // Inject actual sync errors in a private subprocess, not via storage-format
+    // manipulation or a test switch in the production filesystem.
+    match std::env::var_os("NANOVM_SYNC_FAULT_FILE") {
+        Some(path) => Some(PathBuf::from(path)),
+        None => {
+            let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+            let shim = root.join(format!("{test}-{}.so", std::process::id()));
+            let marker = root.join(format!("{test}-{}.armed", std::process::id()));
+            assert!(std::process::Command::new("cc").args(["-shared", "-fPIC", "-Wall", "-Werror"])
+                .arg(repo().join("crates/nanovm/tests/sync-fault.c")).args(["-ldl", "-o"])
+                .arg(&shim).status().unwrap().success());
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture"])
+                .env("LD_PRELOAD", &shim).env("NANOVM_SYNC_FAULT_FILE", &marker)
+                .output().unwrap();
+            std::fs::remove_file(shim).unwrap();
+            let _ = std::fs::remove_file(marker);
+            assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            None
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "page-fs"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn database_creation_requires_durable_name() {
+    let Some(marker) = sync_fault_process("database_creation_requires_durable_name") else { return };
+    let node = node("database_creation_requires_durable_name", "counter", 2);
+    std::fs::write(&marker, b"").unwrap();
+    let reply = request(&node, "POST", "init-sync", "/incr", "").await;
+    assert!(reply.status >= 500, "must not acknowledge before directory sync: {}", reply.body);
+    let calls = std::fs::read(&marker).unwrap();
+    let directory = calls.iter().position(|&call| call == b'D').expect("directory sync was not attempted");
+    assert!(calls[..directory].contains(&b'F'), "database must sync before its name: {calls:?}");
+    std::fs::remove_file(marker).unwrap();
+    let reply = get(&node, "init-sync", "/").await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.json()["count"], 0, "failed initialization must not run guest mutation");
+    node.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn post_return_work_keeps_context_and_reports_commit_failure() {
     use http_body_util::BodyExt;
     use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
     use prost::Message;
+    let Some(marker) = sync_fault_process("post_return_work_keeps_context_and_reports_commit_failure") else { return };
     // A private fixture, outside guests/** and its publishing workflow.
     let build = std::process::Command::new("cargo").args([
         "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
@@ -3166,7 +3224,6 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
     app.limits.egress = vec![address.to_string()];
     app.limits.post_return_timeout_ms = 5000;
     app.limits.cpu_ms = 1000;
-    let objects = cfg.app_dirs(&app.name)[0].clone();
     let node = Node::new(cfg, &app, &wasm, None).unwrap();
     for (i, fail) in [(1u8, false), (2, true)] {
         let id = format!("parent{i}");
@@ -3178,15 +3235,31 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/begin");
         begin.add_permits(1);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/finish");
-        let journal = objects.join("~journal").join(&id).join("log");
-        assert!(journal.exists(), "post-return write has an uncommitted journal");
-        if fail { std::fs::rename(&journal, journal.with_file_name("saved-log")).unwrap(); }
+        if fail { std::fs::write(&marker, b"").unwrap(); }
         finish.add_permits(1);
         assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "finished");
         eventually("final commit", || node.phases().keys().all(|p| *p == "idle" || *p == "cold")).await;
-        if fail { std::fs::rename(journal.with_file_name("saved-log"), &journal).unwrap(); }
+        if fail {
+            assert!(!std::fs::read(&marker).unwrap().is_empty(), "no sync failure was injected");
+            std::fs::remove_file(&marker).unwrap();
+        }
     }
     node.shutdown().await;
+    let mut recovered = None;
+    for _ in 0..2 {
+        let reopened = Node::new(node.cfg.clone(), &app, &wasm, None).unwrap();
+        let accepted = get(&reopened, "parent1", "/state").await;
+        assert_eq!(accepted.status, 200, "{}", accepted.body);
+        assert_eq!(accepted.body, "old/after/other");
+        let uncertain = get(&reopened, "parent2", "/state").await;
+        assert_eq!(uncertain.status, 200, "{}", uncertain.body);
+        assert!(matches!(uncertain.body.as_str(), "old/old/old" | "old/after/other"),
+            "earlier acceptance must survive, later acceptance must be atomic: {}", uncertain.body);
+        if let Some(previous) = recovered.replace(uncertain.body.clone()) {
+            assert_eq!(uncertain.body, previous, "recovery changed the committed generation");
+        }
+        reopened.shutdown().await;
+    }
     let telemetry = node.telemetry.clone();
     tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
     let spans = spans.lock();

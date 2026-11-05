@@ -3,7 +3,100 @@
 Storage screening for W-18/Q78, not a replacement WASI filesystem. The requirement
 is a coherent, immediately visible tentative view that the host can accept or
 reject. It does not prescribe an undo log. No production code, guests, root
-dependencies or Wasmtime patches change in this experiment.
+dependencies or Wasmtime patches changed in the original storage-only experiment.
+The separate runtime candidate below is now available for comparison, not adoption.
+
+## Runtime integration checkpoint (2026-11-05)
+
+`cargo test --locked -p nanovm --features page-fs` selects the real hash-addressed
+WASIp3 adapter; the default remains the journal. This temporary A/B feature is not
+a compatibility layer or a migration. Use separate disposable data roots: old
+ordinary-file volumes are not imported. No `guests/**` changes or Wasmtime patches
+are part of this integration.
+
+The candidate has hierarchical stable inode identities, bounded range streams,
+shared logical quotas, held-unlinked charging, and atomic DATA/TMP roots in one
+file-backed redb database. Opening clears TMP and reclaims unheld orphans. Both
+host acceptance gates use Immediate/two-phase commits; guest sync cannot publish.
+Read-only acceptance performs no storage writes. `storage_mb=256` is an independent,
+provisional database-file-length ceiling, not a proven multiplier of `disk_mb`.
+The redb cache target is 64 KiB, not a total-memory guarantee.
+
+Integration exposed two real issues: the actor's live counter retired before all
+database/stream resources dropped, and redb continued without exclusion when the
+jail returned ENOSYS for OFD locking. Retirement now follows complete teardown;
+the jail permits OFD locks and flock but still denies signal-owner commands.
+The jailed locking regression opens the real capped adapter, not just bare redb.
+
+Independent review caught a missing directory sync for the new database name.
+The real syscall-error regression failed with an acknowledged mutation before
+the fix; initialization now syncs database contents then its directory before
+running guest work. Failure rejects initialization. Removing that sync fails the
+test; restoration uses `git checkout --` and an empty unstaged diff. This is not
+physical power-loss certification. The post-return failure test now reopens twice,
+requiring earlier accepted bytes and a stable, wholly old-or-new later generation.
+The inode's persisted linkage replaces a redundant ORPHANS table; recovery already
+streams inode metadata for accounting, with no namespace cross-product scan.
+
+Restored full candidate validation passes 88 unit and 68 integration tests, with
+11 optional tests ignored. Default validation passes 91 unit and 67 integration
+tests on rerun: its first run hit N-32's setup CPU-budget failure, not a claimed
+fix. The opt-in composed SQL contract also passes, including mixed SQL/file/KV
+rejection, obstructed startup/retry and restart. The demo against the saved page
+binary and a fresh disposable root passes all 70,000 normal requests, contains
+100 attacks, and serves 486 canary requests without failure or reported counter
+kills. Services and disposable data were removed afterward. Remaining optional
+SQL, stream-lifetime, hostile resource-bound and ancestor-directory durability
+gates remain to be completed. In
+particular, old optional tests that inspect host-side guest filenames are not
+valid oracles for this backend and must be adapted, not silently skipped.
+
+Three alternating release pairs use the identical composed counter, Wasmtime
+50.0.0, the existing `kv_bench`, isolated disposable volumes, and no overlapping
+builds/tests. Medians in milliseconds per request:
+
+| Operation | Journal | Page candidate |
+|---|---:|---:|
+| GET 128 B | 0.190 | 0.207 |
+| GET 16 KiB | 0.232 | 0.266 |
+| GET 1 MiB | 3.033 | 3.032 |
+| PUT 128 B | 2.817 | 0.911 |
+| PUT 16 KiB | 3.291 | 0.948 |
+| PUT 1 MiB | 7.282 | 5.217 |
+| Cold PUT 4 B | 4.079 | 4.468 |
+
+These PUTs repeat one value and contain identical pages; they favor deduplication.
+`kv_bench <counter.wasm> --unique` now changes every page between PUTs, with data
+generation excluded from timing and final byte equality checked. Three additional
+alternating pairs on the simplified candidate give median PUT 128 B **2.884/0.914
+ms**, 16 KiB **3.421/1.170 ms**, and 1 MiB **7.154/16.764 ms** (journal/pages).
+Large unique writes are **2.34× slower**, despite small-write wins. GETs remain
+repeated-content controls: **0.187/0.192**, **0.234/0.256**, **2.970/2.994 ms**;
+cold PUT is **3.882/4.182 ms**. Neither benchmark uses network HTTP.
+
+One matched `bench --quick` pair reports journal/page cold starts **2,775/958 per
+second**, warm concurrent GET **90,527/85,829**, concurrent writes **754/4,131**,
+serial writes **394/1,077**, recovery **1,437/290**, churn **4,298/769**, and observed
+incremental density **144/210 KiB per object**. Both have no request or instantiation
+failures. These expose cold/reopen/memory regressions; write gains alone do not
+clear the gate. Raw logs and saved binaries are in `.amp/in/fs-integrated/`.
+The simplified candidate's final quick rerun confirms the regressions: cold 1,049/s,
+churn 830/s, recovery 278/s, density 211 KiB/object; concurrent/serial writes
+4,366/1,241 per second, with no request or instantiation failures.
+
+Count all replacement code: old quota+journal **564+476=1,040** lines versus
+adapter+inode+cap **611+699+68=1,378**. The checked-in A/B tree is 6,464 runtime
+lines. Deleting the old modules would give **5,424 versus 5,074 (+350)**, before
+removing temporary feature wiring. Provider code is unchanged. No LOC reduction
+or overall simplicity improvement is claimed.
+
+**Successor prompt:** continue `hashed-fs-integration`, not a production swap.
+Preserve the integrated correctness fixes and actual file-length cap; finish the
+review's real-stream and persistent-cap/runtime cases, replace SQL filename
+oracles with guest-visible assertions, and investigate eager database creation
+and reopen cost. Measure unique pages and density alongside writes, simplify
+actual ownership rather than formatting, and rerun both complete suites, demo
+and matched benchmarks before any merge. Guest publication still needs approval.
 
 ## Candidates and protocol
 

@@ -140,6 +140,7 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_renameat2,
         libc::SYS_readlinkat,
         libc::SYS_ftruncate,
+        libc::SYS_flock,
         libc::SYS_fsync,
         libc::SYS_fdatasync,
         libc::SYS_utimensat,
@@ -184,9 +185,12 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
     );
     // Reading limits, never raising them.
     rules.insert(libc::SYS_prlimit64, vec![rule(vec![Cond::new(2, Qword, Eq, 0)?])?]);
-    // Descriptor flags only. Not F_SETOWN or F_SETSIG: with O_ASYNC they have
-    // the kernel signal any process of the same uid.
-    let fcntl = [libc::F_GETFD, libc::F_SETFD, libc::F_GETFL, libc::F_SETFL, libc::F_DUPFD_CLOEXEC];
+    // Descriptor flags and open-file-description locks for the database.
+    // Never F_SETOWN or F_SETSIG: they can signal another process of the same uid.
+    let fcntl = [
+        libc::F_GETFD, libc::F_SETFD, libc::F_GETFL, libc::F_SETFL, libc::F_DUPFD_CLOEXEC,
+        libc::F_OFD_GETLK, libc::F_OFD_SETLK, libc::F_OFD_SETLKW,
+    ];
     let fcntl = fcntl.map(|c| Ok(rule(vec![Cond::new(1, Dword, Eq, c as u64)?])?));
     rules.insert(libc::SYS_fcntl, fcntl.into_iter().collect::<anyhow::Result<_>>()?);
     // Making a received socket non-blocking (std uses this ioctl for it).

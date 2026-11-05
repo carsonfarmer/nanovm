@@ -1,5 +1,6 @@
 //! Storage-only comparison, not a replacement WASI filesystem.
 #[cfg(test)]
+#[path = "../../../crates/nanovm/src/capped.rs"]
 mod capped;
 mod inode;
 

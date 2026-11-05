@@ -3,13 +3,13 @@ use redb::{BackendError, StorageBackend, backends::FileBackend};
 use std::{fs::File, io, ops::Bound};
 
 #[derive(Debug)]
-pub(super) struct CappedFile {
+pub(crate) struct CappedFile {
     file: FileBackend,
     ceiling: u64,
 }
 
 impl CappedFile {
-    pub(super) fn new(file: File, ceiling: u64) -> anyhow::Result<Self> {
+    pub(crate) fn new(file: File, ceiling: u64) -> anyhow::Result<Self> {
         // Never truncate an existing database to satisfy a lowered policy.
         if file.metadata()?.len() > ceiling {
             return Err(full().into());

@@ -1822,6 +1822,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "prost",
+ "redb",
  "reqwest",
  "rustix",
  "rustls",
@@ -2386,6 +2387,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "678054eb77286b51581ba43620cc911abf02758c91f93f479767aed0f90458b2"
 dependencies = [
  "rand_core 0.3.2",
+]
+
+[[package]]
+name = "redb"
+version = "4.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39178e0a867f9e3eaa6292a4ab1dd3613f2519c5b564341e1e7b29b270736cc4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

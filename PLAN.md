@@ -460,12 +460,21 @@ cover mutations and orphan recovery with shared content. A real component now pr
 stock-WASI resource mapping and guest destruction without patches. Fixed file-length
 ceilings pass exhaustion/recovery/locking tests under the unchanged cap (Q82).
 They are not allocated-block or RSS caps, nor a guarantee of full-quota availability.
-The hierarchical inode core and real WASI adapter are in progress.
+The hierarchical inode core and real WASI adapter are integrated behind temporary
+`page-fs` (Q83), not selected by default. Actual runtime comparison finds faster
+writes but worse cold starts, recovery, density and total replacement LOC. These
+are failed adoption gates, not costs to hide with storage-only benchmarks.
 Preserve directory confinement, descriptor identity, streaming bounds,
 ephemeral `/tmp` with shared quotas, and both host commit boundaries. Compare
 mixed KV/SQL/raw-file workloads through real jailed workers before switching.
 Count all replacement runtime and provider code, not only deleted journal lines;
 report latency, CPU, live-object memory, physical storage and ownership complexity.
+The review's missing database-name sync is fixed with real syscall-error coverage;
+shutdown now waits for stream/database destruction and the actual capped adapter
+retains exclusive locks in the jail. Finish stream-after-descriptor-drop,
+persistent-cap/RSS amplification, ancestor-directory durability and backend-neutral
+optional SQLite oracles. Investigate eager database creation/reopening before
+accepting cold/churn regressions. [Current evidence and successor prompt](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05).
 
 The separate improvement branch's source assessment is in HANDOFF (2026-11-04).
 Reuse its benchmark instrumentation and lazy-bucket idea, but measure any provider,

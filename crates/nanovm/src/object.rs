@@ -259,12 +259,6 @@ pub struct ObjState {
     _tmp: TmpDir,
 }
 
-impl Drop for ObjState {
-    fn drop(&mut self) {
-        self.hooks.metrics.stores_live.fetch_sub(1, Relaxed);
-    }
-}
-
 impl WasiView for ObjState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -321,8 +315,6 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     // `/tmp` was just created, so only the persistent volume holds usage.
     let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone())?;
 
-    let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
-    node.metrics.stores_peak.fetch_max(live, Relaxed);
     let state = ObjState {
         wasi: b.build(),
         table,
@@ -447,8 +439,16 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", true));
         shared.begin_start();
         let t0 = Instant::now();
+        // ObjState::drop runs before the store's remaining resources drop.
+        // Publish retirement only after streams and database locks are gone.
+        let mut counted = scopeguard::guard(false, |counted| {
+            if counted { node.metrics.stores_live.fetch_sub(1, Relaxed); }
+        });
         let started = async {
             let mut store = new_store(&node, &app, &shared)?;
+            *counted = true;
+            let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
+            node.metrics.stores_peak.fetch_max(live, Relaxed);
             let svc = shared
                 .charged(&node.metrics, app.pre.instantiate_async(&mut store))
                 .await?;

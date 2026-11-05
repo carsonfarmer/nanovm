@@ -148,6 +148,9 @@ config! {
         max_response_body_kb: u64 = 8192u64,
         /// Disk budget shared by `/data` and `/tmp`.
         disk_mb: u64 = 64u64,
+        /// Page backend database-file-length ceiling, independent of logical
+        /// bytes. Exhaustion can prevent recovery; not a host-memory limit.
+        storage_mb: u64 = 256u64,
         max_files: u64 = 1000u64,
         max_queue: usize = 64usize,
         max_outbound_concurrency: usize = 4usize,
