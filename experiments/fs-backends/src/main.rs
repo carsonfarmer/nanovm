@@ -1,4 +1,6 @@
 //! Storage-only comparison, not a replacement WASI filesystem.
+#[cfg(test)]
+mod capped;
 mod inode;
 
 use anyhow::{Result, bail, ensure};

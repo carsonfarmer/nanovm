@@ -456,8 +456,12 @@ fault recovery or replica export; keep the production host unchanged.
 
 **Integration gate (Q80):** `hashed-fs-integration` owns the next implementation.
 Whole-namespace orphan scans are removed (Q81), and real-file I/O failure matrices
-cover mutations and orphan recovery with shared content. Next prove a stock-WASI resource adapter without a Wasmtime
-patch. Preserve directory confinement, descriptor identity, streaming bounds,
+cover mutations and orphan recovery with shared content. A real component now proves
+stock-WASI resource mapping and guest destruction without patches. Fixed file-length
+ceilings pass exhaustion/recovery/locking tests under the unchanged cap (Q82).
+They are not allocated-block or RSS caps, nor a guarantee of full-quota availability.
+The hierarchical inode core and real WASI adapter are in progress.
+Preserve directory confinement, descriptor identity, streaming bounds,
 ephemeral `/tmp` with shared quotas, and both host commit boundaries. Compare
 mixed KV/SQL/raw-file workloads through real jailed workers before switching.
 Count all replacement runtime and provider code, not only deleted journal lines;

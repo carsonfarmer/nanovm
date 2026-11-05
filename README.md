@@ -258,7 +258,11 @@ The separate improvement branch has been assessed for reusable ideas (HANDOFF,
 Q80); its combined scheduler/guest/runtime results are not filesystem benchmarks.
 The candidate now uses an atomic orphan index rather than namespace scans, and
 passes 818 injected mutation/commit/recovery I/O failures, including partial
-writes. These are bounded storage checks, not production integration or physical
+writes. Six additional cases exhaust fixed database-file-length ceilings, reopen
+under the same cap, reclaim shared-content orphans, and retain usable small
+writes/deletes and exclusive locks. The ceiling bounds file length, not allocated
+blocks or host memory; the cache target is not an RSS cap.
+These are bounded storage checks, not production integration or physical
 power-loss certification; [protocol and remaining gates](experiments/fs-backends/README.md#hardening-orphan-lookup-and-storage-failures-2026-11-05).
 
 **`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.

@@ -238,3 +238,93 @@ fn storage_errors_cannot_publish_partial_mutations() -> Result<()> {
     fs::remove_dir_all(root)?;
     Ok(())
 }
+
+#[test]
+fn persistent_ceiling_rejects_growth_without_losing_the_committed_generation() -> Result<()> {
+    use crate::capped::CappedFile;
+    use std::os::unix::fs::MetadataExt;
+
+    let root = std::env::current_dir()?.join(format!("target/fs-capacity-{}", std::process::id()));
+    ensure!(!root.exists(), "refuse existing capacity-test directory");
+    let limits = Limits {
+        bytes: 64 << 20,
+        files: 8,
+        handles: 8,
+        cache: 65536,
+    };
+    for kind in ["pages", "hashed"] {
+        let seed = root.join(format!("{kind}-seed"));
+        let mut v = Volume::open(kind, &seed, limits)?;
+        let a = v.create("a")?;
+        v.write(a, 0, &payload(8193, 11))?;
+        let b = v.create("b")?;
+        v.write(b, 0, b"old-b")?;
+        let orphan = v.create("orphan")?;
+        v.write(orphan, 0, &payload(8193, 11))?;
+        v.unlink("orphan")?;
+        v.finish(true)?;
+        drop(v);
+        let initial = fs::metadata(seed.join("store.redb"))?.len();
+        for allowance in [0, 1 << 20, 4 << 20] {
+            let ceiling = initial + allowance;
+            let path = root.join(format!("{kind}-{allowance}.redb"));
+            fs::copy(seed.join("store.redb"), &path)?;
+            let open = || -> Result<Database> {
+                let file = File::options().read(true).write(true).open(&path)?;
+                Ok(Database::builder()
+                    .set_cache_size(limits.cache)
+                    .create_with_backend(CappedFile::new(file, ceiling)?)?)
+            };
+            let mut v = Volume::from_backend(Backend::pages(open()?, kind == "hashed")?, limits)?;
+            ensure!(open().is_err(), "competing opener acquired a capped database");
+            let stage = v.create("stage")?;
+            let mut failed = false;
+            for index in 0..1024 {
+                let result = v.write(stage, index * 65536, &payload(65536, index as u64 + 71));
+                ensure!(
+                    fs::metadata(&path)?.len() <= ceiling,
+                    "growth exceeded ceiling before close"
+                );
+                if result.is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            ensure!(failed, "bounded growth did not exhaust the database ceiling");
+            ensure!(v.backend.end(true).is_err(), "caught exhaustion allowed acceptance");
+            ensure!(open().is_err(), "exhaustion released the database lock");
+            drop(v);
+            // Keep the exact same cap in force during repair and orphan collection.
+            for _ in 0..2 {
+                let mut v = Volume::from_backend(Backend::pages(open()?, kind == "hashed")?, limits)?;
+                ensure!(!verify(&mut v, true)?, "exhaustion published a mutation");
+                v.finish(true)?;
+            }
+            let mut v = Volume::from_backend(Backend::pages(open()?, kind == "hashed")?, limits)?;
+            let a = v.open_file("a")?;
+            v.write(a, 0, b"small")?;
+            v.unlink("b")?;
+            v.finish(true)?;
+            drop(v);
+            let mut v = Volume::from_backend(Backend::pages(open()?, kind == "hashed")?, limits)?;
+            let mut expected = payload(8193, 11);
+            expected[..5].copy_from_slice(b"small");
+            ensure!(
+                contents(&mut v, "a")? == Some(expected),
+                "post-exhaustion small write lost"
+            );
+            ensure!(contents(&mut v, "b")?.is_none() && v.files == 1 && v.bytes == 8193);
+            v.backend.audit()?;
+            drop(v);
+            let metadata = fs::metadata(&path)?;
+            ensure!(metadata.len() <= ceiling, "database exceeded its fixed ceiling");
+            eprintln!(
+                "PASS {kind} ceiling={ceiling} length={} allocated={} recovery, locks, small write/delete",
+                metadata.len(),
+                metadata.blocks() * 512
+            );
+        }
+    }
+    fs::remove_dir_all(root)?;
+    Ok(())
+}

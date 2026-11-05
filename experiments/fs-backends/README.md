@@ -326,3 +326,35 @@ its 5,074-line count are unchanged; the shared experiment inode layer grows
 clippy pass. Full locked host suite passes 91 unit/67 integration, eleven ignored.
 No demo rerun for this experiment-only milestone. Review found no bounded-slice
 implementation blocker; that is not approval of a production swap.
+
+### Persistent capacity boundary (2026-11-05)
+
+`capped.rs` delegates to the real `FileBackend`, including all six lock methods,
+and refuses growth or a write ending beyond a fixed ceiling before touching the
+file. Overflow is refused; shrink and writes inside the cap remain permitted.
+Opening existing data above a lowered ceiling refuses it without truncation.
+This bounds file length (`st_size`), not allocated filesystem blocks or RSS.
+
+The release tests run both variants at 1,056,768, 2,105,344 and 5,251,072 bytes.
+They exhaust storage during a bounded append sequence, attempt caught-error
+acceptance, and reopen twice with the **same** cap still enforced. Committed
+bytes survive, an orphan sharing content with a named file is reclaimed exactly
+once, hash references and logical counters agree, and small writes/deletes still
+commit. Competing opens fail before and after exhaustion. File length is checked
+during growth, not only after close (redb can shrink then). All six cases pass.
+Direct boundary tests cover rejected partial writes, arithmetic overflow, shrink
+at the ceiling and lowered-policy refusal. Omitting the growth guard fails the
+test; `git checkout --` restores staged good source with empty unstaged diff.
+
+These cases do not establish that every full database can allocate recovery
+metadata, or a safe file-length/logical-quota multiplier. Production must fail
+closed when same-cap recovery cannot complete. The exact-source resource audit
+found that cache budgets count page payload softly, not total heap; uncommitted
+rewrites do not inherently retain every historical version. Avoid memory-backed
+`/tmp`; use file-backed ephemeral state with shared logical accounting. Worker
+cgroups are aggregate protection, not per-object host-memory limits.
+
+**Successor prompt:** continue real WASI integration on `hashed-fs-integration`,
+using the fixed-cap backend, stable inode resources and bounded streams. Preserve
+both host acceptance gates. Complete jailed KV/SQL/raw-file validation and matched
+performance, memory and total-LOC comparisons before swapping production storage.
