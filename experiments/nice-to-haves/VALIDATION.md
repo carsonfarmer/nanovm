@@ -104,3 +104,8 @@ topology; [batch 4](BATCH4.md) adds six passing in-memory application protocol t
 and a deterministic CLI transcript. These models do not validate a deployed chat
 service, storage persistence, authentication or concurrency. All batches remain
 independent of runtime/recovery work and local to `experiments/nice-to-haves/`.
+
+[Batch 5](BATCH5.md) adds seven passing synthetic-planning contract tests; the queue
+CLI fixture returns exact waits `[0,3,5,0]` and finishes `[6,8,8,13]`. Other tested
+calculators cover per-file block rounding, label-product overflow, separate cost
+alternatives and seeded balanced order/popularity. No live measurements are implied.

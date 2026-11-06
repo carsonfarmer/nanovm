@@ -1,0 +1,1 @@
+{"basis":"synthetic","kind":"queue","jobs":[{"arrival_ms":2,"service_ms":4},{"arrival_ms":3,"service_ms":2},{"arrival_ms":3,"service_ms":0},{"arrival_ms":12,"service_ms":1}]}
