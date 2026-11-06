@@ -30,15 +30,15 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH17 | P1 / M | Collector dashboard JSON using bounded labels; run pinned Grafana/Prometheus on synthetic series | Proposed |
 | NH18 | P1 / M | WIT import/export inventory via pinned wasm-tools; nested/composed fixtures and provenance | Tested: 1.263.0 external interfaces, not recursive dependency/SBOM inspection |
 | NH19 | P1 / S | Benchmark metadata manifest generator excluding environment values; secret-canary validation | Tested: allowlisted fields, hashes, no environment/remote/path contents |
-| NH20 | P1 / M | Client disconnect test harness for application authors; distinguish unknown result from rejected operation | Proposed |
+| NH20 | P1 / M | Client disconnect test harness for application authors; distinguish unknown result from rejected operation | Tested: local handler accepts before disconnect, both clients report unknown, explicit retries |
 | NH21 | P2 / M | Chat-client protocol simulator with reconnect cursors and duplicate message IDs; deterministic transcript | Tested: contiguous cursors, history gaps, duplicate delivery; no browser/outbox |
 | NH22 | P2 / M | Application dedup model in memory only; bounded TTL and conflict tests, explicitly not persistence proof | Tested: caller/room scope, exact body, capacity, TTL re-execution boundary |
 | NH23 | P2 / S | Downstream tracing enrichment example for operator-owned region/env; prove app identity stays untouched | Tested: synthetic environment enrichment and retained identity/parentage |
 | NH24 | P2 / M | Collector redaction fixture with seeded secret fields; assert sanitized decoded output | Tested: Collector 0.164.0, trace/resource canaries; no general privacy guarantee |
-| NH25 | P2 / M | JS component feasibility probe outside guests; pin tools, show imports and build failure/success | Proposed |
-| NH26 | P2 / M | Python component feasibility probe outside guests; separate P2/P3 compatibility and startup cost | Proposed |
+| NH25 | P2 / M | JS component feasibility probe outside guests; pin tools, show imports and build failure/success | Tested: sync build/validate/4 round trips; native async WIT build fails in pinned 0.23.0 |
+| NH26 | P2 / M | Python component feasibility probe outside guests; separate P2/P3 compatibility and startup cost | Partial: sync build/run, async build/validate; async execution and startup cost unverified |
 | NH27 | P2 / S | workerd/Spin comparison worksheet; equivalent semantics before any performance claim | Recipe |
-| NH28 | P2 / M | Portability matrix from pinned source/docs and actual compile probes; mark untested jail support | Proposed |
+| NH28 | P2 / M | Portability matrix from pinned source/docs and actual compile probes; mark untested jail support | Partial: Linux x64 language/tool survey in BATCH7; other platforms/jail untested |
 | NH29 | P2 / S | Conceptual scheduler HTTP contract with duplicate delivery/cancellation examples; no live alarms | Recipe: revision/cancellation sketch in BATCH4; product decisions unresolved |
 | NH30 | P2 / S | Synthetic storage-amplification calculator comparing logical bytes, blocks and metadata; no backup logic | Tested: per-file rounding, empty-file metadata, null empty ratio |
 | NH31 | P2 / M | Offline histogram merger from compatible raw buckets; reject mismatched boundaries/units | Tested: disjoint buckets, nearest-rank intervals, overflow explicit |
@@ -54,7 +54,7 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH41 | P3 / S | Component build-size budget diff, keyed by toolchain and digest; no size-as-speed inference | Tested: binary digests, budget boundary, reductions, toolchain labels |
 | NH42 | P3 / M | Offline trace waterfall from sanitized OTLP fixture; validate parent IDs and missing-span markers | Proposed |
 | NH43 | P3 / S | Energy/cost worksheet with explicit electricity/cloud-rate assumptions; no live price claims | Tested: synthetic kWh, separate cloud/electricity alternatives |
-| NH44 | P3 / M | Client language interop fixtures for operation IDs and Unicode bodies; Python/JS wire-byte agreement | Proposed |
+| NH44 | P3 / M | Client language interop fixtures for operation IDs and Unicode bodies; Python/JS wire-byte agreement | Tested: exact files/IDs over real loopback HTTP, whitespace conflict, no canonicalization claim |
 | NH45 | P3 / S | Changelog candidate generator from explicit commit range; retain human review and no auto-release | Tested: explicit ancestral commits, Unicode-safe subjects; no release |
 | NH46 | P3 / M | License/SBOM review worksheet using existing Cargo metadata; missing-license warnings, no policy verdict | Tested: declaration worksheet and secret-path exclusion; not build SBOM/legal approval |
 | NH47 | P3 / M | Browser chat protocol demo against a fake server; inspect reconnect, pending and rejected states | Proposed |
@@ -68,7 +68,8 @@ target URL; no general rate/skew driver exists. Batch 3 completes NH15/NH31/NH33
 Batch 4 completes bounded NH21/NH22 models and NH29/NH35/NH38 teaching recipes.
 Batch 5 completes synthetic NH30/NH32/NH39/NH40/NH43/NH48 exercises.
 Batch 6 completes NH41/NH45/NH46 and the offline portion of NH37.
-Next are language probes and additional local fixtures.
+Batch 7 adds NH20/NH44 wire fixtures, NH25 and bounded NH26/NH28 language probes.
+Next are config/documentation checks and additional local fixtures.
 NH17 still needs real Grafana/Prometheus synthetic-series validation; no dashboard
 is claimed. None requires production access or a host API change.
 

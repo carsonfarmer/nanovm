@@ -114,3 +114,8 @@ alternatives and seeded balanced order/popularity. No live measurements are impl
 metadata, existing-component size and local Git-range checks. Unicode line framing
 was caught and corrected during validation. OCI signatures remain NOT VERIFIED;
 license declarations and changelog candidates require human review.
+
+[Batch 7](BATCH7.md) adds two passing Node/Python wire tests and separately executed
+pinned language probes: both synchronous components validate and pass four string
+round trips; native async JS fails to build, Python async validates but execution
+is unverified because the pinned host binding generator rejects its type encoding.
