@@ -7,6 +7,8 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 **Current delivery (2026-11-06):** `runtime-ownership-hardening` is validated through `225cfc4` for main. Runtime 5,082 → 5,077; both slower actor rewrites were rejected. No guest changes. Next: single-node storage ownership and recoverability; distributed failover is not implemented by this slice.
 
+**Active ownership:** Amp on `local-volume-ownership` owns app admission (`app.rs`), the corresponding jail syscall rule, and persistence admission tests. Add fail-fast local directory locking before scratch cleanup/recovery. Keep the lock through all app owners' lifetimes; shutdown drains stores but callers must drop their Node/App handles before reopening. This is cooperative local exclusion, not a lease or distributed fencing.
+
 ## Problems
 
 Found by the review at `c607ec9`, unless an entry says otherwise; line numbers are as of that commit.
