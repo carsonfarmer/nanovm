@@ -7,7 +7,7 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 **Current delivery (2026-11-06):** `runtime-ownership-hardening` is validated through `225cfc4` for main. Runtime 5,082 → 5,077; both slower actor rewrites were rejected. No guest changes. Next: single-node storage ownership and recoverability; distributed failover is not implemented by this slice.
 
-**Active ownership:** Amp on `local-volume-ownership` owns app admission (`app.rs`), the corresponding jail syscall rule, and persistence admission tests. Add fail-fast local directory locking before scratch cleanup/recovery. Keep the lock through all app owners' lifetimes; shutdown drains stores but callers must drop their Node/App handles before reopening. This is cooperative local exclusion, not a lease or distributed fencing.
+**Latest delivery:** local app storage admission/preparation exclusion is validated in `8c94218`, together with SQLite fixture correction `14711ad`. Runtime is 5,085; backup/restore and distributed fencing remain unimplemented. No active file ownership after main integration.
 
 ## Problems
 
@@ -263,7 +263,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### N-42: cooperating local nodes can open the same app storage
 - **Reproduced:** two Nodes admitted the same app directory; a second admission could clean live scratch and later recover another owner's journal. A separate preparation regression also reproduced supervisor preparation proceeding while the directory was locked.
-- **Status:** fixing on `local-volume-ownership`. Standard directory locks guard App lifetime and supervisor directory preparation. Tests cover retained handles, failed admission cleanup, separate apps and real jailed-worker release after SIGKILL. No distributed fencing, noncooperating-writer protection or atomic preparation-to-worker reservation is claimed.
+- **Status:** fixed in 8c94218. Standard directory locks guard App lifetime and supervisor directory preparation. Tests cover retained handles, failed admission cleanup, separate apps and real jailed-worker release after SIGKILL; preparation rejection also passes as root. Both removed-lock mutations fail and restored full suite/SQL/KV/demo pass. No distributed fencing, noncooperating-writer protection or atomic preparation-to-worker reservation is claimed.
 
 ## Planned work
 
