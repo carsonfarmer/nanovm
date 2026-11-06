@@ -36,6 +36,12 @@ jobs:
             components/sqlite -> ../../target/sqlite
       - name: Prepare host limits
         run: sudo sysctl -w vm.max_map_count=1048576
+      - name: Check offline backup tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y restic
+          python3 -m unittest discover -s scripts -p test_backup.py -v
+          sudo python3 -m unittest discover -s scripts -p test_backup.py -v
       - name: Report runtime line count
         run: |
           python3 - <<'PY'

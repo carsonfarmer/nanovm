@@ -2001,6 +2001,113 @@ async fn sqlite_survives_a_jailed_worker_crash() {
     }
 }
 
+/// A real process crash followed by offline backup and recovery elsewhere.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the SQLite experiment and restic"]
+async fn sqlite_backup_restores_into_a_fresh_root() {
+    async fn start(cfg: &NodeConfig, path: &Path) -> (tokio::process::Child, std::net::SocketAddr) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut cfg = cfg.clone();
+        cfg.listen = addr.to_string();
+        std::fs::write(path, toml::to_string(&cfg).unwrap()).unwrap();
+        drop(listener);
+        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_nanovm"))
+            .args(["serve", "--config"]).arg(path).kill_on_drop(true)
+            .stderr(std::fs::File::create(path.with_extension("log")).unwrap())
+            .spawn().unwrap();
+        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(1)).build().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(child.try_wait().unwrap().is_none(), "supervisor failed; inspect {}", path.display());
+            if client.get(format!("http://{addr}/_nanovm/ready")).send().await.is_ok_and(|r| r.status() == 204) {
+                return (child, addr);
+            }
+            assert!(Instant::now() < deadline, "supervisor not ready");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    let mut cfg = node_cfg("sqlite_backup_source", 8);
+    let workspace = node_cfg("sqlite_backup_drill", 8).data_dir;
+    let mut app = app("counter");
+    app.limits.memory_mb = 64;
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 30_000;
+    cfg.limits.cpu_ms = app.limits.cpu_ms;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/composed.wasm")).unwrap();
+    let image = publish_wasm("backup-probe", &app, wasm).await;
+    let name = worker(&image);
+    let run = |program: &str, args: &[&str]| {
+        std::process::Command::new(program).args(args)
+            .env("RESTIC_REPOSITORY", workspace.join("repository"))
+            .env("RESTIC_PASSWORD", "disposable-restore-drill")
+            .env("RESTIC_CACHE_DIR", workspace.join("restic-cache"))
+            .output().unwrap()
+    };
+    assert!(run("restic", &["init"]).status.success());
+    let script = repo().join("scripts/backup.py");
+    let backup = || run("python3", &[script.to_str().unwrap(), "backup", cfg.data_dir.to_str().unwrap(), "--stopped"]);
+    let (mut source, addr) = start(&cfg, &workspace.join("source.toml")).await;
+    let (status, body) = app_get(addr, &image, "/a/?v=durable").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!backup().status.success(), "backup must refuse a live jailed owner");
+    let children: Vec<i32> = std::fs::read_dir(format!("/proc/{}/task", source.id().unwrap())).unwrap()
+        .flat_map(|thread| std::fs::read_to_string(thread.unwrap().path().join("children")).unwrap()
+            .split_whitespace().map(|pid| pid.parse().unwrap()).collect::<Vec<_>>()).collect();
+    assert_eq!(children.len(), 1, "one jailed app worker");
+    let pid = children[0];
+    let pending = tokio::spawn({
+        let image = image.clone();
+        async move { app_get(addr, &image, "/a/?v=uncommitted&then=sleep").await }
+    });
+    let objects = cfg.app_dirs(&name)[0].clone();
+    eventually("tentative SQL/file/KV changes before backup", || {
+        std::fs::read(objects.join("a/marker")).is_ok_and(|v| v == b"uncommitted")
+            && std::fs::read(objects.join("a/.kv/default/bWFya2Vy")).is_ok_and(|v| v == b"uncommitted")
+    }).await;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let _ = pending.await;
+    eventually("worker reaped", || !Path::new(&format!("/proc/{pid}")).exists()).await;
+    source.kill().await.unwrap();
+    assert!(objects.join("~journal/a/log").exists(), "backup must include crash-left undo");
+    let saved = backup();
+    assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stderr));
+    let snapshot = String::from_utf8(saved.stdout).unwrap();
+    let snapshot = snapshot.trim();
+    assert_eq!(snapshot.len(), 64);
+    // Make the source unavailable: the fresh root cannot rely on its cache or files.
+    std::fs::rename(&cfg.data_dir, workspace.join("offline-source")).unwrap();
+    let fresh = workspace.join("fresh");
+    let restored = run("python3", &[script.to_str().unwrap(), "restore", snapshot, fresh.to_str().unwrap()]);
+    assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
+    assert!(!fresh.join("cache").exists());
+    assert!(!fresh.join("tmp").exists());
+    let restored_objects = fresh.join("objects").join(&name);
+    assert_eq!(std::fs::read(restored_objects.join("a/marker")).unwrap(), b"uncommitted");
+    assert!(restored_objects.join("~journal/a/log").exists());
+    cfg.data_dir = fresh;
+    let (mut destination, addr) = start(&cfg, &workspace.join("restored.toml")).await;
+    let (status, body) = app_get(addr, &image, "/a/").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"rows": ["durable"], "file": "durable", "key": "durable", "reused": false}));
+    let (status, body) = app_get(addr, &image, "/a/?v=after-restore").await;
+    assert_eq!(status, 200, "{body}");
+    destination.kill().await.unwrap();
+    // Parent-death cleanup releases admission before the second fresh-root start.
+    eventually("restored worker storage released", || {
+        std::fs::File::open(&restored_objects).unwrap().try_lock().is_ok()
+    }).await;
+    let (mut reopened, addr) = start(&cfg, &workspace.join("reopened.toml")).await;
+    let (status, body) = app_get(addr, &image, "/a/").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"rows": ["durable", "after-restore"], "file": "after-restore", "key": "after-restore", "reused": false}));
+    reopened.kill().await.unwrap();
+    println!("fresh-root restore: crash-left SQL/file/KV rolled back together; new writes survived another restart");
+}
+
 /// Faults at every VFS mutation/sync boundary of a multi-database transaction.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the separately built SQLite experiment (WASI SDK)"]

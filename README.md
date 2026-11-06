@@ -328,6 +328,79 @@ Sockets are indexed by object within each app; a publish visits that object's so
   - A socket is pinged every 30 s and dropped if it heard nothing for a whole interval, so a half-open connection doesn't hold its slot.
   - A socket has at most 64 channels and 16 KiB of handshake headers. A publish has at most 64 items.
 
+## Backup and restore
+
+`python3 scripts/backup.py` is an **offline, operator-only** wrapper around
+[restic](https://restic.readthedocs.io/en/stable/). It adds no runtime endpoint or
+host dependencies. Install Python 3.9+, restic 0.14+ and GNU coreutils on Linux.
+Restic supplies encryption, authenticated content, deduplication and remote
+repository support; nanovm supplies the app-lock boundary and restore drill.
+
+1. Stop ingress, drain requests if possible, then stop the supervisor and **all**
+   embedded writers. Disable automatic restarts for the entire backup. Holding
+   existing app locks rejects lingering owners but cannot prevent a supervisor
+   creating a new app. `--stopped` acknowledges this operational requirement;
+   it does not stop processes. Keep the directory inodes stable.
+2. Configure `RESTIC_REPOSITORY` and a securely stored `RESTIC_PASSWORD_FILE`
+   (use absolute paths). Initialize a repository with `restic init` once. Use
+   root for root-run jailed volumes; use the same UID for an unprivileged node.
+   The repository must be outside the data root; off-node storage is needed
+   to survive losing the node or disk. Store the password separately: losing
+   it makes the encrypted backup unrecoverable. No credentials go into git.
+3. Run `python3 scripts/backup.py backup /srv/nanovm --stopped`. Save its full
+   snapshot ID and the deployment record. The wrapper locks all app directories
+   before invoking restic and reads **all of `objects/`**, including `~journal`
+   logs and retained files. Never exclude or manually clear journals: tentative
+   data can remain after a crash. Scratch, compilation caches and registry caches
+   are deliberately omitted. Only exit-zero backups receive the wrapper's
+   completion tag; an incomplete restic snapshot is not an approved recovery point.
+4. Run `python3 scripts/backup.py restore FULL_SNAPSHOT_ID /srv/nanovm-restored`
+   with the repository credentials. The destination's parent must exist and be
+   trusted; the destination itself must not exist, even as an empty directory or
+   symlink. Restore verifies file contents and syncs the destination filesystem
+   before returning success. On error, an incomplete destination may remain:
+   do not serve it, and retry into another new root. Restore only trusted
+   repositories; completion tags are an operational convention, not authorization
+   against someone with repository write credentials.
+5. Reinstall the **same nanovm build**, restore operator configuration, and point
+   `data_dir` at the fresh root. Preserve numeric app UIDs/GIDs and the original
+   `jail_uid_base` for root-run nodes. Keep the same app identity (DNS record owner
+   plus repository), immutable OCI manifest digests, trust policy and guest config.
+   Save those deployment records and ensure the signed OCI artifacts remain
+   available separately: a data snapshot is not a deployment/package backup.
+   The worker recovers the saved undo logs on first object access. Exercise reads
+   and a new write/restart before switching ingress. **Fence the old node first**;
+   a copied volume does not make two writers safe.
+
+The snapshot recovers local committed state at quiescence, not external effects,
+open sockets or lost publishes. Writes after the snapshot are outside its recovery
+point. This is not live backup, point-in-time recovery, synchronous replication or
+automatic failover. Keep several independently checked recovery points; choose
+retention and `restic forget/prune` policy explicitly rather than deleting the
+last known-good backup automatically. Run `restic check --read-data` periodically
+and after repository transfer; encrypted storage is still sensitive tenant data.
+Remote upload performance, backend durability and a second physical host have not
+been tested here.
+
+The executable drill uses the existing composed SQL/KV fixture: commit values,
+kill a jailed worker after tentative SQL/file/KV writes, stop its supervisor,
+back up, move the original root away, restore into a fresh root without caches,
+verify rollback through HTTP, and write/restart again. Run it after building the
+SQLite fixture with `bash experiments/sqlite-filesystem/build.sh --compose`:
+
+```sh
+env -u RUST_BACKTRACE cargo test --locked -p nanovm --test integration \
+  sqlite_backup_restores_into_a_fresh_root -- --ignored --nocapture
+python3 -m unittest discover -s scripts -p test_backup.py -v
+sudo python3 -m unittest discover -s scripts -p test_backup.py -v
+```
+
+The Python checks use disposable repositories to cover active-owner refusal,
+incomplete backups, missing repository content, journals, empty directories,
+numeric ownership/modes and refusal to overwrite existing destinations. The
+root invocation checks UID/GID preservation; the unprivileged one induces a real
+permission-denied backup. Neither touches an operator's existing volumes.
+
 ## Commits
 
 A request's changes to `/data` (files, SQL and key-value alike) commit locally before its initial response is released. A guest error, trap, CPU/time limit or worker crash before commit rolls back those changes. An answer of any status commits. Held WebSocket publishes are released after their corresponding commit, but delivery is best effort: a crash or failed send can lose a publish after storage commits. This is not a durable outbox.
@@ -336,7 +409,7 @@ Outbound HTTP and calls to other objects execute immediately, not behind the cal
 
 A host I/O failure during commit, a crash at its commit marker, or a lost response can leave the caller unsure whether the request committed. Do not interpret every error as a rollback: use application-level operation IDs for idempotent retries. Durability assumes a filesystem and device that honor successful file and directory syncs; process-crash tests do not certify physical power-loss behavior.
 
-Persistence currently depends on the original storage surviving. There is no off-node backup/restore protocol, replication or automatic failover. App admission takes a nonblocking exclusive lock on its objects directory before scratch cleanup or journal recovery. Supervisor directory preparation takes the same lock before changing ownership. Locks last through all `App` owners: embedded callers must drain and drop their `Node` and any `App` handles before reopening. A final actor may still retain ownership briefly after `shutdown()` returns; admission fails closed until it exits.
+Persistence between backups depends on the original storage surviving. Offline backup/restore is described below; there is no replication or automatic failover. App admission takes a nonblocking exclusive lock on its objects directory before scratch cleanup or journal recovery. Supervisor directory preparation takes the same lock before changing ownership. Locks last through all `App` owners: embedded callers must drain and drop their `Node` and any `App` handles before reopening. A final actor may still retain ownership briefly after `shutdown()` returns; admission fails closed until it exits.
 
 This is cooperative local exclusion on a stable directory inode, not distributed fencing or an atomic supervisor-to-worker reservation. Keep one supervisor per data root; cgroup provisioning and noncooperating writers are not fenced. Do not replace a locked directory. Per-object logical quotas do not cap physical blocks or the aggregate storage of cold objects. RAM may cache durable data or stage tentative work, but memory-only acceptance would not preserve these guarantees.
 
