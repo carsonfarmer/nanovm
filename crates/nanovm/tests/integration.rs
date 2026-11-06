@@ -1917,12 +1917,15 @@ async fn sqlite_over_the_existing_filesystem() {
 #[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
 async fn sqlite_survives_a_jailed_worker_crash() {
     for fixture in ["p3", "composed"] {
-        let cfg = node_cfg(&format!("sqlite_worker_crash_{fixture}"), 8);
-        let (_sup, addr) = supervised_with(cfg.clone()).await;
+        let mut cfg = node_cfg(&format!("sqlite_worker_crash_{fixture}"), 8);
         let mut app = app("counter");
         app.limits.memory_mb = 64;
         app.limits.cpu_ms = 2000;
         app.limits.request_timeout_ms = 30_000;
+        // The supervisor clamps tenant budgets; this is a crash-recovery
+        // test, not a test of the default 200 ms CPU ceiling.
+        cfg.limits.cpu_ms = app.limits.cpu_ms;
+        let (_sup, addr) = supervised_with(cfg.clone()).await;
         let wasm = std::fs::read(repo().join(format!("target/sqlite-filesystem/{fixture}.wasm"))).unwrap();
         let image = publish_wasm("sqlite-probe", &app, wasm).await;
         let (status, before) = app_get(addr, &image, "/a/?v=durable").await;
