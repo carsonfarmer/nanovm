@@ -272,7 +272,7 @@ The goal: one node, as fast and secure as we can make it, that runs untrusted We
     - Sockets survive worker exits and version switches; every event resolves the current digest (Q53, superseding Q35). A changed app identity closes the socket rather than crossing apps (Q54).
     - Proxy settings bound sockets globally, per app and per object, message/answer size and per-socket backlog (Q55, superseding Q36).
   - **Alarms** (Q30, then Q41): skipped so far; queued as a scheduler outside the node (Roadmap 4).
-  - **Key-value** (done): a host-implemented `wasi:keyvalue` stored as files under `/data`. `wasi:filesystem` stays exposed. `wasi:config` serves each app's config values.
+  - **Key-value** (done): composed Spin async KV stored as files under `/data`; no native host KV implementation. `wasi:filesystem` stays exposed. `wasi:config` serves each app's config values.
 - **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
 - **Commits** (Q37–Q40): an undo journal under the filesystem host; see README.
 - **Out of scope for now:** one-shot runs of agent-written code, dashboards, static signing keys. Clustering is no longer out of scope: it is prepared for in Roadmap 8, after the proxy.
@@ -341,6 +341,24 @@ Built on branch `proxy` by one agent and finished by another. README's "The prox
 - **Review findings fixed here:** N-1, N-3, N-4, N-11, N-12, N-13 (and with it N-14, N-15), N-16, N-17, N-18, N-19. An adversarial review of the branch then found eleven more; the blocking ones were fixed before it landed (apps keyed by host, no unsigned manifests on disk, canonical registry addresses, proxy dev mode on loopback only, a bounded token and signature count), and the rest became N-22 to N-31 in ISSUES.md, fixed since: `max_apps` with idle apps' slots reused and registry fetches four at once with a deadline (N-22), accept loops that outlast fd exhaustion and proxy client timeouts (N-24), bounded single-flight proxy caches (N-25), bounded policy sets (N-26), a node-wide link cap (N-27), drains that wait for the old process (N-28), directory setup off the front end (N-29), hop-by-hop headers dropped (N-30), and oci-spec in place of oci-client (N-31, partly). Since then: dev mode needs the `dev` cargo feature (N-23) and the proxy has no TLS of its own (W-14).
 
 ## Runtime simplification analysis (2026-11-03)
+
+**2026-11-06 update (Q86):** the current baseline is 5,082 runtime lines,
+not the historical 5,305 below. Both unique pending state and separate per-phase
+event-loop candidates passed tests but regressed measured throughput/churn and
+were rejected. The original actor remains.
+Worker termination uses one watch channel; dependency calls share tracing
+and cancellation. Both commit gates and idle event-loop execution remain.
+The retained slice is **5,077 lines**, plus the unchanged 242-line KV provider;
+the under-5k goal is not yet met. Native-KV splitter removal below is obsolete
+after provider composition; do not count it twice.
+
+Prioritize precise local guarantees and recoverability: resolver deadlines,
+exclusive local volume ownership, total persistent-data admission and quiescent
+export/restore before automatic failover. Memory may cache or stage work, but
+does not replace durable commits. Multi-node operation still needs authenticated
+ingress/internal-call placement, committed-state transfer, an acknowledgement/RPO
+policy and storage-enforced writer fencing. The undo journal is not a replication
+feed, and proxy-owned sockets still need cross-proxy publish routing.
 
 The whole-runtime review starts at **5,305 lines**. The owner rejected the initial
 100–200-line estimate as an overly incremental analysis, not a demonstrated ceiling.

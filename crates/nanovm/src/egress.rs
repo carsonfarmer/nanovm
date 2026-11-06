@@ -168,11 +168,8 @@ impl WasiHttpHooks for EgressHooks {
         if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(crate::telemetry::PATH) {
             return Box::new(async { Err(Error::HttpRequestDenied) });
         }
-        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS) {
-            let node = self.node.clone();
-            return Box::new(async move { Ok((call(node, sem, obj, request).await?, Box::new(async { Ok(()) }) as IoFuture)) });
-        }
-        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && matches!(route, Route::Supervisor(_)) {
+        let internal = request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS);
+        if !internal && request.uri().host() == Some(crate::ws::PUBLISH_HOST) && matches!(route, Route::Supervisor(_)) {
             let (held, max) = (self.held.clone(), self.publish_max);
             return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
         }
@@ -181,17 +178,24 @@ impl WasiHttpHooks for EgressHooks {
             use opentelemetry::{KeyValue, propagation::TextMapPropagator, trace::{Span, SpanKind, TraceContextExt}};
             let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
             let parent = obj.context.lock().clone();
-            let mut span = scopeguard::guard(node.telemetry.span("http.client", &obj.id, &parent, SpanKind::Client), cancelled);
+            let mut span = scopeguard::guard(node.telemetry.span(if internal { "call" } else { "http.client" }, &obj.id, &parent, SpanKind::Client), cancelled);
             span.set_attribute(KeyValue::new("http.request.method", request.method().as_str().chars().take(32).collect::<String>()));
             span.set_attribute(KeyValue::new("url.path", request.uri().path().chars().take(1024).collect::<String>()));
-            span.set_attribute(KeyValue::new("server.address", request.uri().host().unwrap_or("").chars().take(253).collect::<String>()));
-            if let Some(port) = request.uri().port_u16() { span.set_attribute(KeyValue::new("server.port", port as i64)); }
             let context = parent.with_remote_span_context(span.span_context().clone());
             let mut request = request;
-            opentelemetry_sdk::propagation::TraceContextPropagator::new()
-                .inject_context(&context, &mut opentelemetry_http::HeaderInjector(request.headers_mut()));
-            let target = request.uri().clone();
+            if internal {
+                request.extensions_mut().insert(context.clone());
+            } else {
+                span.set_attribute(KeyValue::new("server.address", request.uri().host().unwrap_or("").chars().take(253).collect::<String>()));
+                if let Some(port) = request.uri().port_u16() { span.set_attribute(KeyValue::new("server.port", port as i64)); }
+                opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                    .inject_context(&context, &mut opentelemetry_http::HeaderInjector(request.headers_mut()));
+            }
+            let target = (!internal).then(|| request.uri().clone());
             let res = async {
+                if internal {
+                    return Ok((call(&node, sem, &obj, request, &mut span).await?, Box::new(async { Ok(()) }) as IoFuture));
+                }
                 let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
                 let (res, conn) = match route {
                     Route::Direct(policy) => send(request, options, &policy).await?,
@@ -211,10 +215,11 @@ impl WasiHttpHooks for EgressHooks {
             }
             .await;
             let mut span = scopeguard::ScopeGuard::into_inner(span);
-            client_response(&mut span, res.as_ref().map(|(response, _)| response), false);
+            client_response(&mut span, res.as_ref().map(|(response, _)| response), internal);
+            if internal { return res; }
             if let Err(e) = &res {
                 metrics.egress_denied.fetch_add(1, Relaxed);
-                metrics.event("egress-denied", &obj.id, format!("{} → {e}", target.host().unwrap_or("")), &context);
+                metrics.event("egress-denied", &obj.id, format!("{} → {e}", target.as_ref().and_then(|uri| uri.host()).unwrap_or("")), &context);
             } else {
                 metrics.egress_allowed.fetch_add(1, Relaxed);
             }
@@ -230,57 +235,47 @@ impl WasiHttpHooks for EgressHooks {
 /// or through other calls, is refused with 508: one request at a time per
 /// object would deadlock it.
 async fn call(
-    node: std::sync::Weak<crate::table::Node>,
+    node: &Arc<crate::table::Node>,
     sem: Arc<Semaphore>,
-    obj: Arc<crate::object::ObjShared>,
+    obj: &Arc<crate::object::ObjShared>,
     req: http::Request<WasiBody>,
+    span: &mut crate::telemetry::Span,
 ) -> Result<http::Response<WasiBody>, Error> {
-    use opentelemetry::{KeyValue, trace::{Span, SpanKind, TraceContextExt}};
-    let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
-    let parent = obj.context.lock().clone();
-    let mut span = scopeguard::guard(node.telemetry.span("call", &obj.id, &parent, SpanKind::Client), cancelled);
-    span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
-    span.set_attribute(KeyValue::new("url.path", req.uri().path().chars().take(1024).collect::<String>()));
-    let result = async {
-        let (mut parts, body) = req.into_parts();
-        parts.extensions.insert(parent.with_remote_span_context(span.span_context().clone()));
-        let target = parts.uri.clone();
-        let rest = target.path_and_query().map_or("", |p| p.as_str()).strip_prefix(CALLS).unwrap_or("");
-        let (id, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
-        span.set_attribute(KeyValue::new("nanovm.target_object", id.chars().take(128).collect::<String>()));
-        let to_guest = |res: http::Response<crate::object::RespBody>| {
-            res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync())
-        };
-        if !node.wait_for(&obj, id) {
-            let why = format!("{id} is already waiting on {}", obj.id);
-            return Ok(to_guest(crate::object::error_response(508, "call-cycle", &why)));
+    use opentelemetry::{KeyValue, trace::Span};
+    let (mut parts, body) = req.into_parts();
+    let target = parts.uri.clone();
+    let rest = target.path_and_query().map_or("", |p| p.as_str()).strip_prefix(CALLS).unwrap_or("");
+    let (id, path) = rest.split_at(rest.find(['/', '?']).unwrap_or(rest.len()));
+    span.set_attribute(KeyValue::new("nanovm.target_object", id.chars().take(128).collect::<String>()));
+    let to_guest = |res: http::Response<crate::object::RespBody>| {
+        res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync())
+    };
+    if !node.wait_for(obj, id) {
+        let why = format!("{id} is already waiting on {}", obj.id);
+        return Ok(to_guest(crate::object::error_response(508, "call-cycle", &why)));
+    }
+    let _waiting = scopeguard::guard(id, |id| {
+        let mut waiting = obj.waiting_on.lock();
+        if let Some(i) = waiting.iter().position(|entry| entry.as_ref() == id) {
+            waiting.swap_remove(i);
         }
-        let _waiting = scopeguard::guard(id, |id| {
-            let mut waiting = obj.waiting_on.lock();
-            if let Some(i) = waiting.iter().position(|entry| entry.as_ref() == id) {
-                waiting.swap_remove(i);
-            }
-        });
-        let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
-        let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
-        let body = http_body_util::Limited::new(body, limit).collect().await;
-        let body = body.map_err(|_| Error::HttpRequestBodySize(None))?.to_bytes();
-        parts.uri = format!("http://{}/{}", crate::ws::PUBLISH_HOST, path.trim_start_matches('/'))
-            .parse()
-            .map_err(|_| Error::HttpRequestUriInvalid)?;
-        let res = node.dispatch(id, http::Request::from_parts(parts, body)).await;
-        // The permit lives as long as the response body, as for any request.
-        Ok(to_guest(res.map(|b| {
-            b.map_frame(move |f| {
-                let _ = &permit;
-                f
-            })
-            .boxed_unsync()
-        })))
-    }.await;
-    let mut span = scopeguard::ScopeGuard::into_inner(span);
-    client_response(&mut span, result.as_ref(), true);
-    result
+    });
+    let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
+    let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
+    let body = http_body_util::Limited::new(body, limit).collect().await;
+    let body = body.map_err(|_| Error::HttpRequestBodySize(None))?.to_bytes();
+    parts.uri = format!("http://{}/{}", crate::ws::PUBLISH_HOST, path.trim_start_matches('/'))
+        .parse()
+        .map_err(|_| Error::HttpRequestUriInvalid)?;
+    let res = node.dispatch(id, http::Request::from_parts(parts, body)).await;
+    // The permit lives as long as the response body, as for any request.
+    Ok(to_guest(res.map(|b| {
+        b.map_frame(move |f| {
+            let _ = &permit;
+            f
+        })
+        .boxed_unsync()
+    })))
 }
 
 fn cancelled(mut span: crate::telemetry::Span) {

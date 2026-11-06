@@ -33,7 +33,7 @@ use hyper::body::Incoming;
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, watch};
 
 use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
@@ -119,18 +119,16 @@ struct Live {
     policies: Mutex<HashSet<Policy>>,
     /// How long its longest request may take, to bound a drain.
     drain: Duration,
-    /// Reads as changed once the process is gone, completing its drain.
-    gone: watch::Receiver<()>,
     /// Its slot among `max_apps`, passed on to the worker that replaces it.
     slot: Mutex<Option<OwnedSemaphorePermit>>,
-    /// Dropping or taking this kills the process. It reads as closed once
-    /// the process is gone, because its watcher drops the receiver then.
-    kill: Mutex<Option<oneshot::Sender<()>>>,
+    /// Sending true or dropping this kills the worker. Closure acknowledges
+    /// actual process exit, not just receipt of the kill request.
+    kill: watch::Sender<bool>,
 }
 
 impl Live {
     fn alive(&self) -> bool {
-        self.kill.lock().as_ref().is_some_and(|k| !k.is_closed())
+        !*self.kill.borrow() && !self.kill.is_closed()
     }
 }
 
@@ -439,16 +437,14 @@ impl Supervisor {
             }
         });
 
-        // Watches the process; dropping `kill` (with the `Live`) kills it.
-        // `gone` changes when this ends.
-        let (kill, killed) = oneshot::channel::<()>();
-        let (gone_tx, gone) = watch::channel(());
+        // Keep the receiver until the child is reaped: sender closure is
+        // the drain barrier even when killing takes time.
+        let (kill, mut killed) = watch::channel(false);
         let app = w.name.clone();
         tokio::spawn(async move {
-            let _gone = gone_tx;
             tokio::select! {
                 status = child.wait() => eprintln!("nanovm: worker for app {app:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
-                _ = killed => {
+                _ = killed.changed() => {
                     let _ = child.kill().await;
                 }
             }
@@ -491,9 +487,8 @@ impl Supervisor {
             version: p.version,
             policies: Mutex::new(HashSet::from([want.policy.clone()])),
             drain,
-            gone,
             slot: Mutex::new(Some(slot)),
-            kill: Mutex::new(Some(kill)),
+            kill,
         });
         let ready = tokio::time::timeout(START_TIMEOUT, async {
             let res = live.link.send(get("/_nanovm/ready")).await?;
@@ -545,9 +540,8 @@ async fn drain(old: Arc<Live>) {
     while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    old.kill.lock().take();
-    // Its watcher drops the sender once the process has exited.
-    let _ = old.gone.clone().changed().await;
+    old.kill.send_replace(true);
+    old.kill.closed().await;
 }
 
 /// A forwarded request's answer from the supervisor itself.

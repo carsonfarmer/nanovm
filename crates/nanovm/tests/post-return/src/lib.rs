@@ -11,6 +11,7 @@ impl wasip3::exports::http::handler::Guest for Probe {
         if req.path == "/callee" {
             return util::text(200, "callee");
         }
+        util::write_file("/data", "before.txt", b"before".to_vec()).await.unwrap();
         let gate = req.q("gate").unwrap().to_owned();
         let (mut tx, rx) = wasip3::wit_stream::new();
         let (trailers, trailers_rx) = wasip3::wit_future::new(|| Ok(None));

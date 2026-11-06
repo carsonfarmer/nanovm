@@ -1388,11 +1388,7 @@ async fn a_drain_that_runs_out_of_time_kills_the_old_worker() {
     assert_eq!(app_get(addr, &old, "/x/").await.0, 200);
     // The switch waited out the drain (hostile's 2 s + 1 s), then killed it.
     assert!(t0.elapsed() >= Duration::from_secs(3), "{:?}", t0.elapsed());
-    let t1 = Instant::now();
-    while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z ")) {
-        assert!(t1.elapsed() < Duration::from_secs(2), "the old worker is still running");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "replacement answered before old worker was reaped");
     drop(held);
     let v = stats_json(addr).await;
     assert_eq!(v["workers"][worker(&old).as_str()]["version"], "1.0.0", "{v}");
@@ -3203,7 +3199,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
     app.limits.post_return_timeout_ms = 5000;
     app.limits.cpu_ms = 1000;
     let objects = cfg.app_dirs(&app.name)[0].clone();
-    let node = Node::new(cfg, &app, &wasm, None).unwrap();
+    let node = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
     for (i, fail) in [(1u8, false), (2, true)] {
         let id = format!("parent{i}");
         let req = http::Request::builder().uri(format!("/?gate={address}"))
@@ -3217,12 +3213,41 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         let journal = objects.join("~journal").join(&id).join("log");
         assert!(journal.exists(), "post-return write has an uncommitted journal");
         if fail { std::fs::rename(&journal, journal.with_file_name("saved-log")).unwrap(); }
+        let mut queued = if !fail {
+            let node = node.clone();
+            let id = id.clone();
+            Some(tokio::spawn(async move {
+                node.dispatch(&id, http::Request::builder().uri("/callee").body(bytes::Bytes::new()).unwrap()).await
+            }))
+        } else { None };
+        if let Some(next) = &mut queued {
+            assert!(tokio::time::timeout(Duration::from_millis(100), next).await.is_err(), "next request entered during post-return work");
+        }
         finish.add_permits(1);
         assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), "finished");
+        if let Some(next) = queued {
+            let next = tokio::time::timeout(Duration::from_secs(5), next).await.unwrap().unwrap();
+            assert_eq!(next.into_body().collect().await.unwrap().to_bytes(), "callee");
+        }
         eventually("final commit", || node.phases().keys().all(|p| *p == "idle" || *p == "cold")).await;
         if fail { std::fs::rename(journal.with_file_name("saved-log"), &journal).unwrap(); }
     }
     node.shutdown().await;
+    // The injected failure happened before log deletion: restoring that
+    // undo record must retain the first commit and reject only later work.
+    // This is not a claim that every ambiguous commit failure rolls back.
+    for _ in 0..2 {
+        let reopened = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
+        for id in ["parent1", "parent2"] {
+            let response = reopened.dispatch(id, http::Request::builder().uri("/callee").body(bytes::Bytes::new()).unwrap()).await;
+            assert_eq!(response.status(), 200);
+            response.into_body().collect().await.unwrap();
+            assert_eq!(std::fs::read(objects.join(id).join("before.txt")).unwrap(), b"before");
+        }
+        assert_eq!(std::fs::read(objects.join("parent1/after.txt")).unwrap(), b"after");
+        assert!(!objects.join("parent2/after.txt").exists());
+        reopened.shutdown().await;
+    }
     let telemetry = node.telemetry.clone();
     tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
     let spans = spans.lock();

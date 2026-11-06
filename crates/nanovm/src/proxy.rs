@@ -241,7 +241,12 @@ impl Proxy {
     /// The route `_nanovm.<host>` names, if any, from the cache while its TTL
     /// lasts.
     async fn route(&self, host: &str) -> anyhow::Result<Option<Route>> {
-        self.routes.get(host, self.lookup(host)).await
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        let lookup = async {
+            tokio::time::timeout_at(deadline, self.lookup(host)).await.context("DNS lookup deadline exceeded")?
+        };
+        // A cancelled single-flight initializer must not restart a waiter's budget.
+        tokio::time::timeout_at(deadline, self.routes.get(host, lookup)).await.context("DNS route deadline exceeded")?
     }
 
     async fn lookup(&self, host: &str) -> anyhow::Result<(Option<Route>, Duration)> {
@@ -323,6 +328,36 @@ pub async fn serve_publish(proxy: Arc<Proxy>, listener: tokio::net::TcpListener)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neither missing headers nor a stalled JSON body may hold initial
+    /// routing forever. A timeout is cached like any other resolver error.
+    #[tokio::test]
+    async fn stalled_dns_responses_have_a_total_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = Proxy::new(ProxyConfig {
+                resolver: format!("http://{}/dns-query", listener.local_addr().unwrap()),
+                ..Default::default()
+            }).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                if headers {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
+                }
+                std::future::pending::<()>().await;
+            });
+            let result = tokio::time::timeout(CLIENT_TIMEOUT + Duration::from_secs(2), proxy.resolve("stalled.example")).await;
+            server.abort();
+            let (status, error) = result.expect("initial DNS routing hangs").unwrap_err();
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert!(error.contains("deadline"), "{error}");
+            let cached = tokio::time::timeout(Duration::from_millis(100), proxy.resolve("stalled.example")).await.unwrap();
+            assert_eq!(cached.unwrap_err(), (status, error));
+        }
+    }
 
     /// A key is looked up once however many ask at once; a failure is
     /// answered again until `ERROR_TTL`; and the cache never holds more

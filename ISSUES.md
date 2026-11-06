@@ -211,8 +211,8 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### N-33: initial proxy DNS lookups have no deadline
 - **Where:** `proxy.rs`, `forward` → `resolve` → `lookup`
 - **Scenario:** a resolver that accepts but never answers holds the initial HTTP request or WebSocket handshake before socket admission. W-3's event-delivery timeout does not cover that initial lookup. Predates W-3; found by its adversarial review.
-- **Reproduced:** from source, not a live stalled-resolver test
-- **Status:** open; bound the initial lookup and add a stalled-resolver test
+- **Reproduced:** real stalled headers and JSON body both fail the new regression without the fix.
+- **Status:** validated on `runtime-ownership-hardening`; a ten-second absolute route deadline covers cache waiting and resolver I/O. Full suite, mutation/restoration and demo pass; awaiting main delivery.
 
 ### N-34 (tests): forged worker publish identity lacks a direct regression test
 - **Where:** `supervisor.rs`, the egress link's publish branch
@@ -248,6 +248,16 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** a failed creation of `n/m`, followed by creating regular file `n`, made commit fail while syncing obsolete `n/m`.
 - **Status:** fixed in 0e33e52, approved for main: treat `NotADirectory` like `NotFound` for obsolete sync targets; all other failures propagate. Regression fails before the fix and verifies accepted bytes after reopening.
 
+### N-40: worker reap errors and failed-startup slot lifetime
+- **Where:** `supervisor.rs`, worker watcher and readiness failure path
+- **From source:** the watcher ignores kill/wait errors, so watcher completion is not unconditional proof of reaping. Failed startup drops `Live` and releases its app slot before waiting for the watcher. Both limitations predate the one-channel refactor; the normal replacement path waits for reaping, now asserted immediately by its integration test.
+- **Status:** open; propagate termination failure before replacement and retain the slot through failed-startup reaping. Requires deterministic process-error/lifetime tests; not a demonstrated overlapping writer in the current tests.
+
+### N-41 (tests): lifecycle follow-through coverage
+- **Where:** proxy cache, actor deadlines, internal calls and scratch reuse
+- **Review gaps:** directly exercise cancelled DNS initializer promotion without extending another waiter's deadline, cumulative handling/post-return CPU charging, internal-call cancellation's span/permit/wait-graph cleanup, and detached directory-task lifetimes before scratch reuse. Source review found no new blocker; passing existing tests do not establish these specific oracles.
+- **Status:** open. Post-return queue isolation, exact recovered state across two reopens and immediate worker-reap assertions are addressed by `runtime-ownership-hardening`.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -265,7 +275,7 @@ Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the r
 - **Beta scope:** one composed provider/connection per object, memory-only temporary SQL storage, no direct access to its database/sidecars, no individual in-flight query cancellation, and local storage honoring syncs. These exclusions need documentation, not new host APIs. Commit/transport errors can have unknown outcomes; apps need idempotent retries. See the [beta contract](experiments/sqlite-filesystem/README.md#scope-for-a-production-beta). Physical power-loss certification, broader host-fault injection and hard isolation from same-app raw-file access remain unproven; this is not a general-purpose VFS or published interface.
 - **Source beta:** [components/sqlite](components/sqlite/README.md) packages the provider and a small HTTP app in a locked workspace. `cargo run --locked --example sqlite` checks persistence, isolation, mixed SQL/file/KV rollback and restart on a real in-process Node. CI builds the normal provider, runs that example and tests the same source with the pressure fixtures. No new host API or journal design; no publishing workflow is enabled.
 - **Query cancellation — closed without implementation:** blocking `thread.yield` is intentionally non-cancellable under the component-model specification, not a Wasmtime bug. Query-only cancellation remains outside the beta contract; whole-request interruption and rollback remain supported. Diagnostic probes were removed. No runtime fork, new host API or scheduling redesign is planned; see the [decision](experiments/sqlite-filesystem/README.md#query-cancellation-investigation-2026-11-02).
-- **Status:** source beta/example and host recovery fixes pushed on the validation branch through [74615d9](https://github.com/carsonfarmer/nanovm/commit/74615d9588dd415694dac6a3910531368800a136); CI passed. Not merged to main or published as a package.
+- **Status:** source beta/example and host recovery fixes are on main (through `0baff082`); main CI passes the example/pressure checks. SQLite has not been published as a package. Counter/hostile migrated packages 1.0.11 were published separately with owner approval.
 
 ### W-2: OpenTelemetry by default; deprecate the stats and events APIs (high priority)
 

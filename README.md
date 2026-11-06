@@ -330,9 +330,13 @@ Sockets are indexed by object within each app; a publish visits that object's so
 
 ## Commits
 
-A request's changes to `/data` (files and key-value alike) and what it publishes to WebSockets take effect together when it answers, and are durable before anyone hears of them: Durable Objects' output gate. A guest error, trap, CPU/time limit or worker crash before commit rolls back those changes. An answer of any status commits.
+A request's changes to `/data` (files, SQL and key-value alike) commit locally before its initial response is released. A guest error, trap, CPU/time limit or worker crash before commit rolls back those changes. An answer of any status commits. Held WebSocket publishes are released after their corresponding commit, but delivery is best effort: a crash or failed send can lose a publish after storage commits. This is not a durable outbox.
+
+Outbound HTTP and calls to other objects execute immediately, not behind the caller's commit gate. Their effects cannot be undone by caller rollback. Post-return writes have a second commit; already-visible headers and body bytes cannot be recalled if it fails. These are narrower guarantees than a general network output gate.
 
 A host I/O failure during commit, a crash at its commit marker, or a lost response can leave the caller unsure whether the request committed. Do not interpret every error as a rollback: use application-level operation IDs for idempotent retries. Durability assumes a filesystem and device that honor successful file and directory syncs; process-crash tests do not certify physical power-loss behavior.
+
+Persistence currently depends on the original storage surviving. There is no off-node backup/restore protocol, replication or automatic failover. Run only one supervisor against a data root; separate supervisors are not storage-fenced. Per-object logical quotas do not cap physical blocks or the aggregate storage of cold objects. RAM may cache durable data or stage tentative work, but memory-only acceptance would not preserve these guarantees.
 
 The supervisor syncs app-directory ancestors before launching a jailed worker;
 the worker's journal cannot reach those ancestors after confinement. Embedded
