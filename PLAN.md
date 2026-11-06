@@ -469,7 +469,8 @@ supervisor ancestor-directory sync and obsolete-path ENOTDIR handling. Final
 runtime 5,082 versus 5,074: the overall LOC goal remains unmet, despite the initial
 53-line cleanup. Retain journal; do not present this as the proposed large
 filesystem simplification. Full suites, opt-in SQL and mutation evidence are in
-HANDOFF. Main publication still requires approval for inherited guest migration.
+HANDOFF. The owner approved main integration and migrated guest publication on
+2026-11-06; older publication holds are superseded.
 
 **Decision (Q84):** retain journaling. Optimized plain pages also received a real
 matched comparison: small writes improve about 3× and unique 1 MiB writes reach

@@ -222,7 +222,7 @@ What happens on the first request for a digest:
 
 ## Key-value and config
 
-**`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. This branch's migration is under validation, not released. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.
+**`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. The counter and hostile guest packages compose this provider. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.
 - Values count against the object's disk budget and keys against its file limit, like any other file.
 - Replacement writes a temporary file and renames it over the key. It needs room for both values and a temporary entry; old descriptors retain the old value. Only the host commits, together with all the request's file/SQL changes.
 - Values are bounded to 1 MiB. Key enumeration streams with backpressure and an error completion. A combined 32-store/listing cap lasts through completion delivery; host resource limits also apply.
