@@ -5,7 +5,7 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 - **Reproduced**: shown against the real code or the OS. **From source**: traced through the code, not run.
 - Status: `open`, `fixing`, `fixed in <commit>`, or `deferred: <why>`.
 
-**Active ownership (2026-11-06):** Amp on `runtime-ownership-hardening` owns the request/body lifecycle in `object.rs`, worker lifetime in `supervisor.rs`, and initial lookup deadline in `proxy.rs`. Starting at 5,082 runtime lines; preserve both acceptance gates, idle guest execution, tracing and process-reap barriers. No guest changes. Follow with single-node persistence safeguards; distributed failover is not implemented by this slice.
+**Current delivery (2026-11-06):** `runtime-ownership-hardening` is validated through `225cfc4` for main. Runtime 5,082 → 5,077; both slower actor rewrites were rejected. No guest changes. Next: single-node storage ownership and recoverability; distributed failover is not implemented by this slice.
 
 ## Problems
 
@@ -212,7 +212,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `proxy.rs`, `forward` → `resolve` → `lookup`
 - **Scenario:** a resolver that accepts but never answers holds the initial HTTP request or WebSocket handshake before socket admission. W-3's event-delivery timeout does not cover that initial lookup. Predates W-3; found by its adversarial review.
 - **Reproduced:** real stalled headers and JSON body both fail the new regression without the fix.
-- **Status:** validated on `runtime-ownership-hardening`; a ten-second absolute route deadline covers cache waiting and resolver I/O. Full suite, mutation/restoration and demo pass; awaiting main delivery.
+- **Status:** fixed in 225cfc4; a ten-second absolute route deadline covers cache waiting and resolver I/O. Full suite, mutation/restoration and demo pass.
 
 ### N-34 (tests): forged worker publish identity lacks a direct regression test
 - **Where:** `supervisor.rs`, the egress link's publish branch
