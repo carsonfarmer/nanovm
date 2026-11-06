@@ -5,6 +5,8 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 - **Reproduced**: shown against the real code or the OS. **From source**: traced through the code, not run.
 - Status: `open`, `fixing`, `fixed in <commit>`, or `deferred: <why>`.
 
+**Active ownership (2026-11-06):** Amp on `runtime-ownership-hardening` owns the request/body lifecycle in `object.rs`, worker lifetime in `supervisor.rs`, and initial lookup deadline in `proxy.rs`. Starting at 5,082 runtime lines; preserve both acceptance gates, idle guest execution, tracing and process-reap barriers. No guest changes. Follow with single-node persistence safeguards; distributed failover is not implemented by this slice.
+
 ## Problems
 
 Found by the review at `c607ec9`, unless an entry says otherwise; line numbers are as of that commit.
