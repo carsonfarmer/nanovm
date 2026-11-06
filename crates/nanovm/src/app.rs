@@ -41,6 +41,8 @@ pub struct App {
     /// compares a volume's path with where its open files really are.
     pub objects: PathBuf,
     pub scratch: Arc<Scratch>,
+    /// Advisory local exclusion, retained through every App owner's lifetime.
+    _ownership: std::fs::File,
 }
 
 pub fn linker(engine: &Engine) -> anyhow::Result<Linker<ObjState>> {
@@ -75,6 +77,8 @@ impl App {
     ) -> anyhow::Result<App> {
         let [objects, tmp, cache] = node.app_dirs(&cfg.name);
         std::fs::create_dir_all(&objects)?;
+        let ownership = std::fs::File::open(&objects)?;
+        ownership.try_lock().context("app storage is already owned or cannot be locked")?;
         let component = crate::engine::load_component(engine, wasm, &cache)
             .with_context(|| format!("app {:?}", cfg.name))?;
         check_imports(engine, &component).with_context(|| format!("app {:?}", cfg.name))?;
@@ -97,6 +101,7 @@ impl App {
             config: Arc::new(cfg.config.iter().collect()),
             objects: objects.canonicalize()?,
             scratch: Scratch::new(tmp)?,
+            _ownership: ownership,
         })
     }
 }

@@ -336,7 +336,9 @@ Outbound HTTP and calls to other objects execute immediately, not behind the cal
 
 A host I/O failure during commit, a crash at its commit marker, or a lost response can leave the caller unsure whether the request committed. Do not interpret every error as a rollback: use application-level operation IDs for idempotent retries. Durability assumes a filesystem and device that honor successful file and directory syncs; process-crash tests do not certify physical power-loss behavior.
 
-Persistence currently depends on the original storage surviving. There is no off-node backup/restore protocol, replication or automatic failover. Run only one supervisor against a data root; separate supervisors are not storage-fenced. Per-object logical quotas do not cap physical blocks or the aggregate storage of cold objects. RAM may cache durable data or stage tentative work, but memory-only acceptance would not preserve these guarantees.
+Persistence currently depends on the original storage surviving. There is no off-node backup/restore protocol, replication or automatic failover. App admission takes a nonblocking exclusive lock on its objects directory before scratch cleanup or journal recovery. Supervisor directory preparation takes the same lock before changing ownership. Locks last through all `App` owners: embedded callers must drain and drop their `Node` and any `App` handles before reopening. A final actor may still retain ownership briefly after `shutdown()` returns; admission fails closed until it exits.
+
+This is cooperative local exclusion on a stable directory inode, not distributed fencing or an atomic supervisor-to-worker reservation. Keep one supervisor per data root; cgroup provisioning and noncooperating writers are not fenced. Do not replace a locked directory. Per-object logical quotas do not cap physical blocks or the aggregate storage of cold objects. RAM may cache durable data or stage tentative work, but memory-only acceptance would not preserve these guarantees.
 
 The supervisor syncs app-directory ancestors before launching a jailed worker;
 the worker's journal cannot reach those ancestors after confinement. Embedded

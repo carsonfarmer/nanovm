@@ -353,8 +353,10 @@ the under-5k goal is not yet met. Native-KV splitter removal below is obsolete
 after provider composition; do not count it twice.
 
 Prioritize precise local guarantees and recoverability: resolver deadlines,
-exclusive local volume ownership, total persistent-data admission and quiescent
-export/restore before automatic failover. Memory may cache or stage work, but
+local volume ownership, total persistent-data admission and quiescent
+export/restore before automatic failover. The local ownership slice uses standard
+nonblocking directory locks in App admission and supervisor preparation; it is
+cooperative exclusion, not a lease or atomic handoff between processes. Memory may cache or stage work, but
 does not replace durable commits. Multi-node operation still needs authenticated
 ingress/internal-call placement, committed-state transfer, an acknowledgement/RPO
 policy and storage-enforced writer fencing. The undo journal is not a replication

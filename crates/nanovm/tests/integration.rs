@@ -112,6 +112,37 @@ async fn settle(node: &Arc<Node>) {
 // ---- persistence and isolation ----------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
+async fn app_storage_has_one_local_owner() {
+    let cfg = node_cfg("app_storage_has_one_local_owner", 2);
+    let app = app("counter");
+    let wasm = guest("counter");
+    let first = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
+    let held = cfg.app_dirs(&app.name)[1].join("held");
+    std::fs::create_dir_all(&held).unwrap();
+    std::fs::write(held.join("live"), b"untouched").unwrap();
+    let reject = || {
+        let result = Node::new(cfg.clone(), &app, &wasm, None);
+        assert!(result.is_err(), "two nodes admitted to the same app storage");
+        assert!(result.err().unwrap().to_string().contains("app storage is already owned"));
+        assert_eq!(std::fs::read(held.join("live")).unwrap(), b"untouched", "competing admission cleaned live scratch");
+    };
+    reject();
+    let mut other = app.clone();
+    other.name = "other".into();
+    drop(Node::new(cfg.clone(), &other, &wasm, None).unwrap());
+    let owner = first.app.clone();
+    first.shutdown().await;
+    reject();
+    drop(first);
+    reject();
+    drop(owner);
+    assert!(Node::new(cfg.clone(), &app, b"invalid component", None).is_err());
+    let reopened = Node::new(cfg, &app, &wasm, None).unwrap();
+    assert_eq!(get(&reopened, "object", "/").await.status, 200);
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn volume_survives_eviction_memory_does_not() {
     let node = node("volume_survives_eviction", "counter", 2);
     for n in 1..=3 {
@@ -965,13 +996,18 @@ async fn supervised_workers_contain_attacks() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn killed_worker_is_restarted_and_keeps_its_volumes() {
-    let (_sup, addr) = supervised("killed_worker_is_restarted").await;
+    let cfg = node_cfg("killed_worker_is_restarted", 8);
+    let (_sup, addr) = supervised_with(cfg.clone()).await;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
     assert_eq!(app_get(addr, &hostile, "/k/").await.0, 200);
     let incr = format!("POST /k/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter));
     assert_eq!(raw(addr, &incr, b"").await.0, 200);
 
     let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
+    let mut competing = app("counter");
+    competing.name = worker(&counter);
+    let error = Node::new(cfg, &competing, &guest("counter"), None).err().expect("jailed worker must own its storage");
+    assert!(error.to_string().contains("app storage is already owned"), "{error:#}");
     unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     let t0 = Instant::now();
     while stats_json(addr).await["workers"][worker(&counter).as_str()]["up"] == true {
@@ -1751,6 +1787,7 @@ async fn sqlite_composed_provider() {
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     assert_eq!(get(&node, "b", "/").await.json(), expected(&[], "", false));
     node.shutdown().await;
+    drop(node);
     let node = Node::new(cfg, &app, &wasm, None).unwrap();
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     node.shutdown().await;
@@ -3236,6 +3273,8 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         if fail { std::fs::rename(journal.with_file_name("saved-log"), &journal).unwrap(); }
     }
     node.shutdown().await;
+    let telemetry = node.telemetry.clone();
+    drop(node);
     // The injected failure happened before log deletion: restoring that
     // undo record must retain the first commit and reject only later work.
     // This is not a claim that every ambiguous commit failure rolls back.
@@ -3251,7 +3290,6 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         assert!(!objects.join("parent2/after.txt").exists());
         reopened.shutdown().await;
     }
-    let telemetry = node.telemetry.clone();
     tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
     let spans = spans.lock();
     let logs = logs.lock();

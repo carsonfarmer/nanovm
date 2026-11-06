@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
     let r = load::request(&node, "GET", "fresh", "/empty", "").await;
     ensure!(r.status == 200 && r.body == "ok", "zero-entry read: {}", r.body);
     node.shutdown().await;
+    drop(node);
     ensure!(!dir.join("objects/spin-kv/fresh/.kv").exists());
     println!("PASS read-only bucket with zero file quota creates nothing");
     let node = Node::new(cfg.clone(), &app, &wasm, None)?;

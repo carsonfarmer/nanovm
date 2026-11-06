@@ -205,6 +205,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Status:** partly done in 57d17a4: the runtime depends on `oci-spec` instead of oci-client (10 fewer crates in the runtime build; three small serde structs read the manifest fields it needs). The `check_digest` in `from_headers` stays on purpose: Reference parsing accepts upper case and other algorithms, and the early check answers a malformed digest with a 400 before any start lock or registry work. Its last part, dropping TLS from the proxy, is W-14 (decided).
 
 ### N-32 (tests): persistence tests coupled to small CPU budgets
+- **SQLite fixture correction (2026-11-06, 14711ad):** main CI 42158465026 failed its setup write at the default 200 ms supervisor ceiling even though the fixture requested 2,000 ms. The same-runtime branch CI passed; the supervisor correctly clamped the tenant budget. Set the crash test's supervisor ceiling to its intended fixture budget. Production defaults and CPU-limit tests remain unchanged. Both P3/composed crash cases pass locally after correction.
 - **Confirmed cause:** the registry version-drain test repeatedly failed because its unrelated multi-MiB quota workload exceeded the signed guest's 100 ms CPU budget. Its comparison of two HTTP clients' completion times also depended on client scheduling, not worker lifetime.
 - **Registry fix:** persist a tiny file and KV value across the signed version switch; wait for observed request handling, require the admitted request to succeed, and check that the old process is gone. Warm both signed versions first: cold replacement loading could otherwise hide a missing drain. Disabling the actual drain loop fails with `worker-down`; restored cleanly. Final full default-scheduled and serial suites each pass (104 unit, 67 integration, one ignored). Quota tests and production budgets are unchanged.
 - **Earlier quota fix:** d64c80a gave the dedicated in-process bulk-write fixtures an appropriate budget. CPU-limit tests remain unchanged.
@@ -259,6 +260,10 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** proxy cache, actor deadlines, internal calls and scratch reuse
 - **Review gaps:** directly exercise cancelled DNS initializer promotion without extending another waiter's deadline, cumulative handling/post-return CPU charging, internal-call cancellation's span/permit/wait-graph cleanup, and detached directory-task lifetimes before scratch reuse. Source review found no new blocker; passing existing tests do not establish these specific oracles.
 - **Status:** open. Post-return queue isolation, exact recovered state across two reopens and immediate worker-reap assertions are addressed by `runtime-ownership-hardening`.
+
+### N-42: cooperating local nodes can open the same app storage
+- **Reproduced:** two Nodes admitted the same app directory; a second admission could clean live scratch and later recover another owner's journal. A separate preparation regression also reproduced supervisor preparation proceeding while the directory was locked.
+- **Status:** fixing on `local-volume-ownership`. Standard directory locks guard App lifetime and supervisor directory preparation. Tests cover retained handles, failed admission cleanup, separate apps and real jailed-worker release after SIGKILL. No distributed fencing, noncooperating-writer protection or atomic preparation-to-worker reservation is claimed.
 
 ## Planned work
 

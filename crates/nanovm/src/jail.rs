@@ -189,6 +189,8 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
     let fcntl = [libc::F_GETFD, libc::F_SETFD, libc::F_GETFL, libc::F_SETFL, libc::F_DUPFD_CLOEXEC];
     let fcntl = fcntl.map(|c| Ok(rule(vec![Cond::new(1, Dword, Eq, c as u64)?])?));
     rules.insert(libc::SYS_fcntl, fcntl.into_iter().collect::<anyhow::Result<_>>()?);
+    // Nonblocking exclusive app-volume ownership; close releases the lock.
+    rules.insert(libc::SYS_flock, vec![rule(vec![Cond::new(1, Dword, Eq, (libc::LOCK_EX | libc::LOCK_NB) as u64)?])?]);
     // Making a received socket non-blocking (std uses this ioctl for it).
     rules.insert(libc::SYS_ioctl, vec![rule(vec![Cond::new(1, Dword, Eq, libc::FIONBIO)?])?]);
     // tokio's signal driver wakes itself through a local socketpair, which

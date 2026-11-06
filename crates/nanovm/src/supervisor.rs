@@ -565,6 +565,10 @@ fn get(pq: &str) -> Request<Body> {
 /// survives restarts and config changes.
 fn app_dirs(cfg: &NodeConfig, name: &str, uids: &Mutex<()>) -> anyhow::Result<Option<u32>> {
     use std::os::unix::fs::MetadataExt;
+    let volume = cfg.app_dirs(name)[0].clone();
+    std::fs::create_dir_all(&volume)?;
+    let ownership = std::fs::File::open(&volume)?;
+    ownership.try_lock().context("app storage is already owned or cannot be locked")?;
     let uid = if unsafe { libc::geteuid() } != 0 {
         None
     } else {
@@ -576,8 +580,7 @@ fn app_dirs(cfg: &NodeConfig, name: &str, uids: &Mutex<()>) -> anyhow::Result<Op
             let taken = std::fs::read_dir(&objects).into_iter().flatten().flatten();
             taken.filter_map(|e| owner(&e.path())).max().map_or(base, |u| u + 1)
         });
-        std::fs::create_dir_all(objects.join(name))?;
-        std::os::unix::fs::chown(objects.join(name), Some(uid), Some(uid))?;
+        std::os::unix::fs::chown(&volume, Some(uid), Some(uid))?;
         Some(uid)
     };
     for d in cfg.app_dirs(name) {
@@ -663,6 +666,27 @@ pub fn worker_main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_cannot_change_an_owned_volume() {
+        use std::os::unix::fs::MetadataExt;
+        let cfg = NodeConfig {
+            data_dir: std::env::temp_dir().join(format!("nanovm-owned-preparation-{}", std::process::id())),
+            ..Default::default()
+        };
+        let [objects, tmp, cache] = cfg.app_dirs("app");
+        std::fs::create_dir_all(&objects).unwrap();
+        let ownership = std::fs::File::open(&objects).unwrap();
+        ownership.try_lock().unwrap();
+        let before = ownership.metadata().unwrap();
+        let result = app_dirs(&cfg, "app", &Mutex::new(()));
+        let after = ownership.metadata().unwrap();
+        let untouched = !tmp.exists() && !cache.exists() && (before.uid(), before.gid()) == (after.uid(), after.gid());
+        drop(ownership);
+        std::fs::remove_dir_all(&cfg.data_dir).unwrap();
+        assert!(result.is_err(), "preparation must reject an admitted owner");
+        assert!(untouched, "rejected preparation changed directories or ownership");
+    }
 
     /// The supervisor's own answer to a forwarded request carries the
     /// verdict a worker trusts.
