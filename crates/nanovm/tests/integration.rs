@@ -3040,33 +3040,46 @@ async fn a_switch_finishes_when_its_request_goes_away() {
 /// and served once one is.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_node_runs_at_most_max_apps() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut cfg = node_cfg("a_node_runs_at_most_max_apps", 8);
     cfg.max_apps = 2;
+    // Admission, not deadlines: keep observed requests pending until released.
+    cfg.limits.request_timeout_ms = 30_000;
     let (_sup, addr) = supervised_with(cfg).await;
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let mut tenant = app("hostile");
+    tenant.limits.request_timeout_ms = 30_000;
+    tenant.limits.egress.push(upstream_addr.to_string());
     let mut apps = Vec::new();
     for repo in ["apps-a", "apps-b", "apps-c"] {
-        apps.push(publish(repo, &app("hostile")).await);
+        apps.push(publish(repo, &tenant).await);
     }
     let [a, b, c] = &apps[..] else { unreachable!() };
-    let busy = |app: &String, ms: u64| {
+    let busy = async |app: &String| {
         let app = app.clone();
-        tokio::spawn(async move { app_get(addr, &app, &format!("/s/sleep?ms={ms}")).await })
+        let request = tokio::spawn(async move { app_get(addr, &app, &format!("/s/fetch?url=http://{upstream_addr}/")).await });
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), upstream.accept()).await.unwrap().unwrap();
+        let mut bytes = [0; 4096];
+        assert!(tokio::time::timeout(Duration::from_secs(5), socket.read(&mut bytes)).await.unwrap().unwrap() > 0);
+        (request, socket)
     };
     let up = async |app: &str| stats_json(addr).await["workers"][worker(app).as_str()]["up"] == true;
 
     assert_eq!(app_get(addr, a, "/x/").await.0, 200);
     assert_eq!(app_get(addr, b, "/x/").await.0, 200);
     // `a` is idle and least recently used; `b` is busy.
-    let slow_b = busy(b, 900);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (slow_b, mut gate_b) = busy(b).await;
     assert_eq!(app_get(addr, c, "/x/").await.0, 200);
     assert!(!up(a).await && up(b).await && up(c).await, "{}", stats_json(addr).await);
     // Both running apps busy: `a` is refused, and neither is disturbed.
-    let slow_c = busy(c, 600);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (slow_c, mut gate_c) = busy(c).await;
     let (status, body) = app_get(addr, a, "/x/").await;
     assert!(status == 502 && body.contains("most apps (2)"), "{status} {body}");
+    let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    gate_b.write_all(answer).await.unwrap();
     assert_eq!(slow_b.await.unwrap().0, 200);
+    gate_c.write_all(answer).await.unwrap();
     assert_eq!(slow_c.await.unwrap().0, 200);
     // Once one is idle (and the refusal's backoff has passed), `a` runs.
     tokio::time::sleep(Duration::from_millis(1000)).await;

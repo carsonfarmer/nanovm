@@ -402,6 +402,9 @@ root invocation checks UID/GID preservation; the unprivileged one induces a real
 permission-denied backup. Neither touches an operator's existing volumes.
 The complete real-process drill also passes as root with jailed worker UIDs.
 Six deliberate mutations are caught, including omitted journals and final sync.
+Recovery delivery's main CI passed; its parallel branch run exposed an unrelated
+max-app admission fixture race (N-43). That fixture now gates observed upstream
+requests instead of assuming short guest sleeps survive cold startup.
 CI runs both privilege variants of the CLI tests and the SQL restore drill;
 orb setup installs restic idempotently. Runtime size remains 5,085 lines, with
 89 additional operator-tool lines counted separately.

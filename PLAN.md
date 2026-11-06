@@ -206,6 +206,8 @@ Node-level settings: `max_live_objects` (1000), `memory_reservation_mb` (128), `
 
 CI runs on pushes and pull requests (W-16, done and verified on GitHub): build the guests locally, check the production binary without dev features, then run the locked test suite. It does not publish packages or deploy. Serial test scheduling reduces shared-runner CPU contention without serializing requests inside concurrency tests.
 
+The max-app admission fixture holds observed upstream requests until explicit release, rather than assuming guest sleeps outlast cold startup (N-43). Its request deadlines are test-only; production budgets are unchanged.
+
 Each test spins up a `Node` in-process with small limits.
 - **Basics:** routing, `NANOVM_OBJECT_ID`, in-memory state persists within an instance, objects are independent of each other.
 - **Serial:** 50 parallel requests to one object produce a maximum overlap of 1. Mailbox overflow returns 503.

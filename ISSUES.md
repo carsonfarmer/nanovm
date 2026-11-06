@@ -266,7 +266,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### N-43 (tests): max-app admission assumes requests stay busy during cold startup
 - **Where:** `integration.rs`, `a_node_runs_at_most_max_apps`
 - **Observed:** branch CI 42313030490 returned 200 when the fixture expected a full-capacity refusal. It holds workers busy with 600/900 ms sleeps while loading another app, then assumes they are still busy. Runtime sources are unchanged by backup/restore.
-- **Status:** fixing by Amp on `deterministic-app-admission-test`; owns this integration test. Replace scheduling delays with observed, explicitly released upstream requests; keep production limits and guest sources unchanged. Reproduce the expired-window case before changing the fixture.
+- **Status:** fixed on `deterministic-app-admission-test`: observed upstream requests stay gated until the capacity assertion completes. An injected 1100 ms delay reproduces the old failure and passes with the fix. Allowing eviction of busy workers fails the corrected regression; restored with `git checkout --` and empty unstaged diff verified. Restored full suite passes (99 unit, 69 integration, 12 ignored). Runtime and guests unchanged. Recovery's main CI 42313034048 passed independently; this fixes the race rather than relying on that rerun-equivalent success.
 
 ## Planned work
 
