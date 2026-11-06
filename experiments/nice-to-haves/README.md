@@ -20,6 +20,7 @@ These are developer aids for trusted local files, not hostile-input services.
 | Local load fixture | [local_load_fixture.py](local_load_fixture.py) | 48 real oha requests to a synthetic loopback handler; no user-supplied target |
 | Collector redaction/enrichment fixture | [collector_fixture.py](collector_fixture.py) | Pinned Collector 0.164.0, two synthetic spans, negative configuration tests |
 | Transcript, histogram and CPU topology analysis | [analysis_tools.py](analysis_tools.py) | Deterministic summaries, compatible disjoint buckets and SMT overlap; [batch 3](BATCH3.md) |
+| Chat/deduplication teaching models | [protocol_models.py](protocol_models.py) | In-memory TTL, conflict, capacity and cursor tests; [batch 4](BATCH4.md) includes scheduler/incident/threat exercises |
 | Workload / deduplication cookbook | [RECIPES.md](RECIPES.md) | Design recipes only; no running deduplication service |
 | Telemetry queries and comparison protocol | [OPERATIONS.md](OPERATIONS.md) | Source-aligned guidance, not a new Collector/backend validation |
 | Prioritized backlog | [BACKLOG.md](BACKLOG.md) | 48 concrete items with acceptance gates; proposals clearly marked |

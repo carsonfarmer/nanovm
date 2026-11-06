@@ -95,3 +95,12 @@ Remaining priorities: benchmark import adapter + metadata manifest (NH14/NH19),
 pinned WIT inventory (NH18), then local-only load and Collector examples. There
 are no blockers for this batch; those follow-ons require their own fixtures and
 tools. The [backlog](BACKLOG.md) distinguishes all 48 items by priority and status.
+
+## Follow-on batches
+
+The statements above describe batch 1. [Batch 2](BATCH2.md) records real pinned
+oha/WIT/Collector checks; [batch 3](BATCH3.md) records transcripts, histograms and
+topology; [batch 4](BATCH4.md) adds six passing in-memory application protocol tests
+and a deterministic CLI transcript. These models do not validate a deployed chat
+service, storage persistence, authentication or concurrency. All batches remain
+independent of runtime/recovery work and local to `experiments/nice-to-haves/`.
