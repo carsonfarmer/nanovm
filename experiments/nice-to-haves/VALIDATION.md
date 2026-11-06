@@ -1,4 +1,10 @@
-# Batch 1 validation — 2026-11-06
+# Validation record
+
+Current through batch 3: **29 tests pass with the three pinned tools**, no skips.
+[Batch 2](BATCH2.md) and [batch 3](BATCH3.md) record newer tooling and limits.
+Work is on local branch `nice-to-haves`; nothing pushed or integrated into main.
+
+## Batch 1 validation — 2026-11-06
 
 Local orb, Python 3.11.6. All source changes are confined to
 `experiments/nice-to-haves/`. Runtime, shared HANDOFF/ISSUES, root configuration,

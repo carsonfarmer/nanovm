@@ -1,0 +1,4 @@
+[
+  {"run":"a","unit":"ms","bounds":[1,5,20],"counts":[2,1,0,1],"scope":"synthetic-client-all-responses","provenance":"synthetic"},
+  {"run":"b","unit":"ms","bounds":[1,5,20],"counts":[0,2,3,1],"scope":"synthetic-client-all-responses","provenance":"synthetic"}
+]

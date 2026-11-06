@@ -5,7 +5,7 @@ API, or work on storage recovery/ownership. P1 = most immediate developer value;
 P2 = useful once there is a real consumer; P3 = exploratory. S = hours, M = a few
 days, L = a separate project. Estimates are assumptions, not commitments.
 
-**Tested** means an executable bounded contract was checked in batch 1 or 2.
+**Tested** means an executable bounded contract was checked in a recorded batch.
 **Recipe** means written guidance, not an implemented service or validated deployment.
 **Proposed** means no implementation or measurement. IDs are local, not ISSUES IDs.
 
@@ -25,7 +25,7 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH12 | P1 / S | Dependency update assessment template: interface, build, cost and license evidence | Recipe |
 | NH13 | P1 / M | Bounded GET load driver with rate/concurrency/object-skew controls; prove cap on a loopback server | Partial: fixed 48-request local fixture tested; configurable driver not built |
 | NH14 | P1 / M | oha JSON adapter into NH02 schema; pin version and test archived success/error samples | Tested: 1.16.0, status oracle, raw digest, null latency |
-| NH15 | P1 / S | Deterministic demo transcript from normalized JSON; fixed ordering and secret-canary tests | Proposed |
+| NH15 | P1 / S | Deterministic demo transcript from normalized JSON; fixed ordering and secret-canary tests | Tested: deterministic Markdown, arbitrary labels omitted |
 | NH16 | P1 / M | Deployment TOML linter, schema matched to CLI and warnings distinct from errors; no deployment writes | Proposed |
 | NH17 | P1 / M | Collector dashboard JSON using bounded labels; run pinned Grafana/Prometheus on synthetic series | Proposed |
 | NH18 | P1 / M | WIT import/export inventory via pinned wasm-tools; nested/composed fixtures and provenance | Tested: 1.263.0 external interfaces, not recursive dependency/SBOM inspection |
@@ -41,9 +41,9 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH28 | P2 / M | Portability matrix from pinned source/docs and actual compile probes; mark untested jail support | Proposed |
 | NH29 | P2 / S | Conceptual scheduler HTTP contract with duplicate delivery/cancellation examples; no live alarms | Proposed |
 | NH30 | P2 / S | Synthetic storage-amplification calculator comparing logical bytes, blocks and metadata; no backup logic | Proposed |
-| NH31 | P2 / M | Offline histogram merger from compatible raw buckets; reject mismatched boundaries/units | Proposed |
+| NH31 | P2 / M | Offline histogram merger from compatible raw buckets; reject mismatched boundaries/units | Tested: disjoint buckets, nearest-rank intervals, overflow explicit |
 | NH32 | P2 / S | Synthetic high-cardinality label budget estimator; demonstrate cardinality product and overflow | Proposed |
-| NH33 | P2 / S | CPU/SMT topology capture into benchmark manifest; fixture test offline lscpu formats | Proposed |
+| NH33 | P2 / S | CPU/SMT topology capture into benchmark manifest; fixture test offline lscpu formats | Tested: socket/core grouping, affinity, SMT overlap; bind sidecar digest |
 | NH34 | P2 / M | Markdown anchor/reference checker using a real parser; match duplicate GitHub heading IDs | Proposed |
 | NH35 | P2 / S | Tenant-safe incident template; redact identity/body tokens and include evidence confidence | Proposed |
 | NH36 | P2 / S | Developer troubleshooting decision table for routing, guest API mismatch and telemetry loss | Recipe |
@@ -64,8 +64,8 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 
 Batch 2 completes the bounded NH14/NH19/NH18 tools plus synthetic NH23/NH24.
 NH13 remains partial: the fixture has a fixed request budget and never accepts a
-target URL; no general rate/skew driver exists. Useful next work is NH15 deterministic
-transcripts, NH31 raw histogram compatibility checks or NH33 topology metadata.
+target URL; no general rate/skew driver exists. Batch 3 completes NH15/NH31/NH33.
+Next are bounded application protocol models and synthetic planning exercises.
 NH17 still needs real Grafana/Prometheus synthetic-series validation; no dashboard
 is claimed. None requires production access or a host API change.
 
