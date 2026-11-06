@@ -109,3 +109,8 @@ independent of runtime/recovery work and local to `experiments/nice-to-haves/`.
 CLI fixture returns exact waits `[0,3,5,0]` and finishes `[6,8,8,13]`. Other tested
 calculators cover per-file block rounding, label-product overflow, separate cost
 alternatives and seeded balanced order/popularity. No live measurements are implied.
+
+[Batch 6](BATCH6.md) adds four passing offline-review tests and real read-only Cargo
+metadata, existing-component size and local Git-range checks. Unicode line framing
+was caught and corrected during validation. OCI signatures remain NOT VERIFIED;
+license declarations and changelog candidates require human review.

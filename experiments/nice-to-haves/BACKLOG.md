@@ -47,16 +47,16 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH34 | P2 / M | Markdown anchor/reference checker using a real parser; match duplicate GitHub heading IDs | Proposed |
 | NH35 | P2 / S | Tenant-safe incident template; redact identity/body tokens and include evidence confidence | Recipe: manual privacy/evidence worksheet in BATCH4, not automatic redaction |
 | NH36 | P2 / S | Developer troubleshooting decision table for routing, guest API mismatch and telemetry loss | Recipe |
-| NH37 | P2 / M | Read-only OCI artifact inventory with digest/signature provenance; offline fixture then opt-in registry | Proposed |
+| NH37 | P2 / M | Read-only OCI artifact inventory with digest/signature provenance; offline fixture then opt-in registry | Partial: local descriptor integrity tested; signatures explicitly NOT VERIFIED, no online client |
 | NH38 | P2 / S | Non-production threat-model exercise for trusting client headers; explicit trust-boundary answer key | Recipe: scenario and answer key in BATCH4, no host vulnerability claim |
 | NH39 | P3 / M | Synthetic object-popularity generator (uniform/hotset/Zipf); seeded distribution and count tests | Tested: replayable sequence/counts, partition extremes, no network |
 | NH40 | P3 / M | Fair benchmark run-order generator with randomized balanced pairs and replayable seed | Tested: exact AB/BA balance and seed replay |
-| NH41 | P3 / S | Component build-size budget diff, keyed by toolchain and digest; no size-as-speed inference | Proposed |
+| NH41 | P3 / S | Component build-size budget diff, keyed by toolchain and digest; no size-as-speed inference | Tested: binary digests, budget boundary, reductions, toolchain labels |
 | NH42 | P3 / M | Offline trace waterfall from sanitized OTLP fixture; validate parent IDs and missing-span markers | Proposed |
 | NH43 | P3 / S | Energy/cost worksheet with explicit electricity/cloud-rate assumptions; no live price claims | Tested: synthetic kWh, separate cloud/electricity alternatives |
 | NH44 | P3 / M | Client language interop fixtures for operation IDs and Unicode bodies; Python/JS wire-byte agreement | Proposed |
-| NH45 | P3 / S | Changelog candidate generator from explicit commit range; retain human review and no auto-release | Proposed |
-| NH46 | P3 / M | License/SBOM review worksheet using existing Cargo metadata; missing-license warnings, no policy verdict | Proposed |
+| NH45 | P3 / S | Changelog candidate generator from explicit commit range; retain human review and no auto-release | Tested: explicit ancestral commits, Unicode-safe subjects; no release |
+| NH46 | P3 / M | License/SBOM review worksheet using existing Cargo metadata; missing-license warnings, no policy verdict | Tested: declaration worksheet and secret-path exclusion; not build SBOM/legal approval |
 | NH47 | P3 / M | Browser chat protocol demo against a fake server; inspect reconnect, pending and rejected states | Proposed |
 | NH48 | P3 / S | Teach queueing with synthetic arrivals/service times; mark model assumptions and verify exact small cases | Tested: single-server FIFO, idle gaps, simultaneous arrivals, zero service |
 
@@ -67,7 +67,8 @@ NH13 remains partial: the fixture has a fixed request budget and never accepts a
 target URL; no general rate/skew driver exists. Batch 3 completes NH15/NH31/NH33.
 Batch 4 completes bounded NH21/NH22 models and NH29/NH35/NH38 teaching recipes.
 Batch 5 completes synthetic NH30/NH32/NH39/NH40/NH43/NH48 exercises.
-Next are offline artifact review tools, language probes and additional local fixtures.
+Batch 6 completes NH41/NH45/NH46 and the offline portion of NH37.
+Next are language probes and additional local fixtures.
 NH17 still needs real Grafana/Prometheus synthetic-series validation; no dashboard
 is claimed. None requires production access or a host API change.
 
