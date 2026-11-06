@@ -1,0 +1,12 @@
+{
+  "run": "example-001",
+  "variant": "candidate",
+  "workload": "warm-read",
+  "path": "http-node",
+  "environment": "replace-with-your-reviewed-setup-id",
+  "provenance": "synthetic",
+  "planned_requests": 12,
+  "accepted_statuses": [200],
+  "expected_spans": 0,
+  "received_spans": 0
+}

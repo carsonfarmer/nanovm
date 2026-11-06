@@ -1,0 +1,12 @@
+{
+  "application_cores": {"value": 2, "basis": "assumed", "source": "Synthetic dedicated physical core allocation"},
+  "collector_cores": {"value": 1, "basis": "assumed", "source": "Synthetic separately budgeted Collector allocation"},
+  "target_utilization": {"value": 0.7, "basis": "assumed", "source": "Illustrative headroom policy, not validated"},
+  "application_cpu_us": {"value": 100, "basis": "assumed", "source": "Synthetic CPU time per completed request"},
+  "collector_cpu_us": {"value": 20, "basis": "assumed", "source": "Synthetic CPU time for all spans per request"},
+  "memory_budget_mib": {"value": 1024, "basis": "assumed", "source": "Synthetic application memory budget"},
+  "fixed_memory_mib": {"value": 128, "basis": "assumed", "source": "Synthetic baseline RSS"},
+  "resident_object_kib": {"value": 128, "basis": "assumed", "source": "Synthetic density slope, not configured guest memory"},
+  "target_rps": {"value": 10000, "basis": "assumed", "source": "Example demand"},
+  "mean_latency_ms": {"value": 5, "basis": "assumed", "source": "Synthetic mean response latency"}
+}
