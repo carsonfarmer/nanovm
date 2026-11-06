@@ -5,9 +5,7 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 - **Reproduced**: shown against the real code or the OS. **From source**: traced through the code, not run.
 - Status: `open`, `fixing`, `fixed in <commit>`, or `deferred: <why>`.
 
-**Current delivery (2026-11-06):** `runtime-ownership-hardening` is validated through `225cfc4` for main. Runtime 5,082 → 5,077; both slower actor rewrites were rejected. No guest changes. Next: single-node storage ownership and recoverability; distributed failover is not implemented by this slice.
-
-**Latest delivery:** local app storage admission/preparation exclusion is validated in `8c94218`, together with SQLite fixture correction `14711ad`. Runtime is 5,085; backup/restore and distributed fencing remain unimplemented. No active file ownership after main integration.
+**Latest delivery (2026-11-06):** offline backup/restore (`fab908c`, follow-through `78ac448`) is on main, with a fresh-root SQL/file/KV recovery drill. Local app storage exclusion was delivered in `8c94218`. Runtime remains 5,085; both slower actor rewrites remain rejected. Live snapshots, distributed fencing and automatic failover remain unimplemented. No guest changes or active file ownership after main integration; W-5 records the remaining lifecycle scope.
 
 ## Problems
 
