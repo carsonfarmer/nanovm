@@ -11,6 +11,13 @@ step() {
 }
 done_step() { printf '   (%ss)\n' "$SECONDS"; }
 
+step "offline backup tooling"
+if ! command -v restic >/dev/null; then
+	sudo -n apt-get update -qq
+	sudo -n apt-get install -y restic
+fi
+done_step
+
 step "rust toolchain"
 if ! [ -x "$HOME/.cargo/bin/rustup" ]; then
 	# Also adds ~/.cargo/env to the shell profiles, so later login shells

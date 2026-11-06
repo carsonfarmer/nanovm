@@ -337,7 +337,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-5: data lifecycle (planning)
 - **What:** a plan for deleting an app's or an object's data, exporting a volume, backups and retention, and how each is authorized (likely through the proxy).
-- **Status:** backup/restore in progress by Amp on `offline-backup-restore` (2026-11-06). Owns `scripts/backup.py`, its tests and the SQLite fresh-root drill. Offline operator tooling will use restic for encrypted, integrity-checked snapshots, holding existing app admission locks and preserving undo journals. No live snapshots, remote credentials, deletion API or automated retention. Runtime files remain unchanged.
+- **Status:** offline backup/restore done in `fab908c` with validated main follow-through. Restic snapshots retain journals under app admission locks; only complete snapshots are tagged, and restore requires an exact ID and new destination. Real jailed SQL/file/KV crash recovery into a fresh root passes unprivileged and as root, including another write/restart. Six mutations caught; full suite, ten SQL tests, Python CLI tests, demo, benchmark and adversarial review pass. Host runtime unchanged at 5,085; tooling adds 89 lines. README defines offline authorization, ownership/deployment records, retention guidance and old-writer fencing. Deletion API, live snapshots, automated retention and actual off-node deployment remain open; no active file ownership after main integration.
 
 ### W-6: JS and Python guests
 - **What:** guests built with componentize-js and componentize-py, running the same endpoints as `counter`, to prove the host for other languages.

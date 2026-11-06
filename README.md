@@ -400,6 +400,11 @@ incomplete backups, missing repository content, journals, empty directories,
 numeric ownership/modes and refusal to overwrite existing destinations. The
 root invocation checks UID/GID preservation; the unprivileged one induces a real
 permission-denied backup. Neither touches an operator's existing volumes.
+The complete real-process drill also passes as root with jailed worker UIDs.
+Six deliberate mutations are caught, including omitted journals and final sync.
+CI runs both privilege variants of the CLI tests and the SQL restore drill;
+orb setup installs restic idempotently. Runtime size remains 5,085 lines, with
+89 additional operator-tool lines counted separately.
 
 ## Commits
 
