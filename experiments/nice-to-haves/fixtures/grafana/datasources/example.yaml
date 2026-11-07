@@ -1,0 +1,9 @@
+apiVersion: 1
+datasources:
+  - name: Synthetic local Prometheus
+    uid: nice-prom
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:8791
+    isDefault: true
+    editable: false

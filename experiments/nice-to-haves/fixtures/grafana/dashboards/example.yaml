@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: Synthetic teaching fixtures
+    type: file
+    allowUiUpdates: false
+    options:
+      path: ${NICE_DASHBOARDS}

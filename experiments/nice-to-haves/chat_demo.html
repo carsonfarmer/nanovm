@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chat delivery teaching model</title>
+<style>
+body{font:13px/1.5 var(--font-sans,system-ui);color:var(--foreground,#222);background:var(--background,#fff);margin:0}
+main{max-width:720px;margin:0 auto}h1{font-size:15px;font-weight:500;margin:0 0 4px}p{margin:4px 0 16px}.ui-sub,.note{font-size:12px;color:var(--muted-foreground,#626262)}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0}.ui-btn,select,input{font:inherit;color:inherit;background:var(--background,#fff);border:1px solid var(--border,#ccc);border-radius:6px;padding:8px 10px;min-height:36px;box-sizing:border-box}
+.ui-btn{cursor:pointer}.ui-btn:disabled{color:var(--muted-foreground,#777);cursor:default}button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--link,#3568ac);outline-offset:2px}
+@media(hover:hover){button:not(:disabled):hover{background:var(--muted,#eee)}}
+.room{border:1px solid var(--border,#ccc);border-radius:8px;padding:16px}.row{border-bottom:1px solid var(--border,#ddd);padding:10px 0;overflow-wrap:anywhere}.tag{font-size:11px;color:var(--muted-foreground,#666)}.counts{font-variant-numeric:tabular-nums;margin:12px 0;font-size:12px}.message{flex:1;min-width:130px}.notice{margin:12px 0;min-height:40px}.ui-caption{font-size:11px;color:var(--muted-foreground,#666)}
+</style>
+<main>
+<header class="ui-header"><h1 class="ui-title">A lost reply is not a rejected message</h1><p class="ui-sub">Synthetic in-page server. Try reconnecting or retrying the same ID. Nothing leaves this page; no host guarantees.</p></header>
+<div class="controls"><label for="scenario">Scenario</label><select id="scenario"><option value="lost">Lost reply</option><option value="offline">Offline queue</option><option value="rejected">Rejected message</option><option value="gap">History gap</option></select><button class="ui-btn" id="reset">Reset</button></div>
+<section class="room" aria-label="Chat protocol example">
+<div id="counts" class="counts"></div><div id="messages" aria-label="Displayed messages"></div>
+<div id="pending" class="row"></div><div id="notice" class="notice" role="status" aria-live="polite"></div>
+<div class="controls"><button class="ui-btn" id="reconnect">Reconnect</button><button class="ui-btn" id="retry">Retry same ID</button><button class="ui-btn" id="conflict">Retry changed body</button></div>
+<div class="controls"><label for="message">Message</label><input id="message" class="message" value="Another hello" maxlength="120"><button class="ui-btn" id="send">Send</button></div>
+</section>
+<p class="ui-caption">One room, one caller, at most 8 receipts and 4 replay events. No authentication, persistence, clocks, TTL, real network, encryption or concurrent clients. Reset creates a new world; it is not recovery. Changed bodies conflict; history gaps require application resynchronization.</p>
+</main>
+<script>
+{
+  const $ = id => document.getElementById(id);
+  let state;
+  function accept(id, body) {
+    const previous = state.receipts.find(x => x.id === id);
+    if (previous) return previous.body === body ? 'replay' : 'conflict';
+    if (state.receipts.length >= 8) return 'full';
+    const event = {id, body, sequence: ++state.latest};
+    state.receipts.push(event); state.events.push(event); state.events = state.events.slice(-4);
+    return 'accepted';
+  }
+  function replay() {
+    if (state.events.length && state.cursor < state.events[0].sequence - 1) {
+      state.notice = 'History gap: missing messages. Cursor stays put; reset this teaching model to resynchronize.';
+      return;
+    }
+    for (const event of state.events.filter(x => x.sequence > state.cursor)) {
+      state.display.push(event); state.cursor = event.sequence;
+      if (event.id === state.pending?.id) state.pending.status = 'delivered';
+    }
+  }
+  function reset() {
+    const scenario = $('scenario').value;
+    state = {connected:false, latest:0, next:2, cursor:0, receipts:[], events:[], display:[],
+      pending:{id:'message-1',body:'Hello from the example',status:'unknown'},notice:'The server accepted message-1, but its reply was lost.'};
+    if (scenario === 'lost') accept(state.pending.id,state.pending.body);
+    if (scenario === 'offline') {state.pending.status='queued';state.notice='Offline: message-1 has not reached the server.';}
+    if (scenario === 'rejected') {state.connected=true;state.pending.status='rejected';state.notice='Explicit application rejection: no message was accepted. Edit and send a new operation.';}
+    if (scenario === 'gap') {for(let i=1;i<=6;i++) accept('history-'+i,'Earlier message '+i);state.pending=null;state.notice='Six server events, only the last four retained. Reconnect to detect the gap.';}
+    render();
+  }
+  function render() {
+    $('counts').textContent = `${state.connected?'Connected':'Disconnected'} · Server events ${state.latest} · Displayed ${state.display.length} · Cursor ${state.cursor}`;
+    $('messages').replaceChildren();
+    if (!state.display.length) $('messages').textContent='No messages displayed yet.';
+    for (const event of state.display) {
+      const row=document.createElement('div');row.className='row';row.textContent=`${event.sequence}. ${event.body}`;$('messages').append(row);
+    }
+    $('pending').textContent=state.pending ? `${state.pending.id}: ${state.pending.body} — ${state.pending.status}` : 'No pending operation';
+    $('notice').textContent=state.notice;
+    $('retry').disabled=!state.pending || ['delivered','rejected'].includes(state.pending.status);
+    $('conflict').disabled=!state.pending || !state.receipts.some(x=>x.id===state.pending.id);
+    $('send').disabled=state.pending && ['queued','unknown'].includes(state.pending.status);
+  }
+  $('reset').onclick=reset;$('scenario').onchange=reset;
+  $('reconnect').onclick=()=>{state.connected=true;state.notice='Replayed from the last contiguous cursor. Queued operations still need an explicit retry.';replay();render();};
+  $('retry').onclick=()=>{state.connected=true;const result=accept(state.pending.id,state.pending.body);state.notice=`Same-ID retry: ${result}.`;if(result==='full')state.pending.status='rejected';replay();render();};
+  $('conflict').onclick=()=>{const result=accept(state.pending.id,state.pending.body+' changed');state.notice=`Changed-body retry: ${result}. The original message remains unchanged.`;render();};
+  $('send').onclick=()=>{
+    const body=$('message').value.trim();if(!body){state.notice='Enter a nonempty message.';render();return;}
+    state.pending={id:'message-'+state.next++,body,status:'queued'};
+    if(state.connected){const result=accept(state.pending.id,body);state.notice=`Send: ${result}.`;if(result==='full')state.pending.status='rejected';replay();}
+    else state.notice='Queued locally, not sent. Reconnect, then retry the same ID.';
+    render();
+  };
+  $('message').onkeydown=event=>{if(event.key==='Enter'&&!$('send').disabled)$('send').click();};
+  reset();
+}
+</script></html>

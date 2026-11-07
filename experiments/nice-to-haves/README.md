@@ -25,6 +25,7 @@ These are developer aids for trusted local files, not hostile-input services.
 | Offline review evidence | [review_tools.py](review_tools.py) | Size budgets, Cargo license declarations, explicit Git candidates and local OCI hashes; [batch 6](BATCH6.md) |
 | Python/JS wire and component probes | [wire_fixture.py](wire_fixture.py) | Real loopback unknown outcomes and byte agreement; [batch 7](BATCH7.md) also records pinned component build/run/async boundaries |
 | Config, documentation and load controls | [Batch 8](BATCH8.md) | TOML snapshot linter, optional pinned Markdown parser and capped own-loopback rate/skew exercise |
+| Synthetic dashboards, trace intervals and browser chat | [Batch 9](BATCH9.md) | Real Grafana/Prometheus query checks, offline OTLP views and inspected fake-server interaction states |
 | Workload / deduplication cookbook | [RECIPES.md](RECIPES.md) | Design recipes only; no running deduplication service |
 | Telemetry queries and comparison protocol | [OPERATIONS.md](OPERATIONS.md) | Source-aligned guidance, not a new Collector/backend validation |
 | Prioritized backlog | [BACKLOG.md](BACKLOG.md) | 48 concrete items with acceptance gates; proposals clearly marked |

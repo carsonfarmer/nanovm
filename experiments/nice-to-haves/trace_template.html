@@ -1,0 +1,30 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Offline trace intervals</title>
+<style>
+body{margin:0;font:13px/1.5 var(--font-sans,system-ui);color:var(--foreground,#222);background:var(--background,#fff)}main{max-width:720px;margin:auto}h1{font-size:15px;font-weight:500;margin:0 0 4px}.ui-sub,.ui-caption{font-size:12px;color:var(--muted-foreground,#666)}select{font:inherit;padding:8px;border:1px solid var(--border,#ccc);border-radius:6px;background:var(--background,#fff);color:inherit}select:focus-visible{outline:2px solid var(--link,#3568ac)}
+.span{display:grid;grid-template-columns:110px 1fr;gap:12px;margin:16px 0;align-items:center}.track{position:relative;height:12px;background:var(--grid,#eee)}.bar{height:12px;background:var(--chart-1,#537db0);position:absolute;min-width:1px}.detail{font-size:11px;color:var(--muted-foreground,#666)}.axis{display:flex;justify-content:space-between;margin-left:122px;color:var(--muted-foreground,#666);font-size:11px}.flag{color:var(--warning,#855c05)}.ledger{margin-top:20px;border-top:1px solid var(--border,#ccc);padding-top:12px}p{max-width:65ch} @media(max-width:400px){.span{grid-template-columns:90px 1fr;gap:8px}.axis{margin-left:98px}}
+</style><main>
+<header class="ui-header"><h1 id="title" class="ui-title">Offline trace intervals</h1><p class="ui-sub">Relative span intervals from caller-supplied OTLP JSON. Attributes, names and raw IDs are omitted. No critical-path or privacy guarantee.</p></header>
+<label for="trace">Trace</label> <select id="trace"></select><div id="rows"></div><div class="axis"><span>0 ms</span><span id="end"></span></div><div class="ledger" id="ledger"></div>
+<p class="ui-caption">Overlapping durations are not additive. Missing parents stay explicit; absence can mean sampling or incomplete export. Each trace starts at its earliest supplied span; aliases are local to this file. Clock skew can put children outside parents.</p>
+</main><script type="application/json" id="data">__TRACE_DATA__</script><script>
+{
+  const traces=JSON.parse(document.getElementById('data').textContent), selector=document.getElementById('trace');
+  for(let i=0;i<traces.length;i++){const option=document.createElement('option');option.value=i;option.textContent=traces[i].label;selector.append(option);}
+  function draw(){
+    const trace=traces[Number(selector.value)], rows=document.getElementById('rows');rows.replaceChildren();
+    if(!trace){document.getElementById('title').textContent='No spans supplied';selector.disabled=true;return;}
+    const extent=Math.max(...trace.spans.map(s=>s.start_ms+s.duration_ms)), missing=trace.spans.filter(s=>s.missing_parent).length;
+    document.getElementById('title').textContent=`${trace.spans.length} spans across ${extent.toLocaleString()} ms; ${missing} missing parents`;
+    document.getElementById('end').textContent=`${extent.toLocaleString()} ms`;
+    document.getElementById('ledger').textContent=trace.spans.some(s=>s.outside_parent)?'Warning: a child interval extends outside its supplied parent. Check clocks or instrumentation.':'No supplied child interval extends outside its parent. This does not establish complete tracing.';
+    for(const span of trace.spans){
+      const row=document.createElement('div');row.className='span';const label=document.createElement('div');label.textContent=span.label;
+      const detail=document.createElement('div');detail.className='detail';detail.textContent=`${span.start_ms.toLocaleString()} + ${span.duration_ms.toLocaleString()} ms`;
+      const parent=document.createElement('div');parent.className='detail'+(span.missing_parent?' flag':'');parent.textContent=span.missing_parent?'Parent missing':span.parent?`Child of ${span.parent}`:'Root';label.append(detail,parent);
+      const track=document.createElement('div');track.className='track';track.setAttribute('role','img');track.setAttribute('aria-label',`${span.label}, start ${span.start_ms} ms, duration ${span.duration_ms} ms`);
+      const bar=document.createElement('div');bar.className='bar';bar.style.left=`${extent?100*span.start_ms/extent:0}%`;bar.style.width=`${extent?100*span.duration_ms/extent:0}%`;track.append(bar);row.append(label,track);rows.append(row);
+    }
+  }
+  selector.onchange=draw;draw();
+}
+</script></html>

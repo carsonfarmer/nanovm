@@ -123,3 +123,13 @@ is unverified because the pinned host binding generator rejects its type encodin
 [Batch 8](BATCH8.md) adds six passing tests: three TOML-lint, two parser-backed
 Markdown, and one real bounded-load contract. Python 3.11 is required for tomllib;
 optional Markdown tests need the pinned `NICE_MARKDOWN_TOOLS` installation.
+
+[Batch 9](BATCH9.md) adds exact OTLP interval/error tests and an opt-in real
+Prometheus dashboard-query test. The cumulative suite passes 56 tests with zero
+skips using all optional dependencies and `NICE_SYNTHETIC_PROMETHEUS=1` against
+the disposable local fixture. Queries return 100 requests/s, 20% errors, 35% queue,
+80/20 outcomes and 5 dropped spans/s; the deliberately incorrect two-layer sum
+returns 200. Chromium DOM assertions, inspected screenshots (including narrow,
+empty and warning states) and pointer recordings validate the browser examples.
+These UI checks are manual recorded validation, not a permanent browser suite.
+All changes remain isolated; no runtime/guest or production guarantees are added.

@@ -27,7 +27,7 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH14 | P1 / M | oha JSON adapter into NH02 schema; pin version and test archived success/error samples | Tested: 1.16.0, status oracle, raw digest, null latency |
 | NH15 | P1 / S | Deterministic demo transcript from normalized JSON; fixed ordering and secret-canary tests | Tested: deterministic Markdown, arbitrary labels omitted |
 | NH16 | P1 / M | Deployment TOML linter, schema matched to CLI and warnings distinct from errors; no deployment writes | Tested: source-hash-pinned prototype, selected syntax/type/dev checks, not deployment approval |
-| NH17 | P1 / M | Collector dashboard JSON using bounded labels; run pinned Grafana/Prometheus on synthetic series | Proposed |
+| NH17 | P1 / M | Collector dashboard JSON using bounded labels; run pinned Grafana/Prometheus on synthetic series | Tested: Grafana 13.3.0/Prometheus 3.16.0, invented series, one-layer and double-count controls |
 | NH18 | P1 / M | WIT import/export inventory via pinned wasm-tools; nested/composed fixtures and provenance | Tested: 1.263.0 external interfaces, not recursive dependency/SBOM inspection |
 | NH19 | P1 / S | Benchmark metadata manifest generator excluding environment values; secret-canary validation | Tested: allowlisted fields, hashes, no environment/remote/path contents |
 | NH20 | P1 / M | Client disconnect test harness for application authors; distinguish unknown result from rejected operation | Tested: local handler accepts before disconnect, both clients report unknown, explicit retries |
@@ -52,15 +52,15 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH39 | P3 / M | Synthetic object-popularity generator (uniform/hotset/Zipf); seeded distribution and count tests | Tested: replayable sequence/counts, partition extremes, no network |
 | NH40 | P3 / M | Fair benchmark run-order generator with randomized balanced pairs and replayable seed | Tested: exact AB/BA balance and seed replay |
 | NH41 | P3 / S | Component build-size budget diff, keyed by toolchain and digest; no size-as-speed inference | Tested: binary digests, budget boundary, reductions, toolchain labels |
-| NH42 | P3 / M | Offline trace waterfall from sanitized OTLP fixture; validate parent IDs and missing-span markers | Proposed |
+| NH42 | P3 / M | Offline trace waterfall from sanitized OTLP fixture; validate parent IDs and missing-span markers | Tested: relative intervals, cycles/duplicates rejected, missing/outside parents visible; no privacy guarantee |
 | NH43 | P3 / S | Energy/cost worksheet with explicit electricity/cloud-rate assumptions; no live price claims | Tested: synthetic kWh, separate cloud/electricity alternatives |
 | NH44 | P3 / M | Client language interop fixtures for operation IDs and Unicode bodies; Python/JS wire-byte agreement | Tested: exact files/IDs over real loopback HTTP, whitespace conflict, no canonicalization claim |
 | NH45 | P3 / S | Changelog candidate generator from explicit commit range; retain human review and no auto-release | Tested: explicit ancestral commits, Unicode-safe subjects; no release |
 | NH46 | P3 / M | License/SBOM review worksheet using existing Cargo metadata; missing-license warnings, no policy verdict | Tested: declaration worksheet and secret-path exclusion; not build SBOM/legal approval |
-| NH47 | P3 / M | Browser chat protocol demo against a fake server; inspect reconnect, pending and rejected states | Proposed |
+| NH47 | P3 / M | Browser chat protocol demo against a fake server; inspect reconnect, pending and rejected states | Tested: in-page lost/offline/rejected/gap states, explicit retries, literal text and 360px layout |
 | NH48 | P3 / S | Teach queueing with synthetic arrivals/service times; mark model assumptions and verify exact small cases | Tested: single-server FIFO, idle gaps, simultaneous arrivals, zero service |
 
-## Suggested next bounded batch
+## Completed batches and deferred boundaries
 
 Batch 2 completes the bounded NH14/NH19/NH18 tools plus synthetic NH23/NH24.
 Batch 3 completes NH15/NH31/NH33.
@@ -69,9 +69,12 @@ Batch 5 completes synthetic NH30/NH32/NH39/NH40/NH43/NH48 exercises.
 Batch 6 completes NH41/NH45/NH46 and the offline portion of NH37.
 Batch 7 adds NH20/NH44 wire fixtures, NH25 and bounded NH26/NH28 language probes.
 Batch 8 completes bounded NH13/NH16/NH34 controls; tools never deploy or load external targets.
-Next are synthetic visual examples; platform/runtime adoption remains out of scope.
-NH17 still needs real Grafana/Prometheus synthetic-series validation; no dashboard
-is claimed. None requires production access or a host API change.
+Batch 9 completes bounded NH17/NH42/NH47 visual examples and real synthetic-series queries.
+All 48 items have bounded implementations, recipes or explicit partial outcomes.
+NH26 async Python execution/startup cost requires compatible host tooling; NH28
+other platforms/jail support requires actual platform access; NH37 online registry
+and signature trust requires access and policy decisions. NH29 scheduler adoption
+requires a product decision. No production integration or guarantee is implied.
 
 The language probes (NH25/NH26) must remain outside `guests/**`; successful builds
 do not authorize migration or package publication. Comparison and portability work
