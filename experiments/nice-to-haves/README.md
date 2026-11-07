@@ -1,7 +1,7 @@
 # Independent developer toolbox
 
 Noncritical tools and recipes, isolated from the runtime and active backup work.
-Python 3.10+; Python standard library only. Batch 1 needs no external tools;
+Python 3.11+ for the full suite (3.10+ for batches 1–7). Batch 1 needs no external tools;
 batch 2 optionally runs pinned oha, wasm-tools and Collector binaries. No root
 changes, guest edits, package publication, or production services. Run from the repository root.
 These are developer aids for trusted local files, not hostile-input services.
@@ -24,6 +24,7 @@ These are developer aids for trusted local files, not hostile-input services.
 | Synthetic planning exercises | [planning.py](planning.py) | Block rounding, label budgets, cost, FIFO queue, balanced run order and object popularity; [batch 5](BATCH5.md) |
 | Offline review evidence | [review_tools.py](review_tools.py) | Size budgets, Cargo license declarations, explicit Git candidates and local OCI hashes; [batch 6](BATCH6.md) |
 | Python/JS wire and component probes | [wire_fixture.py](wire_fixture.py) | Real loopback unknown outcomes and byte agreement; [batch 7](BATCH7.md) also records pinned component build/run/async boundaries |
+| Config, documentation and load controls | [Batch 8](BATCH8.md) | TOML snapshot linter, optional pinned Markdown parser and capped own-loopback rate/skew exercise |
 | Workload / deduplication cookbook | [RECIPES.md](RECIPES.md) | Design recipes only; no running deduplication service |
 | Telemetry queries and comparison protocol | [OPERATIONS.md](OPERATIONS.md) | Source-aligned guidance, not a new Collector/backend validation |
 | Prioritized backlog | [BACKLOG.md](BACKLOG.md) | 48 concrete items with acceptance gates; proposals clearly marked |

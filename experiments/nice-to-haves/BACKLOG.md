@@ -23,10 +23,10 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH10 | P1 / S | Release checklist separating source delivery, CI, deployment and package authorization | Recipe |
 | NH11 | P1 / S | Workload matrix for hot rooms, many cold objects, payloads and dependencies with explicit oracles | Recipe |
 | NH12 | P1 / S | Dependency update assessment template: interface, build, cost and license evidence | Recipe |
-| NH13 | P1 / M | Bounded GET load driver with rate/concurrency/object-skew controls; prove cap on a loopback server | Partial: fixed 48-request local fixture tested; configurable driver not built |
+| NH13 | P1 / M | Bounded GET load driver with rate/concurrency/object-skew controls; prove cap on a loopback server | Tested: configurable own-loopback driver, total/concurrency/admission caps, skew and HTTP error oracle |
 | NH14 | P1 / M | oha JSON adapter into NH02 schema; pin version and test archived success/error samples | Tested: 1.16.0, status oracle, raw digest, null latency |
 | NH15 | P1 / S | Deterministic demo transcript from normalized JSON; fixed ordering and secret-canary tests | Tested: deterministic Markdown, arbitrary labels omitted |
-| NH16 | P1 / M | Deployment TOML linter, schema matched to CLI and warnings distinct from errors; no deployment writes | Proposed |
+| NH16 | P1 / M | Deployment TOML linter, schema matched to CLI and warnings distinct from errors; no deployment writes | Tested: source-hash-pinned prototype, selected syntax/type/dev checks, not deployment approval |
 | NH17 | P1 / M | Collector dashboard JSON using bounded labels; run pinned Grafana/Prometheus on synthetic series | Proposed |
 | NH18 | P1 / M | WIT import/export inventory via pinned wasm-tools; nested/composed fixtures and provenance | Tested: 1.263.0 external interfaces, not recursive dependency/SBOM inspection |
 | NH19 | P1 / S | Benchmark metadata manifest generator excluding environment values; secret-canary validation | Tested: allowlisted fields, hashes, no environment/remote/path contents |
@@ -44,7 +44,7 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 | NH31 | P2 / M | Offline histogram merger from compatible raw buckets; reject mismatched boundaries/units | Tested: disjoint buckets, nearest-rank intervals, overflow explicit |
 | NH32 | P2 / S | Synthetic high-cardinality label budget estimator; demonstrate cardinality product and overflow | Tested: exact product, budget boundary and signed-64-bit overflow flag |
 | NH33 | P2 / S | CPU/SMT topology capture into benchmark manifest; fixture test offline lscpu formats | Tested: socket/core grouping, affinity, SMT overlap; bind sidecar digest |
-| NH34 | P2 / M | Markdown anchor/reference checker using a real parser; match duplicate GitHub heading IDs | Proposed |
+| NH34 | P2 / M | Markdown anchor/reference checker using a real parser; match duplicate GitHub heading IDs | Tested: pinned CommonMark/github-slugger, references/duplicates/Unicode; no full GitHub HTML equivalence |
 | NH35 | P2 / S | Tenant-safe incident template; redact identity/body tokens and include evidence confidence | Recipe: manual privacy/evidence worksheet in BATCH4, not automatic redaction |
 | NH36 | P2 / S | Developer troubleshooting decision table for routing, guest API mismatch and telemetry loss | Recipe |
 | NH37 | P2 / M | Read-only OCI artifact inventory with digest/signature provenance; offline fixture then opt-in registry | Partial: local descriptor integrity tested; signatures explicitly NOT VERIFIED, no online client |
@@ -63,13 +63,13 @@ days, L = a separate project. Estimates are assumptions, not commitments.
 ## Suggested next bounded batch
 
 Batch 2 completes the bounded NH14/NH19/NH18 tools plus synthetic NH23/NH24.
-NH13 remains partial: the fixture has a fixed request budget and never accepts a
-target URL; no general rate/skew driver exists. Batch 3 completes NH15/NH31/NH33.
+Batch 3 completes NH15/NH31/NH33.
 Batch 4 completes bounded NH21/NH22 models and NH29/NH35/NH38 teaching recipes.
 Batch 5 completes synthetic NH30/NH32/NH39/NH40/NH43/NH48 exercises.
 Batch 6 completes NH41/NH45/NH46 and the offline portion of NH37.
 Batch 7 adds NH20/NH44 wire fixtures, NH25 and bounded NH26/NH28 language probes.
-Next are config/documentation checks and additional local fixtures.
+Batch 8 completes bounded NH13/NH16/NH34 controls; tools never deploy or load external targets.
+Next are synthetic visual examples; platform/runtime adoption remains out of scope.
 NH17 still needs real Grafana/Prometheus synthetic-series validation; no dashboard
 is claimed. None requires production access or a host API change.
 

@@ -119,3 +119,7 @@ license declarations and changelog candidates require human review.
 pinned language probes: both synchronous components validate and pass four string
 round trips; native async JS fails to build, Python async validates but execution
 is unverified because the pinned host binding generator rejects its type encoding.
+
+[Batch 8](BATCH8.md) adds six passing tests: three TOML-lint, two parser-backed
+Markdown, and one real bounded-load contract. Python 3.11 is required for tomllib;
+optional Markdown tests need the pinned `NICE_MARKDOWN_TOOLS` installation.
