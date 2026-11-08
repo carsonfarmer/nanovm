@@ -4,15 +4,56 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## Current state (2026-11-08)
 
-Continue from main `1e5f18ad4c4c3b06e1d4adc0da16ed38c173eab5`. Backup delivery
+**Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
+and is included in this main integration from `w9-atomic-capture`. Bounded, opt-in
+immutable capture now uses the real journal's decision at both commit gates.
+Local acceptance stays local-durable; remote acknowledgement and promotion policy
+are still undecided. W-9 is not complete: production receipt, restoration, retention
+and authority/fencing remain. No guest changes, publication or deployment occurred.
+Check the exact main integration head's CI before calling delivery fully verified.
+
+**Local capture evidence:** real journal capture passes 14 commit
+sync-error cuts and 28 rollback sync-error cuts, plus actual subprocess exits at
+the same boundaries. Every case reopens twice and checks exact state/history.
+Both response/post-return versions and jailed-worker restart tests pass. Transferred
+SQL/file/KV captures recover after source-root deletion, exclude rejected and unsent
+writes, and continue their history through another restart. The full serial suite
+passes 105 unit/69 integration/two proof tests (13 ignored), plus all 11 SQL tests.
+Removing rollback discard, accepted-publication recovery, byte enforcement or the
+version cap makes the regressions fail; all four mutations were restored from the
+index, followed by another passing full suite and all 11 SQL tests. Review caught visible-but-unsynced
+directory deletions being trusted on recovery. Two regressions fail before adding
+the missing barriers and pass afterward; follow-up review clears the blocker.
+This is barrier-ordering and process-loss evidence, not physical-power-loss proof.
+Opus routing is unattested. The release demo completed 70,000 normal requests and
+contained 100 attacks; 603 canary requests had no failures. Managed demo service
+was stopped. Production check and rustdoc pass (five existing rustdoc warnings);
+strict clippy retains seven existing diagnostics and none from capture code.
+The historical backend experiment still compiles against the changed Journal API;
+only its two call sites and dependency lock were updated, not its rejected design.
+
+**Performance:** three alternating main/candidate quick runs give median cold
+2,763/2,690 per second, warm concurrent 61,389/62,459, serial GET 8,221/8,229,
+concurrent writes 780/827 and serial writes 410/431. No consistent default-mode
+regression, but baseline had two write CPU failures and three cold CPU failures;
+candidate's third run had two write CPU failures. These are not clean benchmark
+passes or a fix of N-32. Two capture-enabled runs used an explicitly raised
+1,000-version cap to avoid measuring exhaustion: concurrent writes 465/457 per
+second and serial writes 221/196, roughly half default throughput. Full copies
+are deliberately costly; no large-volume or remote-performance clearance. Temporary
+benchmark configuration was restored; retained runtime defaults are unchanged.
+The earlier checkpoint `baab90e3` passed docs-only CI 42487886309; implementation
+CI is recorded above. Runtime is 5,320 lines versus the 5,085-line baseline.
+
+Historical starting main was `1e5f18ad4c4c3b06e1d4adc0da16ed38c173eab5`. Backup delivery
 and N-43 admission-fixture follow-through passed CI; neither is next work.
-Runtime is 5,085 lines; under 5k remains unmet. The single-node durable-object
-foundation is working, but loss of its storage loses writes since the last backup.
-No ordered committed-state feed, remote acknowledgement or distributed fencing exists.
+Baseline runtime is 5,085 lines; under 5k remains unmet. The single-node durable-object
+foundation is working, but local captures alone do not survive loss of its storage.
+No production remote transfer, remote acknowledgement or distributed fencing exists.
 The owner clarified on 2026-11-08: 5k is a simplicity goal, not a hard limit or
 delivery gate. Correctness and useful core progress take priority over that count.
 
-**W-9 bounded proof, Amp, `w9-committed-state`:** `examples/committed_state.rs`
+**Historical W-9 proof checkpoint, Amp, `w9-committed-state`:** `examples/committed_state.rs`
 uses the actual journal to capture immutable versions, transfer them in order and
 recover into a fresh root after deleting the source. This is research groundwork,
 not a replication architecture approval or runtime failover feature. Production
@@ -22,7 +63,7 @@ Do not extend offline backup, revive rejected actors/page backends, or integrate
 the optional nice-to-haves branch. W-10 placement follows capture/recovery evidence.
 Acknowledgement/RPO, remote backend and failover policy remain owner decisions.
 
-**Evidence:** the two example tests pass and run in the default suite. The separate
+**Evidence for that earlier proof:** the two example tests pass and run in the default suite. The separate
 `cargo run --locked -p nanovm --example committed_state` passes actual receiver
 process transfers and four abrupt-exit cuts (written, synced, linked, published),
 with exact-byte retry/recovery. These cuts are not run by the two unit tests.
@@ -40,16 +81,19 @@ with five existing warnings. Strict all-target clippy still fails on seven exist
 runtime diagnostics; the example emits no additional diagnostics. Its rustfmt check
 passes; repository-wide formatting remains unclean in unchanged files.
 
-**Delivery:** implementation `310c992` passed CI 42438468359, including the full
+**Earlier delivery:** implementation `310c992` passed CI 42438468359, including the full
 suite, example tests, composed SQL/KV and SQL pressure tests. Main integration
-includes this record; the exact new main head's CI must also complete. The earlier
+`3c69eb2` passed CI 42439279475. The earlier
 docs-only checkpoint `fed57b1` passed CI 42437123623. W-9 remains unfinished beyond
-this bounded proof; no production replication, guest publication or deployment.
+local capture; no production replication, guest publication or deployment.
 
 **Successor prompt:** Continue W-9 from this current section and PLAN's W-9 contract.
-Keep both response and post-return commits distinct. Close capture/publication crash
-windows before production integration; do not confuse same-host roots with remote
-durability or a sequence/epoch field with fencing. No guest changes or publishing.
+Keep both response and post-return captures distinct and preserve the recovery
+durability barriers. Verify exact-head main CI, then establish the owner's
+acknowledgement/RPO and recovery-authority policy before
+building a production receiver/restore path. The JSON proof is not a TAR receiver.
+Do not confuse same-host recovery with remote durability or sequence fields with
+fencing. No guest changes, publishing, automatic pruning or promotion.
 
 ## Historical checkpoints (superseded by current state above)
 
@@ -484,6 +528,7 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q87 | Cooperating local owners use standard nonblocking exclusive locks on stable app objects-directory inodes. App lifetime protects scratch cleanup/recovery/use; supervisor preparation takes the same lock before ownership changes. Preparation releases before worker admission, not an atomic handoff. Closing all owners or process exit releases admission; shutdown alone does not. Keep one supervisor per root: cgroup provisioning, directory replacement and noncooperating writers remain outside this local guarantee. |
 | Q88 | Offline backup/restore is operator tooling around restic, not another runtime API or custom archive. Stop all writers throughout backup, hold existing app locks, preserve the complete objects/journal tree, and approve only exit-zero snapshots. Restore an exact full ID to a nonexistent root, verify then sync before serving. Preserve numeric owners and deployment identity separately; fence the old writer before cutover. No live snapshot, external-effect rollback, automatic retention, off-node durability or failover claim. Keep restic in the caller's cwd so credentials keep their meaning; extract to temporary storage inside the fresh root, then move the verified objects subtree without copying it again. |
 | Q89 | W-9 engineering research starts with a bounded immutable full-version protocol using the actual journal, separate from production acceptance. Ordered sequence/parent hashes and fixed stream identity are not authentication or fencing. Preserve both commit gates; close local commit/capture crash windows before runtime integration. Acknowledgement/RPO, remote failure domain and automatic promotion remain undecided. The owner clarifies that 5k is a simplicity goal, not a hard limit. |
+| Q90 | Engineering continuation stages bounded streaming TAR captures before the existing journal commit decision, discards staging before rollback, and completes immutable hard-link publication before new mutations. Optional operator capture defaults off; full byte/version caps reject new dirty commits, no automatic pruning. Local durable acknowledgement is unchanged. Same-host capture recovery is not remote durability or permission to promote a second writer. |
 
 Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 

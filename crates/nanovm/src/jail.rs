@@ -142,6 +142,9 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_getdents64,
         libc::SYS_mkdirat,
         libc::SYS_unlinkat,
+        // Publish a committed capture without dropping its durable staged name.
+        // Landlock still confines both names; WASI hard links remain refused.
+        libc::SYS_linkat,
         libc::SYS_renameat2,
         libc::SYS_readlinkat,
         libc::SYS_ftruncate,
@@ -160,6 +163,7 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_renameat,
         // std's remove_file, remove_dir and read_link on x86_64 glibc.
         libc::SYS_unlink,
+        libc::SYS_link,
         libc::SYS_rmdir,
         libc::SYS_readlink,
     ]);
