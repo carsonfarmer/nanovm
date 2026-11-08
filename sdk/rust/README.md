@@ -1,0 +1,100 @@
+# nanovm-sdk
+
+Write a [nanovm](../../README.md) app in Rust: one async function from a
+request to a response. Each `/{object}/…` URL is its own durable object, with
+its own files and key-value store, served one request at a time.
+
+## Five minutes
+
+Once: Rust's WebAssembly target, `wac` (it composes the key-value store into
+apps), and `nanovm` itself.
+
+```sh
+rustup target add wasm32-wasip2
+cargo install --locked wac-cli@0.12.0
+git clone https://github.com/carsonfarmer/nanovm
+cargo install --locked --path nanovm/crates/nanovm
+```
+
+An app:
+
+```sh
+cargo new --lib hello && cd hello
+cargo add --git https://github.com/carsonfarmer/nanovm nanovm-sdk
+printf '\n[lib]\ncrate-type = ["cdylib"]\n' >> Cargo.toml
+```
+
+`src/lib.rs`:
+
+```rust
+use nanovm_sdk::{Request, Response, Result, kv};
+
+nanovm_sdk::serve!(handle);
+
+async fn handle(_req: Request) -> Result {
+    let visits = kv::increment("visits", 1).await?;
+    Ok(Response::text(format!("{} has had {visits} visits\n", nanovm_sdk::id())))
+}
+```
+
+Build and run it, then ask it things from another terminal:
+
+```sh
+../nanovm/tools/build-app.sh --run   # cargo build, compose the key-value provider, nanovm run hello.wasm
+curl http://127.0.0.1:8080/alice/    # alice has had 1 visits
+curl http://127.0.0.1:8080/alice/    # alice has had 2 visits
+curl http://127.0.0.1:8080/bob/      # bob has had 1 visits
+```
+
+`nanovm run` prints a line per request and what the app prints, keeps data in
+`./nanovm-data`, and restarts when `hello.wasm` changes: run
+`../nanovm/tools/build-app.sh` again after an edit. Limits, `env` and `config`
+go in `./nanovm.json` (`--manifest` names another file). It listens on
+loopback only: there is no registry, signature or jail.
+
+**Why a build script.** nanovm nodes link only the filesystem, HTTP and
+config into apps. The key-value store is a Wasm provider over the object's
+files, composed into the app with `wac plug`, so what `nanovm run` serves is
+exactly what a production node will run. An app that doesn't use `kv` is
+left as cargo built it.
+
+## Commits
+
+A request's file and key-value changes, and its WebSocket publishes, land
+together when it answers. `?` (or a panic) rolls them all back, so there is
+no need for write-to-temp-then-rename.
+
+## What's in it
+
+- `Request`: `method()`, `path()` (within the object), `query("q")`,
+  `query_or("n", 0)`, `header("h")`, `body()`, `text()`, `json()` (feature
+  `json`). `Response::text/html/json/bytes/new/not_found` with
+  `.status()`, `.header()`, `.body()`.
+- `data()` and `tmp()`: `read` (an `Option`), `read_text`, `write`, `append`,
+  `remove`, `open`.
+- `kv::get/get_text/set/delete/exists/increment/keys` on the store
+  `default`; `kv::open(label)` for others.
+- `config::get(key)`: the manifest's `config` table.
+- `fetch(url).method(..).header(..).body(..).send()`: outbound HTTP to hosts
+  in the manifest's `egress` list.
+- `object("lobby").post(path, body).send()`: calls another object of the
+  app, through its queue; it commits before it answers.
+- `ws::events(&req)`, `ws::Answer` (`accept`, `subscribe`, `text`, `binary`,
+  `close`) and `ws::publish(channel, msg)` for WebSockets.
+- `id()`, `app()`, `env(key)`, `sleep(d)`, `quote(s)`; `wasip3` for the rest.
+
+The [chat example](../../examples/chat) uses most of it.
+
+## Publish
+
+Production nodes run only signed apps from an OCI registry, routed by a DNS
+TXT record:
+
+```sh
+nanovm publish hello.wasm ghcr.io/you/hello:1.0.0   # pushes it with ./nanovm.json; prints how to sign and route
+```
+
+It prints the TXT record to add and how to sign keylessly: the GitHub
+workflow template [publish-app.yml](../../.github/workflows/publish-app.yml)
+(an artifact attestation from CI), or `cosign` from a laptop. README "Apps"
+has the details.

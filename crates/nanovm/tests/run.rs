@@ -217,3 +217,115 @@ async fn nanovm_run_restarts_when_the_component_changes() {
     assert_eq!(get(addr, "/x/").await, (200, r#"{"object":"x","hits":1}"#.into()));
     assert_eq!(std::fs::read_to_string(data.join("objects/app/x/count")).unwrap(), "1");
 }
+
+/// The quickstart (README, sdk/rust/README.md): examples/hello, built with
+/// tools/build-app.sh, counts each object's visits in its composed
+/// key-value store, which survives a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_quickstart_app_counts_visits() {
+    let data = data_dir("quickstart");
+    let args = [wasm("examples/target/hello.wasm").into_os_string(), "--data".into(), data.into()];
+    let args: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+    let mut run = start(&args);
+    let addr = run.addr().await;
+    assert_eq!(get(addr, "/alice/").await, (200, "alice has had 1 visits\n".into()));
+    assert_eq!(get(addr, "/alice/").await, (200, "alice has had 2 visits\n".into()));
+    assert_eq!(get(addr, "/bob/").await, (200, "bob has had 1 visits\n".into()));
+    let line = run.line("GET /bob/").await;
+    assert!(line.contains("→ 200 in") && line.ends_with("cold start"), "{line}");
+    drop(run);
+    let mut run = start(&args);
+    let addr = run.addr().await;
+    assert_eq!(get(addr, "/alice/").await, (200, "alice has had 3 visits\n".into()), "durable across restarts");
+}
+
+/// The example chat: rooms are objects whose history survives eviction and
+/// restarts, members are WebSockets, and the lobby indexes rooms through
+/// calls between objects.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_chat_example_is_live_and_durable() {
+    let data = data_dir("chat_example");
+    // The example's limits, with objects evicted after 300 ms idle.
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(repo().join("examples/chat/nanovm.json")).unwrap()).unwrap();
+    manifest["limits"]["idle_timeout_ms"] = 300.into();
+    std::fs::write(data.join("nanovm.json"), manifest.to_string()).unwrap();
+    let args = [
+        wasm("examples/target/chat.wasm").into_os_string(),
+        "--manifest".into(),
+        data.join("nanovm.json").into(),
+        "--data".into(),
+        data.clone().into(),
+    ];
+    let args: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
+    let message = |m: Message| -> serde_json::Value { serde_json::from_str(m.to_text().unwrap()).unwrap() };
+    let texts = |v: serde_json::Value| -> Vec<String> {
+        v.as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap().into()).collect()
+    };
+
+    let mut run = start(&args);
+    let addr = run.addr().await;
+    let (status, page) = get(addr, "/lobby/").await;
+    assert!(status == 200 && page.contains("<title>nanovm chat</title>"), "{status} {page}");
+
+    let mut ann = open(addr, "/general/ws?name=ann").await.unwrap();
+    let mut bob = open(addr, "/general/ws?name=bob").await.unwrap();
+    say(&mut ann, "hello").await;
+    for ws in [&mut ann, &mut bob] {
+        let m = message(next(ws).await);
+        assert_eq!((m["name"].as_str(), m["text"].as_str()), (Some("ann"), Some("hello")), "{m}");
+    }
+    assert_eq!(post(addr, "/general/messages?name=carl", "").await.0, 400);
+    assert_eq!(post(addr, "/general/messages?name=carl", "over http").await.0, 200);
+    for ws in [&mut ann, &mut bob] {
+        assert_eq!(message(next(ws).await)["text"], "over http");
+    }
+    // The lobby heard of each message through a call between objects.
+    let (status, rooms) = get(addr, "/lobby/rooms").await;
+    let rooms: serde_json::Value = serde_json::from_str(&rooms).unwrap();
+    assert_eq!(status, 200);
+    assert_eq!((rooms[0]["room"].as_str(), rooms[0]["messages"].as_u64()), (Some("general"), Some(2)), "{rooms}");
+    assert_eq!(rooms[0]["last"]["name"], "carl");
+    let mut lobby = open(addr, "/lobby/ws").await.unwrap();
+    assert_eq!(message(next(&mut lobby).await)["messages"], 2);
+    say(&mut bob, "and live").await;
+    assert_eq!(message(next(&mut lobby).await)["messages"], 3);
+    for ws in [&mut ann, &mut bob] {
+        assert_eq!(message(next(ws).await)["text"], "and live");
+    }
+
+    // Idle rooms are evicted. Their history is in their volume, and their
+    // sockets outlive them.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let (status, history) = get(addr, "/general/messages").await;
+    let history = texts(serde_json::from_str(&history).unwrap());
+    assert_eq!((status, history), (200, vec!["hello".into(), "over http".into(), "and live".into()]));
+    let line = run.line("GET /general/messages").await;
+    assert!(line.ends_with("cold start"), "evicted, so started again: {line}");
+    say(&mut ann, "after eviction").await;
+    for ws in [&mut ann, &mut bob] {
+        assert_eq!(message(next(ws).await)["text"], "after eviction");
+    }
+
+    // A restart keeps everything, and a new member gets the history.
+    drop(run);
+    let mut run = start(&args);
+    let addr = run.addr().await;
+    let mut dee = open(addr, "/general/ws?name=dee").await.unwrap();
+    let mut seen = vec![];
+    for _ in 0..4 {
+        seen.push(message(next(&mut dee).await)["text"].as_str().unwrap().to_string());
+    }
+    assert_eq!(seen, ["hello", "over http", "and live", "after eviction"]);
+    let rooms: serde_json::Value = serde_json::from_str(&get(addr, "/lobby/rooms").await.1).unwrap();
+    assert_eq!((rooms[0]["messages"].as_u64(), rooms[0]["last"]["text"].as_str()), (Some(4), Some("after eviction")));
+    // Bad input is refused, not stored.
+    assert_eq!(post(addr, "/lobby/rooms/general", "not json").await.0, 400);
+    for bad in ["%3Cb%3E", "_x", ".x"] {
+        let entry = r#"{"messages":1,"last":{"name":"a","text":"b","at":1}}"#;
+        assert_eq!(post(addr, &format!("/lobby/rooms/{bad}"), entry).await.0, 400, "{bad}");
+    }
+    say(&mut dee, &"x".repeat(2001)).await;
+    assert!(message(next(&mut dee).await)["error"].is_string());
+    assert_eq!(texts(serde_json::from_str(&get(addr, "/general/messages").await.1).unwrap()).len(), 4);
+}

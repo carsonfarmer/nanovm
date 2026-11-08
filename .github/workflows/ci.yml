@@ -34,6 +34,7 @@ jobs:
             guests -> ../target/guests
             components/keyvalue -> ../../target/keyvalue
             components/sqlite -> ../../target/sqlite
+            examples -> target
       - name: Prepare host limits
         run: sudo sysctl -w vm.max_map_count=1048576
       - name: Check offline backup tooling
@@ -56,6 +57,10 @@ jobs:
         run: cargo install wac-cli --version 0.12.0 --locked
       - name: Build guests locally (no publishing)
         run: bash scripts/build-guests.sh
+      - name: Build the example apps (no publishing)
+        run: |
+          tools/build-app.sh --locked examples/hello -o examples/target/hello.wasm
+          tools/build-app.sh --locked examples/chat -o examples/target/chat.wasm
       - name: Check production build without dev features
         run: cargo check --locked -p nanovm --bin nanovm
       - name: Run unit and integration tests

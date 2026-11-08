@@ -41,14 +41,14 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-const RUN: &str = "nanovm run <app.wasm> [--manifest nanovm.json] [--listen 127.0.0.1:8080] [--data nanovm-data]";
+const RUN: &str = "nanovm run <app.wasm> [--manifest ./nanovm.json] [--listen 127.0.0.1:8080] [--data nanovm-data]";
 
 /// `nanovm run`: one app in this process, for local development. With no
 /// registry, signatures or jail, it listens on loopback only. It serves
 /// `/{object}/…` as a node does, holds WebSockets as the proxy does, prints
 /// a line per request, and restarts when the component changes.
 fn run(wasm: &str, flags: &[String]) -> anyhow::Result<()> {
-    let (mut cfg, mut manifest) = (NodeConfig::default(), None);
+    let (mut cfg, mut manifest) = (NodeConfig::default(), std::fs::read("nanovm.json").ok());
     for flag in flags.chunks(2) {
         match flag {
             [k, v] if k == "--manifest" => manifest = Some(std::fs::read(v).with_context(|| format!("reading {v}"))?),
