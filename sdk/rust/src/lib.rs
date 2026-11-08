@@ -234,6 +234,13 @@ impl Request {
         &self.headers
     }
 
+    /// Cookie `name`, as the client sent it; set one with
+    /// `Response::header("set-cookie", "name=value; Path=/; HttpOnly")`.
+    pub fn cookie(&self, name: &str) -> Option<&str> {
+        let cookies = self.headers.iter().filter(|(k, _)| k == "cookie").flat_map(|(_, v)| v.split(';'));
+        cookies.filter_map(|c| c.trim().split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| v.trim_matches('"'))
+    }
+
     pub fn body(&self) -> &[u8] {
         &self.body
     }
@@ -357,4 +364,24 @@ type Trailers = core::result::Result<Option<wit::Fields>, wit::ErrorCode>;
 
 fn no_trailers() -> wit_bindgen::rt::async_support::FutureReader<Trailers> {
     wit_future::new(|| Ok(None)).1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(headers: &[(&str, &str)]) -> Request {
+        let headers = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        Request { method: "GET".into(), url: "http://x/".into(), path: "/".into(), query: vec![], headers, body: vec![] }
+    }
+
+    #[test]
+    fn cookies() {
+        let req = request(&[("cookie", "a=1; voter=x7=; b"), ("cookie", r#"c="quoted""#)]);
+        assert_eq!(req.cookie("a"), Some("1"));
+        assert_eq!(req.cookie("voter"), Some("x7="), "values may hold `=`");
+        assert_eq!(req.cookie("c"), Some("quoted"));
+        assert_eq!((req.cookie("b"), req.cookie("A"), req.cookie("d")), (None, None, None));
+        assert_eq!(request(&[]).cookie("a"), None);
+    }
 }

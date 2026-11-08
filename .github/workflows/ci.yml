@@ -73,6 +73,8 @@ jobs:
             tools/build-app.sh --locked "examples/$app" -o "examples/target/$app.wasm"
           done
           tools/build-app.sh --locked js/tests/app.js -o js/target/test-app.wasm
+      - name: Test the Rust SDK (its pure parts, natively)
+        run: cargo test --locked --manifest-path examples/Cargo.toml -p nanovm-sdk
       - name: Check production build without dev features
         run: cargo check --locked -p nanovm --bin nanovm
       - name: Run unit and integration tests
