@@ -276,7 +276,7 @@ impl Sockets {
     /// Opens a socket on `object` if the caps allow it and the object accepts:
     /// the 101 to answer the upgrade with. `req` has had the app headers
     /// removed; its own WebSocket headers are the client's.
-    pub async fn open(
+    async fn open(
         self: &Arc<Self>,
         object: &str,
         mut req: Request<Body>,
@@ -375,6 +375,22 @@ impl Sockets {
             }
         });
         Ok(res.body(()).expect("a valid response"))
+    }
+
+    /// The answer to a client asking to open a socket on `object`: the
+    /// socket is opened in a task of its own, so an `OPEN` the object
+    /// accepts is finished, and the socket's end delivered, even if the
+    /// client leaves meanwhile.
+    pub async fn upgrade(self: Arc<Self>, object: String, req: Request<Body>, deliver: Deliver) -> Response<crate::object::RespBody> {
+        let open = tokio::spawn(async move { self.open(&object, req, deliver).await });
+        match open.await.unwrap_or(Err((500, "opening the socket failed"))) {
+            Ok(res) => res.map(|()| http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync()),
+            Err((status, why)) => {
+                let mut res = crate::object::error_response(status, "socket-refused", why);
+                res.headers_mut().insert(http::header::SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+                res
+            }
+        }
     }
 
     /// Sends what `object` publishes to its sockets subscribed to each item's

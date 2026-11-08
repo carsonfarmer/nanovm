@@ -169,7 +169,7 @@ impl WasiHttpHooks for EgressHooks {
             return Box::new(async { Err(Error::HttpRequestDenied) });
         }
         let internal = request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS);
-        if !internal && request.uri().host() == Some(crate::ws::PUBLISH_HOST) && matches!(route, Route::Supervisor(_)) {
+        if !internal && request.uri().host() == Some(crate::ws::PUBLISH_HOST) {
             let (held, max) = (self.held.clone(), self.publish_max);
             return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
         }
@@ -316,6 +316,7 @@ async fn hold(
     let (mut parts, body) = req.into_parts();
     let status = match http_body_util::Limited::new(body, max).collect().await.map(|b| b.to_bytes()) {
         Err(_) => 413,
+        Ok(_) if parts.uri.path().trim_end_matches('/') != "/publish" => 404,
         Ok(body) if !crate::ws::well_formed(&body) => 400,
         // What a request holds is bounded like one publish.
         Ok(body) if held.lock().iter().map(|r| r.body().len()).sum::<usize>() + body.len() > max => 413,
