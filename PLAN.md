@@ -602,8 +602,8 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 
 ## W-9 contract and bounded proof (2026-11-08)
 
-**Active continuation:** implement opt-in local capture inside the real journal,
-at both existing commit gates. Stage and sync an immutable full version before
+**Local capture implemented in `b7bf806` (CI 42491417145 passed):** opt-in capture
+runs inside the real journal at both existing commit gates. Stage and sync an immutable full version before
 the undo log's commit marker, then publish it before permitting another mutation.
 Recovery discards staged capture before rollback when the log remains; otherwise
 it finishes publication. This ordering must survive repeated recovery cuts too.
@@ -612,7 +612,7 @@ than expanding JSON byte arrays or designing an archive. Operator-owned per-obje
 byte/version caps reject new commits when full; no silent discard or automatic GC.
 Capture is disabled by default and is not a remote-acknowledgement policy.
 
-The runtime candidate uses `<objects>/<app>/~committed/<object>/<sequence>.tar`,
+The runtime uses `<objects>/<app>/~committed/<object>/<sequence>.tar`,
 with `nanovm.json` (format, app/object identity, sequence and parent SHA-256) followed
 by `data/`. A durable staged name stays in the journal until a hard-linked output
 name is synced; renaming alone could lose the sole durable name between directory
@@ -623,8 +623,9 @@ Limits default to 256 MiB of archive bytes and 16 versions per object; a full
 history refuses dirty commits, while read-only commits consume no version. These
 are not aggregate disk/RSS budgets. Disabling capture while history exists is
 refused to prevent silent gaps. No pruning, retention or epoch/fencing policy is
-implied. Full-volume capture adds copy/hash/I/O cost; default-path and enabled-path
-measurements are required before landing. TAR is an interchange container, not a
+implied. Full-volume capture adds copy/hash/I/O cost: measured small-write throughput
+is roughly half default throughput (HANDOFF records matched controls and failures).
+TAR is an interchange container, not a
 validated network receiver or an operator restore API. The existing JSON receiver
 experiment and the new runtime TAR output are distinct formats.
 
@@ -660,7 +661,7 @@ names, hardlink identity, hostile local writers, retention/GC and migration are
 outside this disposable, trusted-root experiment.
 
 **Runtime evidence and remaining gaps:** `object::commit` runs at response acceptance
-and again after post-return execution. The candidate captures both dirty versions
+and again after post-return execution. Local capture preserves both dirty versions
 before later mutations. Fourteen commit/publication and 28 rollback sync-error and
 process-exit cuts check exact state/history agreement. Separate barrier regressions
 cover visible-but-unsynced deletions: recovery must sync the decision before

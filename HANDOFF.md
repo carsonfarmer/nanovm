@@ -4,14 +4,15 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## Current state (2026-11-08)
 
-**Active continuation:** owner requested continuous core implementation, not stops
-at research milestones. Amp owns `w9-atomic-capture`: connect bounded, opt-in local
-committed-state capture to the real journal and both commit gates. Use the undo-log
-commit decision to recover or discard a staged immutable version after a crash.
-Local acceptance stays local-durable; no remote acknowledgement or promotion policy
-is selected. Prior proof delivery `3c69eb2` passed main CI 42439279475.
+**Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
+and is included in this main integration from `w9-atomic-capture`. Bounded, opt-in
+immutable capture now uses the real journal's decision at both commit gates.
+Local acceptance stays local-durable; remote acknowledgement and promotion policy
+are still undecided. W-9 is not complete: production receipt, restoration, retention
+and authority/fencing remain. No guest changes, publication or deployment occurred.
+Check the exact main integration head's CI before calling delivery fully verified.
 
-**Candidate evidence (not yet landed):** real journal capture passes 14 commit
+**Local capture evidence:** real journal capture passes 14 commit
 sync-error cuts and 28 rollback sync-error cuts, plus actual subprocess exits at
 the same boundaries. Every case reopens twice and checks exact state/history.
 Both response/post-return versions and jailed-worker restart tests pass. Transferred
@@ -41,8 +42,8 @@ passes or a fix of N-32. Two capture-enabled runs used an explicitly raised
 second and serial writes 221/196, roughly half default throughput. Full copies
 are deliberately costly; no large-volume or remote-performance clearance. Temporary
 benchmark configuration was restored; retained runtime defaults are unchanged.
-The checkpoint `baab90e3` passed CI 42487886309; this is docs-only CI, not validation
-of the uncommitted runtime candidate. Runtime candidate is 5,320 lines versus 5,085.
+The earlier checkpoint `baab90e3` passed docs-only CI 42487886309; implementation
+CI is recorded above. Runtime is 5,320 lines versus the 5,085-line baseline.
 
 Historical starting main was `1e5f18ad4c4c3b06e1d4adc0da16ed38c173eab5`. Backup delivery
 and N-43 admission-fixture follow-through passed CI; neither is next work.
@@ -88,8 +89,8 @@ local capture; no production replication, guest publication or deployment.
 
 **Successor prompt:** Continue W-9 from this current section and PLAN's W-9 contract.
 Keep both response and post-return captures distinct and preserve the recovery
-durability barriers. Finish exact-head CI and fast-forward delivery of local capture,
-then establish the owner's acknowledgement/RPO and recovery-authority policy before
+durability barriers. Verify exact-head main CI, then establish the owner's
+acknowledgement/RPO and recovery-authority policy before
 building a production receiver/restore path. The JSON proof is not a TAR receiver.
 Do not confuse same-host recovery with remote durability or sequence fields with
 fencing. No guest changes, publishing, automatic pruning or promotion.
