@@ -49,7 +49,8 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
     let control = tokio::runtime::Builder::new_multi_thread().worker_threads(1)
         .thread_name("nanovm-control").on_thread_start(move || nanovm::link::set_thread(threads))
         .enable_all().build()?;
-    let sup = control.block_on(async { Supervisor::new(cfg, std::env::current_exe()?, threads) })?;
+    let leases = nanovm::lease::Leases::open(&cfg.leases)?;
+    let sup = control.block_on(async { Supervisor::new(cfg, std::env::current_exe()?, threads, leases) })?;
     let first = rt.block_on(async { listener(addr) })?;
     eprintln!("nanovm: ready in {:.0?} on http://{addr}/", t0.elapsed());
     for i in 1..threads {

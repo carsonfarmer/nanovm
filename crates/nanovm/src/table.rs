@@ -1,7 +1,7 @@
 //! The node: one loaded app, and the table mapping each object id to the
 //! single actor that owns that object.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
@@ -71,6 +71,8 @@ pub struct Node {
     pub heavy: Arc<Semaphore>,
     /// One permit per live store, released only after the store is dropped.
     pub slots: Arc<Semaphore>,
+    /// With more than one node, its leases on objects (see `lease`).
+    pub leases: Option<crate::lease::Worker>,
     objects: Mutex<HashMap<Arc<str>, Entry>>,
 }
 
@@ -84,6 +86,8 @@ impl Node {
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
+        let leases = upstream.clone().filter(|_| !cfg.leases.is_empty()).map(crate::lease::Worker::new);
+        anyhow::ensure!(leases.is_some() == !cfg.leases.is_empty(), "leases are taken through a supervisor");
         let app = Arc::new(App::load(&engine, &linker, &cfg, app, wasm, upstream)?);
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
@@ -95,6 +99,7 @@ impl Node {
             telemetry,
             heavy,
             slots,
+            leases,
             objects: Mutex::default(),
         });
         node.metrics.telemetry.set(Arc::downgrade(&node.telemetry)).ok();
@@ -163,6 +168,15 @@ impl Node {
         // immutable context is shared with guest logs and calls.
         let context = parent.with_remote_span_context(span.span_context().clone());
         let enqueued = Instant::now();
+        let callers: Vec<Arc<str>> = req.headers().get(crate::egress::CALLERS).and_then(|h| h.to_str().ok())
+            .map_or(vec![], |c| c.split(',').filter(|c| valid_object(c)).map(Arc::from).collect());
+        // A call from another node: its callers wait on it, so it must not
+        // wait on them (see `wait_for`).
+        if !callers.is_empty() && reaches(&self.objects.lock(), id, |o| callers.iter().any(|c| &**c == o)) {
+            let response = error_response(508, "call-cycle", &format!("{id} is already waiting on its callers"));
+            crate::telemetry::response(&mut span, &response);
+            return response;
+        }
         let (reply, rx) = oneshot::channel();
         let job = Box::new(Job {
             req,
@@ -170,6 +184,7 @@ impl Node {
             enqueued,
             span,
             context,
+            callers,
         });
         match self.enqueue(id, job) {
             Err(resp) => resp,
@@ -181,6 +196,11 @@ impl Node {
         let (app, key): (_, Arc<str>) = (&self.app, id.into());
         let mut objects = self.objects.lock();
         if let Some(e) = objects.get(&key) {
+            if self.lost(&e.shared) {
+                let response = misdirected(None);
+                crate::telemetry::response(&mut job.span, &response);
+                return Err(response);
+            }
             match e.tx.try_send(job) {
                 Ok(()) => return Ok(()),
                 // A socket's event waits instead: each socket has one at a
@@ -234,25 +254,76 @@ impl Node {
     }
 
     /// Records that `from` waits on a call to object `to` of its app, unless
-    /// `to` already waits on `from`, directly or through other calls: with
-    /// one request at a time per object, that call could never be served.
-    /// Checked and recorded under the table lock, so two objects calling each
-    /// other at once can't both pass.
+    /// `to` already waits on `from`, or on an object waiting on `from` (its
+    /// callers), directly or through other calls: with one request at a time
+    /// per object, that call could never be served. Checked and recorded
+    /// under the table lock, so two objects calling each other at once can't
+    /// both pass. The callers name waits on other nodes; a cycle through two
+    /// or more waits between other nodes, not along one chain of calls, is
+    /// ended by the request timeout instead.
     pub fn wait_for(&self, from: &ObjShared, to: &str) -> bool {
         let objects = self.objects.lock();
-        let (mut next, mut seen) = (vec![Arc::<str>::from(to)], std::collections::HashSet::new());
-        while let Some(id) = next.pop() {
-            if id == from.id {
-                return false;
-            }
-            if seen.insert(id.clone())
-                && let Some(e) = objects.get(&id)
-            {
-                next.extend(e.shared.waiting_on.lock().iter().cloned());
-            }
+        let callers = from.callers.lock();
+        if reaches(&objects, to, |o| o == &*from.id || callers.iter().any(|c| &**c == o)) {
+            return false;
         }
+        drop(callers);
         from.waiting_on.lock().push(to.into());
         true
+    }
+
+    /// Whether this node may serve `obj` and commit its changes: on the only
+    /// node always, else while it holds the object's lease in its current
+    /// session.
+    pub fn holds(&self, obj: &ObjShared) -> bool {
+        self.leases.as_ref().is_none_or(|l| obj.lease.lock().as_ref().is_some_and(|g| l.holds(g)))
+    }
+
+    /// Whether `obj` had a lease that this node no longer holds.
+    fn lost(&self, obj: &ObjShared) -> bool {
+        self.leases.as_ref().is_some_and(|l| obj.lease.lock().as_ref().is_some_and(|g| !l.holds(g)))
+    }
+
+    /// The epoch of this node's lease on `obj`, which its commit carries; an
+    /// error once the node no longer holds it, so a node that lost an object
+    /// can't commit it (W-10). 0 on the only node.
+    pub fn lease_epoch(&self, obj: &ObjShared) -> std::io::Result<u64> {
+        let Some(l) = &self.leases else { return Ok(0) };
+        match &*obj.lease.lock() {
+            Some(g) if l.holds(g) => Ok(g.epoch),
+            _ => Err(std::io::Error::other("this node no longer holds the object's lease")),
+        }
+    }
+
+    /// Takes `obj`'s lease before its instance starts, unless this node holds
+    /// it: else the answer for its requests, a 421 the proxy follows to the
+    /// node holding it (or on to the next node).
+    pub async fn acquire(&self, obj: &ObjShared) -> Result<(), http::Response<RespBody>> {
+        let Some(l) = &self.leases else { return Ok(()) };
+        if self.holds(obj) {
+            return Ok(());
+        }
+        let (grant, id, until) = l.acquire(&obj.id).await.map_err(|owner| misdirected(owner.as_deref()))?;
+        self.renewed(id, until);
+        *obj.lease.lock() = Some(grant);
+        Ok(())
+    }
+
+    /// Gives up `obj`'s lease, its actor having exited.
+    pub fn release(self: &Arc<Self>, obj: &ObjShared) {
+        if let Some(grant) = obj.lease.lock().take() {
+            let (node, id) = (self.clone(), obj.id.clone());
+            tokio::spawn(async move { node.leases.as_ref().expect("a grant").release(&id, &grant).await });
+        }
+    }
+
+    /// The supervisor's word on the node's session. A new one ends every
+    /// lease of the last: idle objects are evicted at once, busy ones stop at
+    /// their next request or commit.
+    pub fn renewed(&self, id: u64, until: u64) {
+        if self.leases.as_ref().is_some_and(|l| l.set(id, until)) {
+            self.objects.lock().retain(|_, e| e.idle_since().is_none());
+        }
     }
 
     /// Drops the table's handle on the least recently used idle object; its
@@ -294,6 +365,33 @@ impl Node {
     }
 }
 
+/// Whether object `to` is, or waits on (directly or through other calls),
+/// an object `is` picks.
+fn reaches(objects: &HashMap<Arc<str>, Entry>, to: &str, is: impl Fn(&str) -> bool) -> bool {
+    let (mut next, mut seen) = (vec![Arc::<str>::from(to)], HashSet::new());
+    while let Some(id) = next.pop() {
+        if is(&id) {
+            return true;
+        }
+        if seen.insert(id.clone())
+            && let Some(e) = objects.get(&id)
+        {
+            next.extend(e.shared.waiting_on.lock().iter().cloned());
+        }
+    }
+    false
+}
+
+/// A refusal of a request for an object this node doesn't hold, naming the
+/// node that does, if known; the proxy sends it there, or to the next node.
+pub fn misdirected(owner: Option<&str>) -> http::Response<RespBody> {
+    let mut res = error_response(421, "not-held", owner.unwrap_or("this node can't take the object's lease"));
+    if let Some(owner) = owner.and_then(|o| o.parse().ok()) {
+        res.headers_mut().insert(crate::lease::OWNER, owner);
+    }
+    res
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +422,7 @@ mod tests {
             enqueued: Instant::now(),
             context: Default::default(),
             span: tracer.start("request"),
+            callers: vec![],
         });
         let (tx, _rx) = mpsc::channel(4);
         let e = Entry {

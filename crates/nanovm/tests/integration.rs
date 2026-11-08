@@ -829,7 +829,14 @@ fn captures() -> &'static parking_lot::Mutex<std::collections::HashMap<std::net:
     CAPTURES.get_or_init(Default::default)
 }
 
-async fn supervised_with(mut cfg: NodeConfig) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+async fn supervised_with(cfg: NodeConfig) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    (supervised_at(cfg, listener, None).await, addr)
+}
+
+/// A supervisor serving on `listener`, with `leases` its lease store.
+async fn supervised_at(mut cfg: NodeConfig, listener: tokio::net::TcpListener, leases: Option<Arc<dyn object_store::ObjectStore>>) -> Arc<nanovm::supervisor::Supervisor> {
     let captured = Arc::new(parking_lot::Mutex::new(collector::Collector::default()));
     if cfg.telemetry_endpoint == NodeConfig::default().telemetry_endpoint {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -847,14 +854,13 @@ async fn supervised_with(mut cfg: NodeConfig) -> (Arc<nanovm::supervisor::Superv
         }));
     }
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
-    let sup = nanovm::supervisor::Supervisor::new(cfg, exe, 1).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sup = nanovm::supervisor::Supervisor::new(cfg, exe, 1, leases).unwrap();
     let addr = listener.local_addr().unwrap();
     captures().lock().retain(|_, (sup, _)| sup.strong_count() != 0);
     captures().lock().insert(addr, (Arc::downgrade(&sup), captured));
     let s = sup.clone();
     tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
-    (sup, addr)
+    sup
 }
 
 /// A registry on loopback for the whole test run, as dev mode allows.
@@ -2527,7 +2533,7 @@ mod sockets {
     async fn front(label: &str, mut cfg: nanovm::config::ProxyConfig, apps: &[(&str, AppConfig)]) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, std::net::SocketAddr, Records) {
         let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut node_cfg = node_cfg(label, 8);
-        node_cfg.publish_to = format!("http://{}/publish", control.local_addr().unwrap());
+        node_cfg.proxy = format!("http://{}", control.local_addr().unwrap());
         let (sup, node) = supervised_with(node_cfg).await;
         let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         for (host, app) in apps {
@@ -2535,7 +2541,7 @@ mod sockets {
             records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", published.split_once('@').unwrap().0)]);
         }
         cfg.listen = "127.0.0.1:0".into();
-        cfg.node = node.to_string();
+        cfg.nodes = vec![node.to_string()];
         cfg.resolver = doh(records.clone()).await;
         cfg.tag_ttl_s = 0;
         cfg.dev = true;
@@ -2860,7 +2866,7 @@ async fn doh(records: Arc<parking_lot::Mutex<std::collections::HashMap<String, V
 /// registry for a tag's digest every time.
 async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::SocketAddr {
     let cfg = nanovm::config::ProxyConfig {
-        node: node.to_string(),
+        nodes: vec![node.to_string()],
         resolver,
         tag_ttl_s: 0,
         dev: true,
@@ -3284,7 +3290,7 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     records.lock().insert("_nanovm.good.test".into(), vec![format!("app={}:latest; trust=dev dev", counter.split_once('@').unwrap().0)]);
     let cfg = nanovm::config::ProxyConfig {
-        node: node.to_string(), resolver: doh(records).await, telemetry_endpoint: endpoint,
+        nodes: vec![node.to_string()], resolver: doh(records).await, telemetry_endpoint: endpoint,
         listen: "127.0.0.1:0".into(), dev: true, ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3699,4 +3705,280 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
     }).await.expect("collector must actually refuse an export");
     assert_eq!(tokio::time::timeout(Duration::from_secs(2), app_get(addr, &counter, "/room/")).await.unwrap().0, 200);
     collector.abort();
+}
+
+// ---- many nodes --------------------------------------------------------------
+
+mod nodes {
+    use super::*;
+    use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path as Key};
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    type Records = Arc<parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>>;
+
+    const LEASE_MS: u64 = 500;
+
+    /// The lease store as one node sees it: the shared one, until the node
+    /// is cut off from it.
+    #[derive(Debug)]
+    struct Cut(Arc<InMemory>, Arc<AtomicBool>);
+
+    impl std::fmt::Display for Cut {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Cut")
+        }
+    }
+
+    impl Cut {
+        fn check(&self) -> object_store::Result<()> {
+            match self.1.load(SeqCst) {
+                true => Err(object_store::Error::Generic { store: "cut", source: "cut off".into() }),
+                false => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Cut {
+        async fn put_opts(&self, l: &Key, p: object_store::PutPayload, o: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+            self.check()?;
+            self.0.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(&self, l: &Key, o: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.check()?;
+            self.0.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &Key, o: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+            self.check()?;
+            self.0.get_opts(l, o).await
+        }
+        fn delete_stream(&self, l: futures::stream::BoxStream<'static, object_store::Result<Key>>) -> futures::stream::BoxStream<'static, object_store::Result<Key>> {
+            self.0.delete_stream(l)
+        }
+        fn list(&self, p: Option<&Key>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.0.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Key>) -> object_store::Result<object_store::ListResult> {
+            self.0.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Key, t: &Key, o: object_store::CopyOptions) -> object_store::Result<()> {
+            self.0.copy_opts(f, t, o).await
+        }
+    }
+
+    /// The node holding `object`'s lease, and its epoch.
+    async fn holder(store: &InMemory, app: &str, object: &str) -> (String, u64) {
+        let rec = store.get(&Key::from_iter(["objects", app, object])).await.unwrap().bytes().await.unwrap();
+        let rec: serde_json::Value = serde_json::from_slice(&rec).unwrap();
+        (rec["node"].as_str().unwrap().to_owned(), rec["epoch"].as_u64().unwrap())
+    }
+
+    /// Listeners for `n` nodes, and their names.
+    fn listeners(n: usize) -> (Vec<std::net::TcpListener>, Vec<String>) {
+        let ls: Vec<_> = (0..n).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+        let names = ls.iter().map(|l| l.local_addr().unwrap().to_string()).collect();
+        (ls, names)
+    }
+
+    /// A node's config: named for `listener`, taking leases, calling through
+    /// the proxy's private endpoint `private`.
+    fn leased(test: &str, listener: &std::net::TcpListener, private: std::net::SocketAddr) -> NodeConfig {
+        let mut cfg = node_cfg(test, 8);
+        (cfg.name, cfg.leases, cfg.lease_ms) = (listener.local_addr().unwrap().to_string(), "memory:".into(), LEASE_MS);
+        cfg.proxy = format!("http://{private}");
+        cfg.limits.post_return_timeout_ms = 20_000;
+        cfg
+    }
+
+    async fn serve(cfg: NodeConfig, listener: std::net::TcpListener, leases: Arc<dyn ObjectStore>) -> Arc<nanovm::supervisor::Supervisor> {
+        listener.set_nonblocking(true).unwrap();
+        supervised_at(cfg, tokio::net::TcpListener::from_std(listener).unwrap(), Some(leases)).await
+    }
+
+    /// A dev-mode proxy placing objects on `nodes`, with its private
+    /// endpoint on `private`; and the name of the app `host` serves, its
+    /// record naming `published`.
+    async fn proxy(nodes: &[String], private: tokio::net::TcpListener, host: &str, published: &str) -> (std::net::SocketAddr, String) {
+        let records: Records = Arc::default();
+        let tagged = format!("{}:latest", published.split_once('@').unwrap().0);
+        records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={tagged}; trust=dev dev")]);
+        let cfg = nanovm::config::ProxyConfig {
+            nodes: nodes.to_vec(), resolver: doh(records).await, tag_ttl_s: 0, dev: true, listen: "127.0.0.1:0".into(),
+            failover_ms: 20_000, ..Default::default()
+        };
+        let proxy = nanovm::proxy::Proxy::new(cfg).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(nanovm::proxy::serve(proxy.clone(), listener));
+        tokio::spawn(nanovm::proxy::serve_publish(proxy, private));
+        (addr, nanovm::registry::app_name(host, &tagged.parse().unwrap()))
+    }
+
+    /// An object of `app` whose home is `node`.
+    fn homed(nodes: &[String], app: &str, node: &str) -> String {
+        (0..).map(|i| format!("o{i}")).find(|o| nanovm::proxy::rank(nodes, app, o)[0] == node).unwrap()
+    }
+
+    async fn get(proxy: std::net::SocketAddr, host: &str, path: &str) -> (u16, String) {
+        raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"), b"").await
+    }
+
+    /// Node A serves an object; A stops; node B takes the object's lease, at
+    /// the next epoch, once A's has run out, and serves the object, with what
+    /// A committed. The nodes share a data root, standing in for W-9's
+    /// stream of committed versions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_object_moves_to_another_node_when_its_node_stops() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("an_object_moves", &la, private.local_addr().unwrap());
+        let cfg_b = NodeConfig { name: names[1].clone(), ..cfg_a.clone() };
+        // A runs on a runtime of its own, so that stopping it stops all of
+        // it: its server, its session's renewals and its workers.
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let leases: Arc<dyn ObjectStore> = store.clone();
+        let a = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let _a = serve(cfg_a, la, leases).await;
+                let _ = stopped.await;
+            })
+        });
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-moves", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "moves.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+
+        let written = get(proxy, "moves.test", &format!("/{object}/commit?v=one")).await;
+        assert_eq!(written, (200, r#"{"file":"one","key":"one"}"#.into()));
+        assert_eq!(holder(&store, &app, &object).await, (names[0].clone(), 1));
+        stop.send(()).unwrap();
+        a.join().unwrap();
+        let t0 = Instant::now();
+        let read = loop {
+            // B refuses until A's worker has gone from the shared root.
+            let read = get(proxy, "moves.test", &format!("/{object}/commit")).await;
+            if read.0 == 200 || t0.elapsed() > Duration::from_secs(15) {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(read, (200, r#"{"file":"one","key":"one"}"#.into()));
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+        assert!(t0.elapsed() >= Duration::from_millis(LEASE_MS), "taken over before A's lease ran out: {:?}", t0.elapsed());
+    }
+
+    /// Node A answers a request and works on after answering; meanwhile it
+    /// is cut off from the lease store. Its lease runs out, so it refuses the
+    /// object's requests, and node B takes the lease and serves them. A's
+    /// late commit of its work after answering is refused: it stays
+    /// uncommitted, to be rolled back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_that_lost_an_objects_lease_cannot_commit_it() {
+        let wasm = probe();
+        let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = gate.local_addr().unwrap();
+        let (begin, finish) = (Arc::new(tokio::sync::Semaphore::new(0)), Arc::new(tokio::sync::Semaphore::new(0)));
+        let (arrived, mut arrivals) = tokio::sync::mpsc::channel(4);
+        let (b, f) = (begin.clone(), finish.clone());
+        tokio::spawn(nanovm::server::serve_http1(gate, move |req| {
+            let gate = if req.uri().path() == "/begin" { b.clone() } else { f.clone() };
+            let arrived = arrived.clone();
+            async move {
+                arrived.send(req.uri().path().to_owned()).await.unwrap();
+                gate.acquire().await.unwrap().forget();
+                nanovm::server::ok_json(serde_json::json!({}))
+            }
+        }));
+        let store = Arc::new(InMemory::new());
+        let cut = Arc::new(AtomicBool::new(false));
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("lost_lease_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("lost_lease_b", &lb, private.local_addr().unwrap());
+        let objects_a = cfg_a.data_dir.join("objects");
+        let a = serve(cfg_a, la, Arc::new(Cut(store.clone(), cut.clone()))).await;
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let mut probe = app("hostile");
+        probe.limits.egress = vec![address.to_string()];
+        (probe.limits.post_return_timeout_ms, probe.limits.cpu_ms) = (20_000, 1000);
+        let published = publish_wasm("nodes-lost-lease", &probe, wasm).await;
+        let (proxy, app) = proxy(&names, private, "probe.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+
+        let path = format!("/{object}/?gate={address}");
+        let first = tokio::spawn(async move { get(proxy, "probe.test", &path).await });
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10), arrivals.recv()).await.unwrap().unwrap(), "/begin");
+        assert_eq!(holder(&store, &app, &object).await, (names[0].clone(), 1));
+        cut.store(true, SeqCst);
+        // Past the lease A last renewed, A refuses the object.
+        tokio::time::sleep(Duration::from_millis(LEASE_MS)).await;
+        let t0 = Instant::now();
+        loop {
+            match get(proxy, "probe.test", &format!("/{object}/callee")).await {
+                (200, body) => break assert_eq!(body, "callee"),
+                other => assert!(t0.elapsed() < Duration::from_secs(10), "{other:?}"),
+            }
+        }
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+        assert!(objects_a.join(&app).join(&object).join("before.txt").exists(), "A committed what it wrote before answering");
+
+        // A's work after answering calls another object (through the proxy,
+        // to B, since A can take no lease) and writes; its commit is refused.
+        (begin.add_permits(1), finish.add_permits(1));
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10), arrivals.recv()).await.unwrap().unwrap(), "/finish");
+        let (status, body) = first.await.unwrap();
+        assert!(status == 200 && body.contains("finished"), "{status} {body}");
+        let t0 = Instant::now();
+        let refused = loop {
+            a.flush_telemetry().await.unwrap();
+            let logs = captures().lock()[&names[0].parse().unwrap()].1.lock().logs.clone();
+            if let Some(e) = logs.iter().find(|e| e["kind"] == "post-return-commit-failed") {
+                break e.clone();
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "no refused commit in {logs:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(refused["detail"].as_str().unwrap().contains("no longer holds the object's lease"), "{refused}");
+        assert!(objects_a.join(&app).join(&object).join("after.txt").exists(), "A wrote after answering");
+        assert!(objects_a.join(&app).join("~journal").join(&object).join("log").exists(), "the write is uncommitted");
+    }
+
+    /// An object calls an object on another node, through the proxy, which
+    /// commits there; a call back to the caller is refused at once (508),
+    /// though the wait it would close is on another node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn calls_reach_objects_on_other_nodes_and_cycles_across_nodes_are_refused() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("calls_across_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("calls_across_b", &lb, private.local_addr().unwrap());
+        let objects_b = cfg_b.data_dir.join("objects");
+        let _a = serve(cfg_a, la, store.clone()).await;
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-calls", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "calls.test", &published).await;
+        let (x, y) = (homed(&names, &app, &names[0]), homed(&names, &app, &names[1]));
+        let enc = |s: &str| s.replace('%', "%25").replace('&', "%26").replace('?', "%3F").replace('=', "%3D");
+        let call = async |from: &str, url: &str| {
+            let (status, body) = get(proxy, "calls.test", &format!("/{from}/fetch?url={}", enc(url))).await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        };
+
+        let r = call(&x, &format!("http://nanovm/objects/{y}/commit?v=via-x")).await;
+        assert_eq!((r["status"].as_u64(), r["body"].as_str()), (Some(200), Some(r#"{"file":"via-x","key":"via-x"}"#)), "{r}");
+        assert_eq!(std::fs::read_to_string(objects_b.join(&app).join(&y).join("c.txt")).unwrap(), "via-x");
+        assert_eq!(holder(&store, &app, &y).await.0, names[1]);
+
+        let t0 = Instant::now();
+        let back = format!("http://nanovm/objects/{y}/fetch?url={}", enc(&format!("http://nanovm/objects/{x}/")));
+        let r = call(&x, &back).await;
+        assert!(r["body"].as_str().unwrap().contains(r#""status":508"#), "{r}");
+        assert!(t0.elapsed() < Duration::from_secs(1), "refused at once: {:?}", t0.elapsed());
+    }
 }

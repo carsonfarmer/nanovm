@@ -60,6 +60,8 @@ opentelemetry-proto = { version = "0.33", default-features = false, features = [
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 prost = "0.14"
 async-trait = "0.1"
+# Leases on an object store (S3 and compatibles) with conditional writes; see `lease`.
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
