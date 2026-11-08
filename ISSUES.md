@@ -324,6 +324,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor puts its pid in the worker's spec, and the worker compares `getppid()` with it. +2 runtime lines.
 - **Status:** fixed on `ideas/container-image`
 
+### N-552: a binary replaced under a running supervisor starts workers of the new version
+- **Where:** `main.rs`/`supervisor.rs` (`Supervisor::new(cfg, std::env::current_exe()?, …)`; `start` spawns `self.exe`)
+- **Scenario:** found by the ops agent writing the upgrade runbook. The supervisor resolved its executable's path once at start and spawned every worker from that path. Installing a new binary (`install`, `mv`, a package manager's upgrade before its restart) while the node ran made new workers the new version under the old supervisor; their private spec or link protocol can differ.
+- **Reproduced:** yes, `docs/ops/drills/binary-swap.sh` with builds before and after N-551: the running app kept serving, a new app got `502 worker-down` (`worker spec: invalid length 3, expected a tuple of size 4`).
+- **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
+- **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
