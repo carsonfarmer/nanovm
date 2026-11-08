@@ -1,0 +1,12 @@
+# /etc/nanovm/proxy.toml for nanovm-proxy.service. Every key and its default
+# is in crates/nanovm/src/config.rs (ProxyConfig); unknown keys are refused.
+
+# Plain HTTP. TLS terminates in front (Caddy, a load balancer); keep this on
+# loopback when the terminator is on the same host.
+listen = "127.0.0.1:8443"
+node = "127.0.0.1:8080"
+# Committed WebSocket publishes from the node. Never expose it publicly.
+publish_listen = "127.0.0.1:8444"
+telemetry_endpoint = "http://127.0.0.1:4318"
+resolver = "https://cloudflare-dns.com/dns-query"
+tag_ttl_s = 30

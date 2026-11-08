@@ -310,6 +310,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** yes: with `memory_mb = 32`, the test probe held 600 maps of 60 KiB, new or copied from a 60 KiB request header (36 MB each way), and a 100 KiB map.
 - **Status:** fixed in 98c1698: a head is at most 64 KiB at every hop (hyper's `max_header_size`, which also bounds trailers; over it a client gets 431), a guest's map at most 64 KiB, and an instance holds at most `memory_mb / 64 KiB` resources (`max_resources` is the lower of the two: 1,024 at 64 MiB, 256 at the counter's 16 MiB). So header maps the host holds for an instance stay within its memory limit, and 64 KiB is twice what nginx accepts by default (four 8 KiB header buffers). `guest_header_maps_are_bounded_by_the_memory_limit` (a test-only probe route) fails without each part.
 
+### N-550 (docs): README understated the memory mappings a worker needs threefold
+- **Where:** README "Host requirements on Linux"; `engine.rs` (`MAPS_PER_OBJECT`, `preflight`)
+- **Scenario:** found by the ops agent. README said about 8 mappings per pool slot (65,530 fits roughly 7,600 objects; 8,000 need 68,352). `preflight` has required `24 × (max_live_objects + 32) + 4096` since `c504f29`: the default 65,530 fits about 2,500 objects, and the demo's 8,000 need 196,864. An operator sizing from README got a worker that refuses to start.
+- **Reproduced:** from source (the arithmetic in `preflight`); the host here has 1,048,576 and is shared, so the default was not tried.
+- **Status:** fixed on `ideas/systemd-units` (README line and `deploy/systemd/90-nanovm.conf`)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
