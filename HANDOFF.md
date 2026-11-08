@@ -2,7 +2,28 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
-## State (2026-11-03)
+## Current state (2026-11-08)
+
+Continue from main `1e5f18ad4c4c3b06e1d4adc0da16ed38c173eab5`. Backup delivery
+and N-43 admission-fixture follow-through passed CI; neither is next work.
+Runtime is 5,085 lines; under 5k remains unmet. The single-node durable-object
+foundation is working, but loss of its storage loses writes since the last backup.
+No ordered committed-state feed, remote acknowledgement or distributed fencing exists.
+
+**Active: W-9, Amp, `w9-committed-state`.** First establish a bounded storage-only
+proof of immutable committed versions, ordered transfer and fresh-root recovery
+using the actual journal. This is research groundwork, not a replication architecture
+approval or runtime failover feature. Preserve local durable acceptance and rollback.
+Do not extend offline backup, revive rejected actors/page backends, or integrate
+the optional nice-to-haves branch. W-10 placement follows capture/recovery evidence.
+Acknowledgement/RPO, remote backend and failover policy remain owner decisions.
+
+**Successor prompt:** Continue W-9 from this current section and PLAN's W-9 contract.
+Keep both response and post-return commits distinct. Close capture/publication crash
+windows before production integration; do not confuse same-host roots with remote
+durability or a sequence/epoch field with fencing. No guest changes or publishing.
+
+## Historical checkpoints (superseded by current state above)
 
 - **CI follow-through (N-43):** backup/restore is on main through `721b667`; main CI 42313034048 passed. Parallel branch CI 42313030490 exposed the old max-apps test's 600/900 ms busy-window assumption (expected refusal, got 200). `deterministic-app-admission-test` replaces those sleeps with observed gated upstream requests. An injected 1100 ms delay fails the old fixture and passes the correction; permitting busy-worker eviction fails the corrected test. Both probes restored with `git checkout --`, empty unstaged diff verified. Restored full locked suite passes 99 unit/69 integration, 12 ignored. Runtime remains 5,085 lines; no guest changes. Prior recovery demo/benchmark evidence remains applicable, not newly measured for this test-only correction.
   - **Successor prompt:** finish exact-head CI and fast-forward delivery of N-43. Preserve Q88's stopped-writer backup contract and fresh-root restore requirement. Independent nice-to-haves remain isolated in their own thread/archives; do not import them into recovery changes without review. No production deployment or remote durability is claimed.

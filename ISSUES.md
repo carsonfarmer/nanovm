@@ -354,13 +354,13 @@ The checkpoints below are historical, not outstanding product decisions.
 - **What:** density (memory per object), cold starts and warm latency against workerd (Durable Objects) and Spin, on the same machine, with the method written down.
 - **Status:** open
 
-### W-9: research: change records shipped off the node
-- **What:** whether a commit can emit a self-contained record of what it changed (the journal already knows the touched paths) and ship it to replicated storage, Litestream-style, so a node is a cache of its volumes. Survey Litestream, LiteFS and Durable Objects' storage design first.
-- **Status:** open
+### W-9: ordered committed-state transfer and recovery
+- **What:** capture immutable committed content and namespace state before later mutations, transfer ordered versions and recover without the original root. The undo journal is not a replication feed. Survey Litestream, LiteFS and Durable Objects before choosing machinery.
+- **Status:** in progress, Amp on `w9-committed-state`. Bounded first slice: storage-only capture/transfer/recovery proof using the real journal, without changing runtime acceptance. Acknowledgement/RPO, production capture atomicity, remote transport/durability and failover policy remain unresolved. Offline backup is complete, not this work's objective.
 
 ### W-10: groundwork for many nodes
 - **What:** a lease hook before instantiation in `table.rs` (always granted on one node), an epoch carried by each commit, request ids so the proxy can retry safely. Placement belongs in the proxy.
-- **Status:** open, after W-3
+- **Status:** open, after W-9 capture/recovery evidence and explicit acknowledgement/fencing decisions; not authorized by adding an epoch field alone.
 
 ### W-11: run requests that don't write in parallel
 - **What:** stateless routes on any node, and read-only requests on read replicas of an object. On one node, a reader beside the writer would see uncommitted data (the undo journal writes in place), so replicas need committed state: a snapshot, or W-9's change records. Whether a request writes isn't known in advance, so routes would be declared read-only, with `/data` mounted read-only to enforce it.

@@ -2,6 +2,12 @@
 
 ## Context
 
+**Current priority (2026-11-08):** offline backup and N-43 are delivered and tested.
+Next is W-9 committed-state capture/transfer and recovery groundwork, then W-10
+placement/fencing. This sequence is not approval of a replication or failover policy.
+Runtime remains 5,085 lines; the under-5k goal is unmet. Historical experiments below
+are not instructions to restart rejected actor/page-backend rewrites.
+
 The goal is to run large numbers of untrusted wasip3 HTTP components at high density. Each one must be strongly isolated with hard limits.
 
 The run model is shaped like Durable Objects:

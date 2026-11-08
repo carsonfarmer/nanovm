@@ -12,6 +12,13 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 
 Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
+**Current scope (2026-11-08):** single-node durable acceptance and rejected-request
+rollback, plus tested offline backup/restore. There is no live committed-state feed,
+remote durability guarantee or automatic failover. W-9 capture/transfer/recovery is
+the next core work, before placement/fencing; acknowledgement/RPO policy remains
+undecided. Runtime is 5,085 lines, still above the under-5k goal. Older checkpoint
+counts and candidate designs below are historical, not current delivery claims.
+
 ## SQLite beta
 
 [Build and run the SQLite example](components/sqlite/README.md). A composed Wasm
