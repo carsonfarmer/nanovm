@@ -87,7 +87,7 @@ impl Backend {
         fs::create_dir_all(root)?;
         if kind == "journal" {
             let root = root.canonicalize()?;
-            let journal = Journal::open(&root, 1 << 30, Arc::new(ObjShared::new("bench".into(), "o")))?;
+            let journal = Journal::open(&root, 1 << 30, Arc::new(ObjShared::new("bench".into(), "o")), None)?;
             Ok(Self::Journal { root, journal })
         } else {
             ensure!(matches!(kind, "pages" | "hashed"), "unknown backend {kind}");
@@ -281,7 +281,7 @@ impl Backend {
                     journal.commit()?;
                 } else {
                     // Recovery runs when the rejected request's instance restarts.
-                    *journal = Journal::open(root, 1 << 30, Arc::new(ObjShared::new("bench".into(), "o")))?;
+                    *journal = Journal::open(root, 1 << 30, Arc::new(ObjShared::new("bench".into(), "o")), None)?;
                 }
             }
             Self::Pages { tx, dirty, .. } => {

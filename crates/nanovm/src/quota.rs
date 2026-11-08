@@ -70,9 +70,9 @@ struct Inner {
 impl QuotaGuard {
     /// A budget whose starting usage is what's already under `volume`, so a
     /// persistent volume starts each instance with its real usage.
-    pub fn new(volume: &Path, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>) -> std::io::Result<Self> {
+    pub fn new(volume: &Path, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>, capture: Option<&crate::config::CaptureConfig>) -> std::io::Result<Self> {
         // First, so a failed request or a crash is undone before it's counted.
-        let journal = Journal::open(volume, limits.disk_mb << 20, obj.clone())?;
+        let journal = Journal::open(volume, limits.disk_mb << 20, obj.clone(), capture)?;
         let (mut bytes, mut files) = (0, 0);
         let mut stack = vec![volume.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -683,7 +683,7 @@ mod tests {
             ..Limits::default()
         };
         let dir = tempdir("empty");
-        let g = QuotaGuard::new(&dir, &limits, metrics.clone(), obj).unwrap();
+        let g = QuotaGuard::new(&dir, &limits, metrics.clone(), obj, None).unwrap();
         std::fs::remove_dir(dir).unwrap();
         g.0.lock().max_bytes = bytes;
         (g, metrics)
@@ -695,8 +695,8 @@ mod tests {
 
     fn volume_guard(v: &Path, max: u64) -> QuotaGuard {
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(v, &Limits::default(), Default::default(), obj.clone()).unwrap();
-        g.0.lock().journal = Journal::open(v, max, obj).unwrap();
+        let g = QuotaGuard::new(v, &Limits::default(), Default::default(), obj.clone(), None).unwrap();
+        g.0.lock().journal = Journal::open(v, max, obj, None).unwrap();
         g
     }
 
@@ -840,7 +840,7 @@ mod tests {
             ..Limits::default()
         };
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj).unwrap();
+        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj, None).unwrap();
         assert_eq!(usage(&g), (15, 4));
         assert_eq!(g.0.lock().max_bytes, 2 << 20);
         std::fs::remove_dir_all(dir).unwrap();
@@ -978,7 +978,7 @@ mod tests {
         std::fs::write(dir.join("f"), [0; 10]).unwrap();
         std::fs::write(dir.join("g"), [0; 10]).unwrap();
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj).unwrap();
+        let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj, None).unwrap();
         let f = std::fs::File::options().write(true).open(dir.join("f")).unwrap();
         g.remove(&dir.join("f"), 10).unwrap();
         assert_eq!(usage(&g), (10, 1));
@@ -996,7 +996,7 @@ mod tests {
         let dir = tempdir("new-unlinked").canonicalize().unwrap();
         let limits = Limits { disk_mb: 1, ..Limits::default() };
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj).unwrap();
+        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj, None).unwrap();
         let create = |name: &str| {
             let path = dir.join(name);
             g.journal(|j| j.creating(&path)).unwrap();
