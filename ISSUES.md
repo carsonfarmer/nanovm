@@ -317,6 +317,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** recovery treats NotADirectory like NotFound for a `Created` record: nothing can be there, so the create never happened. One line; also repairs logs already written.
 - **Status:** fixed on `ideas/fix-recover-enotdir`
 
+### N-551: a supervisor running as pid 1 (a container without an init) starts no worker
+- **Where:** `jail.rs` (`Jail::enter`: `ensure!(getppid() != 1, "supervisor exited")`)
+- **Scenario:** found by the ops agent building the container image. A worker took "my parent is pid 1" to mean its supervisor had died before `PR_SET_PDEATHSIG` was armed. In a container without `--init`, or a Kubernetes pod, the supervisor *is* pid 1, so every worker refused to start (`502 worker-down`, worker's last words `entering the jail: supervisor exited`). The check also passed wrongly under a child subreaper, which adopts orphans instead of pid 1.
+- **Reproduced:** yes, `deploy/container/test/local.sh` ("as PID 1, workers start" fails before the fix).
+- **Fix:** the supervisor puts its pid in the worker's spec, and the worker compares `getppid()` with it. +2 runtime lines.
+- **Status:** fixed on `ideas/container-image`
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
