@@ -1130,6 +1130,7 @@ fn jail_probe() {
     let root = unsafe { libc::geteuid() } == 0;
     nanovm::jail::Jail {
         uid: root.then_some(200_099),
+        parent: std::os::unix::process::parent_id(),
         read_write: vec![dir.join("mine")],
         read_only: vec![],
     }

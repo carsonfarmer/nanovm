@@ -408,12 +408,12 @@ impl Supervisor {
             place_in_cgroup(root, &app, pid)?;
         }
 
-        // The worker's spec: the node config, its app, and its uid.
+        // The worker's spec: the node config, its app, its uid and our pid.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
         // As many links to the supervisor as its objects may use at once:
         // each its outbound requests and a publish.
         let links = self.cfg.max_live_objects * (app.limits.max_outbound_concurrency + 1);
-        let mut spec = serde_json::to_vec(&(&self.cfg, &app, uid))?;
+        let mut spec = serde_json::to_vec(&(&self.cfg, &app, uid, std::process::id()))?;
         spec.push(b'\n');
         let mut stdin = child.stdin.take().expect("piped");
         stdin.write_all(&spec).await?;
@@ -636,7 +636,7 @@ pub fn worker_main() -> anyhow::Result<()> {
     let mut input = Vec::new();
     std::io::stdin().read_to_end(&mut input)?;
     let nl = input.iter().position(|&b| b == b'\n').context("no worker spec on stdin")?;
-    let (cfg, app, uid): (NodeConfig, AppConfig, Option<u32>) =
+    let (cfg, app, uid, parent): (NodeConfig, AppConfig, Option<u32>, u32) =
         serde_json::from_slice(&input[..nl]).context("worker spec")?;
     let wasm = input.split_off(nl + 1);
     // SAFETY: the supervisor put these sockets at fds 3 and 4 and nothing
@@ -648,6 +648,7 @@ pub fn worker_main() -> anyhow::Result<()> {
 
     Jail {
         uid,
+        parent,
         read_write: cfg.app_dirs(&app.name).into(),
         read_only: vec!["/proc/self".into()],
     }
