@@ -7,6 +7,8 @@ Next is W-9 committed-state capture/transfer and recovery groundwork, then W-10
 placement/fencing. This sequence is not approval of a replication or failover policy.
 Runtime remains 5,085 lines; the under-5k goal is unmet. Historical experiments below
 are not instructions to restart rejected actor/page-backend rewrites.
+The owner clarified that 5k is a goal, not a hard limit; do not block useful,
+correct core work or pursue a rewrite just to meet it.
 
 The goal is to run large numbers of untrusted wasip3 HTTP components at high density. Each one must be strongly isolated with hard limits.
 
@@ -597,6 +599,58 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
    - **Placement and leases:** the proxy places each object on a home node (rendezvous hashing to start); a node takes a lease with an epoch before instantiating an object, and every commit carries the epoch, so a node that lost its lease can't commit. On one node the lease is always granted, so the hook can land early. (W-10)
    - **Requests that don't write can run in parallel** (Q50): stateless routes on any node, and read-only requests on read replicas of an object fed by committed change records. On one node it needs care: the undo journal writes in place, so a concurrent reader would see uncommitted data. (W-11)
 9. **Cleanups:** the rest of the review's removable-code list (registry cache and re-hash, config memory checks), for the agent doing the rewrite. (W-13)
+
+## W-9 contract and bounded proof (2026-11-08)
+
+**Engineering choice, not an approved replication architecture:** establish an
+ordered immutable version contract before placement. The executable
+`cargo run --locked -p nanovm --example committed_state` uses the actual Journal,
+copies full file/namespace state while its fixture owns the writer, transfers to
+independent receiver processes and restores after removing the source directory.
+This is a storage-only reference experiment, not offline-backup extension or a
+production node endpoint. It does not run guest SQL or prove scheduler integration.
+
+Survey: [Litestream](https://litestream.io/how-it-works/) packages committed SQLite
+WAL pages into ordered checksummed LTX files; its asynchronous replication does
+not make local success remotely durable. [LiteFS](https://fly.io/docs/litefs/how-it-works/)
+intercepts SQLite transaction boundaries through FUSE, emits LTX page sets, and
+uses Consul leases; its documented asynchronous mode can lose unreplicated writes.
+[Durable Objects output gates](https://blog.cloudflare.com/durable-objects-easy-fast-correct-choose-three/)
+hold outgoing messages for storage completion backed by replication. Neither
+SQLite tool directly captures nanovm's atomic SQL + arbitrary files + KV namespace;
+their SQLite commit boundaries can occur inside a request nanovm later rejects.
+Do not add either as a volume replicator. Reuse existing serde/SHA-256 and standard
+filesystem primitives for the proof; no new dependency or storage backend.
+
+The prototype's fixed `(app, object, epoch)` identifies one stream. Each complete
+version carries sequence, previous-version digest and copied namespace/file bytes.
+The receiver rejects gaps, different identities/epochs, conflicting retries and
+corruption, and syncs an immutable version before acknowledging receipt. Identical
+retries succeed. Full snapshots intentionally avoid designing deltas now; copying
+whole volumes and retaining every version is not a scalable production design.
+The proof caps wire bytes at 1 MiB, entries at 256 and versions at 16. SHA-256 is
+integrity, not authentication; epoch equality is not fencing. Metadata, non-UTF8
+names, hardlink identity, hostile local writers, retention/GC and migration are
+outside this disposable, trusted-root experiment.
+
+**Production gaps:** `object::commit` runs at response acceptance and again after
+post-return execution. Capture must preserve both versions before another mutation.
+Today `Journal::commit` syncs changes then unlinks the undo log; a crash between that
+commit and an after-the-fact capture can lose a version. Checking log absence is
+only a fixture assertion, not a concurrency lock or a crash-atomic capture protocol.
+A production outbox needs a durable decision tying sequence, immutable content and
+local commit together, recoverable on either side of every crash cut. A capture
+failure after commit must not be reported as a rollback. Its disk budget and outage
+behavior must be explicit rather than an unbounded queue or silent discard.
+
+**Next decisions:** retain existing local-durable acknowledgement while developing
+capture, or gate responses on a durable remote receipt? Local-only plus asynchronous
+transfer allows loss of acknowledged writes; no bounded RPO follows without a lag
+bound and outage admission policy. Remote gating adds latency and availability
+dependence and needs a chosen receiver failure domain/quorum. Recommend completing
+crash-atomic local capture next, without enabling automatic promotion; ask the owner
+before selecting the externally promised acknowledgement/RPO and failover policy.
+W-10 must fence storage commits, not merely check a lease before instantiation.
 
 ## Follow-ups
 

@@ -9,14 +9,32 @@ and N-43 admission-fixture follow-through passed CI; neither is next work.
 Runtime is 5,085 lines; under 5k remains unmet. The single-node durable-object
 foundation is working, but loss of its storage loses writes since the last backup.
 No ordered committed-state feed, remote acknowledgement or distributed fencing exists.
+The owner clarified on 2026-11-08: 5k is a simplicity goal, not a hard limit or
+delivery gate. Correctness and useful core progress take priority over that count.
 
-**Active: W-9, Amp, `w9-committed-state`.** First establish a bounded storage-only
-proof of immutable committed versions, ordered transfer and fresh-root recovery
-using the actual journal. This is research groundwork, not a replication architecture
-approval or runtime failover feature. Preserve local durable acceptance and rollback.
+**W-9 bounded proof, Amp, `w9-committed-state`:** `examples/committed_state.rs`
+uses the actual journal to capture immutable versions, transfer them in order and
+recover into a fresh root after deleting the source. This is research groundwork,
+not a replication architecture approval or runtime failover feature. Production
+acceptance/rollback are unchanged. The executable demonstrates loss of an unsent
+locally accepted third write rather than implying that local success is remote durability.
 Do not extend offline backup, revive rejected actors/page backends, or integrate
 the optional nice-to-haves branch. W-10 placement follows capture/recovery evidence.
 Acknowledgement/RPO, remote backend and failover policy remain owner decisions.
+
+**Evidence:** the two example tests pass and run in the default suite. The separate
+`cargo run --locked -p nanovm --example committed_state` passes actual receiver
+process transfers and four abrupt-exit cuts (written, synced, linked, published),
+with exact-byte retry/recovery. These cuts are not run by the two unit tests.
+Four removed guards (digest, parent chain, retry equality, tentative capture) each
+fail the targeted test; each was restored from the index with an empty file diff.
+Read-only adversarial review found no blocker within the documented proof scope;
+Opus routing could not be attested. No new dependency, runtime or guest source change.
+The existing HTTP demo/benchmarks were not rerun: this experiment adds no serving
+path and makes no performance claim. Full local suite: 99 unit pass, 67 integration
+pass, two unchanged KV fixtures fail CPU/deadline limits (N-32), 12 ignored. A
+targeted rerun passes listing but quota still fails; this is not a green suite or a
+fix. The docs-only checkpoint `fed57b1` passed CI 42437123623 with the same runtime.
 
 **Successor prompt:** Continue W-9 from this current section and PLAN's W-9 contract.
 Keep both response and post-return commits distinct. Close capture/publication crash
@@ -455,6 +473,7 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q86 | Reject both the phase-by-phase and unique-pending actor candidates after measured regressions; retain the original actor rather than trading throughput for LOC. DNS route entry fixes an absolute deadline shared by cache waiting and resolver I/O; cancelled initialization must not renew another caller's budget. Memory is transient cache/staging, never a replacement for durable acceptance. |
 | Q87 | Cooperating local owners use standard nonblocking exclusive locks on stable app objects-directory inodes. App lifetime protects scratch cleanup/recovery/use; supervisor preparation takes the same lock before ownership changes. Preparation releases before worker admission, not an atomic handoff. Closing all owners or process exit releases admission; shutdown alone does not. Keep one supervisor per root: cgroup provisioning, directory replacement and noncooperating writers remain outside this local guarantee. |
 | Q88 | Offline backup/restore is operator tooling around restic, not another runtime API or custom archive. Stop all writers throughout backup, hold existing app locks, preserve the complete objects/journal tree, and approve only exit-zero snapshots. Restore an exact full ID to a nonexistent root, verify then sync before serving. Preserve numeric owners and deployment identity separately; fence the old writer before cutover. No live snapshot, external-effect rollback, automatic retention, off-node durability or failover claim. Keep restic in the caller's cwd so credentials keep their meaning; extract to temporary storage inside the fresh root, then move the verified objects subtree without copying it again. |
+| Q89 | W-9 engineering research starts with a bounded immutable full-version protocol using the actual journal, separate from production acceptance. Ordered sequence/parent hashes and fixed stream identity are not authentication or fencing. Preserve both commit gates; close local commit/capture crash windows before runtime integration. Acknowledgement/RPO, remote failure domain and automatic promotion remain undecided. The owner clarifies that 5k is a simplicity goal, not a hard limit. |
 
 Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 
