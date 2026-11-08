@@ -1,0 +1,7 @@
+# /etc/nanovm/proxy.toml in the image (`nanovm proxy --config
+# /etc/nanovm/proxy.toml`), sharing the node container's network namespace.
+# Plain HTTP: put a TLS terminator in front.
+listen = "0.0.0.0:8443"
+node = "127.0.0.1:8080"
+publish_listen = "127.0.0.1:8444"
+telemetry_endpoint = "http://127.0.0.1:4318"
