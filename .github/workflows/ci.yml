@@ -68,8 +68,10 @@ jobs:
           echo "WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux" >> "$GITHUB_ENV"
       - name: Build the example apps and the JavaScript test app (no publishing)
         run: |
-          tools/build-app.sh --locked examples/hello -o examples/target/hello.wasm
-          tools/build-app.sh --locked examples/chat -o examples/target/chat.wasm
+          for app in examples/*/Cargo.toml; do
+            app=$(basename "$(dirname "$app")")
+            tools/build-app.sh --locked "examples/$app" -o "examples/target/$app.wasm"
+          done
           tools/build-app.sh --locked js/tests/app.js -o js/target/test-app.wasm
       - name: Check production build without dev features
         run: cargo check --locked -p nanovm --bin nanovm
