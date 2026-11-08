@@ -1,0 +1,51 @@
+name: Seccomp drift
+
+# What jailed workers really call, against the allowlist in jail.rs (D-50).
+# Nightly and on demand only: it runs the jail tests under strace.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Trace jailed workers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            guests -> ../target/guests
+      - name: Prepare host limits and strace
+        run: |
+          sudo sysctl -w vm.max_map_count=1048576
+          sudo apt-get update -qq
+          sudo apt-get install -y strace
+      - name: Install component composition tool
+        run: cargo install wac-cli --version 0.12.0 --locked
+      - name: Build guests locally (no publishing)
+        run: bash scripts/build-guests.sh
+      - name: Test the drift checker's parser
+        run: python3 -m unittest discover -s scripts -p test_seccomp_drift.py -v
+      - name: Trace the jail tests and compare with the allowlist
+        run: |
+          ulimit -n "$(ulimit -Hn)"
+          python3 scripts/seccomp-drift.py --fail-on-drift --json seccomp-drift.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: seccomp-drift
+          path: seccomp-drift.json
+          if-no-files-found: ignore
