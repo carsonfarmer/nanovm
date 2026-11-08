@@ -507,7 +507,9 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         *shared.context.lock() = job.context.clone();
         shared.set_phase(Phase::Starting);
         // Boxed: only nodes with leases wait on it.
-        if let Err(response) = Box::pin(node.acquire(&shared)).await {
+        if node.leases.is_some()
+            && let Err(response) = Box::pin(node.acquire(&shared)).await
+        {
             crate::telemetry::response(&mut job.span, &response);
             let _ = job.reply.send(response);
             shared.set_phase(Phase::Cold);
@@ -633,7 +635,11 @@ async fn serve(
 
                 let (resp, mut failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
-                        let res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
+                        let mut res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
+                        // Only the node refuses requests to the proxy: a guest
+                        // answering as one would have the proxy run its
+                        // request again and again.
+                        res.headers_mut().remove(crate::lease::OWNER);
                         let res = res.map(|b| {
                             GuardedBody {
                                 inner: b,

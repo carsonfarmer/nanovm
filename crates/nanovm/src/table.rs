@@ -317,9 +317,9 @@ impl Node {
         }
     }
 
-    /// The supervisor's word on the node's session. A new one ends every
-    /// lease of the last: idle objects are evicted at once, busy ones stop at
-    /// their next request or commit.
+    /// The supervisor's word on the node's session. Once it has lapsed, or
+    /// is a new one, the leases of the last are gone: idle objects are
+    /// evicted at once, busy ones stop at their next request or commit.
     pub fn renewed(&self, id: u64, until: u64) {
         if self.leases.as_ref().is_some_and(|l| l.set(id, until)) {
             self.objects.lock().retain(|_, e| e.idle_since().is_none());
@@ -383,12 +383,12 @@ fn reaches(objects: &HashMap<Arc<str>, Entry>, to: &str, is: impl Fn(&str) -> bo
 }
 
 /// A refusal of a request for an object this node doesn't hold, naming the
-/// node that does, if known; the proxy sends it there, or to the next node.
+/// node that does (empty if none is known); the proxy sends it there, or to
+/// the next node.
 pub fn misdirected(owner: Option<&str>) -> http::Response<RespBody> {
     let mut res = error_response(421, "not-held", owner.unwrap_or("this node can't take the object's lease"));
-    if let Some(owner) = owner.and_then(|o| o.parse().ok()) {
-        res.headers_mut().insert(crate::lease::OWNER, owner);
-    }
+    let owner = owner.and_then(|o| o.parse().ok()).unwrap_or(http::HeaderValue::from_static(""));
+    res.headers_mut().insert(crate::lease::OWNER, owner);
     res
 }
 

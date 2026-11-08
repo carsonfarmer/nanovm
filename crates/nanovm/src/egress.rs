@@ -275,6 +275,11 @@ async fn call(
     parts.headers.insert(CALLERS, callers.parse().map_err(|_| Error::HttpRequestUriInvalid)?);
     let res = match (&node.leases, &node.app.egress) {
         (Some(_), Route::Supervisor(up)) => {
+            if let Some(cx) = parts.extensions.get::<opentelemetry::Context>() {
+                use opentelemetry::propagation::TextMapPropagator;
+                opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                    .inject_context(cx, &mut opentelemetry_http::HeaderInjector(&mut parts.headers));
+            }
             let req = http::Request::from_parts(parts, http_body_util::Full::new(body).map_err(|e| match e {}).boxed_unsync());
             let (res, _) = forward(req, None, up.clone()).await?;
             res

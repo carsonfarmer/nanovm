@@ -20,6 +20,10 @@ impl wasip3::exports::http::handler::Guest for Probe {
         if req.path == "/callee" {
             return util::text(200, "callee");
         }
+        // Answers as a node refusing the object would, naming another.
+        if let Some(owner) = req.path.strip_prefix("/misdirect/") {
+            return util::respond_with(421, &[("nanovm-owner", owner)], b"forged".to_vec());
+        }
         util::write_file("/data", "before.txt", b"before".to_vec()).await.unwrap();
         let gate = req.q("gate").unwrap().to_owned();
         let (mut tx, rx) = wasip3::wit_stream::new();

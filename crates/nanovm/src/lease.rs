@@ -37,7 +37,8 @@ use serde::{Deserialize, Serialize};
 /// Where a worker asks its supervisor for leases: `POST` takes one, `DELETE`
 /// gives it up.
 pub const PATH: &str = "/_lease/";
-/// The node a 421 names as holding the object.
+/// Marks a node's refusal (421) of a request for an object it doesn't hold,
+/// naming the node that does, or empty.
 pub const OWNER: &str = "nanovm-owner";
 /// The supervisor's word on its session to a worker: `<id> <until>`.
 pub const SESSION: &str = "nanovm-session";
@@ -244,12 +245,12 @@ impl Worker {
         Worker { id: AtomicU64::new(0), until: AtomicU64::new(0), up }
     }
 
-    /// Records the node's session; whether it is a new one.
+    /// Records the node's session; whether it is a new one or has lapsed.
     pub fn set(&self, id: u64, until: u64) -> bool {
         // The id first: whoever sees the new `until` sees the new id.
         let old = self.id.swap(id, SeqCst);
         self.until.store(until, SeqCst);
-        old != id
+        old != id || until <= mono_ns()
     }
 
     /// Whether `grant` is in the node's session and that hasn't lapsed.

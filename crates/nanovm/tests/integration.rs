@@ -3912,9 +3912,21 @@ mod nodes {
         let first = tokio::spawn(async move { get(proxy, "probe.test", &path).await });
         assert_eq!(tokio::time::timeout(Duration::from_secs(10), arrivals.recv()).await.unwrap().unwrap(), "/begin");
         assert_eq!(holder(&store, &app, &object).await, (names[0].clone(), 1));
+        // Another of A's objects, idle; and a request queued behind A's work.
+        let idle = (0..).map(|i| format!("idle{i}")).find(|o| nanovm::proxy::rank(&names, &app, o)[0] == names[0]).unwrap();
+        assert_eq!(get(proxy, "probe.test", &format!("/{idle}/callee")).await, (200, "callee".into()));
+        let queued = format!("/{object}/callee");
+        let queued = tokio::spawn(async move { get(proxy, "probe.test", &queued).await });
         cut.store(true, SeqCst);
-        // Past the lease A last renewed, A refuses the object.
+        // Past the lease A last renewed, A refuses the object, and evicts
+        // the idle one.
         tokio::time::sleep(Duration::from_millis(LEASE_MS)).await;
+        let a_addr = names[0].parse().unwrap();
+        let t0 = Instant::now();
+        while stats_json(a_addr).await["apps"][&app]["live_objects"] != 1 {
+            assert!(t0.elapsed() < Duration::from_secs(5), "{}", stats_json(a_addr).await);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let t0 = Instant::now();
         loop {
             match get(proxy, "probe.test", &format!("/{object}/callee")).await {
@@ -3931,6 +3943,8 @@ mod nodes {
         assert_eq!(tokio::time::timeout(Duration::from_secs(10), arrivals.recv()).await.unwrap().unwrap(), "/finish");
         let (status, body) = first.await.unwrap();
         assert!(status == 200 && body.contains("finished"), "{status} {body}");
+        // The request that waited on A is not run there, but on B.
+        assert_eq!(queued.await.unwrap(), (200, "callee".into()));
         let t0 = Instant::now();
         let refused = loop {
             a.flush_telemetry().await.unwrap();
@@ -3944,6 +3958,35 @@ mod nodes {
         assert!(refused["detail"].as_str().unwrap().contains("no longer holds the object's lease"), "{refused}");
         assert!(objects_a.join(&app).join(&object).join("after.txt").exists(), "A wrote after answering");
         assert!(objects_a.join(&app).join("~journal").join(&object).join("log").exists(), "the write is uncommitted");
+    }
+
+    /// A guest answering as a node that doesn't hold its object (421, naming
+    /// another) is answered as it is: were it taken at its word, the proxy
+    /// would run the request again on every node until `failover_ms`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_cannot_pose_as_a_node_refusing_its_object() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let _a = serve(leased("forged_refusal_a", &la, private.local_addr().unwrap()), la, store.clone()).await;
+        let _b = serve(leased("forged_refusal_b", &lb, private.local_addr().unwrap()), lb, store.clone()).await;
+        let mut probe_app = app("hostile");
+        probe_app.limits.idle_timeout_ms = 200;
+        let published = publish_wasm("nodes-forged-refusal", &probe_app, probe()).await;
+        let (proxy, app) = proxy(&names, private, "forged.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let t0 = Instant::now();
+        let (status, body) = get(proxy, "forged.test", &format!("/{object}/misdirect/{}", names[1])).await;
+        assert_eq!((status, body.as_str()), (421, "forged"));
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!(holder(&store, &app, &object).await, (names[0].clone(), 1), "run once, on its home");
+        // Once idle, its node gives up its lease.
+        let t0 = Instant::now();
+        while holder(&store, &app, &object).await != (String::new(), 1) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", holder(&store, &app, &object).await);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// An object calls an object on another node, through the proxy, which
@@ -3980,5 +4023,10 @@ mod nodes {
         let r = call(&x, &back).await;
         assert!(r["body"].as_str().unwrap().contains(r#""status":508"#), "{r}");
         assert!(t0.elapsed() < Duration::from_secs(1), "refused at once: {:?}", t0.elapsed());
+
+        // B renews its leases as long as it lives: y keeps its epoch.
+        tokio::time::sleep(Duration::from_millis(3 * LEASE_MS)).await;
+        assert_eq!(call(&x, &format!("http://nanovm/objects/{y}/commit")).await["status"], 200);
+        assert_eq!(holder(&store, &app, &y).await, (names[1].clone(), 1));
     }
 }

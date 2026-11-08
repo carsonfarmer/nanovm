@@ -222,7 +222,7 @@ impl Proxy {
             let mut req = Request::new(Full::new(body.clone()).map_err(|e| match e {}).boxed_unsync());
             (*req.method_mut(), *req.uri_mut(), *req.headers_mut()) = (parts.method.clone(), uri(node)?, parts.headers.clone());
             match self.node.request(req).await {
-                Ok(res) if res.status() != StatusCode::MISDIRECTED_REQUEST => return Ok(res),
+                Ok(res) if res.status() != StatusCode::MISDIRECTED_REQUEST || !res.headers().contains_key(crate::lease::OWNER) => return Ok(res),
                 Ok(res) => {
                     let named = res.headers().get(crate::lease::OWNER).and_then(|o| o.to_str().ok());
                     owner = ranked.iter().copied().find(|n| Some(*n) == named && *n != node);
