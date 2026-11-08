@@ -1,0 +1,17 @@
+[package]
+name = "fsops-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+util = { path = "../../../../guests/util" }
+
+[profile.release]
+opt-level = "s"
+strip = true

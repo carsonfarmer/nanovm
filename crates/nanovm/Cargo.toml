@@ -79,3 +79,5 @@ oci-client = { version = "0.18", default-features = false, features = ["rustls-t
 tokio-tungstenite = "0.30"
 tokio = { version = "1", features = ["test-util"] }
 container-registry = { version = "0.3.1", features = ["test-support"] }
+# Model-based tests (tests/quota_model.rs); std only, no fork or regex support.
+proptest = { version = "1.7", default-features = false, features = ["std"] }
