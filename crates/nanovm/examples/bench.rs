@@ -34,7 +34,7 @@ fn repo() -> PathBuf {
 
 /// An in-process node running the guest `app`, with its own data directory.
 fn node(name: &str, app: &str, max_live: usize, endpoint: Option<String>) -> anyhow::Result<Arc<Node>> {
-    let root = repo().join("target/bench-data");
+    let root = std::env::var_os("NANOVM_BENCH_DATA").map_or_else(|| repo().join("target/bench-data"), PathBuf::from);
     let dir = root.join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
@@ -100,6 +100,7 @@ fn row(name: &str, r: &Run, note: &str) {
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--export") { return full_export().await; }
+    if args.iter().any(|a| a == "--writes") { return writes().await; }
     let quick = args.iter().any(|a| a == "--quick");
     let json_out = args
         .iter()
@@ -277,6 +278,54 @@ async fn main() -> anyhow::Result<()> {
         std::fs::write(&path, serde_json::to_string_pretty(&Value::Object(out))?)?;
         println!("\nwrote {path}");
     }
+    Ok(())
+}
+
+/// Process CPU (user + system) so far.
+fn cpu() -> Duration {
+    // SAFETY: getrusage writes only the struct it is given.
+    let ru = unsafe {
+        let mut ru = std::mem::zeroed::<libc::rusage>();
+        libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+        ru
+    };
+    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+    tv(ru.ru_utime) + tv(ru.ru_stime)
+}
+
+/// Writes, discards and flushes block device `dev` (`NANOVM_BENCH_DEV`) has
+/// completed: on a device only the benchmark uses, its I/O per request.
+fn disk_ops(dev: &str) -> [u64; 3] {
+    let stat = std::fs::read_to_string(format!("/sys/block/{dev}/stat")).unwrap_or_default();
+    let f: Vec<u64> = stat.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+    [4, 11, 15].map(|i| f.get(i).copied().unwrap_or(0))
+}
+
+/// Durable writes only (`--writes [ROUNDS]`): `POST /incr` on one object
+/// serially, then 256 concurrent over 100 objects; rate, latency, the
+/// process's CPU per request and, with `NANOVM_BENCH_DEV`, the device's I/O.
+async fn writes() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let rounds = args.iter().position(|a| a == "--writes").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(1);
+    let n = node("writes", "counter", 200, None)?;
+    load(&n, "POST", "/incr", 100, 64, |i| format!("o{}", i % 100)).await;
+    for _ in 0..rounds {
+        for (method, name, total, conc, objects) in [
+            ("GET", "serial", 2_000, 1, 1),
+            ("POST", "serial", 2_000, 1, 1),
+            ("POST", "concurrent", 20_000, 256, 100),
+        ] {
+            let path = if method == "GET" { "/" } else { "/incr" };
+            let dev = std::env::var("NANOVM_BENCH_DEV").unwrap_or_default();
+            let (c0, d0) = (cpu(), disk_ops(&dev));
+            let run = load(&n, method, path, total, conc, move |i| format!("o{}", i % objects)).await;
+            let us = (cpu() - c0).as_secs_f64() * 1e6 / total as f64;
+            let io = std::iter::zip(disk_ops(&dev), d0).map(|(a, b)| (a - b) as f64 / total as f64);
+            let io: Vec<_> = std::iter::zip(["writes", "discards", "flushes"], io).map(|(k, v)| format!("{k} {v:.2}")).collect();
+            row(&format!("{method} {path} {name}"), &run, &format!("cpu {us:.0} us/req  {}", io.join(" ")));
+        }
+    }
+    n.shutdown().await;
     Ok(())
 }
 
