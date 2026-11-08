@@ -194,3 +194,49 @@ async fn shortener_redirects_and_counts_clicks() {
     assert_eq!(app.get(&format!("/{code}/stats")).await.json()["clicks"], 3);
     assert_eq!(app.post("/docs/", "https://evil.example").await.status, 409);
 }
+
+/// examples/ratelimit: a token bucket per key object. Concurrent takes
+/// can't overspend it, it refills by the clock, and a spent bucket stays
+/// spent across eviction and restarts (an in-memory limiter would reset).
+#[tokio::test(flavor = "multi_thread")]
+async fn ratelimit_buckets_are_exact_and_durable() {
+    let mut app = App::start("ratelimit", json!({})).await;
+    let fresh = app.get("/a/").await.json();
+    assert!(fresh["tokens"] == 10.0 && fresh["capacity"] == 10.0, "the config's defaults: {fresh}");
+
+    // Twenty at once against five tokens: exactly five get one.
+    assert_eq!(app.send("PUT", "/burst/", &[], r#"{"capacity":5,"per_second":0.001}"#).await.status, 204);
+    let takes = futures::future::join_all((0..20).map(|_| app.post("/burst/take", ""))).await;
+    let mut remaining: Vec<_> = takes.iter().filter(|r| r.status == 200).map(|r| r.json()["remaining"].as_f64().unwrap()).collect();
+    remaining.sort_by(f64::total_cmp);
+    assert_eq!(remaining, [0.0, 1.0, 2.0, 3.0, 4.0]);
+    let denied = takes.iter().find(|r| r.status != 200).unwrap();
+    assert_eq!(takes.iter().filter(|r| r.status == 429).count(), 15);
+    assert!(denied.header("retry-after").parse::<u64>().unwrap() > 900, "{denied:?}");
+    for bad in ["/burst/take?n=0", "/burst/take?n=6", "/burst/take?n=x1"] {
+        assert_eq!(app.post(bad, "").await.status, 400, "{bad}");
+    }
+    for bad in ["", r#"{"capacity":0,"per_second":1}"#, r#"{"capacity":5,"per_second":-1}"#] {
+        assert_eq!(app.send("PUT", "/x/", &[], bad).await.status, 400, "{bad}");
+    }
+
+    // It refills by the clock: once denied, waiting as long as it says is enough.
+    assert_eq!(app.send("PUT", "/refill/", &[], r#"{"capacity":2,"per_second":4}"#).await.status, 204);
+    let denied = loop {
+        let take = app.post("/refill/take", "").await;
+        if take.status == 429 {
+            break take.json();
+        }
+    };
+    let wait = denied["retry_after_ms"].as_u64().unwrap();
+    assert!((1..=250).contains(&wait), "{denied}");
+    tokio::time::sleep(Duration::from_millis(wait)).await;
+    assert_eq!(app.post("/refill/take", "").await.status, 200);
+
+    // A spent bucket stays spent.
+    assert!(app.evicted("/burst/").await.json()["tokens"].as_f64().unwrap() < 1.0);
+    assert_eq!(app.post("/burst/take", "").await.status, 429);
+    let app = app.restart().await;
+    assert_eq!(app.post("/burst/take", "").await.status, 429);
+    assert_eq!(app.post("/a/take?n=10", "").await.json()["remaining"], 0.0);
+}
