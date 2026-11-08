@@ -37,8 +37,74 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(1)
         }),
         [cmd, wasm, flags @ ..] if cmd == "run" => run(wasm, flags),
-        _ => bail!("usage: nanovm serve --config <nanovm.toml> | nanovm proxy --config <proxy.toml> | {RUN}"),
+        [cmd, wasm, target, flags @ ..] if cmd == "publish" => publish(wasm, target, flags),
+        _ => bail!("usage: nanovm serve --config <nanovm.toml> | nanovm proxy --config <proxy.toml> | {RUN} | {PUBLISH}"),
     }
+}
+
+/// Says how to give a node a key-value store when it refused one's import.
+fn compose_hint(e: anyhow::Error) -> anyhow::Error {
+    match format!("{e:#}").contains("spin:key-value") {
+        true => e.context("its key-value store is a Wasm provider composed into the app: build it with tools/build-app.sh"),
+        false => e,
+    }
+}
+
+const PUBLISH: &str = "nanovm publish <app.wasm> <registry>/<repository>:<version> [--manifest ./nanovm.json]";
+
+/// `nanovm publish`: pushes an app as nodes pull it, an OCI artifact of type
+/// `APP_TYPE` whose config is its manifest and whose one layer is the
+/// component, versioned by its tag; then says how to sign and route it.
+/// Credentials, if the registry wants them: `NANOVM_REGISTRY_USER` and
+/// `NANOVM_REGISTRY_TOKEN`. A loopback registry is plain HTTP.
+fn publish(wasm: &str, target: &str, flags: &[String]) -> anyhow::Result<()> {
+    use nanovm::registry::{APP_TYPE, CONFIG_TYPE, VERSION, WASM_TYPE};
+    use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
+    let spec = match flags {
+        [k, v] if k == "--manifest" => std::fs::read(v).with_context(|| format!("reading {v}"))?,
+        [] => std::fs::read("nanovm.json").unwrap_or_else(|_| b"{}".into()),
+        _ => bail!("usage: {PUBLISH}"),
+    };
+    serde_json::from_slice::<nanovm::registry::AppSpec>(&spec).context("the manifest")?;
+    let r: oci_client::Reference = target.parse().with_context(|| format!("{target} is not <registry>/<repository>:<version>"))?;
+    let version = r.tag().and_then(|t| semver::Version::parse(t).ok());
+    let version = version.context("the tag is the app's version, nodes' `min=` compares it: :1.0.0, not :latest")?;
+    // What a node checks when it loads the app: its imports and its handler.
+    let wasm = std::fs::read(wasm).with_context(|| format!("reading {wasm}"))?;
+    let engine = nanovm::engine::build(&NodeConfig { max_live_objects: 1, ..NodeConfig::default() })?;
+    let component = wasmtime::component::Component::new(&engine, &wasm).map_err(anyhow::Error::from).context("not a component")?;
+    nanovm::app::check_imports(&engine, &component).map_err(compose_hint)?;
+    let pre = nanovm::app::linker(&engine)?.instantiate_pre(&component);
+    pre.and_then(wasmtime_wasi_http::p3::bindings::ServicePre::new).map_err(anyhow::Error::from)?;
+    let host = r.registry().rsplit_once(':').map_or(r.registry(), |(h, _)| h);
+    let local = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let protocol = if local { ClientProtocol::Http } else { ClientProtocol::Https };
+    let client = oci_client::Client::new(ClientConfig { protocol, ..Default::default() });
+    let auth = match (std::env::var("NANOVM_REGISTRY_USER"), std::env::var("NANOVM_REGISTRY_TOKEN")) {
+        (Ok(user), Ok(token)) => oci_client::secrets::RegistryAuth::Basic(user, token),
+        _ => oci_client::secrets::RegistryAuth::Anonymous,
+    };
+    let (layer, config) = (ImageLayer::new(wasm, WASM_TYPE.into(), None), Config::new(spec, CONFIG_TYPE.into(), None));
+    let annotations = [(VERSION.to_string(), version.to_string())].into();
+    let mut manifest = oci_client::manifest::OciImageManifest::build(std::slice::from_ref(&layer), &config, Some(annotations));
+    (manifest.media_type, manifest.artifact_type) = (Some(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.into()), Some(APP_TYPE.into()));
+    let digest = tokio::runtime::Runtime::new()?.block_on(async {
+        client.push(&r, &[layer], config, &auth, Some(manifest)).await.with_context(|| format!("pushing {target}"))?;
+        client.fetch_manifest_digest(&r, &auth).await.context("reading back its digest")
+    })?;
+    let repo = format!("{}/{}", r.registry(), r.repository());
+    println!("{repo}:{version}@{digest}");
+    eprintln!(
+        "nanovm: pushed {repo}:{version} ({digest}). Nodes pull it anonymously (make the package public) and run it \
+         only once it is signed. Sign it keylessly, either:\n\
+         - from GitHub Actions: .github/workflows/publish-app.yml attests it (actions/attest-build-provenance), or\n\
+         - from a laptop: cosign attest --yes --new-bundle-format --type custom --predicate <(echo '{{}}') {repo}@{digest}\n\
+         Then route a host to it with a DNS TXT record naming the signer's OIDC issuer and identity:\n\
+         _nanovm.example.com. TXT \"app={repo}:{version}; trust=<issuer> <identity>\"\n\
+         such as trust=https://token.actions.githubusercontent.com \
+         https://github.com/<owner>/<repo>/.github/workflows/publish-app.yml@refs/heads/main"
+    );
+    Ok(())
 }
 
 const RUN: &str = "nanovm run <app.wasm> [--manifest ./nanovm.json] [--listen 127.0.0.1:8080] [--data nanovm-data]";
@@ -70,10 +136,7 @@ fn run(wasm: &str, flags: &[String]) -> anyhow::Result<()> {
         let console = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         cfg.telemetry_endpoint = format!("http://{}", console.local_addr()?);
         tokio::spawn(nanovm::server::serve_http1(console, print));
-        let node = Node::new(cfg, &app, &bytes, None).map_err(|e| match format!("{e:#}").contains("spin:key-value") {
-            true => e.context("its key-value store is a Wasm provider composed into the app: build it with tools/build-app.sh"),
-            false => e,
-        })?;
+        let node = Node::new(cfg, &app, &bytes, None).map_err(compose_hint)?;
         let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
         eprintln!("nanovm: {name} on http://{}/<object>/ with data in {}", listener.local_addr()?, node.cfg.data_dir.display());
         tokio::spawn(restart_on_change(PathBuf::from(wasm)));

@@ -1,0 +1,67 @@
+# A template: publishes one app as a signed nanovm app, by hand only
+# (Actions > publish-app > Run workflow). Nothing runs it automatically.
+# Copy it into your app's repository and adjust the build step (a .js app
+# also needs WASI SDK 34, as in ci.yml).
+#
+# It builds the app with tools/build-app.sh, pushes it with `nanovm publish`
+# (an application/vnd.nanovm.app.v1+json artifact: the component as its
+# layer, nanovm.json as its config, the tag as its version), and attaches a
+# GitHub artifact attestation: a Sigstore bundle signed with this workflow's
+# short-lived identity. No key exists anywhere. Route a host to it with
+#   _nanovm.example.com. TXT "app=ghcr.io/<owner>/<name>:<version>; trust=https://token.actions.githubusercontent.com https://github.com/<owner>/<repo>/.github/workflows/publish-app.yml@refs/heads/main"
+# and make the package public: nodes pull anonymously.
+name: publish-app
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: The app to build (a crate directory or a .js file)
+        default: examples/hello
+      name:
+        description: Its package name on ghcr.io
+        default: nanovm-hello
+      version:
+        description: Its version (semver), the image tag
+        required: true
+      manifest:
+        description: Its nanovm.json (limits, env, config); empty for the defaults
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.name }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install wac-cli --version 0.12.0 --locked
+      - run: cargo install --locked --path crates/nanovm
+      - env:
+          APP: ${{ inputs.app }}
+        run: tools/build-app.sh --locked "$APP" -o app.wasm
+      - id: push
+        env:
+          NANOVM_REGISTRY_USER: ${{ github.actor }}
+          NANOVM_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          pushed=$(nanovm publish app.wasm "$IMAGE:$VERSION" ${MANIFEST:+--manifest "$MANIFEST"})
+          echo "digest=${pushed##*@}" >> "$GITHUB_OUTPUT"
+          echo "$pushed" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

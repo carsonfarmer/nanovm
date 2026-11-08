@@ -1,6 +1,7 @@
-//! `nanovm run`, the binary itself, as a developer uses it: one app on
-//! loopback with WebSockets, a console line per request, and a restart when
-//! the component is rebuilt.
+//! The developer commands, the binary itself as a developer uses it:
+//! `nanovm run` (one app on loopback with WebSockets, a console line per
+//! request, a restart when the component is rebuilt) on the example apps,
+//! and `nanovm publish` against a registry on loopback.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -30,7 +31,7 @@ fn guest(name: &str) -> PathBuf {
 /// An empty data directory for `test`, sharing the tests' compile cache.
 fn data_dir(test: &str) -> PathBuf {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let dir = root.join("run").join(test);
+    let dir = root.join("dev").join(test);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::create_dir_all(root.join("cwasm-cache")).unwrap();
@@ -345,4 +346,64 @@ async fn javascript_apps_run_and_publish() {
     assert_eq!(next(&mut a).await.to_text().unwrap().split(" from ").next(), Some("echo hello"));
     say(&mut a, "pub hi").await;
     assert_eq!((next(&mut a).await, next(&mut b).await), (Message::text("hi"), Message::text("hi")));
+}
+
+/// `nanovm publish` pushes an app the way nodes pull it: a node's registry
+/// client loads it by the digest it printed, with its manifest and version,
+/// and a node built from what was pulled serves it. A component a node would
+/// refuse, or a tag that is not a version, is not pushed.
+#[tokio::test(flavor = "multi_thread")]
+async fn nanovm_publish_pushes_what_a_node_loads() {
+    let registry = container_registry::ContainerRegistry::builder().build_for_testing().run_in_background();
+    let addr = registry.bound_addr();
+    let publish = async |wasm: &Path, target: &str, flags: &[&OsStr]| {
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_nanovm"));
+        cmd.arg("publish").arg(wasm).arg(target).args(flags).env_remove("RUST_BACKTRACE").kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(120), cmd.output()).await.expect("published in time").unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    let hello = wasm("examples/target/hello.wasm");
+    let manifest = repo().join("examples/chat/nanovm.json");
+    let target = format!("{addr}/you/hello:1.2.3");
+    let (ok, stdout, stderr) = publish(&hello, &target, &["--manifest".as_ref(), manifest.as_os_str()]).await;
+    assert!(ok, "{stderr}");
+    let digest = stdout.trim().strip_prefix(&format!("{target}@")).unwrap_or_else(|| panic!("{stdout}"));
+    assert!(stderr.contains(&format!("_nanovm.example.com. TXT \"app={target}; trust=")), "{stderr}");
+    assert!(stderr.contains("attest-build-provenance") && stderr.contains("cosign attest"), "{stderr}");
+
+    // What a node does with it: load it by digest, then serve it.
+    let mut headers = http::HeaderMap::new();
+    headers.insert("nanovm-app", format!("{addr}/you/hello@{digest}").parse().unwrap());
+    headers.insert("nanovm-trust", "dev dev".parse().unwrap());
+    let app = nanovm::registry::AppRef::from_headers(&headers).unwrap().unwrap();
+    let data = data_dir("publish");
+    let pulled = nanovm::registry::Registry::new(data.join("registry"), 64 << 20, true).unwrap().load(&app).await.unwrap();
+    assert_eq!((pulled.wasm, pulled.version.to_string()), (std::fs::read(&hello).unwrap(), "1.2.3".into()));
+    assert_eq!((pulled.spec.limits.disk_mb, pulled.spec.limits.max_files), (16, 1000), "the manifest is its config");
+    let cfg = nanovm::config::NodeConfig { data_dir: data, max_live_objects: 8, memory_reservation_mb: 64, ..Default::default() };
+    let spec = pulled.spec;
+    let app = nanovm::config::AppConfig {
+        name: app.name(),
+        digest: digest.into(),
+        env: spec.env,
+        config: spec.config,
+        limits: spec.limits,
+        worker: Default::default(),
+    };
+    nanovm::engine::preflight(&cfg).unwrap();
+    let node = nanovm::table::Node::new(cfg, &app, &std::fs::read(&hello).unwrap(), None).unwrap();
+    let res = node.dispatch("alice", http::Request::get("http://x/").body(bytes::Bytes::new()).unwrap()).await;
+    let body = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+    assert_eq!(body, "alice has had 1 visits\n");
+
+    // Refused before anything is pushed.
+    let bare = repo().join("target/guests/wasm32-wasip2/release/counter.wasm");
+    let (ok, _, stderr) = publish(&bare, &format!("{addr}/you/bare:1.0.0"), &[]).await;
+    assert!(!ok && stderr.contains("spin:key-value") && stderr.contains("tools/build-app.sh"), "{stderr}");
+    let (ok, _, stderr) = publish(&hello, &format!("{addr}/you/hello:latest"), &[]).await;
+    assert!(!ok && stderr.contains("the tag is the app's version"), "{stderr}");
+    let oci = nanovm::registry::Oci::new(true).unwrap();
+    for never in ["you/bare:1.0.0", "you/hello:latest"] {
+        assert!(oci.digest(&format!("{addr}/{never}").parse().unwrap()).await.is_err(), "{never} was pushed");
+    }
 }

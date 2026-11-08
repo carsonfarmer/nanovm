@@ -60,6 +60,8 @@ opentelemetry-proto = { version = "0.33", default-features = false, features = [
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 prost = "0.14"
 async-trait = "0.1"
+# `nanovm publish` pushes apps (the node only pulls, through `registry::Oci`).
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"
@@ -74,7 +76,6 @@ dev = []
 [dev-dependencies]
 # The tests run nodes in dev mode against a loopback registry.
 nanovm = { path = ".", default-features = false, features = ["dev"] }
-oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
 tokio-tungstenite = "0.30"
 tokio = { version = "1", features = ["test-util"] }
 container-registry = { version = "0.3.1", features = ["test-support"] }
