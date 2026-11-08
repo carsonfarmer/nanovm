@@ -602,6 +602,16 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 
 ## W-9 contract and bounded proof (2026-11-08)
 
+**Active continuation:** implement opt-in local capture inside the real journal,
+at both existing commit gates. Stage and sync an immutable full version before
+the undo log's commit marker, then publish it before permitting another mutation.
+Recovery discards staged capture before rollback when the log remains; otherwise
+it finishes publication. This ordering must survive repeated recovery cuts too.
+Use the established `tar` crate for streaming file/namespace snapshots rather
+than expanding JSON byte arrays or designing an archive. Operator-owned per-object
+byte/version caps reject new commits when full; no silent discard or automatic GC.
+Capture is disabled by default and is not a remote-acknowledgement policy.
+
 **Engineering choice, not an approved replication architecture:** establish an
 ordered immutable version contract before placement. The executable
 `cargo run --locked -p nanovm --example committed_state` uses the actual Journal,

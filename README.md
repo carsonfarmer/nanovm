@@ -28,6 +28,10 @@ accepted but unsent write is lost. This is not a runtime replication feature,
 remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
 gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 
+The next implementation slice is opt-in, bounded local capture at the runtime's
+commit gates. It must close the local commit/capture crash window before any
+remote durability or automatic failover claim; the current proof does not do that.
+
 ## SQLite beta
 
 [Build and run the SQLite example](components/sqlite/README.md). A composed Wasm

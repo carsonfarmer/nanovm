@@ -4,6 +4,13 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## Current state (2026-11-08)
 
+**Active continuation:** owner requested continuous core implementation, not stops
+at research milestones. Amp owns `w9-atomic-capture`: connect bounded, opt-in local
+committed-state capture to the real journal and both commit gates. Use the undo-log
+commit decision to recover or discard a staged immutable version after a crash.
+Local acceptance stays local-durable; no remote acknowledgement or promotion policy
+is selected. Prior proof delivery `3c69eb2` passed main CI 42439279475.
+
 Continue from main `1e5f18ad4c4c3b06e1d4adc0da16ed38c173eab5`. Backup delivery
 and N-43 admission-fixture follow-through passed CI; neither is next work.
 Runtime is 5,085 lines; under 5k remains unmet. The single-node durable-object
