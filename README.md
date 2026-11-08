@@ -28,6 +28,39 @@ accepted but unsent write is lost. This is not a runtime replication feature,
 remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
 gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 
+## Build an app
+
+One command builds and runs an app on your machine, one publishes it. Rust apps use
+[nanovm-sdk](sdk/rust/README.md) (one async function from a request to a response);
+JavaScript apps are a Workers-style module ([js/](js/README.md)). Once:
+
+```bash
+rustup target add wasm32-wasip2
+cargo install --locked wac-cli@0.12.0                # composes the key-value provider into apps
+git clone https://github.com/carsonfarmer/nanovm
+cargo install --locked --path nanovm/crates/nanovm   # the CLI: a release build of the node
+```
+
+Then an app, in a directory next to the clone:
+
+```bash
+cargo new --lib hello && cd hello
+cargo add --git https://github.com/carsonfarmer/nanovm nanovm-sdk
+printf '\n[lib]\ncrate-type = ["cdylib"]\n' >> Cargo.toml
+cp ../nanovm/examples/hello/src/lib.rs src/       # the 7 lines in sdk/rust/README.md
+../nanovm/tools/build-app.sh --run                # cargo build, compose kv, nanovm run hello.wasm
+curl http://127.0.0.1:8080/alice/                 # alice has had 1 visits (from another terminal)
+```
+
+`nanovm run` serves `/{object}/…` with the node's own request path, holds WebSockets as the
+proxy does, prints a line per request and what the app prints, and restarts when the `.wasm`
+changes (run `tools/build-app.sh` again after an edit). It is for your own code on your own
+machine: loopback only, no registry, signature or jail. `nanovm publish hello.wasm
+ghcr.io/you/hello:1.0.0` checks the app as a node will, pushes it as nodes pull it ([Apps](#apps)),
+and prints how to sign it and the TXT record that routes a host to it.
+[examples/chat](examples/chat) is a live multi-room chat on the same SDK. A recorded run and the
+reasons for each choice: [notes/onramp.md](notes/onramp.md).
+
 ## SQLite beta
 
 [Build and run the SQLite example](components/sqlite/README.md). A composed Wasm
@@ -236,11 +269,11 @@ What happens on the first request for a digest:
 
 **Uids.** An app's uid is the owner of its `objects/<app>` directory, or the next free one for a new app. It is stable across restarts, with no separate record.
 
-**Publishing.** [.github/workflows/publish-guests.yml](.github/workflows/publish-guests.yml) is the reference pipeline. CI builds each test guest, pushes it with `oras` (artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, version `1.0.<run>`), and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity. No key exists anywhere. A person can sign the same way from a laptop with `cosign` and a browser sign-in.
+**Publishing.** `nanovm publish app.wasm <registry>/<repository>:<version> [--manifest nanovm.json]` pushes an app as nodes pull it: artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, the component as its one `application/wasm` layer, the tag as its version. It first checks the component as a node will (imports, handler export, manifest), and prints the digest, how to sign and the TXT record. Registry credentials come from `NANOVM_REGISTRY_USER`/`NANOVM_REGISTRY_TOKEN`. [.github/workflows/publish-app.yml](.github/workflows/publish-app.yml) is a manual template that builds one app, publishes it and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity; [publish-guests.yml](.github/workflows/publish-guests.yml) does the same for the test guests with `oras`. No key exists anywhere. A person can sign from a laptop with `cosign` and a browser sign-in (not yet tested end to end, W-102).
 
 ## Key-value and config
 
-**`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. The counter and hostile guest packages compose this provider. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.
+**`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. The counter and hostile guest packages compose this provider; `tools/build-app.sh` composes it into any app that imports it. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.
 - Values count against the object's disk budget and keys against its file limit, like any other file.
 - Replacement writes a temporary file and renames it over the key. It needs room for both values and a temporary entry; old descriptors retain the old value. Only the host commits, together with all the request's file/SQL changes.
 - Values are bounded to 1 MiB. Key enumeration streams with backpressure and an error completion. A combined 32-store/listing cap lasts through completion delivery; host resource limits also apply.
@@ -330,7 +363,7 @@ An object calls another object of its own app with an ordinary outgoing request 
 
 The front proxy holds client sockets; the node only answers requests. Objects see sockets as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work. No separate Pushpin process is needed.
 
-Committed publishes travel from the supervisor to the proxy's private `publish_listen` (`127.0.0.1:8444`), at `POST /publish`. Set the node's `publish_to` accordingly (default `http://127.0.0.1:8444/publish`). **Only nodes may reach this control port**, just as only proxies may reach the node. The supervisor names the app, the worker names the object; channels cannot cross either boundary. Publish bodies have a 30 s deadline.
+Committed publishes travel from the supervisor to the proxy's private `publish_listen` (`127.0.0.1:8444`), at `POST /publish`; an in-process node (`nanovm run`, tests) delivers them to sockets of its own after the commit, and refuses any other `http://nanovm/` path with 404. Set the node's `publish_to` accordingly (default `http://127.0.0.1:8444/publish`). **Only nodes may reach this control port**, just as only proxies may reach the node. The supervisor names the app, the worker names the object; channels cannot cross either boundary. Publish bodies have a 30 s deadline.
 Sockets are indexed by object within each app; a publish visits that object's sockets, not every socket in the app. CNAME aliases share channels and per-app caps; separate record owners remain isolated even when they name the same package.
 - **Opening.** A socket opened at `/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`; any other answer refuses the socket, with the object's own status if it is a 4xx or 5xx (so a `401` reaches the client).
 - **Events.** Each later event (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` queued with the object's other requests, so events are ordered with everything else the object serves. The answer carries events for that socket.
