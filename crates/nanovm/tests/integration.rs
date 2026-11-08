@@ -111,6 +111,18 @@ async fn settle(node: &Arc<Node>) {
 
 // ---- persistence and isolation ----------------------------------------
 
+fn captured_files(objects: &Path, id: &str, sequence: u64) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(objects.join(format!("~committed/{id}/{sequence:020}.tar"))).unwrap();
+    tar::Archive::new(file).entries().unwrap().map(|entry| {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        (path, bytes)
+    }).filter(|(path, _)| path != Path::new("nanovm.json")).collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn app_storage_has_one_local_owner() {
     let cfg = node_cfg("app_storage_has_one_local_owner", 2);
@@ -996,12 +1008,16 @@ async fn supervised_workers_contain_attacks() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn killed_worker_is_restarted_and_keeps_its_volumes() {
-    let cfg = node_cfg("killed_worker_is_restarted", 8);
+    let mut cfg = node_cfg("killed_worker_is_restarted", 8);
+    cfg.capture = Some(Default::default());
     let (_sup, addr) = supervised_with(cfg.clone()).await;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
     assert_eq!(app_get(addr, &hostile, "/k/").await.0, 200);
     let incr = format!("POST /k/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter));
-    assert_eq!(raw(addr, &incr, b"").await.0, 200);
+    let (status, body) = raw(addr, &incr, b"").await;
+    assert_eq!(status, 200, "{body}");
+    let objects = cfg.app_dirs(&worker(&counter))[0].clone();
+    assert_eq!(captured_files(&objects, "k", 1)[Path::new("data/count")], b"1");
 
     let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
     let mut competing = app("counter");
@@ -1024,6 +1040,9 @@ async fn killed_worker_is_restarted_and_keeps_its_volumes() {
     let v = stats_json(addr).await;
     assert_eq!(v["workers"][worker(&counter).as_str()]["starts"], 2, "{v}");
     assert_ne!(v["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap(), pid);
+    assert_eq!(raw(addr, &incr, b"").await.0, 200);
+    assert_eq!(captured_files(&objects, "k", 2)[Path::new("data/count")], b"2");
+    assert_eq!(captured_files(&objects, "k", 1)[Path::new("data/count")], b"1");
 }
 
 /// Runs `jail_probe` in a child process (a jail cannot be left), then checks
@@ -1064,6 +1083,9 @@ fn jail_blocks_escapes() {
         .collect();
     let expect = [
         ("write_own_dir", "ok"),
+        ("link_own_dir", "ok"),
+        ("link_other_app", "denied"),
+        ("link_outside", "denied"),
         ("cwd", "ok"),
         ("thread", "ok"),
         ("read_other_app", "denied"),
@@ -1105,6 +1127,9 @@ fn jail_probe() {
     let report = |name: &str, ok: bool| println!("probe {name}={}", if ok { "ok" } else { "denied" });
     let sys = |r: i64| r >= 0;
     report("write_own_dir", std::fs::write(dir.join("mine/f"), "x").is_ok());
+    report("link_own_dir", std::fs::hard_link(dir.join("mine/f"), dir.join("mine/link")).is_ok());
+    report("link_other_app", std::fs::hard_link(dir.join("other/secret"), dir.join("mine/stolen")).is_ok());
+    report("link_outside", std::fs::hard_link(dir.join("mine/f"), dir.join("other/injected")).is_ok());
     // A relative data_dir is canonicalized against it.
     report("cwd", std::env::current_dir().is_ok());
     report("thread", std::thread::spawn(|| 1).join().is_ok());
@@ -1792,6 +1817,81 @@ async fn sqlite_composed_provider() {
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     node.shutdown().await;
     println!("composed Spin SQLite: typed values, one connection, policy denial, drop/reopen, isolation, mixed rollback and restart passed");
+}
+
+/// Transfer only immutable captures, then remove the original node's entire root.
+/// This exercises same-host recovery mechanics, not a remotely durable receipt.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SQLite build.sh --compose"]
+async fn sqlite_captures_recover_without_the_original_node() {
+    use std::io::Read;
+    use sha2::{Digest, Sha256};
+    let mut cfg = node_cfg("sqlite_capture_source", 2);
+    cfg.capture = Some(Default::default());
+    let mut app = app("counter");
+    app.limits.memory_mb = 64;
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/composed.wasm")).unwrap();
+    let node = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
+    let expected = |rows: &[&str], marker: &str, reused: bool| {
+        serde_json::json!({"rows": rows, "file": marker, "key": marker, "reused": reused})
+    };
+    assert_eq!(get(&node, "a", "/?v=first").await.json(), expected(&["first"], "first", false));
+    assert_eq!(get(&node, "a", "/?v=rejected&then=trap").await.status, 500);
+    assert_eq!(get(&node, "a", "/?v=second").await.json(), expected(&["first", "second"], "second", false));
+    settle(&node).await;
+    let source = cfg.app_dirs(&app.name)[0].join("~committed/a");
+    let mut fresh = node_cfg("sqlite_capture_recovered", 2);
+    fresh.capture = cfg.capture.clone();
+    let objects = fresh.app_dirs(&app.name)[0].clone();
+    let received = objects.join("~committed/a");
+    std::fs::create_dir_all(&received).unwrap();
+    let mut versions: Vec<_> = std::fs::read_dir(&source).unwrap().map(|e| e.unwrap().path()).collect();
+    versions.sort();
+    assert_eq!(versions.len(), 2, "rejected request must not enter history");
+    let mut parent = String::new();
+    for (index, path) in versions.iter().enumerate() {
+        let bytes = std::fs::read(path).unwrap();
+        let mut archive = tar::Archive::new(&bytes[..]);
+        let mut entries = archive.entries().unwrap();
+        let mut first = entries.next().unwrap().unwrap();
+        assert_eq!(first.path().unwrap(), Path::new("nanovm.json"));
+        let mut metadata = Vec::new();
+        first.read_to_end(&mut metadata).unwrap();
+        let version: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+        assert_eq!(version["app"], app.name);
+        assert_eq!(version["object"], "a");
+        assert_eq!(version["sequence"], index + 1);
+        assert_eq!(version["parent"], parent);
+        parent = format!("{:x}", Sha256::digest(&bytes));
+        let target = received.join(path.file_name().unwrap());
+        std::fs::write(&target, &bytes).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        std::fs::File::open(&target).unwrap().sync_all().unwrap();
+    }
+    std::fs::File::open(&received).unwrap().sync_all().unwrap();
+    // A later local success is deliberately not transferred. It cannot be
+    // recovered and must never be advertised as remotely durable.
+    assert_eq!(get(&node, "a", "/?v=unsent").await.status, 200);
+    node.shutdown().await;
+    drop(node);
+    std::fs::remove_dir_all(&cfg.data_dir).unwrap();
+    let unpack = fresh.data_dir.join("unpack");
+    let last = received.join(versions.last().unwrap().file_name().unwrap());
+    tar::Archive::new(std::fs::File::open(last).unwrap()).unpack(&unpack).unwrap();
+    std::fs::rename(unpack.join("data"), objects.join("a")).unwrap();
+    let node = Node::new(fresh.clone(), &app, &wasm, None).unwrap();
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
+    assert_eq!(get(&node, "a", "/?v=continued").await.json(), expected(&["first", "second", "continued"], "continued", true));
+    settle(&node).await;
+    assert_eq!(std::fs::read_dir(&received).unwrap().count(), 3, "restored history must continue, not restart");
+    node.shutdown().await;
+    drop(node);
+    let node = Node::new(fresh, &app, &wasm, None).unwrap();
+    assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second", "continued"], "continued", false));
+    node.shutdown().await;
+    println!("source root removed: transferred SQL/file/KV recovered together; rejected and unsent writes absent; history continued across restart");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3322,6 +3422,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
     let logs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut cfg = node_cfg("post_return_context", 8);
+    cfg.capture = Some(Default::default());
     cfg.telemetry_endpoint = format!("http://{}", sink.local_addr().unwrap());
     let (captured, captured_logs) = (spans.clone(), logs.clone());
     let collector = tokio::spawn(nanovm::server::serve_http1(sink, move |req| {
@@ -3367,6 +3468,9 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
             .body(bytes::Bytes::new()).unwrap();
         let response = node.dispatch(&id, req).await;
         assert_eq!(response.status(), 200);
+        let first = captured_files(&objects, &id, 1);
+        assert_eq!(first[Path::new("data/before.txt")], b"before");
+        assert!(!first.contains_key(Path::new("data/after.txt")), "post-return bytes entered the response capture");
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/begin");
         begin.add_permits(1);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/finish");
@@ -3390,6 +3494,12 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
             assert_eq!(next.into_body().collect().await.unwrap().to_bytes(), "callee");
         }
         eventually("final commit", || node.phases().keys().all(|p| *p == "idle" || *p == "cold")).await;
+        if !fail {
+            assert_eq!(captured_files(&objects, &id, 2)[Path::new("data/after.txt")], b"after");
+        } else {
+            assert!(!objects.join(format!("~committed/{id}/{:020}.tar", 2)).exists());
+        }
+        assert_eq!(captured_files(&objects, &id, 1), first, "later work changed a published version");
         if fail { std::fs::rename(journal.with_file_name("saved-log"), &journal).unwrap(); }
     }
     node.shutdown().await;
@@ -3408,6 +3518,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         }
         assert_eq!(std::fs::read(objects.join("parent1/after.txt")).unwrap(), b"after");
         assert!(!objects.join("parent2/after.txt").exists());
+        assert!(!objects.join("~committed/parent2/00000000000000000002.tar").exists(), "recovery published rejected post-return work");
         reopened.shutdown().await;
     }
     tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();

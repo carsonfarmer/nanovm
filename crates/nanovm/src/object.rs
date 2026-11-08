@@ -372,7 +372,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     table.set_max_capacity(limits.max_resources);
 
     // `/tmp` starts empty, so only the persistent volume holds usage.
-    let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone())?;
+    let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone(), node.cfg.capture.as_ref())?;
 
     let state = ObjState {
         wasi: b.build(),
