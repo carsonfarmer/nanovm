@@ -383,7 +383,7 @@ impl Supervisor {
         let (egress, worker_egress) = UnixStream::pair()?;
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
         let mut cmd = Command::new(&self.exe);
-        cmd.arg("worker")
+        cmd.arg0("nanovm").arg("worker")
             .env_clear()
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
