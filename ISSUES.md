@@ -5,7 +5,7 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 - **Reproduced**: shown against the real code or the OS. **From source**: traced through the code, not run.
 - Status: `open`, `fixing`, `fixed in <commit>`, or `deferred: <why>`.
 
-**Current work (2026-11-08):** backup/restore and N-43 are delivered on main through `1e5f18ad`, with passing CI. W-9's bounded committed-version proof is on `w9-committed-state` (Amp); no production runtime files are owned or changed. Runtime remains 5,085; 5k is a simplicity goal, not a hard limit. Both slower actor rewrites remain rejected. Live capture, distributed fencing and automatic failover remain unimplemented. W-5 records remaining lifecycle scope, not the next priority.
+**Current delivery (2026-11-08):** backup/restore and N-43 are delivered through `1e5f18ad`, with passing CI. W-9's bounded committed-version proof is `310c992`, validated by CI 42438468359 and included in main integration; no production runtime files are owned or changed. Runtime remains 5,085; 5k is a simplicity goal, not a hard limit. Both slower actor rewrites remain rejected. Live capture, distributed fencing and automatic failover remain unimplemented. W-5 records remaining lifecycle scope, not the next priority.
 
 ## Problems
 
@@ -267,7 +267,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### N-43 (tests): max-app admission assumes requests stay busy during cold startup
 - **Where:** `integration.rs`, `a_node_runs_at_most_max_apps`
 - **Observed:** branch CI 42313030490 returned 200 when the fixture expected a full-capacity refusal. It holds workers busy with 600/900 ms sleeps while loading another app, then assumes they are still busy. Runtime sources are unchanged by backup/restore.
-- **Status:** fixed on `deterministic-app-admission-test`: observed upstream requests stay gated until the capacity assertion completes. An injected 1100 ms delay reproduces the old failure and passes with the fix. Allowing eviction of busy workers fails the corrected regression; restored with `git checkout --` and empty unstaged diff verified. Restored full suite passes (99 unit, 69 integration, 12 ignored). Runtime and guests unchanged. Recovery's main CI 42313034048 passed independently; this fixes the race rather than relying on that rerun-equivalent success.
+- **Status:** fixed on main through `1e5f18ad`, with passing CI: observed upstream requests stay gated until the capacity assertion completes. An injected 1100 ms delay reproduces the old failure and passes with the fix. Allowing eviction of busy workers fails the corrected regression; restored with `git checkout --` and empty unstaged diff verified. Restored full suite passes (99 unit, 69 integration, 12 ignored). Runtime and guests unchanged. Recovery's main CI 42313034048 passed independently; this fixes the race rather than relying on that rerun-equivalent success.
 
 ## Planned work
 
@@ -359,6 +359,7 @@ The checkpoints below are historical, not outstanding product decisions.
 - **What:** capture immutable committed content and namespace state before later mutations, transfer ordered versions and recover without the original root. The undo journal is not a replication feed. Survey Litestream, LiteFS and Durable Objects before choosing machinery.
 - **Status:** in progress, Amp on `w9-committed-state`. Bounded first slice: storage-only capture/transfer/recovery proof using the real journal, without changing runtime acceptance. Acknowledgement/RPO, production capture atomicity, remote transport/durability and failover policy remain unresolved. Offline backup is complete, not this work's objective.
 - **Evidence:** example tests and separate executable drill pass: ordered/idempotent receipt, immutable response/post-return versions, exact file/namespace recovery after source deletion, rejected mutation rollback, receiver process-exit cuts and continued local writes after recovery. Four guard-removal mutations fail and are restored. An unsent locally accepted write is deliberately absent on recovery. Same-host roots/processes do not establish remote durability; full local suite retains N-32 failures. Review found no blocker for the disclosed research scope, not production integration.
+- **Delivery:** bounded proof done in `310c992`, CI 42438468359 passed the full suite and SQL/KV checks. W-9 stays open for crash-atomic source capture and runtime integration; no active file ownership after main integration.
 
 ### W-10: groundwork for many nodes
 - **What:** a lease hook before instantiation in `table.rs` (always granted on one node), an epoch carried by each commit, request ids so the proxy can retry safely. Placement belongs in the proxy.

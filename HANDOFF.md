@@ -33,8 +33,18 @@ Opus routing could not be attested. No new dependency, runtime or guest source c
 The existing HTTP demo/benchmarks were not rerun: this experiment adds no serving
 path and makes no performance claim. Full local suite: 99 unit pass, 67 integration
 pass, two unchanged KV fixtures fail CPU/deadline limits (N-32), 12 ignored. A
-targeted rerun passes listing but quota still fails; this is not a green suite or a
-fix. The docs-only checkpoint `fed57b1` passed CI 42437123623 with the same runtime.
+targeted rerun passes listing but quota still fails. The restored full local run
+has 99 unit/68 integration passes and the same quota CPU failure, 12 ignored;
+this is not a green local suite or a fix. Production check passes; rustdoc builds
+with five existing warnings. Strict all-target clippy still fails on seven existing
+runtime diagnostics; the example emits no additional diagnostics. Its rustfmt check
+passes; repository-wide formatting remains unclean in unchanged files.
+
+**Delivery:** implementation `310c992` passed CI 42438468359, including the full
+suite, example tests, composed SQL/KV and SQL pressure tests. Main integration
+includes this record; the exact new main head's CI must also complete. The earlier
+docs-only checkpoint `fed57b1` passed CI 42437123623. W-9 remains unfinished beyond
+this bounded proof; no production replication, guest publication or deployment.
 
 **Successor prompt:** Continue W-9 from this current section and PLAN's W-9 contract.
 Keep both response and post-return commits distinct. Close capture/publication crash
