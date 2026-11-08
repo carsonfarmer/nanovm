@@ -329,3 +329,20 @@ async fn the_chat_example_is_live_and_durable() {
     assert!(message(next(&mut dee).await)["error"].is_string());
     assert_eq!(texts(serde_json::from_str(&get(addr, "/general/messages").await.1).unwrap()).len(), 4);
 }
+
+/// A JavaScript app (js/tests/app.js) under `nanovm run`: `env.kv` on the
+/// composed provider, and `env.publish` reaching its object's sockets, which
+/// needs a node that delivers publishes in-process.
+#[tokio::test(flavor = "multi_thread")]
+async fn javascript_apps_run_and_publish() {
+    let data = data_dir("javascript");
+    let mut run = start(&[wasm("js/target/test-app.wasm").as_os_str(), "--data".as_ref(), data.as_os_str()]);
+    let addr = run.addr().await;
+    assert_eq!(post(addr, "/a/incr", "").await, (200, r#"{"n":1,"hits":1}"#.into()));
+    assert_eq!(post(addr, "/a/incr", "").await, (200, r#"{"n":2,"hits":2}"#.into()));
+    let (mut a, mut b) = (open(addr, "/room/ws").await.unwrap(), open(addr, "/room/ws").await.unwrap());
+    say(&mut a, "hello").await;
+    assert_eq!(next(&mut a).await.to_text().unwrap().split(" from ").next(), Some("echo hello"));
+    say(&mut a, "pub hi").await;
+    assert_eq!((next(&mut a).await, next(&mut b).await), (Message::text("hi"), Message::text("hi")));
+}

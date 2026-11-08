@@ -78,3 +78,6 @@ oci-client = { version = "0.18", default-features = false, features = ["rustls-t
 tokio-tungstenite = "0.30"
 tokio = { version = "1", features = ["test-util"] }
 container-registry = { version = "0.3.1", features = ["test-support"] }
+# Pre-initializes JavaScript apps (examples/js-wizer.rs); no wasmtime features
+# beyond nanovm's own.
+wasmtime-wizer = { version = "50.0.1", default-features = false, features = ["component-model"] }
