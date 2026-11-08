@@ -2,6 +2,8 @@
 name = "nanovm"
 version = "0.1.0"
 edition.workspace = true
+# Not on crates.io; also tells cargo-deny (deny.toml) it is private.
+publish = false
 
 [[example]]
 name = "committed_state"

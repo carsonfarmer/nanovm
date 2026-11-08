@@ -1,0 +1,48 @@
+name: Supply chain
+
+# Advisories, licenses, bans and sources (cargo-deny, deny.toml) and RustSec
+# advisories (cargo-audit, .cargo/audit.toml), for the node and for the
+# guest and component workspaces. Daily too: advisories appear without any
+# change here.
+on:
+  push:
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml", ".cargo/audit.toml", ".github/workflows/supply-chain.yml"]
+  pull_request:
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml", ".cargo/audit.toml", ".github/workflows/supply-chain.yml"]
+  workflow_dispatch:
+  schedule:
+    - cron: "41 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: cargo-deny and cargo-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - name: Install pinned tools
+        run: |
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo install --locked cargo-audit --version 0.22.2
+      - name: cargo deny (node)
+        run: cargo deny --locked check
+      - name: cargo audit (node)
+        run: cargo audit
+      # Their own crates are unlicensed and use path dependencies, so only
+      # advisories and sources. experiments/fs-backends' lock is stale.
+      - name: Guest, component and fixture workspaces (advisories and sources)
+        run: |
+          for lock in $(git ls-files '*/Cargo.lock' | grep -v '^experiments/fs-backends/'); do
+            m=$(dirname "$lock")
+            echo "::group::$m"
+            cargo deny --manifest-path "$m/Cargo.toml" --locked check advisories sources
+            (cd "$m" && cargo audit --file Cargo.lock)
+            echo "::endgroup::"
+          done

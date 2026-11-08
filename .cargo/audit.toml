@@ -1,0 +1,11 @@
+# cargo-audit (https://rustsec.org): `cargo audit` from the repository root.
+# The same exceptions, with reasons, are in deny.toml.
+[advisories]
+ignore = [
+    "RUSTSEC-2023-0018", # remove_dir_all 0.5 via tempdir: dev-only (container-registry test-support)
+    "RUSTSEC-2018-0017", # tempdir unmaintained: dev-only, same path
+]
+informational_warnings = ["unmaintained", "unsound", "notice"]
+
+[yanked]
+enabled = true
