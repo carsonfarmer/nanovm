@@ -1,0 +1,60 @@
+[package]
+name = "nanovm-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace: the node's never builds libFuzzer.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nanovm = { path = "../crates/nanovm", default-features = false, features = ["fuzzing"] }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "ws_events"
+path = "fuzz_targets/ws_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grip_publish"
+path = "fuzz_targets/grip_publish.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "txt_record"
+path = "fuzz_targets/txt_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "app_ref"
+path = "fuzz_targets/app_ref.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_log"
+path = "fuzz_targets/journal_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "telemetry_stamp"
+path = "fuzz_targets/telemetry_stamp.rs"
+test = false
+doc = false
+bench = false

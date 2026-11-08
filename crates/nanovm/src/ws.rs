@@ -66,7 +66,7 @@ pub enum Event {
 
 impl Event {
     /// `KIND\r\n`, or `KIND HEXLEN\r\n`, the content and `\r\n`.
-    fn encode(&self) -> Bytes {
+    pub(crate) fn encode(&self) -> Bytes {
         let of = |k: &str, c: &[u8]| Bytes::from([format!("{k} {:x}\r\n", c.len()).as_bytes(), c, b"\r\n"].concat());
         match self {
             Event::Open => "OPEN\r\n".into(),
@@ -80,7 +80,7 @@ impl Event {
 }
 
 /// The events in `body`, if it holds nothing else.
-fn parse(body: Bytes) -> Option<Vec<Event>> {
+pub(crate) fn parse(body: Bytes) -> Option<Vec<Event>> {
     let mut events = vec![];
     let mut at = 0;
     while at < body.len() {
@@ -433,7 +433,7 @@ enum WsMessage {
 
 /// The (channel, message) of each item of a publish that has one for a
 /// socket; `None` unless all are well formed.
-fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
+pub(crate) fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
     let items = serde_json::from_slice::<Publish>(json).ok()?.items;
     if items.len() > MAX_ITEMS {
         return None;

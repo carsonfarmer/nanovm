@@ -70,6 +70,8 @@ tikv-jemallocator = { version = "0.7", default-features = false }
 # Allows `dev = true` (no signature checks, private registries and egress).
 # Off by default, so a release build can't be configured into dev mode.
 dev = []
+# Entry points for the fuzz targets in /fuzz (`nanovm::fuzz`); never in the node.
+fuzzing = []
 
 [dev-dependencies]
 # The tests run nodes in dev mode against a loopback registry.

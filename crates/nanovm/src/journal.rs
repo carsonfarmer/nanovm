@@ -35,7 +35,7 @@ const LOG: &str = "log";
 /// Overwritten bytes are kept in records of at most this many.
 const CHUNK: u64 = 1 << 20;
 
-enum Undo {
+pub(crate) enum Undo {
     Size(PathBuf, u64),
     Bytes(PathBuf, u64, Vec<u8>),
     Created(PathBuf),
@@ -495,7 +495,7 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
 
 /// A record: a tag, then its fields; a path or bytes as a length and the
 /// bytes, a number as 8 bytes.
-fn encode(undo: &Undo) -> Vec<u8> {
+pub(crate) fn encode(undo: &Undo) -> Vec<u8> {
     let mut buf = vec![];
     let mut put = |b: &[u8]| {
         buf.extend((b.len() as u64).to_le_bytes());
@@ -517,7 +517,7 @@ fn encode(undo: &Undo) -> Vec<u8> {
 
 /// The records in `log`, with where each starts, up to the first incomplete
 /// one.
-fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
+pub(crate) fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
     let len = log.len();
     fn bytes(log: &mut &[u8]) -> Option<Vec<u8>> {
         let (n, rest) = log.split_at_checked(8)?;

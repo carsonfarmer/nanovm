@@ -70,3 +70,9 @@ mod counting {
         C.with(|c| c.get().2) - held
     }
 }
+
+/// Entry points for the fuzz targets in `/fuzz`, which build nanovm with this
+/// feature; never part of the node.
+#[cfg(feature = "fuzzing")]
+#[path = "../../../fuzz/entry.rs"]
+pub mod fuzz;

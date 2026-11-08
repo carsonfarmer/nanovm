@@ -41,7 +41,7 @@ const MAX_BATCH: usize = 1 << 20;
 const DEADLINE: Duration = Duration::from_secs(2);
 const INTERVAL: Duration = Duration::from_secs(1);
 
-fn identity(app: &str, digest: &str) -> [KeyValue; 3] {
+pub(crate) fn identity(app: &str, digest: &str) -> [KeyValue; 3] {
     [KeyValue::new("service.name", "nanovm"), KeyValue::new("nanovm.app", app.to_owned()),
         KeyValue::new("service.version", digest.to_owned())]
 }
@@ -269,7 +269,7 @@ impl Relay {
 /// drops identity attributes from scopes, spans, events, links and log
 /// records, at the wire level: the rest is copied as bytes. Decoding the
 /// batch instead cost up to 200 times its size, as 2-byte empty spans (N-74).
-fn stamp(signal: &str, body: &[u8], app: &str, digest: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn stamp(signal: &str, body: &[u8], app: &str, digest: &str) -> anyhow::Result<Vec<u8>> {
     let top = match signal {
         "traces" => Kind::Batch(true),
         "logs" => Kind::Batch(false),

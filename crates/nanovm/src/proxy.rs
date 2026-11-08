@@ -40,15 +40,15 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What `_nanovm.<host>` says.
 #[derive(Clone, Debug, PartialEq)]
-struct Route {
+pub(crate) struct Route {
     /// The name the record was found at, after CNAMEs, without `_nanovm.`:
     /// the app is this name's deployment of its repository, so aliases
     /// share one app.
-    owner: String,
+    pub(crate) owner: String,
     /// `repository:tag`.
-    app: Reference,
-    trust: String,
-    min: Option<String>,
+    pub(crate) app: Reference,
+    pub(crate) trust: String,
+    pub(crate) min: Option<String>,
 }
 
 pub struct Proxy {
@@ -280,12 +280,12 @@ impl Proxy {
 }
 
 /// A TXT record's text: its quoted strings, joined.
-fn unquote(data: &str) -> String {
+pub(crate) fn unquote(data: &str) -> String {
     data.split('"').skip(1).step_by(2).collect()
 }
 
 /// `app=<repository>:<tag>; trust=<issuer> <subject>; …; min=<version>`.
-fn parse(txt: &str) -> anyhow::Result<Route> {
+pub(crate) fn parse(txt: &str) -> anyhow::Result<Route> {
     let (mut app, mut trust, mut min) = (None, vec![], None);
     for field in txt.split(';').map(str::trim).filter(|f| !f.is_empty()) {
         match field.split_once('=') {
