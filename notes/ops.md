@@ -61,3 +61,29 @@ cargo build -p nanovm --features dev --bin nanovm --example dev-registry
 sudo apt-get install -y systemd-container
 sudo deploy/systemd/test/nspawn.sh
 ```
+
+## L-113/L-114 single-node reference deployment (`ideas/single-node`, on `ideas/systemd-units`)
+
+**What:** `deploy/single-node/`: a guide (Caddy TLS → proxy → node → workers,
+Collector on its own cores), `Caddyfile`, CPU/memory drop-ins for nanovm and
+`otelcol-contrib`, `install.sh` (idempotent, refuses to swap the binary under a
+running node, keeps configs), `check-host.py` (per-worker fds and mappings from
+`engine::preflight`'s formulas, Landlock ABI, root, data_dir searchable by app
+uids, filesystem and mount options, cgroup controllers, CA bundle,
+RUST_BACKTRACE; also covers IDEAS C-44's "doctor" checks), and `capacity.json`,
+inputs for the nice-to-haves capacity calculator (measured values cited from
+README). `deploy/systemd/test/nspawn.sh` now takes `SCRIPT=` and `MODES=`.
+
+**Evidence:** `test/e2e.sh` in the nspawn container, 8/8: install, three writes
+and a read over Caddy's verified internal-CA TLS through proxy (DoH stand-in,
+dev registry tag) to a jailed worker; client `nanovm-app` header ignored; 404 for
+a host without a record; 8080/8444 on 127.0.0.1 only; spans from all three layers
+at the Collector port; data survives a node restart. `caddy validate` (2.6.2) and
+`systemd-analyze verify` pass. check-host: 5 tests; on this host it flags the
+scratch directory's 0700 ancestors (the failure the fs matrix first hit:
+`… is not accessible to the worker: Permission denied`). The nice-to-haves
+calculator runs on `capacity.json` (17,100/s application ceiling, 40,800/s
+Collector, ~69,000 resident objects in 6 GiB, CPU for Caddy/proxy excluded).
+
+**Not run:** otelcol-contrib (no binary), real ACME/DNS, signed apps, AllowedCPUs
+enforcement (cgroup v1 here). No Terraform/Ansible: a tested shell installer.

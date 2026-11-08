@@ -7,6 +7,8 @@
 #
 #   cargo build -p nanovm --features dev --bin nanovm --example dev-registry
 #   sudo deploy/systemd/test/nspawn.sh            # BIN=target/debug by default
+# SCRIPT= runs another in-container script (e.g. deploy/single-node/test/e2e.sh)
+# and MODES= picks the runs ("plain cgroup capture" by default).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 BIN=${BIN:-$REPO/target/debug}
@@ -28,14 +30,14 @@ After=multi-user.target
 [Service]
 Type=oneshot
 EnvironmentFile=-/etc/nanovm-test.env
-ExecStart=/bin/bash $REPO/deploy/systemd/test/in-container.sh
+ExecStart=/bin/bash ${SCRIPT:-$REPO/deploy/systemd/test/in-container.sh}
 StandardOutput=journal+console
 ExecStopPost=/bin/systemctl poweroff --no-block
 EOF
 ln -s ../nanovm-test.service "$R/etc/systemd/system/multi-user.target.wants/"
 
 status=0
-for mode in plain cgroup capture; do
+for mode in ${MODES:-plain cgroup capture}; do
     echo "== $mode"
     unified=0
     rm -f "$R/etc/nanovm-test.env"
@@ -48,7 +50,7 @@ for mode in plain cgroup capture; do
         --system-call-filter="landlock_create_ruleset landlock_add_rule landlock_restrict_self" \
         --keep-unit -M nanovm-test --boot >"$WORK/$mode.log" 2>&1 || true
     tr -d '\r' <"$WORK/$mode.log" | sed -n 's/^.*bash\[[0-9]*\]: //p' >"$WORK/$mode.out"
-    grep -aE '^(PASS|FAIL|RESULT|cgroups:|supervisor:|proxy:|worker pid|captured)' "$WORK/$mode.out" | sed 's/^/  /'
+    grep -aE '^(PASS|FAIL|RESULT|cgroups:|supervisor:|proxy:|worker pid|captured|Collector)' "$WORK/$mode.out" | sed 's/^/  /'
     grep -aqx 'RESULT fail=0' "$WORK/$mode.out" || status=1
 done
 exit $status
