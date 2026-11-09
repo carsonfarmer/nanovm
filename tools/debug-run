@@ -1,0 +1,8 @@
+#!/bin/sh
+# One request through a component outside the node, with the full wasm
+# backtrace on a trap. See docs/debugging.md and crates/nanovm/examples/debug-run.rs.
+#   tools/debug-run app.wasm [METHOD] /object/path [--body TEXT] [--data DIR] [--config K=V]...
+set -e
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cargo build -q --locked --manifest-path "$root/Cargo.toml" -p nanovm --example debug-run
+exec env -u RUST_BACKTRACE "$root/target/debug/examples/debug-run" "$@"

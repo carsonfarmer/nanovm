@@ -7,6 +7,10 @@ edition.workspace = true
 name = "committed_state"
 test = true
 
+[[example]]
+name = "debug-run"
+test = true
+
 [dependencies]
 # wasmtime's defaults less what the node never uses: its own compile cache
 # (`engine::load_component` keeps one), profilers, core dumps, the text
