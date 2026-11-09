@@ -15,7 +15,33 @@ domain, protocol and authority implementation still need concrete design and evi
 Main integration `59b3783` passed CI 42492425381; that proves its checks, not acceptance
 of its capture performance. Do not build remote replication atop the rejected cost.
 
-**Active candidate (2026-11-09), not accepted for main:** policy checkpoint `4005a79`
+**Current experiment, rejected for adoption:** `103985f` preserves the format-2 delta
+candidate on `w9-efficient-capture`; CI 42553580842 passed. Format-3 work on
+`w9-single-decision`
+makes immutable publication the capture-mode decision. A sequence prefix in the
+undo log binds recovery to that publication; output-directory sync must precede
+undo disposal. Default mode still commits by durable log deletion. This removes
+two warm capture syncs, not required data/decision barriers. Formats 1/2 are refused,
+not migrated. Full runtime suite passes 109 unit, 69 integration and two proof tests;
+all 11 SQL tests pass. After review's extra boundary fixtures, all 33 journal tests
+pass through the actual runtime and scratch harness. Removing recovery's decision
+sync, using the old rename offset or ignoring accepted-log recovery each fails its
+regression; all mutations were restored. Read-only review found no concrete blocker
+under trusted-root/filesystem assumptions, but Opus routing remains unattested.
+Production check and rustdoc pass (existing warnings); strict clippy retains seven
+existing diagnostics. This does not fix the earlier intermittent CPU failures.
+The final default-mode demo is not clean: 69,997/70,000 normal requests succeed,
+with three counter CPU failures (two instantiation failures). All 100 attacks are
+contained and 1,024 canary requests succeed. The managed service was stopped.
+
+Three final same-binary benchmark pairs remain unacceptable: concurrent writes
+398/425/455 disabled versus 285/414/234 enabled; serial writes 236/215/113 versus
+121/132/61. These runs had no request failures, but medians regress 33%/44%.
+Orb storage timings vary widely; fewer syncs did not establish a throughput win.
+Do not merge either candidate. Runtime is 5,483 lines. Remote receipt and fenced
+recovery remain absent; no infrastructure, guests or packages were changed.
+
+**Previous candidate (2026-11-09), not accepted for main:** policy checkpoint `4005a79`
 passed CI 42545866551. Profiling the unchanged runtime shows 64 eight-byte updates
 beside an untouched 8 MiB file emit 537,133,056 archive bytes; twelve tiny updates
 add 96 fsync calls versus capture disabled. The working branch replaces repeated
@@ -42,15 +68,15 @@ Required read-only review and focused cache/ancestor follow-ups found no remaini
 concrete blocker within the trusted-root/local scope; Opus routing is unattested.
 Runtime is 5,463 lines, not a reduction. Remote durability remains unimplemented.
 
-**Current successor prompt:** Continue `w9-efficient-capture`; preserve the
-owner-approved remote-before-success and manually authorized, fenced recovery policy.
-The delta candidate fixes full-copy amplification but fails the local performance
-gate. Investigate a single durable capture/commit decision instead of independently
-syncing both decisions; this is an engineering proposal, not implemented or approved
-replication architecture. Preserve default-mode durable acceptance, rejected-request
-rollback and both gates. Require recovery-cut tests, mutations, independent review
-and matched measurements before adoption. Do not extend backup or revive rejected
-backends. Historical checkpoints below are not current performance clearance.
+**Current successor prompt:** Main remains `59b3783`; neither `w9-efficient-capture`
+nor `w9-single-decision` clears performance. Stop treating permanent local history
+as the target. Confirm the proposed single off-node durability/fencing authority
+versus a replicated quorum before implementing remote acceptance. The owner already
+requires remote-before-success and manually authorized, fenced recovery; do not ask
+those questions again. Preserve local durability, rejected-request rollback and both
+gates. Design ambiguous receipt/late retry handling explicitly; absence of a receipt
+is not proof of rejection. Reuse range-capture evidence without importing failed
+local-storage architecture wholesale. No backup extension or rejected backend revival.
 
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
 and is included in this main integration from `w9-atomic-capture`. Bounded, opt-in

@@ -16,7 +16,7 @@ Apps are signed artifacts in OCI registries. A proxy finds each host's app in DN
 rollback, tested offline backup/restore, and opt-in local committed-state capture.
 There is no production remote transfer, remote durability guarantee or automatic
 failover. The approved target is remote durability before success, with recovery
-manually authorized and fenced; this is not yet implemented. Candidate runtime is 5,463 lines,
+manually authorized and fenced; this is not yet implemented. Experimental runtime is 5,483 lines,
 above the under-5k goal. Older checkpoint
 counts and candidate designs below are historical, not current delivery claims.
 The line goal guides simplicity; it is not a hard limit or correctness tradeoff.
@@ -31,23 +31,29 @@ gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 
 **Local capture — performance gate open, not recommended for deployment:** optional node `[capture]` configuration
 enables TAR captures at both dirty commit gates (`max_mb = 256`,
-`max_versions = 16`, per object). Versions are staged before the journal's commit
-decision, then published under `objects/<app>/~committed/<object>/`; recovery
-discards rejected staging or completes accepted publication before new work.
+`max_versions = 16`, per object). In the current format-3 experiment (rejected for adoption),
+syncing immutable publication under `objects/<app>/~committed/<object>/` is the
+capture-mode commit decision. Undo names that sequence before mutation; recovery
+persists observed publication before dropping undo, or discards staging and rolls
+back if unpublished. Default-mode durable log deletion remains unchanged.
 Full history rejects further dirty commits rather than discarding old versions;
 read-only commits consume no version. Capture defaults off. This is bounded local
 capture, not continuous replication: no retention, network receiver, restore API,
 distributed fence or remote acknowledgement policy is provided. Do not manually
 prune history or disable capture on a root with history. The delivered full-copy
-design halved small-write throughput and was rejected. The working format-2 candidate
-copies the initial volume, then stores a complete namespace and changed byte ranges;
+design halved small-write throughput and was rejected. The delta candidates
+copy the initial volume, then store a complete namespace and changed byte ranges;
 small, new or renamed files can still be copied in full. Replay requires the entire
 ordered chain and a restored root must exactly match its head before serving.
-Format-1 histories are refused, not silently upgraded. Capture output for 64 tiny
+Format-1/2 histories are refused, not silently upgraded. The preceding format-2
+candidate's capture output for 64 tiny
 updates beside an untouched 8 MiB file falls from 537,133,056 to 8,683,008 bytes,
 but median tiny-write throughput still falls 12% concurrent / 20% serial against
 capture disabled. Correcting that cost remains the core priority; this candidate
-is not accepted for main and has not cleared its performance gate. The older JSON
+is not accepted for main and has not cleared its performance gate. The subsequent
+format-3 experiment passes runtime/SQL tests but still regresses final matched
+write medians 33%/44%; fewer durability barriers did not establish a throughput win.
+Neither experimental branch is approved for deployment. The older JSON
 experiment is not a receiver for these TARs. Tests exercise both commit gates,
 process-exit and failed-sync recovery, history exhaustion and SQL/file/KV recovery
 after source-root deletion; these do not certify physical power loss or remote hosts.

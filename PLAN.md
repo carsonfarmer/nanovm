@@ -603,6 +603,23 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 
 ## W-9 contract and bounded proof (2026-11-08)
 
+**Single-decision experiment (2026-11-09), not accepted:** format 3 binds each
+capture-mode undo log to its next sequence before the first guest mutation. After
+syncing live changes and the immutable archive, publish and sync the output name;
+that is the commit decision. Removing staging and undo is then cleanup. Recovery
+must validate and sync an observed published version before discarding undo; with
+no publication it discards staging before rollback. Staging without a log cannot
+publish anything new. Every new log name still syncs its directory before mutation,
+persisting previous cleanup. Default-mode log-deletion acceptance stays unchanged.
+Formats 1/2 are refused rather than interpreting their different decision rules.
+The full runtime and 11-test SQL suites pass; 33 journal tests cover the final
+boundary fixtures and three new mutations fail. Review found no concrete blocker
+within local trusted-root assumptions (Opus routing unattested). Nevertheless,
+three final benchmark pairs regress median write throughput 33% concurrent / 44%
+serial with capture enabled. **Reject for adoption**, preserving the experiment
+on `w9-single-decision`; main stays unchanged. Reduced syscall counts alone do not
+clear performance. This is not remote acceptance or authority policy.
+
 **Performance rejection:** the owner rejects the measured roughly 50% enabled write
 throughput loss; calling capture opt-in does not clear this gate. Amp is profiling
 sync, history-scan/hash and full-copy cost on `w9-efficient-capture`. Preserve the
@@ -729,6 +746,20 @@ cannot prevent two restored roots from accepting divergent version N+1. Network
 latency is a separate cost from avoidable local full-copy/barrier overhead; report
 both rather than using remote latency to excuse the rejected capture cost.
 W-10 must fence storage commits, not merely check a lease before instantiation.
+
+**Proposed next decision, not approved:** use one designated off-node durable
+receipt/fencing authority for the initial original-node-loss contract, or require
+a replicated quorum now. The former is smaller but makes authority availability
+a prerequisite for successful writes and does not tolerate losing both copies.
+Remote acceptance should not require another permanent, independently synced local
+archive merely because the research fixture has one. Immutable final-byte capture
+remains useful; do not equate this with deleting durability barriers from current code.
+Timeouts and lost replies must leave the writer unable to publish success until the
+authority resolves the attempt. A negative lookup cannot authorize rollback while
+an old commit can still arrive; resolution needs terminal rejection or fencing.
+Manually authorized promotion must revoke the old writer at the commit authority
+before the new root can accept writes. These are protocol requirements, not a
+deployed receiver, a selected backend or permission to provision infrastructure.
 
 ## Follow-ups
 

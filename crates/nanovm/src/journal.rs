@@ -10,10 +10,11 @@
 //! - "recreate this", for a removed directory.
 //!
 //! Writes then happen in place, so open files stay valid. Committing syncs
-//! what changed and deletes the log. Rolling back replays it backwards, which
-//! is what [`recover`] does when an instance starts, so a failed request (its
-//! instance is restarted) and a crash take the same path. Recovery drops each
-//! record once undone, so a crash during it resumes where it stopped.
+//! what changed, then durably deletes the log or publishes its bound capture
+//! version. [`recover`] resolves that decision when an instance starts; absent
+//! acceptance it replays undo backwards. Failed requests and crashes take the
+//! same recovery path. Each undone record is dropped durably, so interrupted
+//! rollback resumes where it stopped.
 //!
 //! The log lives beside the volume, at `<objects>/~journal/<object>`, which
 //! no object id can name and no guest path reaches. Paths in it are relative
@@ -48,6 +49,8 @@ enum Undo {
     Renamed(PathBuf, PathBuf),
     /// A rename that failed, durably cancelled before paths can be reused.
     Cancelled,
+    /// Publication of this version, rather than log deletion, commits this log.
+    Capture(u64),
 }
 
 struct Saved {
@@ -183,7 +186,12 @@ impl Journal {
     /// Appends `undo` and syncs it, before the change it undoes is made.
     fn record(&mut self, undo: Undo) -> std::io::Result<()> {
         self.check()?;
-        let rec = encode(&undo);
+        let mut rec = encode(&undo);
+        if self.log.is_none() && let Some(capture) = &self.capture {
+            let mut prefix = encode(&Undo::Capture(capture.next_sequence()?));
+            prefix.extend(rec);
+            rec = prefix;
+        }
         self.charge(rec.len() as u64, 0)?;
         // An I/O failure may leave a complete or partial record. Do not
         // permit more mutations or a commit until recovery has run.
@@ -354,9 +362,11 @@ impl Journal {
     /// directory (removed with [`Self::removing_dir`]) is.
     pub fn renaming(&mut self, from: &Path, to: &Path) -> std::io::Result<u64> {
         let (from, to) = (self.rel(from), self.rel(to));
-        let at = self.held.0;
-        self.record(Undo::Renamed(from.clone(), to.clone()))?;
-        Ok(at)
+        let undo = Undo::Renamed(from, to);
+        let length = encode(&undo).len() as u64;
+        self.record(undo)?;
+        // The first record may have a capture-decision prefix.
+        Ok(self.held.0 - length)
     }
 
     /// Only a successful syscall moves the dirty paths to their new names.
@@ -449,11 +459,14 @@ impl Journal {
         }
         self.prepare_capture()?;
         drop(log);
-        // Deleting the log is the commit.
-        std::fs::remove_file(self.dir.join(LOG))?;
-        sync(&self.dir)?;
         if let Some(capture) = &self.capture {
+            // The immutable version is this transaction's durable decision.
             capture.publish(&self.dir)?;
+            std::fs::remove_file(self.dir.join(LOG))?;
+        } else {
+            // Without capture, deleting the undo log remains the decision.
+            std::fs::remove_file(self.dir.join(LOG))?;
+            sync(&self.dir)?;
         }
         self.obj.uncharge(t0.elapsed());
         clear(&self.dir)?;
@@ -465,7 +478,7 @@ impl Journal {
     }
 }
 
-/// Rolls back the log in `dir` if there is one, then empties `dir`. Failure
+/// Resolves capture acceptance or rolls back the log, then empties `dir`. Failure
 /// leaves the current undo intact and refuses to start the object. Only
 /// already-applied or never-performed operations may be skipped.
 fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<()> {
@@ -477,12 +490,18 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<()> {
         }
         Err(e) => return Err(e),
     };
+    let records = decode(&log);
+    if let Some((_, Undo::Capture(sequence))) = records.first()
+        && committed::accepted(&committed::directory(base, dir), obj, *sequence)?
+    {
+        return clear(dir);
+    }
     committed::discard(dir)?;
     // Each record is dropped from the log once undone and synced, so a crash
     // here resumes where it stopped; the undo it was in may run twice, which
     // each tolerates. A record cut short by a crash was never acted on.
     let file = File::options().write(true).open(dir.join(LOG))?;
-    for (at, undo) in decode(&log).into_iter().rev() {
+    for (at, undo) in records.into_iter().rev() {
         let abs = |p: &PathBuf| base.join(p);
         let open = |p: &PathBuf| File::options().write(true).open(abs(p));
         match &undo {
@@ -510,12 +529,12 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<()> {
                     std::fs::rename(abs(to), abs(from))
                 }
             }
-            Undo::Cancelled => Ok(()),
+            Undo::Cancelled | Undo::Capture(_) => Ok(()),
         }?;
         let p = match &undo {
             Undo::Size(p, _) | Undo::Bytes(p, ..) => p.as_path(),
             Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
-            Undo::Cancelled => Path::new(""),
+            Undo::Cancelled | Undo::Capture(_) => Path::new(""),
         };
         sync_if_there(&base.join(p))?;
         if let Undo::Renamed(_, to) = &undo {
@@ -550,6 +569,7 @@ fn encode(undo: &Undo) -> Vec<u8> {
         Undo::Created(a) => (2, vec![p(a)]),
         Undo::RemovedDir(a) => (3, vec![p(a)]),
         Undo::Renamed(a, b) => (4, vec![p(a), p(b)]),
+        Undo::Capture(sequence) => (6, vec![sequence.to_le_bytes().to_vec()]),
         Undo::Cancelled => unreachable!("only made by cancelling a rename's tag"),
     };
     put(&[tag]);
@@ -586,6 +606,7 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
                 path(log)?;
                 Undo::Cancelled
             }
+            [6] => Undo::Capture(num(log)?),
             _ => return None,
         })
     };
@@ -774,21 +795,31 @@ mod tests {
         let cap = CaptureConfig::default();
         let mut j = captured(&v, &cap).unwrap();
         write(&mut j, &v, "a", 2, b"accepted");
+        let slot = j.remove(&v.join("a"), 11).unwrap();
+        let retained = std::fs::read(&slot).unwrap();
+        let log = j.dir.join(LOG);
+        let undo = std::fs::read(&log).unwrap();
         j.commit().unwrap();
         let before = tree(&v);
         let out = committed::directory(&j.base, &j.dir);
         let staged = j.dir.join("capture");
         drop(j);
-        // Explicitly restore the name that an unsynced cleanup might leave.
+        // Restore names that unsynced or partially completed cleanup might leave.
         // This is an ordering fixture, not a power-loss simulation.
-        for _ in 0..2 {
-            std::fs::hard_link(out.join("00000000000000000001.tar"), &staged).unwrap();
+        for (restore_log, restore_staging) in [(false, true), (true, false), (true, true)] {
+            if restore_log {
+                std::fs::write(&log, &undo).unwrap();
+                std::fs::write(&slot, &retained).unwrap();
+            }
+            if restore_staging {
+                std::fs::hard_link(out.join("00000000000000000001.tar"), &staged).unwrap();
+            }
             drop(captured(&v, &cap).unwrap());
             assert_eq!(tree(&v), before);
             assert_eq!(archive_tree(&v, 1), before);
         }
         let mut j = captured(&v, &cap).unwrap();
-        write(&mut j, &v, "a", 0, b"next");
+        write(&mut j, &v, "f", 0, b"next");
         j.commit().unwrap();
         assert_eq!(archive_tree(&v, 2), tree(&v));
         assert_eq!(archive_tree(&v, 1), before);
@@ -798,7 +829,7 @@ mod tests {
 
     #[test]
     fn capture_rejects_an_unsupported_history_or_staged_format() {
-        for staged in [false, true] {
+        for (format, staged) in [(1, false), (1, true), (2, false), (2, true)] {
             let v = volume();
             let cap = CaptureConfig::default();
             let mut j = captured(&v, &cap).unwrap();
@@ -808,7 +839,9 @@ mod tests {
             let path = if staged { j.dir.join("capture") }
                 else { committed::directory(&j.base, &j.dir).join("00000000000000000001.tar") };
             drop(j);
-            let metadata = br#"{"format":1,"app":"app","object":"o","sequence":1,"parent":""}"#;
+            let metadata = serde_json::to_vec(&serde_json::json!({
+                "format": format, "app": "app", "object": "o", "sequence": 1, "parent": ""
+            })).unwrap();
             let mut archive = tar::Builder::new(File::create(path).unwrap());
             let mut header = tar::Header::new_gnu();
             header.set_size(metadata.len() as u64);
@@ -862,7 +895,7 @@ mod tests {
                 let result = command.output().unwrap();
                 assert!(result.status.success() || result.status.code() == Some(77),
                     "cut {cut}: {}", String::from_utf8_lossy(&result.stderr));
-                let committed = !rollback && !v.parent().unwrap().join("~journal/o/log").exists();
+                let committed = !rollback && out.join("00000000000000000001.tar").exists();
                 for _ in 0..2 {
                     drop(captured(&v, &cap).unwrap());
                     assert_eq!(tree(&v), if committed { &changed } else { &before }.clone(), "cut {cut}");
@@ -882,27 +915,68 @@ mod tests {
     }
 
     #[test]
-    fn capture_recovery_requires_a_durable_decision_before_publication() {
+    fn capture_recovery_requires_durable_publication_before_discarding_undo() {
         let cap = CaptureConfig::default();
         let v = volume();
         let mut j = captured(&v, &cap).unwrap();
         change(&mut j, &v);
         let out = committed::directory(&j.base, &j.dir);
         j.prepare_capture().unwrap();
-        // Model an unlink visible to a new process, without a completed sync.
-        std::fs::remove_file(j.dir.join(LOG)).unwrap();
+        // Model publication visible to a new process without a completed sync.
+        std::fs::hard_link(j.dir.join("capture"), out.join("00000000000000000001.tar")).unwrap();
+        let log = j.dir.join(LOG);
         drop(j);
         for _ in 0..2 {
             FAIL_SYNC_AFTER.set(Some(0));
             let result = captured(&v, &cap);
             FAIL_SYNC_AFTER.set(None);
             assert!(result.is_err());
-            assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0,
-                "must not publish before the decision directory can be synced");
+            assert!(log.exists(), "must retain undo until publication is durable");
         }
         drop(captured(&v, &cap).unwrap());
         assert_eq!(archive_tree(&v, 1), tree(&v));
         std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn capture_recovery_refuses_unbound_or_invalid_publication() {
+        for case in ["no-log", "parent", "sequence", "identity"] {
+            let v = volume();
+            let cap = CaptureConfig::default();
+            let mut j = captured(&v, &cap).unwrap();
+            change(&mut j, &v);
+            j.prepare_capture().unwrap();
+            let changed = tree(&v);
+            let out = committed::directory(&j.base, &j.dir);
+            let log = j.dir.join(LOG);
+            let undo = std::fs::read(&log).unwrap();
+            if case == "no-log" {
+                std::fs::remove_file(&log).unwrap();
+            } else {
+                let metadata = serde_json::to_vec(&serde_json::json!({
+                    "format": 3, "app": if case == "identity" { "other" } else { "app" },
+                    "object": "o", "sequence": if case == "sequence" { 2 } else { 1 },
+                    "parent": if case == "parent" { "wrong" } else { "" }
+                })).unwrap();
+                let mut archive = tar::Builder::new(File::create(out.join("00000000000000000001.tar")).unwrap());
+                let mut header = tar::Header::new_gnu();
+                header.set_size(metadata.len() as u64);
+                header.set_mode(0o600);
+                archive.append_data(&mut header, "nanovm.json", &metadata[..]).unwrap();
+                drop(archive.into_inner().unwrap());
+            }
+            drop(j);
+            for _ in 0..2 {
+                assert_eq!(captured(&v, &cap).err().unwrap().kind(), ErrorKind::InvalidData, "{case}");
+                assert_eq!(tree(&v), changed, "{case}: refused recovery must not undo accepted state");
+                if case == "no-log" {
+                    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+                } else {
+                    assert_eq!(std::fs::read(&log).unwrap(), undo);
+                }
+            }
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -944,8 +1018,8 @@ mod tests {
             let result = j.commit();
             FAIL_SYNC_AFTER.with(|c| c.set(None));
             if result.is_err() { assert!(j.commit().is_err(), "failed commit must not reuse an advanced capture cache"); }
-            let committed = !j.dir.join(LOG).exists();
             let out = committed::directory(&j.base, &j.dir);
+            let committed = out.join("00000000000000000002.tar").exists();
             drop(j);
             for _ in 0..2 {
                 drop(captured(&v, &cap).unwrap());
@@ -963,7 +1037,7 @@ mod tests {
             if committed { assert_eq!(archive_tree(&v, 2), changed, "older capture changed"); }
             std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
             if result.is_ok() {
-                assert!(after >= 8, "did not exercise capture/publication sync boundaries");
+                assert!(after >= 6, "did not exercise capture/publication sync boundaries");
                 println!("capture commit: {after} sync-error cuts preserve state/version agreement");
                 return;
             }
@@ -1367,6 +1441,46 @@ mod tests {
         assert_eq!(j.held.1, 0);
         drop(j);
         open(&v);
+        assert_eq!(tree(&v), before);
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn incomplete_capture_prefix_or_first_undo_never_commits() {
+        let prefix = encode(&Undo::Capture(1)).len();
+        for length in [prefix - 1, prefix, prefix + 1] {
+            let v = volume();
+            let before = tree(&v);
+            let cap = CaptureConfig::default();
+            let mut j = captured(&v, &cap).unwrap();
+            // Record, but never perform, the first mutation. A complete prefix
+            // alone is also the last step of an interrupted rollback.
+            j.renaming(&v.join("a"), &v.join("unused")).unwrap();
+            File::options().write(true).open(j.dir.join(LOG)).unwrap().set_len(length as u64).unwrap();
+            drop(j);
+            let mut j = captured(&v, &cap).unwrap();
+            assert_eq!(tree(&v), before);
+            write(&mut j, &v, "a", 0, b"next");
+            j.commit().unwrap();
+            assert_eq!(archive_tree(&v, 1), tree(&v));
+            drop(j);
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn captured_first_rename_can_be_cancelled_without_losing_rollback() {
+        let v = volume();
+        let cap = CaptureConfig::default();
+        let before = tree(&v);
+        let mut j = captured(&v, &cap).unwrap();
+        let (from, to) = (v.join("a"), v.join("missing/target"));
+        let at = j.renaming(&from, &to).unwrap();
+        assert!(std::fs::rename(&from, &to).is_err());
+        j.cancel_rename(at).unwrap();
+        write(&mut j, &v, "a", 0, b"discard me");
+        drop(j);
+        drop(captured(&v, &cap).unwrap());
         assert_eq!(tree(&v), before);
         std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
     }

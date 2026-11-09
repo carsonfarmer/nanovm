@@ -22,7 +22,7 @@ pub fn tree(history: &Path, sequence: u64, app: &str, object: &str) -> BTreeMap<
             if index == 0 {
                 assert_eq!(path, Path::new("nanovm.json"));
                 let version: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(version["format"], 2);
+                assert_eq!(version["format"], 3);
                 assert_eq!(version["app"], app);
                 assert_eq!(version["object"], object);
                 assert_eq!(version["sequence"], number);

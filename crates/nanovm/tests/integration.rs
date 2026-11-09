@@ -3486,7 +3486,8 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/finish");
         let journal = objects.join("~journal").join(&id).join("log");
         assert!(journal.exists(), "post-return write has an uncommitted journal");
-        if fail { std::fs::rename(&journal, journal.with_file_name("saved-log")).unwrap(); }
+        // Block preparation, before the capture-mode publication decision.
+        if fail { std::fs::create_dir(journal.with_file_name("capture")).unwrap(); }
         let mut queued = if !fail {
             let node = node.clone();
             let id = id.clone();
@@ -3510,13 +3511,13 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
             assert!(!objects.join(format!("~committed/{id}/{:020}.tar", 2)).exists());
         }
         assert_eq!(captured_files(&objects, &id, 1), first, "later work changed a published version");
-        if fail { std::fs::rename(journal.with_file_name("saved-log"), &journal).unwrap(); }
+        if fail { std::fs::remove_dir(journal.with_file_name("capture")).unwrap(); }
     }
     node.shutdown().await;
     let telemetry = node.telemetry.clone();
     drop(node);
-    // The injected failure happened before log deletion: restoring that
-    // undo record must retain the first commit and reject only later work.
+    // The injected failure happened before publication: the remaining undo
+    // must retain the first commit and reject only later work.
     // This is not a claim that every ambiguous commit failure rolls back.
     for _ in 0..2 {
         let reopened = Node::new(cfg.clone(), &app, &wasm, None).unwrap();

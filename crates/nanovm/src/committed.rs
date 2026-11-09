@@ -84,8 +84,14 @@ impl Capture {
         prepare(self, volume, journal, obj, changed)
     }
 
-    // Journal::commit has already synced the log deletion. Recovery cannot
-    // use this path: it must first establish its own decision barrier.
+    pub(super) fn next_sequence(&self) -> io::Result<u64> {
+        self.sequence
+            .checked_add(1)
+            .ok_or_else(|| invalid("capture sequence overflow"))
+    }
+
+    // Publication is the decision. The undo log identifies this sequence and
+    // stays available until the output directory barrier has succeeded.
     pub(super) fn publish(&self, journal: &Path) -> io::Result<()> {
         // This activation prepared the version; only recovery needs to reread
         // metadata and validate an interrupted publication against history.
@@ -216,7 +222,7 @@ fn prepare(
         return Err(ErrorKind::StorageFull.into());
     }
     let version = Version {
-        format: 2,
+        format: 3,
         app: obj.app.to_string(),
         object: obj.id.to_string(),
         sequence: capture
@@ -300,7 +306,6 @@ fn prepare(
     }
     let writer = archive.into_inner()?;
     sync(&staged)?;
-    sync(journal)?;
     // Journal poisoning prevents reuse if publication later fails. Reopening
     // derives these caches from the recovered immutable history, never a cursor.
     capture.sequence = version.sequence;
@@ -322,7 +327,7 @@ pub(super) fn discard(journal: &Path) -> io::Result<()> {
     sync(journal)
 }
 
-// Called only after the log's deletion is durable, or on recovery without a log.
+// Without an undo log, staging can only be cleanup from an accepted version.
 pub(super) fn finish(journal: &Path, out: &Path, obj: &ObjShared) -> io::Result<()> {
     let staged = journal.join(STAGED);
     let file = match File::open(&staged) {
@@ -330,10 +335,11 @@ pub(super) fn finish(journal: &Path, out: &Path, obj: &ObjShared) -> io::Result<
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
-    // Recovery may observe a log unlink whose directory sync never completed.
-    // Establish that decision before making any capture visible to a receiver.
-    sync(journal)?;
-    publish(file, journal, out, obj)
+    let version = read_version(file, obj)?;
+    if !accepted(out, obj, version.sequence)? || digest(&staged)? != digest(&out.join(filename(version.sequence)))? {
+        return Err(invalid("uncommitted capture without undo log"));
+    }
+    fs::remove_file(staged)
 }
 
 fn read_version(file: File, obj: &ObjShared) -> io::Result<Version> {
@@ -346,37 +352,30 @@ fn read_version(file: File, obj: &ObjShared) -> io::Result<Version> {
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
     let version: Version = serde_json::from_slice(&bytes)?;
-    if version.format != 2 || version.app != *obj.app || version.object != *obj.id || version.sequence == 0 {
+    if version.format != 3 || version.app != *obj.app || version.object != *obj.id || version.sequence == 0 {
         return Err(invalid("wrong capture identity"));
     }
     Ok(version)
 }
 
-fn publish(file: File, journal: &Path, out: &Path, obj: &ObjShared) -> io::Result<()> {
-    let staged = journal.join(STAGED);
+pub(super) fn accepted(out: &Path, obj: &ObjShared, sequence: u64) -> io::Result<bool> {
+    let file = match File::open(out.join(filename(sequence))) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
     let version = read_version(file, obj)?;
     let (last, _) = head(out)?;
-    let target = out.join(filename(version.sequence));
-    if version.sequence == last {
-        if digest(&staged)? != digest(&target)? {
-            return Err(invalid("conflicting committed version"));
-        }
+    let parent = if sequence == 1 {
+        String::new()
     } else {
-        let parent = if last == 0 {
-            String::new()
-        } else {
-            digest(&out.join(filename(last)))?
-        };
-        if last.checked_add(1) != Some(version.sequence) || version.parent != parent {
-            return Err(invalid("out-of-order committed version"));
-        }
-        // Keep the durable staged name until the destination name is durable.
-        // A rename could lose the only recoverable name between directory syncs.
-        fs::hard_link(&staged, &target)?;
+        digest(&out.join(filename(sequence - 1)))?
+    };
+    if sequence != last || version.sequence != sequence || version.parent != parent {
+        return Err(invalid("out-of-order committed version"));
     }
+    // A visible link is not yet a durable decision. Never discard the undo
+    // log or admit another request until this barrier succeeds, even on retry.
     sync(out)?;
-    // The output name is durable. A resurrected staging name is now an
-    // idempotent publication retry, not a lost accepted version. The next
-    // journal creation/staging barrier persists cleanup before another commit.
-    fs::remove_file(&staged)
+    Ok(true)
 }
