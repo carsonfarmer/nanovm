@@ -29,7 +29,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
-use crate::object::ObjShared;
+use crate::{committed, config::CaptureConfig, object::ObjShared};
 
 const LOG: &str = "log";
 /// Overwritten bytes are kept in records of at most this many.
@@ -75,6 +75,7 @@ pub struct Journal {
     /// Bytes the log holds, and the removed files; each may reach `max`.
     held: (u64, u64),
     max: u64,
+    capture: Option<CaptureConfig>,
     poisoned: bool,
     /// Waits for the disk aren't charged to its CPU budget.
     obj: Arc<ObjShared>,
@@ -84,10 +85,13 @@ impl Journal {
     /// The journal of `volume` (an absolute path without symlinks), whose
     /// log and removed files may each hold `max` bytes, after rolling back
     /// what a previous instance left uncommitted.
-    pub fn open(volume: &Path, max: u64, obj: Arc<ObjShared>) -> std::io::Result<Journal> {
+    pub fn open(volume: &Path, max: u64, obj: Arc<ObjShared>, capture: Option<&CaptureConfig>) -> std::io::Result<Journal> {
         let base = volume.parent().expect("a volume has a parent").to_path_buf();
         let dir = base.join("~journal").join(volume.file_name().expect("a volume has a name"));
-        recover(&base, &dir)?;
+        recover(&base, &dir, &obj)?;
+        if capture.is_none() && committed::directory(&base, &dir).try_exists()? {
+            return Err(std::io::Error::other("committed history requires capture to remain enabled"));
+        }
         let md = std::fs::metadata(volume)?;
         Ok(Journal {
             base,
@@ -102,6 +106,7 @@ impl Journal {
             slots: 0,
             held: (0, 0),
             max,
+            capture: capture.cloned(),
             poisoned: false,
             obj,
         })
@@ -413,10 +418,17 @@ impl Journal {
         for p in self.touched.drain() {
             sync_if_there(&self.base.join(p))?;
         }
+        let out = committed::directory(&self.base, &self.dir);
+        if let Some(cap) = &self.capture {
+            committed::prepare(&self.volume, &self.dir, &out, &self.obj, cap)?;
+        }
         drop(log);
         // Deleting the log is the commit.
         std::fs::remove_file(self.dir.join(LOG))?;
         sync(&self.dir)?;
+        if self.capture.is_some() {
+            committed::finish(&self.dir, &out, &self.obj)?;
+        }
         self.obj.uncharge(t0.elapsed());
         clear(&self.dir)?;
         self.sized.clear();
@@ -430,12 +442,16 @@ impl Journal {
 /// Rolls back the log in `dir` if there is one, then empties `dir`. Failure
 /// leaves the current undo intact and refuses to start the object. Only
 /// already-applied or never-performed operations may be skipped.
-fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
+fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<()> {
     let log = match std::fs::read(dir.join(LOG)) {
         Ok(log) => log,
-        Err(e) if e.kind() == ErrorKind::NotFound => return clear(dir),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            committed::finish(dir, &committed::directory(base, dir), obj)?;
+            return clear(dir);
+        }
         Err(e) => return Err(e),
     };
+    committed::discard(dir)?;
     // Each record is dropped from the log once undone and synced, so a crash
     // here resumes where it stopped; the undo it was in may run twice, which
     // each tolerates. A record cut short by a crash was never acted on.
@@ -581,7 +597,7 @@ fn clear(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Syncs a file or a directory.
-fn sync(p: &Path) -> std::io::Result<()> {
+pub(crate) fn sync(p: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     tests::sync_point()?;
     File::open(p)?.sync_all()
@@ -660,11 +676,229 @@ mod tests {
     }
 
     fn reopen(v: &Path, max: u64) -> std::io::Result<Journal> {
-        Journal::open(v, max, Arc::new(ObjShared::new("app".into(), "o")))
+        Journal::open(v, max, Arc::new(ObjShared::new("app".into(), "o")), None)
     }
 
     fn open(v: &Path) -> Journal {
         reopen(v, 1 << 30).unwrap()
+    }
+
+    fn captured(v: &Path, cap: &CaptureConfig) -> std::io::Result<Journal> {
+        Journal::open(v, 1 << 30, Arc::new(ObjShared::new("app".into(), "o")), Some(cap))
+    }
+
+    fn archive_tree(v: &Path, sequence: u64) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let base = v.parent().unwrap();
+        let dest = base.join(format!("restored-{sequence}"));
+        let _ = std::fs::remove_dir_all(&dest);
+        tar::Archive::new(File::open(base.join(format!("~committed/o/{sequence:020}.tar"))).unwrap())
+            .unpack(&dest).unwrap();
+        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(dest.join("nanovm.json")).unwrap()).unwrap();
+        assert_eq!(metadata["app"], "app");
+        assert_eq!(metadata["object"], "o");
+        assert_eq!(metadata["sequence"], sequence);
+        tree(&dest.join("data"))
+    }
+
+    #[test]
+    fn capture_process_cuts() {
+        let cap = CaptureConfig::default();
+        // Re-enter only this test in a fresh process. Exit bypasses every Drop;
+        // these are process-loss cuts, not a simulation of power loss.
+        if let Ok(v) = std::env::var("NANOVM_CAPTURE_CUT_ROOT") {
+            let v = Path::new(&v);
+            let cut = std::env::var("NANOVM_CAPTURE_CUT").unwrap().parse().unwrap();
+            if std::env::var_os("NANOVM_CAPTURE_ROLLBACK").is_some() {
+                EXIT_SYNC_AFTER.set(Some(cut));
+                drop(captured(v, &cap).unwrap());
+            } else {
+                let mut j = captured(v, &cap).unwrap();
+                change(&mut j, v);
+                EXIT_SYNC_AFTER.set(Some(cut));
+                j.commit().unwrap();
+            }
+            EXIT_SYNC_AFTER.set(None);
+            return;
+        }
+        for rollback in [false, true] {
+            let mut finished = false;
+            for cut in 0..128 {
+                let v = volume();
+                let before = tree(&v);
+                let mut j = captured(&v, &cap).unwrap();
+                change(&mut j, &v);
+                let changed = tree(&v);
+                let out = committed::directory(&j.base, &j.dir);
+                if rollback {
+                    committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+                }
+                drop(j);
+                if !rollback { drop(captured(&v, &cap).unwrap()); }
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command.args(["--exact", "journal::tests::capture_process_cuts", "--nocapture"])
+                    .env("NANOVM_CAPTURE_CUT_ROOT", &v).env("NANOVM_CAPTURE_CUT", cut.to_string());
+                if rollback { command.env("NANOVM_CAPTURE_ROLLBACK", "1"); }
+                let result = command.output().unwrap();
+                assert!(result.status.success() || result.status.code() == Some(77),
+                    "cut {cut}: {}", String::from_utf8_lossy(&result.stderr));
+                let committed = !rollback && !v.parent().unwrap().join("~journal/o/log").exists();
+                for _ in 0..2 {
+                    drop(captured(&v, &cap).unwrap());
+                    assert_eq!(tree(&v), if committed { &changed } else { &before }.clone(), "cut {cut}");
+                    assert_eq!(std::fs::read_dir(&out).map(|d| d.count()).unwrap_or(0), usize::from(committed));
+                    if committed { assert_eq!(archive_tree(&v, 1), changed); }
+                }
+                std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+                if result.status.success() {
+                    assert!(cut >= 10, "did not reach capture boundaries");
+                    println!("capture process loss: rollback={rollback}, {cut} abrupt exits recovered exactly");
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "process cut loop did not finish");
+        }
+    }
+
+    #[test]
+    fn capture_recovery_requires_a_durable_decision_before_publication() {
+        let cap = CaptureConfig::default();
+        let v = volume();
+        let mut j = captured(&v, &cap).unwrap();
+        change(&mut j, &v);
+        let out = committed::directory(&j.base, &j.dir);
+        committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+        // Model an unlink visible to a new process, without a completed sync.
+        std::fs::remove_file(j.dir.join(LOG)).unwrap();
+        drop(j);
+        for _ in 0..2 {
+            FAIL_SYNC_AFTER.set(Some(0));
+            let result = captured(&v, &cap);
+            FAIL_SYNC_AFTER.set(None);
+            assert!(result.is_err());
+            assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0,
+                "must not publish before the decision directory can be synced");
+        }
+        drop(captured(&v, &cap).unwrap());
+        assert_eq!(archive_tree(&v, 1), tree(&v));
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn capture_recovery_requires_durable_discard_before_undo() {
+        let cap = CaptureConfig::default();
+        let v = volume();
+        let before = tree(&v);
+        let mut j = captured(&v, &cap).unwrap();
+        change(&mut j, &v);
+        let changed = tree(&v);
+        let out = committed::directory(&j.base, &j.dir);
+        committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+        drop(j);
+        for _ in 0..2 {
+            FAIL_SYNC_AFTER.set(Some(0));
+            let result = captured(&v, &cap);
+            FAIL_SYNC_AFTER.set(None);
+            assert!(result.is_err());
+            assert_eq!(tree(&v), changed, "must persist discard before starting undo, including retries");
+        }
+        drop(captured(&v, &cap).unwrap());
+        assert_eq!(tree(&v), before);
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn capture_and_local_commit_recover_as_one_decision() {
+        let cap = CaptureConfig::default();
+        for after in 0..64 {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = captured(&v, &cap).unwrap();
+            change(&mut j, &v);
+            let changed = tree(&v);
+            FAIL_SYNC_AFTER.with(|c| c.set(Some(after)));
+            let result = j.commit();
+            FAIL_SYNC_AFTER.with(|c| c.set(None));
+            let committed = !j.dir.join(LOG).exists();
+            let out = committed::directory(&j.base, &j.dir);
+            drop(j);
+            for _ in 0..2 {
+                drop(captured(&v, &cap).unwrap());
+                assert_eq!(tree(&v), if committed { changed.clone() } else { before.clone() }, "cut {after}");
+                let count = std::fs::read_dir(&out).map(|d| d.count()).unwrap_or(0);
+                assert_eq!(count, usize::from(committed), "cut {after}: state/capture diverged");
+                if committed { assert_eq!(archive_tree(&v, 1), changed, "cut {after}"); }
+            }
+            let mut next = captured(&v, &cap).unwrap();
+            next.creating(&v.join("next")).unwrap();
+            std::fs::write(v.join("next"), "next version").unwrap();
+            next.commit().unwrap();
+            assert_eq!(archive_tree(&v, if committed { 2 } else { 1 }), tree(&v));
+            if committed { assert_eq!(archive_tree(&v, 1), changed, "older capture changed"); }
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+            if result.is_ok() {
+                assert!(after >= 10, "did not exercise capture/publication sync boundaries");
+                println!("capture commit: {after} sync-error cuts preserve state/version agreement");
+                return;
+            }
+        }
+        panic!("capture commit fault loop did not finish");
+    }
+
+    #[test]
+    fn rejected_capture_is_never_published_by_interrupted_recovery() {
+        let cap = CaptureConfig::default();
+        for after in 0..128 {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = captured(&v, &cap).unwrap();
+            change(&mut j, &v);
+            let out = committed::directory(&j.base, &j.dir);
+            committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+            drop(j); // Prepared, but the commit decision was never made.
+            FAIL_SYNC_AFTER.with(|c| c.set(Some(after)));
+            let result = captured(&v, &cap);
+            FAIL_SYNC_AFTER.with(|c| c.set(None));
+            let finished = result.is_ok();
+            drop(result);
+            for _ in 0..2 {
+                drop(captured(&v, &cap).unwrap());
+                assert_eq!(tree(&v), before, "recovery cut {after}");
+                assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "published rejected version at cut {after}");
+            }
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+            if finished {
+                assert!(after > 5);
+                println!("capture rollback: {after} recovery sync-error cuts exclude rejected versions");
+                return;
+            }
+        }
+        panic!("capture recovery fault loop did not finish");
+    }
+
+    #[test]
+    fn capture_caps_reject_without_discarding_accepted_history() {
+        for byte_limit in [false, true] {
+            let v = volume();
+            let cap = CaptureConfig { max_mb: 1, max_versions: if byte_limit { 16 } else { 1 } };
+            if byte_limit { std::fs::write(v.join("large"), vec![7; 600_000]).unwrap(); }
+            let mut j = captured(&v, &cap).unwrap();
+            write(&mut j, &v, "a", 0, b"accepted");
+            j.commit().unwrap();
+            let accepted = tree(&v);
+            write(&mut j, &v, "a", 0, b"rejected");
+            assert_eq!(j.commit().unwrap_err().kind(), ErrorKind::StorageFull);
+            assert!(j.commit().is_err(), "failed capture must poison commit retries");
+            drop(j);
+            let mut j = captured(&v, &cap).unwrap();
+            assert_eq!(tree(&v), accepted);
+            assert_eq!(archive_tree(&v, 1), accepted);
+            j.commit().unwrap(); // Read-only acceptance does not consume history.
+            drop(j);
+            assert!(reopen(&v, 1 << 30).is_err(), "disabling capture must not create silent gaps");
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+        }
     }
 
     /// Writes as the filesystem host does: journal first, then the write.
@@ -716,9 +950,14 @@ mod tests {
         /// Undos recovery may apply before a simulated crash.
         static CRASH_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
         static FAIL_SYNC_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+        static EXIT_SYNC_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     }
 
     pub(super) fn sync_point() -> std::io::Result<()> {
+        EXIT_SYNC_AFTER.with(|c| match c.get() {
+            Some(0) => std::process::exit(77),
+            n => c.set(n.map(|n| n - 1)),
+        });
         FAIL_SYNC_AFTER.with(|c| match c.get() {
             Some(0) => Err(std::io::Error::from_raw_os_error(libc::EIO)),
             n => Ok(c.set(n.map(|n| n - 1))),
