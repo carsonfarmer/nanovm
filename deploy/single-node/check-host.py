@@ -125,9 +125,9 @@ def check(cfg_path, nofile=None):
         if fstype == "tmpfs":
             warnings.append("data_dir on tmpfs: nothing survives a reboot")
         if fstype == "btrfs":
-            warnings.append("btrfs had the lowest concurrent durable-write rate measured (experiments/fs-matrix)")
+            warnings.append("btrfs held at 39-46 durable writes/s at 64 concurrent in every measured round (experiments/fs-matrix)")
         if "discard" in opts.split(",") and fstype in ("ext4", "xfs"):
-            warnings.append("online discard cost 29-46% of concurrent durable writes measured; prefer fstrim.timer")
+            warnings.append("online discard lowered concurrent durable writes in 5 of 6 measured rounds (experiments/fs-matrix); prefer fstrim.timer")
 
     capture = raw.get("capture")
     history = data.is_dir() and any((data / "objects").glob("*/~committed/*"))
