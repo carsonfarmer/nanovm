@@ -148,6 +148,21 @@ async fn nanovm_run_listens_on_loopback_only() {
     assert!(!out.status.success() && stderr.contains("only on loopback"), "{stderr}");
 }
 
+/// A manifest that asks for more than `nanovm run` allows is told so, not
+/// silently cut down (a 4 MiB upload limit would otherwise be refused at
+/// 1 MiB with no hint why).
+#[tokio::test(flavor = "multi_thread")]
+async fn nanovm_run_says_when_it_lowers_a_limit() {
+    let data = data_dir("lowers_a_limit");
+    std::fs::write(data.join("nanovm.json"), r#"{"limits":{"max_request_body_kb":4096,"cpu_ms":50}}"#).unwrap();
+    let args = [guest("counter").into_os_string(), "--manifest".into(), data.join("nanovm.json").into(), "--data".into(), data.into()];
+    let mut run = start(&args.iter().map(|a| a.as_os_str()).collect::<Vec<_>>());
+    let line = run.line("max_request_body_kb").await;
+    assert!(line.contains("is 4096") && line.contains("at most 1024"), "{line}");
+    let addr = run.addr().await;
+    assert_eq!(post(addr, "/a/incr", &"x".repeat(2 << 20)).await.0, 413);
+}
+
 /// A component that imports `spin:key-value` without the provider composed
 /// in is refused with what to do about it, not served.
 #[tokio::test(flavor = "multi_thread")]

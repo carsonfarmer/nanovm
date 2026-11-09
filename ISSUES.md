@@ -341,6 +341,11 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** `kill_on_drop` sends SIGKILL without waiting; a `nanovm run` started on the same data before the old one has exited fails with "app storage is already owned or cannot be locked" and exits. Seen in 2 of ~16 runs of the shop example's test at load ~25.
 - **Status:** fixed on `ideas/examples` (42b2fc2 for the examples harness, fa88fe7 for `dev.rs`): kill, then wait for the process, then start.
 
+### N-602: `nanovm run` lowered a manifest's limits without saying so
+- **Where:** `main.rs` (`run`: `spec.limits.clamped(&cfg.limits)`)
+- **Scenario:** `nanovm run` caps every limit at its node's defaults (1 MiB request bodies, 200 ms CPU, 5 s deadlines). A manifest asking for `max_request_body_kb: 4096` got 1024, and a 3 MiB upload was refused with `413` (found by `examples/files`); nothing at startup said the manifest had been overridden.
+- **Status:** fixed on `ideas/examples`: `run` prints a line for each limit it lowers (`the manifest's max_request_body_kb is 4096; nanovm run allows at most 1024, so it is 1024 here`). `nanovm_run_says_when_it_lowers_a_limit` times out waiting for that line without it. Raising the caps (a flag, or the manifest's own limits up to a higher ceiling) is left open.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
