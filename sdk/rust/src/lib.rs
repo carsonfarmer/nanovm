@@ -2,8 +2,9 @@
 //! function from a [`Request`] to a [`Response`]. nanovm runs it as durable
 //! objects: the first segment of a URL, `/{object}/…`, names an object, and
 //! each object is one live instance serving one request at a time, with its
-//! own persistent volume ([`data`]), key-value store ([`kv`]) and WebSockets
-//! ([`ws`]). Its memory is lost when it is evicted; its volume is not.
+//! own persistent volume ([`data`]), key-value store ([`kv`]), SQLite
+//! database ([`sqlite`]) and WebSockets ([`ws`]). Its memory is lost when
+//! it is evicted; its volume is not.
 //!
 //! ```no_run
 //! use nanovm_sdk::{Request, Response, Result, kv};
@@ -20,14 +21,14 @@
 //! ```
 //!
 //! Build it with `tools/build-app.sh` (cargo, then `wac plug` of the
-//! key-value provider if the app uses [`kv`]) and serve it with
+//! key-value and SQLite providers the app uses) and serve it with
 //! `nanovm run app.wasm`.
 //!
-//! **Commits.** What a request changes in `/data` and the key-value store,
-//! and what it publishes to WebSockets, takes effect together and durably
-//! when it answers, whatever the status. Returning an [`Error`] (as `?` does)
-//! or panicking rolls all of it back, so a failed step never leaves half a
-//! change behind. Answer with a 4xx or 5xx only when what was done so far
+//! **Commits.** What a request changes in `/data`, the key-value store and
+//! the database, and what it publishes to WebSockets, takes effect together
+//! and durably when it answers, whatever the status. Returning an [`Error`]
+//! (as `?` does) or panicking rolls all of it back, so a failed step never
+//! leaves half a change behind. Answer with a 4xx or 5xx only when what was done so far
 //! should stand.
 
 use std::fmt;
@@ -41,6 +42,7 @@ pub mod config;
 pub mod fs;
 pub mod http;
 pub mod kv;
+pub mod sqlite;
 pub mod ws;
 
 pub use fs::{data, tmp};

@@ -67,13 +67,20 @@ no need for write-to-temp-then-rename.
 ## What's in it
 
 - `Request`: `method()`, `path()` (within the object), `query("q")`,
-  `query_or("n", 0)`, `header("h")`, `body()`, `text()`, `json()` (feature
-  `json`). `Response::text/html/json/bytes/new/not_found` with
+  `query_or("n", 0)`, `header("h")`, `cookie("c")`, `body()`, `text()`,
+  `json()` (feature `json`). `Response::text/html/json/bytes/new/not_found` with
   `.status()`, `.header()`, `.body()`.
 - `data()` and `tmp()`: `read` (an `Option`), `read_text`, `write`, `append`,
   `remove`, `open`.
 - `kv::get/get_text/set/delete/exists/increment/keys` on the store
   `default`; `kv::open(label)` for others.
+- `sqlite::query(sql, &[&a, &b])` (its `Rows`: `iter()`, `first()`,
+  `row.get::<T>("column")`, `json()`), `sqlite::execute` (rows changed) and
+  `last_insert_rowid`, on the object's own database. The request is the
+  transaction: `BEGIN`/`COMMIT` are refused, and each statement that writes
+  costs its own syncs, so write a batch in one statement (`json_each(?)`).
+  Building it needs `WASI_SDK_PATH` (SQLite is C);
+  [examples/leaderboard](../../examples/leaderboard) uses it.
 - `config::get(key)`: the manifest's `config` table.
 - `fetch(url).method(..).header(..).body(..).send()`: outbound HTTP to hosts
   in the manifest's `egress` list.
