@@ -950,3 +950,46 @@ async fn wiki_keeps_every_revision_and_refuses_lost_updates() {
     let next = app.send("PUT", "/w/pages/Home?author=ann", &[("if-match", "2")], "# Home\n").await;
     assert_eq!(next.json()["rev"], 3);
 }
+
+/// examples/notes: an FTS5 index per person, kept in step by the same
+/// statements that save notes; ranked, highlighted prefix search that
+/// treats query syntax as words; durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn notes_search_their_own_full_text_index() {
+    let mut app = App::start("notes", json!({})).await;
+    let add = async |user: &str, title: &str, body: &str| {
+        let r = app.post(format!("/{user}/notes"), json!({"title": title, "body": body}).to_string()).await;
+        assert_eq!(r.status, 201, "{r:?}");
+        r.json()["id"].as_i64().unwrap()
+    };
+    let soup = add("ann", "Soup", "Leek and potato soup: simmer the leeks slowly.").await;
+    let trip = add("ann", "Trip to Lisbon", "Book the train; pack light. Try the soup at the market.").await;
+    add("ann", "Taxes", "File by April.").await;
+    add("bob", "Soup", "Bob's own soup.").await;
+    let ids = |found: &Value| -> Vec<i64> { found.as_array().unwrap().iter().map(|n| n["id"].as_i64().unwrap()).collect() };
+
+    let found = app.get("/ann/search?q=soup").await.json();
+    assert_eq!(ids(&found), [soup, trip], "a title match ranks first");
+    assert!(found[1]["snippet"].as_str().unwrap().contains("[soup]"), "{found}");
+    assert_eq!(ids(&app.get("/ann/search?q=simmering%20leek").await.json()), [soup], "stems and prefixes, all words");
+    assert_eq!(ids(&app.get("/ann/search?q=lisb").await.json()), [trip]);
+    assert_eq!(app.get("/ann/search?q=%22NEAR(soup").await.status, 200, "query syntax is only words");
+    for bad in ["/ann/search", "/ann/search?q=%20%21"] {
+        assert_eq!(app.get(bad).await.status, 400, "{bad}");
+    }
+
+    // Edits and deletes keep the index in step.
+    let edit = json!({"title": "Trip to Porto", "body": "Book the train."}).to_string();
+    assert_eq!(app.send("PUT", format!("/ann/notes/{trip}"), &[], edit).await.status, 204);
+    assert_eq!(ids(&app.get("/ann/search?q=soup").await.json()), [soup]);
+    assert_eq!(app.send("DELETE", format!("/ann/notes/{soup}"), &[], "").await.status, 204);
+    assert_eq!(app.get("/ann/search?q=soup").await.json(), json!([]));
+    assert_eq!(app.get(format!("/ann/notes/{soup}")).await.status, 404);
+    assert_eq!(app.get("/ann/notes/x").await.status, 404);
+    assert_eq!(app.get("/bob/search?q=soup").await.json().as_array().unwrap().len(), 1, "bob's notes are his");
+
+    let porto = app.evicted(&format!("/ann/notes/{trip}")).await.json();
+    assert_eq!(porto["title"], "Trip to Porto");
+    let app = app.restart().await;
+    assert_eq!(ids(&app.get("/ann/search?q=porto%20train").await.json()), [trip]);
+}
