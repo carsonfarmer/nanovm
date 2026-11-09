@@ -1,4 +1,4 @@
-# examples: twenty apps on the SDK, each with an end-to-end test
+# examples: twenty-two apps on the SDK, each with an end-to-end test
 
 Branch `ideas/examples`, on `cf/onramp` (5884b38). IDEAS section A, built
 on `nanovm-sdk` (`sdk/rust`), each in `examples/<name>/` with a README (what
@@ -31,11 +31,15 @@ node.
 | [todos](../examples/todos) | A-23 | offline-first sync: field-level merges, reported conflicts, retries that apply nothing twice | 2.1 |
 | [webhooks](../examples/webhooks) | A-7 | HMAC-verified webhooks answered at once, relayed after the answer (`after`), retried with backoff; egress allowlist | 3.0 |
 | [gateway](../examples/gateway) | A-17 | per-user token quotas in front of a streaming API: reserve before streaming, refund after, so cut streams aren't free | 3.7 |
+| [feeds](../examples/feeds) | A-18 | a feed object as a shared cache: conditional GETs, items kept once; readers fan in through calls | 1.6 |
+| [oauth](../examples/oauth) | A-14 | GitHub sign-in: one-time state, token exchange over egress, cookies only the user's object accepts, `auth` vouching for sessions (W-602) | 0.6 |
 
-All twenty: 72 s in one run (`RUST_TEST_THREADS=1`, load average 11-16 on
-4 shared cores). Most tests start `nanovm run` itself; webhooks and gateway
-run on an in-process dev-mode node, because their targets are on loopback
-and `nanovm run`, like a production node, refuses private egress.
+The first twenty: 72 s in one run, 59 s in the full suite
+(`RUST_TEST_THREADS=1`, load average 11-17 on 4 shared cores). Most tests
+start `nanovm run` itself; webhooks, gateway, feeds and oauth run on an
+in-process dev-mode node (`Local` in the test file), because what they
+reach over egress is on loopback and `nanovm run`, like a production node,
+refuses private egress.
 
 ## Run them
 
@@ -112,12 +116,13 @@ bytes before and after the SQLite module, with no `spin:sqlite` import.
 
 - **A-21 counter in every language**: only Rust and JavaScript build WASIp3
   HTTP components with the installed tools (C needs `wit-bindgen`'s C
-  generator, not installed); the JavaScript runtime build was removed to
-  stay inside the disk budget.
-- **A-2 collaborative editor** (L), **A-9 pastebin with `syntect`**, **A-11
-  thumbnailer** (`image`): large dependencies and build times; not attempted.
-- **A-14 OAuth** and **A-18 feed aggregator**: need egress like webhooks and
-  gateway; the in-process harness (`Local`, `upstream`) is ready for them.
+  generator, not installed); the Rust one is `examples/hello`, the
+  JavaScript one `js/examples/counter.js`. A table of their overheads needs
+  the JavaScript runtime rebuilt (~220 MB) and a quiet machine; not done
+  within the disk budget.
+- **A-2 collaborative editor** (L, `yrs`), **A-9 pastebin** (`syntect`) and
+  **A-11 thumbnailer** (`image`): large dependencies, builds and disk; not
+  attempted.
 
 ## Pick list
 
