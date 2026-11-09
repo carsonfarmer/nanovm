@@ -34,3 +34,10 @@ reproduce the behaviour each runbook quotes.
 (`journal.rs`, `quota.rs:75`), 1 s failed-start memory (`RESTART_BACKOFF`),
 worker exit and last-words log lines, preflight messages, caches vs state
 under `data_dir`, deny-unknown-fields config, tag TTL and version floor.
+
+**After the base moved to `3dafe33` (W-9 local capture):** the runbooks now
+cover `~committed/` (never prune; never drop `[capture]` from a root with
+history; no rollback past capture support), capture's storage in sizing, and a
+full capture history (`commit-failed` "no storage space" on one object while the
+disk has room), each checked with `docs/ops/errors-check.sh` on a dev build of
+`3dafe33`.

@@ -12,9 +12,13 @@ Three facts every runbook leans on:
 - **Stopping is not graceful.** SIGTERM ends the supervisor; workers die with it
   and in-flight requests roll back, their clients unsure whether they committed.
   Close ingress at the TLS terminator first.
-- **Never delete anything under `objects/*/~journal/`.** A log there is a
-  request's undo record. The object recovers it on its next start; deleting it
-  can leave half a request's writes in place.
+- **Never delete anything under `objects/*/~journal/` or `objects/*/~committed/`.**
+  A log in `~journal` is a request's undo record: the object recovers it on its
+  next start, and deleting it can leave half a request's writes in place.
+  `~committed` is local capture's version history (`[capture]`, off by default):
+  don't prune it, and don't remove `[capture]` from a node that has history
+  (its objects then refuse to start: `committed history requires capture to
+  remain enabled`).
 - **Uids are data.** An app's uid is the owner of its `objects/<app>` directory.
   Keep `jail_uid_base`, run as root, and preserve numeric owners.
 
@@ -51,7 +55,9 @@ Three facts every runbook leans on:
    to each listed object through the proxy (`curl -H 'Host: <app host>'
    http://127.0.0.1:8443/<object>/`): instantiating it recovers the log. Stop
    again; the `find` must print nothing.
-3. Remove config keys the old version doesn't know. Restore the binary
+3. Remove config keys the old version doesn't know. A build from before local
+   capture can't read `[capture]` and doesn't know `~committed/`: on a root with
+   capture history, don't roll back past it. Restore the binary
    (`mv /usr/local/bin/nanovm.prev /usr/local/bin/nanovm`), start, check as in
    Upgrade step 4–5.
 
@@ -65,8 +71,8 @@ loses every write after the snapshot.
 
 [`scripts/backup.py`](../../scripts/backup.py) wraps restic; README "Backup and
 restore" has the full contract. With the node stopped it locks every app
-directory, backs up `objects/` (journals included; caches left out), and tags
-only a complete snapshot.
+directory, backs up `objects/` (journals and capture history included; caches
+left out), and tags only a complete snapshot.
 
 ```sh
 export RESTIC_REPOSITORY=/srv/backups/nanovm RESTIC_PASSWORD_FILE=/root/restic-pass   # off-node in practice
@@ -107,12 +113,18 @@ the failed KV write was gone.
 3. If that isn't enough: with the node stopped, `cache/` (compiled code) and
    `registry/` (downloaded apps) are caches: delete their contents and the node
    recompiles and refetches (and re-verifies) on demand. `tmp/` is per-instance
-   scratch. Never touch `objects/*/~journal/`.
+   scratch. Never touch `objects/*/~journal/` or `objects/*/~committed/`.
 4. Start; writes recover object by object. Read back an object that failed.
 5. Size for it: an object's quota counts logical bytes, and while a request runs
    its journal and replaced files can hold as much again (up to 3 × `disk_mb`
-   per busy object, plus metadata); quotas don't cap the total. Alert on
-   filesystem usage and on `error.type = commit-failed`.
+   per busy object, plus metadata); quotas don't cap the total. With `[capture]`,
+   each object's history adds up to `max_mb` (256 MiB by default) of full-volume
+   copies. Alert on filesystem usage and on `error.type = commit-failed`.
+
+A single object answering `commit-failed` with `no storage space` while the
+disk has room is a full capture history (`max_versions` or `max_mb`), not a
+full disk: raise the limits in `[capture]` and restart; nanovm never drops old
+versions to make room.
 
 ## Worker crash loop
 
