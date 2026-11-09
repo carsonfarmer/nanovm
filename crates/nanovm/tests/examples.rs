@@ -1035,3 +1035,41 @@ async fn analytics_rolls_events_up_per_day() {
     let app = app.restart().await;
     assert_eq!(app.get(format!("/blog/days.csv?from={yday}&to={yday}")).await.text(), format!("day,name,events,users\n{yday},view,2,2\n"));
 }
+
+/// examples/reminders: no alarms, so an external tick (or the client's own
+/// polling) delivers due reminders, each exactly once, pushed to the
+/// owner's sockets; pending reminders survive eviction and restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn reminders_fire_once_on_a_tick_or_a_poll() {
+    let mut app = App::start("reminders", json!({})).await;
+    let tick = async || app.post("/clock/tick", "").await.json()["fired"].as_i64().unwrap();
+    // Bob polls: what is due is his, once, and a tick doesn't fire it again.
+    let now = app.post("/bob/reminders", r#"{"text":"now","in_ms":0}"#).await;
+    assert_eq!(now.status, 201, "{now:?}");
+    let due = app.get("/bob/due").await.json();
+    assert_eq!((due.as_array().unwrap().len(), &due[0]["text"]), (1, &json!("now")));
+    assert_eq!(app.get("/bob/due").await.json(), json!([]));
+    assert_eq!(tick().await, 0, "bob's was polled already");
+
+    // The tick delivers ann's to her socket once it is due, and only once.
+    let mut ann_ws = app.open("/ann/ws").await.unwrap();
+    assert_eq!(app.post("/ann/reminders", r#"{"text":"tea","in_ms":300}"#).await.status, 201);
+    assert_eq!(app.post("/ann/reminders", r#"{"text":"later","in_ms":3600000}"#).await.status, 201);
+    assert_eq!(app.post("/ann/reminders", r#"{"text":""}"#).await.status, 400);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let ticks = futures::future::join_all([tick(), tick()]).await;
+    assert_eq!(ticks.iter().sum::<i64>(), 1, "two ticks at once fire it once: {ticks:?}");
+    assert_eq!(next(&mut ann_ws).await["text"], "tea");
+    let list = app.get("/ann/reminders").await.json();
+    let fired: Vec<_> = list.as_array().unwrap().iter().map(|r| (r["text"].as_str().unwrap(), r["fired"].as_bool().unwrap())).collect();
+    assert_eq!(fired, [("tea", true), ("later", false)]);
+    assert_eq!(app.post("/ann/fire?id=1", "").await.status, 204, "firing again does nothing");
+
+    // Pending reminders and the clock's schedule are durable.
+    assert_eq!(app.evicted("/ann/reminders").await.json()[1]["fired"], false);
+    let app = app.restart().await;
+    let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 - 1;
+    assert_eq!(app.post("/cy/reminders", json!({"text": "overdue", "at": at}).to_string()).await.status, 201);
+    assert_eq!(app.post("/clock/tick", "").await.json()["fired"], 1);
+    assert_eq!(app.get("/cy/reminders").await.json()[0]["fired"], true);
+}
