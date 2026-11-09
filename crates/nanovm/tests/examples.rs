@@ -1073,3 +1073,50 @@ async fn reminders_fire_once_on_a_tick_or_a_poll() {
     assert_eq!(app.post("/clock/tick", "").await.json()["fired"], 1);
     assert_eq!(app.get("/cy/reminders").await.json()[0]["fired"], true);
 }
+
+/// examples/todos: two devices sync offline edits through one object per
+/// person; edits to different fields merge, edits to the same field
+/// conflict (the first to sync wins and the other is told), retried syncs
+/// apply nothing twice, all durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn todos_sync_offline_edits_and_report_conflicts() {
+    let mut app = App::start("todos", json!({})).await;
+    let sync = async |since: u64, ops: Value| app.post("/ann/sync", json!({"since": since, "ops": ops}).to_string()).await.json();
+    let titles = |r: &Value| -> Vec<(String, String, bool)> {
+        r["changes"].as_array().unwrap().iter()
+            .map(|t| (t["id"].as_str().unwrap().into(), t["title"].as_str().unwrap().into(), t["done"].as_bool().unwrap())).collect()
+    };
+    let laptop = sync(0, json!([{"id": "l1", "todo": "t1", "base": 0, "title": "milk"}, {"id": "l2", "todo": "t2", "base": 0, "title": "eggs"}])).await;
+    assert_eq!((laptop["version"].as_u64(), laptop["conflicts"].as_array().unwrap().len()), (Some(2), 0));
+    let phone = sync(0, json!([])).await;
+    assert_eq!(titles(&phone), [("t1".into(), "milk".into(), false), ("t2".into(), "eggs".into(), false)]);
+
+    // Offline, both edit t1, different fields: they merge.
+    let laptop = sync(2, json!([{"id": "l3", "todo": "t1", "base": 2, "title": "oat milk"}])).await;
+    let phone = sync(2, json!([{"id": "p1", "todo": "t1", "base": 2, "done": true}])).await;
+    assert_eq!((titles(&phone), &phone["conflicts"]), (vec![("t1".into(), "oat milk".into(), true)], &json!([])));
+    // Both rename t2: the laptop synced first, so the phone is told.
+    sync(laptop["version"].as_u64().unwrap(), json!([{"id": "l4", "todo": "t2", "base": 2, "title": "eggs x12"}])).await;
+    let ops = json!([{"id": "p2", "todo": "t2", "base": 2, "title": "brown eggs"}]);
+    let phone = sync(4, ops.clone()).await;
+    assert_eq!(phone["conflicts"], json!([{"op": "p2", "todo": "t2", "fields": ["title"]}]));
+    assert_eq!(titles(&phone).last().unwrap().1, "eggs x12", "the list kept the first");
+    // The phone's answer was lost and it retries: nothing applies twice.
+    let again = sync(4, ops).await;
+    assert_eq!((&again["version"], &again["conflicts"]), (&phone["version"], &json!([])));
+
+    // A delete wins over a later edit based on before it.
+    let v = again["version"].as_u64().unwrap();
+    sync(v, json!([{"id": "l5", "todo": "t1", "base": v, "delete": true}])).await;
+    let late = sync(v, json!([{"id": "p3", "todo": "t1", "base": v, "title": "soy milk"}])).await;
+    assert_eq!(late["conflicts"][0]["fields"], json!(["title"]));
+    assert_eq!(app.post("/ann/sync", r#"{"since":0,"ops":[{"id":"x y","todo":"t","base":0}]}"#).await.status, 400);
+    assert_eq!(app.post("/bob/sync", r#"{"since":0}"#).await.json()["changes"], json!([]), "lists are their own");
+
+    let all = app.evicted("/ann/sync").await;
+    assert_eq!(all.status, 404, "a GET is not a sync");
+    let app = app.restart().await;
+    let all = app.post("/ann/sync", r#"{"since":0}"#).await.json();
+    let t1 = all["changes"].as_array().unwrap().iter().find(|t| t["id"] == "t1").unwrap().clone();
+    assert_eq!((&t1["deleted"], &t1["title"], &all["version"]), (&json!(true), &json!("oat milk"), &late["version"]));
+}
