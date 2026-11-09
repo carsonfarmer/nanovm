@@ -59,7 +59,8 @@ machine: loopback only, no registry, signature or jail. `nanovm publish hello.wa
 ghcr.io/you/hello:1.0.0` checks the app as a node will, pushes it as nodes pull it ([Apps](#apps)),
 and prints how to sign it and the TXT record that routes a host to it.
 [examples/chat](examples/chat) is a live multi-room chat on the same SDK. A recorded run and the
-reasons for each choice: [notes/onramp.md](notes/onramp.md).
+reasons for each choice: [notes/onramp.md](notes/onramp.md). Twenty more examples, from a URL
+shortener to a job queue, each with an end-to-end test: [notes/examples.md](notes/examples.md).
 
 ## SQLite beta
 
