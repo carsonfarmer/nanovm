@@ -20,6 +20,9 @@ impl wasip3::exports::http::handler::Guest for Probe {
         if req.path == "/callee" {
             return util::text(200, "callee");
         }
+        if req.path == "/selfwake" {
+            return selfwake().await;
+        }
         util::write_file("/data", "before.txt", b"before".to_vec()).await.unwrap();
         let gate = req.q("gate").unwrap().to_owned();
         let (mut tx, rx) = wasip3::wit_stream::new();
@@ -38,6 +41,21 @@ impl wasip3::exports::http::handler::Guest for Probe {
         });
         Ok(response)
     }
+}
+
+/// `/selfwake`: three tasks that wake themselves in a tight loop, forever.
+/// Each wake hands control back to the host (`CALLBACK_CODE_YIELD`), which
+/// runs it again at once.
+async fn selfwake() -> Result<Response, ErrorCode> {
+    let spin = || async {
+        loop {
+            wasip3::wit_bindgen::yield_async().await;
+        }
+    };
+    wasip3::spawn_local(spin());
+    wasip3::spawn_local(spin());
+    spin().await;
+    unreachable!()
 }
 
 /// `/headers?n=…&kb=…`: holds `n` more header maps, for good: new ones with
