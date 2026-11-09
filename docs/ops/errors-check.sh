@@ -65,6 +65,16 @@ stop
 node tiny '[limits]' 'memory_mb = 1'
 show "memory_mb below the guest's start" -H @"$W/counter.h" "$U/x/"
 
+stop
+
+# Local capture: history full, then capture turned off on a root with history.
+node cap '[capture]' 'max_versions = 2'
+for _ in 1 2; do curl -s -o /dev/null -XPOST -H @"$W/counter.h" "$U/c/incr"; done
+show "capture history full (max_versions = 2)" -XPOST -H @"$W/counter.h" "$U/c/incr"
+stop
+node cap
+show "capture turned off, history kept" -H @"$W/counter.h" "$U/c/"
+
 # The proxy, with a resolver that isn't there.
 P=http://127.0.0.1:$((PORT + 1))
 printf 'dev = true\nlisten = "%s"\nnode = "127.0.0.1:%s"\npublish_listen = "127.0.0.1:%s"\nresolver = "http://127.0.0.1:9/dns-query"\ntelemetry_endpoint = "http://127.0.0.1:9"\n' \

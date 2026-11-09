@@ -13,8 +13,12 @@ bodies, post-return commits, 431s). `docs/ops/errors-check.sh` triggers them.
 
 **Evidence:** the list was built from every `error_response` call and
 `metrics::Poison`. `errors-check.sh` (dev node + proxy, counter and hostile
-guests) produced 18 checks covering 17 reasons, each with the expected status and
-header; the quoted details are its output. Not triggered: `commit-failed`,
+guests) produced 20 checks covering 17 reasons, each with the expected status and
+header; the quoted details are its output. After the base moved to `3dafe33`
+(W-9 local capture), two checks cover capture: a full history answers
+`500 commit-failed` "no storage space", and a node restarted without `[capture]`
+over objects with history answers `503 instantiate-failed` "committed history
+requires capture to remain enabled". Not triggered: `commit-failed`,
 `object-unavailable`, `bad-request-body`, `bad-uri`, the 500 `worker-down` and the
 WebSocket refusals.
 

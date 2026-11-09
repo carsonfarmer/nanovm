@@ -35,8 +35,8 @@ fresh instance. The `detail` names the limit; limits come from the app's
 | 500 | `trap` | The guest trapped: a panic, `unreachable`, out-of-bounds, stack overflow. The detail has the trap and the tail of the guest's stderr (the panic message). | A guest bug: read the stderr tail. |
 | 500 | `resource-table` | Too many live handles (`max_resources`, also at most `memory_mb × 16`): usually leaked streams, bodies or fields. | Drop handles you're done with. |
 | 500 | `guest-error` | The handler returned a `wasi:http` error code instead of a response (the detail is the code). The request rolls back and the instance restarts. | Return a response (any status commits); return an error code only to roll back. |
-| 500 | `commit-failed` | The host could not make the request's changes durable (an I/O error from the disk: full, read-only, failing). The request rolls back when the object next starts, but a client can't always know whether a commit landed. | See the disk runbook. Retry with an operation id. |
-| 503 | `instantiate-failed` | A fresh instance could not be created, e.g. `memory_mb` below the component's own minimum ("memory minimum size of 17 pages exceeds memory limits"), or its CPU budget ran out while instantiating on an overloaded host ("cpu budget exceeded"). Nothing ran. | Raise `memory_mb`; under load, retry. |
+| 500 | `commit-failed` | The host could not make the request's changes durable: an I/O error from the disk (full, read-only, failing; "journal requires recovery" once a full disk refused a journal record), or, with `[capture]` on, the object's history is full (`max_versions` or `max_mb`; detail "no storage space"): capture refuses further writes rather than drop old versions. The request rolls back when the object next starts, but a client can't always know whether a commit landed. | See the disk runbook. For capture, raise the limits; never prune `~committed/` by hand. Retry with an operation id. |
+| 503 | `instantiate-failed` | A fresh instance could not be created, e.g. `memory_mb` below the component's own minimum ("memory minimum size of 17 pages exceeds memory limits"), its CPU budget ran out while instantiating on an overloaded host ("cpu budget exceeded"), or `[capture]` was removed from the config of a node whose objects have history ("committed history requires capture to remain enabled"). Its journal recovery failing also lands here. Nothing ran. | Raise `memory_mb`; under load, retry; put `[capture]` back. |
 | 503 | `object-busy` | The object's queue is full: `max_queue` requests already waiting behind the running one ("queue full (64 waiting)"). Nothing ran. | Retry with backoff; a hot object serves one request at a time, so shard it. |
 | 503 | `node-at-capacity` | `max_live_objects` objects are live and none idle to evict ("1000 live objects, none idle"). Nothing ran. | Retry with backoff; raise `max_live_objects` (with its fd and mapping needs) or add capacity. |
 | 503 | `object-unavailable` | The object's actor stopped before answering (rare: the node shutting down, or the object retired with the request queued). | Retry; with an operation id if the request writes. |
@@ -80,7 +80,7 @@ Outbound calls never pass an upstream's `x-nanovm-error` on as nanovm's.
 Every reason above is from an `error_response` call in `crates/nanovm/src`
 (`object.rs`, `server.rs`, `table.rs`, `egress.rs`, `supervisor.rs`,
 `proxy.rs`, `ws.rs`), and the poison reasons from `metrics::Poison` and
-`object::classify`. [errors-check.sh](errors-check.sh) triggers 17 of them (18 checks) against
+`object::classify`. [errors-check.sh](errors-check.sh) triggers 17 of them (20 checks, two of them with local capture) against
 a dev-mode node and proxy, with the counter and hostile guests, and prints
 status, header and detail; the details quoted above are its output. Not
 triggered there: `commit-failed`, `object-unavailable`, `bad-request-body`,
