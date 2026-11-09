@@ -1456,3 +1456,68 @@ async fn feeds_fetch_once_and_fan_in_to_readers() {
     assert_eq!(app.send("POST", "/f-rust/refresh", &[], "").await.json()["unchanged"], true, "the ETag survived");
 }
 
+/// A GitHub stand-in on loopback: `POST /token` gives `tok-ann` for the code
+/// `good` and the secret `s3cret`; `GET /user` with that token is ann.
+async fn github() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| async move {
+        let (path, auth) = (req.uri().path().to_string(), req.headers().get("authorization").cloned());
+        let body = http_body_util::BodyExt::collect(req.into_body()).await.unwrap().to_bytes();
+        let ask: Value = serde_json::from_slice(&body).unwrap_or_default();
+        nanovm::server::ok_json(match path.as_str() {
+            "/token" if ask["code"] == "good" && ask["client_secret"] == "s3cret" && ask["client_id"] == "app-1" => json!({"access_token": "tok-ann"}),
+            "/token" => json!({"error": "bad_verification_code"}),
+            _ if auth.is_some_and(|a| a == "Bearer tok-ann") => json!({"login": "ann", "id": 7, "name": "Ann"}),
+            _ => json!({"message": "Bad credentials"}),
+        })
+    }));
+    addr
+}
+
+/// examples/oauth (on an in-process node, with GitHub on loopback): the
+/// OAuth code flow with a one-time state, a session cookie that only the
+/// signed-in user's object accepts, logout, and sessions that survive
+/// eviction and restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_signs_in_with_one_time_state_and_scoped_sessions() {
+    let gh = github().await;
+    let patch = json!({
+        "limits": {"egress": [gh]},
+        "config": {"authorize_url": "https://github.example/authorize", "token_url": format!("http://{gh}/token"),
+                   "user_url": format!("http://{gh}/user"), "client_id": "app-1", "redirect_uri": "http://app/auth/callback"},
+        "env": {"CLIENT_SECRET": "s3cret"},
+    });
+    let app = Local::start("oauth", patch);
+    let login = async |app: &Local| -> String {
+        let to = app.send("GET", "/auth/login", &[], "").await;
+        assert_eq!(to.status, 302);
+        let location = to.header("location").to_string();
+        assert!(location.starts_with("https://github.example/authorize?client_id=app-1&redirect_uri=http://app/auth/callback&state="), "{location}");
+        location.split("state=").nth(1).unwrap().split('&').next().unwrap().to_string()
+    };
+    let state = login(&app).await;
+    let back = app.send("GET", &format!("/auth/callback?code=good&state={state}"), &[], "").await;
+    assert_eq!((back.status, back.header("location")), (302, "/u-ann/me"));
+    let cookie = back.header("set-cookie").split(';').next().unwrap().to_string();
+    assert!(cookie.starts_with("session=ann.") && back.header("set-cookie").contains("HttpOnly"), "{cookie}");
+    let me = [("cookie", cookie.as_str())];
+    assert_eq!(app.send("GET", "/u-ann/me", &me, "").await.json(), json!({"login": "ann", "id": 7, "name": "Ann"}));
+    assert_eq!(app.send("GET", "/u-ann/me", &[], "").await.status, 401);
+    assert_eq!(app.send("GET", "/u-bob/me", &me, "").await.status, 401, "ann's cookie is only ann's");
+    let forged = format!("session=ann.{}", "0".repeat(64));
+    assert_eq!(app.send("GET", "/u-ann/me", &[("cookie", &forged)], "").await.status, 401, "a made-up session");
+
+    // A state is used once, and only a state we made counts.
+    assert_eq!(app.send("GET", &format!("/auth/callback?code=good&state={state}"), &[], "").await.status, 400);
+    assert_eq!(app.send("GET", "/auth/callback?code=good&state=forged", &[], "").await.status, 400);
+    let state = login(&app).await;
+    assert_eq!(app.send("GET", &format!("/auth/callback?code=bad&state={state}"), &[], "").await.status, 401);
+
+    // Sessions outlive instances and the node; logout ends them everywhere.
+    app.evicted().await;
+    let app = app.restart().await;
+    assert_eq!(app.send("GET", "/u-ann/me", &me, "").await.status, 200);
+    assert_eq!(app.send("POST", "/u-ann/logout", &me, "").await.status, 204);
+    assert_eq!(app.send("GET", "/u-ann/me", &me, "").await.status, 401);
+}
