@@ -330,6 +330,17 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** the test writes 198 one-byte keys in one `hostile` request, under that app's 100 ms CPU budget and 1 s deadline. At load average 13–19 from other agents it failed with `cpu` or `timeout` in 4 of 4 alternating runs of `cf/main-next`'s test binary and 4 of 4 of `cf/onramp`'s (one run of each in the first round produced no result), and passed alone at lower load. It measures the machine, not the quota.
 - **Status:** open: give the fill its own app limits (as `kv_refuses_bad_names_and_streams_keys` does for its 1,500 keys), keeping the quota assertions.
 
+### N-600: SQLite's own syncs are charged to the request's CPU budget
+- **Where:** `components/sqlite/provider` (`PRAGMA journal_mode=DELETE; synchronous=FULL`, the VFS's `block_on` around `sync`), CPU accounting in `object.rs` (`charged`: time inside the store's polls)
+- **Scenario:** found by the examples (`examples/leaderboard`, `examples/shop`). Every SQLite statement that writes is a SQLite transaction with its own journal file and syncs, and the provider waits for each host fsync inside the guest's poll, so the wait counts as CPU. Under `nanovm run` (debug build, 4 cores at load 21-26), one-row `INSERT` statements cost ~6-12 ms each: 10 in one request took 97 ms, 20 took 243 ms, 40 were refused with `cpu` ("used more than 200ms of CPU in one request"; 200 ms is the most `nanovm run` allows). A checkout of four writing statements and one call failed with `cpu` in 1 of 4 runs. The same rows as one statement (`INSERT … SELECT … FROM json_each(?)`): 100 rows in 25-47 ms. The examples write one statement per request (a batch statement; a trigger for multi-table changes) and say why.
+- **Reproduced:** yes (numbers above; `leaderboard_pages_and_ranks_from_sqlite` and `shop_checkout_is_all_or_nothing` were the failing tests before the examples were changed).
+- **Status:** open, for the storage owners: nanovm's outer journal already makes the request atomic and durable, so SQLite's DELETE journal and FULL syncs are redundant work (experiments/sqlite-filesystem found MEMORY mode recovers correctly, "not a general endorsement"). Either the provider syncs less (e.g. `synchronous=OFF` or `journal_mode=MEMORY`, after the recovery matrix is rerun), or time blocked on host I/O stops counting as CPU.
+
+### N-601 (tests): restarting `nanovm run` raced the old process's storage lock
+- **Where:** `tests/dev.rs` (`drop(run); start(..)`), and the examples harness as first written
+- **Scenario:** `kill_on_drop` sends SIGKILL without waiting; a `nanovm run` started on the same data before the old one has exited fails with "app storage is already owned or cannot be locked" and exits. Seen in 2 of ~16 runs of the shop example's test at load ~25.
+- **Status:** fixed on `ideas/examples` (42b2fc2 for the examples harness, fa88fe7 for `dev.rs`): kill, then wait for the process, then start.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -504,4 +515,8 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-104: move the test guests onto the SDK
 - **What:** `guests/counter` and `guests/hostile` still use `guests/util`. Porting them shrinks them by about a third (cf/optimistic-feynman's D1), but any change under `guests/**` republishes them from main, which needs the owner's approval.
+- **Status:** open
+
+### W-600: let a request roll back and still choose its answer
+- **What:** a handler that returns an error rolls back everything the request did, and the client gets `500` with `x-nanovm-error: guest-error`; any answer it gives instead, whatever its status, commits. So a checkout whose card is declined after it has written (`examples/shop`) can only say `500`, never `402`, and an app that wants a clean `409` must check everything before its first write. A way to answer *and* roll back (for example a reserved response header the host strips, which marks the request failed but sends the response) would let the SDK offer `Response::rollback()`. It touches the commit path in `object.rs`, so it is for its owners.
 - **Status:** open
