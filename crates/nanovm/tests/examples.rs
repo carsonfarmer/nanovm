@@ -567,3 +567,78 @@ async fn jobs_lease_retry_and_dead_letter() {
 async fn add_after_restart(app: &App) -> u16 {
     app.send("POST", "/mail/jobs", &[("idempotency-key", "k1")], r#"{"text":"x"}"#).await.status
 }
+
+/// A streamed response's chunks, each with when it arrived, and whether the
+/// body ended cleanly.
+async fn chunks(app: &App, path: &str) -> (Vec<(std::time::Instant, String)>, bool) {
+    let mut res = app.http.get(app.url(path)).send().await.unwrap();
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    let mut out = vec![];
+    loop {
+        match res.chunk().await {
+            Ok(Some(c)) => out.push((std::time::Instant::now(), String::from_utf8_lossy(&c).into_owned())),
+            Ok(None) => return (out, true),
+            Err(_) => return (out, false),
+        }
+    }
+}
+
+/// examples/events: Server-Sent Events replayed from a log with a reconnect
+/// hint, and a long-lived stream written after the handler returned. While
+/// it streams, its object serves nothing else (other objects are not held
+/// up); what it changes after answering commits when it ends, and rolls back
+/// if it outlives `post_return_timeout_ms`.
+#[tokio::test(flavor = "multi_thread")]
+async fn events_stream_after_the_handler_returns() {
+    let mut app = App::start("events", json!({"post_return_timeout_ms": 2000})).await;
+    for (i, text) in ["one", "two\nlines", "three"].iter().enumerate() {
+        assert_eq!(app.post("/feed/events", text.to_string()).await.json()["id"], i + 1);
+    }
+    let all = app.get("/feed/events").await.text();
+    assert_eq!(all, "retry: 1000\n\nid: 1\ndata: one\n\nid: 2\ndata: two\ndata: lines\n\nid: 3\ndata: three\n\n");
+    let since = app.send("GET", "/feed/events", &[("last-event-id", "2")], "").await;
+    assert_eq!((since.header("content-type"), since.text().as_str()), ("text/event-stream", "retry: 1000\n\nid: 3\ndata: three\n\n"));
+    assert_eq!(app.get("/feed/events?after=3").await.text(), "retry: 1000\n\n");
+
+    // A countdown is streamed: its ticks arrive 200 ms apart, after the
+    // handler has returned.
+    let (got, clean) = chunks(&app, "/cd/countdown?from=5&every_ms=200").await;
+    let text: String = got.iter().map(|(_, c)| c.as_str()).collect();
+    assert!(clean && text.ends_with("event: done\ndata: liftoff\n\n"), "{text}");
+    assert_eq!(text.matches("event: tick").count(), 5);
+    assert!(got.last().unwrap().0 - got[0].0 >= Duration::from_millis(800), "streamed, not buffered: {got:?}");
+    assert_eq!(app.get("/cd/").await.json()["countdowns"], 1, "its write after answering committed");
+
+    // While it streams its object waits; other objects don't.
+    let stream = tokio::spawn({
+        let (http, url) = (app.http.clone(), app.url("/cd/countdown?from=6&every_ms=200"));
+        async move {
+            let mut res = http.get(url).send().await.unwrap();
+            while res.chunk().await.unwrap().is_some() {}
+            std::time::Instant::now()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let other = app.get("/elsewhere/").await;
+    let other_done = std::time::Instant::now();
+    let same = app.post("/cd/events", "queued").await;
+    let same_done = std::time::Instant::now();
+    let ended = stream.await.unwrap();
+    assert_eq!((other.status, same.status), (200, 201));
+    assert!(other_done < ended && same_done >= ended, "the stream's own object waited for it");
+    assert_eq!(app.get("/cd/").await.json()["countdowns"], 2);
+
+    // A stream that outlives post_return_timeout_ms is cut, its object
+    // stopped, and what it changed after answering rolled back.
+    let (got, clean) = chunks(&app, "/cd/countdown?from=30&every_ms=200").await;
+    let text: String = got.iter().map(|(_, c)| c.as_str()).collect();
+    assert!(!text.contains("done") && text.matches("event: tick").count() < 30, "cut short: clean={clean} {text}");
+    app.line("deadline exceeded while post-return").await;
+    assert_eq!(app.get("/cd/").await.json()["countdowns"], 2, "the cut stream's write rolled back");
+
+    // The log outlives the instance and the node.
+    assert_eq!(app.evicted("/feed/events?after=2").await.text(), "retry: 1000\n\nid: 3\ndata: three\n\n");
+    let app = app.restart().await;
+    assert_eq!(app.get("/feed/").await.json(), json!({"events": 3, "countdowns": 0}));
+    assert_eq!(app.get("/cd/").await.json(), json!({"events": 1, "countdowns": 2}));
+}
