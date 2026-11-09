@@ -993,3 +993,45 @@ async fn notes_search_their_own_full_text_index() {
     let app = app.restart().await;
     assert_eq!(ids(&app.get("/ann/search?q=porto%20train").await.json()), [trip]);
 }
+
+/// examples/analytics: batched ingest in one statement, a per-day rollup
+/// kept by a trigger, distinct users, CSV export, durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn analytics_rolls_events_up_per_day() {
+    let mut app = App::start("analytics", json!({})).await;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let yesterday = now - 86_400_000;
+    let batch = json!([
+        {"name": "view", "path": "/", "user": "u1"},
+        {"name": "view", "path": "/a", "user": "u1"},
+        {"name": "view", "path": "/b", "user": "u2"},
+        {"name": "click", "path": "/b", "user": "u1"},
+        {"name": "view", "path": "/", "user": "u3", "at": yesterday},
+        {"name": "view", "path": "/", "user": "u4", "at": yesterday},
+    ]);
+    assert_eq!(app.post("/blog/events", batch.to_string()).await.json(), json!({"accepted": 6}));
+    let all = app.get("/blog/days?from=2000-01-01&to=2999-12-31").await.json();
+    let rows: Vec<(String, i64, i64)> = all.as_array().unwrap().iter()
+        .map(|r| (r["name"].as_str().unwrap().into(), r["events"].as_i64().unwrap(), r["users"].as_i64().unwrap())).collect();
+    assert_eq!(rows, [("view".into(), 2, 2), ("click".into(), 1, 1), ("view".into(), 3, 2)], "{all}");
+    let (yday, today) = (all[0]["day"].as_str().unwrap().to_string(), all[1]["day"].as_str().unwrap().to_string());
+    assert!(yday < today);
+    assert_eq!(app.get("/blog/days").await.json().as_array().unwrap().len(), 2, "today by default");
+    let csv = app.get(format!("/blog/days.csv?from={yday}&to={today}")).await;
+    assert_eq!(csv.header("content-type"), "text/csv; charset=utf-8");
+    assert_eq!(csv.text(), format!("day,name,events,users\n{yday},view,2,2\n{today},click,1,1\n{today},view,3,2\n"));
+
+    assert_eq!(app.post("/blog/events", r#"{"name":"view","user":"u5"}"#).await.status, 202, "one event alone");
+    let month_ago = now - 31 * 86_400_000;
+    for bad in [json!({"name": "a b"}), json!({"name": "view", "at": month_ago}), json!("view")] {
+        assert_eq!(app.post("/blog/events", bad.to_string()).await.status, 400, "{bad}");
+    }
+    let many: Vec<_> = (0..101).map(|_| json!({"name": "x"})).collect();
+    assert_eq!(app.post("/blog/events", Value::from(many).to_string()).await.status, 400);
+    assert_eq!(app.get("/other/days").await.json(), json!([]), "sites are their own");
+
+    let later = app.evicted(&format!("/blog/days?from={today}&to={today}")).await.json();
+    assert_eq!((&later[1]["events"], &later[1]["users"]), (&json!(4), &json!(3)));
+    let app = app.restart().await;
+    assert_eq!(app.get(format!("/blog/days.csv?from={yday}&to={yday}")).await.text(), format!("day,name,events,users\n{yday},view,2,2\n"));
+}
