@@ -29,6 +29,8 @@ config! {
         listen: String = "127.0.0.1:8080",
         /// Root for per-object volumes, scratch space and the compile cache.
         data_dir: PathBuf = "nanovm-data",
+        /// Optional local committed-version capture. Not remote replication.
+        capture: Option<CaptureConfig> = None::<CaptureConfig>,
         /// Upper bound on objects with a live instance; sizes the pooling allocator.
         max_live_objects: usize = 1000usize,
         /// The proxy's private endpoint: committed publishes go to its
@@ -141,6 +143,15 @@ config! {
         /// For local development only: registries may be on private
         /// addresses, and loopback ones are plain HTTP (as for the node).
         dev: bool = false,
+    }
+}
+
+config! {
+    /// Operator-owned limits for each object's immutable local capture history.
+    /// Exhaustion rejects new writes; versions are never silently discarded.
+    pub struct CaptureConfig {
+        max_mb: u64 = 256u64,
+        max_versions: u64 = 16u64,
     }
 }
 

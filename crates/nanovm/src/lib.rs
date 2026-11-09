@@ -3,6 +3,7 @@
 //! per-object memory, CPU, disk and egress limits.
 
 pub mod app;
+mod committed;
 pub mod config;
 pub mod egress;
 pub mod engine;

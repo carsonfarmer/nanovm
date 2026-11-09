@@ -603,6 +603,33 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 
 ## W-9 contract and bounded proof (2026-11-08)
 
+**Local capture implemented in `b7bf806` (CI 42491417145 passed):** opt-in capture
+runs inside the real journal at both existing commit gates. Stage and sync an immutable full version before
+the undo log's commit marker, then publish it before permitting another mutation.
+Recovery discards staged capture before rollback when the log remains; otherwise
+it finishes publication. This ordering must survive repeated recovery cuts too.
+Use the established `tar` crate for streaming file/namespace snapshots rather
+than expanding JSON byte arrays or designing an archive. Operator-owned per-object
+byte/version caps reject new commits when full; no silent discard or automatic GC.
+Capture is disabled by default and is not a remote-acknowledgement policy.
+
+The runtime uses `<objects>/<app>/~committed/<object>/<sequence>.tar`,
+with `nanovm.json` (format, app/object identity, sequence and parent SHA-256) followed
+by `data/`. A durable staged name stays in the journal until a hard-linked output
+name is synced; renaming alone could lose the sole durable name between directory
+syncs. Publication recovery runs before admitting another request. Capture errors
+poison the journal: before the commit decision recovery rolls back, after it the
+outcome can be committed despite an error response, as for existing commit errors.
+Limits default to 256 MiB of archive bytes and 16 versions per object; a full
+history refuses dirty commits, while read-only commits consume no version. These
+are not aggregate disk/RSS budgets. Disabling capture while history exists is
+refused to prevent silent gaps. No pruning, retention or epoch/fencing policy is
+implied. Full-volume capture adds copy/hash/I/O cost: measured small-write throughput
+is roughly half default throughput (HANDOFF records matched controls and failures).
+TAR is an interchange container, not a
+validated network receiver or an operator restore API. The existing JSON receiver
+experiment and the new runtime TAR output are distinct formats.
+
 **Engineering choice, not an approved replication architecture:** establish an
 ordered immutable version contract before placement. The executable
 `cargo run --locked -p nanovm --example committed_state` uses the actual Journal,
@@ -634,23 +661,32 @@ integrity, not authentication; epoch equality is not fencing. Metadata, non-UTF8
 names, hardlink identity, hostile local writers, retention/GC and migration are
 outside this disposable, trusted-root experiment.
 
-**Production gaps:** `object::commit` runs at response acceptance and again after
-post-return execution. Capture must preserve both versions before another mutation.
-Today `Journal::commit` syncs changes then unlinks the undo log; a crash between that
-commit and an after-the-fact capture can lose a version. Checking log absence is
-only a fixture assertion, not a concurrency lock or a crash-atomic capture protocol.
-A production outbox needs a durable decision tying sequence, immutable content and
-local commit together, recoverable on either side of every crash cut. A capture
-failure after commit must not be reported as a rollback. Its disk budget and outage
-behavior must be explicit rather than an unbounded queue or silent discard.
+**Runtime evidence and remaining gaps:** `object::commit` runs at response acceptance
+and again after post-return execution. Local capture preserves both dirty versions
+before later mutations. Fourteen commit/publication and 28 rollback sync-error and
+process-exit cuts check exact state/history agreement. Separate barrier regressions
+cover visible-but-unsynced deletions: recovery must sync the decision before
+publishing, and sync discarded staging before undo even on a repeated recovery.
+Review found these missing dependencies; both regressions failed before correction.
+Process exits retain kernel state, so this is not power-loss certification. The
+composed SQL test transfers exact TAR/history copies, removes the entire source
+root, restores SQL/file/KV without rejected or unsent writes, then continues writes
+and reopens. This fixture does not provide a production restore/receiver API or
+prove remote durability. A receiver still needs validated bounds/identity/chain,
+durable ordered receipt, interrupted restore recovery and an explicit authority
+for deciding which history may become writable. No distributed fence exists.
 
-**Next decisions:** retain existing local-durable acknowledgement while developing
-capture, or gate responses on a durable remote receipt? Local-only plus asynchronous
+**Next decisions:** retain local-durable acknowledgement with asynchronous transfer,
+or gate responses on a durable remote receipt? Local-only plus asynchronous
 transfer allows loss of acknowledged writes; no bounded RPO follows without a lag
 bound and outage admission policy. Remote gating adds latency and availability
-dependence and needs a chosen receiver failure domain/quorum. Recommend completing
-crash-atomic local capture next, without enabling automatic promotion; ask the owner
-before selecting the externally promised acknowledgement/RPO and failover policy.
+dependence and needs a chosen receiver failure domain/quorum. Local capture resolves
+neither choice. For a promise that acknowledged writes survive node loss, recommend
+remote durable receipt before success and refusing writes when that receipt is
+unavailable, with manually authorized recovery after fencing the old writer first.
+This is a recommendation for owner approval, not implemented policy. A receiver
+and restore protocol must carry the selected authority/epoch; adding a sequence
+field alone cannot prevent two restored roots from accepting divergent version N+1.
 W-10 must fence storage commits, not merely check a lease before instantiation.
 W-10 now checks the lease at every commit, but only W-9's store write can fence a
 commit that outlives the lease: see W-90 and `notes/multinode.md`.

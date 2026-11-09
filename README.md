@@ -13,10 +13,10 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
 **Current scope (2026-11-08):** single-node durable acceptance and rejected-request
-rollback, plus tested offline backup/restore. There is no live committed-state feed,
-remote durability guarantee or automatic failover. W-9 capture/transfer/recovery is
-the next core work, before placement/fencing; acknowledgement/RPO policy remains
-undecided. Runtime is 5,085 lines, still above the under-5k goal. Older checkpoint
+rollback, tested offline backup/restore, and opt-in local committed-state capture.
+There is no production remote transfer, remote durability guarantee or automatic
+failover. W-9 receiver/recovery work precedes placement/fencing; acknowledgement/RPO
+policy remains undecided. Runtime is 5,320 lines, above the under-5k goal. Older checkpoint
 counts and candidate designs below are historical, not current delivery claims.
 The line goal guides simplicity; it is not a hard limit or correctness tradeoff.
 
@@ -27,6 +27,22 @@ fresh-root recovery after deleting the source. It also demonstrates that a local
 accepted but unsent write is lost. This is not a runtime replication feature,
 remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
 gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
+
+**Local capture:** optional node `[capture]` configuration
+enables full-volume TAR captures at both dirty commit gates (`max_mb = 256`,
+`max_versions = 16`, per object). Versions are staged before the journal's commit
+decision, then published under `objects/<app>/~committed/<object>/`; recovery
+discards rejected staging or completes accepted publication before new work.
+Full history rejects further dirty commits rather than discarding old versions;
+read-only commits consume no version. Capture defaults off. This is bounded local
+capture, not continuous replication: no retention, network receiver, restore API,
+distributed fence or remote acknowledgement policy is provided. Do not manually
+prune history or disable capture on a root with history. Full copies cost storage
+and write latency: two small-write release probes measured roughly half default
+write throughput. This is not a large-volume performance result. The older JSON
+experiment is not a receiver for these TARs. Tests exercise both commit gates,
+process-exit and failed-sync recovery, history exhaustion and SQL/file/KV recovery
+after source-root deletion; these do not certify physical power loss or remote hosts.
 
 ## SQLite beta
 
