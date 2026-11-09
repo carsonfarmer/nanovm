@@ -16,7 +16,7 @@ use nanovm::table::Node;
 mod load;
 
 /// One measured case: `n` requests of `method path`, numbered `{i}` in the
-/// path/body; `setup` requests run first, unmeasured.
+/// path; `setup` requests run first, unmeasured.
 struct Case {
     component: &'static str,
     name: &'static str,
@@ -26,84 +26,60 @@ struct Case {
     body: &'static str,
     /// Operations each request performs, to report per-op figures.
     ops: u64,
+    /// Restart the node before each measured request: a cold instance that
+    /// must load its state first.
+    cold: bool,
 }
 
+const fn case(
+    component: &'static str,
+    name: &'static str,
+    setup: &'static [(&'static str, &'static str, &'static str)],
+    (method, path, body): (&'static str, &'static str, &'static str),
+    ops: u64,
+    cold: bool,
+) -> Case {
+    Case {
+        component,
+        name,
+        setup,
+        method,
+        path,
+        body,
+        ops,
+        cold,
+    }
+}
+
+const NONE: (&str, &str, &str) = ("GET", "/none", "");
+const DOCS_10K: &[(&str, &str, &str)] = &[
+    ("POST", "/index?field=tag", ""),
+    ("POST", "/bulk?count=10000&size=100", ""),
+];
+const QUEUE_1K: &[(&str, &str, &str)] = &[("POST", "/bulk?count=1000&size=100&batch=100", "")];
+
+#[rustfmt::skip]
 const CASES: &[Case] = &[
     // The composed KV provider's own test app, for reference.
-    Case {
-        component: "keyvalue",
-        name: "reference: KV set 9 B / request",
-        setup: &[],
-        method: "GET",
-        path: "/set",
-        body: "",
-        ops: 1,
-    },
-    Case {
-        component: "keyvalue",
-        name: "reference: KV get / request",
-        setup: &[("GET", "/set", "")],
-        method: "GET",
-        path: "/get",
-        body: "",
-        ops: 1,
-    },
-    Case {
-        component: "queue",
-        name: "baseline: unknown route (404)",
-        setup: &[],
-        method: "GET",
-        path: "/none",
-        body: "",
-        ops: 1,
-    },
-    Case {
-        component: "queue",
-        name: "append 1 x 100 B / request",
-        setup: &[],
-        method: "POST",
-        path: "/append",
-        body: B100,
-        ops: 1,
-    },
-    Case {
-        component: "queue",
-        name: "read 1 / request",
-        setup: &[("POST", "/bulk?count=1000&size=100&batch=100", "")],
-        method: "GET",
-        path: "/read?offset={i}&max=1",
-        body: "",
-        ops: 1,
-    },
-    Case {
-        component: "queue",
-        name: "next 1 (consume + commit position) / request",
-        setup: &[("POST", "/bulk?count=1000&size=100&batch=100", "")],
-        method: "POST",
-        path: "/next?max=1",
-        body: "",
-        ops: 1,
-    },
-    Case {
-        component: "queue",
-        name: "append batch of 100 x 100 B / request (per message)",
-        setup: &[],
-        method: "POST",
-        path: "/bulk?count=100&size=100&batch=100",
-        body: "",
-        ops: 100,
-    },
-    Case {
-        component: "queue",
-        name: "append 100 B x 1000 in one request (per append)",
-        setup: &[],
-        method: "POST",
-        path: "/bulk?count=1000&size=100&batch=1",
-        body: "",
-        ops: 1000,
-    },
+    case("keyvalue", "reference: KV set 9 B / request", &[], ("GET", "/set", ""), 1, false),
+    case("keyvalue", "reference: KV get / request", &[("GET", "/set", "")], ("GET", "/get", ""), 1, false),
+    case("queue", "baseline: unknown route (404)", &[], NONE, 1, false),
+    case("queue", "append 1 x 100 B / request", &[], ("POST", "/append", B100), 1, false),
+    case("queue", "read 1 / request", QUEUE_1K, ("GET", "/read?offset={i}&max=1", ""), 1, false),
+    case("queue", "next 1 (consume + commit position) / request", QUEUE_1K, ("POST", "/next?max=1", ""), 1, false),
+    case("queue", "append batch of 100 x 100 B / request (per message)", &[], ("POST", "/bulk?count=100&size=100&batch=100", ""), 100, false),
+    case("queue", "append 100 B x 1000 in one request (per append)", &[], ("POST", "/bulk?count=1000&size=100&batch=1", ""), 1000, false),
+    case("docs", "baseline: unknown route (404)", &[], NONE, 1, false),
+    case("docs", "put 1 doc (~150 B, 1 index) / request", &[("POST", "/index?field=tag", "")], ("PUT", "/doc?id=k{i}", DOC), 1, false),
+    case("docs", "get 1 doc / request (of 10,000)", DOCS_10K, ("GET", "/doc?id=d00{i}", ""), 1, false),
+    case("docs", "query tag = t3, 10 docs / request (of 10,000)", DOCS_10K, ("GET", "/query?field=tag&eq=%22t3%22&limit=10", ""), 1, false),
+    case("docs", "put 1,000 docs in one request (per put)", &[("POST", "/index?field=tag", "")], ("POST", "/bulk?count=1000&size=100&prefix=b{i}-", ""), 1000, false),
+    case("docs", "cold start: first get after restart, 10,000 docs, 1 index", DOCS_10K, ("GET", "/doc?id=d000001", ""), 1, true),
+    case("docs", "cold start: first get after restart, 10,000 docs, no index", &[("POST", "/bulk?count=10000&size=100", "")], ("GET", "/doc?id=d000001", ""), 1, true),
+    case("docs", "cold start: unknown route after restart (no load)", &[("POST", "/bulk?count=10000&size=100", "")], NONE, 1, true),
 ];
 
+const DOC: &str = r#"{"tag":"t1","n":12345,"name":"Ada Lovelace","email":"ada@example.com","pad":"0123456789012345678901234567890123456789012345678901234567890123456789"}"#;
 const B100: &str =
     "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
 
@@ -179,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 "memory_mb": 128, "cpu_ms": 60000, "request_timeout_ms": 120000, "disk_mb": 1024, "max_files": 100000
             }))?,
         };
-        let node = Node::new(cfg.clone(), &app, &wasm, None)?;
+        let mut node = Node::new(cfg.clone(), &app, &wasm, None)?;
         let id = format!("case{k}");
         for (method, path, body) in case.setup {
             let r = load::request(&node, method, &id, path, body).await;
@@ -189,18 +165,24 @@ async fn main() -> anyhow::Result<()> {
         let _ = load::request(&node, "GET", &id, "/none", "").await;
         let volume = dir.join("objects").join(case.component).join(&id);
         let (bytes0, _) = logical_bytes(&volume);
-        let reqs = if case.ops > 1 {
-            (n * 10 / case.ops as usize).max(3)
-        } else {
-            n
+        let reqs = match (case.cold, case.ops) {
+            (true, _) => 10,
+            (false, 1) => n,
+            (false, ops) => (n * 10 / ops as usize).max(3),
         };
-        let (t0, c0) = (Instant::now(), cpu());
+        let (mut wall, mut used) = (0.0, 0.0);
         for i in 0..reqs {
-            let path = case.path.replace("{i}", &i.to_string());
+            if case.cold {
+                node.shutdown().await;
+                drop(node);
+                node = Node::new(cfg.clone(), &app, &wasm, None)?;
+            }
+            let path = case.path.replace("{i}", &format!("{i:04}"));
+            let (t0, c0) = (Instant::now(), cpu());
             let r = load::request(&node, case.method, &id, &path, case.body).await;
+            (wall, used) = (wall + t0.elapsed().as_secs_f64(), used + cpu() - c0);
             ensure!(r.status == 200 || path == "/none", "{path}: {} {}", r.status, r.body);
         }
-        let (wall, used) = (t0.elapsed().as_secs_f64(), cpu() - c0);
         let (bytes1, _) = logical_bytes(&volume);
         let per_req = used / reqs as f64 * 1e6;
         println!(

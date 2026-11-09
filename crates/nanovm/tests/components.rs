@@ -301,3 +301,282 @@ async fn queue_quota_exhaustion_is_refused_cleanly() {
     assert_eq!(entries.len(), 1, "a refused topic left a directory");
     node.shutdown().await;
 }
+
+// ---- docs -----------------------------------------------------------------
+
+fn ids(v: &Value) -> Vec<String> {
+    v["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/docs/build.sh"]
+async fn docs_contracts() {
+    let cfg = node_cfg("docs_contracts", 4);
+    let node = start(&cfg, &app("docs", json!({})));
+    assert_eq!(ok(&node, "GET", "d", "/contracts", "").await, json!("ok"));
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/docs/build.sh"]
+async fn docs_indexes_survive_eviction_and_restart() {
+    let cfg = node_cfg("docs_persist", 1);
+    let app = app("docs", json!({}));
+    let mut node = start(&cfg, &app);
+    ok(&node, "POST", "d", "/index?field=email&unique=1", "").await;
+    for (id, body) in [
+        ("ann", r#"{"email":"ann@x","city":"Oslo","age":31}"#),
+        ("bob", r#"{"email":"bob@x","city":"Lima","age":25}"#),
+        ("cat", r#"{"email":"cat@x","city":"Oslo","age":40}"#),
+    ] {
+        ok(&node, "PUT", "d", &format!("/doc?id={id}"), body).await;
+    }
+    // An index created later covers existing documents.
+    ok(&node, "POST", "d", "/index?field=city", "").await;
+    ok(&node, "POST", "d", "/index?field=age", "").await;
+    assert_eq!(
+        ids(&ok(
+            &node,
+            "GET",
+            "d",
+            &format!("/query?field=city&eq={}", urlencode("\"Oslo\"")),
+            ""
+        )
+        .await),
+        ["ann", "cat"]
+    );
+    // A unique index refuses a second owner of a value, and changes nothing.
+    let r = request(&node, "PUT", "d", "/doc?id=dan", r#"{"email":"ann@x","city":"Rome"}"#).await;
+    assert_eq!(
+        (r.status, r.json()["error"].as_str()),
+        (409, Some("Error::Conflict(\"email\")")),
+        "{}",
+        r.body
+    );
+    assert_eq!(request(&node, "GET", "d", "/doc?id=dan", "").await.status, 404);
+    let r = request(&node, "POST", "d", "/index?field=city&unique=1", "").await;
+    assert_eq!(r.status, 409, "{}", r.body);
+    // Replacing a document moves it in every index.
+    ok(
+        &node,
+        "PUT",
+        "d",
+        "/doc?id=ann",
+        r#"{"email":"ann@y","city":"Lima","age":32}"#,
+    )
+    .await;
+    evict(&node, "/stats").await;
+    assert_eq!(
+        ids(&ok(
+            &node,
+            "GET",
+            "d",
+            &format!("/query?field=city&eq={}", urlencode("\"Lima\"")),
+            ""
+        )
+        .await),
+        ["ann", "bob"]
+    );
+    assert_eq!(
+        ids(&ok(
+            &node,
+            "GET",
+            "d",
+            &format!("/query?field=email&eq={}", urlencode("\"ann@x\"")),
+            ""
+        )
+        .await),
+        Vec::<String>::new()
+    );
+    ok(
+        &node,
+        "PUT",
+        "d",
+        "/doc?id=dan",
+        r#"{"email":"ann@x","city":"Rome","age":25}"#,
+    )
+    .await;
+    assert_eq!(ok(&node, "DELETE", "d", "/doc?id=bob", "").await["existed"], true);
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(
+        ids(&ok(&node, "GET", "d", "/query?field=age&gte=25&lt=40", "").await),
+        ["dan", "ann"]
+    );
+    let page = ok(&node, "GET", "d", "/query?field=age&limit=1", "").await;
+    assert_eq!(ids(&page), ["dan"]);
+    let cursor = page["cursor"].as_str().unwrap();
+    let next = ok(
+        &node,
+        "GET",
+        "d",
+        &format!("/query?field=age&limit=5&after={}", urlencode(cursor)),
+        "",
+    )
+    .await;
+    assert_eq!(
+        (ids(&next), &next["cursor"]),
+        (vec!["ann".to_string(), "cat".to_string()], &Value::Null)
+    );
+    assert_eq!(ok(&node, "GET", "d", "/doc?id=ann", "").await["email"], "ann@y");
+    assert_eq!(
+        ok(&node, "GET", "d", "/indexes", "").await,
+        json!([{"field": "email", "unique": true}, {"field": "city", "unique": false}, {"field": "age", "unique": false}])
+    );
+    let listed: Vec<_> = ok(&node, "GET", "d", "/list", "")
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].clone())
+        .collect();
+    assert_eq!(listed, ["ann", "cat", "dan"]);
+    node.shutdown().await;
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+            b => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/docs/build.sh"]
+async fn docs_failed_request_rolls_back() {
+    let cfg = node_cfg("docs_rollback", 2);
+    let node = start(&cfg, &app("docs", json!({})));
+    ok(&node, "PUT", "d", "/doc?id=a", r#"{"v":1}"#).await;
+    // A failed request's put and new index both roll back, memory included.
+    let r = request(&node, "POST", "d", "/fail?id=a&field=v", r#"{"v":2}"#).await;
+    assert_eq!(r.error.as_deref(), Some("guest-error"), "{}", r.body);
+    assert_eq!(ok(&node, "GET", "d", "/doc?id=a", "").await, json!({"v": 1}));
+    assert_eq!(ok(&node, "GET", "d", "/indexes", "").await, json!([]));
+    let r = request(&node, "POST", "d", "/trap?id=a", "").await;
+    assert_eq!(r.error.as_deref(), Some("trap"), "{}", r.body);
+    assert_eq!(ok(&node, "GET", "d", "/doc?id=a", "").await, json!({"v": 1}));
+    assert_eq!(ok(&node, "GET", "d", "/stats", "").await["documents"], 1);
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/docs/build.sh"]
+async fn docs_log_is_compacted() {
+    let cfg = node_cfg("docs_compact", 2);
+    let app = app("docs", json!({}));
+    let mut node = start(&cfg, &app);
+    ok(&node, "POST", "d", "/index?field=tag", "").await;
+    // 100 documents of ~4 KiB, rewritten three times: compaction keeps the
+    // log under twice its live bytes once it passes 1 MiB.
+    for _ in 0..3 {
+        ok(&node, "POST", "d", "/bulk?count=100&size=4000", "").await;
+    }
+    let stats = ok(&node, "GET", "d", "/stats", "").await;
+    let (live, log) = (stats["live"].as_u64().unwrap(), stats["log"].as_u64().unwrap());
+    assert_eq!(stats["documents"], 100);
+    assert!(log > live && log <= 2 * live + 5000, "{stats}");
+    let file = volume(&cfg, "docs", "d").join(".docs/people/log");
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), log);
+    ok(&node, "POST", "d", "/compact", "").await;
+    assert_eq!(std::fs::metadata(&file).unwrap().len(), live);
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(
+        ok(&node, "GET", "d", "/stats", "").await,
+        json!({"documents": 100, "live": live, "log": live})
+    );
+    assert_eq!(
+        ids(&ok(
+            &node,
+            "GET",
+            "d",
+            &format!("/query?field=tag&eq={}&limit=3", urlencode("\"t3\"")),
+            ""
+        )
+        .await),
+        ["d000003", "d000013", "d000023"]
+    );
+    assert_eq!(ok(&node, "GET", "d", "/doc?id=d000099", "").await["n"], 99);
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/docs/build.sh"]
+async fn docs_quota_exhaustion_is_refused_cleanly() {
+    let cfg = node_cfg("docs_quota", 2);
+    let app = app("docs", json!({"disk_mb": 1}));
+    let mut node = start(&cfg, &app);
+    let long = "L".repeat(200);
+    ok(&node, "PUT", "d", &format!("/doc?id={long}"), r#"{"long":true}"#).await;
+    let full = ok(&node, "POST", "d", "/fill?fine=1", "").await;
+    assert_eq!(full["error"], "Error::Full");
+    let stored = full["stored"].as_u64().unwrap();
+    assert!(stored > 15, "{full}");
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(ok(&node, "GET", "d", "/stats", "").await["documents"], stored + 1);
+    // Not even its delete record fits now: the delete marks its record dead in place.
+    assert_eq!(
+        ok(&node, "DELETE", "d", &format!("/doc?id={long}"), "").await["existed"],
+        true
+    );
+    assert_eq!(
+        request(&node, "GET", "d", &format!("/doc?id={long}"), "").await.status,
+        404
+    );
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(
+        request(&node, "GET", "d", &format!("/doc?id={long}"), "").await.status,
+        404
+    );
+    assert_eq!(ok(&node, "GET", "d", "/stats", "").await["documents"], stored);
+    // A full volume still lets documents go (the log is rewritten in place
+    // when a delete record doesn't fit), and compaction frees the space
+    // without needing room for a second copy.
+    let r = request(
+        &node,
+        "PUT",
+        "d",
+        "/doc?id=more",
+        &format!(r#"{{"pad":"{}"}}"#, "z".repeat(100_000)),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json()["error"].as_str()),
+        (409, Some("Error::Full")),
+        "{}",
+        r.body
+    );
+    for n in 0..stored - 1 {
+        assert_eq!(
+            ok(&node, "DELETE", "d", &format!("/doc?id=fill{n}"), "").await["existed"],
+            true
+        );
+    }
+    assert_eq!(ok(&node, "GET", "d", "/stats", "").await["documents"], 1);
+    ok(&node, "POST", "d", "/compact", "").await;
+    let stats = ok(&node, "GET", "d", "/stats", "").await;
+    assert_eq!(
+        (stats["documents"].as_u64(), stats["log"].as_u64()),
+        (Some(1), stats["live"].as_u64())
+    );
+    ok(
+        &node,
+        "PUT",
+        "d",
+        "/doc?id=more",
+        &format!(r#"{{"pad":"{}"}}"#, "z".repeat(500_000)),
+    )
+    .await;
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(ok(&node, "GET", "d", "/stats", "").await["documents"], 2);
+    assert_eq!(
+        ok(&node, "GET", "d", &format!("/doc?id=fill{}", stored - 1), "").await["n"],
+        stored - 1
+    );
+    node.shutdown().await;
+}

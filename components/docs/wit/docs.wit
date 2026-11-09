@@ -1,0 +1,120 @@
+package nanovm:docs@0.1.0;
+
+/// JSON document collections with secondary indexes, stored in the object's
+/// own volume. Every change commits or rolls back with the request that made
+/// it, together with the request's other file, SQL, KV and queue changes.
+interface store {
+  /// A stored document: its id and its JSON object, as text.
+  record document {
+    id: string,
+    body: string,
+  }
+
+  /// One end of a range over an index, as JSON scalar text (`"a"`, `3`,
+  /// `true`, `null`).
+  variant bound {
+    unbounded,
+    included(string),
+    excluded(string),
+  }
+
+  /// Documents whose `field` value lies between `lower` and `upper`, in the
+  /// index's order (null < false < true < numbers < strings), then by id.
+  /// Equality is `included(v)` at both ends.
+  record query {
+    /// A dotted path into the document (`user.email`) that has an index.
+    field: string,
+    lower: bound,
+    upper: bound,
+    /// Continue after this cursor, from the previous page.
+    after: option<string>,
+    /// 1 to 1,000.
+    limit: u32,
+  }
+
+  /// One page of a query. `cursor` is set when more may follow.
+  record page {
+    documents: list<document>,
+    cursor: option<string>,
+  }
+
+  record index {
+    field: string,
+    unique: bool,
+  }
+
+  record stats {
+    documents: u64,
+    /// Bytes of the current version of every document, with record headers.
+    live-bytes: u64,
+    /// Bytes of the log, including replaced and deleted versions.
+    log-bytes: u64,
+  }
+
+  /// Errors. A call that returns an error has changed nothing.
+  variant error {
+    /// Collection names are 1-64 ASCII letters, digits, `_` or `-`.
+    invalid-name,
+    /// An id, field, limit or cursor is outside the documented bounds.
+    invalid-argument(string),
+    /// The body is not a JSON object, or a bound is not a JSON scalar.
+    invalid-json(string),
+    /// The change would give two documents the same value in this unique
+    /// index.
+    conflict(string),
+    /// No index on this field.
+    no-such-index(string),
+    /// The object's disk or file quota is full.
+    full,
+    /// Too many collections are open at once; drop one and retry.
+    table-full,
+    /// An I/O or other implementation error.
+    other(string),
+  }
+
+  /// A named collection. Several handles to one name share its state.
+  resource collection {
+    /// Opens a collection. Creates nothing until the first change.
+    open: static async func(name: string) -> result<collection, error>;
+
+    /// The document's JSON, if it exists.
+    get: async func(id: string) -> result<option<string>, error>;
+
+    /// Inserts or replaces a document. `id` is 1-256 bytes; `body` a JSON
+    /// object of at most 1 MiB.
+    put: async func(id: string, body: string) -> result<_, error>;
+
+    /// Removes a document; whether it existed.
+    delete: async func(id: string) -> result<bool, error>;
+
+    /// Up to `limit` (1-1,000) documents in id order, after `after`.
+    scan: async func(after: option<string>, limit: u32) -> result<list<document>, error>;
+
+    query: async func(q: query) -> result<page, error>;
+
+    /// Indexes `field` (a dotted path), including existing documents. A scalar
+    /// value is indexed as itself, each scalar in an array separately; objects
+    /// and missing fields are not indexed. A unique index refuses existing
+    /// duplicates with `conflict`. Creating an existing index is a no-op if
+    /// `unique` matches.
+    create-index: async func(field: string, unique: bool) -> result<_, error>;
+
+    drop-index: async func(field: string) -> result<_, error>;
+
+    indexes: async func() -> result<list<index>, error>;
+
+    stats: async func() -> result<stats, error>;
+
+    /// Rewrites the log without replaced and deleted versions. Changes do this
+    /// on their own once more than half the log (over 1 MiB) is garbage.
+    compact: async func() -> result<_, error>;
+  }
+}
+
+world provider {
+  export store;
+}
+
+world client {
+  import store;
+}
