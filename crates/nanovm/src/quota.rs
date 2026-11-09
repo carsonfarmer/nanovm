@@ -178,25 +178,18 @@ impl QuotaGuard {
         operation: impl std::future::Future<Output = FilesystemResult<()>>,
     ) -> FilesystemResult<()> {
         let src = std::fs::symlink_metadata(from).map_err(|_| ErrorCode::NoEntry)?;
-        let (mut file, mut dir) = (None, false);
-        match std::fs::symlink_metadata(to) {
-            Ok(d) if d.is_file() && src.is_dir() => return Err(ErrorCode::NotDirectory.into()),
-            Ok(d) if d.is_file() => file = Some((self.remove(to, d.len())?, d.len())),
-            Ok(_) => {
-                self.journal(|j| j.removing_dir(to))?;
-                dir = true;
-            }
-            Err(_) => {}
+        let replaced = std::fs::symlink_metadata(to).ok();
+        if replaced.as_ref().is_some_and(|d| d.is_file()) && src.is_dir() {
+            return Err(ErrorCode::NotDirectory.into());
         }
-        let record = match self.journal(|j| j.renaming(from, to)) {
-            Ok(at) => at,
-            Err(e) => {
-                self.restore_rename(to, file, None)?;
-                return Err(e.into());
-            }
-        };
+        let dir = replaced.as_ref().is_some_and(|d| !d.is_file());
+        let (record, slot) = self.journal(|j| j.renaming(from, to, replaced.as_ref()))?;
+        let file = slot.map(|slot| (slot, replaced.as_ref().map_or(0, |d| d.len())));
+        if let Some((_, bytes)) = file {
+            self.adjust(-(bytes as i64), -1);
+        }
         if let Err(e) = operation.await {
-            self.restore_rename(to, file, Some(record))?;
+            self.restore_rename(to, file, record)?;
             return Err(e);
         }
         self.journal(|j| {
@@ -210,25 +203,17 @@ impl QuotaGuard {
         Ok(())
     }
 
-    /// Failed renames restore their staged target even when logging failed.
+    /// A failed rename restores its staged target and cancels its record.
     /// Restoration/cancellation errors poison the journal, so a guest cannot
     /// catch the error and commit the missing target.
-    fn restore_rename(
-        &self,
-        to: &Path,
-        file: Option<(std::path::PathBuf, u64)>,
-        record: Option<u64>,
-    ) -> Result<(), ErrorCode> {
+    fn restore_rename(&self, to: &Path, file: Option<(std::path::PathBuf, u64)>, record: u64) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
         if let Some((slot, bytes)) = file {
             q.journal.restore(&slot, to, bytes).map_err(|_| ErrorCode::Io)?;
             q.bytes += bytes;
             q.files += 1;
         }
-        if let Some(at) = record {
-            q.journal.cancel_rename(at).map_err(|_| ErrorCode::Io)?;
-        }
-        Ok(())
+        q.journal.cancel_rename(record).map_err(|_| ErrorCode::Io)
     }
 
     /// Makes the current request's changes durable.

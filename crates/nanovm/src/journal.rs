@@ -9,29 +9,46 @@
 //!   renamed into the journal if it existed before the request;
 //! - "recreate this", for a removed directory.
 //!
-//! Writes then happen in place, so open files stay valid. Committing syncs
-//! what changed and deletes the log. Rolling back replays it backwards, which
+//! Writes then happen in place, so open files stay valid. Records made
+//! back to back, with no change between them, share one sync. Committing
+//! syncs what changed, then replaces the key the log's records are signed
+//! with, which voids them all. Rolling back replays the log backwards, which
 //! is what [`recover`] does when an instance starts, so a failed request (its
 //! instance is restarted) and a crash take the same path. Recovery drops each
 //! record once undone, so a crash during it resumes where it stopped.
 //!
-//! The log lives beside the volume, at `<objects>/~journal/<object>`, which
-//! no object id can name and no guest path reaches. Paths in it are relative
-//! to `<objects>`: in the volume, or in the journal for a file the guest
-//! still writes after removing it. The log, and the removed files, may each
-//! hold as much as the object's quota.
+//! The log lives beside the volume, at `<objects>/~journal/<object>/log`,
+//! which no object id can name and no guest path reaches. It is made once
+//! and kept: its first block holds a format tag and the key, so a commit
+//! writes and syncs a block that already exists. Records follow, each one
+//! signed, so the end of a request's records is the first that isn't: what
+//! lies past them is left from earlier requests, and a guest chose some of
+//! those bytes (old file contents), but it can't sign them without the key,
+//! which is random and never leaves the log. Paths in it are relative to
+//! `<objects>`: in the volume, or in the journal for a file the guest still
+//! writes after removing it. The log, and the removed files, may each hold
+//! as much as the object's quota during a request; between requests the log
+//! keeps at most `KEEP` bytes.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
+use sha2::{Digest, Sha256};
+
 use crate::object::ObjShared;
 
 const LOG: &str = "log";
+/// The log's format tag, then the key, in its first block; records start in
+/// the next, so writing them never rewrites the key.
+const MAGIC: &[u8; 8] = b"nanovmj1";
+const HEADER: u64 = 4096;
+/// After a commit, a longer log is cut back to this.
+const KEEP: u64 = HEADER + (64 << 10);
 /// Overwritten bytes are kept in records of at most this many.
 const CHUNK: u64 = 1 << 20;
 
@@ -62,6 +79,12 @@ pub struct Journal {
     dir: PathBuf,
     /// Open while the current request has changes.
     log: Option<File>,
+    /// What the current request's records are signed with.
+    key: [u8; 8],
+    /// Where the next record goes.
+    end: u64,
+    /// Records are written that aren't synced yet.
+    unsynced: bool,
     /// Files (by inode) whose size is recorded, and what to sync on commit.
     sized: HashMap<u64, Saved>,
     /// Successful creations, with every guest open of that inode. Weak
@@ -87,7 +110,10 @@ impl Journal {
     pub fn open(volume: &Path, max: u64, obj: Arc<ObjShared>) -> std::io::Result<Journal> {
         let base = volume.parent().expect("a volume has a parent").to_path_buf();
         let dir = base.join("~journal").join(volume.file_name().expect("a volume has a name"));
-        recover(&base, &dir)?;
+        let key = match recover(&base, &dir)? {
+            Some(key) => key,
+            None => key()?,
+        };
         let md = std::fs::metadata(volume)?;
         Ok(Journal {
             base,
@@ -95,6 +121,9 @@ impl Journal {
             root: (md.dev(), md.ino()),
             dir,
             log: None,
+            key,
+            end: HEADER,
+            unsynced: false,
             sized: HashMap::new(),
             created: HashMap::new(),
             unlinked: vec![],
@@ -170,30 +199,67 @@ impl Journal {
 
     /// Appends `undo` and syncs it, before the change it undoes is made.
     fn record(&mut self, undo: Undo) -> std::io::Result<()> {
+        self.append(undo)?;
+        self.sync_log()
+    }
+
+    /// Writes `undo` to the log, unsynced: before the change it undoes is
+    /// made, [`Self::sync_log`] must run. Returns where it is.
+    fn append(&mut self, undo: Undo) -> std::io::Result<u64> {
         self.check()?;
-        let rec = encode(&undo);
+        let rec = encode(&self.key, &undo);
         self.charge(rec.len() as u64, 0)?;
+        let at = self.end;
         // An I/O failure may leave a complete or partial record. Do not
         // permit more mutations or a commit until recovery has run.
-        self.poisoned = true;
-        let t0 = Instant::now();
-        if self.log.is_none() {
-            // The directories the log is first made in must be durable too.
-            std::fs::create_dir_all(&self.dir)?;
-            let log = File::options().create(true).append(true).open(self.dir.join(LOG))?;
-            for d in [&self.dir, self.dir.parent().expect("in ~journal"), &self.base] {
-                sync(d)?;
+        self.or_poison(|j| {
+            if j.log.is_none() {
+                j.log = Some(j.open_log()?);
             }
-            self.log = Some(log);
+            j.log.as_ref().expect("opened above").write_all_at(&rec, at)
+        })?;
+        self.end += rec.len() as u64;
+        self.unsynced = true;
+        Ok(at)
+    }
+
+    /// Makes the records written so far durable.
+    fn sync_log(&mut self) -> std::io::Result<()> {
+        if self.unsynced {
+            self.or_poison(|j| {
+                let log = j.log.as_ref().expect("records were written");
+                waiting(|| {
+                    #[cfg(test)]
+                    tests::sync_point()?;
+                    log.sync_data()
+                })
+            })?;
+            self.unsynced = false;
         }
-        let log = self.log.as_mut().expect("opened above");
-        log.write_all(&rec)?;
-        #[cfg(test)]
-        tests::sync_point()?;
-        log.sync_data()?;
-        self.poisoned = false;
-        self.obj.uncharge(t0.elapsed());
         Ok(())
+    }
+
+    /// Opens the log; if the object never had one, makes it under another
+    /// name, so the log is whole whenever it exists, along with the
+    /// directories it is in.
+    fn open_log(&self) -> std::io::Result<File> {
+        let path = self.dir.join(LOG);
+        match File::options().write(true).open(&path) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            log => return log,
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        let new = self.dir.join("new");
+        let log = File::options().write(true).create(true).truncate(true).open(&new)?;
+        log.write_all_at(&[&MAGIC[..], &self.key].concat(), 0)?;
+        waiting(|| {
+            #[cfg(test)]
+            tests::sync_point()?;
+            log.sync_data()?;
+            std::fs::rename(new, path)?;
+            [&self.dir, self.dir.parent().expect("in ~journal"), &self.base].into_iter().try_for_each(sync)
+        })?;
+        Ok(log)
     }
 
     /// Before `file` is written over `[at, end)`, if it is in the volume:
@@ -205,16 +271,11 @@ impl Journal {
         if self.created.contains_key(&md.ino()) {
             return Ok(());
         }
-        if !self.sized.contains_key(&md.ino()) {
-            self.record(Undo::Size(p.clone(), md.len()))?;
-            self.sized.insert(md.ino(), Saved { len: md.len(), ranges: vec![] });
-            self.touched.insert(p.clone());
-        }
+        let saved = self.sized.get(&md.ino());
         // The parts of `[at, end)` within the original size not saved yet.
-        let saved = &self.sized[&md.ino()];
-        let end = end.min(saved.len);
+        let end = end.min(saved.map_or(md.len(), |s| s.len));
         let (mut gaps, mut from) = (vec![], at);
-        for r in saved.ranges.iter().filter(|r| r.end > at && r.start < end) {
+        for r in saved.iter().flat_map(|s| &s.ranges).filter(|r| r.end > at && r.start < end) {
             if r.start > from {
                 gaps.push(from..r.start);
             }
@@ -223,22 +284,31 @@ impl Journal {
         if from < end {
             gaps.push(from..end);
         }
-        if gaps.is_empty() {
+        if saved.is_some() && gaps.is_empty() {
             return Ok(());
         }
+        if saved.is_none() {
+            self.append(Undo::Size(p.clone(), md.len()))?;
+        }
         // Read through a handle of our own: the guest's may be write-only.
-        let current = File::open(self.base.join(&p))?;
+        let current = if gaps.is_empty() { None } else { Some(File::open(self.base.join(&p))?) };
+        let mut kept = vec![];
         for gap in gaps {
             for at in gap.clone().step_by(CHUNK as usize) {
                 let mut old = vec![0; (gap.end - at).min(CHUNK) as usize];
-                current.read_exact_at(&mut old, at)?;
-                let n = old.len() as u64;
-                self.record(Undo::Bytes(p.clone(), at, old))?;
-                // Only a durable record protects a range, including when a
-                // later chunk fails and the caller retries the whole write.
-                save(&mut self.sized.get_mut(&md.ino()).expect("sized above").ranges, at..at + n);
+                current.as_ref().expect("opened for gaps").read_exact_at(&mut old, at)?;
+                kept.push(at..at + old.len() as u64);
+                self.append(Undo::Bytes(p.clone(), at, old))?;
             }
         }
+        self.sync_log()?;
+        // Only a durable record protects a size or a range, including when
+        // a later chunk fails and the caller retries the whole write.
+        let saved = self.sized.entry(md.ino()).or_insert_with(|| Saved { len: md.len(), ranges: vec![] });
+        for r in kept {
+            save(&mut saved.ranges, r);
+        }
+        self.touched.insert(p);
         Ok(())
     }
 
@@ -319,8 +389,7 @@ impl Journal {
     /// journal: where it now is.
     pub fn remove(&mut self, path: &Path, bytes: u64) -> std::io::Result<PathBuf> {
         self.charge(0, bytes)?;
-        self.slots += 1;
-        let slot = self.dir.join(self.slots.to_string());
+        let slot = self.slot();
         let p = self.rel(path);
         let result = self.record(Undo::Renamed(p.clone(), self.rel(&slot)))
             .and_then(|()| std::fs::rename(path, &slot));
@@ -332,13 +401,52 @@ impl Journal {
         Ok(slot)
     }
 
-    /// Before `from` is renamed to `to`, where nothing is or an empty
-    /// directory (removed with [`Self::removing_dir`]) is.
-    pub fn renaming(&mut self, from: &Path, to: &Path) -> std::io::Result<u64> {
+    fn slot(&mut self) -> PathBuf {
+        self.slots += 1;
+        self.dir.join(self.slots.to_string())
+    }
+
+    /// Before `from` is renamed to `to`, where `replaced` is: a file there
+    /// is moved into the journal, to the slot returned; an empty directory
+    /// is recorded to be made again. One sync covers the records. Also
+    /// returns where the rename's own record is, to cancel it if the rename
+    /// fails.
+    pub fn renaming(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        replaced: Option<&std::fs::Metadata>,
+    ) -> std::io::Result<(u64, Option<PathBuf>)> {
+        let bytes = replaced.filter(|md| md.is_file()).map_or(0, |md| md.len());
+        self.charge(0, bytes)?;
         let (from, to) = (self.rel(from), self.rel(to));
-        let at = self.held.0;
-        self.record(Undo::Renamed(from.clone(), to.clone()))?;
-        Ok(at)
+        let staged = (|| -> std::io::Result<_> {
+            let slot = match replaced {
+                Some(md) if md.is_file() => {
+                    let slot = self.slot();
+                    self.append(Undo::Renamed(to.clone(), self.rel(&slot)))?;
+                    Some(slot)
+                }
+                Some(_) => {
+                    self.append(Undo::RemovedDir(to.clone()))?;
+                    None
+                }
+                None => None,
+            };
+            let at = self.append(Undo::Renamed(from, to.clone()))?;
+            self.sync_log()?;
+            Ok((at, slot))
+        })();
+        let (at, slot) = staged.inspect_err(|_| self.held.1 -= bytes)?;
+        if let Some(slot) = &slot {
+            if let Err(e) = std::fs::rename(self.base.join(&to), slot) {
+                self.held.1 -= bytes;
+                self.cancel_rename(at)?;
+                return Err(e);
+            }
+            self.touch_parent(&to);
+        }
+        Ok((at, slot))
     }
 
     /// Only a successful syscall moves the dirty paths to their new names.
@@ -373,8 +481,9 @@ impl Journal {
     /// operations' records. Cancelled records still consume log budget.
     pub fn cancel_rename(&mut self, at: u64) -> std::io::Result<()> {
         self.or_poison(|j| {
-            let log = File::options().write(true).open(j.dir.join(LOG))?;
-            log.write_all_at(&[5], at + 8)?;
+            let log = j.log.as_ref().expect("the rename was recorded");
+            // Past the signature, the length, and the tag's own length.
+            log.write_all_at(&[5], at + 24)?;
             #[cfg(test)]
             tests::sync_point()?;
             log.sync_data()
@@ -410,13 +519,22 @@ impl Journal {
         // log must not make a second commit look like an empty successful one.
         self.poisoned = true;
         let t0 = Instant::now();
-        for p in self.touched.drain() {
-            sync_if_there(&self.base.join(p))?;
+        let key = key()?;
+        waiting(|| {
+            for p in self.touched.drain() {
+                sync_if_there(&self.base.join(p))?;
+            }
+            // A new key is the commit: no record is signed with it.
+            log.write_all_at(&key, MAGIC.len() as u64)?;
+            #[cfg(test)]
+            tests::sync_point()?;
+            log.sync_data()
+        })?;
+        self.key = key;
+        if self.end > KEEP {
+            log.set_len(KEEP)?;
         }
-        drop(log);
-        // Deleting the log is the commit.
-        std::fs::remove_file(self.dir.join(LOG))?;
-        sync(&self.dir)?;
+        (self.end, self.unsynced) = (HEADER, false);
         self.obj.uncharge(t0.elapsed());
         clear(&self.dir)?;
         self.sized.clear();
@@ -427,20 +545,24 @@ impl Journal {
     }
 }
 
-/// Rolls back the log in `dir` if there is one, then empties `dir`. Failure
-/// leaves the current undo intact and refuses to start the object. Only
-/// already-applied or never-performed operations may be skipped.
-fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
+/// Rolls back the log in `dir` if there is one, then empties `dir` but for
+/// the log, and returns its key. Failure leaves the current undo intact and
+/// refuses to start the object. Only already-applied or never-performed
+/// operations may be skipped.
+fn recover(base: &Path, dir: &Path) -> std::io::Result<Option<[u8; 8]>> {
     let log = match std::fs::read(dir.join(LOG)) {
         Ok(log) => log,
-        Err(e) if e.kind() == ErrorKind::NotFound => return clear(dir),
+        Err(e) if e.kind() == ErrorKind::NotFound => return clear(dir).map(|()| None),
         Err(e) => return Err(e),
+    };
+    let Some(key) = log.strip_prefix(MAGIC).and_then(|k| k.get(..8)?.try_into().ok()) else {
+        return Err(std::io::Error::new(ErrorKind::InvalidData, "not a journal log"));
     };
     // Each record is dropped from the log once undone and synced, so a crash
     // here resumes where it stopped; the undo it was in may run twice, which
     // each tolerates. A record cut short by a crash was never acted on.
     let file = File::options().write(true).open(dir.join(LOG))?;
-    for (at, undo) in decode(&log).into_iter().rev() {
+    for (at, undo) in decode(&log, &key).into_iter().rev() {
         let abs = |p: &PathBuf| base.join(p);
         let open = |p: &PathBuf| File::options().write(true).open(abs(p));
         match &undo {
@@ -488,37 +610,75 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<()> {
         tests::sync_point()?;
         file.sync_data()?;
     }
-    std::fs::remove_file(dir.join(LOG))?;
-    sync(dir)?;
-    clear(dir)
+    file.set_len(file.metadata()?.len().min(KEEP))?;
+    clear(dir)?;
+    Ok(Some(key))
 }
 
-/// A record: a tag, then its fields; a path or bytes as a length and the
-/// bytes, a number as 8 bytes.
-fn encode(undo: &Undo) -> Vec<u8> {
-    let mut buf = vec![];
+/// A key no guest can guess.
+fn key() -> std::io::Result<[u8; 8]> {
+    let mut key = [0; 8];
+    // SAFETY: getentropy writes at most `key.len()` bytes into `key`.
+    if unsafe { libc::getentropy(key.as_mut_ptr().cast(), key.len()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(key)
+}
+
+/// A record's signature: SHA-256 of the key and its body, with a cancelled
+/// rename's tag read as the rename's, since cancelling changes only that.
+fn sign(key: &[u8; 8], body: &[u8]) -> [u8; 8] {
+    let tag = [if body[8] == 5 { 4 } else { body[8] }];
+    let sum = Sha256::new().chain_update(key).chain_update(&body[..8]).chain_update(tag).chain_update(&body[9..]);
+    sum.finalize()[..8].try_into().expect("8 of 32 bytes")
+}
+
+/// A record: its signature and the length of its body, then the body: a
+/// tag, then its fields; a path or bytes as a length and the bytes, a
+/// number as 8 bytes.
+fn encode(key: &[u8; 8], undo: &Undo) -> Vec<u8> {
+    let mut buf = vec![0; 16];
     let mut put = |b: &[u8]| {
         buf.extend((b.len() as u64).to_le_bytes());
         buf.extend(b);
     };
-    let p = |p: &PathBuf| p.as_os_str().as_encoded_bytes().to_vec();
-    let (tag, fields): (u8, Vec<Vec<u8>>) = match undo {
-        Undo::Size(a, n) => (0, vec![p(a), n.to_le_bytes().to_vec()]),
-        Undo::Bytes(a, at, data) => (1, vec![p(a), at.to_le_bytes().to_vec(), data.clone()]),
-        Undo::Created(a) => (2, vec![p(a)]),
-        Undo::RemovedDir(a) => (3, vec![p(a)]),
-        Undo::Renamed(a, b) => (4, vec![p(a), p(b)]),
+    fn p(p: &Path) -> &[u8] {
+        p.as_os_str().as_encoded_bytes()
+    }
+    let fields: &[&[u8]] = match undo {
+        Undo::Size(a, n) => &[&[0], p(a), &n.to_le_bytes()],
+        Undo::Bytes(a, at, data) => &[&[1], p(a), &at.to_le_bytes(), data],
+        Undo::Created(a) => &[&[2], p(a)],
+        Undo::RemovedDir(a) => &[&[3], p(a)],
+        Undo::Renamed(a, b) => &[&[4], p(a), p(b)],
         Undo::Cancelled => unreachable!("only made by cancelling a rename's tag"),
     };
-    put(&[tag]);
     fields.iter().for_each(|f| put(f));
+    let len = (buf.len() - 16) as u64;
+    let sum = sign(key, &buf[16..]);
+    buf[..8].copy_from_slice(&sum);
+    buf[8..16].copy_from_slice(&len.to_le_bytes());
     buf
 }
 
-/// The records in `log`, with where each starts, up to the first incomplete
-/// one.
-fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
-    let len = log.len();
+/// The records signed with `key` in `log`, with where each starts, up to the
+/// first that isn't.
+fn decode(log: &[u8], key: &[u8; 8]) -> Vec<(u64, Undo)> {
+    let mut at = HEADER as usize;
+    std::iter::from_fn(|| {
+        let rec = log.get(at..)?;
+        let len = usize::try_from(u64::from_le_bytes(rec.get(8..16)?.try_into().ok()?)).ok()?;
+        let body = rec.get(16..16usize.checked_add(len)?)?;
+        (body.len() > 8 && rec[..8] == sign(key, body)).then_some(())?;
+        let found = (at as u64, undo(body)?);
+        at += 16 + len;
+        Some(found)
+    })
+    .collect()
+}
+
+/// The undo encoded in `body`.
+fn undo(mut log: &[u8]) -> Option<Undo> {
     fn bytes(log: &mut &[u8]) -> Option<Vec<u8>> {
         let (n, rest) = log.split_at_checked(8)?;
         let (b, rest) = rest.split_at_checked(usize::try_from(u64::from_le_bytes(n.try_into().ok()?)).ok()?)?;
@@ -532,26 +692,20 @@ fn decode(mut log: &[u8]) -> Vec<(u64, Undo)> {
         // SAFETY: written from an `OsStr`'s encoded bytes.
         Some(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(bytes(log)?) }.into())
     }
-    let next = |log: &mut &[u8]| -> Option<Undo> {
-        Some(match bytes(log)?[..] {
-            [0] => Undo::Size(path(log)?, num(log)?),
-            [1] => Undo::Bytes(path(log)?, num(log)?, bytes(log)?),
-            [2] => Undo::Created(path(log)?),
-            [3] => Undo::RemovedDir(path(log)?),
-            [4] => Undo::Renamed(path(log)?, path(log)?),
-            [5] => {
-                path(log)?;
-                path(log)?;
-                Undo::Cancelled
-            }
-            _ => return None,
-        })
-    };
-    std::iter::from_fn(|| {
-        let at = (len - log.len()) as u64;
-        Some((at, next(&mut log)?))
+    let log = &mut log;
+    Some(match bytes(log)?[..] {
+        [0] => Undo::Size(path(log)?, num(log)?),
+        [1] => Undo::Bytes(path(log)?, num(log)?, bytes(log)?),
+        [2] => Undo::Created(path(log)?),
+        [3] => Undo::RemovedDir(path(log)?),
+        [4] => Undo::Renamed(path(log)?, path(log)?),
+        [5] => {
+            path(log)?;
+            path(log)?;
+            Undo::Cancelled
+        }
+        _ => return None,
     })
-    .collect()
 }
 
 /// Adds `r`, disjoint from the sorted, disjoint `ranges`, merged with the
@@ -567,7 +721,8 @@ fn save(ranges: &mut Vec<std::ops::Range<u64>>, r: std::ops::Range<u64>) {
     }
 }
 
-/// Removes everything in `dir` (slots left by a commit or a rollback).
+/// Removes everything in `dir` but the log (slots left by a commit or a
+/// rollback).
 fn clear(dir: &Path) -> std::io::Result<()> {
     match std::fs::read_dir(dir) {
         Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
@@ -575,8 +730,24 @@ fn clear(dir: &Path) -> std::io::Result<()> {
         Ok(mut entries) => entries.try_for_each(|entry| {
             let e = entry?;
             let p = e.path();
-            if e.file_type()?.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) }
+            match () {
+                _ if e.file_name() == LOG => Ok(()),
+                _ if e.file_type()?.is_dir() => std::fs::remove_dir_all(p),
+                _ => std::fs::remove_file(p),
+            }
         }),
+    }
+}
+
+/// Runs `f`, which waits for the disk, on this thread while the runtime's
+/// other tasks move to another. Blocking the worker thread instead capped
+/// a node at as many syncs in flight as it has worker threads, though a
+/// disk completes many concurrent syncs in about the time of one.
+fn waiting<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
     }
 }
 
@@ -674,17 +845,22 @@ mod tests {
         file.write_all_at(data, at).unwrap();
     }
 
-    /// Renames as the filesystem host does: a file in the way goes into the
-    /// journal, then the rename is recorded and made.
+    /// Renames as the filesystem host does: the rename is recorded and a
+    /// file in the way goes into the journal, then the rename is made.
     fn rename(j: &mut Journal, v: &Path, from: &str, to: &str) {
         let (from, to) = (v.join(from), v.join(to));
-        let replaced = std::fs::metadata(&to).ok().map(|md| (j.remove(&to, md.len()).unwrap(), md.len()));
-        j.renaming(&from, &to).unwrap();
+        let replaced = std::fs::symlink_metadata(&to).ok();
+        let (_, slot) = j.renaming(&from, &to, replaced.as_ref()).unwrap();
         std::fs::rename(&from, &to).unwrap();
         j.renamed(&from, &to);
-        if let Some((slot, bytes)) = replaced {
-            j.discard_created(&slot, bytes).unwrap();
+        if let Some(slot) = slot {
+            j.discard_created(&slot, replaced.unwrap().len()).unwrap();
         }
+    }
+
+    /// The key the log's records are signed with now.
+    fn signed_with(j: &Journal) -> Vec<u8> {
+        std::fs::read(j.dir.join(LOG)).unwrap()[8..16].to_vec()
     }
 
     #[test]
@@ -716,9 +892,14 @@ mod tests {
         /// Undos recovery may apply before a simulated crash.
         static CRASH_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
         static FAIL_SYNC_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+        /// Syncs so far, and how long each takes on top of the disk's time.
+        static SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static SLOW: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
     }
 
     pub(super) fn sync_point() -> std::io::Result<()> {
+        SYNCS.set(SYNCS.get() + 1);
+        std::thread::sleep(SLOW.get());
         FAIL_SYNC_AFTER.with(|c| match c.get() {
             Some(0) => Err(std::io::Error::from_raw_os_error(libc::EIO)),
             n => Ok(c.set(n.map(|n| n - 1))),
@@ -777,7 +958,8 @@ mod tests {
         assert_eq!(tree(&v), after);
         assert_eq!(std::fs::read(v.join("d/a2")).unwrap(), b"hello WORLD, again");
         assert_eq!(std::fs::read(v.join("f")).unwrap(), b"new");
-        assert_eq!(std::fs::read_dir(&j.dir).unwrap().count(), 0, "the journal is empty");
+        let left: Vec<_> = std::fs::read_dir(&j.dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [LOG], "the journal holds only its log");
     }
 
     /// A real filesystem error must preserve the undo, not turn a failed
@@ -838,7 +1020,7 @@ mod tests {
                     change(&mut j, &v);
                 }
                 let changed = tree(&v);
-                let log = j.dir.join(LOG);
+                let key = (phase == "commit").then(|| signed_with(&j));
                 FAIL_SYNC_AFTER.set(Some(after));
                 let failed = match phase {
                     "record" => {
@@ -852,9 +1034,9 @@ mod tests {
                 if failed && phase != "recover" {
                     assert!(j.commit().is_err(), "{phase}: a failed sync poisons the instance");
                 }
-                // Once the log is unlinked, a failed commit sync has an
+                // Once the key is replaced, a failed commit sync has an
                 // ambiguous durable outcome; on this running kernel it is new.
-                let expected = if phase == "commit" && !log.exists() { &changed } else { &before };
+                let expected = if key.is_some_and(|k| k != signed_with(&j)) { &changed } else { &before };
                 drop(j);
                 open(&v);
                 assert_eq!(&tree(&v), expected, "{phase} sync cut {after}");
@@ -876,8 +1058,8 @@ mod tests {
             let before = tree(&v);
             let mut j = open(&v);
             change(&mut j, &v);
-            let mut log = File::options().append(true).open(j.dir.join(LOG)).unwrap();
-            log.write_all(&encode(&Undo::Created(PathBuf::from("o/a")))[..9]).unwrap();
+            j.append(Undo::Created(PathBuf::from("o/a"))).unwrap();
+            j.log.as_ref().unwrap().set_len(j.end - 1).unwrap();
             drop(j);
             CRASH_AFTER.with(|c| c.set(Some(after)));
             let crashed = reopen(&v, 1 << 30).is_err();
@@ -984,8 +1166,8 @@ mod tests {
         let handle = Arc::new(File::open(&to).unwrap());
         j.opened(&handle).unwrap();
         let ino = handle.metadata().unwrap().ino();
-        let slot = j.remove(&to, 3).unwrap();
-        let at = j.renaming(&v.join("a"), &to).unwrap();
+        let (at, slot) = j.renaming(&v.join("a"), &to, Some(&std::fs::metadata(&to).unwrap())).unwrap();
+        let slot = slot.unwrap();
         assert!(
             j.touched.contains(Path::new("o/a")),
             "dirty source must still be synced after failure"
@@ -1018,8 +1200,8 @@ mod tests {
             j.creating(&from).unwrap();
             std::fs::write(&from, b"new").unwrap();
             j.created(&from).unwrap();
-            let slot = j.remove(&to, 2).unwrap();
-            let at = j.renaming(&from, &to).unwrap();
+            let (at, slot) = j.renaming(&from, &to, Some(&std::fs::metadata(&to).unwrap())).unwrap();
+            let slot = slot.unwrap();
             j.restore(&slot, &to, 2).unwrap();
             j.cancel_rename(at).unwrap();
             j.unlink(&from, 3).unwrap();
@@ -1035,6 +1217,132 @@ mod tests {
             assert_eq!(tree(&v), before, "recovery interrupted at {after}");
             std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
         }
+    }
+
+    /// What lies in the log past the current request's records is left from
+    /// earlier requests, or was never written by the journal: none of it is
+    /// undone, whether signed with an old key or a guessed one.
+    #[test]
+    fn only_the_current_requests_records_are_undone() {
+        let v = volume();
+        let mut j = open(&v);
+        change(&mut j, &v);
+        j.commit().unwrap();
+        let committed = tree(&v);
+        let old = j.key;
+        write(&mut j, &v, "d/a2", 0, b"X");
+        let stale = std::fs::metadata(j.dir.join(LOG)).unwrap().len();
+        assert!(stale > j.end + 200, "earlier records lie past this one");
+        // A record a guest might plant: replayed, it would empty a file.
+        let forged = Undo::Size(PathBuf::from("o/d/a2"), 0);
+        for key in [old, [0; 8]] {
+            j.log.as_ref().unwrap().write_all_at(&encode(&key, &forged), j.end).unwrap();
+            drop(reopen(&v, 1 << 30).unwrap());
+            assert_eq!(tree(&v), committed);
+        }
+    }
+
+    /// A log from another format is refused, not taken as empty: rolling
+    /// nothing back would keep what a crash left half done.
+    #[test]
+    fn a_log_of_another_format_is_refused() {
+        let v = volume();
+        let log = v.parent().unwrap().join("~journal/o/log");
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        // The previous format: unsigned records from the start.
+        let old = [&[1, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0][..], b"o/a"].concat();
+        std::fs::write(&log, &old).unwrap();
+        let e = reopen(&v, 1 << 30).err().expect("an unknown log must be refused");
+        assert_eq!(e.kind(), ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&log).unwrap(), old);
+    }
+
+    /// A log is whole whenever it is there: one cut short while being made
+    /// is left under another name, which recovery clears.
+    #[test]
+    fn a_log_cut_short_while_made_is_ignored() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        FAIL_SYNC_AFTER.set(Some(0));
+        let f = File::options().write(true).open(v.join("a")).unwrap();
+        assert!(j.writing(&f, 0, 1).is_err());
+        FAIL_SYNC_AFTER.set(None);
+        drop(j);
+        assert!(!v.parent().unwrap().join("~journal/o/log").exists());
+        let mut j = open(&v);
+        assert_eq!(tree(&v), before);
+        write(&mut j, &v, "a", 0, b"H");
+        j.commit().unwrap();
+        let left: Vec<_> = std::fs::read_dir(&j.dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, [LOG]);
+    }
+
+    /// The log keeps the space a big request needed only up to `KEEP`.
+    #[test]
+    fn the_log_shrinks_after_a_big_request() {
+        let v = volume();
+        std::fs::write(v.join("big"), vec![1; 200 << 10]).unwrap();
+        let mut j = open(&v);
+        write(&mut j, &v, "big", 0, &vec![2; 200 << 10]);
+        j.commit().unwrap();
+        assert_eq!(std::fs::metadata(j.dir.join(LOG)).unwrap().len(), KEEP);
+        write(&mut j, &v, "big", 0, b"3");
+        drop(j);
+        open(&v);
+        assert_eq!(std::fs::read(v.join("big")).unwrap(), vec![2; 200 << 10]);
+    }
+
+    /// What a request pays in syncs once its object has a log: one per
+    /// change that destroys something, however many records it takes
+    /// (renaming over a file takes two, overwriting a file's start two),
+    /// then one per changed path and one for the key.
+    #[test]
+    fn records_made_together_share_a_sync() {
+        let v = volume();
+        let mut j = open(&v);
+        write(&mut j, &v, "f", 0, b"F");
+        j.commit().unwrap();
+        let syncs = |j: &mut Journal, f: &dyn Fn(&mut Journal)| {
+            SYNCS.set(0);
+            f(j);
+            SYNCS.get()
+        };
+        assert_eq!(syncs(&mut j, &|j| write(j, &v, "a", 0, b"HELLO")), 1);
+        assert_eq!(syncs(&mut j, &|j| j.creating(&v.join("n")).unwrap()), 1);
+        std::fs::write(v.join("n"), "new").unwrap();
+        j.created(&v.join("n")).unwrap();
+        assert_eq!(syncs(&mut j, &|j| rename(j, &v, "n", "f")), 1);
+        // `a`, `f` and the volume, then the key.
+        assert_eq!(syncs(&mut j, &|j| j.commit().unwrap()), 4);
+    }
+
+    /// A sync waits on another thread's time: the runtime's other tasks go
+    /// on meanwhile, even on a runtime with one worker thread.
+    #[test]
+    fn other_tasks_run_while_a_sync_waits() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_time().build().unwrap();
+        rt.block_on(async {
+            let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let counter = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            });
+            tokio::spawn(async {
+                let v = volume();
+                let mut j = open(&v);
+                SLOW.set(std::time::Duration::from_millis(100));
+                write(&mut j, &v, "a", 0, b"slow");
+                SLOW.set(std::time::Duration::ZERO);
+            })
+            .await
+            .unwrap();
+            let n = ticks.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(n > 100, "the other task ran {n} times");
+        });
     }
 
     /// A file opened write-only can be written over: the bytes it replaces
@@ -1076,7 +1384,7 @@ mod tests {
     #[test]
     fn the_journal_is_bounded() {
         let v = volume();
-        let mut j = reopen(&v, 100).unwrap();
+        let mut j = reopen(&v, 130).unwrap();
         let a = File::options().read(true).write(true).open(v.join("a")).unwrap();
         j.writing(&a, 0, 5).unwrap();
         for _ in 0..2 {
@@ -1121,7 +1429,7 @@ mod tests {
             for _ in 0..1000 {
                 write(&mut j, &v, "renamed", 0, b"abcdefghijklmnop");
             }
-            let payload: usize = decode(&std::fs::read(j.dir.join(LOG)).unwrap())
+            let payload: usize = decode(&std::fs::read(j.dir.join(LOG)).unwrap(), &j.key)
                 .iter()
                 .map(|(_, u)| match u {
                     Undo::Bytes(_, _, bytes) => bytes.len(),
@@ -1164,7 +1472,7 @@ mod tests {
             j.unlink(&v.join("new"), 2048).unwrap();
             assert_eq!(j.held.1, 11);
             assert!(j.created.is_empty(), "no stale identity can survive inode reuse");
-            let count = decode(&std::fs::read(j.dir.join(LOG)).unwrap()).len();
+            let count = decode(&std::fs::read(j.dir.join(LOG)).unwrap(), &j.key).len();
             assert!(count < 14, "exercise every recovery cut");
             drop(j);
             CRASH_AFTER.with(|c| c.set(Some(after)));

@@ -307,13 +307,14 @@ fn disk_ops(dev: &str) -> [u64; 3] {
 async fn writes() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let rounds = args.iter().position(|a| a == "--writes").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(1);
+    let scale = if args.iter().any(|a| a == "--quick") { 10 } else { 1 };
     let n = node("writes", "counter", 200, None)?;
     load(&n, "POST", "/incr", 100, 64, |i| format!("o{}", i % 100)).await;
     for _ in 0..rounds {
         for (method, name, total, conc, objects) in [
             ("GET", "serial", 2_000, 1, 1),
-            ("POST", "serial", 2_000, 1, 1),
-            ("POST", "concurrent", 20_000, 256, 100),
+            ("POST", "serial", 2_000 / scale, 1, 1),
+            ("POST", "concurrent", 20_000 / scale, 256, 100),
         ] {
             let path = if method == "GET" { "/" } else { "/incr" };
             let dev = std::env::var("NANOVM_BENCH_DEV").unwrap_or_default();
