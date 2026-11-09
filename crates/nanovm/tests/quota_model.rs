@@ -7,6 +7,7 @@
 //! always equals the model's.
 //!
 //! The test component is `crates/nanovm/tests/fsops` (outside guests/**).
+//! Notes, coverage and the mutations it kills: `notes/quality.md` (D-46).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -22,10 +23,11 @@ use proptest::prelude::*;
 mod load;
 
 const MAX_BYTES: u64 = 1 << 20;
-const MAX_FILES: u64 = 12;
+const MAX_FILES: u64 = 4;
 /// How close the request's undo log may come to its budget (the quota)
-/// before the model accepts the journal refusing as a full disk.
-const LOG_SLACK: u64 = 16 << 10;
+/// before the model can't tell where the journal refuses a write, as a full
+/// disk: that depends on how the write's stream is chunked.
+const LOG_SLACK: u64 = 64 << 10;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
@@ -85,7 +87,11 @@ struct Log {
     /// Files present when the request began: their size then, and the byte
     /// ranges of it saved.
     original: HashMap<u64, (u64, Vec<(u64, u64)>)>,
+    /// Old bytes saved in the undo log.
     bytes: u64,
+    /// Bytes of removed files the journal holds (their own budget, also the
+    /// quota): a file present when the request began, until it ends.
+    removed: u64,
 }
 
 impl Log {
@@ -94,7 +100,7 @@ impl Log {
             Entry::File(id, c) => Some((*id, (c.len() as u64, vec![]))),
             Entry::Dir => None,
         }).collect();
-        Log { original, bytes: 0 }
+        Log { original, bytes: 0, removed: 0 }
     }
 
     /// Saves what of `[at, end)` of file `id` was there when the request
@@ -118,6 +124,18 @@ impl Log {
 
     fn near_full(&self) -> bool {
         self.bytes + LOG_SLACK >= MAX_BYTES
+    }
+
+    /// Removes file `id` of `len` bytes into the journal, if its budget has
+    /// room; a file created in this request is held only while removing.
+    fn remove(&mut self, id: u64, len: u64) -> bool {
+        if self.removed + len > MAX_BYTES {
+            return false;
+        }
+        if self.original.contains_key(&id) {
+            self.removed += len;
+        }
+        true
     }
 }
 
@@ -198,6 +216,11 @@ impl Model {
                 if matches!(src, Entry::Dir) && b.starts_with(&format!("{a}/")) {
                     return "error";
                 }
+                if let Some(Entry::File(id, c)) = self.tree.get(b)
+                    && !log.remove(*id, c.len() as u64)
+                {
+                    return "insufficient-space";
+                }
                 // Moves `a` and, for a directory, everything under it.
                 let moved: Vec<String> = std::iter::once(a.clone()).chain(self.children(a)).collect();
                 let entries: Vec<(String, Entry)> =
@@ -206,10 +229,12 @@ impl Model {
                 "ok"
             }
             Op::Unlink(p) => match self.tree.get(p) {
-                Some(Entry::File(..)) => {
+                // A new file without open descriptors is just deleted.
+                Some(Entry::File(id, c)) if !log.original.contains_key(id) || log.remove(*id, c.len() as u64) => {
                     self.tree.remove(p);
                     "ok"
                 }
+                Some(Entry::File(..)) => "insufficient-space",
                 _ => "error",
             },
             Op::Mkdir(p) => {
@@ -233,8 +258,24 @@ impl Model {
     }
 }
 
-/// What is on disk under `volume`, as the model writes it (identities aside).
-fn on_disk(volume: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+/// A file's contents as runs, `byte x count`, for readable differences.
+fn runs(c: &[u8]) -> String {
+    let mut out: Vec<String> = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        let n = c[i..].iter().take_while(|&&b| b == c[i]).count();
+        out.push(format!("{}x{n}", c[i]));
+        i += n;
+    }
+    format!("[{}]", out.join(" "))
+}
+
+/// What is on disk under `volume`: each file's runs, or `dir`.
+fn on_disk(volume: &Path) -> BTreeMap<String, String> {
+    raw(volume).into_iter().map(|(k, v)| (k, v.map_or("dir".into(), |c| runs(&c)))).collect()
+}
+
+fn raw(volume: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
     let mut out = BTreeMap::new();
     let mut stack = vec![volume.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -252,8 +293,8 @@ fn on_disk(volume: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
     out
 }
 
-fn expected(m: &Model) -> BTreeMap<String, Option<Vec<u8>>> {
-    m.tree.iter().map(|(k, e)| (k.clone(), match e { Entry::Dir => None, Entry::File(_, c) => Some(c.clone()) })).collect()
+fn expected(m: &Model) -> BTreeMap<String, String> {
+    m.tree.iter().map(|(k, e)| (k.clone(), match e { Entry::Dir => "dir".into(), Entry::File(_, c) => runs(c) })).collect()
 }
 
 struct Fixture {
@@ -288,6 +329,10 @@ fn fixture() -> &'static Fixture {
     })
 }
 
+/// How often each op gave each result, and requests by kind: printed at
+/// the end, to show the cases cover quota and journal refusals.
+static STATS: std::sync::Mutex<BTreeMap<String, usize>> = std::sync::Mutex::new(BTreeMap::new());
+
 #[derive(Clone, Debug)]
 struct Step {
     ops: Vec<Op>,
@@ -295,8 +340,10 @@ struct Step {
     probe: bool,
 }
 
+/// More than `MAX_FILES` paths, mostly at the top or in `d`, so entries,
+/// renames across directories and the entry limit all come up.
 fn path() -> impl Strategy<Value = String> {
-    prop::sample::select(vec!["a", "b", "d", "d/a", "d/b", "d/e", "d/e/a", "f", "f/a"]).prop_map(String::from)
+    prop::sample::select(vec!["a", "b", "c", "d", "d", "d/a", "d/b", "d/e", "d/e/a"]).prop_map(String::from)
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -307,9 +354,9 @@ fn op() -> impl Strategy<Value = Op> {
         4 => (path(), offset, len, any::<u8>()).prop_map(|(p, o, l, b)| Op::Write(p, o, l, b)),
         2 => (path(), size).prop_map(|(p, s)| Op::Truncate(p, s)),
         3 => (path(), path()).prop_map(|(a, b)| Op::Rename(a, b)),
-        1 => path().prop_map(Op::Unlink),
+        2 => path().prop_map(Op::Unlink),
         2 => path().prop_map(Op::Mkdir),
-        1 => path().prop_map(Op::Rmdir),
+        2 => path().prop_map(Op::Rmdir),
     ]
 }
 
@@ -329,31 +376,38 @@ fn run(steps: &[Step]) {
         for (n, s) in steps.iter().enumerate() {
             let mut next = model.clone();
             let mut log = Log::begin(&model);
-            // Each op's expected result, and whether the undo log is nearly
-            // full once it ran (so the journal may refuse it).
-            let (lines, full): (Vec<String>, Vec<bool>) = s.ops.iter()
-                .map(|op| (format!("{} => {}", op.line(), next.apply(op, &mut log)), log.near_full()))
-                .unzip();
+            // Each op's expected result. Once the undo log is nearly full,
+            // where the journal refuses a write is unknown: that op may also
+            // give `insufficient-space`, its file is read back afterwards,
+            // and the request's later ops are left out.
+            let (mut lines, mut unsure) = (vec![], None);
+            for op in &s.ops {
+                let result = next.apply(op, &mut log);
+                if let (true, Op::Write(p, ..) | Op::Truncate(p, _)) = (log.near_full(), op) {
+                    lines.push(format!("{} => {result}|insufficient-space", op.line()));
+                    unsure = Some(p.clone());
+                    break;
+                }
+                lines.push(format!("{} => {result}", op.line()));
+            }
+            for l in &lines {
+                let (op, result) = l.split_once(" => ").unwrap();
+                let key = format!("{} {result}", op.split(' ').next().unwrap());
+                *STATS.lock().unwrap().entry(key).or_default() += 1;
+            }
+            *STATS.lock().unwrap().entry(format!("request commit={} probe={}", s.commit, s.probe)).or_default() += 1;
             let r = send("POST", &format!("/ops?commit={}", s.commit as u8), &lines.join("\n")).await;
             let committed = match (r.status, r.body.as_str()) {
                 (200, "matched") => true,
-                (500, body) if body.contains("mismatch") => {
-                    // `mismatch <line> <actual>`: only a nearly full undo log
-                    // may refuse what the quota allows, as a full disk.
-                    let detail = body.split("mismatch ").nth(1).unwrap_or_default();
-                    let mut words = detail.split(|c: char| !c.is_ascii_alphanumeric() && c != '-');
-                    let line: usize = words.next().and_then(|w| w.parse().ok()).unwrap_or(usize::MAX);
-                    let actual = words.next().unwrap_or_default();
-                    assert!(
-                        actual == "insufficient-space" && full.get(line) == Some(&true),
-                        "step {n}:\n{}\nop {line} gave {actual}: {}\nsteps: {steps:#?}", lines.join("\n"), r.body
-                    );
-                    false
-                }
-                (500, body) if body.contains("matched") && !s.commit => false,
-                _ => panic!("step {n}: {} {}\nsteps: {steps:#?}", r.status, r.body),
+                (500, body) if body.contains("matched") && !body.contains("mismatch") && !s.commit => false,
+                _ => panic!("step {n}:\n{}\n{} {}\nsteps: {steps:#?}", lines.join("\n"), r.status, r.body),
             };
             if committed {
+                if let Some(p) = unsure
+                    && let Some(Entry::File(_, c)) = next.tree.get_mut(&p)
+                {
+                    *c = std::fs::read(volume.join(&p)).unwrap();
+                }
                 model = next;
             }
             if s.probe {
@@ -374,10 +428,20 @@ fn run(steps: &[Step]) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 64, max_shrink_iters: 200, failure_persistence: None, ..ProptestConfig::default() })]
+    // QUOTA_MODEL_CASES=1000 for a longer run.
+    #![proptest_config(ProptestConfig {
+        cases: std::env::var("QUOTA_MODEL_CASES").ok().and_then(|c| c.parse().ok()).unwrap_or(64),
+        max_shrink_iters: 200, failure_persistence: None, ..ProptestConfig::default()
+    })]
 
     #[test]
     fn quota_usage_always_matches_the_model(steps in prop::collection::vec(step(), 1..20)) {
         run(&steps);
     }
+}
+
+#[test]
+fn zz_print_coverage() {
+    // Runs after the model test with RUST_TEST_THREADS=1 (alphabetical).
+    eprintln!("{:#?}", STATS.lock().unwrap());
 }

@@ -6,7 +6,8 @@
 //! - `POST /ops?commit=1|0`: one operation per line, `<op> <args…> => <expected>`
 //!   (`write <path> <offset> <len> <byte>`, `truncate <path> <size>`,
 //!   `rename <from> <to>`, `unlink <path>`, `mkdir <path>`, `rmdir <path>`;
-//!   expected `ok`, `insufficient-space`, `quota` or `error`). Stops at the
+//!   expected `ok`, `insufficient-space`, `quota` or `error`, or several
+//!   joined with `|`). Stops at the
 //!   first result that differs. Answers 200 `matched` if all matched and
 //!   `commit=1` (the changes commit); otherwise fails the request (rolling it
 //!   back) with `matched` or `mismatch <line> <actual>` in the error.
@@ -79,7 +80,7 @@ async fn ops(body: &str) -> String {
             other => panic!("unknown op {other}"),
         };
         let actual = kind(result);
-        if actual != expected {
+        if !expected.split('|').any(|e| e == actual) {
             return format!("mismatch {i} {actual}");
         }
     }
