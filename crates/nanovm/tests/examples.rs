@@ -911,3 +911,42 @@ async fn flags_override_defaults_per_tenant_live() {
     let flags = app.get("/acme/flags").await.json();
     assert_eq!((&flags["new_checkout"]["source"], &flags["search_v2"]["source"]), (&json!("tenant"), &json!("default")));
 }
+
+/// examples/wiki: revisions in SQLite, edits that would overwrite someone
+/// else's refused, Markdown rendered with raw HTML escaped, diffs between
+/// revisions, all durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn wiki_keeps_every_revision_and_refuses_lost_updates() {
+    let mut app = App::start("wiki", json!({})).await;
+    let save = async |rev: &str, author: &str, body: &str| {
+        app.send("PUT", format!("/w/pages/Home?author={author}"), &[("if-match", rev)], body.to_string()).await
+    };
+    assert_eq!(save("0", "ann", "# Home\n\nWelcome.\n").await.json()["rev"], 1);
+    assert_eq!(save("1", "bob", "# Home\n\nWelcome, all.\n\n<script>alert(1)</script>\n").await.json()["rev"], 2);
+    // Ann saves an edit of revision 1: bob's would be lost, so it is refused.
+    let stale = save("1", "ann", "# Home\n\nHi.\n").await;
+    assert_eq!((stale.status, &stale.json()["rev"], stale.header("etag")), (409, &json!(2), "\"2\""));
+    assert_eq!(app.send("PUT", "/w/pages/Home", &[], "x").await.status, 428, "an edit names its base");
+    assert_eq!(save("0", "eve", "again").await.status, 409, "the page exists");
+    assert_eq!(app.send("PUT", "/w/pages/a%20b", &[("if-match", "0")], "x").await.status, 404);
+
+    let page = app.get("/w/pages/Home").await;
+    assert_eq!((page.header("etag"), page.header("content-type")), ("\"2\"", "text/html; charset=utf-8"));
+    assert!(page.text().contains("<h1>Home</h1>") && page.text().contains("<p>Welcome, all.</p>"), "{}", page.text());
+    assert!(page.text().contains("&lt;script&gt;") && !page.text().contains("<script>"), "raw HTML is shown, not run");
+    assert_eq!(app.get("/w/pages/Home?rev=1&raw=1").await.text(), "# Home\n\nWelcome.\n");
+    assert_eq!(app.get("/w/pages/Home?rev=9").await.status, 404);
+    let history = app.get("/w/pages/Home/history").await.json();
+    let authors: Vec<_> = history.as_array().unwrap().iter().map(|r| (r["rev"].as_i64().unwrap(), r["author"].as_str().unwrap())).collect();
+    assert_eq!(authors, [(2, "bob"), (1, "ann")]);
+    let diff = app.get("/w/pages/Home/diff?from=1&to=2").await.text();
+    assert!(diff.starts_with("--- Home@1\n+++ Home@2\n") && diff.contains("-Welcome.\n+Welcome, all.\n"), "{diff}");
+    assert_eq!(app.get("/w/pages/Home/diff?from=1&to=3").await.status, 404);
+
+    // Every revision survives eviction and restarts.
+    assert_eq!(app.evicted("/w/").await.json(), json!([{"page": "Home", "rev": 2}]));
+    let app = app.restart().await;
+    assert_eq!(app.get("/w/pages/Home?rev=1&raw=1").await.text(), "# Home\n\nWelcome.\n");
+    let next = app.send("PUT", "/w/pages/Home?author=ann", &[("if-match", "2")], "# Home\n").await;
+    assert_eq!(next.json()["rev"], 3);
+}
