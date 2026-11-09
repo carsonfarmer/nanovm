@@ -121,8 +121,9 @@ nanovm/
   - The outer `poll_fn` times every poll of the store's event loop and charges it to the current request. That covers guest code and inline filesystem calls; it is wall time, so it inflates when the host is oversubscribed.
   - An epoch ticker thread runs every `epoch_tick_ms` (default 5 ms). Each Store's `epoch_deadline_callback` checks the charge including the poll in progress, and past `cpu_ms` returns an `Err(CpuExceeded)` trap.
   - Otherwise it returns `Yield(1)`, so a spinning guest still yields to tokio.
-  - **Heavy lanes:** once a request has used 10 ms (`HEAVY_AFTER_NS`), the callback returns `YieldCustom`, which waits for one of `heavy_lanes` permits before the guest runs again. The permit is handed back at every tick. This stops CPU hogs from yielding straight back onto every worker.
+  - **Heavy lanes:** once a request has used 10 ms (`HEAVY_AFTER_NS`), the callback returns `YieldCustom`, which yields the thread once and then waits for one of `heavy_lanes` permits before the guest runs again. The permit is handed back at every tick. This stops CPU hogs from yielding straight back onto every worker.
   - The Store is per object and serves one request at a time, so per-store accounting is per-request accounting.
+  - **Self-wakes:** Wasmtime wakes the store's task during its own poll a few times per request; Tokio takes such a wake for a yield and wakes an idle thread to steal the task. The outer `poll_fn` gives the store its own waker and polls again at once instead. The epoch callback's yield, and any wake once the poll has run for a tick, still go to Tokio, so a poll holds its thread at most about a tick (N-221).
 - **Memory:** a custom `ResourceLimiter` holds the total across *all* linear memories of the object; upstream `StoreLimits` is per memory. Growing past it returns `Err(MemoryLimitExceeded)`. Table elements, instance count and table count are also capped.
 - **Other per-store caps:** `ResourceTable::set_max_capacity(min(max_resources, memory_mb × 16))`, and a guest's header map holds at most 64 KiB (`server::MAX_HEAD`, also hyper's head limit at every hop), so host-held header maps stay within `memory_mb` (N-75).
 - **Poisoning:**
@@ -300,8 +301,8 @@ client ─► proxy ─► supervisor (nanovm serve): no untrusted code
                                                           own uid · Landlock · seccomp · cgroup
 ```
 
-- **Worker = one Node for one app.** The supervisor passes the app's config (JSON) and the component bytes on the worker's stdin. Later it passes bytes it has fetched and verified (Q24). The worker reads them, jails itself, and only then compiles and serves. Untrusted code never runs before the jail is in place.
-- **Jail (Linux), applied by the worker to itself before any thread starts:**
+- **Worker = one Node for one app.** A worker first reads the node's config on stdin and builds its engine and linker; the supervisor keeps one spawned ahead. Taken for an app, it gets the app's config (JSON), its uid, and the digest and cache path of the component the registry fetched and verified (Q24). It opens that file, jails itself, and only then compiles (on a compile-cache miss) and serves. Untrusted code never runs before the jail is in place.
+- **Jail (Linux), applied by the worker to itself before any thread starts (it refuses a process with more than one):**
   - **uid:** when the supervisor runs as root, each app gets its own uid (`jail_uid_base` + app index). The supervisor chowns the app's directories to that uid.
   - **Landlock:** read-write access to the app's `objects/`, `tmp/` and `cache/` subtrees; nothing else.
   - **seccomp:** an allowlist of the syscalls Wasmtime, tokio and the filesystem host need. There is no `socket`, `connect`, `bind`, `execve`, `ptrace`, `mount` or namespace calls, `clone` only creates threads, and anything else fails with `EPERM`. With no way to make a socket, the worker has no network beyond the two it inherited.
