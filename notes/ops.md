@@ -43,12 +43,13 @@ stage ran with its real base. Checked instead:
   systemd notes), and the node works under it.
 - The node needs a CA bundle at all, else it refuses to start.
 
-**Tests run:** full suite with the N-551 change: 103 unit pass; integration 67
-passed, 3 failed at load average ~16 with CPU-budget errors.
-`churn_past_capacity_never_fails` and
-`the_proxy_outlasts_idle_and_excess_connections` pass alone;
-`kv_counts_against_the_disk_quota` (in-process, never enters the jail) still hit
-"used more than 100ms of CPU" alone at that load. `jail_blocks_escapes` passes.
+**Tests run (on `3dafe33`):** full suite with the N-551 change: 109 unit pass;
+integration 69 passed, 1 failed: `kv_counts_against_the_disk_quota` ("used more
+than 100ms of CPU" at load average ~22), which fails the same way twice on the
+plain base (in-process; it never enters the jail). `jail_blocks_escapes` passes.
+`test/local.sh` 11/11 with this branch's build; with a build of the plain base
+the PID-1 check fails (`entering the jail: supervisor exited`). Runtime lines
+5,419 → 5,421.
 
 Reproduce:
 ```sh
