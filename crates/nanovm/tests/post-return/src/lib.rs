@@ -33,6 +33,9 @@ impl wasip3::exports::http::handler::Guest for Probe {
         if let Some(owner) = req.path.strip_prefix("/misdirect/") {
             return util::respond_with(421, &[("nanovm-owner", owner)], b"forged".to_vec());
         }
+        if req.path == "/selfwake" {
+            return selfwake().await;
+        }
         util::write_file("/data", "before.txt", b"before".to_vec()).await.unwrap();
         let gate = req.q("gate").unwrap().to_owned();
         let (mut tx, rx) = wasip3::wit_stream::new();
@@ -68,6 +71,21 @@ async fn call(target: &str) -> Result<Response, ErrorCode> {
     let body = body.collect().await;
     drop(result_tx);
     util::text(200, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// `/selfwake`: three tasks that wake themselves in a tight loop, forever.
+/// Each wake hands control back to the host (`CALLBACK_CODE_YIELD`), which
+/// runs it again at once.
+async fn selfwake() -> Result<Response, ErrorCode> {
+    let spin = || async {
+        loop {
+            wasip3::wit_bindgen::yield_async().await;
+        }
+    };
+    wasip3::spawn_local(spin());
+    wasip3::spawn_local(spin());
+    spin().await;
+    unreachable!()
 }
 
 /// `/headers?n=…&kb=…`: holds `n` more header maps, for good: new ones with
