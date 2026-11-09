@@ -296,6 +296,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shop"
+version = "0.1.0"
+dependencies = [
+ "nanovm-sdk",
+ "serde",
+]
+
+[[package]]
 name = "shortener"
 version = "0.1.0"
 dependencies = [

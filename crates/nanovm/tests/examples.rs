@@ -25,7 +25,7 @@ struct App {
     args: Vec<OsString>,
     addr: std::net::SocketAddr,
     lines: tokio::sync::mpsc::UnboundedReceiver<String>,
-    _child: tokio::process::Child,
+    child: tokio::process::Child,
     http: reqwest::Client,
 }
 
@@ -78,14 +78,14 @@ impl App {
         let line = next_line(&mut lines, " on http://").await;
         let addr = line.split("http://").nth(1).unwrap().split('/').next().unwrap().parse().unwrap();
         let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap();
-        App { args, addr, lines, _child: child, http }
+        App { args, addr, lines, child, http }
     }
 
-    /// Stops the node and starts it again on the same data.
-    async fn restart(self) -> App {
-        let args = self.args.clone();
-        drop(self);
-        App::spawn(args).await
+    /// Stops the node and starts it again on the same data. It waits for the
+    /// old process to be gone: until then it holds the app's storage lock.
+    async fn restart(mut self) -> App {
+        self.child.kill().await.unwrap();
+        App::spawn(self.args).await
     }
 
     /// Waits until every object has idled out, and checks that `path`, asked
@@ -429,4 +429,71 @@ async fn leaderboard_pages_and_ranks_from_sqlite() {
     let app = app.restart().await;
     assert_eq!(app.get("/arcade/top?limit=200").await.json().as_array().unwrap().len(), 100);
     assert_eq!(app.get(format!("/arcade/players/{}", board[0].1)).await.json()["rank"], 1);
+}
+
+/// examples/shop: a failed checkout (a declined card, after the stock was
+/// taken and the order written) rolls all of it back; concurrent checkouts
+/// never oversell; orders and stock survive eviction and restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn shop_checkout_is_all_or_nothing() {
+    let mut app = App::start("shop", json!({})).await;
+    let put = async |path: &str, body: Value| app.send("PUT", path, &[], body.to_string()).await;
+    assert_eq!(put("/s/products/widget", json!({"name":"Widget","price":250,"stock":5})).await.status, 204);
+    assert_eq!(put("/s/products/gadget", json!({"name":"Gadget","price":1000,"stock":1})).await.status, 204);
+    assert_eq!(put("/s/products/bad", json!({"name":"Bad","price":-1,"stock":1})).await.status, 400);
+    assert_eq!(put("/s/carts/a/items/widget", json!({"qty":2})).await.status, 200);
+    let cart = put("/s/carts/a/items/gadget", json!({"qty":1})).await.json();
+    assert_eq!(cart["total"], 1500, "{cart}");
+    assert_eq!(put("/s/carts/a/items/nothing", json!({"qty":1})).await.status, 404);
+    let stock = async || -> Vec<(String, i64)> {
+        let products = app.get("/s/products").await.json();
+        products.as_array().unwrap().iter().map(|p| (p["sku"].as_str().unwrap().into(), p["stock"].as_i64().unwrap())).collect()
+    };
+    let before = stock().await;
+
+    // Declined after the writes: the request fails and nothing it did stays.
+    let declined = app.post("/s/carts/a/checkout", r#"{"card":"4000000000000002"}"#).await;
+    assert_eq!((declined.status, declined.header("x-nanovm-error")), (500, "guest-error"), "{declined:?}");
+    assert!(declined.text().contains("payment declined"), "{declined:?}");
+    assert_eq!(stock().await, before, "the stock it took is back");
+    assert_eq!(app.get("/s/carts/a").await.json()["total"], 1500, "the cart is intact");
+    assert_eq!(app.get("/s/orders/1").await.status, 404, "no order");
+
+    // Paid: stock taken, order written, cart emptied, card charged once.
+    let paid = app.post("/s/carts/a/checkout", r#"{"card":"4242424242424242"}"#).await;
+    assert_eq!(paid.status, 201, "{paid:?}");
+    let id = paid.json()["order"].as_i64().unwrap();
+    assert_eq!(stock().await, [("gadget".into(), 0), ("widget".into(), 3)]);
+    assert_eq!(app.get("/s/carts/a").await.json()["items"], json!([]));
+    let order = app.get(format!("/s/orders/{id}")).await.json();
+    assert_eq!((&order["total"], order["items"].as_array().unwrap().len()), (&json!(1500), 2), "{order}");
+    let charge = app.get(format!("/payments/charges?key=s/{id}")).await.json();
+    assert_eq!((&charge["amount"], &charge["card"]), (&json!(1500), &json!("4242424242424242")));
+    assert_eq!(app.get("/payments/charges?key=s/2").await.status, 404, "the declined attempt charged nothing");
+
+    // Short stock is refused before anything is written.
+    put("/s/carts/b/items/gadget", json!({"qty":1})).await;
+    let short = app.post("/s/carts/b/checkout", r#"{"card":"4242424242424242"}"#).await;
+    assert_eq!((short.status, &short.json()["short"]), (409, &json!(["gadget"])));
+    assert_eq!(app.post("/s/carts/empty/checkout", r#"{"card":"4242"}"#).await.status, 400);
+
+    // Five carts want the last three widgets at once: three get them.
+    for c in 0..5 {
+        put(&format!("/s/carts/c{c}/items/widget"), json!({"qty":1})).await;
+    }
+    let app_ = &app;
+    let rush = (0..5).map(|c| async move { app_.post(format!("/s/carts/c{c}/checkout"), r#"{"card":"4242424242424242"}"#).await });
+    let rush = futures::future::join_all(rush).await;
+    let mut statuses: Vec<u16> = rush.iter().map(|r| r.status).collect();
+    statuses.sort();
+    assert_eq!(statuses, [201, 201, 201, 409, 409], "{rush:?}");
+    assert_eq!(stock().await[1], ("widget".into(), 0));
+
+    // Orders and stock are durable.
+    assert_eq!(app.evicted(&format!("/s/orders/{id}")).await.json()["total"], 1500);
+    let app = app.restart().await;
+    let products = app.get("/s/products").await.json();
+    assert_eq!((&products[0]["stock"], &products[1]["stock"]), (&json!(0), &json!(0)));
+    assert_eq!(app.get("/s/orders/4").await.json()["cart"].as_str().map(|c| c.starts_with('c')), Some(true));
+    assert_eq!(app.get("/s/orders/5").await.status, 404);
 }
