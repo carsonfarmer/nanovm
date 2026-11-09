@@ -49,7 +49,10 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
     let control = tokio::runtime::Builder::new_multi_thread().worker_threads(1)
         .thread_name("nanovm-control").on_thread_start(move || nanovm::link::set_thread(threads))
         .enable_all().build()?;
-    let sup = control.block_on(async { Supervisor::new(cfg, std::env::current_exe()?, threads) })?;
+    // Workers run this process's own image (/proc/self/exe in the forked
+    // child), not whatever file is at its path by then (N-552).
+    let exe = if cfg!(target_os = "linux") { PathBuf::from("/proc/self/exe") } else { std::env::current_exe()? };
+    let sup = control.block_on(async { Supervisor::new(cfg, exe, threads) })?;
     let first = rt.block_on(async { listener(addr) })?;
     eprintln!("nanovm: ready in {:.0?} on http://{addr}/", t0.elapsed());
     for i in 1..threads {
