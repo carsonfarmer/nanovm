@@ -1,0 +1,8 @@
+#!/bin/sh
+# Registry, stub DNS resolver, dev-mode node and proxy on loopback, with the
+# apps deployed under *.localhost names. See crates/nanovm/examples/local-stack.rs.
+#   tools/local-stack [--listen 127.0.0.1:8443] [--fresh] [HOST=APP.wasm[,nanovm.json] ...]
+set -e
+cd "$(dirname "$0")/.."
+cargo build -q --locked -p nanovm --features dev --bin nanovm --example local-stack
+exec target/debug/examples/local-stack --nanovm target/debug/nanovm "$@"
