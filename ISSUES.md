@@ -337,6 +337,20 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** from source (the arithmetic in `preflight`); the host here has 1,048,576 and is shared, so the default was not tried.
 - **Status:** fixed on `ideas/systemd-units` (README line and `deploy/systemd/90-nanovm.conf`)
 
+### N-670 (docs): README said Landlock on Linux 5.13 is enough; the journal needs ABI 2 (5.19)
+- **Where:** README "Host requirements on Linux"; `jail.rs` (`ABI::V6`, best effort); `journal.rs` (replaced and removed files are renamed into `~journal/<object>`)
+- **Scenario:** found by the tooling agent writing `nanovm doctor` (C-44). Under Landlock ABI 1 (Linux 5.13 to 5.18) a ruleset refuses every rename or link between directories (the kernel's Landlock documentation, `LANDLOCK_ACCESS_FS_REFER`), and best-effort mode only drops the right it cannot name. The journal renames a file a request replaces or removes into `~journal`, so on those kernels such requests fail; capture's hard links (`committed.rs`) too.
+- **Reproduced:** no: from the kernel documentation; this host has ABI 7.
+- **Fix:** README now says ABI 2 (Linux 5.19+); `check-host.py`/`tools/doctor` fails on ABI 1. A worker could refuse ABI 1 at start with that message (+2 runtime lines in `jail.rs`), not done here.
+- **Status:** docs and check fixed on `ideas/tooling-doctor`
+
+### N-671: a worker under `ulimit -v` fails with "failed to create memory pool mapping", naming no fix
+- **Where:** `engine.rs` (`build`: the pooling allocator reserves `4 × (max_live_objects + 32)` memories of `memory_reservation_mb` + 64 KiB up front; `preflight` checks fds and mappings, not `RLIMIT_AS`)
+- **Scenario:** found by the tooling agent. At the defaults a worker reserves about 517 GiB of address space. A host or unit with an address-space limit (`ulimit -v`, `LimitAS=`, some container runtimes) starts the supervisor, but every app's worker fails with wasmtime's `failed to create memory pool mapping`, which says nothing about the limit or the config.
+- **Reproduced:** yes: the engine for `max_live_objects = 1` (33 slots, 16.5 GiB of reservations) fails under `prlimit --as` 15 and 16 GiB and starts under 17, 18 and 20 GiB (`target/debug/examples/inspect`, which builds the node's engine).
+- **Fix:** documented in README "Host requirements"; `tools/doctor` fails with the numbers and the fix. Suggested: `preflight` checks `RLIMIT_AS` as it checks fds (about +6 runtime lines).
+- **Status:** docs and check on `ideas/tooling-doctor`; runtime check open
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

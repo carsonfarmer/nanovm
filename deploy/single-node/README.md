@@ -29,12 +29,16 @@ publishes from nodes.
   git show origin/nice-to-haves:experiments/nice-to-haves/toolkit.py > /tmp/toolkit.py
   python3 -I /tmp/toolkit.py capacity deploy/single-node/capacity.json
   ```
-- **Host limits**: [check-host.py](check-host.py) reads `nanovm.toml` and
-  checks what each worker needs against this host: `2 × (max_live_objects + 32)
-  + 1024` fds, `24 × (max_live_objects + 32) + 4096` mappings, Landlock, root,
-  a data directory app uids can reach, the cgroup, CA certificates, and the
+- **Host limits**: [check-host.py](check-host.py) (also `tools/doctor`) reads
+  `nanovm.toml` and checks what each worker needs against this host: `2 ×
+  (max_live_objects + 32) + 1024` fds, `24 × (max_live_objects + 32) + 4096`
+  mappings, `4 × (max_live_objects + 32) × memory_reservation_mb` of address
+  space (no `ulimit -v`), Landlock ABI 2+, seccomp (it installs a filter in a
+  child), root's capabilities, a data directory app uids can reach, the
   filesystem (see [experiments/fs-matrix](../../experiments/fs-matrix/README.md):
-  prefer ext4 or XFS without the `discard` mount option; avoid btrfs).
+  prefer ext4 or XFS without the `discard` mount option; avoid btrfs; it probes
+  the syncs, locks, renames and links the journal makes), cgroup v2 and the
+  delegated cgroup, the clock, and CA certificates. Every warning says what to do.
 - **Disk**: an object holds up to `disk_mb`, and up to 3 × `disk_mb` while a
   request runs; quotas don't cap the total. Add the registry and compile caches
   (each version's component, ≤ `max_component_mb`, and its compiled code).
@@ -111,7 +115,7 @@ needs the node stopped, so schedule a window) and
   spans arrive; the count survives a node restart.
 - `caddy validate` passes on the Caddyfile; `systemd-analyze verify` on the
   drop-ins (it rejects a bad `AllowedCPUs`).
-- `check-host.py`: 6 unit tests (`python3 -m unittest discover -s
+- `check-host.py`: 15 unit tests (`python3 -m unittest discover -s
   deploy/single-node`), and run on this host.
 - Not run: `otelcol-contrib` (no binary here; the reference config's validation
   is README's), real ACME, real DNS, signed apps, `AllowedCPUs` enforcement
