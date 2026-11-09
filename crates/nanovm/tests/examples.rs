@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use reqwest::Method;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
@@ -33,6 +33,11 @@ impl App {
     /// Serves `examples/target/{name}.wasm` with `examples/{name}/nanovm.json`
     /// (if any) and `limits` changed, objects idling out after 300 ms.
     async fn start(name: &str, limits: Value) -> App {
+        App::configured(name, limits, json!({})).await
+    }
+
+    /// [`App::start`], with `config` changed too.
+    async fn configured(name: &str, limits: Value, config: Value) -> App {
         let wasm = repo().join(format!("examples/target/{name}.wasm"));
         assert!(wasm.exists(), "{} is missing: tools/build-app.sh examples/{name} -o {}", wasm.display(), wasm.display());
         let data = Path::new(env!("CARGO_TARGET_TMPDIR")).join("examples").join(name);
@@ -51,6 +56,9 @@ impl App {
         manifest["limits"]["cpu_ms"] = 200.into();
         for (k, v) in limits.as_object().unwrap() {
             manifest["limits"][k] = v.clone();
+        }
+        for (k, v) in config.as_object().unwrap() {
+            manifest["config"][k] = v.clone();
         }
         std::fs::write(data.join("nanovm.json"), manifest.to_string()).unwrap();
         let args = vec![wasm.into(), "--manifest".into(), data.join("nanovm.json").into(), "--data".into(), data.into()];
@@ -185,6 +193,10 @@ async fn next(ws: &mut Ws) -> Value {
             m => panic!("not text: {m:?}"),
         }
     }
+}
+
+async fn say(ws: &mut Ws, text: &str) {
+    ws.send(Message::text(text)).await.unwrap();
 }
 
 /// examples/shortener: a link per object, a redirect that counts clicks per
@@ -734,4 +746,57 @@ async fn site_serves_embedded_files_and_its_api() {
     let app = app.restart().await;
     assert_eq!(app.get("/www/api/likes").await.json()["likes"], 3);
     assert_eq!(app.get("/www/").await.header("etag"), etag, "the same bytes, the same ETag");
+}
+
+/// examples/presence: joins, leaves and typing pushed to a room's sockets;
+/// two tabs are one person; presence survives eviction, and lapses after a
+/// restart (whose sockets never said goodbye) unless refreshed.
+#[tokio::test(flavor = "multi_thread")]
+async fn presence_tracks_who_is_here() {
+    let mut app = App::configured("presence", json!({}), json!({"stale_ms": "2000"})).await;
+    // The next event of `kind`, skipping others (a socket may hear its own join).
+    async fn event(ws: &mut Ws, kind: &str) -> Value {
+        loop {
+            let m = next(ws).await;
+            if m["type"] == kind {
+                return m;
+            }
+        }
+    }
+    let who = async |app: &App| app.get("/lounge/who").await.json()["names"].clone();
+    assert_eq!(app.open("/lounge/ws").await.err(), Some(400), "a socket needs a name");
+    let mut ann = app.open("/lounge/ws?name=ann").await.unwrap();
+    assert_eq!(event(&mut ann, "here").await["names"], json!(["ann"]));
+    let mut bob = app.open("/lounge/ws?name=bob").await.unwrap();
+    assert_eq!(event(&mut bob, "here").await["names"], json!(["ann", "bob"]));
+    assert_eq!(event(&mut ann, "join").await["name"], "bob");
+    say(&mut bob, "typing").await;
+    assert_eq!(event(&mut ann, "typing").await["name"], "bob");
+    assert_eq!(who(&app).await, json!(["ann", "bob"]));
+
+    // A second tab is the same person: closing one leaves them here.
+    let mut ann2 = app.open("/lounge/ws?name=ann").await.unwrap();
+    assert_eq!(event(&mut ann2, "here").await["names"], json!(["ann", "bob"]));
+    ann2.close(None).await.unwrap();
+    bob.close(None).await.unwrap();
+    assert_eq!(event(&mut ann, "leave").await["name"], "bob", "bob left; ann's closed tab said nothing");
+    assert_eq!(who(&app).await, json!(["ann"]));
+
+    // The room's instance comes and goes under ann's socket.
+    assert_eq!(app.evicted("/lounge/who").await.json()["names"], json!(["ann"]));
+    let mut cy = app.open("/lounge/ws?name=cy").await.unwrap();
+    assert_eq!(event(&mut ann, "join").await["name"], "cy");
+    say(&mut cy, "typing").await;
+    assert_eq!(event(&mut ann, "typing").await["name"], "cy");
+
+    // A restart drops every socket without a word: presence lapses unless
+    // refreshed, and a fresh socket that pings stays.
+    drop((ann, cy));
+    let app = app.restart().await;
+    let mut dee = app.open("/lounge/ws?name=dee").await.unwrap();
+    event(&mut dee, "here").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    say(&mut dee, "ping").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(who(&app).await, json!(["dee"]));
 }
