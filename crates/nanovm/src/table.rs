@@ -83,7 +83,7 @@ impl Node {
     pub fn new(cfg: NodeConfig, app: &AppConfig, wasm: &[u8], upstream: Option<Upstream>) -> anyhow::Result<Arc<Node>> {
         let engine = crate::engine::build(&cfg)?;
         let linker = crate::app::linker(&engine)?;
-        Node::with_engine(engine, &linker, cfg, app, wasm, upstream)
+        Node::with_engine(engine, &linker, cfg, app, crate::engine::Wasm::Bytes(wasm), upstream)
     }
 
     /// [`Node::new`] with the engine and linker `engine::build` and
@@ -94,7 +94,7 @@ impl Node {
         linker: &Linker<ObjState>,
         cfg: NodeConfig,
         app: &AppConfig,
-        wasm: &[u8],
+        wasm: crate::engine::Wasm,
         upstream: Option<Upstream>,
     ) -> anyhow::Result<Arc<Node>> {
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
