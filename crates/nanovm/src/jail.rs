@@ -32,6 +32,11 @@ impl Jail {
             ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
         };
 
+        // The uid, Landlock and seccomp below bind this thread and those it
+        // starts later, so a thread already running would be left out.
+        let threads = std::fs::read_dir("/proc/self/task")?.count();
+        ensure!(threads == 1, "the jail must be entered with one thread, not {threads}");
+
         // SAFETY: plain syscalls on this process's own credentials.
         unsafe {
             if let Some(id) = self.uid {
@@ -215,4 +220,21 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         SeccompAction::Allow,
         std::env::consts::ARCH.try_into()?,
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A process with a second thread is refused before anything is
+    /// changed: the jail would not bind that thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_jail_needs_one_thread() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || rx.recv());
+        let jail = super::Jail { uid: None, parent: std::os::unix::process::parent_id(), read_write: vec![], read_only: vec![] };
+        let e = format!("{:#}", jail.enter().unwrap_err());
+        assert!(e.contains("with one thread"), "{e}");
+        drop(tx);
+        let _ = other.join();
+    }
 }
