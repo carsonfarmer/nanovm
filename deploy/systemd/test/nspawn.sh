@@ -1,8 +1,8 @@
 #!/bin/bash
 # Boots this host's own OS (its /usr under a throwaway overlay, a copy of its
 # /etc) in systemd-nspawn, and runs in-container.sh there against the units in
-# deploy/systemd: once plain, once with the cgroup drop-in on a cgroup v2
-# hierarchy. Testing only. Needs root, systemd-nspawn (apt: systemd-container)
+# deploy/systemd: plain, with the cgroup drop-in on a cgroup v2 hierarchy, and
+# with local capture on. Testing only. Needs root, systemd-nspawn (apt: systemd-container)
 # and a dev build of the node and the loopback registry:
 #
 #   cargo build -p nanovm --features dev --bin nanovm --example dev-registry
@@ -35,11 +35,12 @@ EOF
 ln -s ../nanovm-test.service "$R/etc/systemd/system/multi-user.target.wants/"
 
 status=0
-for mode in plain cgroup; do
+for mode in plain cgroup capture; do
     echo "== $mode"
     unified=0
     rm -f "$R/etc/nanovm-test.env"
     if [ $mode = cgroup ]; then unified=1; echo CGROUP=1 >"$R/etc/nanovm-test.env"; fi
+    if [ $mode = capture ]; then echo CAPTURE=1 >"$R/etc/nanovm-test.env"; fi
     # The repository read-only at its own path: dev-registry finds the guests
     # there. nspawn's own seccomp filter lacks Landlock, which workers need.
     SYSTEMD_NSPAWN_UNIFIED_HIERARCHY=$unified timeout 600 systemd-nspawn -q -D "$R" \
@@ -47,7 +48,7 @@ for mode in plain cgroup; do
         --system-call-filter="landlock_create_ruleset landlock_add_rule landlock_restrict_self" \
         --keep-unit -M nanovm-test --boot >"$WORK/$mode.log" 2>&1 || true
     tr -d '\r' <"$WORK/$mode.log" | sed -n 's/^.*bash\[[0-9]*\]: //p' >"$WORK/$mode.out"
-    grep -aE '^(PASS|FAIL|RESULT|cgroups:|supervisor:|proxy:|worker pid)' "$WORK/$mode.out" | sed 's/^/  /'
+    grep -aE '^(PASS|FAIL|RESULT|cgroups:|supervisor:|proxy:|worker pid|captured)' "$WORK/$mode.out" | sed 's/^/  /'
     grep -aqx 'RESULT fail=0' "$WORK/$mode.out" || status=1
 done
 exit $status

@@ -74,12 +74,14 @@ fails that worker's start with `writing "…" to …/memory.max: Permission deni
 ## How these were tested
 
 `test/nspawn.sh` boots this host's own Ubuntu 24.04 (systemd 255) in
-`systemd-nspawn` and runs `test/in-container.sh` there, plain and with the
-cgroup drop-in on a cgroup v2 hierarchy: install, start, drive the counter and
-hostile apps from a loopback registry in dev mode, check worker uid, seccomp
-and `no_new_privs`, restart (data and uids survive), start the proxy, stop both,
-and check nothing is left. Both runs pass (35 checks). `systemd-analyze verify`
-passes on all three files.
+`systemd-nspawn` and runs `test/in-container.sh` there three times: plain, with
+the cgroup drop-in on a cgroup v2 hierarchy, and with local capture on (its
+version publication uses `link`, which `@system-service` allows): install,
+start, drive the counter and hostile apps from a loopback registry in dev mode,
+check worker uid, seccomp and `no_new_privs`, restart (data and uids survive),
+start the proxy, stop both, and check nothing is left. All three pass (52
+checks, on a dev build of `3dafe33`). `systemd-analyze verify` passes on all
+three files.
 
 Not tested here: controllers actually enforced under the drop-in (this host
 gives memory, cpu and pids to cgroup v1, so the v2 hierarchy had none to hand

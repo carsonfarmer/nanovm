@@ -20,6 +20,8 @@ if [ -n "${CGROUP:-}" ]; then
   cp $D/nanovm-cgroup.conf /etc/systemd/system/nanovm.service.d/cgroup.conf
   sed -i '1i cgroup = "/sys/fs/cgroup/system.slice/nanovm.service/apps"' /etc/nanovm/nanovm.toml
 fi
+# Local capture publishes versions with link(2): the unit's filter must allow it.
+[ -n "${CAPTURE:-}" ] && printf '\n[capture]\nmax_mb = 64\nmax_versions = 100\n' >>/etc/nanovm/nanovm.toml
 systemctl daemon-reload
 rm -f /run/devreg.out
 systemd-run -q --unit=devreg -p StandardOutput=file:/run/devreg.out /usr/local/bin/dev-registry
@@ -33,6 +35,10 @@ check "node active" '[ "$(systemctl is-active nanovm)" = active ]'
 check "ready 204" '[ "$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/_nanovm/ready)" = 204 ]'
 for _ in 1 2 3; do curl -s -XPOST -H @/run/counter.h http://127.0.0.1:8080/alice/incr; echo; done
 check "counter at 3" 'curl -s -H @/run/counter.h http://127.0.0.1:8080/alice/ | grep -q "\"count\":3"'
+if [ -n "${CAPTURE:-}" ]; then
+  echo "captured versions of alice: $(find /var/lib/nanovm/objects/*/~committed/alice -type f | wc -l)"
+  check "three captured versions" '[ "$(find /var/lib/nanovm/objects/*/~committed/alice -type f -name "*.tar" | wc -l)" = 3 ]'
+fi
 W=$(pgrep -f "nanovm worker" | head -1)
 echo "worker pid $W uid $(ps -o uid= -p $W) caps $(grep CapEff /proc/$W/status)"
 check "worker runs as an app uid" '[ "$(ps -o uid= -p $W | tr -d " ")" -ge 200000 ]'

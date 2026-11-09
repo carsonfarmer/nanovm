@@ -15,6 +15,8 @@ throwaway overlay, a copy of `/etc`, private network) and runs
 `test/in-container.sh`: install the files, start the node, drive the counter and
 hostile apps from the loopback dev registry, restart, start the proxy, stop both.
 Result: plain 16/16 checks and cgroup mode 19/19 pass (`RESULT fail=0` twice),
+and, after the base moved to `3dafe33`, a third mode with `[capture]` on (17/17:
+three versions published under `~committed/` through the unit's syscall filter),
 `systemd-analyze verify` exit 0, `shellcheck -S warning` clean.
 `systemd-analyze security`: node 2.6 (2.8 with the cgroup drop-in), proxy 1.1,
 bare unit 9.6.
