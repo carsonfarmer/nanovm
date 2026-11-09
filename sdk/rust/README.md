@@ -93,6 +93,8 @@ no need for write-to-temp-then-rename.
   app, through its queue; it commits before it answers.
 - `ws::events(&req)`, `ws::Answer` (`accept`, `subscribe`, `text`, `binary`,
   `close`) and `ws::publish(channel, msg)` for WebSockets.
+- `after(async { … })`: work that runs once the handler has answered (its
+  changes commit when it is done).
 - `id()`, `app()`, `env(key)`, `sleep(d)`, `quote(s)`; `wasip3` for the rest.
 
 The [chat example](../../examples/chat) uses most of it.

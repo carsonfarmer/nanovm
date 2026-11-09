@@ -75,10 +75,32 @@ pub async fn __serve<F: Future<Output = Result>>(
     request: wit::Request,
     handler: impl FnOnce(Request) -> F,
 ) -> core::result::Result<wit::Response, wit::ErrorCode> {
-    match handler(Request::read(request).await).await {
-        Ok(response) => response.into_wit(),
+    let result = handler(Request::read(request).await).await;
+    let later = AFTER.with(|a| a.take());
+    match result {
+        Ok(response) => {
+            for work in later {
+                wasip3::spawn_local(work);
+            }
+            response.into_wit()
+        }
+        // A failed request's instance is discarded: nothing runs after it.
         Err(Error(why)) => Err(wit::ErrorCode::InternalError(Some(why))),
     }
+}
+
+thread_local! {
+    static AFTER: std::cell::RefCell<Vec<std::pin::Pin<Box<dyn Future<Output = ()>>>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `work` once the handler has answered: the client gets its response
+/// without waiting for it (a webhook's sender, say), and the object takes no
+/// other request until `work` is done, within the app's
+/// `post_return_timeout_ms`. What `work` changes commits when it finishes,
+/// and rolls back if it panics or runs out of time (the answer already sent
+/// stands). Nothing runs if the handler returns an error.
+pub fn after(work: impl Future<Output = ()> + 'static) {
+    AFTER.with(|a| a.borrow_mut().push(Box::pin(work)));
 }
 
 /// Why a request failed. A handler that returns one rolls back everything the
