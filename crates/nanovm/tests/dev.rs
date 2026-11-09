@@ -41,7 +41,7 @@ fn data_dir(test: &str) -> PathBuf {
 
 /// `nanovm run`, killed when dropped, and the lines it prints.
 struct Running {
-    _child: tokio::process::Child,
+    child: tokio::process::Child,
     lines: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
@@ -63,10 +63,16 @@ fn start(args: &[&OsStr]) -> Running {
             let _ = tx.send(line);
         }
     });
-    Running { _child: child, lines }
+    Running { child, lines }
 }
 
 impl Running {
+    /// Kills it and waits until it is gone: until then it holds the app's
+    /// storage lock, and a new `nanovm run` on the same data exits.
+    async fn stop(mut self) {
+        self.child.kill().await.unwrap();
+    }
+
     /// The next line that contains `text`.
     async fn line(&mut self, text: &str) -> String {
         loop {
@@ -234,7 +240,7 @@ async fn the_quickstart_app_counts_visits() {
     assert_eq!(get(addr, "/bob/").await, (200, "bob has had 1 visits\n".into()));
     let line = run.line("GET /bob/").await;
     assert!(line.contains("→ 200 in") && line.ends_with("cold start"), "{line}");
-    drop(run);
+    run.stop().await;
     let mut run = start(&args);
     let addr = run.addr().await;
     assert_eq!(get(addr, "/alice/").await, (200, "alice has had 3 visits\n".into()), "durable across restarts");
@@ -309,7 +315,7 @@ async fn the_chat_example_is_live_and_durable() {
     }
 
     // A restart keeps everything, and a new member gets the history.
-    drop(run);
+    run.stop().await;
     let mut run = start(&args);
     let addr = run.addr().await;
     let mut dee = open(addr, "/general/ws?name=dee").await.unwrap();
