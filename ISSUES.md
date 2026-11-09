@@ -529,3 +529,7 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-601: let an app serve `/`
 - **What:** every URL's first segment names an object, so `/` is `400 bad-object-id` and a site has to live at `/www/` (`examples/site`). A per-app default object for paths that don't name one (or for `/` only), set in the manifest, would let a domain's root be a site. It changes routing in `server.rs`/`proxy.rs`, so it is for their owners.
 - **Status:** open
+
+### W-602: tell an object who is calling it
+- **What:** a call between objects (`http://nanovm/objects/{id}/…`) reaches its target as an ordinary request, so an object can't tell its app's own calls from a client's, and every route meant for other objects is public (`examples/tictactoe`'s `/join`, `examples/chat`'s `/rooms/…`); apps must write them defensively. The host could set a header naming the calling object on calls and strip it from every request that enters from outside (the node's front door and the worker link), so an object could keep internal routes. It is a security property of every entry path (`server.rs`, `egress.rs`, the worker link), so it is for their owners.
+- **Status:** open

@@ -800,3 +800,62 @@ async fn presence_tracks_who_is_here() {
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_eq!(who(&app).await, json!(["dee"]));
 }
+
+/// examples/tictactoe: a lobby pairs players through calls to game objects
+/// (never three to a game, even all at once); each game validates moves and
+/// pushes the board to its sockets; games survive eviction and restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn tictactoe_lobby_pairs_players_and_games_judge_moves() {
+    let mut app = App::start("tictactoe", json!({})).await;
+    let matched = async |p: &str| app.post(format!("/lobby/match?player={p}"), "").await.json();
+    let ann = matched("ann").await;
+    let game = ann["game"].as_str().unwrap().to_string();
+    assert_eq!(ann["you"], "x");
+    assert_eq!(matched("ann").await, ann, "asking again keeps her place");
+    let mut ann_ws = app.open(&format!("/{game}/ws?player=ann")).await.unwrap();
+    assert_eq!(next(&mut ann_ws).await["o"], Value::Null, "waiting for an opponent");
+    let bob = matched("bob").await;
+    assert_eq!((bob["game"].as_str(), &bob["you"]), (Some(game.as_str()), &json!("o")));
+    assert_eq!(next(&mut ann_ws).await["o"], "bob", "pushed when bob joined");
+    let mut bob_ws = app.open(&format!("/{game}/ws?player=bob")).await.unwrap();
+    assert_eq!(next(&mut bob_ws).await["board"], ".........");
+
+    // Moves are checked by the game: turn, square, and the end.
+    say(&mut bob_ws, "0").await;
+    assert_eq!(next(&mut bob_ws).await["error"], "not your turn");
+    say(&mut ann_ws, "4").await;
+    for ws in [&mut ann_ws, &mut bob_ws] {
+        assert_eq!(next(ws).await["board"], "....x....");
+    }
+    say(&mut bob_ws, "4").await;
+    assert_eq!(next(&mut bob_ws).await["error"], "that square is taken");
+    say(&mut bob_ws, "nine").await;
+    assert_eq!(next(&mut bob_ws).await["error"], "a square is 0 to 8");
+    let mv = async |p: &str, s: u8| app.post(format!("/{game}/move?player={p}&square={s}"), "").await;
+    for (p, s) in [("bob", 0), ("ann", 1), ("bob", 2), ("ann", 7)] {
+        assert_eq!(mv(p, s).await.status, 200, "{p} {s}");
+    }
+    let mut last = Value::Null;
+    while last["result"].is_null() {
+        last = next(&mut ann_ws).await;
+    }
+    assert_eq!((&last["board"], &last["result"]), (&json!("oxo.x..x."), &json!("x")), "ann's column");
+    assert_eq!(mv("bob", 8).await.json()["error"], "the game is over");
+    assert_eq!(app.post("/elsewhere/join", "eve").await.status, 404, "no game there to join");
+
+    // Ten players at once: five games of exactly two.
+    let app_ = &app;
+    let rush = (0..10).map(|i| async move { app_.post(format!("/lobby/match?player=p{i}"), "").await.json() });
+    let rush = futures::future::join_all(rush).await;
+    let mut games = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for m in &rush {
+        games.entry(m["game"].as_str().unwrap().into()).or_default().push(m["you"].as_str().unwrap().into());
+    }
+    assert!(games.len() == 5 && games.values().all(|seats| seats.len() == 2 && seats.contains(&"x".into())), "{games:?}");
+
+    // Games outlive their instances (sockets too) and the node.
+    let state = app.evicted(&format!("/{game}/")).await.json();
+    assert_eq!(state["result"], "x");
+    let app = app.restart().await;
+    assert_eq!(app.get(format!("/{game}/")).await.json(), state);
+}
