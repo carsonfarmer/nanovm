@@ -497,3 +497,73 @@ async fn shop_checkout_is_all_or_nothing() {
     assert_eq!(app.get("/s/orders/4").await.json()["cart"].as_str().map(|c| c.starts_with('c')), Some(true));
     assert_eq!(app.get("/s/orders/5").await.status, 404);
 }
+
+/// examples/jobs: idempotent enqueues, leases whose visibility timeout is
+/// seen by the next lease, acks fenced by the lease, a worker object pulling
+/// through calls, retries into the dead letters, and a queue that survives
+/// eviction and restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn jobs_lease_retry_and_dead_letter() {
+    let mut app = App::start("jobs", json!({})).await;
+    let add = async |queue: &str, payload: Value, key: Option<&str>| {
+        let headers: Vec<(&str, &str)> = key.map(|k| ("idempotency-key", k)).into_iter().collect();
+        app.send("POST", format!("/{queue}/jobs"), &headers, payload.to_string()).await
+    };
+    let first = add("mail", json!({"text": "hello"}), Some("k1")).await;
+    assert_eq!((first.status, &first.json()["state"]), (201, &json!("ready")), "{first:?}");
+    let again = add("mail", json!({"text": "other"}), Some("k1")).await;
+    assert_eq!((again.status, &again.json()["id"], &again.json()["payload"]), (200, &first.json()["id"], &json!({"text": "hello"})));
+    for payload in [json!({"text": "b"}), json!({"text": "c", "fail": true}), json!({"text": "d"})] {
+        assert_eq!(add("mail", payload, None).await.status, 201);
+    }
+    assert_eq!(app.post("/mail/jobs", "not json").await.status, 400);
+
+    // A lease that runs out makes its job visible to the next lease, and only
+    // the latest lease can ack it.
+    let id = add("solo", json!({"text": "hello"}), None).await.json()["id"].clone();
+    let one = app.post("/solo/lease?visibility_ms=200", "").await.json();
+    assert_eq!((&one["id"], &one["attempts"], &one["state"]), (&id, &json!(1), &json!("leased")));
+    assert_eq!(app.post("/solo/lease", "").await.status, 204, "leased, so not visible");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let two = app.post("/solo/lease?visibility_ms=60000", "").await.json();
+    assert_eq!((&two["id"], &two["attempts"]), (&id, &json!(2)), "the same job, again");
+    let ack = |lease: &Value| format!("/solo/jobs/{id}/ack?lease={}", lease.as_str().unwrap());
+    assert_eq!(app.post(ack(&one["lease"]), "late").await.status, 409, "its lease ran out");
+    assert_eq!(app.post(ack(&two["lease"]), "HELLO").await.status, 204);
+    assert_eq!(app.get(format!("/solo/jobs/{id}")).await.json()["result"], "HELLO");
+
+    // A worker object pulls the rest through calls; the failing job is
+    // retried until it is dead.
+    let worked = app.post("/w1/work?queue=mail&retry_ms=0", "").await;
+    assert_eq!(worked.json(), json!({"done": 3, "failed": 3}), "{worked:?}");
+    assert_eq!(app.get("/mail/").await.json(), json!({"ready": 0, "leased": 0, "done": 3, "dead": 1}));
+    let dead = app.get("/mail/dead").await.json();
+    assert_eq!((&dead[0]["payload"]["text"], &dead[0]["attempts"], &dead[0]["error"]), (&json!("c"), &json!(3), &json!("could not do it")));
+    assert_eq!(app.post("/mail/lease", "").await.status, 204, "nothing left to lease");
+    let dead_id = dead[0]["id"].as_i64().unwrap();
+    assert_eq!(app.post(format!("/mail/dead/{dead_id}/retry"), "").await.status, 204);
+    assert_eq!(app.post(format!("/mail/dead/{dead_id}/retry"), "").await.status, 404);
+
+    assert_eq!(app.post("/mail/lease?visibility_ms=60000", "").await.json()["id"], dead_id, "retried");
+
+    // A job leased on its last attempt whose lease runs out is dead too.
+    let last = add("once", json!({"text": "e"}), None).await.json()["id"].clone();
+    for _ in 0..3 {
+        assert_eq!(app.post("/once/lease?visibility_ms=1", "").await.json()["id"], last);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(app.post("/once/lease", "").await.status, 204);
+    let gone = app.get(format!("/once/jobs/{last}")).await.json();
+    assert_eq!((&gone["state"], &gone["error"]), (&json!("dead"), &json!("its last lease ran out")));
+
+    // The queue is durable: a leased job stays leased.
+    let counts = app.evicted("/mail/").await.json();
+    assert_eq!(counts, json!({"ready": 0, "leased": 1, "done": 3, "dead": 0}));
+    let app = app.restart().await;
+    assert_eq!(app.get("/mail/").await.json(), counts);
+    assert_eq!(add_after_restart(&app).await, 200, "keys are remembered");
+}
+
+async fn add_after_restart(app: &App) -> u16 {
+    app.send("POST", "/mail/jobs", &[("idempotency-key", "k1")], r#"{"text":"x"}"#).await.status
+}
