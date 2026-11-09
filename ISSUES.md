@@ -331,6 +331,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
+### N-503: a failed create of an over-long name bricks the object if its request then fails
+- **Where:** `journal.rs` (`recover`, the `Undo::Created` arm)
+- **Scenario:** found by the quality agent's second hostile guest (D-58). Creating a name longer than NAME_MAX (256 bytes) is recorded as `Created` (its `symlink_metadata` fails with ENAMETOOLONG, not NotFound) before the create fails. If the request then fails, recovery hits ENAMETOOLONG again and refuses to start the object, for good (503 `instantiate-failed`, `File name too long`). The same class as N-502; any app that creates files named from request data can be bricked by a long name and a failing request.
+- **Reproduced:** yes (`unusual_names_commit_and_roll_back` on `ideas/hostile2`; `a_failed_create_of_an_overlong_name_rolls_back` fails without the fix).
+- **Fix:** recovery treats ENAMETOOLONG (`InvalidFilename`) like NotFound for a `Created` record: such a name can't exist. One line.
+- **Status:** fixed on `ideas/fix-long-name`
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

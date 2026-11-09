@@ -465,8 +465,9 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<()> {
             Undo::Created(p) => match std::fs::symlink_metadata(abs(p)) {
                 Ok(md) if md.is_dir() => std::fs::remove_dir(abs(p)),
                 Ok(_) => std::fs::remove_file(abs(p)),
-                // Under a file, the create failed: nothing is there either.
-                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(()),
+                // Under a file or with too long a name, the create failed:
+                // nothing is there either.
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::InvalidFilename) => Ok(()),
                 Err(e) => Err(e),
             },
             Undo::RemovedDir(p) => std::fs::create_dir(abs(p)).or_else(|e| {
@@ -1206,6 +1207,23 @@ mod tests {
             j.creating(&v.join(p)).unwrap();
             assert!(std::fs::create_dir(v.join(p)).is_err());
         }
+        drop(j);
+        reopen(&v, 1 << 30).expect("recovery succeeds");
+        assert_eq!(tree(&v), before);
+    }
+
+    /// A create of a name longer than NAME_MAX is recorded, then fails
+    /// (ENAMETOOLONG). Rolling it back finds nothing, as for a missing path,
+    /// rather than failing recovery and refusing to start the object ever
+    /// again (N-503, found by the second hostile guest, D-58).
+    #[test]
+    fn a_failed_create_of_an_overlong_name_rolls_back() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        let p = v.join("n".repeat(256));
+        j.creating(&p).unwrap();
+        assert!(std::fs::write(&p, b"x").is_err());
         drop(j);
         reopen(&v, 1 << 30).expect("recovery succeeds");
         assert_eq!(tree(&v), before);
