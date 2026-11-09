@@ -1,0 +1,13 @@
+# /etc/caddy/Caddyfile: TLS for every app host, in front of `nanovm proxy`.
+# Caddy gets and renews certificates (ACME) for the names listed; each must
+# resolve to this VM and have its `_nanovm.<name>` TXT record. Add a name per
+# app host and `systemctl reload caddy`.
+{
+	email ops@example.com
+}
+
+app.example.com, www.app.example.com {
+	# The proxy routes by Host, which Caddy passes through, and holds
+	# WebSockets itself. It drops any nanovm-* header a client sends.
+	reverse_proxy 127.0.0.1:8443
+}

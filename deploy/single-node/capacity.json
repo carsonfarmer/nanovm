@@ -1,0 +1,12 @@
+{
+  "application_cores": {"value": 3, "basis": "assumed", "source": "This guide's split: CPUs 0-2 for nanovm (dropins/nanovm-cpus.conf) on a 4-core VM"},
+  "collector_cores": {"value": 1, "basis": "assumed", "source": "CPU 3 for the Collector (dropins/otelcol-contrib-budget.conf)"},
+  "target_utilization": {"value": 0.6, "basis": "assumed", "source": "Headroom for bursts, TLS in Caddy and the proxy, which these CPU figures exclude"},
+  "application_cpu_us": {"value": 105, "basis": "measured", "source": "README: node+worker 103.45-105.00 us/request, c256 warm counter GETs, 4-core orb, physical cores split, oha 1.16.0, Collector 0.164.0; supervisor and worker only, no proxy or Caddy"},
+  "collector_cpu_us": {"value": 14.7, "basis": "measured", "source": "README: Collector 14.70 us/request for two spans per request with derived metrics, same runs"},
+  "memory_budget_mib": {"value": 6144, "basis": "assumed", "source": "An 8 GiB VM less 1 GiB for the Collector and 1 GiB for the OS and Caddy"},
+  "fixed_memory_mib": {"value": 256, "basis": "assumed", "source": "Supervisor, proxy and worker baselines; measure yours with ps -o rss"},
+  "resident_object_kib": {"value": 87, "basis": "measured", "source": "README Linux table: 87 KB RSS per live counter object, 9,000 objects, 4-core Xeon sandbox; your guests' memory adds to this"},
+  "target_rps": {"value": 10000, "basis": "assumed", "source": "Example demand"},
+  "mean_latency_ms": {"value": 3, "basis": "assumed", "source": "Example mean latency"}
+}

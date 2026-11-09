@@ -1,0 +1,75 @@
+# nanovm node: the supervisor (`nanovm serve`) and one jailed worker per app.
+# Install: see deploy/systemd/README.md. Optional cgroup v2 limits per app:
+# add nanovm-cgroup.conf as a drop-in.
+[Unit]
+Description=nanovm node (supervisor and jailed app workers)
+Documentation=https://github.com/carsonfarmer/nanovm/tree/main/deploy/systemd
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/nanovm serve --config /etc/nanovm/nanovm.toml
+# Root is required for per-app uids: the supervisor chowns each app's
+# directories to `jail_uid_base + i` and the worker drops to that uid before
+# it jails itself. Every other root power is removed below.
+User=root
+# chown app directories; setresuid/setresgid/setgroups in the worker before
+# its jail; SIGKILL a worker that runs as another uid (drain, version switch).
+CapabilityBoundingSet=CAP_CHOWN CAP_SETUID CAP_SETGID CAP_KILL
+AmbientCapabilities=
+# Not NoNewPrivileges=yes: under systemd 255 it left the supervisor without
+# CAP_SETUID (CapPrm 0x61, not 0xe1), so every worker failed setresuid. Each
+# worker sets no_new_privs itself (Landlock) before it loads any guest code.
+# The node has no graceful drain: SIGTERM ends the supervisor, workers die
+# with it (PR_SET_PDEATHSIG) and in-flight requests roll back. Drain at the
+# proxy/load balancer before stopping.
+KillMode=control-group
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=2s
+
+# Each worker checks these at start: about 2 x max_live_objects + 1024 fds
+# (it raises its soft limit to this hard limit itself), and vm.max_map_count
+# (see 90-nanovm.conf). The supervisor caps worker links at a quarter of it.
+LimitNOFILE=1048576
+# Core dumps would hold tenants' guest memory.
+LimitCORE=0
+# wasmtime captures a backtrace for every guest-visible error with this set:
+# warm throughput fell from 63K/s to 23K/s (README, Host requirements).
+UnsetEnvironment=RUST_BACKTRACE RUST_LIB_BACKTRACE
+
+# Filesystem: everything read-only except the data root.
+StateDirectory=nanovm
+StateDirectoryMode=0755
+ConfigurationDirectory=nanovm
+# Workers run as other uids and must traverse data_dir/objects etc. to reach
+# their own directories, so these must stay searchable: keep 0022, not 0077.
+UMask=0022
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Not MemoryDenyWriteExecute: wasmtime makes compiled code executable with
+# mprotect, which that option forbids. The worker's own seccomp filter
+# already refuses memory that is writable and executable at once.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+# Workers inherit this filter, then build their jail with Landlock and install
+# their own, stricter seccomp filter: both need adding to @system-service.
+SystemCallFilter=@system-service landlock_create_ruleset landlock_add_rule landlock_restrict_self seccomp
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
