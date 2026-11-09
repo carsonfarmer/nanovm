@@ -327,6 +327,11 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** yes, `docs/ops/drills/binary-swap.sh` with builds before and after N-551: the running app kept serving, a new app got `502 worker-down` (`worker spec: invalid length 3, expected a tuple of size 4`).
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
+### N-552: a binary replaced under a running supervisor starts workers of the new version
+- **Where:** `main.rs`/`supervisor.rs` (`Supervisor::new(cfg, std::env::current_exe()?, …)`; `start` spawns `self.exe`)
+- **Scenario:** found by the ops agent writing the upgrade runbook. The supervisor resolves its executable's path once at start and spawns every worker from that path. Installing a new binary (`install`, `mv`, a package manager) while the node runs makes new workers the new version under the old supervisor; their private spec or link protocol can differ.
+- **Reproduced:** yes, `docs/ops/drills/binary-swap.sh` with builds before and after N-551: the running app keeps serving, a new app gets `502 worker-down` (`worker spec: invalid length 3, expected a tuple of size 4`).
+- **Status:** open. Documented in the upgrade runbook (stop, replace, start). A fix would spawn workers from the supervisor's own image (e.g. an fd of `/proc/self/exe` opened at start, executed through `/proc/self/fd/N`), so supervisor and workers always match.
 
 ## Planned work
 
