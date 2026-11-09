@@ -1120,3 +1120,155 @@ async fn todos_sync_offline_edits_and_report_conflicts() {
     let t1 = all["changes"].as_array().unwrap().iter().find(|t| t["id"] == "t1").unwrap().clone();
     assert_eq!((&t1["deleted"], &t1["title"], &all["version"]), (&json!(true), &json!("oat milk"), &late["version"]));
 }
+
+/// An example app on an in-process dev-mode node, its requests dispatched
+/// straight to it: for apps whose egress must reach a server on loopback,
+/// which `nanovm run` (like a production node) refuses.
+struct Local {
+    node: std::sync::Arc<nanovm::table::Node>,
+    cfg: nanovm::config::NodeConfig,
+    app: nanovm::config::AppConfig,
+    wasm: Vec<u8>,
+}
+
+impl Local {
+    /// `examples/target/{name}.wasm` with its manifest, `limits` changed and
+    /// objects idling out after 300 ms.
+    fn start(name: &str, limits: Value) -> Local {
+        let wasm = std::fs::read(repo().join(format!("examples/target/{name}.wasm")))
+            .unwrap_or_else(|_| panic!("build it: tools/build-app.sh examples/{name} -o examples/target/{name}.wasm"));
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let data = root.join("examples-local").join(name);
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(root.join("cwasm-cache")).unwrap();
+        std::os::unix::fs::symlink(root.join("cwasm-cache"), data.join("cache")).unwrap();
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(repo().join(format!("examples/{name}/nanovm.json"))).unwrap()).unwrap();
+        manifest["limits"]["idle_timeout_ms"] = 300.into();
+        for (k, v) in limits.as_object().unwrap() {
+            manifest["limits"][k] = v.clone();
+        }
+        let spec: nanovm::registry::AppSpec = serde_json::from_value(manifest).unwrap();
+        let cfg = nanovm::config::NodeConfig { data_dir: data, max_live_objects: 16, memory_reservation_mb: 64, dev: true, ..Default::default() };
+        let app = nanovm::config::AppConfig {
+            name: name.into(),
+            digest: "local".into(),
+            env: spec.env,
+            config: spec.config,
+            limits: spec.limits,
+            worker: Default::default(),
+        };
+        nanovm::engine::preflight(&cfg).unwrap();
+        let node = nanovm::table::Node::new(cfg.clone(), &app, &wasm, None).unwrap();
+        Local { node, cfg, app, wasm }
+    }
+
+    async fn send(&self, method: &str, path: &str, headers: &[(&str, &str)], body: impl Into<bytes::Bytes>) -> Reply {
+        let (id, rest) = nanovm::table::route(path).unwrap();
+        let mut req = http::Request::builder().method(method).uri(format!("http://x{}", if rest.is_empty() { "/" } else { rest }));
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let res = self.node.dispatch(id, req.body(body.into()).unwrap()).await;
+        let (parts, body) = res.into_parts();
+        let body = http_body_util::BodyExt::collect(body).await.unwrap().to_bytes().to_vec();
+        Reply { status: parts.status.as_u16(), headers: parts.headers, body }
+    }
+
+    /// Waits for every object to idle out.
+    async fn evicted(&self) {
+        let t0 = std::time::Instant::now();
+        while self.node.live_objects() > 0 {
+            assert!(t0.elapsed() < Duration::from_secs(20), "objects never idled out");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Shuts the node down and starts another on the same data.
+    async fn restart(self) -> Local {
+        self.node.shutdown().await;
+        drop(self.node);
+        let node = nanovm::table::Node::new(self.cfg.clone(), &self.app, &self.wasm, None).unwrap();
+        Local { node, ..self }
+    }
+}
+
+/// A server on loopback that records what it is sent and answers each
+/// request with the next status of `script` (then 200).
+async fn upstream(script: Vec<u16>, delay: Duration) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(http::HeaderMap, String)>>>) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let script = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(script)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let log = seen.clone();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| {
+        let (log, script) = (log.clone(), script.clone());
+        async move {
+            let (parts, body) = req.into_parts();
+            let body = http_body_util::BodyExt::collect(body).await.unwrap().to_bytes();
+            log.lock().unwrap().push((parts.headers, String::from_utf8_lossy(&body).into_owned()));
+            tokio::time::sleep(delay).await;
+            match script.lock().unwrap().pop_front().unwrap_or(200) {
+                200 => nanovm::server::ok_json(json!({"ok": true})),
+                status => nanovm::object::error_response(status, "scripted", "failing on purpose"),
+            }
+        }
+    }));
+    (addr, seen)
+}
+
+/// examples/webhooks (on an in-process node, to reach loopback targets):
+/// signatures checked, the sender answered before any target is tried,
+/// targets reached after the answer, failures retried with backoff, targets
+/// outside the egress list refused by the node, all durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn webhooks_verify_answer_then_relay_with_retries() {
+    let (fast, fast_seen) = upstream(vec![], Duration::from_millis(1500)).await;
+    let (flaky, flaky_seen) = upstream(vec![503], Duration::ZERO).await;
+    let app = Local::start("webhooks", json!({"egress": [fast, flaky]}));
+    let config = json!({"secret": "s3cret", "targets": [format!("http://{fast}/hook"), format!("http://{flaky}/hook"), "http://127.0.0.1:9/no"]});
+    assert_eq!(app.send("PUT", "/gh/config", &[], config.to_string()).await.status, 204);
+
+    let body = r#"{"action":"opened","number":7}"#;
+    // HMAC-SHA256 (RFC 2104), as GitHub signs.
+    use sha2::{Digest, Sha256};
+    let key: Vec<u8> = b"s3cret".iter().copied().chain(std::iter::repeat(0)).take(64).collect();
+    let pad = |x: u8| key.iter().map(|b| b ^ x).collect::<Vec<u8>>();
+    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(body).finalize();
+    let mac = Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize();
+    let signature = format!("sha256={}", mac.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    for bad in ["", "sha256=00", "sha1=abc"] {
+        assert_eq!(app.send("POST", "/gh/in", &[("x-hub-signature-256", bad)], body).await.status, 401, "{bad}");
+    }
+    assert_eq!(app.send("POST", "/gh/in", &[("x-hub-signature-256", &signature)], "tampered").await.status, 401);
+    let t0 = std::time::Instant::now();
+    let signed = [("x-hub-signature-256", signature.as_str()), ("content-type", "application/json")];
+    let accepted = app.send("POST", "/gh/in", &signed, body).await;
+    assert_eq!((accepted.status, accepted.json()), (202, json!({"id": 1})));
+    assert!(t0.elapsed() < Duration::from_millis(1200), "answered before the 1.5 s target: {:?}", t0.elapsed());
+
+    // After the answer: the fast target got it once it was asked; the
+    // flaky one failed; one not in the egress list was refused by the node.
+    let deliveries = app.send("GET", "/gh/deliveries", &[], "").await.json();
+    assert!(t0.elapsed() >= Duration::from_millis(1500), "the object finished relaying before the next request");
+    let (headers, got) = fast_seen.lock().unwrap()[0].clone();
+    assert_eq!((got.as_str(), &headers["x-relay-delivery"], &headers["content-type"]), (body, &"1".parse::<http::HeaderValue>().unwrap(), &"application/json".parse::<http::HeaderValue>().unwrap()));
+    let d = &deliveries[0];
+    assert_eq!((&d["done"], &d["tries"]), (&json!([format!("http://{fast}/hook")]), &json!(1)), "{d}");
+    assert_eq!(d["pending"].as_array().unwrap().len(), 2);
+
+    // Retried when due, by an external clock: the flaky target now answers.
+    assert_eq!(app.send("POST", "/gh/retry", &[], "").await.json()["retried"], 0, "not due yet");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(app.send("POST", "/gh/retry", &[], "").await.json()["retried"], 1);
+    let d = app.send("GET", "/gh/deliveries", &[], "").await.json()[0].clone();
+    assert_eq!((d["done"].as_array().unwrap().len(), &d["pending"], &d["tries"]), (2, &json!(["http://127.0.0.1:9/no"]), &json!(2)), "{d}");
+    assert!(d["error"].as_str().unwrap().contains("127.0.0.1:9/no: ErrorCode::HttpRequestDenied"), "not in the egress list: {d}");
+    assert_eq!((flaky_seen.lock().unwrap().len(), fast_seen.lock().unwrap().len()), (2, 1), "each target as often as needed");
+
+    app.evicted().await;
+    assert_eq!(app.send("GET", "/gh/deliveries", &[], "").await.json()[0]["tries"], 2);
+    let app = app.restart().await;
+    assert_eq!(app.send("GET", "/gh/deliveries", &[], "").await.json()[0]["done"].as_array().unwrap().len(), 2);
+    assert_eq!(app.send("POST", "/gh/in", &signed, body).await.json()["id"], 2, "the secret survived too");
+}
