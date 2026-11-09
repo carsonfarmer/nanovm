@@ -115,7 +115,7 @@ impl App {
         for (k, v) in headers {
             req = req.header(*k, *v);
         }
-        let res = req.send().await.unwrap_or_else(|e| panic!("{method} {path}: {e}"));
+        let res = req.send().await.unwrap_or_else(|e| panic!("{method} {path}: {e:?}"));
         let (status, headers) = (res.status().as_u16(), res.headers().clone());
         let body = res.bytes().await.unwrap().to_vec();
         Reply { status, headers, body }
@@ -369,4 +369,64 @@ async fn polls_count_each_voter_once_and_push_results() {
     let app = app.restart().await;
     assert_eq!(votes(&app.send("POST", "/lunch/vote?option=2", &me, "").await.json()), [0, 0, 21]);
     assert_eq!(app.get("/lunch/").await.json()["voters"], 21);
+}
+
+/// examples/leaderboard: SQLite in an object. Best scores per player, pages
+/// of the board that add up to the whole of it, ranks with ties, and a
+/// database that outlives eviction and restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn leaderboard_pages_and_ranks_from_sqlite() {
+    let mut app = App::start("leaderboard", json!({})).await;
+    // 150 players, scores with ties, in two batches.
+    let score = |i: usize| (i * 37 % 100) as i64;
+    let players: Vec<_> = (0..150).map(|i| json!({"player": format!("p{i:03}"), "score": score(i)})).collect();
+    for batch in players.chunks(100) {
+        let r = app.post("/arcade/scores", Value::from(batch.to_vec()).to_string()).await;
+        assert_eq!(r.status, 200, "{r:?}");
+        assert_eq!(r.json().as_array().unwrap().len(), batch.len());
+    }
+    // Best first; ties to whoever got there first (the first batch), then by name.
+    let mut expected: Vec<(i64, usize, String)> = (0..150).map(|i| (-score(i), i / 100, format!("p{i:03}"))).collect();
+    expected.sort();
+    let mut board = vec![];
+    for offset in (0..).step_by(40) {
+        let page = app.get(format!("/arcade/top?limit=40&offset={offset}")).await.json();
+        let page = page.as_array().unwrap();
+        board.extend(page.iter().map(|e| (e["rank"].as_u64().unwrap(), e["player"].as_str().unwrap().to_string())));
+        if page.len() < 40 {
+            break;
+        }
+    }
+    assert_eq!(board.len(), 150);
+    for (i, ((rank, player), (neg, _, name))) in board.iter().zip(&expected).enumerate() {
+        assert_eq!(player, name, "position {i}");
+        let better = expected.iter().filter(|e| e.0 < *neg).count() as u64;
+        assert_eq!(*rank, better + 1, "{player}: competition ranking");
+    }
+    assert_eq!(app.get("/arcade/top?limit=1000").await.json().as_array().unwrap().len(), 100, "pages are at most 100");
+
+    // A worse score doesn't replace a best one; a better one does.
+    let top = &board[0].1;
+    let mine = app.get(format!("/arcade/players/{top}")).await.json();
+    assert_eq!((&mine["rank"], &mine["score"]), (&json!(1), &json!(99)));
+    let worse = app.post("/arcade/scores", json!({"player": top, "score": 1}).to_string()).await.json();
+    assert_eq!(worse[0]["score"], 99);
+    let up = app.post("/arcade/scores", r#"{"player":"p149","score":1000}"#).await.json();
+    assert_eq!((&up[0]["rank"], &up[0]["score"]), (&json!(1), &json!(1000)));
+    assert_eq!(app.get(format!("/arcade/players/{top}")).await.json()["rank"], 2);
+    assert_eq!(app.send("DELETE", "/arcade/players/p149", &[], "").await.status, 204);
+    assert_eq!(app.get("/arcade/players/p149").await.status, 404);
+    for bad in ["{}", r#"{"player":"","score":1}"#, r#"{"player":"a","score":1.5}"#, "nope"] {
+        assert_eq!(app.post("/arcade/scores", bad).await.status, 400, "{bad}");
+    }
+    let many: Vec<_> = (0..101).map(|i| json!({"player": format!("x{i}"), "score": 1})).collect();
+    assert_eq!(app.post("/arcade/scores", Value::from(many).to_string()).await.status, 400);
+    assert_eq!(app.get("/other/top").await.json(), json!([]), "boards have their own databases");
+
+    // The database is the object's: it survives eviction and restarts.
+    let top = app.evicted("/arcade/top?limit=3").await.json();
+    assert_eq!(top[0]["player"], board[0].1.as_str());
+    let app = app.restart().await;
+    assert_eq!(app.get("/arcade/top?limit=200").await.json().as_array().unwrap().len(), 100);
+    assert_eq!(app.get(format!("/arcade/players/{}", board[0].1)).await.json()["rank"], 1);
 }
