@@ -1,0 +1,11 @@
+{
+  "config": {
+    "flag.dark_mode": "true",
+    "flag.new_checkout": "false",
+    "flag.search_v2": "{\"percent\": 25}"
+  },
+  "limits": {
+    "memory_mb": 16, "cpu_ms": 50, "request_timeout_ms": 1000, "idle_timeout_ms": 30000,
+    "disk_mb": 1, "max_files": 100
+  }
+}

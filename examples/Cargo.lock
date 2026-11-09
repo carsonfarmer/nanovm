@@ -44,6 +44,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flags"
+version = "0.1.0"
+dependencies = [
+ "nanovm-sdk",
+ "serde",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

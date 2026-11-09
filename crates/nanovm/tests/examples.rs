@@ -859,3 +859,55 @@ async fn tictactoe_lobby_pairs_players_and_games_judge_moves() {
     let app = app.restart().await;
     assert_eq!(app.get(format!("/{game}/")).await.json(), state);
 }
+
+/// examples/flags: defaults from the app's config, overrides per tenant
+/// object pushed live to its sockets, stable and monotonic percentage
+/// rollouts, all durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn flags_override_defaults_per_tenant_live() {
+    let mut app = App::start("flags", json!({})).await;
+    let flags = app.get("/acme/flags").await.json();
+    assert_eq!(flags["dark_mode"], json!({"value": true, "source": "default"}));
+    assert_eq!(flags["search_v2"]["value"], json!({"percent": 25}));
+    let mut watch = app.open("/acme/ws").await.unwrap();
+    assert_eq!(next(&mut watch).await, flags);
+
+    let set = app.send("PUT", "/acme/flags/new_checkout", &[], "true").await;
+    assert_eq!(set.json(), json!({"value": true, "source": "tenant"}));
+    assert_eq!(next(&mut watch).await["new_checkout"]["value"], true, "pushed live");
+    assert_eq!(app.get("/other/flags").await.json()["new_checkout"]["value"], false, "tenants are their own");
+    assert_eq!(app.send("PUT", "/acme/flags/nope", &[], "true").await.status, 404, "only flags the app defines");
+    for bad in ["maybe", r#"{"percent":101}"#, r#"{"percent":5,"x":1}"#, "1"] {
+        assert_eq!(app.send("PUT", "/acme/flags/dark_mode", &[], bad).await.status, 400, "{bad}");
+    }
+
+    // A rollout is per user, the same each time, and only grows.
+    let on = async |app: &App| -> std::collections::BTreeSet<usize> {
+        let mut on = std::collections::BTreeSet::new();
+        for batch in (0..100).collect::<Vec<_>>().chunks(25) {
+            let asks = batch.iter().map(|u| async move { (*u, app.get(format!("/acme/flags?user=u{u}")).await.json()) });
+            for (u, f) in futures::future::join_all(asks).await {
+                if f["search_v2"]["value"] == true {
+                    on.insert(u);
+                }
+            }
+        }
+        on
+    };
+    let quarter = on(&app).await;
+    assert_eq!(on(&app).await, quarter, "the same users each time");
+    app.send("PUT", "/acme/flags/search_v2", &[], r#"{"percent":50}"#).await;
+    let half = on(&app).await;
+    assert!(quarter.is_subset(&half) && quarter.len() < half.len() && half.len() < 100, "{} {}", quarter.len(), half.len());
+    app.send("PUT", "/acme/flags/search_v2", &[], r#"{"percent":0}"#).await;
+    assert!(on(&app).await.is_empty());
+    while next(&mut watch).await["search_v2"]["value"] != json!({"percent": 0}) {}
+
+    // Back to the default, and durable.
+    assert_eq!(app.send("DELETE", "/acme/flags/search_v2", &[], "").await.json()["source"], "default");
+    assert_eq!(next(&mut watch).await["search_v2"]["source"], "default");
+    assert_eq!(app.evicted("/acme/flags").await.json()["new_checkout"]["value"], true);
+    let app = app.restart().await;
+    let flags = app.get("/acme/flags").await.json();
+    assert_eq!((&flags["new_checkout"]["source"], &flags["search_v2"]["source"]), (&json!("tenant"), &json!("default")));
+}
