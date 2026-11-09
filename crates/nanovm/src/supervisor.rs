@@ -13,12 +13,11 @@
 //! Each worker gets two control sockets (see `link`): on fd 3 the supervisor
 //! hands it connections for requests, and on fd 4 the worker hands the
 //! supervisor connections for its guests' outbound requests. Its spec
-//! arrives on stdin, read before the worker jails itself: the node's config,
-//! which it builds its engine from (see [`Spawned`]), then its app and
-//! component.
+//! arrives on stdin: the node's config, which it builds its engine from (see
+//! [`Spawned`]), then its app and the file in the registry's cache that holds
+//! its component, which it opens before it jails itself.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -39,6 +38,7 @@ use tokio::sync::{OwnedSemaphorePermit, watch};
 
 use crate::config::{AppConfig, NodeConfig};
 use crate::egress::{EgressPolicy, serve_forwarded};
+use crate::engine::Wasm;
 use crate::jail::Jail;
 use crate::link::{self, Dialer};
 use crate::registry::{APP_HEADER, AppRef, HOST_HEADER, MIN_VERSION_HEADER, Policy, Registry, TRUST_HEADER};
@@ -401,15 +401,14 @@ impl Supervisor {
             place_in_cgroup(root, &app, pid)?;
         }
 
-        // The rest of the worker's spec: its app, its uid and our pid.
+        // The rest of the worker's spec: its app, its uid, its component and our pid.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
         // As many links to the supervisor as its objects may use at once:
         // each its outbound requests and a publish.
         let links = self.cfg.max_live_objects * (app.limits.max_outbound_concurrency + 1);
-        let mut spec = serde_json::to_vec(&(&app, uid, std::process::id()))?;
+        let mut spec = serde_json::to_vec(&(&app, uid, &p.component, std::process::id()))?;
         spec.push(b'\n');
         stdin.write_all(&spec).await?;
-        stdin.write_all(&p.wasm).await?;
         drop(stdin);
 
         // The worker's stderr goes to ours, tagged with its app, a line (of at
@@ -696,9 +695,10 @@ pub fn worker_main() -> anyhow::Result<()> {
     let linker = crate::app::linker(&engine)?;
     line.clear();
     input.read_until(b'\n', &mut line)?;
-    let (app, uid, parent): (AppConfig, Option<u32>, u32) = serde_json::from_slice(&line).context("worker spec: the app")?;
-    let mut wasm = Vec::new();
-    input.read_to_end(&mut wasm)?;
+    let (app, uid, (digest, path), parent): (AppConfig, Option<u32>, (String, PathBuf), u32) =
+        serde_json::from_slice(&line).context("worker spec: the app")?;
+    // The registry's cache is outside the jail.
+    let wasm = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: the supervisor put these sockets at fds 3 and 4 and nothing
     // else in this process owns them.
     let (requests, upstream) = unsafe { (UnixStream::from_raw_fd(3), UnixStream::from_raw_fd(4)) };
@@ -717,7 +717,7 @@ pub fn worker_main() -> anyhow::Result<()> {
     rt.block_on(async move {
         // Pool 0 for the runtime's threads, 1 for the telemetry export thread.
         let upstream = Dialer::new(upstream, 2);
-        let node = Node::with_engine(engine, &linker, cfg, &app, &wasm, Some(upstream))?;
+        let node = Node::with_engine(engine, &linker, cfg, &app, Wasm::File(wasm, &digest), Some(upstream))?;
         let requests = tokio::net::UnixStream::from_std(requests)?;
         link::serve(requests, vec![], move |req| crate::server::handle(node.clone(), req)).await
     })
