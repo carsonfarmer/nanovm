@@ -31,6 +31,10 @@ use std::time::Instant;
 
 use crate::{committed, config::CaptureConfig, object::ObjShared};
 
+#[cfg(test)]
+#[path = "../tests/capture/mod.rs"]
+mod capture_tests;
+
 const LOG: &str = "log";
 /// Overwritten bytes are kept in records of at most this many.
 const CHUNK: u64 = 1 << 20;
@@ -60,6 +64,7 @@ pub struct Journal {
     /// needs no asking where it is.
     root: (u64, u64),
     dir: PathBuf,
+    dir_synced: bool,
     /// Open while the current request has changes.
     log: Option<File>,
     /// Files (by inode) whose size is recorded, and what to sync on commit.
@@ -75,7 +80,7 @@ pub struct Journal {
     /// Bytes the log holds, and the removed files; each may reach `max`.
     held: (u64, u64),
     max: u64,
-    capture: Option<CaptureConfig>,
+    capture: Option<Box<committed::Capture>>,
     poisoned: bool,
     /// Waits for the disk aren't charged to its CPU budget.
     obj: Arc<ObjShared>,
@@ -92,12 +97,14 @@ impl Journal {
         if capture.is_none() && committed::directory(&base, &dir).try_exists()? {
             return Err(std::io::Error::other("committed history requires capture to remain enabled"));
         }
+        let capture = capture.map(|cap| committed::Capture::open(volume, &dir, &obj, cap).map(Box::new)).transpose()?;
         let md = std::fs::metadata(volume)?;
         Ok(Journal {
             base,
             volume: volume.to_path_buf(),
             root: (md.dev(), md.ino()),
             dir,
+            dir_synced: false,
             log: None,
             sized: HashMap::new(),
             created: HashMap::new(),
@@ -106,7 +113,7 @@ impl Journal {
             slots: 0,
             held: (0, 0),
             max,
-            capture: capture.cloned(),
+            capture,
             poisoned: false,
             obj,
         })
@@ -186,8 +193,14 @@ impl Journal {
             // The directories the log is first made in must be durable too.
             std::fs::create_dir_all(&self.dir)?;
             let log = File::options().create(true).append(true).open(self.dir.join(LOG))?;
-            for d in [&self.dir, self.dir.parent().expect("in ~journal"), &self.base] {
-                sync(d)?;
+            sync(&self.dir)?; // Every new log name must precede its mutations.
+            if !self.dir_synced {
+                // These ancestor names stay fixed for this activation. Reopen
+                // repeats the barriers rather than trusting visible names.
+                for d in [self.dir.parent().expect("in ~journal"), &self.base] {
+                    sync(d)?;
+                }
+                self.dir_synced = true;
             }
             self.log = Some(log);
         }
@@ -407,6 +420,22 @@ impl Journal {
         self.touched.insert(p.parent().unwrap_or(Path::new("")).to_path_buf());
     }
 
+    fn prepare_capture(&mut self) -> std::io::Result<()> {
+        if let Some(capture) = &mut self.capture {
+            capture.prepare(&self.volume, &self.dir, &self.obj, |ino, length| {
+                if self.created.contains_key(&ino) { return std::iter::once(0..length).collect(); }
+                let Some(saved) = self.sized.get(&ino) else { return vec![] };
+                let mut ranges: Vec<_> = saved.ranges.iter()
+                    .map(|r| r.start..r.end.min(length)).collect();
+                // Undo only saves original bytes. Capture also needs new tails,
+                // including zero-filled extensions after a truncate.
+                if length > saved.len { ranges.push(saved.len..length); }
+                ranges
+            })?;
+        }
+        Ok(())
+    }
+
     /// Makes the request's changes durable and forgets how to undo them.
     pub fn commit(&mut self) -> std::io::Result<()> {
         self.check()?;
@@ -418,16 +447,13 @@ impl Journal {
         for p in self.touched.drain() {
             sync_if_there(&self.base.join(p))?;
         }
-        let out = committed::directory(&self.base, &self.dir);
-        if let Some(cap) = &self.capture {
-            committed::prepare(&self.volume, &self.dir, &out, &self.obj, cap)?;
-        }
+        self.prepare_capture()?;
         drop(log);
         // Deleting the log is the commit.
         std::fs::remove_file(self.dir.join(LOG))?;
         sync(&self.dir)?;
-        if self.capture.is_some() {
-            committed::finish(&self.dir, &out, &self.obj)?;
+        if let Some(capture) = &self.capture {
+            capture.publish(&self.dir)?;
         }
         self.obj.uncharge(t0.elapsed());
         clear(&self.dir)?;
@@ -688,16 +714,111 @@ mod tests {
     }
 
     fn archive_tree(v: &Path, sequence: u64) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
-        let base = v.parent().unwrap();
-        let dest = base.join(format!("restored-{sequence}"));
-        let _ = std::fs::remove_dir_all(&dest);
-        tar::Archive::new(File::open(base.join(format!("~committed/o/{sequence:020}.tar"))).unwrap())
-            .unpack(&dest).unwrap();
-        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(dest.join("nanovm.json")).unwrap()).unwrap();
-        assert_eq!(metadata["app"], "app");
-        assert_eq!(metadata["object"], "o");
-        assert_eq!(metadata["sequence"], sequence);
-        tree(&dest.join("data"))
+        capture_tests::tree(&v.parent().unwrap().join("~committed/o"), sequence, "app", "o")
+    }
+
+    #[test]
+    fn capture_ranges_preserve_namespace_and_unchanged_bytes() {
+        let v = volume();
+        std::fs::write(v.join("large"), vec![137; 2 << 20]).unwrap();
+        let cap = CaptureConfig { max_mb: 3, max_versions: 16 };
+        let mut j = captured(&v, &cap).unwrap();
+        write(&mut j, &v, "a", 1, b"BASE");
+        j.commit().unwrap();
+        let first = tree(&v);
+        write(&mut j, &v, "large", 4093, b"cross-page");
+        let large = File::options().read(true).write(true).open(v.join("large")).unwrap();
+        j.writing(&large, (2 << 20) - 64, 2 << 20).unwrap();
+        large.set_len((2 << 20) - 64).unwrap();
+        j.writing(&large, (2 << 20) - 64, (2 << 20) + 4).unwrap();
+        large.set_len((2 << 20) + 4).unwrap();
+        write(&mut j, &v, "large", 2 << 20, b"LAST");
+        let file = File::options().read(true).write(true).open(v.join("a")).unwrap();
+        j.writing(&file, 3, 11).unwrap();
+        file.set_len(3).unwrap();
+        j.writing(&file, 3, 15).unwrap();
+        file.set_len(15).unwrap();
+        write(&mut j, &v, "a", 10, b"tail");
+        rename(&mut j, &v, "d", "nested");
+        j.unlink(&v.join("f"), 2).unwrap();
+        j.creating(&v.join("empty")).unwrap();
+        std::fs::write(v.join("empty"), []).unwrap();
+        j.commit().unwrap(); // A second full 2 MiB copy would exhaust history.
+        let second = tree(&v);
+        assert_eq!(second[Path::new("a")], Some(b"hBA\0\0\0\0\0\0\0tail\0".to_vec()));
+        let mut tail = vec![0; 64];
+        tail.extend_from_slice(b"LAST");
+        assert_eq!(&second[Path::new("large")].as_ref().unwrap()[(2 << 20) - 64..], &tail);
+        assert_eq!(archive_tree(&v, 2), second);
+        assert_eq!(archive_tree(&v, 1), first);
+        drop(j);
+        let mut j = captured(&v, &cap).unwrap();
+        // Replace a name, then mutate through its retained old descriptor.
+        j.unlink(&v.join("a"), 15).unwrap();
+        j.creating(&v.join("a")).unwrap();
+        std::fs::write(v.join("a"), "replacement").unwrap();
+        j.created(&v.join("a")).unwrap();
+        j.writing(&file, 0, 3).unwrap();
+        file.write_all_at(b"old", 0).unwrap();
+        write(&mut j, &v, "large", (1 << 20) + 7, b"restart");
+        j.commit().unwrap();
+        assert_eq!(archive_tree(&v, 3), tree(&v));
+        assert_eq!(archive_tree(&v, 2), second);
+        drop(j);
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn capture_cleanup_can_be_retried_after_its_name_reappears() {
+        let v = volume();
+        let cap = CaptureConfig::default();
+        let mut j = captured(&v, &cap).unwrap();
+        write(&mut j, &v, "a", 2, b"accepted");
+        j.commit().unwrap();
+        let before = tree(&v);
+        let out = committed::directory(&j.base, &j.dir);
+        let staged = j.dir.join("capture");
+        drop(j);
+        // Explicitly restore the name that an unsynced cleanup might leave.
+        // This is an ordering fixture, not a power-loss simulation.
+        for _ in 0..2 {
+            std::fs::hard_link(out.join("00000000000000000001.tar"), &staged).unwrap();
+            drop(captured(&v, &cap).unwrap());
+            assert_eq!(tree(&v), before);
+            assert_eq!(archive_tree(&v, 1), before);
+        }
+        let mut j = captured(&v, &cap).unwrap();
+        write(&mut j, &v, "a", 0, b"next");
+        j.commit().unwrap();
+        assert_eq!(archive_tree(&v, 2), tree(&v));
+        assert_eq!(archive_tree(&v, 1), before);
+        drop(j);
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn capture_rejects_an_unsupported_history_or_staged_format() {
+        for staged in [false, true] {
+            let v = volume();
+            let cap = CaptureConfig::default();
+            let mut j = captured(&v, &cap).unwrap();
+            write(&mut j, &v, "a", 0, b"accepted");
+            j.commit().unwrap();
+            let before = tree(&v);
+            let path = if staged { j.dir.join("capture") }
+                else { committed::directory(&j.base, &j.dir).join("00000000000000000001.tar") };
+            drop(j);
+            let metadata = br#"{"format":1,"app":"app","object":"o","sequence":1,"parent":""}"#;
+            let mut archive = tar::Builder::new(File::create(path).unwrap());
+            let mut header = tar::Header::new_gnu();
+            header.set_size(metadata.len() as u64);
+            header.set_mode(0o600);
+            archive.append_data(&mut header, "nanovm.json", &metadata[..]).unwrap();
+            drop(archive.into_inner().unwrap());
+            assert_eq!(captured(&v, &cap).err().unwrap().kind(), ErrorKind::InvalidData);
+            assert_eq!(tree(&v), before);
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -730,7 +851,7 @@ mod tests {
                 let changed = tree(&v);
                 let out = committed::directory(&j.base, &j.dir);
                 if rollback {
-                    committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+                    j.prepare_capture().unwrap();
                 }
                 drop(j);
                 if !rollback { drop(captured(&v, &cap).unwrap()); }
@@ -767,7 +888,7 @@ mod tests {
         let mut j = captured(&v, &cap).unwrap();
         change(&mut j, &v);
         let out = committed::directory(&j.base, &j.dir);
-        committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+        j.prepare_capture().unwrap();
         // Model an unlink visible to a new process, without a completed sync.
         std::fs::remove_file(j.dir.join(LOG)).unwrap();
         drop(j);
@@ -793,7 +914,7 @@ mod tests {
         change(&mut j, &v);
         let changed = tree(&v);
         let out = committed::directory(&j.base, &j.dir);
-        committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+        j.prepare_capture().unwrap();
         drop(j);
         for _ in 0..2 {
             FAIL_SYNC_AFTER.set(Some(0));
@@ -813,13 +934,16 @@ mod tests {
         let cap = CaptureConfig::default();
         for after in 0..64 {
             let v = volume();
-            let before = tree(&v);
             let mut j = captured(&v, &cap).unwrap();
+            write(&mut j, &v, "f", 0, b"BS");
+            j.commit().unwrap();
+            let before = tree(&v);
             change(&mut j, &v);
             let changed = tree(&v);
             FAIL_SYNC_AFTER.with(|c| c.set(Some(after)));
             let result = j.commit();
             FAIL_SYNC_AFTER.with(|c| c.set(None));
+            if result.is_err() { assert!(j.commit().is_err(), "failed commit must not reuse an advanced capture cache"); }
             let committed = !j.dir.join(LOG).exists();
             let out = committed::directory(&j.base, &j.dir);
             drop(j);
@@ -827,18 +951,19 @@ mod tests {
                 drop(captured(&v, &cap).unwrap());
                 assert_eq!(tree(&v), if committed { changed.clone() } else { before.clone() }, "cut {after}");
                 let count = std::fs::read_dir(&out).map(|d| d.count()).unwrap_or(0);
-                assert_eq!(count, usize::from(committed), "cut {after}: state/capture diverged");
-                if committed { assert_eq!(archive_tree(&v, 1), changed, "cut {after}"); }
+                assert_eq!(count, 1 + usize::from(committed), "cut {after}: state/capture diverged");
+                assert_eq!(archive_tree(&v, 1), before);
+                if committed { assert_eq!(archive_tree(&v, 2), changed, "cut {after}"); }
             }
             let mut next = captured(&v, &cap).unwrap();
             next.creating(&v.join("next")).unwrap();
             std::fs::write(v.join("next"), "next version").unwrap();
             next.commit().unwrap();
-            assert_eq!(archive_tree(&v, if committed { 2 } else { 1 }), tree(&v));
-            if committed { assert_eq!(archive_tree(&v, 1), changed, "older capture changed"); }
+            assert_eq!(archive_tree(&v, if committed { 3 } else { 2 }), tree(&v));
+            if committed { assert_eq!(archive_tree(&v, 2), changed, "older capture changed"); }
             std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
             if result.is_ok() {
-                assert!(after >= 10, "did not exercise capture/publication sync boundaries");
+                assert!(after >= 8, "did not exercise capture/publication sync boundaries");
                 println!("capture commit: {after} sync-error cuts preserve state/version agreement");
                 return;
             }
@@ -855,7 +980,7 @@ mod tests {
             let mut j = captured(&v, &cap).unwrap();
             change(&mut j, &v);
             let out = committed::directory(&j.base, &j.dir);
-            committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+            j.prepare_capture().unwrap();
             drop(j); // Prepared, but the commit decision was never made.
             FAIL_SYNC_AFTER.with(|c| c.set(Some(after)));
             let result = captured(&v, &cap);
@@ -888,6 +1013,7 @@ mod tests {
             j.commit().unwrap();
             let accepted = tree(&v);
             write(&mut j, &v, "a", 0, b"rejected");
+            if byte_limit { write(&mut j, &v, "large", 0, &vec![8; 600_000]); }
             assert_eq!(j.commit().unwrap_err().kind(), ErrorKind::StorageFull);
             assert!(j.commit().is_err(), "failed capture must poison commit retries");
             drop(j);

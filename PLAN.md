@@ -610,6 +610,43 @@ crash/rejection tests; measure a replacement against both baseline and full capt
 including tiny changes to larger volumes. Do not assume fewer copied bytes alone
 will fix the extra durable barriers, and do not remove required barriers.
 
+**Active replacement, not accepted for main (2026-11-09):** retain the
+undo log's acceptance decision and standard TAR container; do not introduce a
+second transaction log or a storage-engine rewrite. Format 2 starts with one full
+capture, then records the complete namespace, lengths and final changed byte ranges.
+Same-path/same-inode files inherit their previous bytes; new/replaced/renamed files
+are copied. Journal range tracking identifies what to read from final live files,
+not undo bytes to replicate. The initial full capture, namespace walks and full
+copies on rename remain costs to measure. Reopening binds paths to the recovered
+root's current inodes, not to inode numbers on another machine. Replay needs the
+whole ordered chain; there is no retention/compaction or production restore API.
+The recovered live root must exactly match the history head. Existing format-1
+histories are refused, not migrated. Tiny/mostly changed files use a full copy
+when range metadata would cost more. Sequence, total bytes and the head digest
+are cached only for the exclusive writer's activation and reconstructed on open;
+hashing streamed output avoids rereading it. No mutable on-disk cursor is added.
+
+The candidate persists journal and capture directory ancestors once per object activation,
+while still syncing every newly created undo-log name before any mutation. Capture
+state is boxed so disabled objects do not pay for the larger cache structure. It
+uses the normal commit's already-completed decision barrier for publication, and
+keeps the independent decision barrier on recovery. After the output name is
+durable, removing staging is cleanup: a resurrected staging name retries identical
+publication. Staging/discard barriers before decisions/undo remain mandatory.
+Read-only review found no concrete blocker; 30 journal tests and five guard-removal
+mutations validate local mechanisms, not physical power loss. The actual full suite
+and SQL suite still fail CPU-budget cases (HANDOFF records counts). Matched release
+measurements reduce 64 updates beside an unchanged 8 MiB file from 537,133,056 to
+8,683,008 archive bytes. Tiny-write median throughput still falls 12% concurrent
+and 20% serial versus capture disabled; the performance gate remains open.
+Next investigate making immutable publication the capture-mode commit decision,
+with a transaction identity binding the undo log to that version. Merely removing
+the existing decision barrier would be incorrect. This proposal needs recovery
+ordering, rejection and retry evidence before implementation is accepted.
+These changes do not implement remote acknowledgement or
+approve a replication/fencing authority. Current main below is historical to this
+candidate, not a performance acceptance claim.
+
 **Local capture implemented in `b7bf806` (CI 42491417145 passed):** opt-in capture
 runs inside the real journal at both existing commit gates. Stage and sync an immutable full version before
 the undo log's commit marker, then publish it before permitting another mutation.

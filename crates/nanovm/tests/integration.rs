@@ -111,16 +111,12 @@ async fn settle(node: &Arc<Node>) {
 
 // ---- persistence and isolation ----------------------------------------
 
+#[path = "capture/mod.rs"]
+mod capture;
+
 fn captured_files(objects: &Path, id: &str, sequence: u64) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
-    use std::io::Read;
-    let file = std::fs::File::open(objects.join(format!("~committed/{id}/{sequence:020}.tar"))).unwrap();
-    tar::Archive::new(file).entries().unwrap().map(|entry| {
-        let mut entry = entry.unwrap();
-        let path = entry.path().unwrap().into_owned();
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).unwrap();
-        (path, bytes)
-    }).filter(|(path, _)| path != Path::new("nanovm.json")).collect()
+    capture::tree(&objects.join("~committed").join(id), sequence, objects.file_name().unwrap().to_str().unwrap(), id).into_iter()
+        .filter_map(|(path, bytes)| bytes.map(|bytes| (Path::new("data").join(path), bytes))).collect()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1877,15 +1873,29 @@ async fn sqlite_captures_recover_without_the_original_node() {
     node.shutdown().await;
     drop(node);
     std::fs::remove_dir_all(&cfg.data_dir).unwrap();
-    let unpack = fresh.data_dir.join("unpack");
-    let last = received.join(versions.last().unwrap().file_name().unwrap());
-    tar::Archive::new(std::fs::File::open(last).unwrap()).unpack(&unpack).unwrap();
-    std::fs::rename(unpack.join("data"), objects.join("a")).unwrap();
+    std::fs::create_dir_all(objects.join("a")).unwrap();
+    for (path, bytes) in capture::tree(&received, versions.len() as u64, &app.name, "a") {
+        let path = objects.join("a").join(path);
+        if let Some(bytes) = bytes { std::fs::write(path, bytes).unwrap(); }
+        else { std::fs::create_dir(path).unwrap(); }
+    }
     let node = Node::new(fresh.clone(), &app, &wasm, None).unwrap();
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     assert_eq!(get(&node, "a", "/?v=continued").await.json(), expected(&["first", "second", "continued"], "continued", true));
     settle(&node).await;
     assert_eq!(std::fs::read_dir(&received).unwrap().count(), 3, "restored history must continue, not restart");
+    let root = objects.join("a");
+    let mut pending = vec![root.clone()];
+    let mut live = std::collections::BTreeMap::new();
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = if path.is_dir() { pending.push(path.clone()); None }
+                else { Some(std::fs::read(&path).unwrap()) };
+            live.insert(path.strip_prefix(&root).unwrap().to_path_buf(), bytes);
+        }
+    }
+    assert_eq!(capture::tree(&received, 3, &app.name, "a"), live);
     node.shutdown().await;
     drop(node);
     let node = Node::new(fresh, &app, &wasm, None).unwrap();

@@ -2,7 +2,7 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
-## Current state (2026-11-08)
+## Current state (2026-11-09)
 
 **Owner correction / active work:** the roughly 50% enabled write-throughput loss
 is unacceptable; opt-in does not waive the performance requirement. Amp owns
@@ -14,6 +14,43 @@ authorized and fenced**. No acknowledgement-policy question remains. Receiver fa
 domain, protocol and authority implementation still need concrete design and evidence.
 Main integration `59b3783` passed CI 42492425381; that proves its checks, not acceptance
 of its capture performance. Do not build remote replication atop the rejected cost.
+
+**Active candidate (2026-11-09), not accepted for main:** policy checkpoint `4005a79`
+passed CI 42545866551. Profiling the unchanged runtime shows 64 eight-byte updates
+beside an untouched 8 MiB file emit 537,133,056 archive bytes; twelve tiny updates
+add 96 fsync calls versus capture disabled. The working branch replaces repeated
+full copies with full namespace plus final-byte ranges and reduces redundant syncs.
+The final candidate emits 8,683,008 bytes in that workload. Twelve tiny commits
+use 38 fsync + 24 fdatasync without capture, 77 + 24 with it (original: 60 + 24
+and 156 + 24). Three alternating, same-binary guest benchmark pairs give concurrent
+writes 447/263/624 without capture versus 393/315/418 with it; serial writes
+202/93/245 versus 124/171/162. One disabled run had a CPU failure. Median enabled
+throughput remains 12%/20% lower: **performance is not accepted**. Do not promote
+this candidate to main or use remote latency to excuse these local costs.
+
+Thirty actual-runtime journal tests and the source-import harness pass; five mutations (missing saved ranges,
+new tails, cumulative accounting, stream hashing and poisoning) fail and were restored.
+Actual runtime suite: 108 unit and 68 integration tests pass, but the KV disk-quota
+test fails its CPU budget. SQL suite: 9 pass, with handled-exhaustion and pressure
+matrix tests failing their 5-second CPU budgets. Both proof example tests pass.
+The separate receiver-process drill passes. The release demo completes all 70,000
+normal requests, contains 100 attacks and serves 652 canary requests without failure;
+its supervised service is stopped. Temporary benchmark source was removed/restored.
+These are failed suites, not a claim that N-32 is fixed. Production check passes;
+rustdoc has five existing warnings, strict clippy seven existing diagnostics.
+Required read-only review and focused cache/ancestor follow-ups found no remaining
+concrete blocker within the trusted-root/local scope; Opus routing is unattested.
+Runtime is 5,463 lines, not a reduction. Remote durability remains unimplemented.
+
+**Current successor prompt:** Continue `w9-efficient-capture`; preserve the
+owner-approved remote-before-success and manually authorized, fenced recovery policy.
+The delta candidate fixes full-copy amplification but fails the local performance
+gate. Investigate a single durable capture/commit decision instead of independently
+syncing both decisions; this is an engineering proposal, not implemented or approved
+replication architecture. Preserve default-mode durable acceptance, rejected-request
+rollback and both gates. Require recovery-cut tests, mutations, independent review
+and matched measurements before adoption. Do not extend backup or revive rejected
+backends. Historical checkpoints below are not current performance clearance.
 
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
 and is included in this main integration from `w9-atomic-capture`. Bounded, opt-in
