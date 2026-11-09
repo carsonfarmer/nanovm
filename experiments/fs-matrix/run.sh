@@ -53,10 +53,11 @@ for _ in $(seq 100); do [ "$(grep -c ' 127' "$W/apps")" = 2 ] && break; sleep 0.
 APP=$(awk '$1 == "counter" {print $2}' "$W/apps")
 H=(-H "nanovm-app: $APP" -H 'nanovm-trust: dev dev')
 
-oha_run() { # C N URL -> "rps p50_ms p99_ms ok"
+oha_run() { # C N URL -> "rps p50_ms p99_ms ok other-statuses"
     "$OHA" --no-tui --output-format json -m POST -c "$1" -n "$2" "${H[@]}" --rand-regex-url "$3" |
         python3 -c 'import json,sys; o=json.load(sys.stdin); l=o["latencyPercentiles"]
-print(round(o["summary"]["requestsPerSec"]), round(l["p50"]*1e3, 3), round(l["p99"]*1e3, 3), o["statusCodeDistribution"].get("200", 0))'
+print(round(o["summary"]["requestsPerSec"]), round(l["p50"]*1e3, 3), round(l["p99"]*1e3, 3), o["statusCodeDistribution"].get("200", 0),
+      ",".join(f"{k}:{v}" for k, v in sorted(o["statusCodeDistribution"].items()) if k != "200") or "-")'
 }
 
 measure() { # NAME ROUND
@@ -68,12 +69,12 @@ measure() { # NAME ROUND
     env -u RUST_BACKTRACE "$BIN/nanovm" serve --config "$W/node.toml" >"$W/node.log" 2>&1 & local pid=$!
     for _ in $(seq 100); do curl -sf "http://127.0.0.1:$PORT/_nanovm/ready" >/dev/null && break; sleep 0.1; done
     oha_run 16 400 "http://127.0.0.1:$PORT/o[0-9]{2}/incr" >/dev/null    # compile, start, warm
-    read -r s_rps s_p50 s_p99 s_ok <<<"$(oha_run 1 "${SERIAL_N:-500}" "http://127.0.0.1:$PORT/one/incr")"
-    read -r c_rps c_p50 c_p99 c_ok <<<"$(oha_run 64 "${CONC_N:-5000}" "http://127.0.0.1:$PORT/o[0-9]{2}/incr")"
+    read -r s_rps s_p50 s_p99 s_ok s_other <<<"$(oha_run 1 "${SERIAL_N:-500}" "http://127.0.0.1:$PORT/one/incr")"
+    read -r c_rps c_p50 c_p99 c_ok c_other <<<"$(oha_run 64 "${CONC_N:-5000}" "http://127.0.0.1:$PORT/o[0-9]{2}/incr")"
     kill $pid; wait $pid 2>/dev/null
     rm -rf "$d"
-    printf '{"fs":"%s","round":%s,"fsync":%s,"incr_serial":{"n":%s,"rps":%s,"p50_ms":%s,"p99_ms":%s,"ok":%s},"incr_c64":{"n":%s,"rps":%s,"p50_ms":%s,"p99_ms":%s,"ok":%s},"load1":%s}\n' \
-        "$1" "$2" "$f" "${SERIAL_N:-500}" "$s_rps" "$s_p50" "$s_p99" "$s_ok" "${CONC_N:-5000}" "$c_rps" "$c_p50" "$c_p99" "$c_ok" \
+    printf '{"fs":"%s","round":%s,"fsync":%s,"incr_serial":{"n":%s,"rps":%s,"p50_ms":%s,"p99_ms":%s,"ok":%s,"other":"%s"},"incr_c64":{"n":%s,"rps":%s,"p50_ms":%s,"p99_ms":%s,"ok":%s,"other":"%s"},"load1":%s}\n' \
+        "$1" "$2" "$f" "${SERIAL_N:-500}" "$s_rps" "$s_p50" "$s_p99" "$s_ok" "$s_other" "${CONC_N:-5000}" "$c_rps" "$c_p50" "$c_p99" "$c_ok" "$c_other" \
         "$(cut -d' ' -f1 /proc/loadavg)" |
         tee -a "$OUT/results.jsonl"
 }
