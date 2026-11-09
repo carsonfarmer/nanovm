@@ -1,0 +1,7 @@
+{
+  "limits": {
+    "memory_mb": 32, "cpu_ms": 200, "request_timeout_ms": 5000, "idle_timeout_ms": 30000,
+    "disk_mb": 16, "max_files": 4000,
+    "egress": ["blog.rust-lang.org", "*.substack.com"]
+  }
+}

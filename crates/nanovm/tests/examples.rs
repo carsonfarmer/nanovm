@@ -1369,3 +1369,90 @@ async fn gateway_streams_completions_within_quotas() {
     let app = app.restart().await;
     assert_eq!(usage(&app).await, 205);
 }
+
+/// Feeds on loopback: `/rss` and `/atom` serve the documents in `docs`
+/// (each with an ETag, and `304` for a matching If-None-Match); every
+/// request's path and If-None-Match is recorded.
+type Docs = std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, (String, String)>>>;
+
+async fn feed_server(docs: Docs) -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let log = seen.clone();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| {
+        let (docs, log) = (docs.clone(), log.clone());
+        async move {
+            let inm = req.headers().get("if-none-match").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+            log.lock().unwrap().push((req.uri().path().to_string(), inm.clone()));
+            let Some((etag, body)) = docs.lock().unwrap().get(req.uri().path()).cloned() else {
+                return nanovm::object::error_response(500, "scripted", "no such feed");
+            };
+            let full = http_body_util::Full::new(bytes::Bytes::from(if inm == etag { String::new() } else { body }));
+            let body = http_body_util::BodyExt::boxed_unsync(http_body_util::BodyExt::map_err(full, |e| match e {}));
+            http::Response::builder().status(if inm == etag { 304 } else { 200 }).header("etag", etag).body(body).unwrap()
+        }
+    }));
+    (addr, seen)
+}
+
+fn rss(items: &[(&str, &str)]) -> String {
+    let items: String = items.iter().map(|(t, l)| format!("<item><title>{t}</title><link>{l}</link><guid>{l}#g</guid></item>")).collect();
+    format!(r#"<?xml version="1.0"?><rss version="2.0"><channel><title>R</title>{items}</channel></rss>"#)
+}
+
+/// examples/feeds (on an in-process node, to reach loopback feeds): RSS and
+/// Atom fetched with conditional GETs by one object per feed, each item kept
+/// once; readers' timelines gathered from the feeds through calls, one entry
+/// per link; all durable, the ETag included.
+#[tokio::test(flavor = "multi_thread")]
+async fn feeds_fetch_once_and_fan_in_to_readers() {
+    let docs: Docs = Default::default();
+    docs.lock().unwrap().insert("/rss".into(), ("\"v1\"".into(), rss(&[("Two", "https://x/2"), ("One", "https://x/1")])));
+    let atom = r#"<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>A</title>
+        <entry><title>Shared</title><link href="https://x/2"/><id>urn:a:2</id></entry>
+        <entry><title>Atom only</title><link rel="alternate" href="https://y/1"/><id>urn:a:1</id></entry></feed>"#;
+    docs.lock().unwrap().insert("/atom".into(), ("\"a1\"".into(), atom.into()));
+    let (addr, seen) = feed_server(docs.clone()).await;
+    let app = Local::start("feeds", json!({"limits": {"egress": [addr]}}));
+    let put = async |path: &str, body: Value| app.send("PUT", path, &[], body.to_string()).await;
+    assert_eq!(put("/f-rust/", json!({"url": format!("http://{addr}/rss")})).await.status, 204);
+    assert_eq!(put("/f-atom/", json!({"url": format!("http://{addr}/atom")})).await.status, 204);
+    let refresh = async |feed: &str| app.send("POST", &format!("/{feed}/refresh"), &[], "").await;
+
+    assert_eq!(refresh("f-rust").await.json(), json!({"new": 2}));
+    assert_eq!(refresh("f-rust").await.json(), json!({"new": 0, "unchanged": true}), "a 304");
+    assert_eq!(seen.lock().unwrap()[1], ("/rss".into(), "\"v1\"".into()), "a conditional GET");
+    docs.lock().unwrap().insert("/rss".into(), ("\"v2\"".into(), rss(&[("Three", "https://x/3"), ("Two", "https://x/2"), ("One", "https://x/1")])));
+    assert_eq!(refresh("f-rust").await.json(), json!({"new": 1}), "only the new item");
+    assert_eq!(refresh("f-atom").await.json(), json!({"new": 2}));
+    let items = app.send("GET", "/f-rust/items?after=1", &[], "").await.json();
+    let titles: Vec<_> = items.as_array().unwrap().iter().map(|i| i["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, ["Two", "Three"], "in the feed's order, after 1");
+
+    // Readers gather from the feeds they follow: no fetch, one entry per link.
+    let fetches = seen.lock().unwrap().len();
+    assert_eq!(put("/ann/follows", json!(["f-rust", "f-atom"])).await.status, 204);
+    let timeline = app.send("GET", "/ann/timeline", &[], "").await.json();
+    let mut links: Vec<_> = timeline.as_array().unwrap().iter().map(|i| i["link"].as_str().unwrap().to_string()).collect();
+    links.sort();
+    assert_eq!(links, ["https://x/1", "https://x/2", "https://x/3", "https://y/1"]);
+    assert_eq!(app.send("GET", "/ann/timeline", &[], "").await.json(), timeline, "nothing new");
+    assert_eq!(put("/bob/follows", json!(["f-rust"])).await.status, 204);
+    assert_eq!(app.send("GET", "/bob/timeline", &[], "").await.json().as_array().unwrap().len(), 3);
+    assert_eq!(seen.lock().unwrap().len(), fetches, "readers never fetch");
+    assert_eq!(put("/ann/follows", json!(["ann"])).await.status, 400);
+
+    // Bad feeds are reported, not stored.
+    docs.lock().unwrap().insert("/rss".into(), ("\"v3\"".into(), "<not xml".into()));
+    assert_eq!(refresh("f-rust").await.status, 502);
+    docs.lock().unwrap().remove("/atom");
+    assert_eq!(refresh("f-atom").await.status, 502);
+
+    app.evicted().await;
+    let app = app.restart().await;
+    assert_eq!(app.send("GET", "/ann/timeline", &[], "").await.json(), timeline);
+    docs.lock().unwrap().insert("/rss".into(), ("\"v2\"".into(), String::new()));
+    assert_eq!(app.send("POST", "/f-rust/refresh", &[], "").await.json()["unchanged"], true, "the ETag survived");
+}
+
