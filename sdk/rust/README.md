@@ -70,6 +70,10 @@ no need for write-to-temp-then-rename.
   `query_or("n", 0)`, `header("h")`, `cookie("c")`, `body()`, `text()`,
   `json()` (feature `json`). `Response::text/html/json/bytes/new/not_found` with
   `.status()`, `.header()`, `.body()`.
+- `Response::stream(content_type, |mut body| async move { body.write(..).await; })`
+  streams a body after the handler returns; the object serves nothing else
+  meanwhile, for at most the app's `post_return_timeout_ms`. `sse(id, event,
+  data)` formats a Server-Sent Event ([examples/events](../../examples/events)).
 - `data()` and `tmp()`: `read` (an `Option`), `read_text`, `write`, `append`,
   `remove`, `open`.
 - `kv::get/get_text/set/delete/exists/increment/keys` on the store

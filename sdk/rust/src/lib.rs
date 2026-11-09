@@ -287,12 +287,63 @@ pub struct Response {
     status: u16,
     headers: Vec<(String, Vec<u8>)>,
     body: Vec<u8>,
+    writer: Option<Writer>,
+}
+
+/// What writes a streamed body ([`Response::stream`]); taken once.
+#[derive(Clone)]
+#[allow(clippy::type_complexity)]
+struct Writer(std::rc::Rc<std::cell::Cell<Option<Box<dyn FnOnce(Body) -> std::pin::Pin<Box<dyn Future<Output = ()>>>>>>>);
+
+impl fmt::Debug for Writer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Writer")
+    }
+}
+
+/// A streamed response's body, written as the client reads it.
+pub struct Body(wit_bindgen::rt::async_support::StreamWriter<u8>);
+
+impl Body {
+    /// Sends `data` on its way; `false` once the client has gone.
+    pub async fn write(&mut self, data: impl Into<Vec<u8>>) -> bool {
+        self.0.write_all(data.into()).await.is_empty()
+    }
+}
+
+/// One Server-Sent Event, `data` split into `data:` lines, for
+/// [`Response::stream`] with content type `text/event-stream`.
+pub fn sse(id: Option<&str>, event: Option<&str>, data: &str) -> String {
+    let mut out = String::new();
+    for (field, value) in [("id", id), ("event", event)] {
+        if let Some(value) = value {
+            out.push_str(&format!("{field}: {}\n", value.replace(['\r', '\n'], "")));
+        }
+    }
+    for line in data.split('\n') {
+        out.push_str(&format!("data: {}\n", line.strip_suffix('\r').unwrap_or(line)));
+    }
+    out.push('\n');
+    out
 }
 
 impl Response {
     /// An empty response.
     pub fn new(status: u16) -> Response {
-        Response { status, headers: vec![], body: vec![] }
+        Response { status, headers: vec![], body: vec![], writer: None }
+    }
+
+    /// `200` with `content_type`, its body written by `body` as the client
+    /// reads it, after the handler has returned. Meanwhile the object serves
+    /// nothing else: its other requests wait until `body` is done, and it has
+    /// the app's `post_return_timeout_ms` for it, after which the object is
+    /// stopped and what it changed since answering rolls back. What it
+    /// changed before answering has already committed.
+    pub fn stream<F: Future<Output = ()> + 'static>(content_type: &str, body: impl FnOnce(Body) -> F + 'static) -> Response {
+        let writer: Box<dyn FnOnce(Body) -> std::pin::Pin<Box<dyn Future<Output = ()>>>> = Box::new(|b| Box::pin(body(b)));
+        let mut response = Response::new(200).header("content-type", content_type);
+        response.writer = Some(Writer(std::rc::Rc::new(std::cell::Cell::new(Some(writer)))));
+        response
     }
 
     /// `200`, `text/plain`.
@@ -339,9 +390,19 @@ impl Response {
     /// The response as `wasip3`'s, for a handler written against it directly.
     pub fn into_wit(mut self) -> core::result::Result<wit::Response, wit::ErrorCode> {
         self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
-        self.headers.push(("content-length".into(), self.body.len().to_string().into()));
+        let body = match self.writer.and_then(|w| w.0.take()) {
+            Some(writer) => {
+                let (tx, rx) = wit_stream::new();
+                wasip3::spawn_local(writer(Body(tx)));
+                rx
+            }
+            None => {
+                self.headers.push(("content-length".into(), self.body.len().to_string().into()));
+                stream(self.body)
+            }
+        };
         let headers = fields(&self.headers)?;
-        let (response, _) = wit::Response::new(headers, Some(stream(self.body)), no_trailers());
+        let (response, _) = wit::Response::new(headers, Some(body), no_trailers());
         let _ = response.set_status_code(self.status);
         Ok(response)
     }
@@ -375,6 +436,13 @@ mod tests {
     fn request(headers: &[(&str, &str)]) -> Request {
         let headers = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         Request { method: "GET".into(), url: "http://x/".into(), path: "/".into(), query: vec![], headers, body: vec![] }
+    }
+
+    #[test]
+    fn server_sent_events() {
+        assert_eq!(sse(Some("7"), Some("tick"), "a"), "id: 7\nevent: tick\ndata: a\n\n");
+        assert_eq!(sse(None, None, "two\r\nlines"), "data: two\ndata: lines\n\n", "a line per data line");
+        assert_eq!(sse(Some("1\n2"), None, ""), "id: 12\ndata: \n\n", "fields can't end the event early");
     }
 
     #[test]
