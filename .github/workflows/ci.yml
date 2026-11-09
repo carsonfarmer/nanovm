@@ -42,6 +42,10 @@ jobs:
           sudo apt-get install -y restic
           python3 -m unittest discover -s scripts -p test_backup.py -v
           sudo python3 -m unittest discover -s scripts -p test_backup.py -v
+      - name: Check operator tools (tools/)
+        run: |
+          python3 -m unittest discover -s tools -p 'test_*.py' -v
+          sudo python3 -m unittest discover -s tools -p 'test_*.py' -v
       - name: Report runtime line count
         run: |
           python3 - <<'PY'
