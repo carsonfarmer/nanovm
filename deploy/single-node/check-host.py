@@ -8,8 +8,9 @@ For the config's `max_live_objects` it prints what each app's worker needs
 the disk an object can use at worst, and checks this host: the fd limit (the
 unit's `LimitNOFILE` if systemd has one for nanovm, else this shell's hard
 limit, or `--nofile`), `vm.max_map_count`, Landlock, root, the data directory
-(searchable by app uids, filesystem, mount options), the cgroup directory if
-set, CA certificates and RUST_BACKTRACE. Exit 1 if anything would stop the
+(searchable by app uids, filesystem, mount options), local capture history
+against `[capture]`, the cgroup directory if set, CA certificates and
+RUST_BACKTRACE. Exit 1 if anything would stop the
 node or its workers; warnings exit 0.
 """
 
@@ -127,6 +128,15 @@ def check(cfg_path, nofile=None):
             warnings.append("btrfs had the lowest concurrent durable-write rate measured (experiments/fs-matrix)")
         if "discard" in opts.split(",") and fstype in ("ext4", "xfs"):
             warnings.append("online discard cost 29-46% of concurrent durable writes measured; prefer fstrim.timer")
+
+    capture = raw.get("capture")
+    history = data.is_dir() and any((data / "objects").glob("*/~committed/*"))
+    if capture is not None:
+        mb = {"max_mb": 256, "max_versions": 16, **capture}
+        facts.append(f"local capture on: each object's history holds up to {mb['max_mb']} MiB "
+                     f"and {mb['max_versions']} versions (full copies); a full one refuses writes")
+    elif history:
+        problems.append("objects have capture history (~committed) but [capture] is off: they will refuse to start")
 
     if cfg.get("cgroup"):
         g = Path(cfg["cgroup"])

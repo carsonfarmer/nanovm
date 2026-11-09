@@ -38,6 +38,9 @@ publishes from nodes.
 - **Disk**: an object holds up to `disk_mb`, and up to 3 × `disk_mb` while a
   request runs; quotas don't cap the total. Add the registry and compile caches
   (each version's component, ≤ `max_component_mb`, and its compiled code).
+  With local capture (`[capture]`, off by default), each object's history adds
+  up to `max_mb` (256 MiB) of full-volume copies, and README measured roughly
+  half the default small-write throughput with it on.
 
 ## 2. Install
 
@@ -108,7 +111,7 @@ needs the node stopped, so schedule a window) and
   spans arrive; the count survives a node restart.
 - `caddy validate` passes on the Caddyfile; `systemd-analyze verify` on the
   drop-ins (it rejects a bad `AllowedCPUs`).
-- `check-host.py`: 5 unit tests (`python3 -m unittest discover -s
+- `check-host.py`: 6 unit tests (`python3 -m unittest discover -s
   deploy/single-node`), and run on this host.
 - Not run: `otelcol-contrib` (no binary here; the reference config's validation
   is README's), real ACME, real DNS, signed apps, `AllowedCPUs` enforcement

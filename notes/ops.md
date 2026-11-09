@@ -87,3 +87,10 @@ Collector, ~69,000 resident objects in 6 GiB, CPU for Caddy/proxy excluded).
 
 **Not run:** otelcol-contrib (no binary), real ACME/DNS, signed apps, AllowedCPUs
 enforcement (cgroup v1 here). No Terraform/Ansible: a tested shell installer.
+
+**After the base moved to `3dafe33` (W-9 local capture):** check-host also fails
+a root whose objects have capture history while `[capture]` is off (they would
+refuse to start) and reports capture's storage when on (6 unit tests); the
+README's disk sizing counts capture. `test/e2e.sh` passes 8/8 again on a dev
+build of `3dafe33`. `deploy/systemd/test/nspawn.sh` keeps `SCRIPT=`/`MODES=` and
+gains the systemd branch's capture mode.

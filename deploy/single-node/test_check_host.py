@@ -58,6 +58,16 @@ class CheckHost(unittest.TestCase):
         _, _, problems = self.run_check(f'data_dir = "d"\ncgroup = "{g}"\n[worker]\nmemory_mb = 64\npids = 10\n')
         self.assertEqual([p for p in problems if "cgroup" in p], [f"{g}/cgroup.subtree_control lacks memory, needed by [worker] limits"])
 
+    def test_capture_history_needs_capture(self):
+        hist = self.root / "data/objects/app/~committed/o"
+        hist.mkdir(parents=True)
+        (hist / "00000000000000000001.tar").write_bytes(b"")
+        _, _, problems = self.run_check('data_dir = "data"\n')
+        self.assertTrue(any("refuse to start" in p for p in problems), problems)
+        facts, _, problems = self.run_check('data_dir = "data"\n[capture]\nmax_mb = 64\n')
+        self.assertFalse(any("refuse to start" in p for p in problems), problems)
+        self.assertTrue(any("up to 64 MiB and 16 versions" in f for f in facts), facts)
+
 
 if __name__ == "__main__":
     unittest.main()
