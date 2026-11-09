@@ -1,0 +1,4 @@
+#!/bin/sh
+# What a node would make of a component; see crates/nanovm/examples/inspect.rs.
+#   tools/inspect app.wasm [--config nanovm.json] [--node nanovm.toml]
+exec cargo run -q --locked --manifest-path "$(dirname "$0")/../Cargo.toml" -p nanovm --example inspect -- "$@"

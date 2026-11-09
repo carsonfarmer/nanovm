@@ -7,6 +7,10 @@ edition.workspace = true
 name = "committed_state"
 test = true
 
+[[example]]
+name = "inspect"
+test = true
+
 [dependencies]
 # wasmtime's defaults less what the node never uses: its own compile cache
 # (`engine::load_component` keeps one), profilers, core dumps, the text
@@ -79,3 +83,6 @@ oci-client = { version = "0.18", default-features = false, features = ["rustls-t
 tokio-tungstenite = "0.30"
 tokio = { version = "1", features = ["test-util"] }
 container-registry = { version = "0.3.1", features = ["test-support"] }
+# tools/inspect walks a component's nesting (wasmtime already builds it
+# with these features).
+wasmparser = { version = "0.261.0", default-features = false, features = ["component-model"] }

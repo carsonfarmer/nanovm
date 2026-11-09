@@ -1745,6 +1745,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "tracing-subscriber",
+ "wasmparser",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-config",
