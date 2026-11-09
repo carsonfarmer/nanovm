@@ -642,3 +642,61 @@ async fn events_stream_after_the_handler_returns() {
     assert_eq!(app.get("/feed/").await.json(), json!({"events": 3, "countdowns": 0}));
     assert_eq!(app.get("/cd/").await.json(), json!({"events": 1, "countdowns": 2}));
 }
+
+/// examples/files: uploads within the disk quota (507 past it, the old file
+/// kept), downloads streamed with ranges, ETags and HEAD, and files that
+/// survive eviction and restarts.
+#[tokio::test(flavor = "multi_thread")]
+async fn files_upload_within_quota_and_serve_ranges() {
+    let mut app = App::start("files", json!({"post_return_timeout_ms": 5000})).await;
+    let kib = |n: usize, seed: u8| -> Vec<u8> { (0..n << 10).map(|i| (i % 251) as u8 ^ seed).collect() };
+    let a = kib(700, 0);
+    let put = app.send("PUT", "/b/files/a.bin", &[("content-type", "application/x-test")], a.clone()).await;
+    assert_eq!(put.status, 201, "{put:?}");
+    let etag = put.header("etag").to_string();
+
+    let full = app.get("/b/files/a.bin").await;
+    assert_eq!((full.status, full.header("content-type"), full.header("accept-ranges")), (200, "application/x-test", "bytes"));
+    assert_eq!((full.header("content-length"), full.body == a), ("716800", true));
+    let part = async |range: &str| app.send("GET", "/b/files/a.bin", &[("range", range)], "").await;
+    let first = part("bytes=0-99").await;
+    assert_eq!((first.status, first.header("content-range"), &first.body[..]), (206, "bytes 0-99/716800", &a[..100]));
+    assert_eq!(part("bytes=-10").await.body, a[a.len() - 10..]);
+    let tail = part("bytes=716700-").await;
+    assert_eq!((tail.header("content-range"), &tail.body[..]), ("bytes 716700-716799/716800", &a[716700..]));
+    let middle = part("bytes=65530-65545").await;
+    assert_eq!(middle.body, a[65530..65546], "across a piece boundary");
+    let beyond = part("bytes=716800-").await;
+    assert_eq!((beyond.status, beyond.header("content-range")), (416, "bytes */716800"));
+    assert_eq!(part("bytes=0-1,5-6").await.status, 200, "several ranges: the whole file");
+    assert_eq!(app.send("GET", "/b/files/a.bin", &[("if-none-match", &etag)], "").await.status, 304);
+    let head = app.send("HEAD", "/b/files/a.bin", &[], "").await;
+    assert_eq!((head.status, head.header("content-length"), head.body.len()), (200, "716800", 0));
+
+    // The bucket has 2 MiB: a third 700 KiB file doesn't fit, and is
+    // refused without touching what is there.
+    assert_eq!(app.send("PUT", "/b/files/b.bin", &[], kib(700, 1)).await.status, 201);
+    let refused = app.send("PUT", "/b/files/c.bin", &[], kib(700, 2)).await;
+    assert_eq!(refused.status, 507, "{refused:?}");
+    let refused = app.send("PUT", "/b/files/a.bin", &[], kib(700, 3)).await;
+    assert_eq!(refused.status, 507, "a replacement needs room for both while it is written");
+    assert_eq!(app.get("/b/files/a.bin").await.body == a, true, "the old file is intact");
+    let list = app.get("/b/").await.json();
+    assert_eq!((list["bytes"].as_u64(), list["files"].as_array().unwrap().len()), (Some(1400 << 10), 2));
+    let big = app.send("PUT", "/b/files/big.bin", &[], kib(1100, 0)).await;
+    assert_eq!((big.status, big.header("x-nanovm-error")), (413, "request-too-large"), "max_request_body_kb");
+    for bad in ["/b/files/.hidden", "/b/files/a%2Fb", "/b/nope"] {
+        assert_eq!(app.send("PUT", bad, &[], "x").await.status, 404, "{bad}");
+    }
+    assert_eq!(app.send("DELETE", "/b/files/b.bin", &[], "").await.status, 204);
+    assert_eq!(app.send("PUT", "/b/files/c.bin", &[], kib(700, 2)).await.status, 201, "deleting freed the space");
+    let small = app.send("PUT", "/b/files/a.bin", &[], "small now").await;
+    assert_ne!(small.header("etag"), etag);
+
+    // Files are in the volume: they survive eviction and the node.
+    assert_eq!(app.evicted("/b/files/a.bin").await.text(), "small now");
+    let app = app.restart().await;
+    let c = app.send("GET", "/b/files/c.bin", &[("range", "bytes=-4")], "").await;
+    assert_eq!((c.status, c.body.as_slice()), (206, &kib(700, 2)[(700 << 10) - 4..]));
+    assert_eq!(app.get("/b/").await.json()["bytes"], (700 << 10) + 9);
+}
