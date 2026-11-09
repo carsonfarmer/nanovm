@@ -40,10 +40,14 @@ fn node(name: &str, app: &str, max_live: usize, endpoint: Option<String>) -> any
     std::fs::create_dir_all(&dir)?;
     std::fs::create_dir_all(root.join("cache"))?;
     std::os::unix::fs::symlink(root.join("cache"), dir.join("cache"))?;
-    let guest = repo().join(format!("guests/target/wasm32-wasip2/release/{app}.wasm"));
+    let guest = match app {
+        "sqlite" => repo().join("target/sqlite/example.wasm"),
+        _ => repo().join(format!("guests/target/wasm32-wasip2/release/{app}.wasm")),
+    };
     let wasm = std::fs::read(&guest).with_context(|| format!("{}: run scripts/build-guests.sh", guest.display()))?;
     let limits = match app {
         "counter" => json!({ "memory_mb": 16, "cpu_ms": 50, "idle_timeout_ms": 600000, "disk_mb": 1, "max_queue": 1024 }),
+        "sqlite" => json!({ "memory_mb": 64, "cpu_ms": 2000, "idle_timeout_ms": 600000, "disk_mb": 8, "max_queue": 1024 }),
         _ => json!({ "memory_mb": 32, "cpu_ms": 100, "request_timeout_ms": 1000, "max_resources": 2000 }),
     };
     let app = AppConfig {
@@ -302,24 +306,31 @@ fn disk_ops(dev: &str) -> [u64; 3] {
 }
 
 /// Durable writes only (`--writes [ROUNDS]`): `POST /incr` on one object
-/// serially, then 256 concurrent over 100 objects; rate, latency, the
-/// process's CPU per request and, with `NANOVM_BENCH_DEV`, the device's I/O.
+/// serially, then 256 concurrent over 100 objects, and with the composed
+/// SQLite example built, its `POST /set` (one SQL upsert, a file and a KV
+/// key) serially; rate, latency, the process's CPU per request and, with
+/// `NANOVM_BENCH_DEV`, the device's I/O.
 async fn writes() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let rounds = args.iter().position(|a| a == "--writes").and_then(|i| args.get(i + 1)?.parse().ok()).unwrap_or(1);
     let scale = if args.iter().any(|a| a == "--quick") { 10 } else { 1 };
     let n = node("writes", "counter", 200, None)?;
     load(&n, "POST", "/incr", 100, 64, |i| format!("o{}", i % 100)).await;
+    let sql = node("writes-sql", "sqlite", 200, None).ok();
+    if let Some(sql) = &sql {
+        load(sql, "POST", "/set", 20, 20, |i| format!("o{i}")).await;
+    }
     for _ in 0..rounds {
-        for (method, name, total, conc, objects) in [
-            ("GET", "serial", 2_000, 1, 1),
-            ("POST", "serial", 2_000 / scale, 1, 1),
-            ("POST", "concurrent", 20_000 / scale, 256, 100),
+        for (method, path, name, total, conc, objects) in [
+            ("GET", "/", "serial", 2_000, 1, 1),
+            ("POST", "/incr", "serial", 2_000 / scale, 1, 1),
+            ("POST", "/incr", "concurrent", 20_000 / scale, 256, 100),
+            ("POST", "/set", "serial", 500 / scale, 1, 1),
         ] {
-            let path = if method == "GET" { "/" } else { "/incr" };
+            let n = if path == "/set" { match &sql { Some(sql) => sql, None => continue } } else { &n };
             let dev = std::env::var("NANOVM_BENCH_DEV").unwrap_or_default();
             let (c0, d0) = (cpu(), disk_ops(&dev));
-            let run = load(&n, method, path, total, conc, move |i| format!("o{}", i % objects)).await;
+            let run = load(n, method, path, total, conc, move |i| format!("o{}", i % objects)).await;
             let us = (cpu() - c0).as_secs_f64() * 1e6 / total as f64;
             let io = std::iter::zip(disk_ops(&dev), d0).map(|(a, b)| (a - b) as f64 / total as f64);
             let io: Vec<_> = std::iter::zip(["writes", "discards", "flushes"], io).map(|(k, v)| format!("{k} {v:.2}")).collect();

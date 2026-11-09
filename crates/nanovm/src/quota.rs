@@ -216,9 +216,12 @@ impl QuotaGuard {
         q.journal.cancel_rename(record).map_err(|_| ErrorCode::Io)
     }
 
-    /// Makes the current request's changes durable.
-    pub fn commit(&self) -> std::io::Result<()> {
-        self.0.lock().journal.commit()
+    /// Makes the current request's changes durable, on a thread of its own:
+    /// a commit waits for the disk, which blocked the worker thread and every
+    /// object it runs, so a node had no more commits in flight than threads.
+    pub async fn commit(&self) -> std::io::Result<()> {
+        let q = self.0.clone();
+        tokio::task::spawn_blocking(move || q.lock().journal.commit()).await?
     }
 
     pub fn adjust(&self, bytes: i64, files: i64) {
@@ -417,8 +420,6 @@ macro_rules! delegate {
 impl HostDescriptorWithStore<ObjState> for QuotaFs {
     delegate! {
         advise(offset: Filesize, length: Filesize, advice: Advice) -> FilesystemResult<()>;
-        sync_data() -> FilesystemResult<()>;
-        sync() -> FilesystemResult<()>;
         get_flags() -> FilesystemResult<DescriptorFlags>;
         get_type() -> FilesystemResult<DescriptorType>;
         stat() -> FilesystemResult<DescriptorStat>;
@@ -429,6 +430,17 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         is_same_object(other: Resource<Descriptor>) -> wasmtime::Result<bool>;
         metadata_hash() -> FilesystemResult<MetadataHashValue>;
         metadata_hash_at(flags: PathFlags, path: String) -> FilesystemResult<MetadataHashValue>;
+    }
+
+    /// A guest's sync waits for nothing: a request's writes are durable
+    /// once it commits, and rolled back if it fails, synced or not. SQLite
+    /// syncs several times per transaction.
+    async fn sync_data(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
+        WasiFilesystem::get_flags(&stock(store), fd).await.map(drop)
+    }
+
+    async fn sync(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
+        Self::sync_data(store, fd).await
     }
 
     fn read_via_stream(
@@ -704,7 +716,7 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), b"target");
         assert_eq!(std::fs::read(&from).unwrap(), b"source");
         assert_eq!(g.usage(), (12, 2));
-        g.commit().unwrap();
+        g.commit().await.unwrap();
         drop(g);
         let g = volume_guard(&v, 180);
         assert_eq!(g.usage(), (12, 2));
@@ -742,7 +754,7 @@ mod tests {
         .unwrap();
         assert_eq!(g.usage(), (6, 1));
         assert_eq!(std::fs::read(&to).unwrap(), b"source");
-        g.commit().unwrap();
+        g.commit().await.unwrap();
         drop(g);
         assert_eq!(volume_guard(&v, 1 << 20).usage(), (6, 1));
         std::fs::remove_dir_all(base).unwrap();
@@ -800,7 +812,7 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(g.commit().is_err());
+        assert!(g.commit().await.is_err());
         assert!(g.journal(|j| j.creating(&v.join("later"))).is_err());
         assert_eq!(g.usage(), (6, 1), "no credit for a failed restoration");
         std::fs::remove_dir(&to).unwrap(); // Repair the injected obstruction.
@@ -976,8 +988,8 @@ mod tests {
 
     /// Unlinked new files keep their data and removal-time storage charge
     /// until every independent open and stream clone has gone away.
-    #[test]
-    fn new_unlinked_files_pay_until_the_last_handle_closes() {
+    #[tokio::test]
+    async fn new_unlinked_files_pay_until_the_last_handle_closes() {
         let dir = tempdir("new-unlinked").canonicalize().unwrap();
         let limits = Limits { disk_mb: 1, ..Limits::default() };
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
@@ -1011,7 +1023,7 @@ mod tests {
         drop(reader);
         assert!(matches!(g.unlink(&dir.join("b"), 600 << 10), Err(ErrorCode::InsufficientSpace)));
         // A commit cannot forgive storage still owned by a live stream.
-        g.commit().unwrap();
+        g.commit().await.unwrap();
         assert!(matches!(g.unlink(&dir.join("b"), 600 << 10), Err(ErrorCode::InsufficientSpace)));
         drop(stream);
         g.unlink(&dir.join("b"), 600 << 10).unwrap();

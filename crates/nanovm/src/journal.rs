@@ -232,12 +232,9 @@ impl Journal {
     fn sync_log(&mut self) -> std::io::Result<()> {
         if self.unsynced {
             self.or_poison(|j| {
-                let log = j.log.as_ref().expect("records were written");
-                waiting(|| {
-                    #[cfg(test)]
-                    tests::sync_point()?;
-                    log.sync_data()
-                })
+                #[cfg(test)]
+                tests::sync_point()?;
+                j.log.as_ref().expect("records were written").sync_data()
             })?;
             self.unsynced = false;
         }
@@ -257,13 +254,13 @@ impl Journal {
         let new = self.dir.join("new");
         let log = File::options().write(true).create(true).truncate(true).open(&new)?;
         log.write_all_at(&[&MAGIC[..], &self.key].concat(), 0)?;
-        waiting(|| {
-            #[cfg(test)]
-            tests::sync_point()?;
-            log.sync_data()?;
-            std::fs::rename(new, path)?;
-            [&self.dir, self.dir.parent().expect("in ~journal"), &self.base].into_iter().try_for_each(sync)
-        })?;
+        #[cfg(test)]
+        tests::sync_point()?;
+        log.sync_data()?;
+        std::fs::rename(new, path)?;
+        for d in [&self.dir, self.dir.parent().expect("in ~journal"), &self.base] {
+            sync(d)?;
+        }
         Ok(log)
     }
 
@@ -517,38 +514,33 @@ impl Journal {
     }
 
     /// Makes the request's changes durable and forgets how to undo them.
+    /// It waits for the disk, so callers run it off the object's task: its
+    /// time isn't charged as CPU.
     pub fn commit(&mut self) -> std::io::Result<()> {
         self.check()?;
         let Some(log) = self.log.take() else { return Ok(()) };
         // Any error leaves the outcome uncertain. In particular, taking the
         // log must not make a second commit look like an empty successful one.
         self.poisoned = true;
-        let t0 = Instant::now();
-        let key = key()?;
+        let paths: Vec<_> = self.touched.drain().map(|p| self.base.join(p)).collect();
+        sync_all(&paths)?;
         let out = committed::directory(&self.base, &self.dir);
-        waiting(|| {
-            for p in self.touched.drain() {
-                sync_if_there(&self.base.join(p))?;
-            }
-            if let Some(cap) = &self.capture {
-                committed::prepare(&self.volume, &self.dir, &out, &self.obj, cap)?;
-            }
-            // A new key is the commit: no record is signed with it.
-            log.write_all_at(&key, MAGIC.len() as u64)?;
-            #[cfg(test)]
-            tests::sync_point()?;
-            log.sync_data()?;
-            match self.capture {
-                Some(_) => committed::finish(&self.dir, &out, &self.obj, || Ok(())),
-                None => Ok(()),
-            }
-        })?;
-        self.key = key;
+        if let Some(cap) = &self.capture {
+            committed::prepare(&self.volume, &self.dir, &out, &self.obj, cap)?;
+        }
+        // A new key is the commit: no record is signed with it.
+        self.key = key()?;
+        log.write_all_at(&self.key, MAGIC.len() as u64)?;
+        #[cfg(test)]
+        tests::sync_point()?;
+        log.sync_data()?;
+        if self.capture.is_some() {
+            committed::finish(&self.dir, &out, &self.obj, || Ok(()))?;
+        }
         if self.end > KEEP {
             log.set_len(KEEP)?;
         }
         (self.end, self.unsynced) = (HEADER, false);
-        self.obj.uncharge(t0.elapsed());
         clear(&self.dir)?;
         self.sized.clear();
         self.created.clear();
@@ -765,18 +757,6 @@ fn clear(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Runs `f`, which waits for the disk, on this thread while the runtime's
-/// other tasks move to another. Blocking the worker thread instead capped
-/// a node at as many syncs in flight as it has worker threads, though a
-/// disk completes many concurrent syncs in about the time of one.
-fn waiting<T>(f: impl FnOnce() -> T) -> T {
-    use tokio::runtime::{Handle, RuntimeFlavor};
-    match Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
-        _ => f(),
-    }
-}
-
 /// Syncs a file or a directory.
 pub(crate) fn sync(p: &Path) -> std::io::Result<()> {
     #[cfg(test)]
@@ -790,6 +770,21 @@ pub(crate) fn sync_ancestors(dir: &Path) -> std::io::Result<()> {
         sync(parent)?;
     }
     Ok(())
+}
+
+/// Syncs `paths` (as [`sync_if_there`]), up to 16 at once: a disk completes
+/// concurrent syncs in about the time of one, and a request that wrote
+/// 1,500 files waited seconds for them one by one.
+fn sync_all(paths: &[PathBuf]) -> std::io::Result<()> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || loop {
+        let Some(p) = paths.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else { return Ok(()) };
+        sync_if_there(p)?;
+    };
+    std::thread::scope(|s| {
+        let helpers: Vec<_> = (1..paths.len().div_ceil(8).min(16)).map(|_| s.spawn(work)).collect();
+        helpers.into_iter().map(|h| h.join().expect("a sync does not panic")).fold(work(), Result::and)
+    })
 }
 
 /// Syncs `p` unless a later change removed it or replaced an ancestor with a file.
@@ -1144,14 +1139,16 @@ mod tests {
         static CRASH_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
         static FAIL_SYNC_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
         static EXIT_SYNC_AFTER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
-        /// Syncs so far, and how long each takes on top of the disk's time.
+        /// Syncs so far.
         static SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        static SLOW: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
     }
+
+    /// Milliseconds each sync takes on top of the disk's time, on any thread.
+    static SLOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     pub(super) fn sync_point() -> std::io::Result<()> {
         SYNCS.set(SYNCS.get() + 1);
-        std::thread::sleep(SLOW.get());
+        std::thread::sleep(std::time::Duration::from_millis(SLOW_MS.load(std::sync::atomic::Ordering::Relaxed)));
         EXIT_SYNC_AFTER.with(|c| match c.get() {
             Some(0) => std::process::exit(77),
             n => c.set(n.map(|n| n - 1)),
@@ -1595,10 +1592,10 @@ mod tests {
         assert_eq!(syncs(&mut j, &|j| j.commit().unwrap()), 4);
     }
 
-    /// A sync waits on another thread's time: the runtime's other tasks go
-    /// on meanwhile, even on a runtime with one worker thread.
+    /// A commit waits for the disk on a thread of its own: the runtime's
+    /// other tasks go on meanwhile, even with one worker thread.
     #[test]
-    fn other_tasks_run_while_a_sync_waits() {
+    fn other_tasks_run_while_a_commit_waits() {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_time().build().unwrap();
         rt.block_on(async {
             let ticks = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1611,16 +1608,55 @@ mod tests {
             });
             tokio::spawn(async {
                 let v = volume();
-                let mut j = open(&v);
-                SLOW.set(std::time::Duration::from_millis(100));
-                write(&mut j, &v, "a", 0, b"slow");
-                SLOW.set(std::time::Duration::ZERO);
+                let obj = Arc::new(ObjShared::new("app".into(), "o"));
+                let limits = crate::config::Limits::default();
+                let quota = crate::quota::QuotaGuard::new(&v, &limits, Default::default(), obj, None).unwrap();
+                quota.journal(|j| j.creating(&v.join("n"))).unwrap();
+                SLOW_MS.store(100, std::sync::atomic::Ordering::Relaxed);
+                quota.commit().await.unwrap();
+                SLOW_MS.store(0, std::sync::atomic::Ordering::Relaxed);
             })
             .await
             .unwrap();
             let n = ticks.load(std::sync::atomic::Ordering::Relaxed);
             assert!(n > 100, "the other task ran {n} times");
         });
+    }
+
+    /// A commit syncs the paths it changed many at a time, and fails if any
+    /// of them can't be synced, whichever thread meets it.
+    #[test]
+    fn a_commit_syncs_its_paths_together() {
+        for bad in [None].into_iter().chain((0..8).map(|i| Some(i * 7))) {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = open(&v);
+            for i in 0..64 {
+                let p = v.join(format!("n{i}"));
+                j.creating(&p).unwrap();
+                std::fs::write(&p, "x").unwrap();
+                j.created(&p).unwrap();
+            }
+            if let Some(i) = bad {
+                // A file a commit can't sync, as on a failing disk.
+                std::fs::remove_file(v.join(format!("n{i}"))).unwrap();
+                std::os::unix::fs::symlink(format!("n{i}"), v.join(format!("n{i}"))).unwrap();
+            }
+            SLOW_MS.store(if bad.is_none() { 50 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+            let t0 = Instant::now();
+            let result = j.commit();
+            SLOW_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+            if bad.is_none() {
+                result.unwrap();
+                assert!(t0.elapsed() < std::time::Duration::from_millis(1600), "65 syncs of 50 ms took {:?}", t0.elapsed());
+            } else {
+                assert!(result.is_err(), "bad path {bad:?}");
+                drop(j);
+                open(&v);
+                assert_eq!(tree(&v), before);
+            }
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+        }
     }
 
     /// A file opened write-only can be written over: the bytes it replaces
