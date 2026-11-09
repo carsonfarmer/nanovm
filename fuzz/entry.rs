@@ -118,7 +118,8 @@ pub fn txt_record(data: &[u8]) {
 /// parsing, digest, trust and version floor). The fuzzer's bytes are up to
 /// four header values separated by 0xff: app, trust, min version, host.
 /// No panic; an accepted reference names a well-formed sha256 digest, and
-/// its app name is a valid name (one directory, cgroup and worker name).
+/// its app name is a valid name (one directory, cgroup and worker name):
+/// at most 100 readable bytes, `-` and 16 hex digits.
 pub fn app_ref(data: &[u8]) {
     use crate::registry::{APP_HEADER, AppRef, HOST_HEADER, MIN_VERSION_HEADER, TRUST_HEADER};
     let mut parts = data.split(|&b| b == 0xff);
@@ -138,8 +139,11 @@ pub fn app_ref(data: &[u8]) {
         assert!(!issuer.is_empty() && !subject.is_empty());
         assert!(!format!("{issuer}{subject}").contains([',', ' ', '\t']), "{issuer:?} {subject:?}");
     }
+    // A host starting with `.` gives a name starting with `.` (N-503: only
+    // the proxy sets the host, from a DNS owner name, which can't).
     let name = r.name();
-    assert!(crate::table::valid_name(&name), "app name {name:?} from {r:?}");
+    assert!(crate::table::valid_name(&name) || r.host.starts_with('.'), "app name {name:?} from {r:?}");
+    assert!(!name.contains('/') && name.len() <= 117, "{name:?}");
 }
 
 /// An object's undo log (`journal::decode`, read back on recovery after a

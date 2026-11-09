@@ -55,10 +55,14 @@ SEEDS = {
     "txt_record": [
         b'"app=ghcr.io/org/app:prod; trust=https://token.actions.githubusercontent.com repo:org/app:ref:refs/heads/main; min=1.2.0"',
         b'"app=localhost:5000/x/y:latest; " "trust=https://i s1; trust=https://i s2"',
+        # Found by fuzzing: a comma inside an identity (fixed in the proxy).
+        b'"app=ghcr.io/org/apprp:od; trust=httsp://token,actions.githu mbruepo"',
     ],
     "app_ref": [
         f"ghcr.io/org/app@{DIGEST}\xffhttps://i s1, https://i s2\xff1.2.0\xffexample.com".encode("latin-1"),
         f"localhost:5000/x/y@{DIGEST}\xffdev dev".encode("latin-1"),
+        # Found by fuzzing: a host starting with `.` (N-503).
+        f"ghgppar/o@{DIGEST}\xffhttps://i s1\xff1.2.0\xff.com".encode("latin-1"),
     ],
     "journal_log": [
         undo(0, b"a/b", 10) + undo(1, b"f", 0, b"xyz") + undo(2, b"d") + undo(3, b"d2") + undo(4, b"a", b"b"),
