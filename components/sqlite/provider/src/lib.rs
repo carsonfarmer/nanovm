@@ -142,10 +142,17 @@ impl GuestConnection for Database {
             | AuthAction::Savepoint { .. }
             | AuthAction::Attach { .. }
             | AuthAction::Detach { .. } => Authorization::Deny,
+            // Read-only: `data_version` is what FTS5 and `page_size` what
+            // FTS3/4 and R-Tree ask on their own connection.
             AuthAction::Pragma {
                 pragma_name,
                 pragma_value: None,
-            } if pragma_name.eq_ignore_ascii_case("integrity_check") => Authorization::Allow,
+            } if ["integrity_check", "data_version", "page_size"]
+                .iter()
+                .any(|p| pragma_name.eq_ignore_ascii_case(p)) =>
+            {
+                Authorization::Allow
+            }
             AuthAction::Pragma { .. } => Authorization::Deny,
             _ => Authorization::Allow,
         }))

@@ -1,0 +1,6 @@
+{
+  "limits": {
+    "memory_mb": 16, "cpu_ms": 100, "request_timeout_ms": 5000, "idle_timeout_ms": 30000,
+    "disk_mb": 4, "max_files": 1000
+  }
+}

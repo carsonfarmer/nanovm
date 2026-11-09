@@ -62,8 +62,9 @@ The normal provider artifact remains separate from fault-injection builds.
   drops a connection per request for clarity. Caching across successful requests
   is supported; a failed request discards the whole instance before recovery.
 - **No app-facing journaling controls.** Internally DELETE/FULL. Transaction
-  control, savepoints, ATTACH/DETACH and PRAGMA controls are denied (read-only
-  `integrity_check` is allowed). SQL statements finish inside the call; there
+  control, savepoints, ATTACH/DETACH and PRAGMA controls are denied (the
+  read-only `integrity_check`, `data_version` and `page_size` are allowed:
+  FTS5, FTS3/4 and R-Tree ask the last two themselves). SQL statements finish inside the call; there
   are no open SQL transactions or live cursors spanning responses.
 - **Request atomicity includes SQL, files and KV.** A successful HTTP response,
   including HTTP 4xx/5xx, commits. A guest error or trap rolls back. Do not catch

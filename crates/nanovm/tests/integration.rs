@@ -2729,6 +2729,19 @@ async fn objects_call_objects() {
     assert_eq!(call("b", "http://nanovm/objects/a/").await["status"], 200);
 }
 
+/// What an object posts to `http://nanovm/` is held for its sockets only at
+/// `/publish`, and only if well formed; anything else is refused at once, as
+/// a supervisor would refuse it. An in-process node holds publishes too: it
+/// no longer sends them to its egress policy, which denied them.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_well_formed_publishes_are_held() {
+    let node = node("only_well_formed_publishes_are_held", "hostile", 8);
+    for (url, status) in [("http://nanovm/elsewhere", 404), ("http://nanovm/publish/", 400)] {
+        let r = get(&node, "p", &format!("/fetch?method=POST&url={url}")).await;
+        assert_eq!(r.json()["status"], status, "{url}: {}", r.body);
+    }
+}
+
 // ---- WebSockets ----------------------------------------------------------
 
 mod sockets {

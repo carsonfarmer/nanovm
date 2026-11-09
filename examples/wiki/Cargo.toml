@@ -1,0 +1,13 @@
+[package]
+name = "wiki"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nanovm-sdk = { path = "../../sdk/rust", features = ["json"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+similar = "2"

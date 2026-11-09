@@ -74,7 +74,7 @@ where
     tokio::spawn(builder.serve_connection(TokioIo::new(io), svc).with_upgrades())
 }
 
-pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {
+pub async fn handle<B: http_body::Body<Data = Bytes, Error = hyper::Error>>(node: Arc<Node>, req: Request<B>) -> Response<RespBody> {
     let path = req.uri().path().to_string();
     if let Some(rest) = path.strip_prefix("/_nanovm") {
         return admin(&node, rest).await;

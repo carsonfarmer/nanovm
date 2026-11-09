@@ -1,0 +1,11 @@
+[package]
+name = "site"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nanovm-sdk = { path = "../../sdk/rust" }

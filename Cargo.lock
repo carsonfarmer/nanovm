@@ -1749,6 +1749,7 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-config",
  "wasmtime-wasi-http",
+ "wasmtime-wizer",
  "webpki-roots",
 ]
 
@@ -3954,6 +3955,18 @@ dependencies = [
  "bytes",
  "futures",
  "tracing",
+ "wasmtime",
+]
+
+[[package]]
+name = "wasmtime-wizer"
+version = "50.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caae0a1d67383a20a3ec6cdbbfe69f801a3060e7751c9cc75573099da2a37b10"
+dependencies = [
+ "log",
+ "wasm-encoder",
+ "wasmparser",
  "wasmtime",
 ]
 

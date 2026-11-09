@@ -72,6 +72,9 @@ pub struct Node {
     pub heavy: Arc<Semaphore>,
     /// One permit per live store, released only after the store is dropped.
     pub slots: Arc<Semaphore>,
+    /// An in-process node's WebSockets (`nanovm run`, tests); a jailed
+    /// worker's are the proxy's.
+    pub sockets: Arc<crate::ws::Sockets>,
     objects: Mutex<HashMap<Arc<str>, Entry>>,
 }
 
@@ -110,6 +113,7 @@ impl Node {
             telemetry,
             heavy,
             slots,
+            sockets: Arc::new(crate::ws::Sockets::new(Default::default(), Default::default())),
             objects: Mutex::default(),
         });
         node.metrics.telemetry.set(Arc::downgrade(&node.telemetry)).ok();

@@ -331,6 +331,48 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
+### N-200: an in-process node could not publish to its sockets
+- **Where:** `egress.rs` (`send_request`), `object.rs` (`commit`)
+- **Scenario:** a node built in-process (tests, the benchmark, embedders, `nanovm run`) sent a guest's `http://nanovm/publish/` to its egress policy, which denied it, so only jailed workers could publish, and nothing could run a WebSocket app on one machine without the supervisor and proxy.
+- **Status:** fixed on `cf/onramp` (416f85d, ported from 1392e99): every node holds publishes until its request commits; a jailed worker forwards them as before, an in-process node hands them to `Node::sockets` (the proxy's `ws::Sockets`). `only_well_formed_publishes_are_held` fails without it.
+
+### N-201: a publish to another `http://nanovm/` path was accepted and dropped
+- **Where:** `egress.rs` (`hold`)
+- **Scenario:** a worker held a POST to, say, `http://nanovm/elsewhere` as a publish and answered 200; the supervisor then dropped it, so the guest believed it had published.
+- **Status:** fixed on `cf/onramp` (416f85d): anything but `/publish` gets 404 at once.
+
+### N-202: the QuickJS runtime's allocator declarations trip rustc 1.99's runtime-symbol lint
+- **Where:** `js/runtime/src/lib.rs` (`extern "C"` malloc, calloc, realloc, free)
+- **Scenario:** declared with `*mut u8` where std's runtime symbols take `c_void`; rustc 1.99 warns (`suspicious_runtime_symbol_definitions`). Harmless on wasm32 today (same ABI) but a future toolchain may make it an error.
+- **Status:** fixed on `cf/onramp` (3308ee0): `c_void` signatures, cast at the allocator boundary.
+
+### N-203 (tests): `kv_counts_against_the_disk_quota` fails under load on the base too
+- **Where:** `tests/integration.rs`
+- **Scenario:** the test writes 198 one-byte keys in one `hostile` request, under that app's 100 ms CPU budget and 1 s deadline. At load average 13–19 from other agents it failed with `cpu` or `timeout` in 4 of 4 alternating runs of `cf/main-next`'s test binary and 4 of 4 of `cf/onramp`'s (one run of each in the first round produced no result), and passed alone at lower load. It measures the machine, not the quota.
+- **Status:** open: give the fill its own app limits (as `kv_refuses_bad_names_and_streams_keys` does for its 1,500 keys), keeping the quota assertions.
+
+### N-600: SQLite's own syncs are charged to the request's CPU budget
+- **Where:** `components/sqlite/provider` (`PRAGMA journal_mode=DELETE; synchronous=FULL`, the VFS's `block_on` around `sync`), CPU accounting in `object.rs` (`charged`: time inside the store's polls)
+- **Scenario:** found by the examples (`examples/leaderboard`, `examples/shop`). Every SQLite statement that writes is a SQLite transaction with its own journal file and syncs, and the provider waits for each host fsync inside the guest's poll, so the wait counts as CPU. Under `nanovm run` (debug build, 4 cores at load 21-26), one-row `INSERT` statements cost ~6-12 ms each: 10 in one request took 97 ms, 20 took 243 ms, 40 were refused with `cpu` ("used more than 200ms of CPU in one request"; 200 ms is the most `nanovm run` allows). A checkout of four writing statements and one call failed with `cpu` in 1 of 4 runs. The same rows as one statement (`INSERT … SELECT … FROM json_each(?)`): 100 rows in 25-47 ms. The examples write one statement per request (a batch statement; a trigger for multi-table changes) and say why.
+- **Why (from source):** `object.rs` builds the WASI context with `allow_blocking_current_thread(true)`, so wasmtime-wasi runs a guest's `sync`/`sync_data` (and every other file call) inline, inside the store's poll that `ObjShared::charged` times. The journal's own waits are given back with `uncharge` (`journal.rs`), but `QuotaFs`'s `sync`/`sync_data` delegate straight through (`quota.rs`), so a guest's own fsyncs count as CPU. Only SQLite issues them today (synchronous=FULL, several per writing statement).
+- **Reproduced:** yes (numbers above; `leaderboard_pages_and_ranks_from_sqlite` and `shop_checkout_is_all_or_nothing` were the failing tests before the examples were changed).
+- **Status:** open, for the storage owners: nanovm's outer journal already makes the request atomic and durable, so SQLite's DELETE journal and FULL syncs are redundant work (experiments/sqlite-filesystem found MEMORY mode recovers correctly, "not a general endorsement"). Either the provider syncs less (e.g. `synchronous=OFF` or `journal_mode=MEMORY`, after the recovery matrix is rerun), or `QuotaFs`'s `sync`/`sync_data` uncharge their wait as the journal does (a few lines in `quota.rs`).
+
+### N-601 (tests): restarting `nanovm run` raced the old process's storage lock
+- **Where:** `tests/dev.rs` (`drop(run); start(..)`), and the examples harness as first written
+- **Scenario:** `kill_on_drop` sends SIGKILL without waiting; a `nanovm run` started on the same data before the old one has exited fails with "app storage is already owned or cannot be locked" and exits. Seen in 2 of ~16 runs of the shop example's test at load ~25.
+- **Status:** fixed on `ideas/examples` (42b2fc2 for the examples harness, fa88fe7 for `dev.rs`): kill, then wait for the process, then start.
+
+### N-602: `nanovm run` lowered a manifest's limits without saying so
+- **Where:** `main.rs` (`run`: `spec.limits.clamped(&cfg.limits)`)
+- **Scenario:** `nanovm run` caps every limit at its node's defaults (1 MiB request bodies, 200 ms CPU, 5 s deadlines). A manifest asking for `max_request_body_kb: 4096` got 1024, and a 3 MiB upload was refused with `413` (found by `examples/files`); nothing at startup said the manifest had been overridden.
+- **Status:** fixed on `ideas/examples`: `run` prints a line for each limit it lowers (`the manifest's max_request_body_kb is 4096; nanovm run allows at most 1024, so it is 1024 here`). `nanovm_run_says_when_it_lowers_a_limit` times out waiting for that line without it. Raising the caps (a flag, or the manifest's own limits up to a higher ceiling) is left open.
+
+### N-603: the SQLite provider refused full-text search
+- **Where:** `components/sqlite/provider/src/lib.rs` (the authorizer)
+- **Scenario:** the provider denies every `PRAGMA` but `integrity_check`, and the authorizer also sees the statements SQLite's own modules prepare: FTS5 asks `PRAGMA main.data_version` (FTS3/4 and R-Tree ask `page_size`), so `CREATE VIRTUAL TABLE … USING fts5` and every write to one failed with `access-denied`, although the bundled SQLite has FTS5 compiled in (found by `examples/notes`).
+- **Status:** fixed on `ideas/examples`: the two read-only pragmas (no value) are allowed; setting pragmas stays denied (the SQLite experiment's policy test, which checks `journal_mode=WAL` and `synchronous=OFF`, is unchanged). `notes_search_their_own_full_text_index` fails with `Error::AccessDenied` without it.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -407,11 +449,11 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-6: JS and Python guests
 - **What:** guests built with componentize-js and componentize-py, running the same endpoints as `counter`, to prove the host for other languages.
-- **Status:** open
+- **Status:** JavaScript done on `cf/onramp` with our own QuickJS runtime (`js/`; componentize-js has no WASIp3 HTTP yet), `env.kv` on the composed provider, nine tests in `tests/js.rs`. Python open.
 
 ### W-7: `nanovm publish`
 - **What:** one command that pushes an app with `oras` (layout as in `publish-guests.yml`) and signs it keylessly (`cosign` with a browser sign-in, or a CI attestation).
-- **Status:** open
+- **Status:** done on `cf/onramp` (e74577c): `nanovm publish` pushes the same layout itself (oci-client), checks the component as a node will first, and prints the signing steps and TXT record; `.github/workflows/publish-app.yml` is the manual attestation template. Signing stays outside the CLI (W-102).
 
 ### W-8: benchmarks against workerd and Spin
 - **What:** density (memory per object), cold starts and warm latency against workerd (Durable Objects) and Spin, on the same machine, with the method written down.
@@ -486,4 +528,36 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-35: bound what the proxy buffers for objects across all apps
 - **What:** each event answer and each publish is collected whole in the proxy, up to `max_response_body_kb` (8 MiB), with no bound across sockets, objects or apps: 1,000 sockets of one app answered at once is 8 GiB, and publishes are as many as objects committing at once. One app's plain Wasm can so exhaust the proxy every app shares. Parsing is not the problem: an answer is parsed and applied within one poll, so its parse (about 6–14 times its size, `ws::parse`) is bounded by the proxy's threads, and publishes now parse in about their size (N-72). Found by the sec review.
 - **Design:** (1) collect an answer up to `socket_backlog_kb`, not `max_response_body_kb` (in `Proxy::socket`'s `deliver`): `apply` queues an answer's messages at once, each costing its length plus 64, so an answer bigger than the socket's backlog overflows it and drops the socket anyway (only a flood of subscribe controls would fit). Answers then cost at most one backlog per socket, within the per-socket budgets the proxy already has. (2) publishes: a proxy-wide semaphore of publish bytes in flight (an operator setting, or `max_sockets_per_app × socket_backlog_kb` per app), acquired for the declared or collected size before buffering, so one app's commits wait rather than grow the proxy.
+- **Status:** open
+
+### W-100: publish nanovm-sdk to crates.io
+- **What:** apps depend on the SDK by git today. Its bindings read WIT from `../../components/keyvalue/wit` and `../../wit/config`, which a git checkout has and a crates.io package would not: vendor the two WIT packages into `sdk/rust/wit` (with Spin's license) before publishing, and pin `wasip3` with nodes' wasmtime.
+- **Status:** open
+
+### W-101: compose without the `wac` CLI
+- **What:** `tools/build-app.sh` needs `wac` 0.12 (`cargo install`, about a minute) only for apps that use key-value. A prebuilt, digest-pinned provider published with each release, or a small composer on the `wac-graph` library outside the runtime crate, would drop that install. Composing inside `nanovm run` was rejected: `publish` and nodes need the composed component, so it belongs in the build (notes/onramp.md).
+- **Status:** open
+
+### W-102: test the laptop signing path end to end
+- **What:** `nanovm publish` prints `cosign attest --new-bundle-format …` for signing without CI. The node accepts Sigstore bundles attached as OCI referrers over the manifest digest (as GitHub attestations are); whether cosign's new-bundle attestation lands where `registry::verify` looks, with a subject it accepts, is untested here (no cosign, and nothing may be published to a real registry). Verify against a throwaway public repository, then document the exact command, or replace it with what works.
+- **Status:** open
+
+### W-103: warn when a published app can't be pulled anonymously
+- **What:** nodes pull anonymously, and a new ghcr.io package is private, so a first publish looks fine and then every node refuses it. After pushing, `nanovm publish` could read the manifest back anonymously with `registry::Oci` and say "make the package public" when that fails.
+- **Status:** open
+
+### W-104: move the test guests onto the SDK
+- **What:** `guests/counter` and `guests/hostile` still use `guests/util`. Porting them shrinks them by about a third (cf/optimistic-feynman's D1), but any change under `guests/**` republishes them from main, which needs the owner's approval.
+- **Status:** open
+
+### W-600: let a request roll back and still choose its answer
+- **What:** a handler that returns an error rolls back everything the request did, and the client gets `500` with `x-nanovm-error: guest-error`; any answer it gives instead, whatever its status, commits. So a checkout whose card is declined after it has written (`examples/shop`) can only say `500`, never `402`, and an app that wants a clean `409` must check everything before its first write. A way to answer *and* roll back (for example a reserved response header the host strips, which marks the request failed but sends the response) would let the SDK offer `Response::rollback()`. It touches the commit path in `object.rs`, so it is for its owners.
+- **Status:** open
+
+### W-601: let an app serve `/`
+- **What:** every URL's first segment names an object, so `/` is `400 bad-object-id` and a site has to live at `/www/` (`examples/site`). A per-app default object for paths that don't name one (or for `/` only), set in the manifest, would let a domain's root be a site. It changes routing in `server.rs`/`proxy.rs`, so it is for their owners.
+- **Status:** open
+
+### W-602: tell an object who is calling it
+- **What:** a call between objects (`http://nanovm/objects/{id}/…`) reaches its target as an ordinary request, so an object can't tell its app's own calls from a client's, and every route meant for other objects is public (`examples/tictactoe`'s `/join`, `examples/chat`'s `/rooms/…`); apps must write them defensively. The host could set a header naming the calling object on calls and strip it from every request that enters from outside (the node's front door and the worker link), so an object could keep internal routes. It is a security property of every entry path (`server.rs`, `egress.rs`, the worker link), so it is for their owners.
 - **Status:** open

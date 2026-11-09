@@ -1,0 +1,7 @@
+{
+  "limits": {
+    "memory_mb": 16, "cpu_ms": 100, "request_timeout_ms": 5000, "post_return_timeout_ms": 10000,
+    "idle_timeout_ms": 30000, "disk_mb": 16, "max_files": 1000,
+    "egress": ["hooks.example.com", "*.example.net"]
+  }
+}
