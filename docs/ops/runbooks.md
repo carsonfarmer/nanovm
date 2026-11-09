@@ -33,11 +33,13 @@ Three facts every runbook leans on:
    cp -p /usr/local/bin/nanovm /usr/local/bin/nanovm.prev
    install -m755 nanovm /usr/local/bin/nanovm.new && mv /usr/local/bin/nanovm.new /usr/local/bin/nanovm
    ```
-   A running supervisor starts every new worker from the path it started with,
-   so a binary replaced under it gives new apps workers of the new version
-   ([drills/binary-swap.sh](drills/binary-swap.sh): `worker spec: invalid
-   length 3, expected a tuple of size 4`, a 502 for every new app). `cp` over the
-   running file fails with "Text file busy"; `install`/`mv` succeed, which is the trap.
+   Before N-552's fix, a running supervisor started every new worker from the
+   path it started with, so a binary replaced under it gave new apps workers of
+   the new version ([drills/binary-swap.sh](drills/binary-swap.sh): `worker
+   spec: invalid length 3, expected a tuple of size 4`, a 502 for every new
+   app). With the fix, workers come from the running image, and the new version
+   runs only once the node restarts. `cp` over the running file fails with "Text
+   file busy"; `install`/`mv` succeed.
 4. `systemctl start nanovm nanovm-proxy`, then
    `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/_nanovm/ready` (204).
    Startup errors are in `journalctl -u nanovm`.
