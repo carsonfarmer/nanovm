@@ -700,3 +700,38 @@ async fn files_upload_within_quota_and_serve_ranges() {
     assert_eq!((c.status, c.body.as_slice()), (206, &kib(700, 2)[(700 << 10) - 4..]));
     assert_eq!(app.get("/b/").await.json()["bytes"], (700 << 10) + 9);
 }
+
+/// examples/site: embedded files with ETags and Cache-Control (304 when
+/// unchanged), and an API in the same component whose state is durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn site_serves_embedded_files_and_its_api() {
+    let mut app = App::start("site", json!({})).await;
+    let page = app.get("/www/").await;
+    assert_eq!((page.status, page.header("content-type"), page.header("cache-control")), (200, "text/html; charset=utf-8", "no-cache"));
+    assert!(page.text().contains(r#"<script src="app.js">"#));
+    let etag = page.header("etag").to_string();
+    assert_eq!(app.send("GET", "/www/", &[("if-none-match", &etag)], "").await.status, 304);
+    assert_eq!(app.send("GET", "/www/", &[("if-none-match", "\"other\", *")], "").await.status, 304);
+    assert_eq!(app.send("GET", "/www/", &[("if-none-match", "\"other\"")], "").await.status, 200);
+    let css = app.get("/www/style.css").await;
+    assert_eq!((css.header("content-type"), css.header("cache-control")), ("text/css; charset=utf-8", "public, max-age=3600"));
+    assert_ne!(css.header("etag"), etag);
+    let head = app.send("HEAD", "/www/app.js", &[], "").await;
+    let js = app.get("/www/app.js").await;
+    assert_eq!((head.status, head.header("content-length"), head.body.len()), (200, js.header("content-length"), 0));
+    assert_eq!(app.get("/www/nope.html").await.status, 404);
+    assert_eq!(app.post("/www/", "").await.status, 404);
+    let root = app.get("/").await;
+    assert_eq!((root.status, root.header("x-nanovm-error")), (400, "bad-object-id"), "no site at / (W-601)");
+
+    // The API beside it.
+    assert_eq!(app.get("/www/api/likes").await.json(), json!({"likes": 0}));
+    for n in 1..=3 {
+        assert_eq!(app.post("/www/api/likes", "").await.json()["likes"], n);
+    }
+    assert_eq!(app.get("/www/api/likes").await.header("cache-control"), "no-store");
+    assert_eq!(app.evicted("/www/api/likes").await.json()["likes"], 3);
+    let app = app.restart().await;
+    assert_eq!(app.get("/www/api/likes").await.json()["likes"], 3);
+    assert_eq!(app.get("/www/").await.header("etag"), etag, "the same bytes, the same ETag");
+}
