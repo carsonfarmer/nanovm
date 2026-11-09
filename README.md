@@ -203,6 +203,8 @@ That is the repository and the tag deployed, each identity whose signature is ac
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
+**Many nodes.** The proxy may place objects on several nodes: list them in `nodes` (each `host:port`, as that node's `name`). An object's home is chosen by rendezvous hashing, and the nodes keep leases on their objects in an object store (`leases = "s3://bucket/prefix"` on every node, with `name`; credentials from `AWS_*`), so an object has one live instance across nodes and a node that lost its lease can't commit. A node that doesn't hold an object answers 421 and the proxy tries the one that does (or the next), for up to `failover_ms`. When a node stops, its objects move after `lease_ms` (10 s). Calls between objects then go through the proxy's private endpoint (the node's `proxy`). Volumes don't move between nodes yet (W-9). See `notes/multinode.md`.
+
 DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs); the table is public; and a cold lookup adds a round trip.
 
 ## Apps
