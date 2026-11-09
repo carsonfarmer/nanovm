@@ -465,7 +465,8 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<()> {
             Undo::Created(p) => match std::fs::symlink_metadata(abs(p)) {
                 Ok(md) if md.is_dir() => std::fs::remove_dir(abs(p)),
                 Ok(_) => std::fs::remove_file(abs(p)),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                // Under a file, the create failed: nothing is there either.
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(()),
                 Err(e) => Err(e),
             },
             Undo::RemovedDir(p) => std::fs::create_dir(abs(p)).or_else(|e| {
@@ -1188,6 +1189,25 @@ mod tests {
         assert!(j.log.is_none());
         drop(j);
         open(&v);
+        assert_eq!(tree(&v), before);
+    }
+
+    /// A create under a file is recorded, then fails (ENOTDIR). Rolling it
+    /// back finds nothing there, as for a missing path, rather than failing
+    /// recovery and refusing to start the object ever again (found by the
+    /// quota model test, D-46: a request that failed after such a create
+    /// left its object answering 503 `instantiate-failed` for good).
+    #[test]
+    fn a_failed_create_under_a_file_rolls_back() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        for p in ["a/x", "f/x/y"] {
+            j.creating(&v.join(p)).unwrap();
+            assert!(std::fs::create_dir(v.join(p)).is_err());
+        }
+        drop(j);
+        reopen(&v, 1 << 30).expect("recovery succeeds");
         assert_eq!(tree(&v), before);
     }
 
