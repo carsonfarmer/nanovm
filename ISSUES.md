@@ -346,6 +346,11 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** `nanovm run` caps every limit at its node's defaults (1 MiB request bodies, 200 ms CPU, 5 s deadlines). A manifest asking for `max_request_body_kb: 4096` got 1024, and a 3 MiB upload was refused with `413` (found by `examples/files`); nothing at startup said the manifest had been overridden.
 - **Status:** fixed on `ideas/examples`: `run` prints a line for each limit it lowers (`the manifest's max_request_body_kb is 4096; nanovm run allows at most 1024, so it is 1024 here`). `nanovm_run_says_when_it_lowers_a_limit` times out waiting for that line without it. Raising the caps (a flag, or the manifest's own limits up to a higher ceiling) is left open.
 
+### N-603: the SQLite provider refused full-text search
+- **Where:** `components/sqlite/provider/src/lib.rs` (the authorizer)
+- **Scenario:** the provider denies every `PRAGMA` but `integrity_check`, and the authorizer also sees the statements SQLite's own modules prepare: FTS5 asks `PRAGMA main.data_version` (FTS3/4 and R-Tree ask `page_size`), so `CREATE VIRTUAL TABLE … USING fts5` and every write to one failed with `access-denied`, although the bundled SQLite has FTS5 compiled in (found by `examples/notes`).
+- **Status:** fixed on `ideas/examples`: the two read-only pragmas (no value) are allowed; setting pragmas stays denied (the SQLite experiment's policy test, which checks `journal_mode=WAL` and `synchronous=OFF`, is unchanged). `notes_search_their_own_full_text_index` fails with `Error::AccessDenied` without it.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
