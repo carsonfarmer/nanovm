@@ -75,7 +75,8 @@ no need for write-to-temp-then-rename.
   meanwhile, for at most the app's `post_return_timeout_ms`. `sse(id, event,
   data)` formats a Server-Sent Event ([examples/events](../../examples/events)).
 - `data()` and `tmp()`: `read` (an `Option`), `read_text`, `write`, `append`,
-  `remove`, `open`.
+  `remove`, `rename`, `open`; `fs::read_at(&fd, offset, len)` and
+  `fs::write_at` for pieces of a file.
 - `kv::get/get_text/set/delete/exists/increment/keys` on the store
   `default`; `kv::open(label)` for others.
 - `sqlite::query(sql, &[&a, &b])` (its `Rows`: `iter()`, `first()`,

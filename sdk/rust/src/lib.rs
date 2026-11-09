@@ -338,7 +338,8 @@ impl Response {
     /// nothing else: its other requests wait until `body` is done, and it has
     /// the app's `post_return_timeout_ms` for it, after which the object is
     /// stopped and what it changed since answering rolls back. What it
-    /// changed before answering has already committed.
+    /// changed before answering has already committed. Set `content-length`
+    /// if you know it; without one the body is chunked.
     pub fn stream<F: Future<Output = ()> + 'static>(content_type: &str, body: impl FnOnce(Body) -> F + 'static) -> Response {
         let writer: Box<dyn FnOnce(Body) -> std::pin::Pin<Box<dyn Future<Output = ()>>>> = Box::new(|b| Box::pin(body(b)));
         let mut response = Response::new(200).header("content-type", content_type);
@@ -389,7 +390,6 @@ impl Response {
 
     /// The response as `wasip3`'s, for a handler written against it directly.
     pub fn into_wit(mut self) -> core::result::Result<wit::Response, wit::ErrorCode> {
-        self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
         let body = match self.writer.and_then(|w| w.0.take()) {
             Some(writer) => {
                 let (tx, rx) = wit_stream::new();
@@ -397,6 +397,7 @@ impl Response {
                 rx
             }
             None => {
+                self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
                 self.headers.push(("content-length".into(), self.body.len().to_string().into()));
                 stream(self.body)
             }

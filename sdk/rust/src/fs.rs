@@ -91,6 +91,30 @@ impl Dir {
     pub async fn remove(self, path: &str) -> Result<(), ErrorCode> {
         self.0.unlink_file_at(path.into()).await
     }
+
+    /// Renames `from` to `to`, replacing any file at `to`.
+    pub async fn rename(self, from: &str, to: &str) -> Result<(), ErrorCode> {
+        self.0.rename_at(from.into(), self.0, to.into()).await
+    }
+}
+
+/// Up to `len` bytes of `fd` from `offset`: fewer only at the end of the
+/// file. With [`Dir::open`], reads a large file a piece at a time.
+pub async fn read_at(fd: &Descriptor, offset: u64, len: usize) -> Result<Vec<u8>, ErrorCode> {
+    use wit_bindgen::rt::async_support::StreamResult;
+    let (mut rx, done) = fd.read_via_stream(offset);
+    let mut data = Vec::with_capacity(len);
+    while data.len() < len {
+        let (status, buf) = rx.read(data).await;
+        data = buf;
+        if let StreamResult::Dropped = status {
+            // The end of the file, or an error that `done` reports.
+            drop(rx);
+            done.await?;
+            return Ok(data);
+        }
+    }
+    Ok(data)
 }
 
 /// Writes `data` to `fd` at `offset`.
