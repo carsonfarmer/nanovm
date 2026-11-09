@@ -1132,9 +1132,9 @@ struct Local {
 }
 
 impl Local {
-    /// `examples/target/{name}.wasm` with its manifest, `limits` changed and
-    /// objects idling out after 300 ms.
-    fn start(name: &str, limits: Value) -> Local {
+    /// `examples/target/{name}.wasm` with its manifest, `patch`'s `limits`,
+    /// `config` and `env` changed, and objects idling out after 300 ms.
+    fn start(name: &str, patch: Value) -> Local {
         let wasm = std::fs::read(repo().join(format!("examples/target/{name}.wasm")))
             .unwrap_or_else(|_| panic!("build it: tools/build-app.sh examples/{name} -o examples/target/{name}.wasm"));
         let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
@@ -1145,8 +1145,10 @@ impl Local {
         std::os::unix::fs::symlink(root.join("cwasm-cache"), data.join("cache")).unwrap();
         let mut manifest: Value = serde_json::from_slice(&std::fs::read(repo().join(format!("examples/{name}/nanovm.json"))).unwrap()).unwrap();
         manifest["limits"]["idle_timeout_ms"] = 300.into();
-        for (k, v) in limits.as_object().unwrap() {
-            manifest["limits"][k] = v.clone();
+        for (table, changes) in patch.as_object().unwrap() {
+            for (k, v) in changes.as_object().unwrap() {
+                manifest[table][k] = v.clone();
+            }
         }
         let spec: nanovm::registry::AppSpec = serde_json::from_value(manifest).unwrap();
         let cfg = nanovm::config::NodeConfig { data_dir: data, max_live_objects: 16, memory_reservation_mb: 64, dev: true, ..Default::default() };
@@ -1225,7 +1227,7 @@ async fn upstream(script: Vec<u16>, delay: Duration) -> (String, std::sync::Arc<
 async fn webhooks_verify_answer_then_relay_with_retries() {
     let (fast, fast_seen) = upstream(vec![], Duration::from_millis(1500)).await;
     let (flaky, flaky_seen) = upstream(vec![503], Duration::ZERO).await;
-    let app = Local::start("webhooks", json!({"egress": [fast, flaky]}));
+    let app = Local::start("webhooks", json!({"limits": {"egress": [fast, flaky]}}));
     let config = json!({"secret": "s3cret", "targets": [format!("http://{fast}/hook"), format!("http://{flaky}/hook"), "http://127.0.0.1:9/no"]});
     assert_eq!(app.send("PUT", "/gh/config", &[], config.to_string()).await.status, 204);
 
@@ -1271,4 +1273,99 @@ async fn webhooks_verify_answer_then_relay_with_retries() {
     let app = app.restart().await;
     assert_eq!(app.send("GET", "/gh/deliveries", &[], "").await.json()[0]["done"].as_array().unwrap().len(), 2);
     assert_eq!(app.send("POST", "/gh/in", &signed, body).await.json()["id"], 2, "the secret survived too");
+}
+
+/// A completion API on loopback: a prompt `n N ms M` streams N tokens as
+/// Server-Sent Events, one every M ms, then `[DONE]`; `fail` is a 500. It
+/// records each request's authorization header.
+async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let keys = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let seen = keys.clone();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| {
+        let seen = seen.clone();
+        async move {
+            let auth = req.headers().get("authorization").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+            seen.lock().unwrap().push(auth);
+            let body = http_body_util::BodyExt::collect(req.into_body()).await.unwrap().to_bytes();
+            let prompt = serde_json::from_slice::<Value>(&body).unwrap()["prompt"].as_str().unwrap().to_string();
+            let words: Vec<&str> = prompt.split(' ').collect();
+            let ["n", n, "ms", ms] = words[..] else { return nanovm::object::error_response(500, "scripted", "fail") };
+            let (n, ms): (u32, u64) = (n.parse().unwrap(), ms.parse().unwrap());
+            let tokens = futures::stream::unfold(0, move |i| async move {
+                if i > n {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                let event = if i == n { "data: [DONE]\n\n".to_string() } else { format!("data: {{\"token\":\"t{i}\"}}\n\n") };
+                Some((Ok::<_, nanovm::object::BoxError>(http_body::Frame::data(bytes::Bytes::from(event))), i + 1))
+            });
+            let body = http_body_util::BodyExt::boxed_unsync(http_body_util::StreamBody::new(tokens));
+            http::Response::builder().header("content-type", "text/event-stream").body(body).unwrap()
+        }
+    }));
+    (addr, keys)
+}
+
+/// examples/gateway (on an in-process node, to reach a loopback API): a
+/// streamed completion passed through as it is generated; the quota
+/// reserved before streaming and refunded after, so a stream cut off by
+/// the client or by post_return_timeout_ms keeps its reservation.
+#[tokio::test(flavor = "multi_thread")]
+async fn gateway_streams_completions_within_quotas() {
+    let (api, keys) = llm().await;
+    let patch = json!({
+        "limits": {"egress": [api], "post_return_timeout_ms": 1500},
+        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "300", "max_tokens": "100"},
+        "env": {"UPSTREAM_KEY": "test-key"},
+    });
+    let app = Local::start("gateway", patch);
+    let usage = async |app: &Local| app.send("GET", "/ann/usage", &[], "").await.json()["used"].as_i64().unwrap();
+    let complete = async |app: &Local, prompt: &str| {
+        let req = http::Request::post("http://x/complete").body(bytes::Bytes::from(json!({"prompt": prompt}).to_string())).unwrap();
+        app.node.dispatch("ann", req).await
+    };
+
+    // Tokens arrive as they are made, and only those used are charged.
+    let res = complete(&app, "n 5 ms 100").await;
+    assert_eq!((res.status().as_u16(), res.headers()["content-type"].to_str().unwrap()), (200, "text/event-stream"));
+    let mut body = res.into_body();
+    let mut pieces = vec![];
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            pieces.push((std::time::Instant::now(), String::from_utf8_lossy(&data).into_owned()));
+        }
+    }
+    let text: String = pieces.iter().map(|p| p.1.as_str()).collect();
+    assert!(text.starts_with("data: {\"token\":\"t0\"}") && text.ends_with("data: [DONE]\n\n") && text.matches("token").count() == 5, "{text}");
+    assert!(pieces.last().unwrap().0 - pieces[0].0 >= Duration::from_millis(300), "streamed as generated");
+    assert_eq!(usage(&app).await, 5, "100 reserved, 95 given back");
+    assert_eq!(keys.lock().unwrap()[0], "Bearer test-key");
+    assert_eq!(complete(&app, "fail").await.status(), 502);
+    assert_eq!(usage(&app).await, 5, "an upstream failure costs nothing");
+    assert_eq!(app.send("POST", "/ann/complete", &[], "nope").await.status, 400);
+
+    // A stream the client drops keeps its reservation.
+    let res = complete(&app, "n 50 ms 50").await;
+    let mut body = res.into_body();
+    http_body_util::BodyExt::frame(&mut body).await.unwrap().unwrap();
+    drop(body);
+    assert_eq!(usage(&app).await, 105);
+    // So does one that outlives post_return_timeout_ms: its refund rolls back.
+    let res = complete(&app, "n 50 ms 100").await;
+    let text = http_body_util::BodyExt::collect(res.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
+    assert!(!String::from_utf8_lossy(&text).contains("[DONE]"), "cut short");
+    assert_eq!(usage(&app).await, 205);
+    // 205 + 100 > 300: refused before anything is sent upstream.
+    let calls = keys.lock().unwrap().len();
+    let over = app.send("POST", "/ann/complete", &[], r#"{"prompt":"n 1 ms 0"}"#).await;
+    assert_eq!((over.status, &over.json()["error"]), (429, &json!("quota")));
+    assert_eq!(keys.lock().unwrap().len(), calls);
+    assert_eq!(app.send("GET", "/bob/usage", &[], "").await.json()["used"], 0, "quotas are per user");
+
+    app.evicted().await;
+    assert_eq!(usage(&app).await, 205);
+    let app = app.restart().await;
+    assert_eq!(usage(&app).await, 205);
 }
