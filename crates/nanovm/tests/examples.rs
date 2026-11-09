@@ -8,9 +8,13 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures::StreamExt;
 use reqwest::Method;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
+use tokio_tungstenite::tungstenite::{Error, Message};
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
@@ -41,6 +45,10 @@ impl App {
         let manifest = std::fs::read(repo().join(format!("examples/{name}/nanovm.json"))).unwrap_or(b"{}".into());
         let mut manifest: Value = serde_json::from_slice(&manifest).unwrap();
         manifest["limits"]["idle_timeout_ms"] = 300.into();
+        // The most `nanovm run` allows: these tests check what the apps do,
+        // and a busy disk's slow fsyncs mustn't turn into timeouts.
+        manifest["limits"]["request_timeout_ms"] = 5000.into();
+        manifest["limits"]["cpu_ms"] = 200.into();
         for (k, v) in limits.as_object().unwrap() {
             manifest["limits"][k] = v.clone();
         }
@@ -120,6 +128,15 @@ impl App {
     async fn post(&self, path: impl AsRef<str>, body: impl Into<reqwest::Body>) -> Reply {
         self.send("POST", path, &[], body).await
     }
+
+    /// A WebSocket, or the refusal's status.
+    async fn open(&self, path: &str) -> Result<Ws, u16> {
+        match tokio_tungstenite::connect_async(format!("ws://{}{path}", self.addr)).await {
+            Ok((ws, _)) => Ok(ws),
+            Err(Error::Http(res)) => Err(res.status().as_u16()),
+            Err(e) => panic!("{path}: {e}"),
+        }
+    }
 }
 
 async fn next_line(lines: &mut tokio::sync::mpsc::UnboundedReceiver<String>, text: &str) -> String {
@@ -155,6 +172,18 @@ impl Reply {
 impl std::fmt::Debug for Reply {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.status, self.text())
+    }
+}
+
+/// The next data message, as JSON.
+async fn next(ws: &mut Ws) -> Value {
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(10), ws.next()).await.expect("a message in time");
+        match m.expect("the socket is open").expect("a frame") {
+            Message::Text(t) => return serde_json::from_str(&t).unwrap_or_else(|e| panic!("{e}: {t}")),
+            Message::Ping(_) | Message::Pong(_) => continue,
+            m => panic!("not text: {m:?}"),
+        }
     }
 }
 
@@ -286,4 +315,58 @@ async fn locks_have_one_holder_and_growing_fencing_tokens() {
     assert_eq!(app.post("/job/acquire?owner=slow", "").await.status, 409);
     assert_eq!(app.post("/job/release?owner=fast&token=2", "").await.status, 204);
     assert_eq!(app.post("/job/acquire?owner=slow", "").await.json()["token"], 3);
+}
+
+/// examples/polls: a poll per object, one vote per voter cookie (voting
+/// again moves the vote), results pushed to WebSockets once a vote commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn polls_count_each_voter_once_and_push_results() {
+    let mut app = App::start("polls", json!({})).await;
+    let votes = |r: &Value| -> Vec<u64> { r["options"].as_array().unwrap().iter().map(|o| o["votes"].as_u64().unwrap()).collect() };
+    let poll = r#"{"question":"Lunch?","options":["pizza","sushi","tacos"]}"#;
+    assert_eq!(app.post("/lunch/vote?option=0", "").await.status, 404, "no poll yet");
+    assert_eq!(app.send("PUT", "/lunch/", &[], poll).await.status, 201);
+    assert_eq!(app.send("PUT", "/lunch/", &[], poll).await.status, 409);
+    for bad in ["{}", r#"{"question":"q","options":["one"]}"#, r#"{"question":" ","options":["a","b"]}"#] {
+        assert_eq!(app.send("PUT", "/bad/", &[], bad).await.status, 400, "{bad}");
+    }
+    let mut watch = app.open("/lunch/ws").await.unwrap();
+    assert_eq!(votes(&next(&mut watch).await), [0, 0, 0]);
+
+    // A first vote gets a voter cookie; voting again with it moves the vote.
+    let first = app.post("/lunch/vote?option=0", "").await;
+    let cookie = first.header("set-cookie").split(';').next().unwrap().to_string();
+    assert!(cookie.starts_with("voter=") && cookie.len() == 22, "{cookie}");
+    assert_eq!((votes(&first.json()), &first.json()["you"]), (vec![1, 0, 0], &json!(0)));
+    assert_eq!(votes(&next(&mut watch).await), [1, 0, 0]);
+    let me = [("cookie", cookie.as_str())];
+    assert_eq!(votes(&app.send("POST", "/lunch/vote?option=1", &me, "").await.json()), [0, 1, 0]);
+    assert_eq!(votes(&next(&mut watch).await), [0, 1, 0]);
+    assert_eq!(votes(&app.send("POST", "/lunch/vote?option=1", &me, "").await.json()), [0, 1, 0], "the same vote again");
+    assert_eq!(app.send("GET", "/lunch/", &me, "").await.json()["you"], 1);
+    assert!(app.get("/lunch/").await.json().get("you").is_none());
+    for bad in ["/lunch/vote?option=3", "/lunch/vote?option=-1", "/lunch/vote"] {
+        assert_eq!(app.post(bad, "").await.status, 400, "{bad}");
+    }
+
+    // Twenty new voters at once: every vote counts, once.
+    let crowd = (0..20).map(|i| format!("voter={i:016x}"));
+    let app_ = &app;
+    let crowd: Vec<_> = crowd.map(|c| async move { app_.send("POST", "/lunch/vote?option=2", &[("cookie", &c)], "").await }).collect();
+    assert!(futures::future::join_all(crowd).await.iter().all(|r| r.status == 200));
+    let now = app.get("/lunch/").await.json();
+    assert_eq!((votes(&now), &now["voters"]), (vec![0, 1, 20], &json!(21)));
+    let mut seen = vec![];
+    while seen != [0, 1, 20] {
+        seen = votes(&next(&mut watch).await);
+    }
+
+    // Votes and voters outlive the instance and the node; sockets outlive the instance.
+    assert_eq!(votes(&app.evicted("/lunch/").await.json()), [0, 1, 20]);
+    app.send("POST", "/lunch/vote?option=0", &me, "").await;
+    assert_eq!(votes(&next(&mut watch).await), [1, 0, 20]);
+    drop(watch);
+    let app = app.restart().await;
+    assert_eq!(votes(&app.send("POST", "/lunch/vote?option=2", &me, "").await.json()), [0, 0, 21]);
+    assert_eq!(app.get("/lunch/").await.json()["voters"], 21);
 }
