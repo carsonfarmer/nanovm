@@ -310,6 +310,53 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** yes: with `memory_mb = 32`, the test probe held 600 maps of 60 KiB, new or copied from a 60 KiB request header (36 MB each way), and a 100 KiB map.
 - **Status:** fixed in 98c1698: a head is at most 64 KiB at every hop (hyper's `max_header_size`, which also bounds trailers; over it a client gets 431), a guest's map at most 64 KiB, and an instance holds at most `memory_mb / 64 KiB` resources (`max_resources` is the lower of the two: 1,024 at 64 MiB, 256 at the counter's 16 MiB). So header maps the host holds for an instance stay within its memory limit, and 64 KiB is twice what nginx accepts by default (four 8 KiB header buffers). `guest_header_maps_are_bounded_by_the_memory_limit` (a test-only probe route) fails without each part.
 
+### N-220: a heavy request kept its thread from 10 ms until its CPU kill when a lane was free
+- **Where:** `object.rs`, the epoch callback's heavy path
+- **Scenario:** past 10 ms of CPU a request takes a heavy lane at every tick. A free lane was taken without returning to the executor, so the request kept its thread until its CPU budget killed it. Other threads steal most tasks queued behind it, but not Tokio's LIFO slot, and on a one-thread runtime nothing. Found on the earlier `cf/hop` branch (its N-120).
+- **Reproduced:** yes: `a_spinner_yields_its_thread_at_each_tick` (one-thread runtime) fails without the fix.
+- **Status:** fixed on `cf/speed` (port of `4805ba9`; see `notes/speed.md`)
+
+### N-221 (efficiency): an object's own wakes went through Tokio and woke idle threads
+- **Where:** `object.rs` `serve`
+- **Scenario:** Wasmtime wakes the store's task during its own poll a few times per ordinary request. Tokio takes a task that wakes itself for one that yields: it queues it behind the others and wakes an idle thread to steal it. At one client the worker made 4.7 voluntary context switches per request (ideal: 1).
+- **Status:** fixed on `cf/speed` (port of `4c37fad`): the store polls again on its own wakes, bounded by the epoch callback's yield and a tick. One client: worker switches 4.7 → 2.1 per request, CPU per request −30%. Side effect: N-227.
+
+### N-222: a jailed worker's telemetry export shared the threads that run guests
+- **Where:** `telemetry.rs` `Telemetry::new`
+- **Scenario:** once an object's task may hold its thread for up to a tick (N-221), export I/O queued behind guest work at saturation and the worker's span queue overflowed: 77% of request spans delivered at 256 clients. The worker-side twin of N-36.
+- **Status:** fixed on `cf/speed` (port of `932be36`): a current-thread runtime on its own thread, with the egress dialer's second pool. 99.7–100% delivered.
+
+### N-223 (efficiency): link sockets woke the other process whenever it read
+- **Where:** `link.rs`
+- **Scenario:** Tokio registers each `UnixStream` for reads and writes, and a Unix stream socket signals writable whenever its peer reads, so each read of a request or response woke the other process for nothing.
+- **Status:** fixed on `cf/speed` (port of `fb7055d`): read interest only; a write that finds the socket full waits on a duplicate descriptor registered for writes. Supervisor switches 3.0 → 2.0 and worker 2.1 → 1.1 per request at one client. Costs 64 runtime lines and two `unsafe` blocks.
+
+### N-224 (efficiency): an app restart spent half its time forking, exec'ing and building the engine
+- **Where:** `supervisor.rs` `start`, `worker_main`
+- **Scenario:** of a ~20 ms restart (first request after an app's worker is gone, compile cached), about 10 ms did not depend on the app: forking the supervisor, exec'ing the 50 MB binary, and building the engine (wasmtime's stack pool takes one `mprotect` per slot, so it grows with `max_live_objects`).
+- **Status:** fixed on `cf/speed` (port of `99d0f55`): one worker is kept spawned ahead with its engine built; it gets no app, uid, cgroup or jail until taken. Restart 21.5 → 11.9 ms; a spare costs 2.9 MB.
+
+### N-225 (tests): the jail relied on a comment for being entered with one thread, and its test jailed one thread of two
+- **Where:** `jail.rs`, `tests/integration.rs` `jail_probe`
+- **Scenario:** the uid, Landlock and seccomp bind only the calling thread and the threads it starts later. Nothing checked that a worker had one thread when it jailed itself, and the probe test ran in the test harness's two-threaded process. Production was not affected.
+- **Status:** fixed on `cf/speed` (with N-224): the jail refuses a process with more than one thread (`the_jail_needs_one_thread`); the probe runs in a forked single-threaded child.
+
+### N-226 (efficiency): every worker start piped the whole component and hashed it again
+- **Where:** `supervisor.rs`, `registry.rs`, `engine.rs`
+- **Scenario:** the supervisor read the cached component and piped it to the worker, which SHA-256'd it to find its cached compile, though the registry had checked those bytes against their digest. This VM has no SHA extensions: a 5.6 MB component cost about 14 ms of worker CPU and 8 ms of supervisor CPU per start.
+- **Status:** fixed on `cf/speed` (port of `77497df`): the worker gets the digest and the cache file, keys its compile by the digest and reads the file only to compile. 5.6 MB restart 31.2 → 8.9 ms.
+
+### N-227: with N-221, a CPU kill after the reply more often fails the response
+- **Where:** `object.rs` `serve` (post-return), `GuardedBody`
+- **Reproduced:** yes: counter with a 2 ms CPU budget, 64 clients, 3 × 50,000 requests. Base turned about 70% of kills into failed responses (500, or 502 `worker-down` when not even the head was out); with N-221's re-polling about 95%. After replying, the actor keeps running post-return work in the same poll, so the kill more often lands before the worker's HTTP task has written the response, and the abort fails it. Failures never outnumbered kills and no bodies were truncated, so neighbours are not affected. Under heavy machine load with the counter's 50 ms budget, kills rose about 2× (wall time billed inside polls, N-640).
+- **Status:** open. Billing thread CPU time (`cf/cpu-clock`, N-640) should remove load-driven kills; whether an answered response should survive a post-return kill is a separate decision.
+
+### N-228 (efficiency): every worker start syncs about 30 directories
+- **Where:** `supervisor.rs` `app_dirs` → `journal::sync_ancestors`
+- **From strace:** each start fsyncs the three app directories and every ancestor up to `/` (30 calls), median 0.19 ms each and up to 16 ms while the disk is busy. With C4 and C5 a restart is about 10 ms, so this is now a visible share, and the 60–300 ms outliers seen in every build were waits, not CPU.
+- **Proposal:** sync ancestors when `app_dirs` creates something, or once per app per supervisor process (a crash before the first sync is then covered by the next process's first start). Durability decision for the storage owner (N-38).
+- **Status:** open
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

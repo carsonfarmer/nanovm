@@ -96,7 +96,7 @@ impl Telemetry {
     pub fn new(endpoint: &str, app: &str, digest: &str, upstream: Option<Upstream>) -> anyhow::Result<Self> {
         // A worker's export I/O runs on a thread of its own, so a batch never
         // waits behind guest work on the node's threads, which can hold one
-        // for a tick (N-121); the supervisor isolates its control runtime the
+        // for a tick (N-222); the supervisor isolates its control runtime the
         // same way (N-36). It uses the egress dialer's second pool of links.
         let runtime = match upstream {
             Some(_) => {

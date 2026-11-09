@@ -169,7 +169,7 @@ client ─► proxy ─► supervisor (nanovm serve): runs no guest code
                     └── fd 4: links for egress  ◄──  one Node for one app, jailed
 ```
 
-A worker reads its config and component from stdin, then jails itself while it still has one thread, before it compiles or runs anything:
+A worker reads the node's config from stdin and builds its engine and linker from it, with no guest input; the supervisor keeps one such worker spawned ahead, so starting an app skips forking, exec'ing and building the engine (about half of a restart). Once taken, it reads its app and the path of its component in the registry's cache, opens that file, and jails itself before it compiles or runs anything. The jail binds only the calling thread and those it starts later, so it refuses a process with more than one thread:
 
 - **Its own uid.** When the supervisor runs as root, app `i` runs as `jail_uid_base + i`, and its directories are chowned to it.
 - **Landlock.** It gets read-write access to the app's own `objects/`, `tmp/` and `cache/`, and nothing else.
@@ -183,11 +183,11 @@ A worker reads its config and component from stdin, then jails itself while it s
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
-- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker goes into `<cgroup>/<app>` with the node's `[worker]` memory, CPU and pids limits, before it is given anything.
+- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker goes into `<cgroup>/<app>` with the node's `[worker]` memory, CPU and pids limits, before it is given its app. A spare waits in the supervisor's cgroup, holding only what the node's config decides (about 3 MB).
 
 Mount and network namespaces were left out on purpose: Landlock already confines the filesystem, and with no `socket()` there is no network to remove.
 
-**Links.** The supervisor and a worker talk HTTP/1.1, one request at a time per connection, over socketpairs. The dialing side passes one end of each pair to the other over its control socket (`SCM_RIGHTS`) and keeps the connections it has made in a pool. A request runs inline in the task that sent it, at both ends: on this path every handoff between tasks is a thread wakeup, and those cost more than the HTTP framing. Each front-end thread (`front_threads`, a quarter of the cores by default) has its own runtime, listener and pool. The supervisor serves a worker at most as many egress links as its objects can use at once (`max_live_objects × (max_outbound_concurrency + 1)`), and all workers together at most a quarter of its file descriptor limit, which it raises to the hard limit at start; a link past either cap is closed unserved.
+**Links.** The supervisor and a worker talk HTTP/1.1, one request at a time per connection, over socketpairs. The dialing side passes one end of each pair to the other over its control socket (`SCM_RIGHTS`) and keeps the connections it has made in a pool. A request runs inline in the task that sent it, at both ends: on this path every handoff between tasks is a thread wakeup, and those cost more than the HTTP framing. Each front-end thread (`front_threads`, a quarter of the cores by default) has its own runtime, listener and pool. The supervisor serves a worker at most as many egress links as its objects can use at once (`max_live_objects × (max_outbound_concurrency + 1)`), and all workers together at most a quarter of its file descriptor limit, which it raises to the hard limit at start; a link past either cap is closed unserved. Link sockets are registered with the reactor for reads only: a Unix stream socket signals writable whenever its peer reads, so with write interest every request woke the other process. A write that finds the socket full waits on a duplicate descriptor registered for writes.
 
 A worker that dies takes only its app with it. In-flight requests get `502 worker-down`, and the next request starts a fresh worker. Volumes survive.
 
@@ -238,7 +238,7 @@ The node trusts these headers because only the proxy can reach it, and strips th
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
 2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
-3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB header map on the host: 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
+3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB header map on the host: 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. The worker spawned ahead gets the component's digest and its file in the cache. Its compile cache is keyed by that digest, which the registry checked when it fetched the bytes, so a cached compile is used without reading or hashing the component; the file is read only to compile.
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
 
