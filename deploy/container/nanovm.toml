@@ -1,0 +1,16 @@
+# /etc/nanovm/nanovm.toml in the image. Every key and its default is in
+# crates/nanovm/src/config.rs. Mount your own over it to change it.
+
+# Loopback: the proxy shares this container's network namespace
+# (`--network container:<node>`), and only it may reach the node.
+listen = "127.0.0.1:8080"
+data_dir = "/var/lib/nanovm"
+max_live_objects = 1000
+publish_to = "http://127.0.0.1:8444/publish"
+telemetry_endpoint = "http://127.0.0.1:4318"
+jail_uid_base = 200000
+
+[limits]
+memory_mb = 64
+cpu_ms = 200
+disk_mb = 64
