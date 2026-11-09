@@ -410,6 +410,50 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
     );
 }
 
+/// A guest that has used a tick lets the other requests on its thread run:
+/// on a one-thread runtime, a short request sent while a spinner is past its
+/// first 10 ms (when it must take a heavy lane) finishes long before the
+/// spinner runs out of CPU.
+#[tokio::test(flavor = "current_thread")]
+async fn a_spinner_yields_its_thread_at_each_tick() {
+    let node = node("a_spinner_yields_its_thread_at_each_tick", "hostile", 8);
+    for id in ["canary", "spinner"] {
+        assert_eq!(get(&node, id, "/").await.status, 200);
+    }
+    let t0 = Instant::now();
+    // Spawned: the test's own future runs only once the queue is empty.
+    let timed = |id: &'static str, path: &'static str| {
+        let node = node.clone();
+        tokio::spawn(async move { (get(&node, id, path).await, t0.elapsed()) })
+    };
+    let spinner = timed("spinner", "/spin");
+    let n = node.clone();
+    let canary = tokio::spawn(async move {
+        // Without a timer, which this runtime checks only now and then: the
+        // loop runs only while the spinner lets the thread go.
+        while t0.elapsed() < Duration::from_millis(30) {
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if std::mem::replace(&mut yielded, true) {
+                    return std::task::Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            })
+            .await;
+        }
+        (get(&n, "canary", "/").await, t0.elapsed())
+    });
+    let ((canary, canary_at), (spun, spun_at)) = (canary.await.unwrap(), spinner.await.unwrap());
+    assert_eq!(spun.error.as_deref(), Some("cpu"), "{}", spun.body);
+    assert_eq!(canary.status, 200, "{}", canary.body);
+    assert!(
+        canary_at < spun_at && canary.elapsed < Duration::from_millis(50),
+        "the canary took {:?} and was done at {canary_at:?}, the spinner at {spun_at:?}",
+        canary.elapsed
+    );
+}
+
 // ---- filesystem layout and quotas -------------------------------------
 
 /// `hostile` with room for heavy file work: writes and creates run inline
