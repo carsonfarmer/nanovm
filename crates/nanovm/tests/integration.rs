@@ -1888,6 +1888,7 @@ async fn sqlite_captures_recover_without_the_original_node() {
         assert_eq!(version["object"], "a");
         assert_eq!(version["sequence"], index + 1);
         assert_eq!(version["parent"], parent);
+        assert_eq!(version["epoch"], 0, "one node: every lease its own, at epoch 0");
         parent = format!("{:x}", Sha256::digest(&bytes));
         let target = received.join(path.file_name().unwrap());
         std::fs::write(&target, &bytes).unwrap();
@@ -4098,6 +4099,37 @@ mod nodes {
             assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", holder(&store, &app, &object).await);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// A WebSocket's events reach its object on the object's node, which
+    /// alone holds its lease.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn socket_events_reach_their_objects_node() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let _a = serve(leased("socket_events_a", &la, private.local_addr().unwrap()), la, store.clone()).await;
+        let _b = serve(leased("socket_events_b", &lb, private.local_addr().unwrap()), lb, store.clone()).await;
+        let published = publish("nodes-sockets", &app("counter")).await;
+        let (proxy, app) = proxy(&names, private, "sockets.test", &published).await;
+        let object = homed(&names, &app, &names[1]);
+        let mut req = format!("ws://{proxy}/{object}/ws").into_client_request().unwrap();
+        req.headers_mut().insert("host", "sockets.test".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        ws.send(Message::text("hello")).await.unwrap();
+        let echo = async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Ping(_) => continue,
+                    m => return m,
+                }
+            }
+        };
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), echo).await.unwrap(), Message::text("echo hello"));
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 1));
     }
 
     /// An object calls an object on another node, through the proxy, which

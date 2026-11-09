@@ -7,7 +7,7 @@
 //! one past the last; a node that doesn't hold the lease refuses the object's
 //! requests (421, naming the holder), and the proxy sends them there. A node
 //! commits an object's changes only while it holds the lease, and the commit
-//! carries the epoch (see `table::Node::lease_epoch`). With no store there is
+//! carries the epoch (see `object::ObjShared::lease_epoch`). With no store there is
 //! one node, and every lease is its own at epoch 0.
 //!
 //! Every write is conditional on the version read, so of two nodes racing for
@@ -58,8 +58,9 @@ pub struct Grant {
     pub epoch: u64,
     /// The node's session it was taken in.
     pub session: u64,
-    e_tag: Option<String>,
-    version: Option<String>,
+    /// The version of the lease record it wrote.
+    pub e_tag: Option<String>,
+    pub version: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -84,8 +85,9 @@ pub enum Refused {
     Unavailable(String),
 }
 
+/// This node's session, as its supervisor renews it.
 #[derive(Clone, Default)]
-struct Session {
+struct Own {
     id: u64,
     beat: u64,
     version: Option<UpdateVersion>,
@@ -98,7 +100,7 @@ pub struct Leases {
     store: Arc<dyn ObjectStore>,
     node: String,
     ttl: Duration,
-    session: Mutex<Session>,
+    session: Mutex<Own>,
     /// Other nodes' session records: the version seen, and since when.
     seen: Mutex<HashMap<String, (Option<UpdateVersion>, Instant)>>,
 }
@@ -126,7 +128,7 @@ impl Leases {
         let (sent, path) = (mono_ns(), Path::from_iter(["nodes", &self.node]));
         if s.until <= sent {
             match self.get::<NodeRecord>(&path).await {
-                Ok((rec, version)) => s = Session { id: rec.map_or(1, |r| r.session + 1), beat: 0, version, until: 0 },
+                Ok((rec, version)) => s = Own { id: rec.map_or(1, |r| r.session + 1), beat: 0, version, until: 0 },
                 Err(_) => return (s.id, s.until),
             }
         }
@@ -154,7 +156,7 @@ impl Leases {
     /// Takes the lease on `key` (`<app>/<object>`), at the next epoch,
     /// unless another node's live session holds it.
     pub async fn acquire(&self, key: &str) -> std::result::Result<Grant, Refused> {
-        let Session { id, until, .. } = self.session.lock().clone();
+        let Own { id, until, .. } = self.session.lock().clone();
         if until <= mono_ns() {
             return Err(Refused::Unavailable("this node's session has lapsed".into()));
         }
@@ -232,19 +234,14 @@ impl Leases {
     }
 }
 
-/// A worker's side: its node's session as the supervisor last told it, and
-/// the link to ask it for leases.
-pub struct Worker {
+/// A worker's view of its node's session, as the supervisor last told it.
+#[derive(Default)]
+pub struct Session {
     id: AtomicU64,
     until: AtomicU64,
-    up: crate::egress::Upstream,
 }
 
-impl Worker {
-    pub fn new(up: crate::egress::Upstream) -> Worker {
-        Worker { id: AtomicU64::new(0), until: AtomicU64::new(0), up }
-    }
-
+impl Session {
     /// Records the node's session; whether it is a new one or has lapsed.
     pub fn set(&self, id: u64, until: u64) -> bool {
         // The id first: whoever sees the new `until` sees the new id.
@@ -257,6 +254,19 @@ impl Worker {
     pub fn holds(&self, grant: &Grant) -> bool {
         let until = self.until.load(SeqCst);
         grant.session == self.id.load(SeqCst) && mono_ns() < until
+    }
+}
+
+/// A worker's side: its node's session, and the link to ask its supervisor
+/// for leases.
+pub struct Worker {
+    pub session: Arc<Session>,
+    up: crate::egress::Upstream,
+}
+
+impl Worker {
+    pub fn new(up: crate::egress::Upstream) -> Worker {
+        Worker { session: Arc::default(), up }
     }
 
     /// Asks the supervisor for `object`'s lease: the grant, with the node's

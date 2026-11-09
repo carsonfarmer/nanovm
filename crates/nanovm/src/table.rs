@@ -196,7 +196,7 @@ impl Node {
         let (app, key): (_, Arc<str>) = (&self.app, id.into());
         let mut objects = self.objects.lock();
         if let Some(e) = objects.get(&key) {
-            if self.lost(&e.shared) {
+            if e.shared.lost() {
                 let response = misdirected(None);
                 crate::telemetry::response(&mut job.span, &response);
                 return Err(response);
@@ -238,7 +238,9 @@ impl Node {
             crate::telemetry::response(&mut job.span, &response);
             return Err(response);
         }
-        let shared = Arc::new(ObjShared::new(app.name.clone(), id));
+        let mut shared = ObjShared::new(app.name.clone(), id);
+        shared.leases = self.leases.as_ref().map(|l| l.session.clone());
+        let shared = Arc::new(shared);
         let (tx, rx) = mpsc::channel(app.cfg.limits.max_queue.max(1));
         tx.try_send(job).ok().expect("fresh queue has room");
         objects.insert(
@@ -272,35 +274,12 @@ impl Node {
         true
     }
 
-    /// Whether this node may serve `obj` and commit its changes: on the only
-    /// node always, else while it holds the object's lease in its current
-    /// session.
-    pub fn holds(&self, obj: &ObjShared) -> bool {
-        self.leases.as_ref().is_none_or(|l| obj.lease.lock().as_ref().is_some_and(|g| l.holds(g)))
-    }
-
-    /// Whether `obj` had a lease that this node no longer holds.
-    fn lost(&self, obj: &ObjShared) -> bool {
-        self.leases.as_ref().is_some_and(|l| obj.lease.lock().as_ref().is_some_and(|g| !l.holds(g)))
-    }
-
-    /// The epoch of this node's lease on `obj`, which its commit carries; an
-    /// error once the node no longer holds it, so a node that lost an object
-    /// can't commit it (W-10). 0 on the only node.
-    pub fn lease_epoch(&self, obj: &ObjShared) -> std::io::Result<u64> {
-        let Some(l) = &self.leases else { return Ok(0) };
-        match &*obj.lease.lock() {
-            Some(g) if l.holds(g) => Ok(g.epoch),
-            _ => Err(std::io::Error::other("this node no longer holds the object's lease")),
-        }
-    }
-
     /// Takes `obj`'s lease before its instance starts, unless this node holds
     /// it: else the answer for its requests, a 421 the proxy follows to the
     /// node holding it (or on to the next node).
     pub async fn acquire(&self, obj: &ObjShared) -> Result<(), http::Response<RespBody>> {
         let Some(l) = &self.leases else { return Ok(()) };
-        if self.holds(obj) {
+        if obj.holds() {
             return Ok(());
         }
         let (grant, id, until) = l.acquire(&obj.id).await.map_err(|owner| misdirected(owner.as_deref()))?;
@@ -321,7 +300,7 @@ impl Node {
     /// is a new one, the leases of the last are gone: idle objects are
     /// evicted at once, busy ones stop at their next request or commit.
     pub fn renewed(&self, id: u64, until: u64) {
-        if self.leases.as_ref().is_some_and(|l| l.set(id, until)) {
+        if self.leases.as_ref().is_some_and(|l| l.session.set(id, until)) {
             self.objects.lock().retain(|_, e| e.idle_since().is_none());
         }
     }

@@ -89,7 +89,8 @@ pub struct ObjShared {
     pub waiting_on: Mutex<Vec<Arc<str>>>,
     /// The objects waiting on its request, while they do.
     pub callers: Mutex<Vec<Arc<str>>>,
-    /// Its node's lease on it, with more than one node.
+    /// With more than one node, its node's session, and lease on it.
+    pub leases: Option<Arc<crate::lease::Session>>,
     pub lease: Mutex<Option<crate::lease::Grant>>,
     pub context: Mutex<opentelemetry::Context>,
 }
@@ -104,6 +105,28 @@ impl ObjShared {
             since_ns: now.into(),
             poll_start_ns: now.into(),
             ..Default::default()
+        }
+    }
+
+    /// Whether its node may serve it and commit its changes: with one node
+    /// always, else while it holds the object's lease in its current session.
+    pub fn holds(&self) -> bool {
+        self.leases.as_ref().is_none_or(|s| self.lease.lock().as_ref().is_some_and(|g| s.holds(g)))
+    }
+
+    /// Whether it had a lease that its node no longer holds.
+    pub fn lost(&self) -> bool {
+        self.leases.as_ref().is_some_and(|s| self.lease.lock().as_ref().is_some_and(|g| !s.holds(g)))
+    }
+
+    /// The epoch of its node's lease on it, which its committed versions
+    /// carry; an error once the node no longer holds it, so a node that lost
+    /// the object can't commit (W-10). 0 with one node.
+    pub fn lease_epoch(&self) -> std::io::Result<u64> {
+        let Some(s) = &self.leases else { return Ok(0) };
+        match &*self.lease.lock() {
+            Some(g) if s.holds(g) => Ok(g.epoch),
+            _ => Err(std::io::Error::other("this node no longer holds the object's lease")),
         }
     }
 
@@ -452,12 +475,13 @@ enum Exit {
 /// changes stand whether or not a publish gets through). Only while the node
 /// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route, node, shared) = acc.with(|mut s| {
+    let (quota, held, route, held_lease) = acc.with(|mut s| {
         let s = s.data_mut();
-        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.hooks.node.clone(), s.shared.clone())
+        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.shared.lease_epoch())
     });
-    // W-9's committed versions are to carry this epoch.
-    let _epoch = node.upgrade().ok_or_else(|| std::io::Error::other("the node is gone"))?.lease_epoch(&shared)?;
+    // The journal checks again at its decision, and its captures carry the
+    // epoch; this also covers requests that changed nothing but publish.
+    held_lease?;
     quota.commit()?;
     if let crate::egress::Route::Supervisor(up) = route
         && !held.is_empty()
@@ -549,7 +573,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                 match serve(&node, &app, &shared, store, svc, job, &mut rx).await {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
-                    Exit::Reset if node.holds(&shared) => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),
+                    Exit::Reset if shared.holds() => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),
                     Exit::Reset => node.metrics.event("lease-lost", &shared.id, "this node no longer holds the object's lease", &shared.context.lock()),
                     Exit::Poisoned(p, detail) => {
                         node.metrics.poison(p);
@@ -604,7 +628,7 @@ async fn serve(
                 };
                 // A node that lost the lease serves nothing more; the proxy
                 // takes the request to the node that has it.
-                if !node.holds(&shared) {
+                if !shared.holds() {
                     let response = crate::table::misdirected(None);
                     crate::telemetry::response(&mut job.span, &response);
                     let _ = job.reply.send(response);

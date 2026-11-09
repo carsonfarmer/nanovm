@@ -423,6 +423,8 @@ impl Journal {
             committed::prepare(&self.volume, &self.dir, &out, &self.obj, cap)?;
         }
         drop(log);
+        // Only while the node holds the object's lease, at the decision.
+        self.obj.lease_epoch()?;
         // Deleting the log is the commit.
         std::fs::remove_file(self.dir.join(LOG))?;
         sync(&self.dir)?;
@@ -757,6 +759,40 @@ mod tests {
                 }
             }
             assert!(finished, "process cut loop did not finish");
+        }
+    }
+
+    /// A version records the epoch of the node's lease, and a node whose
+    /// lease lapsed before the decision can't make it: the change is undone.
+    #[test]
+    fn commits_are_decided_only_under_the_lease() {
+        use crate::lease::{Grant, Session, mono_ns};
+        let session = Arc::new(Session::default());
+        let mut obj = ObjShared::new("app".into(), "o");
+        obj.leases = Some(session.clone());
+        *obj.lease.lock() = Some(Grant { epoch: 7, session: 1, e_tag: None, version: None });
+        let obj = Arc::new(obj);
+        session.set(1, mono_ns() + 60_000_000_000);
+        let (v, cap) = (volume(), CaptureConfig::default());
+        let mut j = Journal::open(&v, 1 << 30, obj.clone(), Some(&cap)).unwrap();
+        change(&mut j, &v);
+        j.commit().unwrap();
+        let mut archive = tar::Archive::new(File::open(v.parent().unwrap().join(format!("~committed/o/{:020}.tar", 1))).unwrap());
+        let version: serde_json::Value = serde_json::from_reader(archive.entries().unwrap().next().unwrap().unwrap()).unwrap();
+        assert_eq!((version["format"].as_u64(), version["epoch"].as_u64()), (Some(2), Some(7)));
+        drop(j);
+        // Without capture, the decision is the only check the journal makes.
+        let w = volume();
+        let before = tree(&w);
+        let mut j = Journal::open(&w, 1 << 30, obj.clone(), None).unwrap();
+        change(&mut j, &w);
+        session.set(1, mono_ns());
+        assert!(j.commit().is_err());
+        drop(j);
+        drop(Journal::open(&w, 1 << 30, obj, None).unwrap());
+        assert_eq!(tree(&w), before, "undone on recovery");
+        for v in [v, w] {
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
         }
     }
 

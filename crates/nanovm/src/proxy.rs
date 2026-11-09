@@ -478,6 +478,28 @@ mod tests {
         assert!(cache.0.lock().len() <= MAX_CACHED);
     }
 
+    /// Every object ranks every node once, the homes spread evenly whatever
+    /// the list's order, and removing a node moves only the objects it was
+    /// home to.
+    #[test]
+    fn rendezvous_moves_only_what_it_must() {
+        let nodes: Vec<String> = (0..4).map(|i| format!("10.0.0.{i}:8080")).collect();
+        let homes = |nodes: &[String]| (0..4000).map(|o| rank(nodes, "app", &format!("o{o}"))[0].to_owned()).collect::<Vec<_>>();
+        let all = homes(&nodes);
+        assert_eq!(rank(&nodes, "app", "o1").len(), 4);
+        assert_eq!(rank(&nodes, "app", "o1"), rank(&nodes, "app", "o1"));
+        for n in &nodes {
+            let share = all.iter().filter(|h| *h == n).count();
+            assert!((800..1200).contains(&share), "{n}: {share}");
+        }
+        let three = homes(&nodes[..3]);
+        for (before, after) in all.iter().zip(&three) {
+            assert!(before == after || *before == nodes[3], "{before} -> {after}");
+        }
+        let shuffled: Vec<String> = [3, 1, 0, 2].iter().map(|&i| nodes[i].clone()).collect();
+        assert_eq!(homes(&shuffled), all, "the list's order doesn't matter");
+    }
+
     /// A record names a tagged repository, one or more identities, and an
     /// optional floor; anything else is refused.
     #[test]
