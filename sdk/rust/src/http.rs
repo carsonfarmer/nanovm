@@ -76,6 +76,19 @@ impl Fetch {
         Ok(Reply { status, headers, body })
     }
 
+    /// Sends the request and returns once the answer's headers arrive, its
+    /// body to be read as it comes ([`Streaming::next`]): to pass a long or
+    /// slow answer on (`Response::stream`) without holding it all.
+    pub async fn stream(self) -> Result<Streaming, ErrorCode> {
+        let response = self.open().await?;
+        let status = response.get_status_code();
+        let headers = response.get_headers().copy_all().into_iter();
+        let headers = headers.map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned())).collect();
+        let (done, result) = wit_future::new(|| Ok(()));
+        let (body, _trailers) = wit::Response::consume_body(response, result);
+        Ok(Streaming { status, headers, body, _done: done })
+    }
+
     /// Sends the request and returns once the answer's headers arrive. Its
     /// body, unread, holds the connection (one of `max_outbound_concurrency`)
     /// until the response is dropped.
@@ -93,6 +106,31 @@ impl Fetch {
         let _ = request.set_authority(Some(authority));
         let _ = request.set_path_with_query(Some(path));
         wasip3::http::client::send(request).await
+    }
+}
+
+/// An answer whose body is read as it arrives ([`Fetch::stream`]).
+pub struct Streaming {
+    pub status: u16,
+    /// Names as the server sent them.
+    pub headers: Vec<(String, String)>,
+    body: wit_bindgen::rt::async_support::StreamReader<u8>,
+    _done: wit_bindgen::rt::async_support::FutureWriter<Result<(), ErrorCode>>,
+}
+
+impl Streaming {
+    /// The body's next piece, as soon as there is one; `None` at its end.
+    /// Dropping the `Streaming` stops reading and frees its connection.
+    pub async fn next(&mut self) -> Option<Vec<u8>> {
+        use wit_bindgen::rt::async_support::StreamResult;
+        loop {
+            let (result, piece) = self.body.read(Vec::with_capacity(16 << 10)).await;
+            match result {
+                StreamResult::Complete(_) if piece.is_empty() => continue,
+                StreamResult::Complete(_) => return Some(piece),
+                _ => return (!piece.is_empty()).then_some(piece),
+            }
+        }
     }
 }
 

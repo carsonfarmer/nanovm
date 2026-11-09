@@ -88,7 +88,8 @@ no need for write-to-temp-then-rename.
   [examples/leaderboard](../../examples/leaderboard) uses it.
 - `config::get(key)`: the manifest's `config` table.
 - `fetch(url).method(..).header(..).body(..).send()`: outbound HTTP to hosts
-  in the manifest's `egress` list.
+  in the manifest's `egress` list; `.stream()` instead reads the answer's
+  body as it arrives (`next()`).
 - `object("lobby").post(path, body).send()`: calls another object of the
   app, through its queue; it commits before it answers.
 - `ws::events(&req)`, `ws::Answer` (`accept`, `subscribe`, `text`, `binary`,
