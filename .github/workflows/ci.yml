@@ -34,6 +34,7 @@ jobs:
             guests -> ../target/guests
             components/keyvalue -> ../../target/keyvalue
             components/sqlite -> ../../target/sqlite
+            components/queue -> ../../target/components
       - name: Prepare host limits
         run: sudo sysctl -w vm.max_map_count=1048576
       - name: Check offline backup tooling
@@ -80,6 +81,11 @@ jobs:
           ulimit -n "$(ulimit -Hn)"
           bash components/keyvalue/build.sh --test-hooks
           env -u RUST_BACKTRACE cargo run --locked -p nanovm --example spin_kv_probe -- --test-hooks
+      - name: Build and test the filesystem components (queue, ...)
+        run: |
+          ulimit -n "$(ulimit -Hn)"
+          bash scripts/build-components.sh
+          env -u RUST_BACKTRACE cargo test --locked -p nanovm --test components -- --ignored
       - name: Pressure test SQLite against the journal
         run: |
           ulimit -n "$(ulimit -Hn)"

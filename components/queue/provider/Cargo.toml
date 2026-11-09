@@ -1,0 +1,13 @@
+[package]
+name = "queue-provider"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+util = { path = "../../../guests/util" }
+wit-bindgen = "0.62"
+futures = { version = "0.3", default-features = false, features = ["std"] }

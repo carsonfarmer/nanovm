@@ -1,0 +1,80 @@
+package nanovm:queue@0.1.0;
+
+/// An append-only log of messages with named consumer positions, stored in
+/// the object's own volume. Every change commits or rolls back with the
+/// request that made it, together with the request's other file, SQL and KV
+/// changes.
+interface log {
+  /// One stored message.
+  record message {
+    /// Its position: the first message ever appended is 0, then +1 each.
+    offset: u64,
+    /// Wall-clock time of the append, in milliseconds since the Unix epoch.
+    timestamp-ms: u64,
+    payload: list<u8>,
+  }
+
+  /// Errors. A call that returns an error has changed nothing.
+  variant error {
+    /// Names are 1-64 ASCII letters, digits, `_` or `-`.
+    invalid-name,
+    /// A message, batch or count is outside the documented bounds.
+    invalid-argument(string),
+    /// The object's disk or file quota is full.
+    full,
+    /// Too many topics are open at once; drop one and retry.
+    table-full,
+    /// An I/O or other implementation error.
+    other(string),
+  }
+
+  /// A named log. Several handles to one name share its state.
+  resource topic {
+    /// Opens a topic. Creates nothing until the first change.
+    open: static async func(name: string) -> result<topic, error>;
+
+    /// Appends 1-4,096 messages of at most 1 MiB each (4 MiB per call), in
+    /// order, and returns the offset of the first. All or none.
+    append: async func(payloads: list<list<u8>>) -> result<u64, error>;
+
+    /// Up to `max-count` (1-1,024) messages from `offset` on, at most 1 MiB of
+    /// payload unless the first message alone is larger. An offset before the
+    /// oldest retained message reads from the oldest; one at or past the end
+    /// returns an empty list.
+    read: async func(offset: u64, max-count: u32) -> result<list<message>, error>;
+
+    /// The oldest retained offset and the offset the next append will get.
+    bounds: async func() -> result<tuple<u64, u64>, error>;
+
+    /// The next offset `consumer` will receive: where it last stopped, or the
+    /// oldest retained message if it has never read or has fallen behind.
+    position: async func(consumer: string) -> result<u64, error>;
+
+    /// Sets `consumer`'s position (at most the end of the log).
+    seek: async func(consumer: string, offset: u64) -> result<_, error>;
+
+    /// Reads like `read` from `consumer`'s position and moves the position
+    /// past what it returns. Both happen in the caller's request: if the
+    /// request fails, the position rolls back and the messages are delivered
+    /// again.
+    next: async func(consumer: string, max-count: u32) -> result<list<message>, error>;
+
+    /// Every consumer and its position, in name order.
+    consumers: async func() -> result<list<tuple<string, u64>>, error>;
+
+    /// Forgets a consumer. Removing an absent one succeeds.
+    remove-consumer: async func(consumer: string) -> result<_, error>;
+
+    /// Drops messages before `before` (at most the end of the log). Storage is
+    /// freed a whole segment (about 1 MiB) at a time.
+    trim: async func(before: u64) -> result<_, error>;
+  }
+}
+
+world provider {
+  export log;
+}
+
+world client {
+  import log;
+}
