@@ -331,6 +331,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
+### N-550 (docs): README understated the memory mappings a worker needs threefold
+- **Where:** README "Host requirements on Linux"; `engine.rs` (`MAPS_PER_OBJECT`, `preflight`)
+- **Scenario:** found by the ops agent. README said about 8 mappings per pool slot (65,530 fits roughly 7,600 objects; 8,000 need 68,352). `preflight` has required `24 × (max_live_objects + 32) + 4096` since `c504f29`: the default 65,530 fits about 2,500 objects, and the demo's 8,000 need 196,864. An operator sizing from README got a worker that refuses to start.
+- **Reproduced:** from source (the arithmetic in `preflight`); the host here has 1,048,576 and is shared, so the default was not tried.
+- **Status:** fixed on `ideas/systemd-units` (README line and `deploy/systemd/90-nanovm.conf`)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
