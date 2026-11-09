@@ -3,9 +3,10 @@
 ## Context
 
 **Current priority (2026-11-08):** offline backup and N-43 are delivered and tested.
-Next is W-9 committed-state capture/transfer and recovery groundwork, then W-10
-placement/fencing. This sequence is not approval of a replication or failover policy.
-Runtime remains 5,085 lines; the under-5k goal is unmet. Historical experiments below
+Next is correcting W-9 capture's rejected write cost, then remote receipt/recovery
+and W-10 fencing. Owner-approved policy is remote durability before success with
+manually authorized, fenced recovery; transport and authority design remain open.
+Runtime is 5,320 lines; the under-5k goal is unmet. Historical experiments below
 are not instructions to restart rejected actor/page-backend rewrites.
 The owner clarified that 5k is a goal, not a hard limit; do not block useful,
 correct core work or pursue a rewrite just to meet it.
@@ -602,6 +603,13 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 
 ## W-9 contract and bounded proof (2026-11-08)
 
+**Performance rejection:** the owner rejects the measured roughly 50% enabled write
+throughput loss; calling capture opt-in does not clear this gate. Amp is profiling
+sync, history-scan/hash and full-copy cost on `w9-efficient-capture`. Preserve the
+crash/rejection tests; measure a replacement against both baseline and full capture,
+including tiny changes to larger volumes. Do not assume fewer copied bytes alone
+will fix the extra durable barriers, and do not remove required barriers.
+
 **Local capture implemented in `b7bf806` (CI 42491417145 passed):** opt-in capture
 runs inside the real journal at both existing commit gates. Stage and sync an immutable full version before
 the undo log's commit marker, then publish it before permitting another mutation.
@@ -675,17 +683,14 @@ prove remote durability. A receiver still needs validated bounds/identity/chain,
 durable ordered receipt, interrupted restore recovery and an explicit authority
 for deciding which history may become writable. No distributed fence exists.
 
-**Next decisions:** retain local-durable acknowledgement with asynchronous transfer,
-or gate responses on a durable remote receipt? Local-only plus asynchronous
-transfer allows loss of acknowledged writes; no bounded RPO follows without a lag
-bound and outage admission policy. Remote gating adds latency and availability
-dependence and needs a chosen receiver failure domain/quorum. Local capture resolves
-neither choice. For a promise that acknowledged writes survive node loss, recommend
-remote durable receipt before success and refusing writes when that receipt is
-unavailable, with manually authorized recovery after fencing the old writer first.
-This is a recommendation for owner approval, not implemented policy. A receiver
-and restore protocol must carry the selected authority/epoch; adding a sequence
-field alone cannot prevent two restored roots from accepting divergent version N+1.
+**Approved durability policy:** the owner requires remote durability before success,
+with recovery manually authorized and fenced. No silent local-only fallback when
+the durable remote receipt is unavailable. Current code does not yet implement this.
+Receiver failure domain/quorum, authentication, ambiguous-outcome handling and the
+authority/epoch mechanism remain to design and validate. A sequence field alone
+cannot prevent two restored roots from accepting divergent version N+1. Network
+latency is a separate cost from avoidable local full-copy/barrier overhead; report
+both rather than using remote latency to excuse the rejected capture cost.
 W-10 must fence storage commits, not merely check a lease before instantiation.
 
 ## Follow-ups

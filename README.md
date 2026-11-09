@@ -15,8 +15,9 @@ Apps are signed artifacts in OCI registries. A proxy finds each host's app in DN
 **Current scope (2026-11-08):** single-node durable acceptance and rejected-request
 rollback, tested offline backup/restore, and opt-in local committed-state capture.
 There is no production remote transfer, remote durability guarantee or automatic
-failover. W-9 receiver/recovery work precedes placement/fencing; acknowledgement/RPO
-policy remains undecided. Runtime is 5,320 lines, above the under-5k goal. Older checkpoint
+failover. The approved target is remote durability before success, with recovery
+manually authorized and fenced; this is not yet implemented. Runtime is 5,320 lines,
+above the under-5k goal. Older checkpoint
 counts and candidate designs below are historical, not current delivery claims.
 The line goal guides simplicity; it is not a hard limit or correctness tradeoff.
 
@@ -28,7 +29,7 @@ accepted but unsent write is lost. This is not a runtime replication feature,
 remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
 gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 
-**Local capture:** optional node `[capture]` configuration
+**Local capture — performance rejected, not recommended for deployment:** optional node `[capture]` configuration
 enables full-volume TAR captures at both dirty commit gates (`max_mb = 256`,
 `max_versions = 16`, per object). Versions are staged before the journal's commit
 decision, then published under `objects/<app>/~committed/<object>/`; recovery
@@ -39,7 +40,8 @@ capture, not continuous replication: no retention, network receiver, restore API
 distributed fence or remote acknowledgement policy is provided. Do not manually
 prune history or disable capture on a root with history. Full copies cost storage
 and write latency: two small-write release probes measured roughly half default
-write throughput. This is not a large-volume performance result. The older JSON
+write throughput. The owner rejected this cost; correcting it is the active core
+priority, not an accepted opt-in tradeoff. This is not a large-volume performance result. The older JSON
 experiment is not a receiver for these TARs. Tests exercise both commit gates,
 process-exit and failed-sync recovery, history exhaustion and SQL/file/KV recovery
 after source-root deletion; these do not certify physical power loss or remote hosts.

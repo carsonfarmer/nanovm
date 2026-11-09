@@ -4,11 +4,22 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## Current state (2026-11-08)
 
+**Owner correction / active work:** the roughly 50% enabled write-throughput loss
+is unacceptable; opt-in does not waive the performance requirement. Amp owns
+`w9-efficient-capture` (journal/capture and associated tests). Profile copy, hash,
+history-scan and sync costs separately before replacing the capture design. Preserve
+the established recovery invariants; do not remove barriers merely to improve numbers.
+The owner has now approved **remote durability before success, with recovery manually
+authorized and fenced**. No acknowledgement-policy question remains. Receiver failure
+domain, protocol and authority implementation still need concrete design and evidence.
+Main integration `59b3783` passed CI 42492425381; that proves its checks, not acceptance
+of its capture performance. Do not build remote replication atop the rejected cost.
+
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
 and is included in this main integration from `w9-atomic-capture`. Bounded, opt-in
 immutable capture now uses the real journal's decision at both commit gates.
-Local acceptance stays local-durable; remote acknowledgement and promotion policy
-are still undecided. W-9 is not complete: production receipt, restoration, retention
+Current implementation acceptance is local-durable; the newly approved remote policy
+is not yet implemented. W-9 is not complete: production receipt, restoration, retention
 and authority/fencing remain. No guest changes, publication or deployment occurred.
 Check the exact main integration head's CI before calling delivery fully verified.
 
@@ -88,10 +99,10 @@ docs-only checkpoint `fed57b1` passed CI 42437123623. W-9 remains unfinished bey
 local capture; no production replication, guest publication or deployment.
 
 **Successor prompt:** Continue W-9 from this current section and PLAN's W-9 contract.
-Keep both response and post-return captures distinct and preserve the recovery
-durability barriers. Verify exact-head main CI, then establish the owner's
-acknowledgement/RPO and recovery-authority policy before
-building a production receiver/restore path. The JSON proof is not a TAR receiver.
+Fix the rejected capture overhead before adding remote transfer. Profile rather than
+assuming copying is the sole cost; keep both gates and recovery barriers correct.
+Remote durability before success and manually authorized, fenced recovery are approved.
+The JSON proof is not a TAR receiver.
 Do not confuse same-host recovery with remote durability or sequence fields with
 fencing. No guest changes, publishing, automatic pruning or promotion.
 
