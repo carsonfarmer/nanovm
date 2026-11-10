@@ -5,7 +5,7 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 - **Reproduced**: shown against the real code or the OS. **From source**: traced through the code, not run.
 - Status: `open`, `fixing`, `fixed in <commit>`, or `deferred: <why>`.
 
-**Current delivery (2026-11-08):** backup/restore and N-43 are delivered through `1e5f18ad`, with passing CI. W-9's bounded committed-version proof is `310c992`, validated by CI 42438468359 and included in main integration; no production runtime files are owned or changed. Runtime remains 5,085; 5k is a simplicity goal, not a hard limit. Both slower actor rewrites remain rejected. Live capture, distributed fencing and automatic failover remain unimplemented. W-5 records remaining lifecycle scope, not the next priority.
+**Current delivery (2026-11-08):** W-9 local capture is implemented in `b7bf806`, passed CI 42491417145 and is included in this main integration. Production remote receipt, restoration, retention and fencing remain open; the next acknowledgement/RPO policy needs owner approval. Runtime is 5,320; 5k is a simplicity goal, not a hard limit. Both slower actor rewrites remain rejected. Backup/restore and N-43 remain delivered, not the next priority. Verify this main integration head's CI; no active runtime file ownership remains after landing.
 
 ## Problems
 
@@ -310,12 +310,49 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** yes: with `memory_mb = 32`, the test probe held 600 maps of 60 KiB, new or copied from a 60 KiB request header (36 MB each way), and a 100 KiB map.
 - **Status:** fixed in 98c1698: a head is at most 64 KiB at every hop (hyper's `max_header_size`, which also bounds trailers; over it a client gets 431), a guest's map at most 64 KiB, and an instance holds at most `memory_mb / 64 KiB` resources (`max_resources` is the lower of the two: 1,024 at 64 MiB, 256 at the counter's 16 MiB). So header maps the host holds for an instance stay within its memory limit, and 64 KiB is twice what nginx accepts by default (four 8 KiB header buffers). `guest_header_maps_are_bounded_by_the_memory_limit` (a test-only probe route) fails without each part.
 
+### N-502: a failed create under a file bricks the object if its request then fails
+- **Where:** `journal.rs` (`recover`, the `Undo::Created` arm; `creating` records the create first)
+- **Scenario:** found by the quality agent's model-based quota test (D-46). A guest creates `d/a` (a file or a directory) where `d` is a file: `creating` records `Created(d/a)` (its `symlink_metadata` fails with ENOTDIR, not NotFound), and the create then fails. If that request fails (an error answer, a trap, CPU, a crash), the next start recovers the log; `symlink_metadata(d/a)` fails with ENOTDIR again, which recovery treated as an error, so the journal refuses to start the object, every time: the object answers 503 `instantiate-failed` (`Not a directory`) for good. Any app that creates paths from request data can be bricked by a client who makes it create under a file and then fail.
+- **Reproduced:** yes: `quota_usage_always_matches_the_model` shrank it to two requests (commit an empty file `d`; then `mkdir d/a` in a request that fails); `a_failed_create_under_a_file_rolls_back` fails without the fix (`recovery succeeds: NotADirectory`).
+- **Fix:** recovery treats NotADirectory like NotFound for a `Created` record: nothing can be there, so the create never happened. One line; also repairs logs already written.
+- **Status:** fixed in 6fdb057 (recovery); the class is closed on `ideas/recover-class`: `creating` and `removing_dir` refuse what they can't name instead of recording it (see N-503, N-504)
+
+### N-503: a failed create of an over-long name bricks the object if its request then fails
+- **Where:** `journal.rs` (`creating`, `recover`)
+- **Scenario:** found by the quality agent's second hostile guest (D-58). The N-502 class with another errno: a 256-byte name fails `symlink_metadata` with ENAMETOOLONG, is recorded as `Created`, the create fails, and a failed request leaves recovery failing on every start (503 `instantiate-failed`, `File name too long`). Any app that names files from request data can be bricked by a long name and a failing request.
+- **Reproduced:** yes (`unusual_names_commit_and_roll_back` on `ideas/hostile2`; `logs_naming_impossible_paths_recover` and `random_path_shapes_always_roll_back` fail without the fix).
+- **Fix:** see N-504.
+- **Status:** fixed on `ideas/recover-class`
+
+### N-504: a directory chain deeper than PATH_MAX bricks the object
+- **Where:** `journal.rs` (`creating`, `removing_dir`, `renaming`, `recover`)
+- **Scenario:** found by the second hostile guest (D-58). A guest reaches any depth by opening each directory from its parent's descriptor; the journal names entries by absolute path. Creating a directory whose path reaches PATH_MAX (16 levels of 255-byte names under a 72-byte volume path) was recorded, made, then failed the commit (`File name too long`) and every later recovery: the object answered 503 `instantiate-failed` for good. A directory renamed under a deep one could also move what is under it out of the journal's reach.
+- **Reproduced:** yes (`/deep` on `ideas/hostile2`: depths 12-15 commit and roll back; 16-20 brick the object).
+- **Fix (one class with N-502, N-503):** `creating` and `removing_dir` record only when `symlink_metadata` says NotFound (or, for `removing_dir`, a directory); any other error is returned, so the guest gets the error the syscall would give (`not-directory`, `name-too-long`) and nothing is recorded. Returning rather than recording nothing: for a whole path too long for the journal but not for the guest's descriptor, the create would succeed out of the journal's reach. `renaming` refuses a move that would put anything under it at PATH_MAX or more (walking a moved directory, at most `max_files` entries). Recovery treats path-shape errors (NotFound, NotADirectory, ENAMETOOLONG, and ELOOP) as "nothing there" for every record, repairing logs already written; real I/O errors stay fatal.
+- **Status:** fixed on `ideas/recover-class`
+
+
+### N-551: a supervisor running as pid 1 (a container without an init) starts no worker
+- **Where:** `jail.rs` (`Jail::enter`: `ensure!(getppid() != 1, "supervisor exited")`)
+- **Scenario:** found by the ops agent building the container image. A worker took "my parent is pid 1" to mean its supervisor had died before `PR_SET_PDEATHSIG` was armed. In a container without `--init`, or a Kubernetes pod, the supervisor *is* pid 1, so every worker refused to start (`502 worker-down`, worker's last words `entering the jail: supervisor exited`). The check also passed wrongly under a child subreaper, which adopts orphans instead of pid 1.
+- **Reproduced:** yes, `deploy/container/test/local.sh` ("as PID 1, workers start" fails before the fix).
+- **Fix:** the supervisor puts its pid in the worker's spec, and the worker compares `getppid()` with it. +2 runtime lines.
+- **Status:** fixed on `ideas/container-image`
+
+### N-552: a binary replaced under a running supervisor starts workers of the new version
+- **Where:** `main.rs`/`supervisor.rs` (`Supervisor::new(cfg, std::env::current_exe()?, …)`; `start` spawns `self.exe`)
+- **Scenario:** found by the ops agent writing the upgrade runbook. The supervisor resolved its executable's path once at start and spawned every worker from that path. Installing a new binary (`install`, `mv`, a package manager's upgrade before its restart) while the node ran made new workers the new version under the old supervisor; their private spec or link protocol can differ.
+- **Reproduced:** yes, `docs/ops/drills/binary-swap.sh` with builds before and after N-551: the running app kept serving, a new app got `502 worker-down` (`worker spec: invalid length 3, expected a tuple of size 4`).
+- **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
+- **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
+
 ### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
 - **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
 - **Scenario:** found by the quality agent while writing D-52. The node's linker defines every WASIp2 interface, including `wasi:filesystem@0.2` and `wasi:sockets@0.2`, and the WASIp2 filesystem shares the `WasiCtx`'s read-write preopens. A guest using `std::fs` links (`instantiate_pre` succeeds). Today `ALLOWED_IMPORTS` refuses it at load, by name, so nothing is exploitable; but that check is the single layer between a guest and writes to `/data` that bypass the quota and the journal (no rollback). Sockets have a second layer (wasmtime's default address check denies every address).
 - **Reproduced:** yes (`components_importing_refused_interfaces_are_rejected_by_name`: `p2_filesystem` and `p2_sockets` link against `app::linker`; with `check_imports` disabled, `p2_sockets was loaded`).
 - **Suggestion:** link only the WASIp2 interfaces `ALLOWED_IMPORTS` permits (io, clocks, random, cli), so a regression in the allowlist fails at link time instead of opening `/data`. Defense in depth, not a bug.
 - **Status:** open (test on `ideas/deploy-validation`)
+
 
 ## Planned work
 
@@ -405,9 +442,10 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-9: ordered committed-state transfer and recovery
 - **What:** capture immutable committed content and namespace state before later mutations, transfer ordered versions and recover without the original root. The undo journal is not a replication feed. Survey Litestream, LiteFS and Durable Objects before choosing machinery.
-- **Status:** in progress, Amp on `w9-committed-state`. Bounded first slice: storage-only capture/transfer/recovery proof using the real journal, without changing runtime acceptance. Acknowledgement/RPO, production capture atomicity, remote transport/durability and failover policy remain unresolved. Offline backup is complete, not this work's objective.
+- **Status:** in progress; bounded local capture done in `b7bf806` and included in main integration. Pending publication recovers before further writes. Local acknowledgement remains unchanged; remote receipt, recovery authority, retention and failover policy remain unresolved. Offline backup is complete, not this work's objective. No active file claim after local capture delivery.
 - **Evidence:** example tests and separate executable drill pass: ordered/idempotent receipt, immutable response/post-return versions, exact file/namespace recovery after source deletion, rejected mutation rollback, receiver process-exit cuts and continued local writes after recovery. Four guard-removal mutations fail and are restored. An unsent locally accepted write is deliberately absent on recovery. Same-host roots/processes do not establish remote durability; full local suite retains N-32 failures. Review found no blocker for the disclosed research scope, not production integration.
-- **Delivery:** bounded proof done in `310c992`, CI 42438468359 passed the full suite and SQL/KV checks. W-9 stays open for crash-atomic source capture and runtime integration; no active file ownership after main integration.
+- **Runtime candidate evidence:** streaming TAR snapshots share the journal decision; 14 commit/publication and 28 rollback sync-error/process-exit cuts pass. Response/post-return separation, jailed-worker restart, bounds and SQL/file/KV recovery without the original root pass. Four mutations (discard, publication recovery, byte cap, version cap) fail and are restored. Review found missing recovery durability barriers; two regressions fail before correction and pass after, with no remaining review blocker. Full serial suite passes 105 unit/69 integration/two proof tests, plus all 11 SQL tests; this passing run does not fix historical N-32 intermittency. No physical-power-loss or remote-durability claim.
+- **Delivery:** bounded proof done in `310c992`, CI 42438468359 passed; runtime capture done in `b7bf806`, CI 42491417145 passed. Restored full suite/SQL checks and demo pass; measured full-copy write cost and noisy default benchmark controls are recorded in HANDOFF. Verify exact-head main integration CI. No production receiver, retention/GC, restore API or promotion authority is delivered by local capture.
 
 ### W-10: groundwork for many nodes
 - **What:** a lease hook before instantiation in `table.rs` (always granted on one node), an epoch carried by each commit, request ids so the proxy can retry safely. Placement belongs in the proxy.

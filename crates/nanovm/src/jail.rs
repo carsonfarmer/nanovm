@@ -10,6 +10,8 @@ use std::path::PathBuf;
 pub struct Jail {
     /// Run as this uid and gid (set when the supervisor is root).
     pub uid: Option<u32>,
+    /// The supervisor's pid: the worker's parent for as long as it lives.
+    pub parent: u32,
     pub read_write: Vec<PathBuf>,
     pub read_only: Vec<PathBuf>,
 }
@@ -38,10 +40,11 @@ impl Jail {
                 ensure!(libc::setresuid(id, id, id) == 0, "setresuid({id}) failed");
             }
             // Changing uid clears the parent-death signal, so it is set here
-            // rather than before exec; a supervisor already gone means init
-            // adopted us.
+            // rather than before exec; a supervisor already gone means a
+            // reaper adopted us. By pid: in a container the supervisor may
+            // itself be pid 1.
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            ensure!(libc::getppid() != 1, "supervisor exited");
+            ensure!(libc::getppid() as u32 == self.parent, "supervisor exited");
         }
 
         // Built by hand: the crate's `path_beneath_rules` silently skips a
@@ -137,6 +140,9 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_getdents64,
         libc::SYS_mkdirat,
         libc::SYS_unlinkat,
+        // Publish a committed capture without dropping its durable staged name.
+        // Landlock still confines both names; WASI hard links remain refused.
+        libc::SYS_linkat,
         libc::SYS_renameat2,
         libc::SYS_readlinkat,
         libc::SYS_ftruncate,
@@ -155,6 +161,7 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_renameat,
         // std's remove_file, remove_dir and read_link on x86_64 glibc.
         libc::SYS_unlink,
+        libc::SYS_link,
         libc::SYS_rmdir,
         libc::SYS_readlink,
     ]);
