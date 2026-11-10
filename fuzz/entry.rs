@@ -139,7 +139,7 @@ pub fn app_ref(data: &[u8]) {
         assert!(!issuer.is_empty() && !subject.is_empty());
         assert!(!format!("{issuer}{subject}").contains([',', ' ', '\t']), "{issuer:?} {subject:?}");
     }
-    // A host starting with `.` gives a name starting with `.` (N-503: only
+    // A host starting with `.` gives a name starting with `.` (N-506: only
     // the proxy sets the host, from a DNS owner name, which can't).
     let name = r.name();
     assert!(crate::table::valid_name(&name) || r.host.starts_with('.'), "app name {name:?} from {r:?}");

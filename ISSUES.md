@@ -346,6 +346,18 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
+### N-506: a `nanovm-host` starting with `.` gives an app name that isn't a valid name
+- **Where:** `registry.rs` (`app_name`)
+- **Scenario:** found by the quality agent's `app_ref` fuzz target (D-45). `app_name` keeps the readable part of `"{host} {registry}/{repository}"` as is, so a host of `.com` makes `.com_docker.io_…-<hash>`, which `table::valid_name` refuses (names don't start with `.`). It is still one path component (no `/`, never `.` or `..`), so nothing escapes; only the proxy sets the host, from a DNS owner name, which can't start with `.`.
+- **Reproduced:** yes (fuzz input in `fuzz/seeds.py`).
+- **Status:** open, low: map a leading `.` to `_` in the readable part if names must stay valid.
+
+### N-507: the proxy accepts a TXT trust identity with a comma that the node then refuses
+- **Where:** `proxy.rs` (`parse`), `registry.rs` (`AppRef::from_headers` splits `nanovm-trust` on commas)
+- **Scenario:** found by the `txt_record` fuzz target (D-45) within seconds. `trust=https://a,b s` was accepted and sent as `nanovm-trust`; the node split it on the comma and refused every request for the host (502), instead of the record being refused. A comma can never yield a different valid policy at the node, so this is availability only.
+- **Reproduced:** yes (`accepted_records_are_policies_the_node_accepts` fails without the fix).
+- **Status:** fixed on `ideas/fix-trust-comma` (bd058de): the proxy refuses a trust field containing a comma.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

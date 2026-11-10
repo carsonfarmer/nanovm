@@ -61,7 +61,7 @@ SEEDS = {
     "app_ref": [
         f"ghcr.io/org/app@{DIGEST}\xffhttps://i s1, https://i s2\xff1.2.0\xffexample.com".encode("latin-1"),
         f"localhost:5000/x/y@{DIGEST}\xffdev dev".encode("latin-1"),
-        # Found by fuzzing: a host starting with `.` (N-503).
+        # Found by fuzzing: a host starting with `.` (N-506).
         f"ghgppar/o@{DIGEST}\xffhttps://i s1\xff1.2.0\xff.com".encode("latin-1"),
     ],
     "journal_log": [
