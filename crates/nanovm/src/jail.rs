@@ -217,8 +217,10 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
     )?)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
+    #![cfg(target_os = "linux")]
+
     /// Run as a child (this test binary again, with `NANOVM_SECCOMP_CHILD`):
     /// installs the worker's filter on this thread and checks what it refuses.
     #[test]
