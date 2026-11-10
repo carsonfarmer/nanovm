@@ -399,7 +399,8 @@ async fn nanovm_publish_pushes_what_a_node_loads() {
     let app = nanovm::registry::AppRef::from_headers(&headers).unwrap().unwrap();
     let data = data_dir("publish");
     let pulled = nanovm::registry::Registry::new(data.join("registry"), 64 << 20, true).unwrap().load(&app).await.unwrap();
-    assert_eq!((pulled.wasm, pulled.version.to_string()), (std::fs::read(&hello).unwrap(), "1.2.3".into()));
+    let pulled_wasm = std::fs::read(&pulled.component.1).unwrap();
+    assert_eq!((pulled_wasm, pulled.version.to_string()), (std::fs::read(&hello).unwrap(), "1.2.3".into()));
     assert_eq!((pulled.spec.limits.disk_mb, pulled.spec.limits.max_files), (16, 1000), "the manifest is its config");
     let cfg = nanovm::config::NodeConfig { data_dir: data, max_live_objects: 8, memory_reservation_mb: 64, ..Default::default() };
     let spec = pulled.spec;
