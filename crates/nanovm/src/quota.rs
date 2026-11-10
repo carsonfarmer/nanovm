@@ -252,6 +252,9 @@ impl Inner {
             .and_then(|()| f(&mut self.journal))
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::StorageFull => self.full(),
+                // A path the journal refuses (`Journal::creating`), as the syscall would.
+                std::io::ErrorKind::NotADirectory => ErrorCode::NotDirectory,
+                std::io::ErrorKind::InvalidFilename => ErrorCode::NameTooLong,
                 _ => ErrorCode::Io,
             })
     }
