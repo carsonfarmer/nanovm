@@ -507,7 +507,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-622: `docs` cold starts cost a scan of the whole log
 - **What:** the first call after an instance starts reads the collection's log and parses every document if it has indexes: 26-39 ms CPU for 10,000 documents with one index (10-14 ms without, 0.5 ms for a request that doesn't open it), charged to that request. At the default `cpu_ms` of 200 that caps a collection near 50,000 documents; text and vector indexes add to it.
-- **Design:** write a snapshot (keydir offsets and index keys, a Bitcask "hint" file) whenever the log is compacted, and on load read the snapshot plus the log's tail past it; or store each put record's index keys so loading needs no JSON parse. Component-only change.
+- **Design:** write a snapshot (keydir offsets and index keys, a Bitcask "hint" file) whenever the log is compacted, and on load read the snapshot plus the log's tail past it; or store each put record's index keys so loading needs no JSON parse. Component-only change. Tried and dropped: skipping the body copy when loading without indexes measured no difference (no-index cold start 11.7-13.6 ms before vs 12.1-13.5 ms after, three alternating rounds), so that part of the cost is the keydir and the reads, not copies.
 - **Status:** open
 
 ### W-623: an approximate vector index (HNSW) for `docs`

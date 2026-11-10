@@ -178,3 +178,18 @@ again restored.
   session store by calling its object.
 - No component can wait for another request (one request at a time per
   object): a queue consumer polls, it doesn't block.
+
+## A trap in this environment's warm builds (for whoever runs the suite)
+
+The hardlinked warm `target/` this worktree started with held nanovm test and
+example binaries built in *other* worktrees (`/home/user/wt/next`,
+`wt/tooling`, `wt/ops`: see the first line of each `target/debug/deps/*.d`).
+Cargo judged them fresh, and they bake in that worktree's paths
+(`CARGO_BIN_EXE_nanovm`, `CARGO_MANIFEST_DIR`), so `cargo test` here ran
+`wt/next`'s integration binary against `wt/next`'s current `nanovm` binary
+and guests: 22 jailed-worker tests failed with `worker-down` (Broken pipe),
+because that binary had moved on. Removing those units' fingerprints
+(`target/debug/.fingerprint/nanovm-<hash>`) and this worktree's links to
+their outputs made cargo rebuild them from this worktree, after which the
+full locked suite passed (110 unit, 70 integration, 2 example tests). Other
+worktrees made the same way may be testing someone else's code.
