@@ -215,6 +215,7 @@ That is the repository and the tag deployed, each identity whose signature is ac
 - drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards HTTP requests; it holds WebSockets itself and forwards their events;
 - speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
 - gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too);
+- makes a client keep sending a request's body: it may keep the proxy waiting 10 s in all, plus a second for every 4 KiB it sends, or gets a 408 (`body-timeout`) and its connection is closed. A body trickled a byte at a time is cut after about 10 s; an upload at 4 KiB/s or faster never is. The node applies the same rule as it reads a body, so a client that reaches it directly is held to it too;
 - refuses a request head over 64 KiB (431), as every hop does (node, worker links, egress responses).
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.

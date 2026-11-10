@@ -34,9 +34,7 @@ use crate::object::{RespBody, error_response};
 use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
 use crate::ws::{self, Sockets};
 
-/// How long a client may take over each request's headers (or idle between
-/// requests).
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::server::CLIENT_TIMEOUT;
 
 /// What `_nanovm.<host>` says.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +102,7 @@ impl<T: Clone> Cache<T> {
     }
 }
 
-pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
+pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, crate::object::BoxError>;
 
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> anyhow::Result<Arc<Proxy>> {
@@ -177,14 +175,17 @@ impl Proxy {
         parts.uri = format!("http://{}{pq}", self.cfg.node).parse().map_err(|_| (StatusCode::BAD_REQUEST, pq.to_string()))?;
 
         if upgrading {
-            return Ok(self.socket(name, host, Request::from_parts(parts, body.boxed_unsync())).await);
+            let req = Request::from_parts(parts, body.map_err(Into::into).boxed_unsync());
+            return Ok(self.socket(name, host, req).await);
         }
         parts.headers.extend(headers);
-        let res = self
-            .node
-            .request(Request::from_parts(parts, body.boxed_unsync()))
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        // The node cuts a slow body too; this holds even if it doesn't.
+        let req = Request::from_parts(parts, crate::server::Paced::new(body).boxed_unsync());
+        let res = match self.node.request(req).await {
+            Ok(res) => res,
+            Err(e) if crate::server::timed_out(&e) => return Ok(crate::server::body_timeout()),
+            Err(e) => return Err((StatusCode::BAD_GATEWAY, e.to_string())),
+        };
         Ok(res.map(|b| b.map_err(Into::into).boxed_unsync()))
     }
 

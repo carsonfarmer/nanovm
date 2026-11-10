@@ -3545,6 +3545,92 @@ async fn the_proxy_outlasts_idle_and_excess_connections() {
     assert!(took >= Duration::from_secs(9), "{took:?}");
 }
 
+/// Sends `head`, then the `len` bytes of body its Content-Length promised,
+/// `chunk` bytes every `every`, while reading the answer. Returns its
+/// status and body (what arrived before any reset) and when it came.
+async fn trickle(addr: std::net::SocketAddr, head: String, len: usize, chunk: usize, every: Duration) -> (u16, String, Duration) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut rx, mut tx) = tokio::net::TcpStream::connect(addr).await.unwrap().into_split();
+    let t0 = Instant::now();
+    tx.write_all(head.as_bytes()).await.unwrap();
+    let writer = tokio::spawn(async move {
+        for sent in (0..len).step_by(chunk) {
+            if tx.write_all(&vec![b'x'; chunk.min(len - sent)]).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(every).await;
+        }
+        std::future::pending::<()>().await;
+    });
+    let mut out = Vec::new();
+    let read = async {
+        let mut buf = [0; 4096];
+        while let Ok(n @ 1..) = rx.read(&mut buf).await {
+            out.extend_from_slice(&buf[..n]);
+        }
+    };
+    let ended = tokio::time::timeout(Duration::from_secs(40), read).await;
+    let took = t0.elapsed();
+    assert!(ended.is_ok(), "{addr}: still open after {took:?}: {:?}", String::from_utf8_lossy(&out));
+    writer.abort();
+    let text = String::from_utf8_lossy(&out).to_string();
+    let status = text.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (status, text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default(), took)
+}
+
+/// A client trickling a request body (a byte every 200 ms) holds nothing for
+/// long at any entry point (an in-process node, the supervisor, the proxy,
+/// and a proxy whose node never reads): after about `CLIENT_TIMEOUT` it is
+/// answered 408 `body-timeout` and its connection is closed. An upload sent
+/// steadily at 8 KiB/s through the proxy takes longer than that and is not
+/// cut (N-505).
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_request_bodies_are_cut_at_every_entry_point() {
+    let node = node("slow_bodies", "counter", 8);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let direct = listener.local_addr().unwrap();
+    let n = node.clone();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| nanovm::server::handle(n.clone(), req)));
+    let (_sup, sup) = supervised("slow_bodies_supervised").await;
+    let counter = publish("counter", &app("counter")).await;
+    let records = Arc::new(parking_lot::Mutex::default());
+    let proxy = proxied(sup, doh(records.clone()).await).await;
+    let tagged = format!("{}:latest", counter.split_once('@').unwrap().0);
+    records.lock().insert("_nanovm.slow.test".to_string(), vec![format!("app={tagged}; trust=dev dev")]);
+    let entries = [(direct, String::new()), (sup, names(&counter)), (proxy, String::new())];
+    let head = |extra: &str, method: &str, path: &str, len: usize| {
+        format!("{method} {path} HTTP/1.1\r\nHost: slow.test\r\n{extra}Content-Length: {len}\r\n\r\n")
+    };
+    // Ordinary uploads first, which also start the worker.
+    for (addr, extra) in &entries {
+        let (status, body) = raw(*addr, &head(extra, "PUT", "/a/kv/k", 5).replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"), b"hello").await;
+        assert_eq!(status, 204, "{addr}: {body}");
+    }
+    // A node that takes requests and never reads them: the proxy's own rule.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let deaf = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::server::serve_http1(listener, |req: http::Request<hyper::body::Incoming>| async move {
+        let _held = req;
+        std::future::pending().await
+    }));
+    let entries = [&entries[..], &[(proxied(deaf, doh(records.clone()).await).await, String::new())]].concat();
+    let slow = entries.iter().map(|(addr, extra)| tokio::spawn(trickle(*addr, head(extra, "PUT", "/a/kv/k", 1000), 1000, 1, Duration::from_millis(200))));
+    let steady = tokio::spawn(trickle(proxy, head("", "PUT", "/a/kv/big", 128 << 10), 128 << 10, 1024, Duration::from_millis(125)));
+    for (s, (addr, _)) in slow.collect::<Vec<_>>().into_iter().zip(&entries) {
+        let (status, body, took) = s.await.unwrap();
+        eprintln!("{addr}: {status} after {took:?}");
+        assert_eq!(status, 408, "{addr}: {body}");
+        assert!(body.contains("body-timeout"), "{addr}: {body}");
+        let limit = nanovm::server::CLIENT_TIMEOUT;
+        assert!(took >= limit && took < limit + Duration::from_secs(3), "{addr}: {took:?}");
+    }
+    let (status, body, took) = steady.await.unwrap();
+    assert_eq!(status, 204, "{body}");
+    assert!(took > Duration::from_secs(15), "{took:?}");
+    let (status, body) = raw(proxy, "GET /a/kv/big HTTP/1.1\r\nHost: slow.test\r\nConnection: close\r\n\r\n", b"").await;
+    assert_eq!((status, body.len()), (200, 128 << 10));
+}
+
 /// Hop-by-hop headers, and the ones a client's `Connection` lists, stay on
 /// the client's connection; the rest reach the node.
 #[tokio::test(flavor = "multi_thread")]
