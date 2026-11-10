@@ -419,7 +419,9 @@ impl Journal {
     /// Makes the request's changes durable and forgets how to undo them.
     pub fn commit(&mut self) -> std::io::Result<()> {
         self.check()?;
-        let Some(log) = self.log.take() else { return Ok(()) };
+        // With nothing to commit, the lease still decides whether its
+        // publishes go out.
+        let Some(log) = self.log.take() else { return self.obj.lease_epoch().map(drop) };
         // Any error leaves the outcome uncertain. In particular, taking the
         // log must not make a second commit look like an empty successful one.
         self.poisoned = true;
@@ -432,6 +434,8 @@ impl Journal {
             committed::prepare(&self.volume, &self.dir, &out, &self.obj, cap)?;
         }
         drop(log);
+        // Only while the node holds the object's lease, at the decision.
+        self.obj.lease_epoch()?;
         // Deleting the log is the commit.
         std::fs::remove_file(self.dir.join(LOG))?;
         sync(&self.dir)?;
@@ -801,6 +805,43 @@ mod tests {
                 }
             }
             assert!(finished, "process cut loop did not finish");
+        }
+    }
+
+    /// A version records the epoch of the node's lease, and a node whose
+    /// lease lapsed before the decision can't make it: the change is undone.
+    #[test]
+    fn commits_are_decided_only_under_the_lease() {
+        use crate::lease::{Grant, Session, mono_ns};
+        let session = Arc::new(Session::default());
+        let mut obj = ObjShared::new("app".into(), "o");
+        obj.leases = Some(session.clone());
+        *obj.lease.lock() = Some(Grant { epoch: 7, session: 1, e_tag: None, version: None });
+        let obj = Arc::new(obj);
+        session.set(1, mono_ns() + 60_000_000_000);
+        let (v, cap) = (volume(), CaptureConfig::default());
+        let mut j = Journal::open(&v, 1 << 30, obj.clone(), Some(&cap)).unwrap();
+        change(&mut j, &v);
+        j.commit().unwrap();
+        let mut archive = tar::Archive::new(File::open(v.parent().unwrap().join(format!("~committed/o/{:020}.tar", 1))).unwrap());
+        let version: serde_json::Value = serde_json::from_reader(archive.entries().unwrap().next().unwrap().unwrap()).unwrap();
+        assert_eq!((version["format"].as_u64(), version["epoch"].as_u64()), (Some(2), Some(7)));
+        drop(j);
+        // Without capture, the decision is the only check the journal makes.
+        let w = volume();
+        let before = tree(&w);
+        let mut j = Journal::open(&w, 1 << 30, obj.clone(), None).unwrap();
+        change(&mut j, &w);
+        session.set(1, mono_ns());
+        assert!(j.commit().is_err());
+        let x = volume();
+        assert!(Journal::open(&x, 1 << 30, obj.clone(), None).unwrap().commit().is_err(),
+            "nothing changed, but nothing may be published either");
+        drop(j);
+        drop(Journal::open(&w, 1 << 30, obj, None).unwrap());
+        assert_eq!(tree(&w), before, "undone on recovery");
+        for v in [v, w, x] {
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
         }
     }
 

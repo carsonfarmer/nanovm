@@ -388,6 +388,26 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** the provider denies every `PRAGMA` but `integrity_check`, and the authorizer also sees the statements SQLite's own modules prepare: FTS5 asks `PRAGMA main.data_version` (FTS3/4 and R-Tree ask `page_size`), so `CREATE VIRTUAL TABLE … USING fts5` and every write to one failed with `access-denied`, although the bundled SQLite has FTS5 compiled in (found by `examples/notes`).
 - **Status:** fixed on `ideas/examples`: the two read-only pragmas (no value) are allowed; setting pragmas stays denied (the SQLite experiment's policy test, which checks `journal_mode=WAL` and `synchronous=OFF`, is unchanged). `notes_search_their_own_full_text_index` fails with `Error::AccessDenied` without it.
 
+### N-180: a cycle of calls closed through waits on two other nodes is ended by the timeout, not refused
+- **Where:** `table.rs` (`wait_for`, `dispatch`), with leases
+- **Scenario:** a call carries its callers, so a node refuses (508) any cycle along one chain of calls, and any whose waits are recorded on that node. Concurrent requests whose waits are recorded on two or more other nodes (x on A waits on y on B, y waits on z on C, z calls x) can still close a cycle: it holds until the request timeout. Found while building W-10.
+- **Status:** open; refusing it needs a wait graph shared between nodes (owner's call: notes/multinode.md)
+
+### N-181: with leases, the lease store is a hard dependency of every node
+- **Where:** `lease.rs`
+- **Scenario:** a node that can't renew its session for 7/8 of `lease_ms` stops serving all its objects; if the store is unreachable from every node, the whole cluster stops after `lease_ms`, and new objects can't be placed meanwhile (the proxy retries for `failover_ms`, then 503). Inherent to lease fencing (etcd and Consul behave alike); S3's availability bounds the cluster's.
+- **Status:** open, owner's call (notes/multinode.md)
+
+### N-182: with more than one node, the proxy buffers each request body to retry it
+- **Where:** `proxy.rs` (`send`)
+- **Scenario:** to send a request again after a 421 or to the next node, the proxy holds its body, up to `max_request_body_kb` (1 MiB), per request in flight; one node still streams. Adds to what W-35 bounds.
+- **Status:** open (with W-35)
+
+### N-183: each instantiation with leases costs a store round trip
+- **Where:** `lease.rs`, `object.rs` (`run`)
+- **Scenario:** an object's actor takes its lease (a read and a conditional write) before instantiating and releases it (a write) when it exits, so a cold start waits on the store (tens of ms on S3) and LRU churn costs three store requests per instantiation.
+- **Status:** open; W-91 would keep released leases for a while
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -483,7 +503,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-10: groundwork for many nodes
 - **What:** a lease hook before instantiation in `table.rs` (always granted on one node), an epoch carried by each commit, request ids so the proxy can retry safely. Placement belongs in the proxy.
-- **Status:** open, after W-9 capture/recovery evidence and explicit acknowledgement/fencing decisions; not authorized by adding an epoch field alone.
+- **Status:** done on `cf/multinode` (multinode agent): the proxy places objects on `nodes` by rendezvous hashing and follows 421s; nodes take leases with rising epochs from an object store (conditional writes; `object_store`, S3 and compatibles), renew one session record each, refuse and evict what they lost, and refuse commits without the lease (`Node::lease_epoch`); calls between objects go through the proxy with their callers. No request ids are needed: the proxy retries only refusals that ran nothing. Failover, a lost node's late commit and cross-node calls are tested; see `notes/multinode.md`. The epoch is not yet part of W-9's committed versions (W-90), and data does not move between nodes until W-9's stream does.
 
 ### W-11: run requests that don't write in parallel
 - **What:** stateless routes on any node, and read-only requests on read replicas of an object. On one node, a reader beside the writer would see uncommitted data (the undo journal writes in place), so replicas need committed state: a snapshot, or W-9's change records. Whether a request writes isn't known in advance, so routes would be declared read-only, with `/data` mounted read-only to enforce it.
@@ -576,3 +596,11 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-602: tell an object who is calling it
 - **What:** a call between objects (`http://nanovm/objects/{id}/…`) reaches its target as an ordinary request, so an object can't tell its app's own calls from a client's, and every route meant for other objects is public (`examples/tictactoe`'s `/join`, `examples/chat`'s `/rooms/…`); apps must write them defensively. The host could set a header naming the calling object on calls and strip it from every request that enters from outside (the node's front door and the worker link), so an object could keep internal routes. It is a security property of every entry path (`server.rs`, `egress.rs`, the worker link), so it is for their owners.
 - **Status:** open
+
+### W-90: carry W-10's epoch in W-9's committed versions, fenced at the store
+- **What:** name each committed version `(app, object, epoch, seq)` from `Node::lease_epoch` (the line before `quota.commit()` in `object::commit`), and make the write that makes a version durable off the node conditional on the object's lease record (`If-Match` the version the grant, or the last commit, produced), so a node that lost the lease mid-commit can't publish a version. A taker restores up to the head it found. Contract in `notes/multinode.md`.
+- **Status:** open, for the storage agent with W-9
+
+### W-91: keep a released lease for a while
+- **What:** an evicted object's node keeps its lease (it is in the node's session anyway) for a grace period after the instance goes, then releases it, so a cold start within the period skips the store (N-183). Meanwhile another node gets 421 and the proxy sends the request back to the holder, which is the object's home anyway unless the node list changed.
+- **Status:** open (proposal)

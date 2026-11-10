@@ -42,6 +42,8 @@ pub struct Job {
     pub enqueued: Instant,
     pub context: opentelemetry::Context,
     pub span: crate::telemetry::Span,
+    /// For a call, the objects waiting on it (see `egress::CALLERS`).
+    pub callers: Vec<Arc<str>>,
 }
 
 #[repr(u8)]
@@ -85,6 +87,11 @@ pub struct ObjShared {
     lane: Mutex<Option<OwnedSemaphorePermit>>,
     /// The objects its calls are waiting on, one entry per call.
     pub waiting_on: Mutex<Vec<Arc<str>>>,
+    /// The objects waiting on its request, while they do.
+    pub callers: Mutex<Vec<Arc<str>>>,
+    /// With more than one node, its node's session, and lease on it.
+    pub leases: Option<Arc<crate::lease::Session>>,
+    pub lease: Mutex<Option<crate::lease::Grant>>,
     pub context: Mutex<opentelemetry::Context>,
 }
 
@@ -98,6 +105,28 @@ impl ObjShared {
             since_ns: now.into(),
             poll_start_ns: now.into(),
             ..Default::default()
+        }
+    }
+
+    /// Whether its node may serve it and commit its changes: with one node
+    /// always, else while it holds the object's lease in its current session.
+    pub fn holds(&self) -> bool {
+        self.leases.as_ref().is_none_or(|s| self.lease.lock().as_ref().is_some_and(|g| s.holds(g)))
+    }
+
+    /// Whether it had a lease that its node no longer holds.
+    pub fn lost(&self) -> bool {
+        self.leases.as_ref().is_some_and(|s| self.lease.lock().as_ref().is_some_and(|g| !s.holds(g)))
+    }
+
+    /// The epoch of its node's lease on it, which its committed versions
+    /// carry; an error once the node no longer holds it, so a node that lost
+    /// the object can't commit (W-10). 0 with one node.
+    pub fn lease_epoch(&self) -> std::io::Result<u64> {
+        let Some(s) = &self.leases else { return Ok(0) };
+        match &*self.lease.lock() {
+            Some(g) if s.holds(g) => Ok(g.epoch),
+            _ => Err(std::io::Error::other("this node no longer holds the object's lease")),
         }
     }
 
@@ -454,12 +483,15 @@ enum Exit {
 }
 
 /// Makes the request's changes durable, then sends what it published (the
-/// changes stand whether or not a publish gets through).
+/// changes stand whether or not a publish gets through). Only while the node
+/// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
     let (quota, held, route, node) = acc.with(|mut s| {
         let s = s.data_mut();
         (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.hooks.node.clone())
     });
+    // Only while the node holds the object's lease (see `Journal::commit`):
+    // otherwise neither its changes nor its publishes go out.
     quota.commit()?;
     if !held.is_empty() {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
@@ -509,10 +541,23 @@ impl Drop for Pending {
 }
 
 pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Box<Job>>) {
+    let _lease = scopeguard::guard((), |()| node.release(&shared));
     loop {
         let Some(mut job) = rx.recv().await else { return };
         *shared.context.lock() = job.context.clone();
         shared.set_phase(Phase::Starting);
+        // Boxed: only nodes with leases wait on it.
+        if node.leases.is_some()
+            && let Err(response) = Box::pin(node.acquire(&shared)).await
+        {
+            crate::telemetry::response(&mut job.span, &response);
+            let _ = job.reply.send(response);
+            shared.set_phase(Phase::Cold);
+            if node.try_retire(&shared, &rx) {
+                return;
+            }
+            continue;
+        }
         // A store holds a slot until it is dropped, and the pool has room for
         // every slot. An evicted object's store lives until its actor next
         // runs, so a new object waits here until that store is gone rather
@@ -544,7 +589,8 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                 match serve(&node, &app, &shared, store, svc, job, &mut rx).await {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
-                    Exit::Reset => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),
+                    Exit::Reset if shared.holds() => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),
+                    Exit::Reset => node.metrics.event("lease-lost", &shared.id, "this node no longer holds the object's lease", &shared.context.lock()),
                     Exit::Poisoned(p, detail) => {
                         node.metrics.poison(p);
                         node.metrics.event(p.as_str(), &shared.id, detail, &shared.context.lock());
@@ -590,13 +636,14 @@ async fn serve(
         async move |acc: &Accessor<ObjState>| -> wasmtime::Result<()> {
             loop {
                 shared.set_phase(Phase::Idle);
-                let job = if let Some(job) = first.take() { job } else {
+                let mut job = if let Some(job) = first.take() { job } else {
                     let Some(mut job) = rx.recv().await else { return Ok(()) };
                     crate::telemetry::duration(&mut job.span, "nanovm.queue.duration_ms", job.enqueued);
                     job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", false));
                     job
                 };
                 *shared.context.lock() = job.context.clone();
+                *shared.callers.lock() = std::mem::take(&mut job.callers);
                 shared.begin_request();
                 // The next tick, not one that passed while the object was
                 // idle: a stale deadline made every request yield to the
@@ -619,7 +666,11 @@ async fn serve(
 
                 let (resp, mut failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
-                        let res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
+                        let mut res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
+                        // Only the node refuses requests to the proxy: a guest
+                        // answering as one would have the proxy run its
+                        // request again and again.
+                        res.headers_mut().remove(crate::lease::OWNER);
                         let res = res.map(|b| {
                             GuardedBody {
                                 inner: b,
@@ -656,6 +707,8 @@ async fn serve(
                     p.phase("nanovm.post_return.duration_ms");
                     if let Some(tx) = p.reply.take() { let _ = tx.send(resp); }
                 }
+                // Its callers have their answer.
+                shared.callers.lock().clear();
                 // Let tasks the guest left running (e.g. streaming the body)
                 // finish before taking the next request.
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;

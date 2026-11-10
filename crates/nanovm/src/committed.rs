@@ -20,6 +20,8 @@ struct Version {
     object: String,
     sequence: u64,
     parent: String,
+    /// The epoch of the node's lease it was committed under (W-10).
+    epoch: u64,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -115,7 +117,7 @@ pub(super) fn prepare(
         return Err(ErrorKind::StorageFull.into());
     }
     let version = Version {
-        format: 1,
+        format: 2,
         app: obj.app.to_string(),
         object: obj.id.to_string(),
         sequence: last
@@ -126,6 +128,7 @@ pub(super) fn prepare(
         } else {
             digest(&out.join(filename(last)))?
         },
+        epoch: obj.lease_epoch()?,
     };
     let metadata = serde_json::to_vec(&version)?;
     if metadata.len() > 4096 {
@@ -208,7 +211,7 @@ pub(super) fn finish(journal: &Path, out: &Path, obj: &ObjShared) -> io::Result<
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
     let version: Version = serde_json::from_slice(&bytes)?;
-    if version.format != 1 || version.app != *obj.app || version.object != *obj.id || version.sequence == 0 {
+    if version.format != 2 || version.app != *obj.app || version.object != *obj.id || version.sequence == 0 {
         return Err(invalid("wrong capture identity"));
     }
     let (last, _) = head(out)?;

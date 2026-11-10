@@ -597,6 +597,7 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 8. **Toward many nodes (Q48–Q50).** Research and groundwork, after the proxy lands:
    - **Committed versions shipped off the node:** separate three concerns: coherent tentative state that can be rejected, local commit, and acknowledgement after the selected durability policy. Undo logging is today's implementation, not a requirement; snapshots, copy-on-write or transactional storage are valid candidates. Replication needs ordered committed content/namespace changes or immutable snapshot manifests, not merely the current undo log. Capture the committed version before subsequent writes can alter it. Include object identity, sequence and fencing epoch; replay must be idempotent. Decide whether success means local durability, remote backup or a regional quorum before promising failover guarantees. Async replication implies a nonzero loss window. (W-9)
    - **Placement and leases:** the proxy places each object on a home node (rendezvous hashing to start); a node takes a lease with an epoch before instantiating an object, and every commit carries the epoch, so a node that lost its lease can't commit. On one node the lease is always granted, so the hook can land early. (W-10)
+     - **Built on `cf/multinode`:** leases in an object store with conditional writes, one session record renewed per node; another node takes an object after seeing its holder's session unchanged for `lease_ms`, ending that session first, so no clock sync is needed. Nodes refuse (421) and evict what they lost; commits check the lease (`Node::lease_epoch`), and calls between objects go through the proxy carrying their callers. Joining the epoch to W-9's versions and fencing them at the store is W-90. Design, safety argument and open decisions: `notes/multinode.md`.
    - **Requests that don't write can run in parallel** (Q50): stateless routes on any node, and read-only requests on read replicas of an object fed by committed change records. On one node it needs care: the undo journal writes in place, so a concurrent reader would see uncommitted data. (W-11)
 9. **Cleanups:** the rest of the review's removable-code list (registry cache and re-hash, config memory checks), for the agent doing the rewrite. (W-13)
 
@@ -687,6 +688,8 @@ This is a recommendation for owner approval, not implemented policy. A receiver
 and restore protocol must carry the selected authority/epoch; adding a sequence
 field alone cannot prevent two restored roots from accepting divergent version N+1.
 W-10 must fence storage commits, not merely check a lease before instantiation.
+W-10 now checks the lease at every commit, but only W-9's store write can fence a
+commit that outlives the lease: see W-90 and `notes/multinode.md`.
 
 ## Follow-ups
 

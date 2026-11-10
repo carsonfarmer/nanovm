@@ -81,7 +81,9 @@ pub struct Supervisor {
     links: Arc<tokio::sync::Semaphore>,
     /// Held while giving a new app its uid.
     uids: Arc<Mutex<()>>,
-    publishes: reqwest::Client,
+    /// To the proxy's private endpoint: publishes, and calls to objects.
+    proxy: reqwest::Client,
+    leases: Option<Arc<crate::lease::Leases>>,
     /// A worker spawned ahead of need: see [`Spawned`].
     spare: tokio::sync::Mutex<Option<Spawned>>,
     relay: Arc<crate::telemetry::Relay>,
@@ -92,6 +94,8 @@ pub struct Supervisor {
 #[derive(Default)]
 struct Worker {
     name: String,
+    /// Where the app is served (see `AppRef::host`).
+    host: String,
     live: Mutex<Option<Arc<Live>>>,
     /// Held while starting or switching, so they are single-flight; holds
     /// the last failed start, which is answered again for a while rather
@@ -143,9 +147,12 @@ impl Worker {
 }
 
 impl Supervisor {
-    /// Call within the control/egress runtime. `threads` counts front-end threads.
-    pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
+    /// Call within the control/egress runtime. `threads` counts front-end
+    /// threads; `leases` is the store `cfg.leases` names (see `lease`).
+    pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize, leases: Option<Arc<dyn object_store::ObjectStore>>) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
+        anyhow::ensure!(leases.is_some() != cfg.leases.is_empty(), "a node with leases has their store");
+        let ttl = Duration::from_millis(cfg.lease_ms);
         let sup = Arc::new(Supervisor {
             runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
@@ -160,12 +167,30 @@ impl Supervisor {
             uids: Arc::default(),
             relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
+            leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
             cfg,
-            publishes: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build()?,
+            proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
             started: Instant::now(),
         });
         sup.clone().refill();
+        // Renews the node's session, and tells each worker it holds.
+        if let Some(leases) = sup.leases.clone() {
+            let weak = Arc::downgrade(&sup);
+            tokio::spawn(async move {
+                loop {
+                    let (id, until) = leases.renew().await;
+                    let Some(sup) = weak.upgrade() else { return };
+                    for l in sup.workers.lock().values().filter_map(|w| w.live()) {
+                        let mut req = get("/_nanovm/lease");
+                        req.headers_mut().insert(crate::lease::SESSION, format!("{id} {until}").parse().unwrap());
+                        tokio::spawn(async move { l.link.send(req).await });
+                    }
+                    drop(sup);
+                    tokio::time::sleep(ttl / 4).await;
+                }
+            });
+        }
         let weak = Arc::downgrade(&sup);
         sup.telemetry.snapshots(move || {
             let Some(sup) = weak.upgrade() else { return };
@@ -236,7 +261,8 @@ impl Supervisor {
                 // their last failures.
                 workers.retain(|_, w| w.live.lock().is_some() || w.starting.try_lock().is_err());
             }
-            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, ..Default::default() })).clone()
+            let host = want.host.clone();
+            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, host, ..Default::default() })).clone()
         };
         w.used.store(self.started.elapsed().as_millis() as u64, Relaxed);
         let live = match self.live(&w, &want).await {
@@ -442,17 +468,26 @@ impl Supervisor {
         });
 
         let policy = Arc::new(policy);
-        let (http, target, app) = (self.publishes.clone(), self.cfg.publish_to.clone(), w.name.clone());
+        let (http, proxy, app, host) = (self.proxy.clone(), self.cfg.proxy.clone(), w.name.clone(), w.host.clone());
+        let leases = self.leases.clone();
         let (telemetry, digest) = (self.relay.clone(), want.digest.clone());
         let telemetry_slots = Arc::new(tokio::sync::Semaphore::new(3));
         egress.set_nonblocking(true)?;
         let link_caps = vec![Arc::new(tokio::sync::Semaphore::new(links)), self.links.clone()];
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, link_caps, move |req| {
-            let (policy, http, target, app) = (policy.clone(), http.clone(), target.clone(), app.clone());
-            let (telemetry, digest, slots) = (telemetry.clone(), digest.clone(), telemetry_slots.clone());
+            let (policy, http, proxy, app, host) = (policy.clone(), http.clone(), proxy.clone(), app.clone(), host.clone());
+            let (telemetry, digest, slots, leases) = (telemetry.clone(), digest.clone(), telemetry_slots.clone(), leases.clone());
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
                     return serve_forwarded(req, &policy).await;
+                }
+                if let Some(leases) = &leases {
+                    if req.uri().path().starts_with(crate::lease::PATH) {
+                        return crate::lease::serve(leases, &app, req).await.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync());
+                    }
+                    if req.uri().path().starts_with(crate::egress::CALLS) {
+                        return call(&http, &proxy, &app, &host, req).await;
+                    }
                 }
                 if req.uri().path().starts_with(crate::telemetry::PATH) {
                     let Ok(_slot) = slots.try_acquire() else { return verdict_ok(429) };
@@ -464,8 +499,8 @@ impl Supervisor {
                     return verdict_ok(404);
                 }
                 let object = req.headers().get(ws::OBJECT_HEADER).cloned().unwrap_or_else(|| http::HeaderValue::from_static(""));
-                let status = http.post(target).header(APP_HEADER, app).header(ws::OBJECT_HEADER, object)
-                    .body(reqwest::Body::wrap(req.into_body())).send().await
+                let status = http.post(format!("{proxy}/publish")).header(APP_HEADER, app).header(ws::OBJECT_HEADER, object)
+                    .timeout(Duration::from_secs(30)).body(reqwest::Body::wrap(req.into_body())).send().await
                     .map_or(502, |r| r.status().as_u16());
                 verdict_ok(status)
             }
@@ -591,6 +626,29 @@ async fn drain(old: Arc<Live>) {
     }
     old.kill.send_replace(true);
     old.kill.closed().await;
+}
+
+/// Sends a worker's call to another object of its app on to the proxy, which
+/// finds the object's node; the supervisor names the app.
+async fn call(http: &reqwest::Client, proxy: &str, app: &str, host: &str, req: Request<Incoming>) -> Response<wasmtime_wasi_http::WasiBody> {
+    let url = format!("{proxy}{}", req.uri().path_and_query().map_or("", |p| p.as_str()));
+    let (mut parts, body) = req.into_parts();
+    parts.headers.remove(http::header::HOST);
+    for (k, v) in [(APP_HEADER, app), (HOST_HEADER, host)] {
+        parts.headers.insert(k, v.parse().expect("app names and hosts are header-safe"));
+    }
+    match http.request(parts.method, url).headers(parts.headers).body(reqwest::Body::wrap(body)).send().await {
+        Ok(res) => {
+            let mut res = Response::from(res).map(|b| b.map_err(|_| wasmtime_wasi_http::Error::ConnectionTerminated).boxed_unsync());
+            res.headers_mut().insert(crate::egress::VERDICT, "ok".parse().unwrap());
+            res
+        }
+        Err(_) => {
+            let mut res = verdict_ok(502);
+            res.headers_mut().insert(crate::egress::VERDICT, "ConnectionRefused".parse().unwrap());
+            res
+        }
+    }
 }
 
 /// A forwarded request's answer from the supervisor itself.

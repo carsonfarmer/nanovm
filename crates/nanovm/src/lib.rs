@@ -9,6 +9,7 @@ pub mod egress;
 pub mod engine;
 pub mod jail;
 pub mod journal;
+pub mod lease;
 pub mod link;
 pub mod metrics;
 pub mod object;

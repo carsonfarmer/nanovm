@@ -15,6 +15,13 @@
 //! never reach another app's data. A deploy moves the tag; rollback moves it
 //! back. Records are cached for their TTL and tags for `tag_ttl_s`; the
 //! records are asked of a DNS-over-HTTPS resolver.
+//!
+//! Each object has a home among the proxy's nodes, by rendezvous hashing
+//! (`rank`). A node that doesn't hold an object's lease answers 421, naming
+//! the node that does if it knows (see `lease`); the proxy tries that node,
+//! or the next in the object's ranking, as it does past a node it can't
+//! reach, until one answers or `failover_ms` passes. Neither kind of
+//! refusal ran the request, so trying again is safe.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use http::header::{CONNECTION, PROXY_AUTHORIZATION, TE, TRAILER, UPGRADE};
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Empty, Full, Limited, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use oci_spec::distribution::Reference;
 use parking_lot::Mutex;
@@ -37,6 +44,8 @@ use crate::ws::{self, Sockets};
 /// How long a client may take over each request's headers (or idle between
 /// requests).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait after trying every node for an object before trying again.
+const RETRY: Duration = Duration::from_millis(100);
 
 /// What `_nanovm.<host>` says.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,8 +118,10 @@ pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> anyhow::Result<Arc<Proxy>> {
         cfg.validate()?;
-        let node = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-            .build(hyper_util::client::legacy::connect::HttpConnector::new());
+        let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
+        // A node that doesn't answer is passed over like one that refuses.
+        connector.set_connect_timeout(Some(Duration::from_secs(1)));
+        let node = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
         Ok(Arc::new(Proxy {
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_proxy", env!("CARGO_PKG_VERSION"), None)?),
             registry: Oci::new(cfg.dev)?,
@@ -173,26 +184,62 @@ impl Proxy {
         for k in ["keep-alive", "proxy-connection"] {
             h.remove(k);
         }
-        let pq = parts.uri.path_and_query().map_or("/", |p| p.as_str());
-        parts.uri = format!("http://{}{pq}", self.cfg.node).parse().map_err(|_| (StatusCode::BAD_REQUEST, pq.to_string()))?;
-
+        let Some((object, _)) = crate::table::route(parts.uri.path()) else {
+            return Err((StatusCode::BAD_REQUEST, crate::table::BAD_OBJECT.into()));
+        };
+        let object = object.to_owned();
         if upgrading {
-            return Ok(self.socket(name, host, Request::from_parts(parts, body.boxed_unsync())).await);
+            return Ok(self.socket(name, host, object, Request::from_parts(parts, body.boxed_unsync())).await);
         }
         parts.headers.extend(headers);
-        let res = self
-            .node
-            .request(Request::from_parts(parts, body.boxed_unsync()))
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        let res = self.send(&name, &object, Request::from_parts(parts, body.boxed_unsync())).await?;
         Ok(res.map(|b| b.map_err(Into::into).boxed_unsync()))
     }
 
-    async fn socket(self: &Arc<Self>, name: String, host: String, req: Request<Body>) -> Response<RespBody> {
-        let Some((object, _)) = crate::table::route(req.uri().path()) else {
-            return error_response(400, "bad-object-id", crate::table::BAD_OBJECT);
-        };
-        let object = object.to_string();
+    /// Sends `req`, for `object` of app `name`, to the node holding the
+    /// object: the first in its ranking that answers, or a node one of them
+    /// names, until `failover_ms` passes.
+    async fn send(&self, name: &str, object: &str, mut req: Request<Body>) -> Result<Response<Incoming>, (StatusCode, String)> {
+        let pq = req.uri().path_and_query().map_or("/", |p| p.as_str()).to_owned();
+        let uri = |node: &str| format!("http://{node}{pq}").parse::<http::Uri>().map_err(|_| (StatusCode::BAD_REQUEST, pq.clone()));
+        let bad_gateway = |e: hyper_util::client::legacy::Error| (StatusCode::BAD_GATEWAY, e.to_string());
+        // One node has nowhere else to send it: stream it there.
+        if let [node] = &self.cfg.nodes[..] {
+            *req.uri_mut() = uri(node)?;
+            return self.node.request(req).await.map_err(bad_gateway);
+        }
+        let (parts, body) = req.into_parts();
+        let max = (self.cfg.max_request_body_kb << 10) as usize;
+        let body = Limited::new(body, max).collect().await.map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body".into()))?.to_bytes();
+        let ranked = rank(&self.cfg.nodes, name, object);
+        let deadline = Instant::now() + Duration::from_millis(self.cfg.failover_ms);
+        let (mut tries, mut owner) = (0, None);
+        loop {
+            let node = owner.take().unwrap_or_else(|| {
+                tries += 1;
+                ranked[(tries - 1) % ranked.len()]
+            });
+            let mut req = Request::new(Full::new(body.clone()).map_err(|e| match e {}).boxed_unsync());
+            (*req.method_mut(), *req.uri_mut(), *req.headers_mut()) = (parts.method.clone(), uri(node)?, parts.headers.clone());
+            match self.node.request(req).await {
+                Ok(res) if res.status() != StatusCode::MISDIRECTED_REQUEST || !res.headers().contains_key(crate::lease::OWNER) => return Ok(res),
+                Ok(res) => {
+                    let named = res.headers().get(crate::lease::OWNER).and_then(|o| o.to_str().ok());
+                    owner = ranked.iter().copied().find(|n| Some(*n) == named && *n != node);
+                }
+                Err(e) if e.is_connect() => {}
+                Err(e) => return Err(bad_gateway(e)),
+            }
+            if Instant::now() >= deadline {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, format!("no node took {object}")));
+            }
+            if owner.is_none() && tries.is_multiple_of(ranked.len()) {
+                tokio::time::sleep(RETRY).await;
+            }
+        }
+    }
+
+    async fn socket(self: &Arc<Self>, name: String, host: String, object: String, req: Request<Body>) -> Response<RespBody> {
         let sockets = {
             let mut apps = self.sockets.lock();
             // Pending opens, live connections and publishes each hold an Arc.
@@ -202,15 +249,15 @@ impl Proxy {
             }
             apps.entry(name.clone()).or_insert_with(|| Arc::new(Sockets::new(self.cfg.clone(), self.total.clone()))).clone()
         };
-        let (proxy, max) = (self.clone(), (self.cfg.max_response_body_kb << 10) as usize);
+        let (proxy, max, target) = (self.clone(), (self.cfg.max_response_body_kb << 10) as usize, object.clone());
         let deliver: ws::Deliver = Box::new(move |mut req| {
-            let (proxy, host, name) = (proxy.clone(), host.clone(), name.clone());
+            let (proxy, host, name, object) = (proxy.clone(), host.clone(), name.clone(), target.clone());
             Box::pin(async move {
                 let event = async {
                     let Ok((current, headers)) = proxy.resolve(&host).await else { return ws::Reply::Bad(502) };
                     if current != name { return ws::Reply::Bad(502) }
                     req.headers_mut().extend(headers);
-                    match proxy.node.request(req).await {
+                    match proxy.send(&name, &object, req).await {
                         Ok(res) => ws::answer(res, max).await,
                         Err(_) => ws::Reply::Bad(502),
                     }
@@ -222,11 +269,39 @@ impl Proxy {
     }
 
     async fn publish(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
+        if req.uri().path().starts_with(crate::egress::CALLS) {
+            return self.call(req).await.unwrap_or_else(|(status, why)| error_response(status.as_u16(), "proxy", &why));
+        }
         let sockets = req.headers().get(APP_HEADER).and_then(|h| h.to_str().ok()).and_then(|app| self.sockets.lock().get(app).cloned());
         let status = if req.method() != http::Method::POST || req.uri().path() != "/publish" { 404 }
             else if let Some(s) = sockets { s.publish(req).await }
             else { 200 };
         Response::builder().status(status).body(Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap()
+    }
+
+    /// A node's call to an object of its app (see `supervisor::call`), sent on
+    /// to the object under the version its host names now, which must still
+    /// be the caller's app: calls never cross apps.
+    async fn call(&self, req: Request<Incoming>) -> Result<Response<RespBody>, (StatusCode, String)> {
+        let (mut parts, body) = req.into_parts();
+        let named = |k| parts.headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+        let (caller, host) = (named(APP_HEADER), named(HOST_HEADER));
+        let (name, headers) = self.resolve(&host).await?;
+        if name != caller {
+            return Err((StatusCode::BAD_GATEWAY, format!("{host} serves another app now")));
+        }
+        let pq = parts.uri.path_and_query().map_or("", |p| p.as_str()).strip_prefix("/objects").unwrap_or_default().to_owned();
+        let Some((object, _)) = crate::table::route(&pq) else {
+            return Err((StatusCode::BAD_REQUEST, crate::table::BAD_OBJECT.into()));
+        };
+        let theirs: Vec<_> = parts.headers.keys().filter(|k| k.as_str().starts_with("nanovm-") && *k != crate::egress::CALLERS).cloned().collect();
+        for k in theirs {
+            parts.headers.remove(k);
+        }
+        parts.headers.extend(headers);
+        parts.uri = pq.parse().map_err(|_| (StatusCode::BAD_REQUEST, pq.clone()))?;
+        let res = self.send(&name, object, Request::from_parts(parts, body.boxed_unsync())).await?;
+        Ok(res.map(|b| b.map_err(Into::into).boxed_unsync()))
     }
 
     /// The route `_nanovm.<host>` names, if any, from the cache while its TTL
@@ -268,6 +343,17 @@ impl Proxy {
         };
         self.digests.get(&key, lookup).await
     }
+}
+
+/// `nodes` in the order an object tries them, its home first: by rendezvous
+/// hashing, each node's score for `(app, object)`, highest first. Adding or
+/// removing a node moves only the objects that it then gains or loses.
+pub fn rank<'a>(nodes: &'a [String], app: &str, object: &str) -> Vec<&'a str> {
+    use sha2::{Digest, Sha256};
+    let score = |n: &str| Sha256::new().chain_update(n).chain_update([0]).chain_update(app).chain_update([0]).chain_update(object).finalize();
+    let mut ranked: Vec<_> = nodes.iter().map(|n| (score(n), n.as_str())).collect();
+    ranked.sort_unstable_by(|a, b| b.cmp(a));
+    ranked.into_iter().map(|(_, n)| n).collect()
 }
 
 /// A TXT record's text: its quoted strings, joined.
@@ -381,6 +467,28 @@ mod tests {
             cache.get(&i.to_string(), async { Ok((1, Duration::from_secs(60))) }).await.unwrap();
         }
         assert!(cache.0.lock().len() <= MAX_CACHED);
+    }
+
+    /// Every object ranks every node once, the homes spread evenly whatever
+    /// the list's order, and removing a node moves only the objects it was
+    /// home to.
+    #[test]
+    fn rendezvous_moves_only_what_it_must() {
+        let nodes: Vec<String> = (0..4).map(|i| format!("10.0.0.{i}:8080")).collect();
+        let homes = |nodes: &[String]| (0..4000).map(|o| rank(nodes, "app", &format!("o{o}"))[0].to_owned()).collect::<Vec<_>>();
+        let all = homes(&nodes);
+        assert_eq!(rank(&nodes, "app", "o1").len(), 4);
+        assert_eq!(rank(&nodes, "app", "o1"), rank(&nodes, "app", "o1"));
+        for n in &nodes {
+            let share = all.iter().filter(|h| *h == n).count();
+            assert!((800..1200).contains(&share), "{n}: {share}");
+        }
+        let three = homes(&nodes[..3]);
+        for (before, after) in all.iter().zip(&three) {
+            assert!(before == after || *before == nodes[3], "{before} -> {after}");
+        }
+        let shuffled: Vec<String> = [3, 1, 0, 2].iter().map(|&i| nodes[i].clone()).collect();
+        assert_eq!(homes(&shuffled), all, "the list's order doesn't matter");
     }
 
     /// A record names a tagged repository, one or more identities, and an

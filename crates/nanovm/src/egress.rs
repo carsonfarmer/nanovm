@@ -138,7 +138,10 @@ const CONNECT_TIMEOUT: &str = "x-nanovm-connect-timeout-ms";
 const FIRST_BYTE_TIMEOUT: &str = "x-nanovm-first-byte-timeout-ms";
 
 /// Where an object calls another of its app: `http://nanovm/objects/{id}/…`.
-const CALLS: &str = "/objects/";
+pub(crate) const CALLS: &str = "/objects/";
+/// On a call, the objects waiting on it, the caller last: `a,b,c`. Set by
+/// the node only (see `call`).
+pub const CALLERS: &str = "nanovm-callers";
 
 pub struct EgressHooks {
     pub route: Route,
@@ -165,7 +168,9 @@ impl WasiHttpHooks for EgressHooks {
         let sem = self.sem.clone();
         let metrics = self.metrics.clone();
         let obj = self.obj.clone();
-        if request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(crate::telemetry::PATH) {
+        if request.uri().host() == Some(crate::ws::PUBLISH_HOST)
+            && [crate::telemetry::PATH, crate::lease::PATH].iter().any(|p| request.uri().path().starts_with(p))
+        {
             return Box::new(async { Err(Error::HttpRequestDenied) });
         }
         let internal = request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS);
@@ -233,7 +238,9 @@ impl WasiHttpHooks for EgressHooks {
 /// other request. The callee commits before it answers, so the caller sees
 /// only durable changes. A call that would wait on its own caller, directly
 /// or through other calls, is refused with 508: one request at a time per
-/// object would deadlock it.
+/// object would deadlock it. With leases (more than one node) the call goes
+/// through the supervisor to the proxy, which finds the object's node; it
+/// names its callers, so a node can refuse a cycle that runs through others.
 async fn call(
     node: &Arc<crate::table::Node>,
     sem: Arc<Semaphore>,
@@ -264,18 +271,34 @@ async fn call(
     let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
     let body = http_body_util::Limited::new(body, limit).collect().await;
     let body = body.map_err(|_| Error::HttpRequestBodySize(None))?.to_bytes();
-    parts.uri = format!("http://{}/{}", crate::ws::PUBLISH_HOST, path.trim_start_matches('/'))
-        .parse()
-        .map_err(|_| Error::HttpRequestUriInvalid)?;
-    let res = node.dispatch(id, http::Request::from_parts(parts, body)).await;
+    let callers = obj.callers.lock().iter().chain([&obj.id]).map(|c| &**c).collect::<Vec<_>>().join(",");
+    parts.headers.insert(CALLERS, callers.parse().map_err(|_| Error::HttpRequestUriInvalid)?);
+    let res = match (&node.leases, &node.app.egress) {
+        (Some(_), Route::Supervisor(up)) => {
+            if let Some(cx) = parts.extensions.get::<opentelemetry::Context>() {
+                use opentelemetry::propagation::TextMapPropagator;
+                opentelemetry_sdk::propagation::TraceContextPropagator::new()
+                    .inject_context(cx, &mut opentelemetry_http::HeaderInjector(&mut parts.headers));
+            }
+            let req = http::Request::from_parts(parts, http_body_util::Full::new(body).map_err(|e| match e {}).boxed_unsync());
+            let (res, _) = forward(req, None, up.clone()).await?;
+            res
+        }
+        _ => {
+            parts.uri = format!("http://{}/{}", crate::ws::PUBLISH_HOST, path.trim_start_matches('/'))
+                .parse()
+                .map_err(|_| Error::HttpRequestUriInvalid)?;
+            to_guest(node.dispatch(id, http::Request::from_parts(parts, body)).await)
+        }
+    };
     // The permit lives as long as the response body, as for any request.
-    Ok(to_guest(res.map(|b| {
+    Ok(res.map(|b| {
         b.map_frame(move |f| {
             let _ = &permit;
             f
         })
         .boxed_unsync()
-    })))
+    }))
 }
 
 fn cancelled(mut span: crate::telemetry::Span) {

@@ -244,7 +244,8 @@ fn serve(cfg: NodeConfig) -> anyhow::Result<()> {
     // Workers run this process's own image (/proc/self/exe in the forked
     // child), not whatever file is at its path by then (N-552).
     let exe = if cfg!(target_os = "linux") { PathBuf::from("/proc/self/exe") } else { std::env::current_exe()? };
-    let sup = control.block_on(async { Supervisor::new(cfg, exe, threads) })?;
+    let leases = nanovm::lease::Leases::open(&cfg.leases)?;
+    let sup = control.block_on(async { Supervisor::new(cfg, exe, threads, leases) })?;
     let first = rt.block_on(async { listener(addr) })?;
     eprintln!("nanovm: ready in {:.0?} on http://{addr}/", t0.elapsed());
     for i in 1..threads {

@@ -63,6 +63,8 @@ prost = "0.14"
 async-trait = "0.1"
 # `nanovm publish` pushes apps (the node only pulls, through `registry::Oci`).
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
+# Leases on an object store (S3 and compatibles) with conditional writes; see `lease`.
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.7"

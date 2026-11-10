@@ -33,8 +33,21 @@ config! {
         capture: Option<CaptureConfig> = None::<CaptureConfig>,
         /// Upper bound on objects with a live instance; sizes the pooling allocator.
         max_live_objects: usize = 1000usize,
-        /// Private proxy endpoint receiving committed publishes.
-        publish_to: String = "http://127.0.0.1:8444/publish",
+        /// The proxy's private endpoint: committed publishes go to its
+        /// `/publish`, and with `leases`, calls to other objects to its
+        /// `/objects/…`, which places them.
+        proxy: String = "http://127.0.0.1:8444",
+        /// With more than one node: where the nodes keep their leases on
+        /// objects, an object store URL (`s3://bucket/prefix`; credentials
+        /// from the environment, as `AWS_ACCESS_KEY_ID` and so on). Empty:
+        /// this is the only node, and every object is its own (see `lease`).
+        leases: String = "",
+        /// This node as the proxy lists it (`host:port`), naming it as a
+        /// lease holder. Every node's must differ.
+        name: String = "",
+        /// How long a node's leases outlive its last renewal: the longest an
+        /// object is unavailable after its node stops (see `lease`).
+        lease_ms: u64 = 10_000u64,
         /// OTLP/HTTP collector base URL. Only the supervisor connects to it.
         telemetry_endpoint: String = "http://127.0.0.1:4318",
         /// Virtual address space reserved per linear memory: no memory grows
@@ -105,8 +118,13 @@ config! {
     pub struct ProxyConfig {
         /// Address the proxy listens on.
         listen: String = "0.0.0.0:8443",
-        /// The node it forwards to.
-        node: String = "127.0.0.1:8080",
+        /// The nodes it places objects on (`host:port`, each as the node's
+        /// `name`).
+        nodes: Vec<String> = vec!["127.0.0.1:8080".to_string()],
+        /// How long a request may wait for its object's node: for a node that
+        /// stopped to lose its leases (its `lease_ms`) and another to take
+        /// over.
+        failover_ms: u64 = 30_000u64,
         /// Private control listener; only nodes may reach it.
         publish_listen: String = "127.0.0.1:8444",
         /// OTLP/HTTP Collector base URL for front-door request events.
@@ -208,12 +226,18 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.leases.is_empty() && self.name.is_empty() {
+            bail!("a node with leases has a name");
+        }
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
 
 impl ProxyConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.nodes.is_empty() {
+            bail!("the proxy has no nodes");
+        }
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
