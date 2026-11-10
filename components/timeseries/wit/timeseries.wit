@@ -1,0 +1,82 @@
+package nanovm:timeseries@0.1.0;
+
+/// Numeric time series with hourly and daily rollups, stored in the object's
+/// own volume. Every change commits or rolls back with the request that made
+/// it, together with the request's other file, SQL, KV and queue changes.
+interface series {
+  /// A sample: milliseconds since the Unix epoch (0 to 2^53) and a finite value.
+  record point {
+    time-ms: u64,
+    value: f64,
+  }
+
+  /// The points in [start-ms, start-ms + step).
+  record bucket {
+    start-ms: u64,
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+  }
+
+  /// Which data a call reads or trims.
+  enum level {
+    /// Every point, in per-day files.
+    raw,
+    /// Count, sum, min and max per hour, kept up to date on every write.
+    hour,
+    /// The same per day (UTC).
+    day,
+  }
+
+  /// Errors. A call that returns an error has changed nothing.
+  variant error {
+    /// Series names are 1-64 ASCII letters, digits, `_` or `-`.
+    invalid-name,
+    /// A time, value, count or step is outside the documented bounds.
+    invalid-argument(string),
+    /// The object's disk or file quota is full.
+    full,
+    /// Too many series are open at once; drop one and retry.
+    table-full,
+    /// An I/O or other implementation error.
+    other(string),
+  }
+
+  /// A named series. Several handles to one name share its state.
+  resource series {
+    /// Opens a series. Creates nothing until the first write.
+    open: static async func(name: string) -> result<series, error>;
+
+    /// Records 1-10,000 points, in any order. A point's time need not be new;
+    /// points with equal times are all kept.
+    write: async func(points: list<point>) -> result<_, error>;
+
+    /// Raw points with `from-ms <= time-ms < to-ms`, in time order (equal
+    /// times in write order), at most `limit` (1-10,000). Points whose day was
+    /// trimmed from `raw` are gone.
+    range: async func(from-ms: u64, to-ms: u64, limit: u32) -> result<list<point>, error>;
+
+    /// Non-empty buckets of `step-ms` aligned to the epoch, covering
+    /// [from-ms, to-ms), at most 10,000 of them. A step that is a whole
+    /// number of days reads the day rollups, of hours the hour rollups (so
+    /// either still works after raw points are trimmed, and counts whole hours
+    /// or days at the ends); any other step reads raw points.
+    aggregate: async func(from-ms: u64, to-ms: u64, step-ms: u64) -> result<list<bucket>, error>;
+
+    /// The point with the greatest time (the last written among equals).
+    latest: async func() -> result<option<point>, error>;
+
+    /// Drops `level`'s data for every whole period before `before-ms`: raw days,
+    /// hour rollups 32 days at a time, day rollups 1,024 days at a time.
+    trim: async func(level: level, before-ms: u64) -> result<_, error>;
+  }
+}
+
+world provider {
+  export series;
+}
+
+world client {
+  import series;
+}
