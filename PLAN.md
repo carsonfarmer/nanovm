@@ -676,6 +676,15 @@ prove remote durability. A receiver still needs validated bounds/identity/chain,
 durable ordered receipt, interrupted restore recovery and an explicit authority
 for deciding which history may become writable. No distributed fence exists.
 
+**Delivered on cf/storage (W-80):** the journal's decision is now a key in its
+kept log; captured versions are changes against the version before (snapshot every
+16), staged under a name tied to that key and published by rename (2 syncs per
+commit); a bounded outbox the supervisor ships to a put-once store (directory or
+S3-compatible), where a second writer of a sequence is refused; an epoch and fence
+object as W-10's hook; opt-in `remote_ack` (default local, per the decision below);
+restore from the store onto a fresh root, history continuing. Open: remote
+retention and a snapshot pointer, commit-time fencing, the decision below.
+
 **Next decisions:** retain local-durable acknowledgement with asynchronous transfer,
 or gate responses on a durable remote receipt? Local-only plus asynchronous
 transfer allows loss of acknowledged writes; no bounded RPO follows without a lag
