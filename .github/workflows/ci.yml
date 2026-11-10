@@ -46,6 +46,8 @@ jobs:
         run: |
           python3 -m unittest discover -s tools -p 'test_*.py' -v
           sudo python3 -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Check the host checks (tools/doctor)
+        run: python3 -m unittest discover -s deploy/single-node -v
       - name: Report runtime line count
         run: |
           python3 - <<'PY'

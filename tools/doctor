@@ -1,0 +1,5 @@
+#!/bin/sh
+# nanovm doctor: checks this host against a node config (or the defaults) and
+# says what to fix. See deploy/single-node/check-host.py.
+#   tools/doctor [nanovm.toml] [--nofile N]
+exec python3 "$(dirname "$0")/../deploy/single-node/check-host.py" "$@"
