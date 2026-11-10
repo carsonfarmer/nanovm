@@ -118,7 +118,7 @@ nanovm/
   | `PostReturn` | `post_return_timeout` | the streaming body is aborted with an error frame, so a truncated response doesn't look complete |
   | `Idle` | `idle_timeout` | clean eviction |
 - **CPU budget:**
-  - The outer `poll_fn` times every poll of the store's event loop and charges it to the current request. That covers guest code and inline filesystem calls; it is wall time, so it inflates when the host is oversubscribed.
+  - The outer `poll_fn` reads the thread's CPU clock (`CLOCK_THREAD_CPUTIME_ID`) around every poll of the store's event loop and charges the difference to the current request. That covers guest code and inline filesystem calls, user and kernel time, but not time waiting for a core or the disk, nor the journal's own work: undo records and the commit (N-640).
   - An epoch ticker thread runs every `epoch_tick_ms` (default 5 ms). Each Store's `epoch_deadline_callback` checks the charge including the poll in progress, and past `cpu_ms` returns an `Err(CpuExceeded)` trap.
   - Otherwise it returns `Yield(1)`, so a spinning guest still yields to tokio.
   - **Heavy lanes:** once a request has used 10 ms (`HEAVY_AFTER_NS`), the callback returns `YieldCustom`, which waits for one of `heavy_lanes` permits before the guest runs again. The permit is handed back at every tick. This stops CPU hogs from yielding straight back onto every worker.
@@ -183,7 +183,7 @@ nanovm/
 | Knob | Default | Enforced by |
 |---|---|---|
 | `memory_mb` | 64 | custom ResourceLimiter (all memories) + pool `max_memory_size` |
-| `cpu_ms` per request | 200 | wall time inside store polls, checked by the epoch callback |
+| `cpu_ms` per request | 200 | thread CPU time inside store polls, checked by the epoch callback |
 | `request_timeout_ms` / `post_return_timeout_ms` / `idle_timeout_ms` | 5000 / 5000 / 30000 | outer deadline wrapper |
 | `max_request_body_kb` / `max_response_body_kb` | 1024 / 8192 | body wrappers |
 | `disk_mb` / `max_files` | 64 / 1000 | QuotaGuard (shared by `/data` and `/tmp`) |

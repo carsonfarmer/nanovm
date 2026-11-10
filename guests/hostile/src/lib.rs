@@ -94,12 +94,13 @@ async fn route(req: Req) -> Result<Response, ErrorCode> {
             json(200, format!("{{\"held_mb\":{held}}}"))
         }
 
-        // Burn CPU forever.
+        // Burn CPU for `n` steps, by default forever.
         "/spin" => {
             let mut x: u64 = 0;
-            loop {
+            for _ in 0..req.q_u64("n", u64::MAX) {
                 x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
             }
+            json(200, format!("{{\"x\":{x}}}"))
         }
 
         // Sleep (async, no CPU) for `ms` milliseconds.
