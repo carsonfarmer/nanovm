@@ -28,21 +28,30 @@ accepted but unsent write is lost. This is not a runtime replication feature,
 remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
 gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 
-**Local capture:** optional node `[capture]` configuration
-enables full-volume TAR captures at both dirty commit gates (`max_mb = 256`,
-`max_versions = 16`, per object). Versions are staged before the journal's commit
-decision, then published under `objects/<app>/~committed/<object>/`; recovery
-discards rejected staging or completes accepted publication before new work.
-Full history rejects further dirty commits rather than discarding old versions;
-read-only commits consume no version. Capture defaults off. This is bounded local
-capture, not continuous replication: no retention, network receiver, restore API,
-distributed fence or remote acknowledgement policy is provided. Do not manually
-prune history or disable capture on a root with history. Full copies cost storage
-and write latency: two small-write release probes measured roughly half default
-write throughput. This is not a large-volume performance result. The older JSON
-experiment is not a receiver for these TARs. Tests exercise both commit gates,
-process-exit and failed-sync recovery, history exhaustion and SQL/file/KV recovery
-after source-root deletion; these do not certify physical power loss or remote hosts.
+**Capture and shipping:** optional node `[capture]` configuration captures a
+version at both dirty commit gates: the whole volume every `snapshot_every` (16)
+versions, otherwise what the commit changed (listings of changed directories, new
+or moved files whole, files changed in place as their changed byte ranges). Versions
+are staged before the journal's commit decision and published under
+`objects/<app>/~committed/<object>/`; recovery discards a rejected one or completes
+an accepted one before new work. A commit with capture costs 2 more syncs. With
+`store` set (a directory, or an S3-compatible bucket URL with credentials in
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), the supervisor (or an in-process node)
+ships each object's versions in order to `<app>/<object>/<sequence>.tar` with
+put-once semantics, then removes them here but the last. `max_versions` and `max_mb`
+bound what waits here: with the store down, writes are refused once they are
+reached; nothing is silently dropped. A commit is acknowledged once durable here
+unless `remote_ack = true`, which also waits (2 s at most, then fails the request:
+the commit still stands locally) for the store. A version another writer stored, or
+a fence object `<app>/<object>/fence` above the node's `epoch`, stops shipping.
+`nanovm::ship::restore` rebuilds an object from the store on a fresh root and keeps
+its last version, so history goes on. Capture defaults off. Not yet: remote
+retention, a snapshot pointer (a restore reads every version), automatic
+failover, or fencing of commits themselves. Do not manually prune history or
+disable capture on a root with history. Tests exercise both commit gates,
+process-exit and failed-sync recovery, history exhaustion, random change sequences
+restored at every version, shipping, outages and restore on a fresh root; these do
+not certify physical power loss or remote hosts.
 
 ## SQLite beta
 

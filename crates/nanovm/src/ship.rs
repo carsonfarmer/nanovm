@@ -313,28 +313,21 @@ pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path)
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
 
     /// An S3-compatible bucket in this process: keeps what is put unless
     /// `If-None-Match: *` finds something there, and refuses requests whose
-    /// signature doesn't check out, or any at all while `down`.
-    pub(crate) struct Fake {
-        pub url: String,
-        pub objects: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>,
-        pub down: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    pub(crate) async fn fake() -> Fake {
+    /// signature doesn't check out.
+    /// Its URL.
+    async fn fake() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/bucket", listener.local_addr().unwrap());
-        let (objects, down) = (Arc::new(Mutex::new(Default::default())), Arc::new(Default::default()));
-        let (store, off): (Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>>, Arc<std::sync::atomic::AtomicBool>) =
-            (Arc::clone(&objects), Arc::clone(&down));
+        let store: Arc<Mutex<std::collections::BTreeMap<String, Vec<u8>>>> = Arc::default();
         tokio::spawn(crate::server::serve_http1(listener, move |req| {
-            let (store, off) = (store.clone(), off.clone());
+            let store = store.clone();
             async move {
                 let (parts, body) = req.into_parts();
                 let body = body.collect().await.unwrap().to_bytes().to_vec();
@@ -345,7 +338,6 @@ pub(crate) mod tests {
                 let expected = authorization(parts.method.as_str(), path, &headers, "us-east-1", "id", "secret");
                 let key = path.strip_prefix("/bucket/").unwrap().to_owned();
                 let status = match () {
-                    _ if off.load(std::sync::atomic::Ordering::Relaxed) => 500,
                     _ if header("authorization") != expected || header("x-amz-content-sha256") != format!("{:x}", Sha256::digest(&body)) => 403,
                     _ if parts.method == http::Method::PUT => {
                         let mut store = store.lock();
@@ -366,7 +358,7 @@ pub(crate) mod tests {
                 res
             }
         }));
-        Fake { url, objects, down }
+        url
     }
 
     fn body_of(bytes: Vec<u8>) -> crate::object::RespBody {
@@ -389,8 +381,8 @@ pub(crate) mod tests {
     /// harmless, other bytes are refused.
     #[tokio::test(flavor = "multi_thread")]
     async fn stores_put_once() {
-        let fake = fake().await;
-        let stores: [Box<dyn Store>; 2] = [Box::new(Dir(tempdir("put"))), Box::new(s3(&fake.url))];
+        let url = fake().await;
+        let stores: [Box<dyn Store>; 2] = [Box::new(Dir(tempdir("put"))), Box::new(s3(&url))];
         for store in stores {
             assert!(store.get("a/o/1").await.unwrap().is_none());
             assert!(matches!(store.put("a/o/1", b"one".to_vec()).await.unwrap(), Put::Stored));
@@ -398,7 +390,7 @@ pub(crate) mod tests {
             assert!(matches!(store.put("a/o/1", b"other".to_vec()).await.unwrap(), Put::Conflict));
             assert_eq!(store.get("a/o/1").await.unwrap().unwrap(), b"one");
         }
-        let forged = S3 { secret: "wrong".into(), ..s3(&fake.url) };
+        let forged = S3 { secret: "wrong".into(), ..s3(&url) };
         assert!(forged.get("a/o/1").await.is_err(), "the fake checks signatures");
     }
 

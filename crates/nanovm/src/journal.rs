@@ -506,6 +506,11 @@ impl Journal {
         result
     }
 
+    /// Whether the current request has recorded a change.
+    pub fn changed(&self) -> bool {
+        self.log.is_some()
+    }
+
     pub fn check(&self) -> std::io::Result<()> {
         if self.poisoned {
             return Err(std::io::Error::other("journal requires recovery"));
@@ -1872,6 +1877,22 @@ mod tests {
             }
             std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
         }
+    }
+
+    /// A commit with nothing to commit stays on the object's task: it doesn't
+    /// wait for a blocking thread, here the only one, which is busy.
+    #[test]
+    fn a_commit_of_nothing_stays_on_its_task() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_time().build().unwrap();
+        rt.block_on(async {
+            let v = volume();
+            let obj = Arc::new(ObjShared::new("app".into(), "o"));
+            let quota = crate::quota::QuotaGuard::new(&v, &Default::default(), Default::default(), obj, None).unwrap();
+            let busy = tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(500)));
+            let commit = tokio::time::timeout(std::time::Duration::from_millis(200), quota.commit());
+            commit.await.expect("not waiting for a blocking thread").unwrap();
+            busy.await.unwrap();
+        });
     }
 
     /// A file opened write-only can be written over: the bytes it replaces
