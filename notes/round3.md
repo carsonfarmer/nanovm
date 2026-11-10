@@ -82,6 +82,29 @@ spare), and `tests/dev.rs` reads the pulled component from its cache file (C5).
 - Failover and late-commit tests pass; see `notes/multinode.md` for the safety argument and its
   limits (the epoch is fenced locally; shipping must be conditional on the lease record, W-90).
 
+### Cheaper durable writes and committed state off the node (`cf/storage`, ported as 7c3d447..4ff1df6)
+
+- **Fewer syncs per write.** The undo log is kept and a commit writes a new key that voids every
+  record at once; records made back to back share one sync; commits run off the worker thread;
+  a guest's own `sync` is a no-op because the commit already makes the request durable. A counter
+  write costs 5 device flushes instead of 9 (with capture, 7 instead of 17).
+- **Evidence on round3** (quiet machine, dev profile, 3 alternating rounds, medians): concurrent
+  `POST /incr` 1,058/s → 1,978/s (1.87×), p99 1.06–1.28 s → 0.46–0.48 s, CPU per concurrent write
+  1,121 → 870 µs (−22%). Serial writes are flat on a quiet disk (385 → 394/s) and cost about 12% more
+  CPU, because each writing commit is handed to a blocking thread; under disk contention serial
+  writes went 40 → 75/s.
+- **Committed versions as changes (format 3).** A snapshot every 16 versions, changes in between
+  (a 1-byte change to a 1 MiB file is a version under 8 KiB), each carrying the lease epoch.
+- **Shipping and restore.** Versions are shipped in order to a put-once store (a directory, or S3,
+  R2 or MinIO through `object_store`), only while this node holds the object's lease (W-90), and an
+  object can be restored on a fresh root. The default acknowledgement stays local; `remote_ack`
+  holds a commit up to 2 s for the store.
+- **Limits.** A short window between reading the lease record and the put remains (W-90, needs a
+  head pointer written with `If-Match`); the shipper polls every 20 ms (N-165); restore reads every
+  version (N-166); a log left uncommitted by an older binary is refused, so drain before upgrading.
+- +494 runtime lines, no new dependencies. All tests pass, including 114 SQLite recovery cuts and
+  the new lease-fenced shipping tests.
+
 ## 3. Branches to pick on their own (no runtime change unless stated)
 
 | Branch | What | Notes |
@@ -98,7 +121,8 @@ instance shares them (W-640). JavaScript keeps its pre-initialization.
 
 ## 4. Decisions for the owner
 
-1. **W-9 acknowledgement and RPO**: still open (local capture only).
+1. **W-9 acknowledgement and RPO**: still open. Shipping exists; the default stays durable on this
+   node, with `remote_ack` as the opt-in.
 2. **Multi-node**: lease length (recommend `lease_ms` 10 s, `failover_ms` 30 s); the lease store
    becomes a hard dependency (N-181); expiry by each node's own clock; keep `object_store`; calls
    go through the proxy when leases are on; cross-node cycles not along one chain end at the
@@ -114,5 +138,4 @@ instance shares them (W-640). JavaScript keeps its pre-initialization.
 
 N-500 (the linker defines all of WASIp2; the import allowlist is the only guard), N-505, N-506,
 N-670 (Landlock ABI 2 needed for cross-directory renames), N-671 (`ulimit -v` makes workers fail
-without a clear message), W-621..W-623, and the storage work (fewer syncs per write, shipping
-committed versions off the node), which is still in progress on `cf/storage`.
+without a clear message), W-621..W-623, W-90's remaining window, N-165 and N-166.
