@@ -361,6 +361,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** `app::linker` defines only the WASIp2 interfaces the allowlist permits (io, clocks, random, cli), so the fixtures fail to link (`wasi:sockets/…`, `wasi:filesystem/…` not found) even without the check. Building the linker got cheaper (median 148 → 90 µs); instantiation is unchanged (`notes/hardening.md`).
 - **Status:** fixed on `cf/hardening`
 
+### N-680: a link connection answered before its request body was sent went back to the pool, holding the body
+- **Where:** `link.rs` (`LinkBody::poll_frame` pooled the connection once the response ended if it was still open)
+- **Scenario:** found by the hardening agent while testing N-505 through the supervisor. A worker that answers before reading the whole request body (a 408 `body-timeout`, or a 413) leaves the supervisor's link connection still sending that body. If the response's last frame was read before the connection saw the worker hang up, the connection went into the idle pool, where nothing polls it: it kept the client's body, and so the client's connection to the node, open indefinitely, with the 408 already sent. `checkout` never reuses such a connection (it isn't ready), so it only leaked.
+- **Reproduced:** yes: 1 run in 5 of `slow_request_bodies_are_cut_at_every_entry_point`, the supervisor's client got its 408 and the connection stayed open (40 s and more); `a_connection_answered_before_its_body_is_sent_is_not_pooled` fails every time without the fix.
+- **Fix:** a connection is pooled only if it is also ready for the next request (`SendRequest::is_ready`, the check `checkout` already made); otherwise it is dropped, which drops the body and lets the client's connection close. No new runtime lines.
+- **Status:** fixed on `cf/hardening`
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
