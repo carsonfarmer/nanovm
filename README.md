@@ -264,6 +264,15 @@ What happens on the first request for a digest:
 
 We adopt Spin's WIT, not its deployment/storage model: all valid labels are allowed within each object's isolated volume, without a `spin.toml` allowlist or shared cross-object store. There is no SQLite dependency for KV. Caller cancellation is deferred across a mutation; traps, deadlines and crashes roll back through the host.
 
+**More components** follow the same pattern, with no host code: a
+[queue](components/queue/README.md) (append-only log with consumer positions),
+[JSON documents](components/docs/README.md) with secondary indexes,
+[time series](components/timeseries/README.md) with rollups,
+[templates](components/templates/README.md) (minijinja) and
+[auth](components/auth/README.md) (JWT/JWKS, argon2id, sessions). Build them with
+`scripts/build-components.sh`; tests are `crates/nanovm/tests/components.rs`;
+costs are in [notes/components.md](notes/components.md).
+
 Profiling found a large-value cost in Wasmtime 50's byte-by-byte component-list
 adapter, not an inherent filesystem cost. An isolated bulk-copy experiment cuts
 1 MiB GET from 3.149 to 1.600 ms (native 1.404 ms); it is not an enabled dependency

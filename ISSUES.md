@@ -331,6 +331,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
+### N-650 (efficiency, guidance): truncating or overwriting committed bytes costs undo-journal room equal to them
+- **Where:** `journal.rs`/`quota.rs` (the undo journal records the bytes a write or truncation destroys); found building `components/docs` (J-89)
+- **Scenario:** a component that reclaims space on a full volume by rewriting a file in place (slide live records down, then truncate) needs undo-journal room for every byte it moves and truncates; the journal's log is bounded by the disk quota, so on a full 1 MiB volume an in-place compaction of a ~1 MiB log is refused (`InsufficientSpace`) and has to trap. Unlinking is free: the file moves into the journal uncounted until commit.
+- **Reproduced:** yes, an earlier in-place version of `docs` compaction failed `docs_quota_exhaustion_is_refused_cleanly` exactly so.
+- **Guidance (no runtime change):** reclaim space by unlinking: `docs` opens the old log, unlinks it, and rewrites the live records from the open descriptor, needing neither free space nor journal room; a delete that can't append its record on a full volume flips one byte in place. Recorded in `notes/components.md` for component authors.
+- **Status:** documented
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -486,4 +493,24 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-35: bound what the proxy buffers for objects across all apps
 - **What:** each event answer and each publish is collected whole in the proxy, up to `max_response_body_kb` (8 MiB), with no bound across sockets, objects or apps: 1,000 sockets of one app answered at once is 8 GiB, and publishes are as many as objects committing at once. One app's plain Wasm can so exhaust the proxy every app shares. Parsing is not the problem: an answer is parsed and applied within one poll, so its parse (about 6–14 times its size, `ws::parse`) is bounded by the proxy's threads, and publishes now parse in about their size (N-72). Found by the sec review.
 - **Design:** (1) collect an answer up to `socket_backlog_kb`, not `max_response_body_kb` (in `Proxy::socket`'s `deliver`): `apply` queues an answer's messages at once, each costing its length plus 64, so an answer bigger than the socket's backlog overflows it and drops the socket anyway (only a flood of subscribe controls would fit). Answers then cost at most one backlog per socket, within the per-socket budgets the proxy already has. (2) publishes: a proxy-wide semaphore of publish bytes in flight (an operator setting, or `max_sockets_per_app × socket_backlog_kb` per app), acquired for the declared or collected size before buffering, so one app's commits wait rather than grow the proxy.
+- **Status:** open
+
+### W-620: building blocks as Wasm components over the filesystem (IDEAS J)
+- **What:** `components/queue` (J-90, `nanovm:queue/log`), `components/docs` (J-89, `nanovm:docs/store`, with full-text search J-91 and exact vector search J-92 as index kinds), `components/timeseries` (J-93), `components/templates` (J-96, minijinja) and `components/auth` (J-97, JWT/JWKS, argon2id, sessions): each a WIT interface, a provider composed with `wac plug`, a minimal test app, `crates/nanovm/tests/components.rs` tests (behaviour, eviction/restart, rollback of failed requests, quota exhaustion) and a README. Zero runtime lines. Costs and design notes in `notes/components.md`; `crates/nanovm/examples/components_bench.rs` measures them.
+- **Findings:** none needs a runtime change; the per-request commit replaces any internal WAL (each call is all-or-nothing within the request and traps if it can't undo). Templates cost about 10% more per render than minijinja linked into the app, at a similar size, so for Rust apps the library is the simpler choice. Rate limiting is better as an SDK helper (W-621).
+- **Status:** done on `ideas/components` (CI step "Build and test the filesystem components")
+
+### W-621: rate limiting (J-95) as an SDK helper, not a component
+- **Why not a component:** the logic is a dozen lines (GCRA: one "theoretical arrival time" per key), and the real choice is where its state lives. Stored in `/data`, every allowed request becomes a committing write: about 1.2-1.5 ms CPU and a commit's fsyncs (18-25 ms wall on this loaded VM) per request, measured as a KV set or a queue append in `components_bench`, where a read-only request costs about 0.07-0.14 ms. Kept in instance memory, it costs nothing, but resets (fails open) on eviction or restart. `examples/ratelimit` on `ideas/examples` already shows the durable token bucket over KV in about 70 lines.
+- **Design:** `nanovm_sdk::ratelimit::Gcra { period, burst }` with `check(key, now) -> Decision { allowed, remaining, retry_after }`, state in a `thread_local` map by default (one object per key or per tenant keeps it bounded), and an opt-in `durable(kv_bucket)` that writes only on allowed requests. Refusals never write. Document fail-open on eviction for the in-memory mode.
+- **Status:** open (belongs with `sdk/rust` on the on-ramp branch)
+
+### W-622: `docs` cold starts cost a scan of the whole log
+- **What:** the first call after an instance starts reads the collection's log and parses every document if it has indexes: 26-39 ms CPU for 10,000 documents with one index (10-14 ms without, 0.5 ms for a request that doesn't open it), charged to that request. At the default `cpu_ms` of 200 that caps a collection near 50,000 documents; text and vector indexes add to it.
+- **Design:** write a snapshot (keydir offsets and index keys, a Bitcask "hint" file) whenever the log is compacted, and on load read the snapshot plus the log's tail past it; or store each put record's index keys so loading needs no JSON parse. Component-only change.
+- **Status:** open
+
+### W-623: an approximate vector index (HNSW) for `docs`
+- **What:** `docs` vector search (J-92) is exact: `nearest` compares every vector, 2.1 ms CPU per query for 10,000 64-dimension vectors on this VM, growing with dimensions x documents, and the vectors sit in memory (4 bytes per dimension per document). Enough for thousands to tens of thousands of embeddings per object, not for millions.
+- **Design:** an HNSW graph kept in memory and rebuilt on load like the other indexes (or persisted beside the log if rebuilding costs too much of the cold-start CPU budget, see W-622), with `nearest` taking an `ef` parameter; keep exact search for small sets. Wasm SIMD (`f32x4`) would speed both.
 - **Status:** open

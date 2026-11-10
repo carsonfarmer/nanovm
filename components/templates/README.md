@@ -25,7 +25,7 @@ persistence, rollback and quota tests of the other components don't apply.
 Measured in one test app that has both (`components_bench -- templates`;
 see [notes/components.md](../../notes/components.md)): rendering a 20-row
 page costs about the same through the component as through minijinja linked
-into the app (per render, within ~10%: the call copies the context in and
+into the app (per render 139 vs 125 µs, about 10%: the call copies the context in and
 the HTML out). Size is also similar: the provider is 886 KB, and linking
 minijinja into an app adds roughly 700 KB.
 

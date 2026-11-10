@@ -81,10 +81,10 @@ a failed request ends the instance, so the cache never outlives a rollback.
 - Memory: every id and indexed value of every opened collection, about 100
   bytes per document plus the values. Memory counts against `memory_mb`.
 - **Cold start**: the first call after an instance starts reads the whole log
-  and parses every document if there are indexes. Measured below at about
-  2.6 ms per 1,000 documents with one index, charged to that request's CPU
-  budget: at the default `cpu_ms` of 200, keep a collection under about
-  50,000 documents, or raise the budget.
+  and parses every document if there are indexes: about 3 ms per 1,000
+  documents with one index (26-39 ms for 10,000 under load), charged to that
+  request's CPU budget. At the default `cpu_ms` of 200, keep a collection
+  under about 50,000 documents, or raise the budget (ISSUES W-622).
 - Space: a record costs 9 bytes plus id and body. Garbage up to the size of
   the live data before a rewrite.
 - Cooperative ownership: don't write `/data/.docs` directly.
