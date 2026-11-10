@@ -94,6 +94,8 @@ pub struct Journal {
     /// charged to the retained-file budget until the last handle closes.
     unlinked: Vec<(Vec<Weak<File>>, u64)>,
     touched: HashSet<PathBuf>,
+    /// Where renames put what they moved, for a captured version to take whole.
+    moved: HashSet<PathBuf>,
     slots: u64,
     /// Bytes the log holds, and the removed files; each may reach `max`.
     held: (u64, u64),
@@ -132,6 +134,7 @@ impl Journal {
             created: HashMap::new(),
             unlinked: vec![],
             touched: HashSet::new(),
+            moved: HashSet::new(),
             slots: 0,
             held: (0, 0),
             max,
@@ -461,6 +464,7 @@ impl Journal {
             Err(_) => p,
         };
         self.touched = self.touched.drain().map(moved).collect();
+        self.moved = self.moved.drain().map(moved).chain([to.clone()]).collect();
         self.touch_parent(&from);
         self.touch_parent(&to);
     }
@@ -509,6 +513,37 @@ impl Journal {
         Ok(())
     }
 
+    /// What this request changed in the volume, given the `paths` it
+    /// touched: the directories whose entries changed, then each file
+    /// changed in place as the ranges that changed, and anything new or
+    /// moved whole.
+    fn changes(&self, paths: &[PathBuf]) -> std::io::Result<committed::Changes> {
+        let inside = |p: &Path| p.strip_prefix(&self.volume).ok().map(Path::to_path_buf);
+        let moved: Vec<_> = self.moved.iter().filter_map(|m| inside(&self.base.join(m))).collect();
+        let mut c = committed::Changes::default();
+        for p in paths {
+            let Some(rel) = inside(p).filter(|rel| !moved.iter().any(|m| rel.starts_with(m))) else { continue };
+            let md = match std::fs::symlink_metadata(p) {
+                Ok(md) => md,
+                // Gone: the listing of a directory it was in says so.
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => continue,
+                Err(e) => return Err(e),
+            };
+            match self.sized.get(&md.ino()) {
+                _ if md.is_dir() => c.listed.push(rel),
+                Some(saved) => {
+                    let grown = saved.len..md.len();
+                    let ranges = saved.ranges.iter().chain(Some(&grown).filter(|g| !g.is_empty()));
+                    let ranges = ranges.filter(|r| r.start < md.len()).map(|r| r.start..r.end.min(md.len())).collect();
+                    c.patched.push((rel, ranges));
+                }
+                None => c.whole.push(rel),
+            }
+        }
+        c.whole.extend(moved.into_iter().filter(|m| self.volume.join(m).exists()));
+        Ok(c)
+    }
+
     fn touch_parent(&mut self, p: &Path) {
         self.touched.insert(p.parent().unwrap_or(Path::new("")).to_path_buf());
     }
@@ -524,9 +559,9 @@ impl Journal {
         self.poisoned = true;
         let paths: Vec<_> = self.touched.drain().map(|p| self.base.join(p)).collect();
         sync_all(&paths)?;
-        let out = committed::directory(&self.base, &self.dir);
+        let (out, old) = (committed::directory(&self.base, &self.dir), self.key);
         if let Some(cap) = &self.capture {
-            committed::prepare(&self.volume, &self.dir, &out, &self.obj, cap)?;
+            committed::prepare(&self.volume, &out, &self.obj, cap, &old, &self.changes(&paths)?)?;
         }
         // A new key is the commit: no record is signed with it.
         self.key = key()?;
@@ -535,8 +570,9 @@ impl Journal {
         tests::sync_point()?;
         log.sync_data()?;
         if self.capture.is_some() {
-            committed::finish(&self.dir, &out, &self.obj, || Ok(()))?;
+            committed::publish(&out, &old)?;
         }
+        self.moved.clear();
         if self.end > KEEP {
             log.set_len(KEEP)?;
         }
@@ -565,17 +601,12 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
     };
     let file = File::options().write(true).open(dir.join(LOG))?;
     let undos = decode(&log, &key);
-    if undos.is_empty() {
-        // The last commit decided, which a capture it staged waits on: a new
-        // key seen here may not be durable yet.
-        committed::finish(dir, &committed::directory(base, dir), obj, || {
-            #[cfg(test)]
-            tests::sync_point()?;
-            file.sync_data()
-        })?;
-    } else {
-        committed::discard(dir)?;
-    }
+    // What commits staged settles first; a key seen here may not be durable yet.
+    committed::settle(&committed::directory(base, dir), obj, &key, !undos.is_empty(), || {
+        #[cfg(test)]
+        tests::sync_point()?;
+        file.sync_data()
+    })?;
     // Each record is dropped from the log once undone and synced, so a crash
     // here resumes where it stopped; the undo it was in may run twice, which
     // each tolerates. A record cut short by a crash was never acted on.
@@ -863,17 +894,134 @@ mod tests {
         Journal::open(v, 1 << 30, Arc::new(ObjShared::new("app".into(), "o")), Some(cap))
     }
 
+    /// The volume that captured versions 1 to `sequence` of `v` restore.
     fn archive_tree(v: &Path, sequence: u64) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
         let base = v.parent().unwrap();
-        let dest = base.join(format!("restored-{sequence}"));
+        let (versions, dest) = (base.join(format!("versions-{sequence}")), base.join(format!("restored-{sequence}")));
         let _ = std::fs::remove_dir_all(&dest);
-        tar::Archive::new(File::open(base.join(format!("~committed/o/{sequence:020}.tar"))).unwrap())
-            .unpack(&dest).unwrap();
-        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(dest.join("nanovm.json")).unwrap()).unwrap();
-        assert_eq!(metadata["app"], "app");
-        assert_eq!(metadata["object"], "o");
-        assert_eq!(metadata["sequence"], sequence);
-        tree(&dest.join("data"))
+        let _ = std::fs::remove_dir_all(&versions);
+        std::fs::create_dir(&versions).unwrap();
+        for n in 1..=sequence {
+            let name = format!("{n:020}.tar");
+            std::fs::copy(base.join("~committed/o").join(&name), versions.join(name)).unwrap();
+        }
+        assert_eq!(committed::restore(&versions, &dest).unwrap(), sequence);
+        tree(&dest)
+    }
+
+    /// How many versions are published in `out`.
+    fn published(out: &Path) -> usize {
+        let names = std::fs::read_dir(out).into_iter().flatten().map(|e| e.unwrap().file_name());
+        names.filter(|n| n.to_str().unwrap().ends_with(".tar")).count()
+    }
+
+    /// Stages `j`'s version as its commit would, without deciding.
+    fn stage(j: &Journal, cap: &CaptureConfig) {
+        let paths: Vec<_> = j.touched.iter().map(|p| j.base.join(p)).collect();
+        let out = committed::directory(&j.base, &j.dir);
+        committed::prepare(&j.volume, &out, &j.obj, cap, &j.key, &j.changes(&paths).unwrap()).unwrap();
+    }
+
+    /// Every version, restored from the snapshot before it and the changes
+    /// since, is the volume as its commit left it, through random creates,
+    /// overwrites, extensions, truncations, renames of files and directories
+    /// (over files and empty directories), removals and type changes.
+    #[test]
+    fn changes_restore_every_version() {
+        let cap = CaptureConfig { max_mb: 64, max_versions: 1000, snapshot_every: 7 };
+        let v = volume();
+        let out = v.parent().unwrap().join("~committed/o");
+        let mut j = captured(&v, &cap).unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let paths = ["a", "b", "f", "d", "e", "d/b", "d/s", "d/s/g", "e/h", "e/s"];
+        // Files and directories made, writes, truncations, removals, renames
+        // of files and of directories.
+        let mut done = [0; 7];
+        for step in 0..120 {
+            for _ in 0..1 + next(4) {
+                let (p, q) = (paths[next(10) as usize], paths[next(10) as usize]);
+                let (pa, qa) = (v.join(p), v.join(q));
+                let fill = vec![b'a' + next(26) as u8; 1 + next(9000) as usize];
+                match std::fs::symlink_metadata(&pa) {
+                    Err(_) if pa.parent().unwrap().is_dir() => {
+                        j.creating(&pa).unwrap();
+                        if next(3) == 0 {
+                            std::fs::create_dir(&pa).unwrap();
+                            done[1] += 1;
+                        } else {
+                            std::fs::write(&pa, &fill).unwrap();
+                            j.created(&pa).unwrap();
+                            done[0] += 1;
+                        }
+                    }
+                    Err(_) => {}
+                    Ok(md) => match next(6) {
+                        0 | 1 if md.is_file() => {
+                            write(&mut j, &v, p, next(md.len() + 10), &fill);
+                            done[2] += 1;
+                        }
+                        2 if md.is_file() => {
+                            let f = File::options().write(true).open(&pa).unwrap();
+                            let size = next(md.len() + 1);
+                            j.writing(&f, size, md.len()).unwrap();
+                            f.set_len(size).unwrap();
+                            done[3] += 1;
+                        }
+                        3 if md.is_file() => {
+                            j.unlink(&pa, md.len()).unwrap();
+                            done[4] += 1;
+                        }
+                        3 if std::fs::read_dir(&pa).unwrap().next().is_none() => {
+                            j.removing_dir(&pa).unwrap();
+                            std::fs::remove_dir(&pa).unwrap();
+                            done[4] += 1;
+                        }
+                        _ if p != q && !q.starts_with(&format!("{p}/")) && qa.parent().unwrap().is_dir() => {
+                            let target = std::fs::symlink_metadata(&qa);
+                            let fits = match &target {
+                                Err(_) => true,
+                                Ok(t) if t.is_dir() => md.is_dir() && std::fs::read_dir(&qa).unwrap().next().is_none(),
+                                Ok(_) => md.is_file(),
+                            };
+                            if fits {
+                                rename(&mut j, &v, p, q);
+                                done[5 + md.is_dir() as usize] += 1;
+                            }
+                        }
+                        _ => {}
+                    },
+                }
+            }
+            j.commit().unwrap();
+            let n = published(&out) as u64;
+            assert_eq!(archive_tree(&v, n), tree(&v), "step {step}, version {n}");
+        }
+        assert!(published(&out) > 80 && done.iter().all(|&n| n > 3), "{} versions, {done:?}", published(&out));
+    }
+
+    /// A small change to a big file is captured as the bytes that changed.
+    #[test]
+    fn a_small_change_is_captured_small() {
+        let cap = CaptureConfig::default();
+        let v = volume();
+        std::fs::write(v.join("big"), vec![1; 1 << 20]).unwrap();
+        let mut j = captured(&v, &cap).unwrap();
+        write(&mut j, &v, "big", 4096, b"X");
+        j.commit().unwrap();
+        write(&mut j, &v, "big", 1 << 19, b"Y");
+        write(&mut j, &v, "big", 1 << 20, b"grown");
+        j.commit().unwrap();
+        let out = v.parent().unwrap().join("~committed/o");
+        assert!(std::fs::metadata(out.join(format!("{:020}.tar", 1))).unwrap().len() > 1 << 20, "a snapshot first");
+        let delta = std::fs::metadata(out.join(format!("{:020}.tar", 2))).unwrap().len();
+        assert!(delta < 8192, "a two-write change took {delta} bytes");
+        assert_eq!(archive_tree(&v, 2), tree(&v));
     }
 
     #[test]
@@ -906,7 +1054,7 @@ mod tests {
                 let changed = tree(&v);
                 let out = committed::directory(&j.base, &j.dir);
                 if rollback {
-                    committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+                    stage(&j, &cap);
                 }
                 drop(j);
                 if !rollback { drop(captured(&v, &cap).unwrap()); }
@@ -921,7 +1069,7 @@ mod tests {
                 for _ in 0..2 {
                     drop(captured(&v, &cap).unwrap());
                     assert_eq!(tree(&v), if committed { &changed } else { &before }.clone(), "cut {cut}");
-                    assert_eq!(std::fs::read_dir(&out).map(|d| d.count()).unwrap_or(0), usize::from(committed));
+                    assert_eq!(published(&out), usize::from(committed));
                     if committed { assert_eq!(archive_tree(&v, 1), changed); }
                 }
                 std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
@@ -943,7 +1091,7 @@ mod tests {
         let mut j = captured(&v, &cap).unwrap();
         change(&mut j, &v);
         let out = committed::directory(&j.base, &j.dir);
-        committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+        stage(&j, &cap);
         // Model a new key visible to a new process, without a completed sync.
         j.log.as_ref().unwrap().write_all_at(&[7; 8], MAGIC.len() as u64).unwrap();
         drop(j);
@@ -952,7 +1100,7 @@ mod tests {
             let result = captured(&v, &cap);
             FAIL_SYNC_AFTER.set(None);
             assert!(result.is_err());
-            assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0,
+            assert_eq!(published(&out), 0,
                 "must not publish before the decision can be synced");
         }
         drop(captured(&v, &cap).unwrap());
@@ -969,7 +1117,7 @@ mod tests {
         change(&mut j, &v);
         let changed = tree(&v);
         let out = committed::directory(&j.base, &j.dir);
-        committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+        stage(&j, &cap);
         drop(j);
         for _ in 0..2 {
             FAIL_SYNC_AFTER.set(Some(0));
@@ -980,7 +1128,7 @@ mod tests {
         }
         drop(captured(&v, &cap).unwrap());
         assert_eq!(tree(&v), before);
-        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        assert_eq!(published(&out), 0);
         std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
     }
 
@@ -1002,7 +1150,7 @@ mod tests {
             for _ in 0..2 {
                 drop(captured(&v, &cap).unwrap());
                 assert_eq!(tree(&v), if committed { changed.clone() } else { before.clone() }, "cut {after}");
-                let count = std::fs::read_dir(&out).map(|d| d.count()).unwrap_or(0);
+                let count = published(&out);
                 assert_eq!(count, usize::from(committed), "cut {after}: state/capture diverged");
                 if committed { assert_eq!(archive_tree(&v, 1), changed, "cut {after}"); }
             }
@@ -1031,7 +1179,7 @@ mod tests {
             let mut j = captured(&v, &cap).unwrap();
             change(&mut j, &v);
             let out = committed::directory(&j.base, &j.dir);
-            committed::prepare(&v, &j.dir, &out, &j.obj, &cap).unwrap();
+            stage(&j, &cap);
             drop(j); // Prepared, but the commit decision was never made.
             FAIL_SYNC_AFTER.with(|c| c.set(Some(after)));
             let result = captured(&v, &cap);
@@ -1041,7 +1189,7 @@ mod tests {
             for _ in 0..2 {
                 drop(captured(&v, &cap).unwrap());
                 assert_eq!(tree(&v), before, "recovery cut {after}");
-                assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "published rejected version at cut {after}");
+                assert_eq!(published(&out), 0, "published rejected version at cut {after}");
             }
             std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
             if finished {
@@ -1057,7 +1205,8 @@ mod tests {
     fn capture_caps_reject_without_discarding_accepted_history() {
         for byte_limit in [false, true] {
             let v = volume();
-            let cap = CaptureConfig { max_mb: 1, max_versions: if byte_limit { 16 } else { 1 } };
+            // Snapshots only, so the byte limit binds.
+            let cap = CaptureConfig { max_mb: 1, max_versions: if byte_limit { 16 } else { 1 }, snapshot_every: 1 };
             if byte_limit { std::fs::write(v.join("large"), vec![7; 600_000]).unwrap(); }
             let mut j = captured(&v, &cap).unwrap();
             write(&mut j, &v, "a", 0, b"accepted");

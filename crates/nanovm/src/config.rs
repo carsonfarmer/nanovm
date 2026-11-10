@@ -134,6 +134,9 @@ config! {
     pub struct CaptureConfig {
         max_mb: u64 = 256u64,
         max_versions: u64 = 16u64,
+        /// Every this many versions, one holds the whole volume; the rest
+        /// hold what a commit changed.
+        snapshot_every: u64 = 16u64,
     }
 }
 
