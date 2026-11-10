@@ -61,8 +61,13 @@ host's per-request commit is the durable boundary.
 
 ## Cost
 
-See [notes/components.md](../../notes/components.md). A point costs 16 bytes
-raw; rollups add 32 bytes per hour and per day that has data.
+Medians of three rounds of `components_bench -- timeseries` (CPU; see
+[notes/components.md](../../notes/components.md) for ranges and method):
+2.2 µs per point in a 1,000-point write, 1.9 ms for a 1-point write in its own
+request (three files committed), 124 µs to aggregate 3 days by day and 133 µs
+a day by hour (72 µs for a request that does nothing), 310 µs a day by 15
+minutes from 1,440 raw points. A point costs 16 bytes raw; rollups add 32
+bytes per hour and per day that has data.
 
 ## Tests
 

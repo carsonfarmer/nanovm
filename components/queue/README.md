@@ -71,8 +71,13 @@ rollback.
 
 Measured with `cargo run --locked -p nanovm --example components_bench --
 queue` (in-process node, dev profile with optimized dependencies, serial
-requests, this 4-core VM under other agents' load). See
-[notes/components.md](../../notes/components.md) for medians and method.
+requests, this 4-core VM under other agents' load; medians of three rounds,
+CPU): an append in its own request 1.3 ms (a KV set: 1.5 ms; both are mostly
+the commit), a batch of 100 appends 16 µs per message, an append inside a
+larger request 67 µs, a 1-message read 173 µs per request against 88 µs for a
+request that does nothing, and `next` (read + commit the position) 1.2 ms.
+116 bytes on disk per 100-byte message. See
+[notes/components.md](../../notes/components.md) for ranges and method.
 
 ## Tests
 

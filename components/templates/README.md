@@ -24,10 +24,10 @@ persistence, rollback and quota tests of the other components don't apply.
 
 Measured in one test app that has both (`components_bench -- templates`;
 see [notes/components.md](../../notes/components.md)): rendering a 20-row
-page costs about the same through the component as through minijinja linked
-into the app (per render 139 vs 125 µs, about 10%: the call copies the context in and
-the HTML out). Size is also similar: the provider is 886 KB, and linking
-minijinja into an app adds roughly 700 KB.
+page costs about 10% more through the component than through minijinja
+linked into the app (139 vs 125 µs CPU per render, medians of three rounds;
+the call copies the context in and the HTML out). Size is similar: the
+provider is 886 KB, and linking minijinja into an app adds roughly 700 KB.
 
 So for **Rust apps the library is the simpler choice**: no composition step,
 no JSON round trip of the context. The component is for guests in languages
