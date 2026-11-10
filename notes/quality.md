@@ -29,7 +29,13 @@ answers, passed.
 RSS and fds are flat (RSS spikes are the `/alloc` and `/echo` peaks being sampled). Mappings rise
 fast while pool slots and caches warm (2,567 → 2,927 in 6.5 minutes) and then creep, slowing:
 +16 per 3 minutes around 10-15 minutes, +8 to +16 per 3 minutes after. It passed the threshold,
-but whether the creep levels off is not shown by 30 minutes: the 24-hour run IDEAS asks for, with
-`/proc/self/maps` diffs to tell anonymous (allocator) from file mappings, is the next step.
+but whether the creep levels off is not shown by 30 minutes.
+
+**24-hour procedure** (out of this round's disk and time budget): on a quiet machine with the
+guests built, `scripts/soak.sh 86400 soak-24h.csv` (samples every 24 minutes; it needs about
+1 GB of test-target build and a few hundred MB of volumes). To classify a mapping creep, save
+`/proc/<pid>/maps` of the test process at the start of the second quarter and at the end and
+compare counts by kind (anonymous allocator regions vs file-backed `.cwasm` code). Pass: the
+same thresholds; a mapping count still rising in the last quarter is worth an issue.
 
 Run: `scripts/soak.sh 1800 soak.csv` (guests built with `scripts/build-guests.sh`).
