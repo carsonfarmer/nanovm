@@ -3951,6 +3951,26 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
     collector.abort();
 }
 
+/// A request to an object names, in `nanovm-callers`, the objects waiting on
+/// it, the caller last, and only nodes say so: a client's forged header never
+/// reaches the guest, nor does one a guest puts on its own call (W-602). One
+/// node, behind the proxy; `nodes::callers_are_named_by_nodes_only_across_
+/// nodes` is the same across two.
+#[tokio::test(flavor = "multi_thread")]
+async fn callers_are_named_by_nodes_only() {
+    let (_sup, node) = supervised("callers_named_by_nodes").await;
+    let records = Arc::new(parking_lot::Mutex::default());
+    let proxy = proxied(node, doh(records.clone()).await).await;
+    let published = publish_wasm("callers-probe", &app("hostile"), probe()).await;
+    let tagged = format!("{}:latest", published.split_once('@').unwrap().0);
+    records.lock().insert("_nanovm.callers.test".to_string(), vec![format!("app={tagged}; trust=dev dev")]);
+    let get = async |path: &str| {
+        raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: callers.test\r\nnanovm-callers: forged\r\nConnection: close\r\n\r\n"), b"").await
+    };
+    assert_eq!(get("/x/callers").await, (200, String::new()), "a client names no caller");
+    assert_eq!(get("/x/call/y").await, (200, "x".into()), "the node names the calling object");
+}
+
 // ---- many nodes --------------------------------------------------------------
 
 mod nodes {
@@ -4262,6 +4282,28 @@ mod nodes {
         };
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), echo).await.unwrap(), Message::text("echo hello"));
         assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 1));
+    }
+
+    /// As `callers_are_named_by_nodes_only`, with the caller and the callee
+    /// on two nodes: the call crosses the proxy's private route, which keeps
+    /// only the header the calling node set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn callers_are_named_by_nodes_only_across_nodes() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let _a = serve(leased("callers_across_a", &la, private.local_addr().unwrap()), la, store.clone()).await;
+        let _b = serve(leased("callers_across_b", &lb, private.local_addr().unwrap()), lb, store.clone()).await;
+        let published = publish_wasm("nodes-callers", &app("hostile"), probe()).await;
+        let (proxy, app) = proxy(&names, private, "callers.test", &published).await;
+        let (x, y) = (homed(&names, &app, &names[0]), homed(&names, &app, &names[1]));
+        let get = async |path: &str| {
+            raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: callers.test\r\nnanovm-callers: forged\r\nConnection: close\r\n\r\n"), b"").await
+        };
+        assert_eq!(get(&format!("/{y}/callers")).await, (200, String::new()), "a client names no caller");
+        assert_eq!(get(&format!("/{x}/call/{y}")).await, (200, x.clone()), "the calling node names the caller");
+        assert_eq!(holder(&store, &app, &y).await.0, names[1], "the call crossed to y's node");
     }
 
     /// An object calls an object on another node, through the proxy, which

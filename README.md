@@ -377,6 +377,7 @@ An object calls another object of its own app with an ordinary outgoing request 
 - The callee commits before it answers, so the caller only ever sees durable changes. Each object commits on its own: a caller that fails afterwards doesn't undo the callee's changes.
 - Calls need no egress rule. They count against the caller's `max_outbound_concurrency`, and their bodies against the app's `max_request_body_kb`.
 - **Cycles are refused.** With one request at a time per object, a call that waits on its own caller, directly (`a` calls `a`) or through other calls (`a` calls `b`, which calls `a`), could never be served. Each object records the objects its calls wait on. A call that would close a cycle gets `508 call-cycle` at once, instead of hanging until a deadline kills both requests and rolls them back. The check and the record happen under the table lock, so two objects calling each other at the same moment can't both get through.
+- **The callee knows its caller.** A call arrives with `nanovm-callers: a,b,c`: the objects waiting on it, the calling object last. Only nodes set it. The caller's node writes it over whatever the guest put on its call, the proxy drops every `nanovm-*` header a client sends, and between nodes it keeps only this one on its private route. So a request without the header came from outside the app, and an object can keep a route to its app's objects, or to one caller, by checking it. Work after an answer calls with its own id only. A node reached without the proxy trusts what it is sent, as it does `nanovm-app`.
 
 ## WebSockets
 

@@ -511,7 +511,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-12: trusted caller header on calls between objects
 - **What:** the node sets `nanovm-caller: <id>` on calls and strips it from client requests, so an object can serve internal endpoints only to its app's objects. Left out of the first version because testing it needs a guest that echoes headers (a guest change; see W-1's note on publishing).
-- **Status:** open
+- **Status:** done with W-602 on `cf/multinode-r3`, as `nanovm-callers` (the chain, caller last) rather than `nanovm-caller`
 
 ### W-13: removable code in the rewrite's files
 - **What:** from the review's list, for the agent rewriting these files: drop the registry's manifest cache and the SHA-256 re-check in `Registry::store` (oci-client already checks digests) and its `to_vec` copy (N-18); drop the `memory_mb <= memory_reservation_mb` checks in `config.rs` (the pool and the limiter already enforce both). Keep the digest-format check of N-3. Owner's call, smaller: stop forwarding the guest's connect and first-byte timeouts, the fs-denied event throttle, the worker-side `well_formed` check on publishes.
@@ -595,7 +595,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-602: tell an object who is calling it
 - **What:** a call between objects (`http://nanovm/objects/{id}/…`) reaches its target as an ordinary request, so an object can't tell its app's own calls from a client's, and every route meant for other objects is public (`examples/tictactoe`'s `/join`, `examples/chat`'s `/rooms/…`); apps must write them defensively. The host could set a header naming the calling object on calls and strip it from every request that enters from outside (the node's front door and the worker link), so an object could keep internal routes. It is a security property of every entry path (`server.rs`, `egress.rs`, the worker link), so it is for their owners.
-- **Status:** open
+- **Status:** done on `cf/multinode-r3` (with W-10): calls carry `nanovm-callers` (the objects waiting on the call, the caller last), which only nodes set: the calling worker overwrites a guest's own, the proxy drops a client's and keeps only the node's on its private call route between nodes. `callers_are_named_by_nodes_only` (one node behind the proxy) and `nodes::callers_are_named_by_nodes_only_across_nodes` check that a client's forged header never reaches the guest and a call shows its caller; each of the three rules is mutation-checked. README: "The callee knows its caller". A node reached without the proxy trusts what it is sent, as for `nanovm-app`.
 
 ### W-90: carry W-10's epoch in W-9's committed versions, fenced at the store
 - **What:** name each committed version `(app, object, epoch, seq)` from `Node::lease_epoch` (the line before `quota.commit()` in `object::commit`), and make the write that makes a version durable off the node conditional on the object's lease record (`If-Match` the version the grant, or the last commit, produced), so a node that lost the lease mid-commit can't publish a version. A taker restores up to the head it found. Contract in `notes/multinode.md`.
