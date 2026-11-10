@@ -16,8 +16,9 @@ use crate::egress::{EgressPolicy, Route, Upstream};
 use crate::object::{ObjState, Scratch};
 
 /// Import prefixes a guest may use. Everything else (sockets, the WASIp2
-/// filesystem, anything custom) is refused at load time, so the only paths
-/// out of the sandbox are the quota'd filesystem and allowlisted HTTP.
+/// filesystem, anything custom) is refused at load time, and [`linker`]
+/// defines none of it, so the only paths out of the sandbox are the quota'd
+/// filesystem and allowlisted HTTP.
 const ALLOWED_IMPORTS: &[&str] = &[
     "wasi:io/",
     "wasi:clocks/",
@@ -45,9 +46,26 @@ pub struct App {
     _ownership: std::fs::File,
 }
 
+/// The host's side of every import [`ALLOWED_IMPORTS`] permits, and nothing
+/// else: no WASIp2 filesystem (it would reach `/data` around the quota and
+/// the journal) or sockets, so an allowlist that let them through would
+/// still fail to link them (N-500).
 pub fn linker(engine: &Engine) -> anyhow::Result<Linker<ObjState>> {
-    let mut linker = Linker::new(engine);
-    wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    use wasmtime_wasi::p2::bindings::{cli, random};
+    use wasmtime_wasi::{WasiView, cli::WasiCli, cli::WasiCliView, random::WasiRandom};
+    let mut linker = Linker::<ObjState>::new(engine);
+    // WASIp2 io, clocks, `random` and stdio; then the rest of random and cli.
+    wasmtime_wasi::p2::add_to_linker_proxy_interfaces_async(&mut linker)?;
+    let l = &mut linker;
+    random::insecure::add_to_linker::<_, WasiRandom>(l, |s| s.ctx().ctx.random())?;
+    random::insecure_seed::add_to_linker::<_, WasiRandom>(l, |s| s.ctx().ctx.random())?;
+    cli::exit::add_to_linker::<_, WasiCli>(l, ObjState::cli)?;
+    cli::environment::add_to_linker::<_, WasiCli>(l, ObjState::cli)?;
+    cli::terminal_input::add_to_linker::<_, WasiCli>(l, ObjState::cli)?;
+    cli::terminal_output::add_to_linker::<_, WasiCli>(l, ObjState::cli)?;
+    cli::terminal_stdin::add_to_linker::<_, WasiCli>(l, ObjState::cli)?;
+    cli::terminal_stdout::add_to_linker::<_, WasiCli>(l, ObjState::cli)?;
+    cli::terminal_stderr::add_to_linker::<_, WasiCli>(l, ObjState::cli)?;
     crate::quota::add_to_linker(&mut linker)?;
     wasmtime_wasi_config::add_to_linker(&mut linker, |s| WasiConfig::from(&*s.config))?;
     wasmtime_wasi_http::p3::add_to_linker(&mut linker)?;

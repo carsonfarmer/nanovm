@@ -160,10 +160,14 @@ async fn local(node: Arc<Node>, req: http::Request<hyper::body::Incoming>) -> ht
     let Some(object) = object.filter(|_| ws::wants(&req)) else { return nanovm::server::handle(node, req).await };
     let (n, max) = (node.clone(), (nanovm::config::ProxyConfig::default().max_response_body_kb << 10) as usize);
     let deliver: ws::Deliver = Box::new(move |req| Box::pin(event(n.clone(), req, max)));
-    node.sockets.clone().upgrade(object, req.map(http_body_util::BodyExt::boxed_unsync), deliver).await
+    node.sockets.clone().upgrade(object, req.map(|b| http_body_util::BodyExt::boxed_unsync(http_body_util::BodyExt::map_err(b, Into::into))), deliver).await
 }
 
-async fn event<B: http_body::Body<Data = bytes::Bytes, Error = hyper::Error>>(node: Arc<Node>, req: http::Request<B>, max: usize) -> ws::Reply {
+async fn event<B>(node: Arc<Node>, req: http::Request<B>, max: usize) -> ws::Reply
+where
+    B: http_body::Body<Data = bytes::Bytes> + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     use http_body_util::BodyExt;
     // Reboxed with a concrete error: awaiting a `dyn Error` one trips rustc's `Send` check.
     let res = nanovm::server::handle(node, req).await.map(|b| b.map_err(|e| std::io::Error::other(e.to_string())).boxed_unsync());

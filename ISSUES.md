@@ -455,6 +455,27 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `ship.rs` (`restore`)
 - **Scenario:** keys are probed from sequence 1 until one is missing; only versions from the last snapshot on are needed, and the store keeps everything (no remote retention yet).
 - **Fix (proposed):** a pointer object to the last shipped snapshot, written after it, and retention of versions before the second-last snapshot.
+
+### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
+- **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
+- **Scenario:** found by the quality agent while writing D-52. The node's linker defines every WASIp2 interface, including `wasi:filesystem@0.2` and `wasi:sockets@0.2`, and the WASIp2 filesystem shares the `WasiCtx`'s read-write preopens. A guest using `std::fs` links (`instantiate_pre` succeeds). Today `ALLOWED_IMPORTS` refuses it at load, by name, so nothing is exploitable; but that check is the single layer between a guest and writes to `/data` that bypass the quota and the journal (no rollback). Sockets have a second layer (wasmtime's default address check denies every address).
+- **Reproduced:** yes (`components_importing_refused_interfaces_are_rejected_by_name`: `p2_filesystem` and `p2_sockets` link against `app::linker`; with `check_imports` disabled, `p2_sockets was loaded`).
+- **Suggestion:** link only the WASIp2 interfaces `ALLOWED_IMPORTS` permits (io, clocks, random, cli), so a regression in the allowlist fails at link time instead of opening `/data`. Defense in depth, not a bug.
+- **Fix:** `app::linker` defines only the WASIp2 interfaces the allowlist permits (io, clocks, random, cli), so the fixtures fail to link (`wasi:sockets/…`, `wasi:filesystem/…` not found) even without the check. Building the linker got cheaper (median 148 → 90 µs); instantiation is unchanged (`notes/hardening.md`).
+- **Status:** fixed on `cf/hardening`
+
+### N-680: a link connection answered before its request body was sent went back to the pool, holding the body
+- **Where:** `link.rs` (`LinkBody::poll_frame` pooled the connection once the response ended if it was still open)
+- **Scenario:** found by the hardening agent while testing N-505 through the supervisor. A worker that answers before reading the whole request body (a 408 `body-timeout`, or a 413) leaves the supervisor's link connection still sending that body. If the response's last frame was read before the connection saw the worker hang up, the connection went into the idle pool, where nothing polls it: it kept the client's body, and so the client's connection to the node, open indefinitely, with the 408 already sent. `checkout` never reuses such a connection (it isn't ready), so it only leaked.
+- **Reproduced:** yes: 1 run in 5 of `slow_request_bodies_are_cut_at_every_entry_point`, the supervisor's client got its 408 and the connection stayed open (40 s and more); `a_connection_answered_before_its_body_is_sent_is_not_pooled` fails every time without the fix.
+- **Fix:** a connection is pooled only if it is also ready for the next request (`SendRequest::is_ready`, the check `checkout` already made); otherwise it is dropped, which drops the body and lets the client's connection close. No new runtime lines.
+- **Status:** fixed on `cf/hardening`
+
+### N-681: the node's front end has no header timeout
+- **Where:** `main.rs` (`front` → `server::serve_http1` → `serve_conn(…, None, …)`); hyper's default 30 s header timeout needs a timer, which isn't set
+- **Scenario:** found by the hardening agent while fixing N-505. The proxy gives a client 10 s for a request's headers; the node's own listener gives none, so a client that reaches the node directly can hold a connection (and an fd) by sending a request head a byte at a time. Bodies are bounded since N-505; heads are not. Behind the proxy, as deployed (the node listens on loopback), only the proxy reaches it.
+- **Reproduced:** by reading: `Dur::Default` timeouts are dropped without a timer (`hyper::common::time::Time::check`). Not run.
+- **Suggestion:** set a header timeout at the node longer than the proxy's pool idle timeout (hyper-util's 90 s default), or the node would close idle pooled connections as the proxy reuses them; or lower the proxy's pool idle timeout below the node's.
 - **Status:** open
 
 ## Planned work

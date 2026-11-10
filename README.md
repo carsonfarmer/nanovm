@@ -261,6 +261,7 @@ That is the repository and the tag deployed, each identity whose signature is ac
 - drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards HTTP requests; it holds WebSockets itself and forwards their events;
 - speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
 - gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too);
+- makes a client keep sending a request's body: it may keep the proxy waiting 10 s in all, plus a second for every 4 KiB it sends, or gets a 408 (`body-timeout`) and its connection is closed. A body trickled a byte at a time is cut after about 10 s; an upload at 4 KiB/s or faster never is. The node applies the same rule as it reads a body, so a client that reaches it directly is held to it too;
 - refuses a request head over 64 KiB (431), as every hop does (node, worker links, egress responses).
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
@@ -593,10 +594,11 @@ Every scenario completed with 0 failed requests.
 
 ### Host requirements on Linux
 
-Each worker checks these at startup and refuses to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
+The supervisor and each worker check these at startup and refuse to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
 
 - **File descriptors:** each live object holds 2 (`/data` and `/tmp`). The check needs about `2 × max_live_objects + 1024`. The worker raises its soft limit to the hard limit itself, before it jails itself; the demo's 8,000 objects per app need `ulimit -n` of at least 17,088.
 - **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 8,000 needs `sysctl -w vm.max_map_count=68352` or more.
+- **Address space:** the engine reserves each pool slot's 4 memories (`memory_reservation_mb` + 64 KiB each), stacks and tables up front, about 522 GiB at the defaults. Under `ulimit -v` or `LimitAS=` below that, `nanovm serve` refuses to start with the number; remove the limit or lower `max_live_objects` or `memory_reservation_mb`.
 - **The jail** needs Landlock (Linux 5.13+) and seccomp. A separate uid per app needs the supervisor to run as root.
 - **Don't run with `RUST_BACKTRACE` set.** wasmtime then captures a stack backtrace for every guest-visible error. That includes routine ones, like reading a file that doesn't exist yet. With it set, warm throughput across 1,000 objects fell from 63K/s to 23K/s.
 

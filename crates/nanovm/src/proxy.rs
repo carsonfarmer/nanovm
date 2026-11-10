@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use http::header::{CONNECTION, PROXY_AUTHORIZATION, TE, TRAILER, UPGRADE};
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full, Limited, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use oci_spec::distribution::Reference;
 use parking_lot::Mutex;
@@ -41,9 +41,8 @@ use crate::object::{RespBody, error_response};
 use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
 use crate::ws::{self, Sockets};
 
-/// How long a client may take over each request's headers (or idle between
-/// requests).
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::server::CLIENT_TIMEOUT;
+
 /// How long to wait after trying every node for an object before trying again.
 const RETRY: Duration = Duration::from_millis(100);
 
@@ -113,7 +112,7 @@ impl<T: Clone> Cache<T> {
     }
 }
 
-pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
+pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, crate::object::BoxError>;
 
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> anyhow::Result<Arc<Proxy>> {
@@ -189,10 +188,16 @@ impl Proxy {
         };
         let object = object.to_owned();
         if upgrading {
-            return Ok(self.socket(name, host, object, Request::from_parts(parts, body.boxed_unsync())).await);
+            return Ok(self.socket(name, host, object, Request::from_parts(parts, body.map_err(Into::into).boxed_unsync())).await);
         }
         parts.headers.extend(headers);
-        let res = self.send(&name, &object, Request::from_parts(parts, body.boxed_unsync())).await?;
+        // The node cuts a slow body too; this holds even if it doesn't (N-505).
+        let req = Request::from_parts(parts, crate::server::Paced::new(body).boxed_unsync());
+        let res = match self.send(&name, &object, req).await {
+            Ok(res) => res,
+            Err((StatusCode::REQUEST_TIMEOUT, _)) => return Ok(crate::server::body_timeout()),
+            Err(e) => return Err(e),
+        };
         Ok(res.map(|b| b.map_err(Into::into).boxed_unsync()))
     }
 
@@ -202,15 +207,34 @@ impl Proxy {
     async fn send(&self, name: &str, object: &str, mut req: Request<Body>) -> Result<Response<Incoming>, (StatusCode, String)> {
         let pq = req.uri().path_and_query().map_or("/", |p| p.as_str()).to_owned();
         let uri = |node: &str| format!("http://{node}{pq}").parse::<http::Uri>().map_err(|_| (StatusCode::BAD_REQUEST, pq.clone()));
-        let bad_gateway = |e: hyper_util::client::legacy::Error| (StatusCode::BAD_GATEWAY, e.to_string());
+        // A body that ran out of time (N-505) is the client's fault: 408.
+        let bad_gateway = |e: hyper_util::client::legacy::Error| match crate::server::timed_out(&e) {
+            true => (StatusCode::REQUEST_TIMEOUT, e.to_string()),
+            false => (StatusCode::BAD_GATEWAY, e.to_string()),
+        };
         // One node has nowhere else to send it: stream it there.
         if let [node] = &self.cfg.nodes[..] {
             *req.uri_mut() = uri(node)?;
             return self.node.request(req).await.map_err(bad_gateway);
         }
-        let (parts, body) = req.into_parts();
+        let (parts, mut body) = req.into_parts();
         let max = (self.cfg.max_request_body_kb << 10) as usize;
-        let body = Limited::new(body, max).collect().await.map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, "request body".into()))?.to_bytes();
+        // Buffered to retry on another node (N-182); a body that runs out of
+        // time is the client's (408, N-505).
+        let mut buf = bytes::BytesMut::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| match crate::server::timed_out(&*e) {
+                true => (StatusCode::REQUEST_TIMEOUT, "request body".to_string()),
+                false => (StatusCode::BAD_REQUEST, e.to_string()),
+            })?;
+            if let Ok(data) = frame.into_data() {
+                if buf.len() + data.len() > max {
+                    return Err((StatusCode::PAYLOAD_TOO_LARGE, "request body".into()));
+                }
+                buf.extend_from_slice(&data);
+            }
+        }
+        let body = buf.freeze();
         let ranked = rank(&self.cfg.nodes, name, object);
         let deadline = Instant::now() + Duration::from_millis(self.cfg.failover_ms);
         let (mut tries, mut owner) = (0, None);
@@ -300,7 +324,7 @@ impl Proxy {
         }
         parts.headers.extend(headers);
         parts.uri = pq.parse().map_err(|_| (StatusCode::BAD_REQUEST, pq.clone()))?;
-        let res = self.send(&name, object, Request::from_parts(parts, body.boxed_unsync())).await?;
+        let res = self.send(&name, object, Request::from_parts(parts, body.map_err(Into::into).boxed_unsync())).await?;
         Ok(res.map(|b| b.map_err(Into::into).boxed_unsync()))
     }
 

@@ -132,8 +132,12 @@ impl AppRef {
             })
             .collect::<anyhow::Result<_>>()?;
         let min_version = get(MIN_VERSION_HEADER).transpose()?.map(str::parse).transpose()?;
+        let host = get(HOST_HEADER).transpose()?.unwrap_or_default().to_ascii_lowercase();
+        // A DNS name, as the proxy finds it, or none: so the app's name is a valid name (N-506).
+        let label = |l: &str| (1..=63).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        ensure!(host.is_empty() || host.len() <= 253 && host.split('.').all(label), "{HOST_HEADER} {host:?} is not a DNS name");
         Ok(Some(AppRef {
-            host: get(HOST_HEADER).transpose()?.unwrap_or_default().to_ascii_lowercase(),
+            host,
             reference,
             digest,
             policy: Policy { trust, min_version },
@@ -590,6 +594,23 @@ mod tests {
             assert!(err(&h).contains("<issuer> <subject>"), "{bad:?}");
         }
         assert!(err(&headers(&[(APP_HEADER, &app)])).contains("nanovm-trust is required"));
+    }
+
+    /// `nanovm-host` is a DNS name or nothing, so every app it names has a
+    /// valid name: `.com` gave `.com_ghcr.io_…`, which no table accepts
+    /// (N-506, found by fuzzing). Only the proxy sets it, from DNS.
+    #[test]
+    fn hosts_are_dns_names() {
+        let app = app();
+        let with = |host: &str| AppRef::from_headers(&headers(&[(APP_HEADER, &app), (TRUST_HEADER, "i s"), (HOST_HEADER, host)]));
+        for good in ["", "example.com", "Counter.Test", "_x.a-b.example", &"a".repeat(63), &["a"; 127].join(".")] {
+            let r = with(good).unwrap_or_else(|e| panic!("{good:?}: {e:#}")).unwrap();
+            assert!(crate::table::valid_name(&r.name()), "{good:?}: {}", r.name());
+        }
+        for bad in [".com", ".", "a..b", "a.", "-.", "a b", "a/b", "a,b", "*.example", &"a".repeat(64), &["a"; 128].join(".")] {
+            let e = format!("{:#}", with(bad).unwrap_err());
+            assert!(e.contains("is not a DNS name"), "{bad:?}: {e}");
+        }
     }
 
     /// The version floor is optional and must be full semver.

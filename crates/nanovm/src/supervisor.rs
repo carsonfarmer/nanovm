@@ -153,6 +153,8 @@ impl Supervisor {
         cfg.validate()?;
         anyhow::ensure!(leases.is_some() != cfg.leases.is_empty(), "a node with leases has their store");
         let ttl = Duration::from_millis(cfg.lease_ms);
+        // Workers inherit its limits: a node too big for them fails here, not in each worker.
+        crate::engine::preflight(&cfg)?;
         let sup = Arc::new(Supervisor {
             runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
