@@ -35,8 +35,7 @@ fn guest(name: &str) -> Vec<u8> {
 /// them.
 fn app(name: &str) -> AppConfig {
     let limits = match name {
-        // A generous CPU budget: oversubscribed CI hosts inflate the
-        // wall-time budget; CPU kills are tested on `hostile`.
+        // A generous CPU budget: CPU kills are tested on `hostile`.
         "counter" => serde_json::json!({
             "memory_mb": 16, "cpu_ms": 500, "request_timeout_ms": 2000,
             "idle_timeout_ms": 60000, "disk_mb": 1, "max_files": 100,
@@ -373,7 +372,12 @@ async fn kills_do_not_disturb_neighbours() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cpu_hogs_leave_cores_for_short_requests() {
-    let node = node("cpu_hogs_leave_cores_for_short_requests", "hostile", 128);
+    // Hogs that take turns on two lanes of a loaded host get their 100 ms
+    // of CPU after more than hostile's 1 s deadline: the budget, not the
+    // deadline, is under test.
+    let mut hostile = app("hostile");
+    hostile.limits.request_timeout_ms = 10_000;
+    let node = node_with(node_cfg("cpu_hogs_leave_cores_for_short_requests", 128), hostile);
     let cores = std::thread::available_parallelism().unwrap().get();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Four spinners per core: without heavy lanes they hold every worker.
@@ -414,10 +418,12 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
 
 /// `hostile` with room for heavy file work: writes and creates run inline
 /// and count against the CPU budget, which on a loaded host (the full suite)
-/// can pass 100 ms. These tests are about quotas, not CPU.
+/// can pass 100 ms, and their syncs can take seconds. These tests are about
+/// quotas, not limits.
 fn filler() -> AppConfig {
     let mut hostile = app("hostile");
     hostile.limits.cpu_ms = 1_000;
+    hostile.limits.request_timeout_ms = 10_000;
     hostile
 }
 
@@ -1623,7 +1629,7 @@ async fn kv_values_persist_in_the_volume() {
 /// budget, which `/data` and `/tmp` share.
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_counts_against_the_disk_quota() {
-    let node = node("kv_quota", "hostile", 8);
+    let node = node_with(node_cfg("kv_quota", 8), filler());
     // An 8 MiB budget holds exactly eight 1 MiB values.
     let r = get(&node, "q", "/kv?op=fill&size=1048576&n=100").await;
     assert_eq!(r.json()["set"], 8, "{}", r.body);
@@ -1642,11 +1648,12 @@ async fn kv_counts_against_the_disk_quota() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_refuses_bad_names_and_streams_keys() {
-    // Writing 1,500 keys takes real CPU; give it room on a loaded host.
+    // Writing 1,500 keys takes real CPU, and on a busy disk more than 10 s
+    // (N-32); give it room on a loaded host.
     let mut hostile = app("hostile");
     hostile.limits.cpu_ms = 5_000;
     hostile.limits.max_files = 3000;
-    hostile.limits.request_timeout_ms = 10_000;
+    hostile.limits.request_timeout_ms = 60_000;
     let node = node_with(node_cfg("kv_refuses", 8), hostile);
     let call = |path: &'static str| {
         let node = node.clone();
@@ -2233,7 +2240,9 @@ async fn sqlite_journal_pressure_matrix() {
     let cfg = node_cfg("sqlite_pressure", 8);
     let mut app = app("counter");
     app.limits.cpu_ms = 5000;
-    app.limits.request_timeout_ms = 15_000;
+    // 1,000 synced statements wait for a busy disk for up to 16 s while
+    // using under 1 s of CPU.
+    app.limits.request_timeout_ms = 60_000;
     let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
     let node = Node::new(cfg, &app, &wasm, None).unwrap();
     let expected = |changed: bool| {
@@ -2301,7 +2310,8 @@ async fn sqlite_handled_storage_exhaustion() {
     let cfg = node_cfg("sqlite_handled_exhaustion", 8);
     let mut app = app("counter");
     app.limits.cpu_ms = 5000;
-    app.limits.request_timeout_ms = 15_000;
+    // As in the pressure matrix: the disk, not the CPU, sets the time.
+    app.limits.request_timeout_ms = 60_000;
     let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
     let node = Node::new(cfg, &app, &wasm, None).unwrap();
     for object in ["insert", "bulk"] {
