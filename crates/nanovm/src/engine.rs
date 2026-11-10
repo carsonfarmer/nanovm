@@ -24,13 +24,13 @@ pub fn build(cfg: &NodeConfig) -> anyhow::Result<Engine> {
     // the cost is explicit bounds checks instead of guard-page elision.
     let reservation = cfg.memory_reservation_mb << 20;
     c.memory_reservation(reservation);
-    c.memory_guard_size(64 << 10);
+    c.memory_guard_size(GUARD);
     c.memory_reservation_for_growth(0);
 
     // Every admitted component can use its full per-component allowance.
     // Composed providers add memories, tables and adapter core instances.
     let n = cfg.max_live_objects as u32 + 32;
-    let (cores, memories, tables) = (16, 4, 8);
+    let (cores, memories, tables) = (16, MEMORIES_PER_OBJECT as u32, 8);
     let mut pool = PoolingAllocationConfig::default();
     pool.total_component_instances(n);
     pool.total_core_instances(n * cores);
@@ -48,6 +48,11 @@ pub fn build(cfg: &NodeConfig) -> anyhow::Result<Engine> {
     Engine::new(&c).map_err(Into::into)
 }
 
+/// Linear memories per component instance, each reserved up front.
+pub const MEMORIES_PER_OBJECT: u64 = 4;
+/// The guard after each linear memory.
+const GUARD: u64 = 64 << 10;
+
 /// File descriptors a live object holds: its `/data` and `/tmp` preopens.
 /// Files a guest opens come on top.
 pub const FDS_PER_OBJECT: u64 = 2;
@@ -58,7 +63,8 @@ pub const MAPS_PER_OBJECT: u64 = 24;
 /// Checks that the process can actually hold `max_live_objects`, raising the
 /// soft fd limit to the hard limit first. Without this a node that is too
 /// big for its host starts fine and then fails instantiations at runtime
-/// with `EMFILE` or `ENOMEM`.
+/// with `EMFILE` or `ENOMEM`, or its engine with "failed to create memory
+/// pool mapping".
 pub fn preflight(cfg: &NodeConfig) -> anyhow::Result<()> {
     let n = cfg.max_live_objects as u64 + 32;
     let fds = raise_nofile()?;
@@ -77,6 +83,21 @@ pub fn preflight(cfg: &NodeConfig) -> anyhow::Result<()> {
             "max_live_objects = {} needs about {need_maps} memory mappings, but vm.max_map_count is {maps}; \
              raise it (`sysctl -w vm.max_map_count={need_maps}`) or lower max_live_objects",
             cfg.max_live_objects
+        );
+    }
+    // Building the engine reserves every slot's memories, stacks and tables
+    // (about 3.3 MiB) at once (N-671); the rest of the process gets 1 GiB.
+    let need_as = n * (MEMORIES_PER_OBJECT * ((cfg.memory_reservation_mb << 20) + GUARD) + (4 << 20)) + (1 << 30);
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `lim` is a valid pointer for getrlimit.
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut lim) } == 0 && lim.rlim_cur != libc::RLIM_INFINITY {
+        let (need, have) = (need_as.div_ceil(1 << 30), lim.rlim_cur as u64 >> 20);
+        anyhow::ensure!(
+            lim.rlim_cur as u64 >= need_as,
+            "max_live_objects = {} with memory_reservation_mb = {} reserves about {need} GiB of address space, \
+             but RLIMIT_AS is {have} MiB; remove the limit (`ulimit -v unlimited` or LimitAS=infinity in the unit) \
+             or lower max_live_objects or memory_reservation_mb",
+            cfg.max_live_objects, cfg.memory_reservation_mb
         );
     }
     Ok(())

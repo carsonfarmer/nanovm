@@ -142,6 +142,8 @@ impl Supervisor {
     /// Call within the control/egress runtime. `threads` counts front-end threads.
     pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
+        // Workers inherit its limits: a node too big for them fails here, not in each worker.
+        crate::engine::preflight(&cfg)?;
         let sup = Arc::new(Supervisor {
             runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,

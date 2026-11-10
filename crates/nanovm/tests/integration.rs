@@ -3043,6 +3043,36 @@ mod sockets {
     }
 }
 
+/// Under an address-space limit (`ulimit -v`) smaller than the pooling
+/// allocator reserves, `nanovm serve` refuses to start and says what it
+/// needs, instead of starting and then failing every app's worker with
+/// "failed to create memory pool mapping" (N-671).
+#[test]
+fn serve_explains_an_address_space_limit() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("address_space_limit");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("nanovm.toml");
+    let toml = format!("listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nmax_live_objects = 8\nmemory_reservation_mb = 64\n", dir.join("data"));
+    std::fs::write(&cfg, toml).unwrap();
+    // 4 GiB: plenty for the supervisor, a third of what 40 slots reserve.
+    let cmd = format!("ulimit -v {} && exec {} serve --config {}", 4 << 20, env!("CARGO_BIN_EXE_nanovm"), cfg.display());
+    let mut child = std::process::Command::new("sh").args(["-c", &cmd]).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let t0 = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if t0.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("nanovm serve started under ulimit -v 4 GiB");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("reserves about 12 GiB of address space, but RLIMIT_AS is 4096 MiB") && stderr.contains("ulimit -v unlimited"), "{stderr}");
+}
+
 // ---- the proxy -------------------------------------------------------------
 
 /// A DNS-over-HTTPS stub answering TXT queries from `records`, by name.
