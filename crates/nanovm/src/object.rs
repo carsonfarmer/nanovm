@@ -475,13 +475,12 @@ enum Exit {
 /// changes stand whether or not a publish gets through). Only while the node
 /// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route, held_lease) = acc.with(|mut s| {
+    let (quota, held, route) = acc.with(|mut s| {
         let s = s.data_mut();
-        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.shared.lease_epoch())
+        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
     });
-    // The journal checks again at its decision, and its captures carry the
-    // epoch; this also covers requests that changed nothing but publish.
-    held_lease?;
+    // Only while the node holds the object's lease (see `Journal::commit`):
+    // otherwise neither its changes nor its publishes go out.
     quota.commit()?;
     if let crate::egress::Route::Supervisor(up) = route
         && !held.is_empty()
@@ -626,15 +625,6 @@ async fn serve(
                     job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", false));
                     job
                 };
-                // A node that lost the lease serves nothing more; the proxy
-                // takes the request to the node that has it.
-                if !shared.holds() {
-                    let response = crate::table::misdirected(None);
-                    crate::telemetry::response(&mut job.span, &response);
-                    let _ = job.reply.send(response);
-                    acc.with(|mut s| s.data_mut().reset = true);
-                    return Ok(());
-                }
                 *shared.context.lock() = job.context.clone();
                 *shared.callers.lock() = std::mem::take(&mut job.callers);
                 shared.begin_request();

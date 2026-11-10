@@ -410,7 +410,9 @@ impl Journal {
     /// Makes the request's changes durable and forgets how to undo them.
     pub fn commit(&mut self) -> std::io::Result<()> {
         self.check()?;
-        let Some(log) = self.log.take() else { return Ok(()) };
+        // With nothing to commit, the lease still decides whether its
+        // publishes go out.
+        let Some(log) = self.log.take() else { return self.obj.lease_epoch().map(drop) };
         // Any error leaves the outcome uncertain. In particular, taking the
         // log must not make a second commit look like an empty successful one.
         self.poisoned = true;
@@ -788,10 +790,13 @@ mod tests {
         change(&mut j, &w);
         session.set(1, mono_ns());
         assert!(j.commit().is_err());
+        let x = volume();
+        assert!(Journal::open(&x, 1 << 30, obj.clone(), None).unwrap().commit().is_err(),
+            "nothing changed, but nothing may be published either");
         drop(j);
         drop(Journal::open(&w, 1 << 30, obj, None).unwrap());
         assert_eq!(tree(&w), before, "undone on recovery");
-        for v in [v, w] {
+        for v in [v, w, x] {
             std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
         }
     }

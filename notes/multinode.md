@@ -55,12 +55,13 @@ and `until` (CLOCK_MONOTONIC, the same in both processes). A worker's actor
 asks its supervisor for the object's lease (`POST http://nanovm/_lease/{id}`
 on the egress link; guests are denied that path) **before instantiating**,
 and gives it up when the actor exits. A worker:
-- refuses a request with 421 when the object's lease is lost, both when
-  queueing it and again when it reaches the front of the queue (so it never
-  runs on a stale instance);
+- refuses a request with 421 when the object's lease is lost, when queueing
+  it; a request already queued, or running, when the lease goes fails its
+  commit, which resets the instance, and the next is refused (421) when the
+  actor asks for the lease again before a new instance;
 - evicts idle objects at once when the session lapses or changes; busy ones
   stop at their next request or commit;
-- refuses any commit once the lease is gone (`Node::lease_epoch`, below);
+- refuses any commit once the lease is gone (`ObjShared::lease_epoch`, below);
 - strips `nanovm-owner` from guest responses. Otherwise a guest answering 421
   could make the proxy run its request again on every node for `failover_ms`.
 
@@ -82,44 +83,54 @@ limits are unchanged: the caller's outbound permits and request-body cap, and
 the callee's own limits on its node. One node keeps the in-process path. Trace
 context crosses nodes as `traceparent`.
 
-## The hook for W-9 (storage agent, `cf/storage`)
+## The hook, and W-9's capture
+
+`ObjShared::lease_epoch() -> io::Result<u64>`: the epoch of the node's lease on
+the object, or an error once the node no longer holds it (0 with one node). It
+is reachable from the journal, which holds the object's `ObjShared`, so it
+sits where W-9's local capture (`committed.rs`, merged from `cf/main-next`
+3dafe33) decides a commit:
 
 ```rust
-// object.rs, commit(): the one line on the commit path
-let _epoch = node.lease_epoch(&shared)?;   // Err once this node lost the lease
-quota.commit()?;
+// journal.rs, Journal::commit: after the syncs and committed::prepare
+self.obj.lease_epoch()?;                     // the decision: only under the lease
+std::fs::remove_file(self.dir.join(LOG))?;   // deleting the log is the commit
 ```
 
-`Node::lease_epoch(&ObjShared) -> io::Result<u64>`: the epoch of this node's
-lease on the object, or an error once the node no longer holds it. It is 0
-with one node. The contract for joining it to the commit stream:
+- `committed::prepare` records the epoch in the captured version
+  (`Version.format` 2, field `epoch`, next to `sequence`: no second
+  sequence). A version is named `(app, object, epoch, sequence)`; epochs rise
+  strictly per object across nodes.
+- A lease that lapses while the version is written (a full-volume archive,
+  which can take a while) refuses the commit at the decision. The journal is
+  left poisoned; recovery discards the staged version and undoes the change,
+  as for any failure before the decision.
+- A request that changed nothing still asks the journal, which checks the
+  lease then too, so a node that lost the object publishes nothing for it.
 
-1. **Identity.** A committed version is named `(app, object, epoch, seq)`.
-   Epochs rise strictly per object across nodes. `seq` restarts or continues
-   per epoch, as the stream chooses, as long as replay orders by
-   `(epoch, seq)`.
-2. **The local check is not the fence.** It stops a node that knows it lost
-   the lease, cheaply, before the local journal commit. A commit that is slow
-   (fsyncs) can still end after the lease lapses. The fence that makes a lost
-   node's commit harmless must be at the store: **the write that makes a
-   version durable off the node must be conditional on the lease record not
-   having moved**. Proposed: keep the stream's head in the lease record
-   (`objects/<app>/<object>` gains `head`), written `If-Match` the version the
-   grant (or the previous commit) produced. A 412 means another node took the
-   object: report the commit as failed and reset the instance. `Grant` already
-   carries that version (`e_tag`, `version`); the supervisor, which holds the
-   store client, would do the write when the worker ships the version. This
-   costs one store round trip per commit, which W-9's remote durability needs
-   anyway.
-3. **Takeover.** B gets epoch e+1 only after ending A's session. Before
+What remains for W-9's stream to make this a fence off the node (W-90):
+
+1. **The local check is not the fence.** It stops a node that knows it lost
+   the lease. A node that doesn't know yet (a long pause between the check and
+   the unlink) can still commit locally. That is harmless only if the version
+   can't become durable off the node: **the write that ships a version must be
+   conditional on the lease record not having moved**. Proposed: keep the
+   stream's head in the lease record (`objects/<app>/<object>` gains `head`),
+   written `If-Match` the version that the grant (or the previous shipped
+   commit) produced. A 412 means another node took the object, so the version
+   is refused. `Grant` already carries that version (`e_tag`, `version`). The
+   supervisor, which holds the store client, would do the write when the
+   worker ships the version: one store round trip per commit, which remote
+   durability needs anyway.
+2. **Takeover.** B gets epoch e+1 only after ending A's session. Before
    serving, B must restore the object up to the head recorded in the lease
    record it overwrote. Until the stream exists, the failover test shares one
    data root between the nodes, standing in for it.
-4. **Never delete lease records**: an object's epochs would restart.
+3. **Never delete lease records**: an object's epochs would restart.
 
 ## Tests (all hostile; each mutation-checked)
 
-Unit (`lease.rs`, in-memory store):
+Unit (`lease.rs`, in-memory store; `journal.rs`; `proxy.rs`):
 - `leases_pass_from_node_to_node_at_rising_epochs`: grant at epoch 1, refusal
   naming the holder, release then take at 2, a stale release changes nothing,
   a takeover only after a whole lease unchanged (3), re-take (4).
@@ -129,6 +140,13 @@ Unit (`lease.rs`, in-memory store):
   renewal.
 - `a_late_renewal_cannot_outlive_a_takeover`: a renewal sent before a takeover
   and landing after it fails.
+- `commits_are_decided_only_under_the_lease`: a captured version records the
+  epoch (7); with the lease lapsed, the journal's commit fails at the decision
+  and recovery undoes the change, and a commit of nothing fails too (so its
+  publishes don't go out).
+- `rendezvous_moves_only_what_it_must`: 4 nodes, 4,000 objects: each node is
+  home to 800–1,200; dropping a node moves only its objects; the list's order
+  doesn't matter.
 
 Integration (`tests/integration.rs`, `mod nodes`; real jailed workers, two
 in-process supervisors, a proxy, a shared in-memory lease store):
@@ -150,12 +168,71 @@ in-process supervisors, a proxy, a shared in-memory lease store):
 - `a_guest_cannot_pose_as_a_node_refusing_its_object`: a guest's own 421 with
   `nanovm-owner` reaches the client as-is and runs once. Once idle, the
   object's lease is released.
+- `socket_events_reach_their_objects_node`: a WebSocket opened through the
+  proxy echoes from its object's node, which alone holds the lease.
+- The capture test `sqlite_captures_recover_without_the_original_node` (opt-in SQL suite) now also checks
+  that a single node's versions carry epoch 0.
 
-MUTATIONS
+Mutation checks (each removes one mechanism; the named test must then fail; all
+restored with `git checkout`, empty diff after). Runs on the merged tree:
+
+| # | removed | caught by |
+|---|---|---|
+| M1a | the journal's lease check at the decision | `commits_are_decided_only_under_the_lease` |
+| M1b | the epoch in the captured version | same |
+| M1d | every lease check on commit | `a_node_that_lost_an_objects_lease_cannot_commit_it` |
+| M1e | the check on a commit of nothing | `commits_are_decided_only_under_the_lease` |
+| M2 | refusing a lost object's request at enqueue | `a_node_that_lost…` (it hangs behind A's work) |
+| M4 | waiting a whole lease before a takeover | `leases_pass…`, `an_object_moves…` |
+| M5 | ending the session before a takeover | `a_late_renewal_cannot_outlive_a_takeover` |
+| M6 | raising the epoch | `leases_pass…`, `an_object_moves…` |
+| M7 | checking the holder's session | `leases_pass…` |
+| M8 | passing over an unreachable node | `an_object_moves…` |
+| M9 | retrying only marked 421s | `a_guest_cannot_pose…` |
+| M10 | stripping the marker from guest answers | `a_guest_cannot_pose…` |
+| M11 | the caller chain in the cycle check | `calls_reach…` (waits out the timeout) |
+| M12 | pushing renewals to workers | `calls_reach…` (y's epoch rises) |
+| M13 | evicting idle objects on a lapse | `a_node_that_lost…` |
+| M14 | releasing on actor exit | `a_guest_cannot_pose…` (not released) |
+| M15 | a new session after a lapse | `a_renewing_holder…` |
+| M16 | the node in the rendezvous score | `rendezvous_moves_only_what_it_must` |
+
+Two mutations survived and led to removing code instead of keeping it
+untested. An early check in `object::commit` was redundant with the
+journal's (now the journal checks commits of nothing too). A per-request check
+in the actor's loop was unreachable but for a window of microseconds: a request
+that runs across a loss fails its commit and resets the instance, and the next
+one goes back through the lease request.
 
 ## Measurements
 
-MEASUREMENTS
+Single node, A/B on the HTTP path, method from the shared bench harness (CPU
+per request from `/proc` for every process involved, alternating rounds,
+100,000 requests at 64 concurrent to 100 counter objects, after a warm-up).
+The base is `cf/main-next` 3dafe33, built exactly like the branch (the
+worktree's Cargo config, dev profile: dependencies at opt-level 3, nanovm at
+1; no release builds, to save disk). The machine was shared (load 14–30), so
+spreads are wide; medians:
+
+| path | base µs/req | branch µs/req | rounds |
+|---|---|---|---|
+| node (supervisor + worker) | 105.6 (91.7–125.7) | 102.0 (88.7–118.4) | 7 each |
+| supervisor alone | 30.5 | 30.7 | |
+| worker alone | 75.1 | 71.0 | |
+| proxy → node (all three) | 181.1 (179.0–188.9) | 180.0 (135.9–185.4) | 3 each |
+| proxy alone | 45.2 | 42.7 | |
+
+No measurable cost: with one node there is no store, no session and no lease
+traffic. The per-request additions are an `Option` check per request, a
+header lookup and a header removal. A first A/B against a base built outside
+`/home/user/wt` showed the branch 19% slower. That base had escaped the
+worktree Cargo config (`debug = 0`, `strip = "debuginfo"`), so it was rebuilt
+alike and the result discarded.
+
+Runtime lines (CI's count): 5,184 at the old base, 5,653 at the branch before
+the merge (+469; `lease.rs` 223, proxy 65, table 65, supervisor 51, object
+27, egress 19, others 19). See the final report for the count after the
+merge.
 
 ## Not done
 
