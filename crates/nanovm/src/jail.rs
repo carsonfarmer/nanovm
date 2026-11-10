@@ -216,3 +216,54 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         std::env::consts::ARCH.try_into()?,
     )?)
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// Run as a child (this test binary again, with `NANOVM_SECCOMP_CHILD`):
+    /// installs the worker's filter on this thread and checks what it refuses.
+    #[test]
+    fn seccomp_child() {
+        if std::env::var_os("NANOVM_SECCOMP_CHILD").is_none() {
+            return;
+        }
+        let filter: seccompiler::BpfProgram = super::seccomp_filter().unwrap().try_into().unwrap();
+        seccompiler::apply_filter(&filter).unwrap();
+        let errno = || std::io::Error::last_os_error().raw_os_error();
+        // SAFETY: plain syscalls; mappings are leaked, sockets closed.
+        unsafe {
+            let map = |prot| libc::mmap(std::ptr::null_mut(), 4096, prot, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+            // Never writable and executable at once.
+            assert_eq!(map(libc::PROT_WRITE | libc::PROT_EXEC), libc::MAP_FAILED);
+            assert_eq!(errno(), Some(libc::ENOSYS));
+            let rw = map(libc::PROT_READ | libc::PROT_WRITE);
+            assert_ne!(rw, libc::MAP_FAILED);
+            assert_ne!(map(libc::PROT_READ | libc::PROT_EXEC), libc::MAP_FAILED);
+            assert_eq!(libc::mprotect(rw, 4096, libc::PROT_WRITE | libc::PROT_EXEC), -1);
+            // No sockets but a stream pair, no new processes, no fcntl owner.
+            assert_eq!(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0), -1);
+            let mut fds = [0; 2];
+            assert_eq!(libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()), -1);
+            assert_eq!(libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()), 0);
+            assert_eq!(libc::syscall(libc::SYS_clone, libc::SIGCHLD as libc::c_ulong, 0, 0, 0, 0), -1);
+            assert_eq!(libc::fcntl(fds[0], libc::F_SETOWN, libc::getpid()), -1);
+            assert!(libc::fcntl(fds[0], libc::F_GETFL) >= 0);
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    /// The seccomp filter itself, without a supervisor: in a child process,
+    /// writable-and-executable memory, inet sockets, datagram pairs, new
+    /// processes and `F_SETOWN` are refused, and their allowed neighbours
+    /// aren't (mutation testing found W^X untested, D-56).
+    #[test]
+    fn the_worker_filter_refuses_what_it_should() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "jail::tests::seccomp_child", "--test-threads=1", "--nocapture"])
+            .env("NANOVM_SECCOMP_CHILD", "1")
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}");
+    }
+}

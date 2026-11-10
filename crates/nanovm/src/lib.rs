@@ -60,6 +60,13 @@ mod counting {
         C.with(|c| c.get().0)
     }
 
+    /// What `f` left held on this thread (allocated and not freed).
+    pub fn held(f: impl FnOnce()) -> usize {
+        let before = C.with(|c| c.get().1);
+        f();
+        C.with(|c| c.get().1).saturating_sub(before)
+    }
+
     /// The most `f` held at once on this thread.
     pub fn peak(f: impl FnOnce()) -> usize {
         let held = C.with(|c| {

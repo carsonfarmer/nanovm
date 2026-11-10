@@ -497,6 +497,31 @@ mod tests {
         assert_eq!(r.reference.repository(), "acme/app");
     }
 
+    /// The per-thread cache of parsed references answers each app with its
+    /// own reference, however they alternate, and keeps none over 1 KiB
+    /// (two mutants of the cache survived the unit tests, D-56).
+    #[test]
+    fn the_reference_cache_keeps_apps_apart_and_small() {
+        let trust = (TRUST_HEADER, "https://issuer subject");
+        let apps = ["ghcr.io/acme/one", "ghcr.io/acme/two", "localhost:5000/x/y"].map(|r| format!("{r}@{DIGEST}"));
+        for _ in 0..3 {
+            for app in &apps {
+                let r = AppRef::from_headers(&headers(&[(APP_HEADER, app), trust])).unwrap().unwrap();
+                assert_eq!(&r.reference.whole(), app);
+            }
+        }
+        // References of 1.2 KiB (a long registry name) are parsed each time:
+        // what 16 of them hold afterwards is far less than 16 copies.
+        let long = |i: usize| format!("{}{i}.example.com/acme/app@{DIGEST}", "r".repeat(1200));
+        AppRef::from_headers(&headers(&[(APP_HEADER, &long(99)), trust])).unwrap().unwrap();
+        let held = crate::counting::held(|| {
+            for i in 0..16 {
+                AppRef::from_headers(&headers(&[(APP_HEADER, &long(i)), trust])).unwrap().unwrap();
+            }
+        });
+        assert!(held < 4 * 1200, "{held} bytes held after parsing 16 long references");
+    }
+
     /// Only `sha256:` and 64 lowercase hex digits is a digest, so none can
     /// name a path.
     #[test]
