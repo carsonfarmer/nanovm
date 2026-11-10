@@ -3287,8 +3287,8 @@ fn refused(name: &str) -> Vec<u8> {
 /// Components that import what nanovm refuses (sockets of either WASI
 /// version, the WASIp2 filesystem, an unknown interface) or export no HTTP
 /// handler are refused when loaded, before any object exists, and the error
-/// names the import. The node's linker defines WASIp2 sockets and files, so
-/// for those the import check is the only thing in the way.
+/// names the import. The node's linker doesn't define WASIp2 sockets or
+/// files either, so the import check isn't the only thing in the way.
 #[tokio::test(flavor = "multi_thread")]
 async fn components_importing_refused_interfaces_are_rejected_by_name() {
     let load = |fixture: &str| Node::new(node_cfg(&format!("refused_{fixture}"), 2), &app("counter"), &refused(fixture), None);
@@ -3314,14 +3314,18 @@ async fn components_importing_refused_interfaces_are_rejected_by_name() {
         }
     }
 
-    // Without the check, WASIp2 sockets and files (outside the quota) link.
+    // Without the check, WASIp2 sockets and files (outside the quota) still
+    // don't link: the linker defines only what the check allows (N-500).
     let engine = nanovm::engine::build(&node_cfg("refused_linking", 2)).unwrap();
     let linker = nanovm::app::linker(&engine).unwrap();
-    for fixture in ["p2_sockets", "p2_filesystem"] {
+    for (fixture, missing) in [("p2_sockets", "wasi:sockets/"), ("p2_filesystem", "wasi:filesystem/")] {
         let component = wasmtime::component::Component::new(&engine, refused(fixture)).unwrap();
-        linker.instantiate_pre(&component).unwrap_or_else(|e| panic!("{fixture}: {e:#}"));
+        let Err(e) = linker.instantiate_pre(&component) else { panic!("{fixture} links against app::linker") };
+        assert!(format!("{e:#}").contains(missing), "{fixture}: {e:#}");
         assert!(nanovm::app::check_imports(&engine, &component).is_err(), "{fixture}");
     }
+    let allowed = wasmtime::component::Component::new(&engine, refused("allowed")).unwrap();
+    linker.instantiate_pre(&allowed).unwrap();
 }
 
 /// The same refusal through a registry and a jailed worker: the request is
