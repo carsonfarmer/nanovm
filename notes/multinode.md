@@ -170,8 +170,24 @@ in-process supervisors, a proxy, a shared in-memory lease store):
   object's lease is released.
 - `socket_events_reach_their_objects_node`: a WebSocket opened through the
   proxy echoes from its object's node, which alone holds the lease.
-- The capture test `sqlite_captures_recover_without_the_original_node` (opt-in SQL suite) now also checks
-  that a single node's versions carry epoch 0.
+- The capture test `sqlite_captures_recover_without_the_original_node` (opt-in
+  SQL suite) now also checks that a single node's versions carry epoch 0. It
+  passes, as do `sqlite_composed_pool_capacity` and `sqlite_composed_provider`,
+  with the composed SQLite built locally (`sqlite_composed_recovery_cuts`
+  needs the test-hooks build, not built here).
+
+**Caller identity (W-602, W-12).** `nanovm-callers` names, last, the object
+making the call. Only nodes set it: the worker inserts it on every call,
+replacing anything the guest put there; the proxy strips every `nanovm-*`
+header from clients and keeps only `nanovm-callers` on its private call route;
+and on one node the call never leaves the worker. So an object can serve an
+internal route only to its app's objects by checking that the header is
+present, and to one caller by checking its last entry. That is W-12's trusted
+caller header, and it would close W-602. It holds within the existing trust
+model: a node reached without the proxy trusts what it is sent, as it does
+`nanovm-app`. Before relying on it: a test with a guest that echoes the header
+(a client's forged header never arrives; a guest's own is replaced), and README
+text. Post-return work, which no caller waits on, sends only its own id.
 
 Mutation checks (each removes one mechanism; the named test must then fail; all
 restored with `git checkout`, empty diff after). Runs on the merged tree:
@@ -203,6 +219,13 @@ journal's (now the journal checks commits of nothing too). A per-request check
 in the actor's loop was unreachable but for a window of microseconds: a request
 that runs across a loss fails its commit and resets the instance, and the next
 one goes back through the lease request.
+
+Full suite on the final tree (`--lib --test integration --example
+committed_state`): 114 unit tests pass; integration 74 pass, 13 ignored
+(opt-in), 1 fails, `kv_counts_against_the_disk_quota`, with `"error":"cpu"`:
+the known load failure N-640 (CPU budget billed as wall time; fixed on
+`cf/cpu-clock`), here at load 9–15. `committed_state` 2 pass. The production
+check (`cargo check --bin nanovm`) is clean.
 
 ## Measurements
 
