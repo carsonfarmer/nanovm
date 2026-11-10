@@ -353,6 +353,48 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** each poll is charged the change in the polling thread's `CLOCK_THREAD_CPUTIME_ID`: user and kernel time, so the guest's own file calls count and waiting for a core or the disk doesn't. The epoch callback runs on that thread and reads the poll in progress the same way; nothing reads it from another thread. The journal's own work (undo records, renames into the journal, the commit and any capture) stays uncharged, measured with the same clock instead of as wall time, so no request is charged more than before. `guest_cpu_ns` is now CPU time. The wall-clock deadlines (504) still stop requests that are slow for any reason. After: the test's request succeeds with 31–40 ms of CPU and `/spin` is killed after 102–103 ms (5 runs); the SQLite tests above and the new one pass under load 21–37 where the old build fails 4 of 5. Tests whose fixtures assumed wall billing get deadlines sized for a busy disk (`filler`, the two 1,000-statement SQLite tests, the 1,500-key KV test) or for lane turns (`cpu_hogs_leave_cores_for_short_requests`), and the quota test `kv_counts_against_the_disk_quota` moves to `filler` like its siblings: its 198 writes use 100–160 ms of real CPU on this loaded host, half of it kernel time. Cost: about 0.16 µs per clock read, 8.1 reads per warm GET (≈2%). Details: `notes/cpuclock.md`.
 - **Status:** fixed on `cf/cpu-clock`
 
+### N-160 (efficiency): a small durable write cost 9 device flushes
+- **Where:** `journal.rs`
+- **Scenario:** the first record of every request made the log and synced three directories; every record was synced on its own; commit synced each changed path, deleted the log and synced its directory. A counter `POST /incr` (create, write, rename over) took 6 fsync + 3 fdatasync, 23 device writes, 2 discards and 9 flushes (private nojournal ext4 loop).
+- **Fix:** the log is made once per object and kept; its first block holds a format tag and a random key that signs every record, and a commit writes a new key (one overwritten block, synced) instead of deleting the log. Records made back to back share a sync. Now 15 writes, 1 discard, 5 flushes; journaled ext4 16.9 writes + 12.7 flushes -> 9.5 + 5.5.
+- **Status:** fixed in d464eec, 1aec24f (cf/storage)
+
+### N-161 (efficiency): a commit blocked its worker thread, and every object on it
+- **Where:** `quota.rs` (`QuotaGuard::commit`), `object.rs` (`commit`)
+- **Scenario:** a commit's syncs ran inline on a tokio worker: a 4-thread worker had at most 4 commits in flight though fdatasync here does 543/s from one thread and 11k/s from four.
+- **Fix:** the commit runs on a blocking thread and is awaited; its syncs of changed paths go up to 16 at once. `block_in_place`, tried first, hung `post_return_work_keeps_context_and_reports_commit_failure`: do not use it inside wasmtime's event loop.
+- **Status:** fixed in 1aec24f (cf/storage)
+
+### N-162: a request that wrote many files overran its post-return deadline committing them
+- **Where:** `journal.rs` (`commit`)
+- **Scenario:** `kv_refuses_bad_names_and_streams_keys` writes 1,500 keys; their commit synced 1,500 files one by one, longer than the 5 s post-return deadline on a loaded disk: the instance was killed and the request reported a timeout though nothing was wrong.
+- **Fix:** paths sync up to 16 at a time (N-161). Still open: the same test (and `kv_counts_against_the_disk_quota`) can exceed the 10 s request deadline under load average ~20, at 2 record syncs per key (temp-file create, rename), as on base.
+- **Status:** commit part fixed in 1aec24f; record syncs per KV key open
+
+### N-163: a guest's sync reached the disk
+- **Where:** `quota.rs` (`sync`, `sync_data`)
+- **Scenario:** the stock host fsyncs on a guest's `sync`/`sync-data`, though a request's writes are durable at its commit and rolled back otherwise, synced or not. The SQLite provider syncs ~1.7 times per write statement (strace: 120 fsyncs over 70 `POST /set`), and a guest could make the device flush in a loop without writing anything.
+- **Fix:** both are a validated no-op.
+- **Status:** fixed in 1aec24f (cf/storage)
+
+### N-164 (efficiency): capture cost 8 syncs and a full-volume copy per commit
+- **Where:** `committed.rs`, `journal.rs`
+- **Scenario:** W-9 capture (b7bf806) synced the archive directory and its two ancestors on every commit, staged in the journal directory and published by a hard link with two more directory syncs, and copied the whole volume each time: `POST /incr` with capture took 17 flushes and 39.8 writes, against 9 and 22 without.
+- **Fix:** versions are changes against the one before (snapshot every 16), staged beside the published ones under a name tied to the journal key, published by an unsynced same-directory rename that recovery redoes: 7 flushes and 20.9 writes with capture, 5 and 15.0 without.
+- **Status:** fixed in bc8f45a (cf/storage)
+
+### N-165 (efficiency): the shipper polls every object's capture directory
+- **Where:** `ship.rs` (`run`)
+- **Scenario:** every 20 ms the shipper lists `~committed/` of every app and stats each object's directory, skipping unchanged ones: ~0.1 core at 10k objects, and up to 20 ms added to a `remote_ack` commit. A worker can't notify the supervisor's shipper except through the filesystem.
+- **Fix (proposed):** a notification over the worker's supervisor link when a version is published.
+- **Status:** open
+
+### N-166 (efficiency): restoring an object downloads every version it ever had
+- **Where:** `ship.rs` (`restore`)
+- **Scenario:** keys are probed from sequence 1 until one is missing; only versions from the last snapshot on are needed, and the store keeps everything (no remote retention yet).
+- **Fix (proposed):** a pointer object to the last shipped snapshot, written after it, and retention of versions before the second-last snapshot.
+- **Status:** open
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -509,3 +551,7 @@ The checkpoints below are historical, not outstanding product decisions.
 - **What:** each event answer and each publish is collected whole in the proxy, up to `max_response_body_kb` (8 MiB), with no bound across sockets, objects or apps: 1,000 sockets of one app answered at once is 8 GiB, and publishes are as many as objects committing at once. One app's plain Wasm can so exhaust the proxy every app shares. Parsing is not the problem: an answer is parsed and applied within one poll, so its parse (about 6–14 times its size, `ws::parse`) is bounded by the proxy's threads, and publishes now parse in about their size (N-72). Found by the sec review.
 - **Design:** (1) collect an answer up to `socket_backlog_kb`, not `max_response_body_kb` (in `Proxy::socket`'s `deliver`): `apply` queues an answer's messages at once, each costing its length plus 64, so an answer bigger than the socket's backlog overflows it and drops the socket anyway (only a flood of subscribe controls would fit). Answers then cost at most one backlog per socket, within the per-socket budgets the proxy already has. (2) publishes: a proxy-wide semaphore of publish bytes in flight (an operator setting, or `max_sockets_per_app × socket_backlog_kb` per app), acquired for the declared or collected size before buffering, so one app's commits wait rather than grow the proxy.
 - **Status:** open
+
+### W-80: W-9 production capture, shipping and restore
+- **Done (bc8f45a, cf/storage):** crash-atomic capture of each committed version at both commit points as changes against the version before (listings, whole new or moved entries, byte ranges), snapshots every `snapshot_every`; a bounded local outbox (`max_versions`, `max_mb`: full means writes are refused); a put-once `Store` (directory, S3-compatible with SigV4 + `If-None-Match: *`); `remote_ack` (off by default: the owner hasn't chosen an RPO); an epoch and a fence object as the hook for W-10's leases; `ship::restore` on a fresh root.
+- **Open:** remote retention and a snapshot pointer (N-166); a shipper notification (N-165); a `nanovm restore` command; choosing the acknowledgement policy (owner); fencing commits themselves, not only shipping (W-10).
