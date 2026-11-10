@@ -16,6 +16,7 @@ pub mod proxy;
 pub mod quota;
 pub mod registry;
 pub mod server;
+pub mod ship;
 pub mod supervisor;
 pub mod table;
 pub mod telemetry;

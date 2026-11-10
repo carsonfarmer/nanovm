@@ -63,6 +63,10 @@ fn node(name: &str, app: &str, max_live: usize, endpoint: Option<String>) -> any
         max_live_objects: max_live,
         memory_reservation_mb: 64,
         telemetry_endpoint: endpoint.unwrap_or_else(|| NodeConfig::default().telemetry_endpoint),
+        // NANOVM_BENCH_CAPTURE=1: every commit is captured, with room for all.
+        capture: std::env::var_os("NANOVM_BENCH_CAPTURE")
+            .map(|_| serde_json::from_value(json!({ "max_mb": 1 << 20, "max_versions": 1u64 << 40 })))
+            .transpose()?,
         ..NodeConfig::default()
     };
     cfg.validate()?;

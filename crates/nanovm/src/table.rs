@@ -72,6 +72,8 @@ pub struct Node {
     /// One permit per live store, released only after the store is dropped.
     pub slots: Arc<Semaphore>,
     objects: Mutex<HashMap<Arc<str>, Entry>>,
+    /// Shipping committed versions, without a supervisor to do it.
+    ship: Option<tokio::task::AbortHandle>,
 }
 
 impl Node {
@@ -84,6 +86,12 @@ impl Node {
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
         let linker = crate::app::linker(&engine)?;
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
+        // Without a supervisor, which ships for its workers, a node ships its own.
+        let ship = cfg.capture.as_ref().filter(|_| upstream.is_none()).map(crate::ship::store).transpose()?.flatten();
+        let ship = ship.map(|store| {
+            let epoch = cfg.capture.as_ref().map_or(0, |c| c.epoch);
+            tokio::spawn(crate::ship::run(cfg.data_dir.join("objects"), store, epoch)).abort_handle()
+        });
         let app = Arc::new(App::load(&engine, &linker, &cfg, app, wasm, upstream)?);
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
@@ -96,6 +104,7 @@ impl Node {
             heavy,
             slots,
             objects: Mutex::default(),
+            ship,
         });
         node.metrics.telemetry.set(Arc::downgrade(&node.telemetry)).ok();
         let started = Instant::now();
@@ -136,6 +145,9 @@ impl Node {
         self.objects.lock().clear();
         while self.metrics.stores_live.load(Relaxed) > 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if let Some(ship) = &self.ship {
+            ship.abort();
         }
     }
 

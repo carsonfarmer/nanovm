@@ -142,6 +142,10 @@ impl Supervisor {
     /// Call within the control/egress runtime. `threads` counts front-end threads.
     pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
+        // Jailed workers can't reach a store: their versions ship from here.
+        if let Some(store) = cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten() {
+            tokio::spawn(crate::ship::run(cfg.data_dir.join("objects"), store, cfg.capture.as_ref().map_or(0, |c| c.epoch)));
+        }
         let sup = Arc::new(Supervisor {
             runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,

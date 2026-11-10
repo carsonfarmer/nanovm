@@ -569,8 +569,11 @@ impl Journal {
         #[cfg(test)]
         tests::sync_point()?;
         log.sync_data()?;
-        if self.capture.is_some() {
-            committed::publish(&out, &old)?;
+        if let Some(cap) = &self.capture {
+            let sequence = committed::publish(&out, &old)?;
+            if cap.remote_ack {
+                crate::ship::stored(&out, sequence)?;
+            }
         }
         self.moved.clear();
         if self.end > KEEP {
@@ -928,7 +931,7 @@ mod tests {
     /// (over files and empty directories), removals and type changes.
     #[test]
     fn changes_restore_every_version() {
-        let cap = CaptureConfig { max_mb: 64, max_versions: 1000, snapshot_every: 7 };
+        let cap = CaptureConfig { max_mb: 64, max_versions: 1000, snapshot_every: 7, ..Default::default() };
         let v = volume();
         let out = v.parent().unwrap().join("~committed/o");
         let mut j = captured(&v, &cap).unwrap();
@@ -1003,6 +1006,67 @@ mod tests {
             assert_eq!(archive_tree(&v, n), tree(&v), "step {step}, version {n}");
         }
         assert!(published(&out) > 80 && done.iter().all(|&n| n > 3), "{} versions, {done:?}", published(&out));
+    }
+
+    /// A directory renamed over one emptied in the same request replaces it
+    /// in the version: what the emptied one held is gone.
+    #[test]
+    fn a_directory_renamed_over_another_replaces_it() {
+        let cap = CaptureConfig::default();
+        let v = volume();
+        let mut j = captured(&v, &cap).unwrap();
+        write(&mut j, &v, "d/b", 0, b"B");
+        j.commit().unwrap();
+        j.unlink(&v.join("d/b"), 3).unwrap();
+        j.creating(&v.join("n")).unwrap();
+        std::fs::create_dir(v.join("n")).unwrap();
+        j.creating(&v.join("n/c")).unwrap();
+        std::fs::write(v.join("n/c"), "C").unwrap();
+        j.created(&v.join("n/c")).unwrap();
+        rename(&mut j, &v, "n", "d");
+        j.commit().unwrap();
+        assert_eq!(archive_tree(&v, 2), tree(&v));
+    }
+
+    /// A version can't name a path outside the volume it is applied to,
+    /// whether to remove, list or write it.
+    #[test]
+    fn a_version_cannot_write_outside_its_root() {
+        let base = volume().parent().unwrap().to_path_buf();
+        std::fs::write(base.join("victim"), "kept").unwrap();
+        let root = base.join("root");
+        std::fs::create_dir(&root).unwrap();
+        let version = |changes: &str, entry: Option<&[u8]>| {
+            let mut tar = tar::Builder::new(vec![]);
+            let mut put = |name: &[u8], bytes: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.as_old_mut().name[..name.len()].copy_from_slice(name);
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o600);
+                header.set_cksum();
+                tar.append(&header, bytes).unwrap();
+            };
+            let id = r#"{"format":2,"app":"app","object":"o","sequence":2,"epoch":0,"parent":"","snapshot":false}"#;
+            put(b"nanovm.json", id.as_bytes());
+            put(b"changes.json", changes.as_bytes());
+            if let Some(name) = entry {
+                put(name, b"evil");
+            }
+            let path = base.join("evil.tar");
+            std::fs::write(&path, tar.into_inner().unwrap()).unwrap();
+            path
+        };
+        let empty = r#"{"listed":{},"whole":[],"patched":{}}"#;
+        for path in [
+            version(r#"{"listed":{"..":[]},"whole":[],"patched":{}}"#, None),
+            version(r#"{"listed":{},"whole":["../victim"],"patched":{}}"#, None),
+            version(empty, Some(b"data/../victim")),
+            version(r#"{"listed":{},"whole":[],"patched":{"../victim":[1,[[0,4]]]}}"#, Some(b"patch/../victim")),
+        ] {
+            let e = committed::apply(&root, &path).err().expect("an unsafe version must be refused");
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+            assert_eq!(std::fs::read(base.join("victim")).unwrap(), b"kept");
+        }
     }
 
     /// A small change to a big file is captured as the bytes that changed.
@@ -1190,6 +1254,8 @@ mod tests {
                 drop(captured(&v, &cap).unwrap());
                 assert_eq!(tree(&v), before, "recovery cut {after}");
                 assert_eq!(published(&out), 0, "published rejected version at cut {after}");
+                // Left staged, a later recovery would take it for decided.
+                assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "kept rejected version at cut {after}");
             }
             std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
             if finished {
@@ -1206,7 +1272,7 @@ mod tests {
         for byte_limit in [false, true] {
             let v = volume();
             // Snapshots only, so the byte limit binds.
-            let cap = CaptureConfig { max_mb: 1, max_versions: if byte_limit { 16 } else { 1 }, snapshot_every: 1 };
+            let cap = CaptureConfig { max_mb: 1, max_versions: if byte_limit { 16 } else { 1 }, snapshot_every: 1, ..Default::default() };
             if byte_limit { std::fs::write(v.join("large"), vec![7; 600_000]).unwrap(); }
             let mut j = captured(&v, &cap).unwrap();
             write(&mut j, &v, "a", 0, b"accepted");

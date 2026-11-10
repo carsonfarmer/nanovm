@@ -30,6 +30,8 @@ pub struct Version {
     pub app: String,
     pub object: String,
     pub sequence: u64,
+    /// The fencing epoch of the node that made it.
+    pub epoch: u64,
     /// SHA-256 of the version before, or empty for the first.
     pub parent: String,
     /// The whole volume, not a change to the version before.
@@ -82,14 +84,16 @@ pub fn digest(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-// No independent mutable cursor: the contiguous immutable filenames are the head.
-fn head(dir: &Path) -> io::Result<(u64, u64)> {
+// No independent mutable cursor: the contiguous immutable filenames are the
+// head. Returns the last sequence, and how many versions and bytes are here:
+// a shipper removes those it shipped but the last, maybe meanwhile.
+fn head(dir: &Path) -> io::Result<(u64, u64, u64)> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0, 0)),
         Err(e) => return Err(e),
     };
-    let (mut count, mut last, mut bytes) = (0u64, 0u64, 0u64);
+    let (mut count, mut first, mut last, mut bytes) = (0u64, u64::MAX, 0u64, 0u64);
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
@@ -104,16 +108,18 @@ fn head(dir: &Path) -> io::Result<(u64, u64)> {
         if sequence == 0 || name != filename(sequence).as_str() || !entry.file_type()?.is_file() {
             return Err(invalid("invalid committed version entry"));
         }
+        let len = match entry.metadata() {
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            len => len?.len(),
+        };
         count += 1;
-        last = last.max(sequence);
-        bytes = bytes
-            .checked_add(entry.metadata()?.len())
-            .ok_or_else(|| invalid("capture size overflow"))?;
+        (first, last) = (first.min(sequence), last.max(sequence));
+        bytes = bytes.checked_add(len).ok_or_else(|| invalid("capture size overflow"))?;
     }
-    if count != last {
+    if count > 0 && count != last - first + 1 {
         return Err(invalid("gap in committed versions"));
     }
-    Ok((last, bytes))
+    Ok((last, count, bytes))
 }
 
 struct Bounded {
@@ -149,12 +155,12 @@ pub(super) fn prepare(
     key: &[u8; 8],
     changes: &Changes,
 ) -> io::Result<()> {
-    let (last, used) = head(out)?;
+    let (last, count, used) = head(out)?;
     let limit = cap
         .max_mb
         .checked_mul(1 << 20)
         .ok_or_else(|| invalid("capture limit overflow"))?;
-    if last >= cap.max_versions || used >= limit {
+    if count >= cap.max_versions || used >= limit {
         return Err(ErrorKind::StorageFull.into());
     }
     let version = Version {
@@ -164,6 +170,7 @@ pub(super) fn prepare(
         sequence: last
             .checked_add(1)
             .ok_or_else(|| invalid("capture sequence overflow"))?,
+        epoch: cap.epoch,
         parent: if last == 0 {
             String::new()
         } else {
@@ -244,10 +251,12 @@ pub(super) fn prepare(
 }
 
 /// Publishes the version staged under journal key `key`, which the journal
-/// has replaced. Recovery does it again if the rename is lost.
-pub(super) fn publish(out: &Path, key: &[u8; 8]) -> io::Result<()> {
+/// has replaced, and returns its sequence. Recovery does it again if the
+/// rename is lost.
+pub(super) fn publish(out: &Path, key: &[u8; 8]) -> io::Result<u64> {
     let next = head(out)?.0 + 1;
-    fs::rename(out.join(format!("{next:020}{}", decided_by(key))), out.join(filename(next)))
+    fs::rename(out.join(format!("{next:020}{}", decided_by(key))), out.join(filename(next)))?;
+    Ok(next)
 }
 
 /// Settles what commits left staged when their instance stopped, given the
@@ -290,7 +299,7 @@ pub(super) fn settle(
     // capture becomes visible to a receiver.
     decided()?;
     for name in staged {
-        let (last, _) = head(out)?;
+        let (last, ..) = head(out)?;
         let path = out.join(&name);
         let version = read_version(&mut tar::Archive::new(File::open(&path)?).entries()?)?;
         let parent = if last == 0 { String::new() } else { digest(&out.join(filename(last)))? };
