@@ -346,6 +346,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
+### N-505: request bodies have no deadline at any hop
+- **Where:** `proxy.rs` (header timeout only), `supervisor.rs` (`forward` streams the body), `server.rs` (`handle` collects it with a size limit only)
+- **Scenario:** found by the quality agent's second hostile guest (D-58). A client sending a request body a byte at a time holds a proxy connection, a supervisor-to-worker link and a worker task for as long as it keeps sending, up to `max_request_body_kb`. The object isn't held (the body is read before the request is queued), so this is connection and memory pressure, the same family as the missing per-client limits in the proxy (IDEAS G-75).
+- **Reproduced:** yes (`slow_uploads_hold_a_connection_not_the_object`: 40 bytes over 4 s, past every per-request limit, are accepted).
+- **Status:** open (design: a body deadline per hop, or per-client limits in the proxy)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
