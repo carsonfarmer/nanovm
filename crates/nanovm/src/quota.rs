@@ -152,16 +152,6 @@ impl QuotaGuard {
         self.0.lock().journaled(f)
     }
 
-    /// Removes the volume's file at `path`, of `bytes`, into the journal:
-    /// where it now is.
-    pub fn remove(&self, path: &Path, bytes: u64) -> Result<std::path::PathBuf, ErrorCode> {
-        let mut q = self.0.lock();
-        let slot = q.journaled(|j| j.remove(path, bytes))?;
-        q.bytes = q.bytes.saturating_sub(bytes);
-        q.files = q.files.saturating_sub(1);
-        Ok(slot)
-    }
-
     pub fn unlink(&self, path: &Path, bytes: u64) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
         q.journaled(|j| j.unlink(path, bytes))?;
@@ -985,7 +975,7 @@ mod tests {
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
         let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj, None).unwrap();
         let f = std::fs::File::options().write(true).open(dir.join("f")).unwrap();
-        g.remove(&dir.join("f"), 10).unwrap();
+        g.unlink(&dir.join("f"), 10).unwrap();
         assert_eq!(usage(&g), (10, 1));
         g.set_size(&f, 0).unwrap();
         assert_eq!(usage(&g).0, 10);

@@ -400,7 +400,7 @@ impl Journal {
 
     /// Removes the file at `path`, of `bytes`, by moving it into the
     /// journal: where it now is.
-    pub fn remove(&mut self, path: &Path, bytes: u64) -> std::io::Result<PathBuf> {
+    fn remove(&mut self, path: &Path, bytes: u64) -> std::io::Result<PathBuf> {
         self.charge(0, bytes)?;
         let slot = self.slot();
         let p = self.rel(path);
