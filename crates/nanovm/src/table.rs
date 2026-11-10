@@ -78,6 +78,8 @@ pub struct Node {
     /// With more than one node, its leases on objects (see `lease`).
     pub leases: Option<crate::lease::Worker>,
     objects: Mutex<HashMap<Arc<str>, Entry>>,
+    /// Shipping committed versions, without a supervisor to do it.
+    ship: Option<tokio::task::AbortHandle>,
 }
 
 impl Node {
@@ -106,6 +108,9 @@ impl Node {
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
         let leases = upstream.clone().filter(|_| !cfg.leases.is_empty()).map(crate::lease::Worker::new);
         anyhow::ensure!(leases.is_some() == !cfg.leases.is_empty(), "leases are taken through a supervisor");
+        // Without a supervisor, which ships for its workers, a node ships its own.
+        let ship = cfg.capture.as_ref().filter(|_| upstream.is_none()).map(crate::ship::store).transpose()?.flatten();
+        let ship = ship.map(|store| tokio::spawn(crate::ship::run(cfg.data_dir.join("objects"), store, None)).abort_handle());
         let app = Arc::new(App::load(&engine, linker, &cfg, app, wasm, upstream)?);
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
@@ -120,6 +125,7 @@ impl Node {
             sockets: Arc::new(crate::ws::Sockets::new(Default::default(), Default::default())),
             leases,
             objects: Mutex::default(),
+            ship,
         });
         node.metrics.telemetry.set(Arc::downgrade(&node.telemetry)).ok();
         let started = Instant::now();
@@ -160,6 +166,9 @@ impl Node {
         self.objects.lock().clear();
         while self.metrics.stores_live.load(Relaxed) > 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        if let Some(ship) = &self.ship {
+            ship.abort();
         }
     }
 

@@ -28,21 +28,33 @@ accepted but unsent write is lost. This is not a runtime replication feature,
 remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
 gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 
-**Local capture:** optional node `[capture]` configuration
-enables full-volume TAR captures at both dirty commit gates (`max_mb = 256`,
-`max_versions = 16`, per object). Versions are staged before the journal's commit
-decision, then published under `objects/<app>/~committed/<object>/`; recovery
-discards rejected staging or completes accepted publication before new work.
-Full history rejects further dirty commits rather than discarding old versions;
-read-only commits consume no version. Capture defaults off. This is bounded local
-capture, not continuous replication: no retention, network receiver, restore API,
-distributed fence or remote acknowledgement policy is provided. Do not manually
-prune history or disable capture on a root with history. Full copies cost storage
-and write latency: two small-write release probes measured roughly half default
-write throughput. This is not a large-volume performance result. The older JSON
-experiment is not a receiver for these TARs. Tests exercise both commit gates,
-process-exit and failed-sync recovery, history exhaustion and SQL/file/KV recovery
-after source-root deletion; these do not certify physical power loss or remote hosts.
+**Capture and shipping:** optional node `[capture]` configuration captures a
+version at both dirty commit gates: the whole volume every `snapshot_every` (16)
+versions, otherwise what the commit changed (listings of changed directories, new
+or moved files whole, files changed in place as their changed byte ranges). Versions
+are staged before the journal's commit decision and published under
+`objects/<app>/~committed/<object>/`; recovery discards a rejected one or completes
+an accepted one before new work. A commit with capture costs 2 more syncs. With
+`store` set (a directory, or an object store URL as for `leases`, e.g.
+`s3://bucket/prefix`, credentials and region from `AWS_*`), the supervisor (or an in-process node)
+ships each object's versions in order to `<app>/<object>/<sequence>.tar` with
+put-once semantics, then removes them here but the last. `max_versions` and `max_mb`
+bound what waits here: with the store down, writes are refused once they are
+reached; nothing is silently dropped. A commit is acknowledged once durable here
+unless `remote_ack = true`, which also waits (2 s at most, then fails the request:
+the commit still stands locally) for the store. A version another writer stored
+stops shipping. Versions carry the lease epoch they were committed under; with
+leases a node ships an object's version only if the lease record names it or still
+has the version's epoch, so a node that lost the object can't ship what it
+committed late (W-90; a window between reading the record and the put remains).
+`nanovm::ship::restore` rebuilds an object from the store on a fresh root and keeps
+its last version, so history goes on. Capture defaults off. Not yet: remote
+retention, a snapshot pointer (a restore reads every version), or a store-side
+conditional head (W-90). Do not manually prune history or
+disable capture on a root with history. Tests exercise both commit gates,
+process-exit and failed-sync recovery, history exhaustion, random change sequences
+restored at every version, shipping, outages and restore on a fresh root; these do
+not certify physical power loss or remote hosts.
 
 ## Build an app
 
@@ -497,7 +509,7 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 `Node` callers must arrange durable storage-root preparation themselves.
 
 **How:** an undo journal (`journal.rs`), as SQLite's rollback journal, under our `wasi:filesystem` host (`quota.rs`).
-- **Before each change, the host records what the change would destroy, and fsyncs it:**
+- **Before each change, the host records what the change would destroy, and fsyncs it** (records made back to back, such as a rename's and the file it replaces, share one fsync):
   - a file's size, the first time it is written;
   - the bytes a write or truncation overwrites;
   - "remove this", for a new entry;
@@ -506,10 +518,10 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 
   A removed or replaced file is renamed into the journal, not deleted.
 - **Then the change happens in place,** so open files and `mmap` keep working, and SQLite can sit on `/data`.
-- **Commit** (before the response is released, and again after post-return work) fsyncs what changed and deletes the log. Held publishes are sent after it.
+- **Commit** (before the response is released, and again after post-return work) fsyncs what changed, up to 16 paths at a time, then writes a new random key into the log's first block and fsyncs it: records are signed with the key, so none is valid any more. The log itself is made once per object and kept (at most 68 KiB between requests), so a commit rewrites a block that already exists instead of deleting a file and syncing its directory. The commit runs on a blocking thread, not the object's. Held publishes are sent after it.
 - **Rollback** has one path. A failed request ends its instance, and every instance start replays any log left behind backwards, so a crash is handled the same way. Recovery trims each step off the log as it completes, so a crash during recovery resumes where it stopped.
 - **Costs:**
-  - One fsync per record that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request. Requests that change nothing pay nothing.
+  - One fsync per change that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request: one per changed path, then the key. A counter's `POST /incr` (create, write, rename over) costs 5 device flushes. Requests that change nothing pay nothing. A guest's own `sync` and `sync-data` do nothing: its writes are durable at commit and rolled back otherwise, synced or not.
   - Waiting for the disk isn't charged to the guest's CPU budget, and neither is the journal's own CPU (records and commit).
   - The byte quota counts logical file lengths, not allocated filesystem blocks or metadata. While a request runs, the log and retained files may each hold as much again: at most three quota-sized logical content budgets. Small files and filesystem metadata add physical overhead; `max_files` independently bounds directory entries. Size the backing disk for both limits, not just `3 × disk_mb`.
 - **Safety:**
@@ -517,7 +529,7 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
   - A recovery error preserves the failing undo and refuses to start the object. Repair the storage problem and retry; never delete the journal to force startup. Already-applied or never-performed operations remain safe to replay.
   - A commit failure poisons that journal instance, so retrying cannot falsely report success. Recovery syncs both parents of a reversed rename before retiring its record.
   - A failed rename restores its staged destination and storage accounting, keeps dirty-source sync tracking, and durably cancels its rename undo before paths can be reused. If restoration or cancellation fails, the request cannot commit and must recover. Cancelled records still consume log space.
-- **Downgrades:** cancelled renames use journal tag 5. This version reads older journals, but older binaries cannot recover a log containing that tag. Before downgrading, drain requests and finish any pending recovery with this version; never delete an uncommitted journal to make a downgrade work.
+- **Upgrades and downgrades:** the log's first block names its format (`nanovmj1`); recovery refuses a log it can't read rather than taking it as empty. A log left by a binary from before the keyed format (one with uncommitted records after a crash) must be recovered by that binary first: drain and stop cleanly before upgrading. Older binaries can't read the keyed log either. Never delete an uncommitted journal to make a version change work.
 - **`/tmp` is not journaled.** It is per-instance scratch, deleted with the instance, so it's the fast place for temporary files. A rename between `/tmp` and `/data` fails as cross-device, as between real filesystems.
 
 **Alternatives considered:**

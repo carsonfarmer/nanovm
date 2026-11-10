@@ -181,6 +181,18 @@ impl Leases {
         Err(Refused::Unavailable(format!("{key}'s lease keeps changing")))
     }
 
+    /// This node's name.
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// Which node's lease the store has for `key` (`<app>/<object>`), empty
+    /// once released, and its epoch; none if it was never taken.
+    pub async fn holder(&self, key: &str) -> Result<Option<(String, u64)>> {
+        let path = Path::from_iter(["objects"].into_iter().chain(key.split('/')));
+        Ok(self.get::<ObjectRecord>(&path).await?.0.map(|r| (r.node, r.epoch)))
+    }
+
     /// Gives up the lease `grant` took on `key`, unless it has moved on.
     pub async fn release(&self, key: &str, grant: &Grant) {
         let path = Path::from_iter(["objects"].into_iter().chain(key.split('/')));
