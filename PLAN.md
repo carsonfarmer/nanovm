@@ -231,7 +231,7 @@ Each test spins up a `Node` in-process with small limits.
 - **Resources:** `/leak` past `max_resources` traps and poisons the object; the object recovers.
 - **Capacity:** with `max_live` objects full, a new object evicts the LRU idle one.
 - **Validation:** a component importing sockets is rejected at deploy time. *(Not written yet.)*
-- **Leaks:** RSS and open fds stay flat over long runs and churn. *(Not written yet.)*
+- **Leaks:** RSS, open fds and mappings stay flat over churn and mixed traffic (`tests/soak.rs`, ignored; `scripts/soak.sh`; 30 minutes recorded in `notes/quality.md`).
 
 ## Benchmarks (`examples/bench.rs`)
 
