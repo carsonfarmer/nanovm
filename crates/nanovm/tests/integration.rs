@@ -2287,7 +2287,11 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
     assert!(!backup().status.success(), "backup must refuse a live jailed owner");
     let children: Vec<i32> = std::fs::read_dir(format!("/proc/{}/task", source.id().unwrap())).unwrap()
         .flat_map(|thread| std::fs::read_to_string(thread.unwrap().path().join("children")).unwrap()
-            .split_whitespace().map(|pid| pid.parse().unwrap()).collect::<Vec<_>>()).collect();
+            .split_whitespace().map(|pid| pid.parse().unwrap()).collect::<Vec<_>>())
+        // A jailed worker runs under its seccomp filter; the spare spawned
+        // ahead (N-224) has not been given an app or entered its jail yet.
+        .filter(|pid| std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|s| s.contains("Seccomp:\t2")))
+        .collect();
     assert_eq!(children.len(), 1, "one jailed app worker");
     let pid = children[0];
     let pending = tokio::spawn({
