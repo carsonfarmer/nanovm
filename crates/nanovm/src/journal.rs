@@ -2064,7 +2064,7 @@ mod tests {
                 std::os::unix::fs::symlink(format!("n{i}"), v.join(format!("n{i}"))).unwrap();
             }
             SLOW_MS.store(if bad.is_none() { 50 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
-            let t0 = Instant::now();
+            let t0 = std::time::Instant::now();
             let result = j.commit();
             SLOW_MS.store(0, std::sync::atomic::Ordering::Relaxed);
             if bad.is_none() {
