@@ -1,0 +1,20 @@
+[package]
+name = "preinit"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace and lockfile: wasmtime-wizer needs wasm-encoder features
+# the node's build doesn't have, and adding them there rebuilds wasmtime.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+wasmtime = { version = "=50.0.1", default-features = false, features = [
+    "anyhow", "async", "cranelift", "runtime", "std", "component-model", "component-model-async", "gc", "gc-null", "threads", "stack-switching",
+] }
+wasmtime-wizer = { version = "=50.0.1", default-features = false, features = ["component-model"] }
+
+[profile.release]
+debug = false
