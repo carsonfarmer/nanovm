@@ -10,6 +10,16 @@ pub fn now_ns() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
+/// CPU time of the calling thread in nanoseconds, user and kernel: not the
+/// time it waited for a core or the disk. A system call (about 0.2 µs),
+/// unlike [`now_ns`].
+pub fn thread_cpu_ns() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // Can't fail for this clock, on Linux or macOS.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
 /// Why an object's instance was torn down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Poison {
@@ -48,6 +58,8 @@ pub struct Metrics {
     pub egress_allowed: AtomicU64,
     pub egress_denied: AtomicU64,
     pub fs_denied: AtomicU64,
+    /// CPU time spent polling objects: guest code and the host work it does
+    /// inline, commits included.
     pub guest_cpu_ns: AtomicU64,
     pub(crate) telemetry: OnceLock<std::sync::Weak<crate::telemetry::Telemetry>>,
 }

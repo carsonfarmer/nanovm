@@ -482,7 +482,7 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 - **Rollback** has one path. A failed request ends its instance, and every instance start replays any log left behind backwards, so a crash is handled the same way. Recovery trims each step off the log as it completes, so a crash during recovery resumes where it stopped.
 - **Costs:**
   - One fsync per change that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request: one per changed path, then the key. A counter's `POST /incr` (create, write, rename over) costs 5 device flushes. Requests that change nothing pay nothing. A guest's own `sync` and `sync-data` do nothing: its writes are durable at commit and rolled back otherwise, synced or not.
-  - Fsync time isn't charged to the guest's CPU budget.
+  - Waiting for the disk isn't charged to the guest's CPU budget, and neither is the journal's own CPU (records and commit).
   - The byte quota counts logical file lengths, not allocated filesystem blocks or metadata. While a request runs, the log and retained files may each hold as much again: at most three quota-sized logical content budgets. Small files and filesystem metadata add physical overhead; `max_files` independently bounds directory entries. Size the backing disk for both limits, not just `3 × disk_mb`.
 - **Safety:**
   - Guest paths reach only the volume. The journal sits beside it, out of reach.
@@ -707,6 +707,6 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 ## Known limits of this phase
 
 - **Inline filesystem calls can't be interrupted by the epoch.** Each one is bounded by the quotas and charged to the guest's CPU budget.
-- **The CPU budget is wall time inside each poll of the guest.** It inflates when the host is oversubscribed, which errs on the side of killing hogs early.
+- **The CPU budget is the CPU time of the thread polling the guest** (user and kernel, so the guest's own file calls count; waiting for a core or the disk doesn't). An overloaded node slows a request down to its wall-clock deadline (504) rather than failing it for CPU ([N-640](ISSUES.md)).
 - **Without root, apps share the supervisor's uid.** Landlock and seccomp still separate them.
 - **A worker's stderr lines are passed on whole up to 4 KiB**; longer ones are split.

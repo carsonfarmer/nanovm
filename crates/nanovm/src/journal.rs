@@ -36,11 +36,10 @@ use std::io::ErrorKind;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 
-use crate::{committed, config::CaptureConfig, object::ObjShared};
+use crate::{committed, config::CaptureConfig, metrics::thread_cpu_ns, object::ObjShared};
 
 const LOG: &str = "log";
 /// The log's format tag, then the key, in its first block; records start in
@@ -505,12 +504,12 @@ impl Journal {
         })
     }
 
-    /// Runs `f`, whose waits for the disk aren't charged as CPU; if it
-    /// fails, the journal needs recovery.
+    /// Runs `f`, whose CPU isn't charged to the guest; if it fails, the
+    /// journal needs recovery.
     fn or_poison(&mut self, f: impl FnOnce(&mut Self) -> std::io::Result<()>) -> std::io::Result<()> {
-        let t0 = Instant::now();
+        let t0 = thread_cpu_ns();
         let result = f(self);
-        self.obj.uncharge(t0.elapsed());
+        self.obj.uncharge(t0);
         self.poisoned |= result.is_err();
         result
     }
@@ -860,13 +859,15 @@ fn no_entry(e: &std::io::Error) -> bool {
 /// reach PATH_MAX: the journal, commits and recovery reach entries by path,
 /// while a guest's descriptors reach deeper (`creating` refuses such creates).
 fn within_path_max(to: &Path, from: &Path) -> std::io::Result<()> {
-    let mut dirs: Vec<PathBuf> = Some(from.to_path_buf()).filter(|f| f.is_dir()).into_iter().collect();
+    let dir = std::fs::symlink_metadata(from).is_ok_and(|m| m.is_dir());
+    let mut dirs: Vec<PathBuf> = Some(from.to_path_buf()).filter(|_| dir).into_iter().collect();
     let mut deepest = 0;
     while let Some(dir) = dirs.pop() {
         for e in std::fs::read_dir(&dir)? {
-            let p = e?.path();
+            // The entry's own type: no stat, and never through a symlink.
+            let (p, is_dir) = e.and_then(|e| Ok((e.path(), e.file_type()?.is_dir())))?;
             deepest = deepest.max(p.as_os_str().len() - from.as_os_str().len());
-            if p.is_dir() {
+            if is_dir {
                 dirs.push(p);
             }
         }
@@ -1677,6 +1678,13 @@ mod tests {
         assert_eq!(too_deep.unwrap_err().kind(), ErrorKind::InvalidFilename);
         assert!(j.log.is_none());
         j.renaming(&v.join("c"), &v.join(levels(7)).join("c"), None).unwrap();
+        // The walk never follows a symlink: an operator's link to an
+        // ancestor (guests can't make one) would otherwise never end.
+        std::fs::create_dir(v.join("s")).unwrap();
+        std::os::unix::fs::symlink("..", v.join("s/up")).unwrap();
+        std::os::unix::fs::symlink(v.join("s"), v.join("link")).unwrap();
+        j.renaming(&v.join("s"), &v.join("s2"), None).unwrap();
+        j.renaming(&v.join("link"), &v.join("link2"), None).unwrap();
     }
 
     /// Logs written before that, naming such paths in any record, recover.
