@@ -367,9 +367,10 @@ fn parse(txt: &str) -> anyhow::Result<Route> {
     for field in txt.split(';').map(str::trim).filter(|f| !f.is_empty()) {
         match field.split_once('=') {
             Some(("app", a)) if app.is_none() => app = Some(a.trim().parse::<Reference>().context("app")?),
+            // The node reads them as one comma-separated header.
             Some(("trust", t)) => match t.split_whitespace().collect::<Vec<_>>()[..] {
-                [issuer, subject] => trust.push(format!("{issuer} {subject}")),
-                _ => bail!("trust is `<issuer> <subject>`"),
+                [issuer, subject] if !t.contains(',') => trust.push(format!("{issuer} {subject}")),
+                _ => bail!("trust is `<issuer> <subject>`, without commas"),
             },
             Some(("min", m)) if min.is_none() => min = Some(m.trim().parse::<semver::Version>()?.to_string()),
             _ => bail!("unknown or repeated field {field:?}"),
@@ -506,9 +507,35 @@ mod tests {
             "app=ghcr.io/org/app:prod; trust=a b; min=x",
             "app=ghcr.io/org/app:prod; app=ghcr.io/x/y:z; trust=a b",
             "app=ghcr.io/org/app:prod; trust=a b; extra=1",
+            // The node splits trust on commas, and would refuse every request.
+            "app=ghcr.io/org/app:prod; trust=https://token,actions.githu mbruepo",
+            "app=ghcr.io/org/app:prod; trust=https://i repo:o/a:ref:refs/heads/x,y",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
         assert_eq!(unquote(r#""app=x:y; " "trust=a b""#), "app=x:y; trust=a b");
+    }
+
+    /// A record the proxy accepts names a policy the node accepts: the node
+    /// reads `nanovm-trust` as comma-separated `<issuer> <subject>` pairs, so
+    /// a comma inside one (found by fuzzing, D-45) made every request to the
+    /// host fail at the node instead of the record being refused.
+    #[test]
+    fn accepted_records_are_policies_the_node_accepts() {
+        use crate::registry::{APP_HEADER, AppRef, TRUST_HEADER};
+        for record in [
+            "app=ghcr.io/org/app:prod; trust=https://i s1; trust=https://i s2",
+            "app=ghcr.io/org/app:prod; trust=https://token,actions.githu mbruepo",
+            "app=ghcr.io/org/app:prod; trust=https://i repo:o/a:ref:refs/heads/x,y",
+            "app=ghcr.io/org/app:prod; trust=, s",
+        ] {
+            let Ok(route) = parse(record) else { continue };
+            let mut headers = http::HeaderMap::new();
+            let app = format!("{}/{}@sha256:{}", route.app.registry(), route.app.repository(), "0".repeat(64));
+            headers.insert(APP_HEADER, app.parse().unwrap());
+            headers.insert(TRUST_HEADER, route.trust.parse().unwrap());
+            let r = AppRef::from_headers(&headers);
+            assert!(r.as_ref().is_ok_and(Option::is_some), "{record}: {:?}", r.err());
+        }
     }
 }

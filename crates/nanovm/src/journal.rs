@@ -650,13 +650,15 @@ fn no_entry(e: &std::io::Error) -> bool {
 /// reach PATH_MAX: the journal, commits and recovery reach entries by path,
 /// while a guest's descriptors reach deeper (`creating` refuses such creates).
 fn within_path_max(to: &Path, from: &Path) -> std::io::Result<()> {
-    let mut dirs: Vec<PathBuf> = Some(from.to_path_buf()).filter(|f| f.is_dir()).into_iter().collect();
+    let dir = std::fs::symlink_metadata(from).is_ok_and(|m| m.is_dir());
+    let mut dirs: Vec<PathBuf> = Some(from.to_path_buf()).filter(|_| dir).into_iter().collect();
     let mut deepest = 0;
     while let Some(dir) = dirs.pop() {
         for e in std::fs::read_dir(&dir)? {
-            let p = e?.path();
+            // The entry's own type: no stat, and never through a symlink.
+            let (p, is_dir) = e.and_then(|e| Ok((e.path(), e.file_type()?.is_dir())))?;
             deepest = deepest.max(p.as_os_str().len() - from.as_os_str().len());
-            if p.is_dir() {
+            if is_dir {
                 dirs.push(p);
             }
         }
@@ -1303,6 +1305,13 @@ mod tests {
         assert_eq!(too_deep.unwrap_err().kind(), ErrorKind::InvalidFilename);
         assert!(j.log.is_none());
         j.renaming(&v.join("c"), &v.join(levels(7)).join("c")).unwrap();
+        // The walk never follows a symlink: an operator's link to an
+        // ancestor (guests can't make one) would otherwise never end.
+        std::fs::create_dir(v.join("s")).unwrap();
+        std::os::unix::fs::symlink("..", v.join("s/up")).unwrap();
+        std::os::unix::fs::symlink(v.join("s"), v.join("link")).unwrap();
+        j.renaming(&v.join("s"), &v.join("s2")).unwrap();
+        j.renaming(&v.join("link"), &v.join("link2")).unwrap();
     }
 
     /// Logs written before that, naming such paths in any record, recover.
