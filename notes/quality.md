@@ -30,7 +30,8 @@ journal refuses a write depends on how the write's stream is chunked; the model 
 first run shrank to two requests: commit an empty file `d`; then `mkdir d/a` in a request that
 fails. `creating` recorded `Created(d/a)`, the mkdir failed with ENOTDIR, and on restart recovery
 treated `symlink_metadata`'s ENOTDIR as an error: the object answered 503 `instantiate-failed`
-forever. `ideas/quota-model` carries the fix (merged) so its test passes.
+forever. The class it belongs to (N-502..N-504) is fixed on `cf/main-next` (98f25be), which this
+branch is now merged with; the test passes on it.
 
 **Coverage of one 64-case run** (op and result counts): writes 151 ok / 102 short or refused for
 space / 37 refused at the entry limit / 231 other errors; truncates 26 ok / 10 refused for space;
