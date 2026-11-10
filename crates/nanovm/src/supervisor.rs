@@ -175,6 +175,10 @@ impl Supervisor {
         });
         sup.clone().refill();
         // Renews the node's session, and tells each worker it holds.
+        // Jailed workers can't reach a store: their versions ship from here.
+        if let Some(store) = sup.cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten() {
+            tokio::spawn(crate::ship::run(sup.cfg.data_dir.join("objects"), store, sup.leases.clone()));
+        }
         if let Some(leases) = sup.leases.clone() {
             let weak = Arc::downgrade(&sup);
             tokio::spawn(async move {

@@ -499,7 +499,7 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
     });
     // Only while the node holds the object's lease (see `Journal::commit`):
     // otherwise neither its changes nor its publishes go out.
-    quota.commit()?;
+    quota.commit().await?;
     if !held.is_empty() {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {

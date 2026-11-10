@@ -152,6 +152,17 @@ config! {
     pub struct CaptureConfig {
         max_mb: u64 = 256u64,
         max_versions: u64 = 16u64,
+        /// Every this many versions, one holds the whole volume; the rest
+        /// hold what a commit changed.
+        snapshot_every: u64 = 16u64,
+        /// Where published versions are shipped, then removed here but the
+        /// last: an object store URL, as `leases` takes (`s3://bucket/prefix`,
+        /// `file:///path`; credentials and region from `AWS_*`). None keeps
+        /// them all here.
+        store: Option<String> = None::<String>,
+        /// Acknowledge a commit once its version is in the store, not once it
+        /// is durable here (the default).
+        remote_ack: bool = false,
     }
 }
 
@@ -228,6 +239,9 @@ impl NodeConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.leases.is_empty() && self.name.is_empty() {
             bail!("a node with leases has a name");
+        }
+        if self.capture.as_ref().is_some_and(|c| c.remote_ack && c.store.is_none()) {
+            bail!("capture.remote_ack needs a capture.store");
         }
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }

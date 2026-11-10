@@ -122,6 +122,88 @@ fn captured_files(objects: &Path, id: &str, sequence: u64) -> std::collections::
     }).filter(|(path, _)| path != Path::new("nanovm.json")).collect()
 }
 
+/// A node ships each committed version to a store and keeps only the last;
+/// the object is then rebuilt from the store on a fresh data root, served,
+/// and its history goes on in the store from there.
+#[tokio::test(flavor = "multi_thread")]
+async fn shipped_versions_restore_an_object_on_a_fresh_root() {
+    use nanovm::ship::{Dir, Store};
+    let store = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ship-store");
+    let _ = std::fs::remove_dir_all(&store);
+    let shipped = |n: u64| store.join(format!("counter/o/{n:020}.tar")).exists();
+    let shipping = |name| {
+        let mut cfg = node_cfg(name, 8);
+        cfg.capture = Some(nanovm::config::CaptureConfig {
+            store: Some(store.to_str().unwrap().into()),
+            snapshot_every: 2,
+            ..Default::default()
+        });
+        cfg
+    };
+    let cfg = shipping("ship_source");
+    let node = node_with(cfg.clone(), app("counter"));
+    for n in 1..=3 {
+        assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
+    }
+    eventually("versions shipped", || shipped(3)).await;
+    let local = cfg.app_dirs("counter")[0].join("~committed/o");
+    eventually("shipped versions removed", || std::fs::read_dir(&local).unwrap().count() == 1).await;
+    node.shutdown().await;
+    drop(node);
+    std::fs::remove_dir_all(&cfg.data_dir).unwrap();
+    for (name, count) in [("ship_restored", 3), ("ship_restored_again", 4)] {
+        let fresh = shipping(name);
+        let objects = fresh.app_dirs("counter")[0].clone();
+        let last = nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &objects).await.unwrap();
+        assert_eq!(last, count);
+        let node = node_with(fresh.clone(), app("counter"));
+        assert_eq!(get(&node, "o", "/").await.json()["count"], count);
+        assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], count + 1);
+        eventually("the next version shipped", || shipped(count + 1)).await;
+        node.shutdown().await;
+        drop(node);
+        if name == "ship_restored" {
+            std::fs::remove_dir_all(&fresh.data_dir).unwrap();
+        }
+    }
+    let theirs = Dir(store.clone()).get("counter/o/00000000000000000005.tar").await.unwrap().unwrap();
+    assert!(!theirs.is_empty());
+}
+
+/// With remote acknowledgement, a commit whose version can't be stored is
+/// not acknowledged, though it stands here; and with the store down, once
+/// the capture limits are reached writes are refused, never versions dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() {
+    for remote_ack in [true, false] {
+        let mut cfg = node_cfg(if remote_ack { "ship_remote_ack" } else { "ship_outbox" }, 8);
+        cfg.capture = Some(nanovm::config::CaptureConfig {
+            // A store no write reaches.
+            store: Some("/dev/null/store".into()),
+            max_versions: 3,
+            remote_ack,
+            ..Default::default()
+        });
+        let node = node_with(cfg.clone(), app("counter"));
+        let r = request(&node, "POST", "o", "/incr", "").await;
+        if remote_ack {
+            assert_eq!(r.error.as_deref(), Some("commit-failed"), "{}", r.body);
+            assert_eq!(get(&node, "o", "/").await.json()["count"], 1, "the commit stands here");
+        } else {
+            assert_eq!(r.json()["count"], 1);
+            for n in 2..=3 {
+                assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
+            }
+            let r = request(&node, "POST", "o", "/incr", "").await;
+            assert_eq!(r.error.as_deref(), Some("commit-failed"), "a full outbox refuses: {}", r.body);
+            assert_eq!(get(&node, "o", "/").await.json()["count"], 3);
+            let local = cfg.app_dirs("counter")[0].join("~committed/o");
+            assert_eq!(std::fs::read_dir(local).unwrap().count(), 3, "every unshipped version kept");
+        }
+        node.shutdown().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn app_storage_has_one_local_owner() {
     let cfg = node_cfg("app_storage_has_one_local_owner", 2);
@@ -2100,10 +2182,7 @@ async fn sqlite_captures_recover_without_the_original_node() {
     node.shutdown().await;
     drop(node);
     std::fs::remove_dir_all(&cfg.data_dir).unwrap();
-    let unpack = fresh.data_dir.join("unpack");
-    let last = received.join(versions.last().unwrap().file_name().unwrap());
-    tar::Archive::new(std::fs::File::open(last).unwrap()).unpack(&unpack).unwrap();
-    std::fs::rename(unpack.join("data"), objects.join("a")).unwrap();
+    assert_eq!(nanovm::committed::restore(&received, &objects.join("a")).unwrap(), 2);
     let node = Node::new(fresh.clone(), &app, &wasm, None).unwrap();
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     assert_eq!(get(&node, "a", "/?v=continued").await.json(), expected(&["first", "second", "continued"], "continued", true));
@@ -3814,9 +3893,13 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/begin");
         begin.add_permits(1);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/finish");
-        let journal = objects.join("~journal").join(&id).join("log");
-        assert!(journal.exists(), "post-return write has an uncommitted journal");
-        if fail { std::fs::rename(&journal, journal.with_file_name("saved-log")).unwrap(); }
+        let after = objects.join(&id).join("after.txt");
+        assert!(after.exists(), "post-return work wrote");
+        if fail {
+            // A file the commit can't sync, as on a failing disk.
+            std::fs::rename(&after, objects.join(format!("{id}-after"))).unwrap();
+            std::os::unix::fs::symlink("after.txt", &after).unwrap();
+        }
         let mut queued = if !fail {
             let node = node.clone();
             let id = id.clone();
@@ -3840,13 +3923,12 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
             assert!(!objects.join(format!("~committed/{id}/{:020}.tar", 2)).exists());
         }
         assert_eq!(captured_files(&objects, &id, 1), first, "later work changed a published version");
-        if fail { std::fs::rename(journal.with_file_name("saved-log"), &journal).unwrap(); }
     }
     node.shutdown().await;
     let telemetry = node.telemetry.clone();
     drop(node);
-    // The injected failure happened before log deletion: restoring that
-    // undo record must retain the first commit and reject only later work.
+    // The injected failure happened before the log's new key: its undo
+    // records must retain the first commit and reject only later work.
     // This is not a claim that every ambiguous commit failure rolls back.
     for _ in 0..2 {
         let reopened = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
