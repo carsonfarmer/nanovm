@@ -315,7 +315,36 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** found by the quality agent's model-based quota test (D-46). A guest creates `d/a` (a file or a directory) where `d` is a file: `creating` records `Created(d/a)` (its `symlink_metadata` fails with ENOTDIR, not NotFound), and the create then fails. If that request fails (an error answer, a trap, CPU, a crash), the next start recovers the log; `symlink_metadata(d/a)` fails with ENOTDIR again, which recovery treated as an error, so the journal refuses to start the object, every time: the object answers 503 `instantiate-failed` (`Not a directory`) for good. Any app that creates paths from request data can be bricked by a client who makes it create under a file and then fail.
 - **Reproduced:** yes: `quota_usage_always_matches_the_model` shrank it to two requests (commit an empty file `d`; then `mkdir d/a` in a request that fails); `a_failed_create_under_a_file_rolls_back` fails without the fix (`recovery succeeds: NotADirectory`).
 - **Fix:** recovery treats NotADirectory like NotFound for a `Created` record: nothing can be there, so the create never happened. One line; also repairs logs already written.
-- **Status:** fixed on `ideas/fix-recover-enotdir`
+- **Status:** fixed in 6fdb057 (recovery); the class is closed on `ideas/recover-class`: `creating` and `removing_dir` refuse what they can't name instead of recording it (see N-503, N-504)
+
+### N-503: a failed create of an over-long name bricks the object if its request then fails
+- **Where:** `journal.rs` (`creating`, `recover`)
+- **Scenario:** found by the quality agent's second hostile guest (D-58). The N-502 class with another errno: a 256-byte name fails `symlink_metadata` with ENAMETOOLONG, is recorded as `Created`, the create fails, and a failed request leaves recovery failing on every start (503 `instantiate-failed`, `File name too long`). Any app that names files from request data can be bricked by a long name and a failing request.
+- **Reproduced:** yes (`unusual_names_commit_and_roll_back` on `ideas/hostile2`; `logs_naming_impossible_paths_recover` and `random_path_shapes_always_roll_back` fail without the fix).
+- **Fix:** see N-504.
+- **Status:** fixed on `ideas/recover-class`
+
+### N-504: a directory chain deeper than PATH_MAX bricks the object
+- **Where:** `journal.rs` (`creating`, `removing_dir`, `renaming`, `recover`)
+- **Scenario:** found by the second hostile guest (D-58). A guest reaches any depth by opening each directory from its parent's descriptor; the journal names entries by absolute path. Creating a directory whose path reaches PATH_MAX (16 levels of 255-byte names under a 72-byte volume path) was recorded, made, then failed the commit (`File name too long`) and every later recovery: the object answered 503 `instantiate-failed` for good. A directory renamed under a deep one could also move what is under it out of the journal's reach.
+- **Reproduced:** yes (`/deep` on `ideas/hostile2`: depths 12-15 commit and roll back; 16-20 brick the object).
+- **Fix (one class with N-502, N-503):** `creating` and `removing_dir` record only when `symlink_metadata` says NotFound (or, for `removing_dir`, a directory); any other error is returned, so the guest gets the error the syscall would give (`not-directory`, `name-too-long`) and nothing is recorded. Returning rather than recording nothing: for a whole path too long for the journal but not for the guest's descriptor, the create would succeed out of the journal's reach. `renaming` refuses a move that would put anything under it at PATH_MAX or more (walking a moved directory, at most `max_files` entries). Recovery treats path-shape errors (NotFound, NotADirectory, ENAMETOOLONG, and ELOOP) as "nothing there" for every record, repairing logs already written; real I/O errors stay fatal.
+- **Status:** fixed on `ideas/recover-class`
+
+
+### N-551: a supervisor running as pid 1 (a container without an init) starts no worker
+- **Where:** `jail.rs` (`Jail::enter`: `ensure!(getppid() != 1, "supervisor exited")`)
+- **Scenario:** found by the ops agent building the container image. A worker took "my parent is pid 1" to mean its supervisor had died before `PR_SET_PDEATHSIG` was armed. In a container without `--init`, or a Kubernetes pod, the supervisor *is* pid 1, so every worker refused to start (`502 worker-down`, worker's last words `entering the jail: supervisor exited`). The check also passed wrongly under a child subreaper, which adopts orphans instead of pid 1.
+- **Reproduced:** yes, `deploy/container/test/local.sh` ("as PID 1, workers start" fails before the fix).
+- **Fix:** the supervisor puts its pid in the worker's spec, and the worker compares `getppid()` with it. +2 runtime lines.
+- **Status:** fixed on `ideas/container-image`
+
+### N-552: a binary replaced under a running supervisor starts workers of the new version
+- **Where:** `main.rs`/`supervisor.rs` (`Supervisor::new(cfg, std::env::current_exe()?, …)`; `start` spawns `self.exe`)
+- **Scenario:** found by the ops agent writing the upgrade runbook. The supervisor resolved its executable's path once at start and spawned every worker from that path. Installing a new binary (`install`, `mv`, a package manager's upgrade before its restart) while the node ran made new workers the new version under the old supervisor; their private spec or link protocol can differ.
+- **Reproduced:** yes, `docs/ops/drills/binary-swap.sh` with builds before and after N-551: the running app kept serving, a new app got `502 worker-down` (`worker spec: invalid length 3, expected a tuple of size 4`).
+- **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
+- **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
 ## Planned work
 
