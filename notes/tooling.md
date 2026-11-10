@@ -112,6 +112,23 @@ The composed component grows 439 KB → 1,357 KB; compile CPU is unchanged
 
 **Tests:** `cargo test -p nanovm --example debug-run` (2).
 
+## C-39 `tools/replay.py` (`ideas/tooling-replay`)
+
+**What it does:** `record --to URL` forwards requests to the proxy or a node
+and logs each request and answer (JSON lines); `replay LOG --to URL [--host
+NEW] [--object-prefix P] [--ignore KEY]` sends them again in order, under the
+new version's host and onto fresh objects (objects keep state, so a replay
+must start where the recording did), and reports every answer whose status,
+`x-nanovm-error` or body (less ignored JSON keys) differs; exit 1 if any.
+HTTP only.
+
+**Evidence:** through `tools/local-stack`, a 6-request counter session
+(increments, read, config, KV put and get) replayed onto fresh objects of the
+same version gave 0 differences, and onto a host running the same component
+with another `greeting` config, exactly the config read differed.
+
+**Tests:** `tools/test_replay.py` (3).
+
 ## K-100 pre-initialization (`ideas/tooling-preinit`)
 
 Full report: [experiments/preinit/README.md](../experiments/preinit/README.md).
