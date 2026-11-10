@@ -29,8 +29,8 @@ mod bindings {
     wit_bindgen::generate!({ path: "../wit", world: "provider" });
 }
 use bindings::exports::nanovm::docs::store::{
-    Bound as WitBound, Collection as Handle, Document, Error, Guest, GuestCollection, Index as WitIndex, Page, Query,
-    Stats,
+    Bound as WitBound, Collection as Handle, Document, Error, Guest, GuestCollection, Hit, Index as WitIndex, Page,
+    Query, Stats,
 };
 bindings::export!(Provider with_types_in bindings);
 struct Provider;
@@ -145,6 +145,17 @@ fn keys_of(doc: &Value, path: &[String]) -> Vec<Key> {
     }
 }
 
+/// Lowercased runs of letters and digits, up to 64 characters each.
+fn terms(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty() && t.chars().count() <= 64)
+        .map(str::to_lowercase)
+}
+
+/// BM25's usual parameters.
+const K1: f64 = 1.2;
+const B: f64 = 0.75;
+
 /// Sorts after every id (ids are at most 256 bytes).
 fn after_all_ids() -> String {
     "\u{10FFFF}".repeat(MAX_ID / 4 + 1)
@@ -174,16 +185,93 @@ struct Index {
     path: Vec<String>,
     unique: bool,
     tree: BTreeSet<(Key, String)>,
+    /// A full-text index: `postings` and `lengths` instead of `tree`.
+    text: bool,
+    /// Term -> document -> occurrences.
+    postings: HashMap<String, HashMap<String, u32>>,
+    /// Document -> terms in its field; and their sum.
+    lengths: HashMap<String, u32>,
+    total: u64,
 }
 
 impl Index {
-    fn new(field: &str, unique: bool) -> Index {
+    fn new(field: &str, unique: bool, text: bool) -> Index {
         Index {
             field: field.into(),
             path: field.split('.').map(String::from).collect(),
             unique,
             tree: BTreeSet::new(),
+            text,
+            postings: HashMap::new(),
+            lengths: HashMap::new(),
+            total: 0,
         }
+    }
+
+    /// A document's keys in this index: its values, or for a text index
+    /// every term, repeated as often as it occurs, sorted.
+    fn keys(&self, doc: &Value) -> Vec<Key> {
+        if !self.text {
+            return keys_of(doc, &self.path);
+        }
+        let mut v = doc;
+        for segment in &self.path {
+            match v.get(segment) {
+                Some(next) => v = next,
+                None => return Vec::new(),
+            }
+        }
+        let texts: Vec<&str> = match v {
+            Value::String(s) => vec![s],
+            Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        let mut terms: Vec<Key> = texts.into_iter().flat_map(terms).map(Key::Str).collect();
+        terms.sort();
+        terms
+    }
+
+    /// Indexes `id` under `keys`; what its entry keeps to remove it later.
+    fn add(&mut self, id: &str, keys: Vec<Key>) -> Vec<Key> {
+        if !self.text {
+            for k in &keys {
+                self.tree.insert((k.clone(), id.to_string()));
+            }
+            return keys;
+        }
+        let mut distinct = Vec::new();
+        for run in keys.chunk_by(|a, b| a == b) {
+            if let Key::Str(term) = &run[0] {
+                self.postings
+                    .entry(term.clone())
+                    .or_default()
+                    .insert(id.to_string(), run.len() as u32);
+                distinct.push(run[0].clone());
+            }
+        }
+        self.lengths.insert(id.to_string(), keys.len() as u32);
+        self.total += keys.len() as u64;
+        distinct
+    }
+
+    fn remove(&mut self, id: &str, keys: Vec<Key>) {
+        if !self.text {
+            for k in keys {
+                self.tree.remove(&(k, id.to_string()));
+            }
+            return;
+        }
+        for k in keys {
+            if let Key::Str(term) = k
+                && let Some(docs) = self.postings.get_mut(&term)
+            {
+                docs.remove(id);
+                if docs.is_empty() {
+                    self.postings.remove(&term);
+                }
+            }
+        }
+        self.total -= u64::from(self.lengths.remove(id).unwrap_or(0));
     }
 
     /// Whether a document other than `id` already has one of `keys`.
@@ -233,7 +321,8 @@ impl State {
                 let (Some(field), Some(unique)) = (def["field"].as_str(), def["unique"].as_bool()) else {
                     return Err(corrupt("indexes", "bad definition"));
                 };
-                self.indexes.push(Index::new(field, unique));
+                let text = def["text"].as_bool().unwrap_or(false);
+                self.indexes.push(Index::new(field, unique, text));
             }
         }
         let Some(mut log) = LogReader::open(&self.log()).await? else {
@@ -248,7 +337,7 @@ impl State {
                         Vec::new()
                     } else {
                         let doc: Value = serde_json::from_slice(&rec.body).map_err(|e| corrupt("log", e))?;
-                        self.indexes.iter().map(|ix| keys_of(&doc, &ix.path)).collect()
+                        self.indexes.iter().map(|ix| ix.keys(&doc)).collect()
                     };
                     self.apply_put(rec.id, rec.at, rec.body.len() as u32, keys);
                 }
@@ -265,11 +354,12 @@ impl State {
 
     fn apply_put(&mut self, id: String, at: u64, body_len: u32, keys: Vec<Vec<Key>>) {
         self.apply_delete(&id);
-        for (ix, ks) in self.indexes.iter_mut().zip(&keys) {
-            for k in ks {
-                ix.tree.insert((k.clone(), id.clone()));
-            }
-        }
+        let keys = self
+            .indexes
+            .iter_mut()
+            .zip(keys)
+            .map(|(ix, ks)| ix.add(&id, ks))
+            .collect();
         let entry = Entry {
             at,
             id_len: id.len() as u32,
@@ -286,9 +376,7 @@ impl State {
         };
         self.live -= old.record_len();
         for (ix, ks) in self.indexes.iter_mut().zip(old.keys) {
-            for k in ks {
-                ix.tree.remove(&(k, id.to_string()));
-            }
+            ix.remove(id, ks);
         }
         true
     }
@@ -343,7 +431,7 @@ impl State {
         if !doc.is_object() {
             return Err(Error::InvalidJson("a document must be a JSON object".into()));
         }
-        let keys: Vec<Vec<Key>> = self.indexes.iter().map(|ix| keys_of(&doc, &ix.path)).collect();
+        let keys: Vec<Vec<Key>> = self.indexes.iter().map(|ix| ix.keys(&doc)).collect();
         for (ix, ks) in self.indexes.iter().zip(&keys) {
             if ix.unique && ix.taken(ks, &id) {
                 return Err(Error::Conflict(ix.field.clone()));
@@ -491,6 +579,12 @@ impl State {
     async fn query(&mut self, q: Query) -> Result<Page, Error> {
         check_limit(q.limit)?;
         let i = self.index(&q.field)?;
+        if self.indexes[i].text {
+            return Err(Error::InvalidArgument(format!(
+                "{} is a text index: use search",
+                q.field
+            )));
+        }
         let lower = match &q.lower {
             WitBound::Unbounded => Bound::Unbounded,
             WitBound::Included(v) => Bound::Included((Key::parse(v)?, String::new())),
@@ -539,6 +633,44 @@ impl State {
         })
     }
 
+    /// Documents matching any term of `query` in text index `field`, best
+    /// first by BM25 (ties by id).
+    async fn search(&mut self, field: &str, query: &str, limit: u32) -> Result<Vec<Hit>, Error> {
+        check_limit(limit)?;
+        let ix = &self.indexes[self.index(field)?];
+        if !ix.text {
+            return Err(Error::InvalidArgument(format!("{field} is not a text index")));
+        }
+        let mut wanted: Vec<String> = terms(query).collect();
+        wanted.sort();
+        wanted.dedup();
+        let n = ix.lengths.len() as f64;
+        let average = ix.total as f64 / n.max(1.0);
+        let mut scores: HashMap<&String, f64> = HashMap::new();
+        for term in &wanted {
+            let Some(docs) = ix.postings.get(term) else { continue };
+            let df = docs.len() as f64;
+            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+            for (id, &tf) in docs {
+                let (tf, len) = (f64::from(tf), f64::from(ix.lengths[id]));
+                *scores.entry(id).or_default() += idf * tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * len / average));
+            }
+        }
+        let mut ranked: Vec<(&String, f64)> = scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        ranked.truncate(limit as usize);
+        let ranked: Vec<(String, f64)> = ranked.into_iter().map(|(id, s)| (id.clone(), s)).collect();
+        let mut hits = Vec::with_capacity(ranked.len());
+        for (id, score) in ranked {
+            let body = self.body(&id).await?;
+            hits.push(Hit {
+                document: Document { id, body },
+                score,
+            });
+        }
+        Ok(hits)
+    }
+
     fn index(&self, field: &str) -> Result<usize, Error> {
         self.indexes
             .iter()
@@ -564,18 +696,18 @@ impl State {
     fn defs(&self) -> Vec<Value> {
         self.indexes
             .iter()
-            .map(|ix| json!({"field": ix.field, "unique": ix.unique}))
+            .map(|ix| json!({"field": ix.field, "unique": ix.unique, "text": ix.text}))
             .collect()
     }
 
-    async fn create_index(&mut self, field: String, unique: bool) -> Result<(), Error> {
+    async fn create_index(&mut self, field: String, unique: bool, text: bool) -> Result<(), Error> {
         if field.is_empty() || field.len() > MAX_FIELD || field.split('.').any(str::is_empty) {
             return Err(Error::InvalidArgument(format!(
                 "a field is 1-{MAX_FIELD} bytes of dot-separated names"
             )));
         }
         if let Ok(i) = self.index(&field) {
-            return match self.indexes[i].unique == unique {
+            return match (self.indexes[i].unique, self.indexes[i].text) == (unique, text) {
                 true => Ok(()),
                 false => Err(Error::InvalidArgument(format!(
                     "{field} is already indexed differently"
@@ -585,7 +717,7 @@ impl State {
         if self.indexes.len() == MAX_INDEXES {
             return Err(Error::InvalidArgument(format!("at most {MAX_INDEXES} indexes")));
         }
-        let mut ix = Index::new(&field, unique);
+        let mut ix = Index::new(&field, unique, text);
         let mut keys = HashMap::with_capacity(self.docs.len());
         if let Some(mut log) = LogReader::open(&self.log()).await? {
             while let Some(rec) = log.next().await? {
@@ -593,18 +725,16 @@ impl State {
                     continue;
                 }
                 let doc: Value = serde_json::from_slice(&rec.body).map_err(|e| corrupt("log", e))?;
-                let ks = keys_of(&doc, &ix.path);
+                let ks = ix.keys(&doc);
                 if unique && ix.taken(&ks, &rec.id) {
                     return Err(Error::Conflict(field));
                 }
-                for k in &ks {
-                    ix.tree.insert((k.clone(), rec.id.clone()));
-                }
-                keys.insert(rec.id, ks);
+                let kept = ix.add(&rec.id, ks);
+                keys.insert(rec.id, kept);
             }
         }
         let mut defs = self.defs();
-        defs.push(json!({"field": field, "unique": unique}));
+        defs.push(json!({"field": field, "unique": unique, "text": text}));
         self.write_indexes(Value::Array(defs)).await?;
         for (id, entry) in self.docs.iter_mut() {
             entry.keys.push(keys.remove(id).unwrap_or_default());
@@ -880,7 +1010,16 @@ impl GuestCollection for Collection {
 
     async fn create_index(&self, field: String, unique: bool) -> Result<(), Error> {
         let mut state = self.loaded().await?;
-        wit_bindgen::block_on(state.create_index(field, unique))
+        wit_bindgen::block_on(state.create_index(field, unique, false))
+    }
+
+    async fn create_text_index(&self, field: String) -> Result<(), Error> {
+        let mut state = self.loaded().await?;
+        wit_bindgen::block_on(state.create_index(field, false, true))
+    }
+
+    async fn search(&self, field: String, query: String, limit: u32) -> Result<Vec<Hit>, Error> {
+        self.loaded().await?.search(&field, &query, limit).await
     }
 
     async fn drop_index(&self, field: String) -> Result<(), Error> {
@@ -896,6 +1035,7 @@ impl GuestCollection for Collection {
             .map(|ix| WitIndex {
                 field: ix.field.clone(),
                 unique: ix.unique,
+                text: ix.text,
             })
             .collect())
     }

@@ -62,6 +62,20 @@ impl util::wasip3::exports::http::handler::Guest for App {
                 Ok(()) => json!({}),
                 Err(e) => return fail(e),
             },
+            ("POST", "/text-index") => match coll.create_text_index(req.q("field").unwrap().into()).await {
+                Ok(()) => json!({}),
+                Err(e) => return fail(e),
+            },
+            ("GET", "/search") => {
+                let (field, q) = (
+                    req.q("field").unwrap().to_string(),
+                    req.q("q").unwrap_or("").to_string(),
+                );
+                match coll.search(field, q, req.q_u64("limit", 10) as u32).await {
+                    Ok(hits) => hits.iter().map(|h| json!([h.document.id, h.score])).collect(),
+                    Err(e) => return fail(e),
+                }
+            }
             ("GET", "/indexes") => {
                 let list = coll.indexes().await.expect("indexes");
                 list.iter()

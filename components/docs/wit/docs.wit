@@ -41,6 +41,14 @@ interface store {
   record index {
     field: string,
     unique: bool,
+    /// A full-text index, searched with `search`.
+    text: bool,
+  }
+
+  /// A search result and its BM25 score (higher is better).
+  record hit {
+    document: document,
+    score: f64,
   }
 
   record stats {
@@ -98,6 +106,15 @@ interface store {
     /// duplicates with `conflict`. Creating an existing index is a no-op if
     /// `unique` matches.
     create-index: async func(field: string, unique: bool) -> result<_, error>;
+
+    /// Indexes the words of `field` (a string, or an array of strings) for
+    /// `search`: lowercased runs of letters and digits, no stemming or stop
+    /// words. Kept in memory like the other indexes.
+    create-text-index: async func(field: string) -> result<_, error>;
+
+    /// Up to `limit` (1-1,000) documents containing any word of `query` in
+    /// text index `field`, best first (BM25), ties by id.
+    search: async func(field: string, query: string, limit: u32) -> result<list<hit>, error>;
 
     drop-index: async func(field: string) -> result<_, error>;
 

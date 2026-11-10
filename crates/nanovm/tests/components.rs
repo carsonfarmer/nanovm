@@ -1065,3 +1065,67 @@ async fn auth_sessions_quota_exhaustion_is_refused_cleanly() {
     assert_eq!(files_under(&volume(&cfg, "auth", "s")).len(), created);
     node.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/docs/build.sh"]
+async fn docs_full_text_search() {
+    let cfg = node_cfg("docs_search", 2);
+    let app = app("docs", json!({}));
+    let mut node = start(&cfg, &app);
+    ok(&node, "POST", "d", "/text-index?field=body", "").await;
+    for (id, body) in [
+        ("a", r#"{"body":"The quick brown fox jumps over the lazy dog"}"#),
+        ("b", r#"{"body":"A quick, QUICK start guide to Rust"}"#),
+        ("c", r#"{"body":["Rust components","over the filesystem"]}"#),
+        ("d", r#"{"body":42}"#),
+    ] {
+        ok(&node, "PUT", "d", &format!("/doc?id={id}"), body).await;
+    }
+    let search = |q: &str| format!("/search?field=body&q={}", urlencode(q));
+    let ranked = |v: Value| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h[0].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    // Twice the term in a shorter document ranks first; case doesn't matter.
+    let quick = ok(&node, "GET", "d", &search("Quick"), "").await;
+    assert_eq!(ranked(quick.clone()), ["b", "a"]);
+    assert!(quick[0][1].as_f64().unwrap() > quick[1][1].as_f64().unwrap());
+    assert_eq!(
+        ranked(ok(&node, "GET", "d", &search("rust filesystem"), "").await),
+        ["c", "b"]
+    );
+    assert_eq!(ranked(ok(&node, "GET", "d", &search("over"), "").await), ["c", "a"]);
+    assert_eq!(ok(&node, "GET", "d", &search("nothing here"), "").await, json!([]));
+    assert_eq!(
+        ok(&node, "GET", "d", &format!("{}&limit=1", search("quick rust")), "")
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Replacing and deleting documents update the index.
+    ok(
+        &node,
+        "PUT",
+        "d",
+        "/doc?id=b",
+        r#"{"body":"A slow start guide to Rust"}"#,
+    )
+    .await;
+    assert_eq!(ranked(ok(&node, "GET", "d", &search("quick"), "").await), ["a"]);
+    ok(&node, "DELETE", "d", "/doc?id=a", "").await;
+    assert_eq!(ok(&node, "GET", "d", &search("quick"), "").await, json!([]));
+    // Text indexes are searched, not ranged; other indexes are ranged, not searched.
+    let r = request(&node, "GET", "d", "/query?field=body", "").await;
+    assert!(r.status == 409 && r.body.contains("search"), "{}", r.body);
+    assert_eq!(request(&node, "POST", "d", "/index?field=body", "").await.status, 409);
+    ok(&node, "POST", "d", "/text-index?field=body", "").await;
+    // Rebuilt from the log on restart; the shorter document ranks first.
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(ranked(ok(&node, "GET", "d", &search("rust"), "").await), ["c", "b"]);
+    node.shutdown().await;
+}

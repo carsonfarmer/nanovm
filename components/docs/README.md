@@ -14,7 +14,16 @@ wac plug app.wasm --plug target/components/docs/provider.wasm -o app-with-docs.w
 The interface is [`nanovm:docs/store@0.1.0`](wit/docs.wit): `collection.open`,
 `get`, `put` (insert or replace), `delete`, `scan` (id order), `query` (an
 index range, paged by cursor), `create-index` / `drop-index` / `indexes`,
-`stats` and `compact`. No standard WIT exists for document stores.
+`create-text-index` and `search` (full-text, BM25), `stats` and `compact`. No
+standard WIT exists for document stores.
+
+**Full-text search (J-91)** is a kind of index here rather than a separate
+component: `create-text-index("body")` indexes the words of a string field (or
+an array of strings), lowercased runs of letters and digits with no stemming
+or stop words, and `search("body", "rust filesystem", 10)` returns documents
+containing any of the words, best first by BM25. The postings live in memory
+and are rebuilt from the log with the other indexes, so they cost memory per
+distinct word per document and add to the cold start.
 
 **If the app already composes SQLite, use it instead**: a table of
 `(id TEXT PRIMARY KEY, body TEXT)` with indexes on `json_extract(body, ...)`
@@ -77,5 +86,6 @@ See [notes/components.md](../../notes/components.md) (method, medians).
 `crates/nanovm/tests/components.rs`, `docs_*`: contracts (order across types,
 nested paths, arrays, cursors, errors), indexes and unique constraints across
 eviction and restart, rollback of failed requests (memory included), log
-compaction, and quota exhaustion (refused puts, deletes and compaction on a
-completely full volume).
+compaction, quota exhaustion (refused puts, deletes and compaction on a
+completely full volume), and full-text search (ranking, case, arrays,
+updates, deletes, restart).
