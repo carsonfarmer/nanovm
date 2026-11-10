@@ -9,7 +9,7 @@ in-process node, and a README. Branch `ideas/components`.
 | Component | Interface | What it is | Provider size |
 |---|---|---|---:|
 | [queue](../components/queue/README.md) (J-90) | `nanovm:queue/log@0.1.0` | append-only topics; consumer positions; `next` reads and advances atomically with the request; trim | 199,971 B |
-| [docs](../components/docs/README.md) (J-89, J-91, J-92) | `nanovm:docs/store@0.1.0` | JSON collections; unique and multi-value secondary indexes; range queries with cursors; full-text search (BM25); exact vector nearest neighbours; compaction | 296,671 B |
+| [docs](../components/docs/README.md) (J-89, J-91, J-92) | `nanovm:docs/store@0.1.0` | JSON collections; unique and multi-value secondary indexes; range queries with cursors; full-text search (BM25); exact vector nearest neighbours; compaction | 376,383 B (296,671 before search and vectors) |
 | [timeseries](../components/timeseries/README.md) (J-93) | `nanovm:timeseries/series@0.1.0` | raw points per day; hour/day rollups kept on write; aggregate at any step; retention per level | 218,793 B |
 | [templates](../components/templates/README.md) (J-96) | `nanovm:templates/render@0.1.0` | minijinja: inheritance, includes, filters, escaping by name; pure computation | 886,064 B |
 | [auth](../components/auth/README.md) (J-97) | `nanovm:auth@0.1.0` | JWT verify (inline JWK Set or URL fetched via egress and cached in the volume), argon2id, sessions | 627,414 B |
