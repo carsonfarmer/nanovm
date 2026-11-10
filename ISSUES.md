@@ -346,6 +346,37 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
+### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
+- **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
+- **Scenario:** found by the quality agent while writing D-52. The node's linker defines every WASIp2 interface, including `wasi:filesystem@0.2` and `wasi:sockets@0.2`, and the WASIp2 filesystem shares the `WasiCtx`'s read-write preopens. A guest using `std::fs` links (`instantiate_pre` succeeds). Today `ALLOWED_IMPORTS` refuses it at load, by name, so nothing is exploitable; but that check is the single layer between a guest and writes to `/data` that bypass the quota and the journal (no rollback). Sockets have a second layer (wasmtime's default address check denies every address).
+- **Reproduced:** yes (`components_importing_refused_interfaces_are_rejected_by_name`: `p2_filesystem` and `p2_sockets` link against `app::linker`; with `check_imports` disabled, `p2_sockets was loaded`).
+- **Suggestion:** link only the WASIp2 interfaces `ALLOWED_IMPORTS` permits (io, clocks, random, cli), so a regression in the allowlist fails at link time instead of opening `/data`. Defense in depth, not a bug.
+- **Status:** open (test on `ideas/deploy-validation`)
+
+### N-501 (tests): the test registry pulls in an unmaintained crate with a RustSec advisory
+- **Where:** `crates/nanovm/Cargo.toml` dev-dependency `container-registry` (feature `test-support`) → `tempdir` 0.3.7 → `remove_dir_all` 0.5.3
+- **Scenario:** found by cargo-deny/cargo-audit (G-72). RUSTSEC-2023-0018 (TOCTOU in `remove_dir_all` < 0.8) and RUSTSEC-2018-0017 (`tempdir` unmaintained). Dev-only: not in the node binary; the tests remove only their own temporary registry storage. `container-registry` 0.3.1 is the latest and needs `tempdir` for `test-support`, so no upgrade fixes it. Separately, `experiments/fs-backends/Cargo.lock` is stale (`--locked` refuses it).
+- **Reproduced:** yes (`cargo audit` without `.cargo/audit.toml` exits 1).
+- **Status:** deferred: ignored with reasons in `deny.toml` and `.cargo/audit.toml` on `ideas/supply-chain`. Dropping it means running the test registry without `test-support` (own storage dir and server), which changes dev-dependency features.
+
+### N-505: request bodies have no deadline at any hop
+- **Where:** `proxy.rs` (header timeout only), `supervisor.rs` (`forward` streams the body), `server.rs` (`handle` collects it with a size limit only)
+- **Scenario:** found by the quality agent's second hostile guest (D-58). A client sending a request body a byte at a time holds a proxy connection, a supervisor-to-worker link and a worker task for as long as it keeps sending, up to `max_request_body_kb`. The object isn't held (the body is read before the request is queued), so this is connection and memory pressure, the same family as the missing per-client limits in the proxy (IDEAS G-75).
+- **Reproduced:** yes (`slow_uploads_hold_a_connection_not_the_object`: 40 bytes over 4 s, past every per-request limit, are accepted).
+- **Status:** open (design: a body deadline per hop, or per-client limits in the proxy)
+
+### N-506: a `nanovm-host` starting with `.` gives an app name that isn't a valid name
+- **Where:** `registry.rs` (`app_name`)
+- **Scenario:** found by the quality agent's `app_ref` fuzz target (D-45). `app_name` keeps the readable part of `"{host} {registry}/{repository}"` as is, so a host of `.com` makes `.com_docker.io_…-<hash>`, which `table::valid_name` refuses (names don't start with `.`). It is still one path component (no `/`, never `.` or `..`), so nothing escapes; only the proxy sets the host, from a DNS owner name, which can't start with `.`.
+- **Reproduced:** yes (fuzz input in `fuzz/seeds.py`).
+- **Status:** open, low: map a leading `.` to `_` in the readable part if names must stay valid.
+
+### N-507: the proxy accepts a TXT trust identity with a comma that the node then refuses
+- **Where:** `proxy.rs` (`parse`), `registry.rs` (`AppRef::from_headers` splits `nanovm-trust` on commas)
+- **Scenario:** found by the `txt_record` fuzz target (D-45) within seconds. `trust=https://a,b s` was accepted and sent as `nanovm-trust`; the node split it on the comma and refused every request for the host (502), instead of the record being refused. A comma can never yield a different valid policy at the node, so this is availability only.
+- **Reproduced:** yes (`accepted_records_are_policies_the_node_accepts` fails without the fix).
+- **Status:** fixed on `ideas/fix-trust-comma` (bd058de): the proxy refuses a trust field containing a comma.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
