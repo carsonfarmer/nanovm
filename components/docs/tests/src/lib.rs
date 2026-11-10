@@ -76,6 +76,42 @@ impl util::wasip3::exports::http::handler::Guest for App {
                     Err(e) => return fail(e),
                 }
             }
+            ("POST", "/vector-index") => {
+                let (field, dims) = (req.q("field").unwrap().into(), req.q_u64("dims", 3) as u32);
+                match coll.create_vector_index(field, dims).await {
+                    Ok(()) => json!({}),
+                    Err(e) => return fail(e),
+                }
+            }
+            ("GET", "/nearest") => {
+                let v: Vec<f32> = req.q("v").unwrap().split(',').map(|x| x.parse().unwrap()).collect();
+                match coll
+                    .nearest(req.q("field").unwrap().into(), v, req.q_u64("k", 10) as u32)
+                    .await
+                {
+                    Ok(hits) => hits.iter().map(|h| json!([h.document.id, h.score])).collect(),
+                    Err(e) => return fail(e),
+                }
+            }
+            // `count` documents {"emb": [...]} of `dims` pseudo-random numbers.
+            ("POST", "/bulk-vectors") => {
+                let (count, dims) = (req.q_u64("count", 1), req.q_u64("dims", 64));
+                let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+                for n in 0..count {
+                    let v: Vec<f64> = (0..dims)
+                        .map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            (x % 2000) as f64 / 1000.0 - 1.0
+                        })
+                        .collect();
+                    coll.put(format!("v{n:06}"), json!({"emb": v}).to_string())
+                        .await
+                        .expect("put");
+                }
+                json!({})
+            }
             ("GET", "/indexes") => {
                 let list = coll.indexes().await.expect("indexes");
                 list.iter()

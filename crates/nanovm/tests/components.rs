@@ -1129,3 +1129,64 @@ async fn docs_full_text_search() {
     assert_eq!(ranked(ok(&node, "GET", "d", &search("rust"), "").await), ["c", "b"]);
     node.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/docs/build.sh"]
+async fn docs_vector_nearest_neighbours() {
+    let cfg = node_cfg("docs_vectors", 2);
+    let app = app("docs", json!({}));
+    let mut node = start(&cfg, &app);
+    ok(&node, "POST", "d", "/vector-index?field=emb&dims=3", "").await;
+    for (id, body) in [
+        ("x", r#"{"emb":[1,0,0]}"#),
+        ("y", r#"{"emb":[0,2,0]}"#),
+        ("xy", r#"{"emb":[1,1,0]}"#),
+        ("neg", r#"{"emb":[-1,0,0]}"#),
+        ("short", r#"{"emb":[1,0]}"#),
+        ("text", r#"{"emb":"no"}"#),
+        ("zero", r#"{"emb":[0,0,0]}"#),
+    ] {
+        ok(&node, "PUT", "d", &format!("/doc?id={id}"), body).await;
+    }
+    let nearest = |v: &str, k: u32| format!("/nearest?field=emb&v={v}&k={k}");
+    let ranked = |v: Value| {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h[0].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    // Cosine similarity: direction, not length; only well-formed vectors.
+    let hits = ok(&node, "GET", "d", &nearest("3,0.5,0", 10), "").await;
+    assert_eq!(ranked(hits.clone()), ["x", "xy", "y", "neg"]);
+    assert!((hits[3][1].as_f64().unwrap() + 0.986).abs() < 0.01, "{hits}");
+    assert_eq!(
+        ranked(ok(&node, "GET", "d", &nearest("0,1,0", 2), "").await),
+        ["y", "xy"]
+    );
+    for bad in ["1,0", "0,0,0"] {
+        let r = request(&node, "GET", "d", &nearest(bad, 2), "").await;
+        assert_eq!(r.status, 409, "{bad}: {}", r.body);
+    }
+    // Replacing, deleting and restarting keep the index in step.
+    ok(&node, "PUT", "d", "/doc?id=x", r#"{"emb":[0,0,1]}"#).await;
+    ok(&node, "DELETE", "d", "/doc?id=y", "").await;
+    assert_eq!(
+        ranked(ok(&node, "GET", "d", &nearest("1,0,0", 10), "").await),
+        ["xy", "x", "neg"]
+    );
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(
+        ranked(ok(&node, "GET", "d", &nearest("1,0,0", 10), "").await),
+        ["xy", "x", "neg"]
+    );
+    // One field, one kind of index.
+    assert_eq!(
+        request(&node, "POST", "d", "/vector-index?field=emb&dims=8", "")
+            .await
+            .status,
+        409
+    );
+    assert_eq!(request(&node, "GET", "d", "/query?field=emb", "").await.status, 409);
+    node.shutdown().await;
+}

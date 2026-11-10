@@ -40,6 +40,7 @@ const MAX_BODY: usize = 1 << 20;
 const MAX_ID: usize = 256;
 const MAX_FIELD: usize = 128;
 const MAX_INDEXES: usize = 16;
+const MAX_DIMS: u32 = 4096;
 const MAX_LIMIT: u32 = 1000;
 /// A page stops once its bodies pass this (always at least one document).
 const PAGE_BYTES: usize = 1 << 20;
@@ -152,6 +153,12 @@ fn terms(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_lowercase)
 }
 
+/// `v` scaled to length 1; `None` for a zero or non-finite vector.
+fn unit(v: &[f32]) -> Option<Vec<f32>> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    (norm > 0.0 && norm.is_finite()).then(|| v.iter().map(|x| x / norm).collect())
+}
+
 /// BM25's usual parameters.
 const K1: f64 = 1.2;
 const B: f64 = 0.75;
@@ -192,10 +199,16 @@ struct Index {
     /// Document -> terms in its field; and their sum.
     lengths: HashMap<String, u32>,
     total: u64,
+    /// A vector index of this many dimensions (0: not one): unit vectors
+    /// back to back, the id in each slot, and each id's slot.
+    dims: u32,
+    vectors: Vec<f32>,
+    slots: Vec<String>,
+    slot_of: HashMap<String, usize>,
 }
 
 impl Index {
-    fn new(field: &str, unique: bool, text: bool) -> Index {
+    fn new(field: &str, unique: bool, text: bool, dims: u32) -> Index {
         Index {
             field: field.into(),
             path: field.split('.').map(String::from).collect(),
@@ -205,12 +218,44 @@ impl Index {
             postings: HashMap::new(),
             lengths: HashMap::new(),
             total: 0,
+            dims,
+            vectors: Vec::new(),
+            slots: Vec::new(),
+            slot_of: HashMap::new(),
         }
+    }
+
+    fn kind(&self) -> (bool, bool, u32) {
+        (self.unique, self.text, self.dims)
     }
 
     /// A document's keys in this index: its values, or for a text index
     /// every term, repeated as often as it occurs, sorted.
     fn keys(&self, doc: &Value) -> Vec<Key> {
+        if self.dims > 0 {
+            // A vector is an array of exactly `dims` numbers; anything else
+            // leaves the document out of the index.
+            let mut v = doc;
+            for segment in &self.path {
+                match v.get(segment) {
+                    Some(next) => v = next,
+                    None => return Vec::new(),
+                }
+            }
+            let nums: Vec<Key> = v
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_f64)
+                .map(Key::Num)
+                .collect();
+            let complete = v.as_array().is_some_and(|a| a.len() == nums.len());
+            return if complete && nums.len() == self.dims as usize {
+                nums
+            } else {
+                Vec::new()
+            };
+        }
         if !self.text {
             return keys_of(doc, &self.path);
         }
@@ -233,6 +278,18 @@ impl Index {
 
     /// Indexes `id` under `keys`; what its entry keeps to remove it later.
     fn add(&mut self, id: &str, keys: Vec<Key>) -> Vec<Key> {
+        if self.dims > 0 {
+            let v: Vec<f32> = keys
+                .iter()
+                .map(|k| if let Key::Num(n) = k { *n as f32 } else { 0.0 })
+                .collect();
+            if let Some(unit) = unit(&v) {
+                self.slot_of.insert(id.to_string(), self.slots.len());
+                self.slots.push(id.to_string());
+                self.vectors.extend(unit);
+            }
+            return Vec::new();
+        }
         if !self.text {
             for k in &keys {
                 self.tree.insert((k.clone(), id.to_string()));
@@ -255,6 +312,19 @@ impl Index {
     }
 
     fn remove(&mut self, id: &str, keys: Vec<Key>) {
+        if self.dims > 0 {
+            // Swap the last vector into the freed slot.
+            if let Some(slot) = self.slot_of.remove(id) {
+                let (d, last) = (self.dims as usize, self.slots.len() - 1);
+                if slot != last {
+                    self.vectors.copy_within(last * d..(last + 1) * d, slot * d);
+                    self.slot_of.insert(self.slots[last].clone(), slot);
+                }
+                self.slots.swap_remove(slot);
+                self.vectors.truncate(last * d);
+            }
+            return;
+        }
         if !self.text {
             for k in keys {
                 self.tree.remove(&(k, id.to_string()));
@@ -322,7 +392,8 @@ impl State {
                     return Err(corrupt("indexes", "bad definition"));
                 };
                 let text = def["text"].as_bool().unwrap_or(false);
-                self.indexes.push(Index::new(field, unique, text));
+                let dims = def["dims"].as_u64().unwrap_or(0) as u32;
+                self.indexes.push(Index::new(field, unique, text, dims));
             }
         }
         let Some(mut log) = LogReader::open(&self.log()).await? else {
@@ -579,9 +650,9 @@ impl State {
     async fn query(&mut self, q: Query) -> Result<Page, Error> {
         check_limit(q.limit)?;
         let i = self.index(&q.field)?;
-        if self.indexes[i].text {
+        if self.indexes[i].text || self.indexes[i].dims > 0 {
             return Err(Error::InvalidArgument(format!(
-                "{} is a text index: use search",
+                "{} is a text or vector index: use search or nearest",
                 q.field
             )));
         }
@@ -671,6 +742,44 @@ impl State {
         Ok(hits)
     }
 
+    /// The `k` documents whose vector in `field` is most similar to `vector`
+    /// (cosine similarity, exact), best first, ties by id.
+    async fn nearest(&mut self, field: &str, vector: &[f32], k: u32) -> Result<Vec<Hit>, Error> {
+        check_limit(k)?;
+        let ix = &self.indexes[self.index(field)?];
+        if ix.dims == 0 {
+            return Err(Error::InvalidArgument(format!("{field} is not a vector index")));
+        }
+        if vector.len() != ix.dims as usize {
+            return Err(Error::InvalidArgument(format!("{field} has {} dimensions", ix.dims)));
+        }
+        let Some(q) = unit(vector) else {
+            return Err(Error::InvalidArgument("a zero or non-finite vector".into()));
+        };
+        let mut scored: Vec<(f32, &String)> = ix
+            .vectors
+            .chunks_exact(ix.dims as usize)
+            .zip(&ix.slots)
+            .map(|(v, id)| (v.iter().zip(&q).map(|(a, b)| a * b).sum::<f32>(), id))
+            .collect();
+        let order = |a: &(f32, &String), b: &(f32, &String)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1));
+        if scored.len() > k as usize {
+            scored.select_nth_unstable_by(k as usize - 1, order);
+            scored.truncate(k as usize);
+        }
+        scored.sort_by(order);
+        let ranked: Vec<(String, f64)> = scored.into_iter().map(|(s, id)| (id.clone(), f64::from(s))).collect();
+        let mut hits = Vec::with_capacity(ranked.len());
+        for (id, score) in ranked {
+            let body = self.body(&id).await?;
+            hits.push(Hit {
+                document: Document { id, body },
+                score,
+            });
+        }
+        Ok(hits)
+    }
+
     fn index(&self, field: &str) -> Result<usize, Error> {
         self.indexes
             .iter()
@@ -696,18 +805,18 @@ impl State {
     fn defs(&self) -> Vec<Value> {
         self.indexes
             .iter()
-            .map(|ix| json!({"field": ix.field, "unique": ix.unique, "text": ix.text}))
+            .map(|ix| json!({"field": ix.field, "unique": ix.unique, "text": ix.text, "dims": ix.dims}))
             .collect()
     }
 
-    async fn create_index(&mut self, field: String, unique: bool, text: bool) -> Result<(), Error> {
+    async fn create_index(&mut self, field: String, unique: bool, text: bool, dims: u32) -> Result<(), Error> {
         if field.is_empty() || field.len() > MAX_FIELD || field.split('.').any(str::is_empty) {
             return Err(Error::InvalidArgument(format!(
                 "a field is 1-{MAX_FIELD} bytes of dot-separated names"
             )));
         }
         if let Ok(i) = self.index(&field) {
-            return match (self.indexes[i].unique, self.indexes[i].text) == (unique, text) {
+            return match self.indexes[i].kind() == (unique, text, dims) {
                 true => Ok(()),
                 false => Err(Error::InvalidArgument(format!(
                     "{field} is already indexed differently"
@@ -717,7 +826,7 @@ impl State {
         if self.indexes.len() == MAX_INDEXES {
             return Err(Error::InvalidArgument(format!("at most {MAX_INDEXES} indexes")));
         }
-        let mut ix = Index::new(&field, unique, text);
+        let mut ix = Index::new(&field, unique, text, dims);
         let mut keys = HashMap::with_capacity(self.docs.len());
         if let Some(mut log) = LogReader::open(&self.log()).await? {
             while let Some(rec) = log.next().await? {
@@ -734,7 +843,7 @@ impl State {
             }
         }
         let mut defs = self.defs();
-        defs.push(json!({"field": field, "unique": unique, "text": text}));
+        defs.push(json!({"field": field, "unique": unique, "text": text, "dims": dims}));
         self.write_indexes(Value::Array(defs)).await?;
         for (id, entry) in self.docs.iter_mut() {
             entry.keys.push(keys.remove(id).unwrap_or_default());
@@ -1010,12 +1119,24 @@ impl GuestCollection for Collection {
 
     async fn create_index(&self, field: String, unique: bool) -> Result<(), Error> {
         let mut state = self.loaded().await?;
-        wit_bindgen::block_on(state.create_index(field, unique, false))
+        wit_bindgen::block_on(state.create_index(field, unique, false, 0))
     }
 
     async fn create_text_index(&self, field: String) -> Result<(), Error> {
         let mut state = self.loaded().await?;
-        wit_bindgen::block_on(state.create_index(field, false, true))
+        wit_bindgen::block_on(state.create_index(field, false, true, 0))
+    }
+
+    async fn create_vector_index(&self, field: String, dims: u32) -> Result<(), Error> {
+        if !(1..=MAX_DIMS).contains(&dims) {
+            return Err(Error::InvalidArgument(format!("dims is 1 to {MAX_DIMS}")));
+        }
+        let mut state = self.loaded().await?;
+        wit_bindgen::block_on(state.create_index(field, false, false, dims))
+    }
+
+    async fn nearest(&self, field: String, vector: Vec<f32>, k: u32) -> Result<Vec<Hit>, Error> {
+        self.loaded().await?.nearest(&field, &vector, k).await
     }
 
     async fn search(&self, field: String, query: String, limit: u32) -> Result<Vec<Hit>, Error> {
@@ -1036,6 +1157,7 @@ impl GuestCollection for Collection {
                 field: ix.field.clone(),
                 unique: ix.unique,
                 text: ix.text,
+                dims: ix.dims,
             })
             .collect())
     }

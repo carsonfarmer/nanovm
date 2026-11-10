@@ -74,6 +74,7 @@ const CASES: &[Case] = &[
     case("docs", "get 1 doc / request (of 10,000)", DOCS_10K, ("GET", "/doc?id=d00{i}", ""), 1, false),
     case("docs", "query tag = t3, 10 docs / request (of 10,000)", DOCS_10K, ("GET", "/query?field=tag&eq=%22t3%22&limit=10", ""), 1, false),
     case("docs", "search 1 term in 1,000 of 10,000 docs, top 10 / request", &[("POST", "/text-index?field=tag", ""), ("POST", "/bulk?count=10000&size=100", "")], ("GET", "/search?field=tag&q=t3", ""), 1, false),
+    case("docs", "nearest 10 of 10,000 64-dim vectors / request", &[("POST", "/vector-index?field=emb&dims=64", ""), ("POST", "/bulk-vectors?count=10000&dims=64", "")], ("GET", "/nearest?field=emb&k=10&v=0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8", ""), 1, false),
     case("docs", "put 1,000 docs in one request (per put)", &[("POST", "/index?field=tag", "")], ("POST", "/bulk?count=1000&size=100&prefix=b{i}-", ""), 1000, false),
     case("docs", "cold start: first get after restart, 10,000 docs, 1 index", DOCS_10K, ("GET", "/doc?id=d000001", ""), 1, true),
     case("docs", "cold start: first get after restart, 10,000 docs, no index", &[("POST", "/bulk?count=10000&size=100", "")], ("GET", "/doc?id=d000001", ""), 1, true),

@@ -14,7 +14,8 @@ wac plug app.wasm --plug target/components/docs/provider.wasm -o app-with-docs.w
 The interface is [`nanovm:docs/store@0.1.0`](wit/docs.wit): `collection.open`,
 `get`, `put` (insert or replace), `delete`, `scan` (id order), `query` (an
 index range, paged by cursor), `create-index` / `drop-index` / `indexes`,
-`create-text-index` and `search` (full-text, BM25), `stats` and `compact`. No
+`create-text-index` and `search` (full-text, BM25), `create-vector-index` and
+`nearest` (cosine similarity), `stats` and `compact`. No
 standard WIT exists for document stores.
 
 **Full-text search (J-91)** is a kind of index here rather than a separate
@@ -24,6 +25,17 @@ or stop words, and `search("body", "rust filesystem", 10)` returns documents
 containing any of the words, best first by BM25. The postings live in memory
 and are rebuilt from the log with the other indexes, so they cost memory per
 distinct word per document and add to the cold start.
+
+**Vector search (J-92, exact)** is another kind of index:
+`create-vector-index("emb", 384)` keeps a unit vector per document whose
+field is an array of exactly that many numbers, and `nearest("emb", v, 10)`
+returns the most similar documents by cosine similarity. It compares every
+vector (no HNSW): exact results, 4 bytes per dimension per document of
+memory, and a query cost of dimensions x documents multiply-adds (see the
+cost table). That suits thousands to tens of thousands of embeddings per
+object; an approximate graph index is the follow-up if bigger sets matter
+(ISSUES W-623). Embeddings come from wherever the app gets them (an
+embedding API over egress).
 
 **If the app already composes SQLite, use it instead**: a table of
 `(id TEXT PRIMARY KEY, body TEXT)` with indexes on `json_extract(body, ...)`
@@ -87,5 +99,6 @@ See [notes/components.md](../../notes/components.md) (method, medians).
 nested paths, arrays, cursors, errors), indexes and unique constraints across
 eviction and restart, rollback of failed requests (memory included), log
 compaction, quota exhaustion (refused puts, deletes and compaction on a
-completely full volume), and full-text search (ranking, case, arrays,
-updates, deletes, restart).
+completely full volume), full-text search (ranking, case, arrays,
+updates, deletes, restart) and nearest neighbours (cosine order, malformed
+vectors left out, updates, deletes, restart).

@@ -43,9 +43,12 @@ interface store {
     unique: bool,
     /// A full-text index, searched with `search`.
     text: bool,
+    /// A vector index's dimensions (0 for other indexes), searched with `nearest`.
+    dims: u32,
   }
 
-  /// A search result and its BM25 score (higher is better).
+  /// A search result and its score (BM25, or cosine similarity for
+  /// `nearest`; higher is better).
   record hit {
     document: document,
     score: f64,
@@ -115,6 +118,16 @@ interface store {
     /// Up to `limit` (1-1,000) documents containing any word of `query` in
     /// text index `field`, best first (BM25), ties by id.
     search: async func(field: string, query: string, limit: u32) -> result<list<hit>, error>;
+
+    /// Indexes `field`, an array of exactly `dims` (1-4,096) numbers, for
+    /// `nearest`; other values leave the document out. Unit vectors are kept
+    /// in memory (4 bytes per dimension per document).
+    create-vector-index: async func(field: string, dims: u32) -> result<_, error>;
+
+    /// The `k` (1-1,000) documents whose vector in `field` is most similar to
+    /// `vector` by cosine similarity, best first, ties by id. Exact: every
+    /// vector is compared, so a query costs dims x documents multiply-adds.
+    nearest: async func(field: string, vector: list<f32>, k: u32) -> result<list<hit>, error>;
 
     drop-index: async func(field: string) -> result<_, error>;
 
