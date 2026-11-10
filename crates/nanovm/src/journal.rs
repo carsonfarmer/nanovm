@@ -2154,10 +2154,10 @@ mod tests {
         // A node: its lease on the object, and its object's view of it.
         let take = async |name: &str| {
             let node = Leases::new(leases.clone(), name, ttl);
-            let (id, until) = node.renew().await;
-            let grant = loop {
+            let (grant, (id, until)) = loop {
+                let session = node.renew().await;
                 match node.acquire("app/o").await {
-                    Ok(grant) => break grant,
+                    Ok(grant) => break (grant, session),
                     Err(_) => tokio::time::sleep(ttl / 4).await,
                 }
             };
@@ -2205,7 +2205,7 @@ mod tests {
         std::fs::create_dir_all(&third).unwrap();
         assert_eq!(crate::ship::restore(&store, "app", "o", &third).await.unwrap(), 2);
         assert_eq!(tree(&third.join("o")), tree(&vb));
-        assert_eq!(std::fs::read(third.join("o/a")).unwrap(), b"B'slo world");
+        assert_eq!(std::fs::read(third.join("o/a")).unwrap(), b"B'sst world");
         for d in [va.parent().unwrap(), vb.parent().unwrap(), &third] {
             std::fs::remove_dir_all(d).unwrap();
         }

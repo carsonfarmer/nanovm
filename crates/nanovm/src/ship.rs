@@ -265,6 +265,36 @@ mod tests {
         }
     }
 
+    /// With leases, a node that isn't the holder ships a version only while
+    /// the lease record still has its epoch: after a release, say.
+    #[tokio::test]
+    async fn the_lease_records_epoch_decides_for_other_nodes() {
+        let base = tempdir("released");
+        let records: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let a = Leases::new(records.clone(), "a", Duration::from_secs(5));
+        a.renew().await;
+        let grant = a.acquire("app/p").await.unwrap();
+        a.release("app/p", &grant).await;
+        let (store, dir) = (Dir(base.join("store")), base.join("objects/app/~committed/p"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let version = |n: u64, epoch: u64| {
+            let id = format!(r#"{{"format":3,"app":"app","object":"p","sequence":{n},"epoch":{epoch},"parent":"","snapshot":true}}"#);
+            let mut tar = tar::Builder::new(vec![]);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(id.len() as u64);
+            header.set_mode(0o600);
+            tar.append_data(&mut header, "nanovm.json", id.as_bytes()).unwrap();
+            std::fs::write(dir.join(format!("{n:020}.tar")), tar.into_inner().unwrap()).unwrap();
+        };
+        let b = Leases::new(records, "b", Duration::from_secs(5));
+        version(1, grant.epoch);
+        ship_object(&store, Some(&b), "app", "p", &dir).await.unwrap();
+        version(2, grant.epoch + 1);
+        assert!(ship_object(&store, Some(&b), "app", "p", &dir).await.is_err());
+        assert!(store.get(&key("app", "p", 2)).await.unwrap().is_none());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// The shipper stores versions in order, then keeps only the last here;
     /// it stops at a version another writer stored.
     #[tokio::test]
