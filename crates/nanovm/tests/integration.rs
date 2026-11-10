@@ -323,6 +323,82 @@ async fn start_up_is_charged_guest_cpu_not_host_work() {
     }
 }
 
+/// CPU time of the calling thread.
+#[cfg(target_os = "linux")]
+fn thread_cpu() -> Duration {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) }, 0);
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+}
+
+/// Regression (N-640): the budget charged wall time inside each poll, so a
+/// guest whose thread was waiting for a core was charged for the wait, and
+/// an overloaded node killed honest requests for CPU. Here the node shares
+/// one core with seven busy threads: a request that needs a third of its
+/// budget succeeds however long it takes, and one that spins forever is
+/// still killed after about its budget of CPU.
+#[cfg(target_os = "linux")]
+#[test]
+fn cpu_budget_is_cpu_not_time_waiting_for_a_core() {
+    std::thread::spawn(|| {
+        // This thread, and the threads it starts (the node's runtime and
+        // epoch ticker, the busy threads), run on one CPU.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set), 0);
+            let cpu = (0..libc::CPU_SETSIZE as usize).rev().find(|&c| libc::CPU_ISSET(c, &set)).unwrap();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(cpu, &mut set);
+            assert_eq!(libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set), 0);
+        }
+        // One thread runs the whole node, so its CPU time is the node's.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let budget = Duration::from_millis(100);
+            let mut hostile = app("hostile");
+            hostile.limits.cpu_ms = budget.as_millis() as u64;
+            hostile.limits.request_timeout_ms = 30_000;
+            let node = node_with(node_cfg("cpu_budget_is_cpu", 8), hostile);
+            let measured = async |path: &str| {
+                let (cpu, wall) = (thread_cpu(), Instant::now());
+                let r = get(&node, "o", path).await;
+                (r, thread_cpu() - cpu, wall.elapsed())
+            };
+            assert_eq!(get(&node, "o", "/").await.status, 200);
+            // Steps that take about a third of the budget, timed alone.
+            let probe = 1u64 << 22;
+            let (r, cpu, _) = measured(&format!("/spin?n={probe}")).await;
+            assert_eq!(r.status, 200, "{:?} {}", r.error, r.body);
+            let steps = (probe as f64 * budget.as_secs_f64() / 3.0 / cpu.as_secs_f64()) as u64;
+
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let busy: Vec<_> = (0..7)
+                .map(|_| {
+                    let stop = stop.clone();
+                    std::thread::spawn(move || while !stop.load(Relaxed) { std::hint::spin_loop() })
+                })
+                .collect();
+            let (r, cpu, wall) = measured(&format!("/spin?n={steps}")).await;
+            let (spun, spun_cpu, spun_wall) = measured("/spin").await;
+            stop.store(true, Relaxed);
+            busy.into_iter().for_each(|b| b.join().unwrap());
+
+            println!("{steps} steps: {} after {cpu:?} of CPU in {wall:?}; spinning: {} after {spun_cpu:?} in {spun_wall:?}",
+                r.status, spun.status);
+            assert!(wall > 3 * cpu, "no contention: {cpu:?} of CPU in {wall:?}");
+            assert_eq!(r.status, 200, "{:?} {} after {cpu:?} of CPU in {wall:?}", r.error, r.body);
+            assert_eq!(spun.error.as_deref(), Some("cpu"), "{}", spun.body);
+            assert!(
+                spun_cpu > budget * 9 / 10 && spun_cpu < budget * 3 / 2,
+                "killed after {spun_cpu:?} of CPU in {spun_wall:?}"
+            );
+            node.shutdown().await;
+        });
+    })
+    .join()
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wall_clock_limit() {
     let node = node("wall_clock_limit", "hostile", 8);
@@ -2335,6 +2411,31 @@ async fn sqlite_handled_storage_exhaustion() {
             "file": "after", "key": "after", "integrity": "ok", "aux_integrity": "ok"}),
             "a failed statement must not commit, including partial multi-page updates");
         println!("handled exhaustion: {completed} successful statements committed without corruption");
+    }
+    node.shutdown().await;
+}
+
+/// Regression (N-640, N-600): a guest's waits for its own syncs aren't CPU.
+/// 100 one-row transactions with `synchronous=FULL` each wait for several
+/// fsyncs; at the default 200 ms budget they were killed for CPU while using
+/// a fraction of it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_sync_waits_are_not_charged_as_cpu() {
+    let mut app = app("counter");
+    app.limits.memory_mb = 64;
+    app.limits.disk_mb = 8;
+    app.limits.cpu_ms = 200;
+    app.limits.request_timeout_ms = 30_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
+    let node = Node::new(node_cfg("sqlite_sync_waits", 8), &app, &wasm, None).unwrap();
+    assert_eq!(get(&node, "o", "/bench?op=init").await.status, 200);
+    for seq in 0..3 {
+        let cpu = node.metrics.guest_cpu_ns.load(Relaxed);
+        let r = get(&node, "o", &format!("/bench?op=autocommit&seq={seq}")).await;
+        let cpu = Duration::from_nanos(node.metrics.guest_cpu_ns.load(Relaxed) - cpu);
+        println!("100 synced transactions: {} after {cpu:?} of CPU in {:?}", r.status, r.elapsed);
+        assert_eq!(r.status, 200, "{:?} {}", r.error, r.body);
     }
     node.shutdown().await;
 }
