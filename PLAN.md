@@ -230,7 +230,7 @@ Each test spins up a `Node` in-process with small limits.
   - an allowed request to `https://example.com` succeeds (ignored by default: needs the internet)
 - **Resources:** `/leak` past `max_resources` traps and poisons the object; the object recovers.
 - **Capacity:** with `max_live` objects full, a new object evicts the LRU idle one.
-- **Validation:** a component importing sockets is rejected at deploy time. *(Not written yet.)*
+- **Validation:** components importing WASIp2 or WASIp3 sockets, the WASIp2 filesystem or an unknown interface, or exporting no HTTP handler, are rejected when loaded, by name, in-process and through a jailed worker (fixtures in `crates/nanovm/tests/refused`).
 - **Leaks:** RSS and open fds stay flat over long runs and churn. *(Not written yet.)*
 
 ## Benchmarks (`examples/bench.rs`)

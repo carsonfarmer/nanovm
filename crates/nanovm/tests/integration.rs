@@ -3264,6 +3264,79 @@ async fn a_refused_app_leaves_nothing_on_disk() {
     assert!(kept.is_empty(), "{kept:?}");
 }
 
+/// Test-only components from `crates/nanovm/tests/refused` (outside
+/// guests/**): `allowed` imports only what nanovm offers; each other one
+/// adds one import nanovm refuses, or has no `wasi:http/handler`.
+fn refused(name: &str) -> Vec<u8> {
+    static BUILT: std::sync::Once = std::sync::Once::new();
+    BUILT.call_once(|| {
+        let build = std::process::Command::new("cargo").args([
+            "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
+            "crates/nanovm/tests/refused/Cargo.toml", "--target-dir", "target/test-guest", "--lib", "--examples",
+        ]).current_dir(repo()).status().unwrap();
+        assert!(build.success());
+    });
+    let out = repo().join("target/test-guest/wasm32-wasip2/release");
+    std::fs::read(match name {
+        "allowed" => out.join("refused_imports.wasm"),
+        _ => out.join("examples").join(format!("{name}.wasm")),
+    })
+    .unwrap()
+}
+
+/// Components that import what nanovm refuses (sockets of either WASI
+/// version, the WASIp2 filesystem, an unknown interface) or export no HTTP
+/// handler are refused when loaded, before any object exists, and the error
+/// names the import. The node's linker defines WASIp2 sockets and files, so
+/// for those the import check is the only thing in the way.
+#[tokio::test(flavor = "multi_thread")]
+async fn components_importing_refused_interfaces_are_rejected_by_name() {
+    let load = |fixture: &str| Node::new(node_cfg(&format!("refused_{fixture}"), 2), &app("counter"), &refused(fixture), None);
+    let control = load("allowed").unwrap_or_else(|e| panic!("the control was refused: {e:#}"));
+    let res = get(&control, "a", "/").await;
+    assert_eq!((res.status, res.body.as_str()), (200, "allowed"));
+
+    for (fixture, named) in [
+        ("p2_sockets", "import `wasi:sockets/"),
+        ("p3_sockets", "import `wasi:sockets/types@0.3"),
+        ("p2_filesystem", "import `wasi:filesystem/"),
+        ("custom_import", "import `acme:backdoor/shell"),
+        ("command", "wasi:http/handler"),
+    ] {
+        let Err(e) = load(fixture) else { panic!("{fixture} was loaded") };
+        let e = format!("{e:#}");
+        assert!(e.contains(named) && e.contains(r#"app "counter""#), "{fixture}: {e}");
+        if fixture != "command" {
+            assert!(e.contains("is not permitted"), "{fixture}: {e}");
+        }
+        if fixture == "p2_filesystem" {
+            assert!(e.contains("@0.2"), "{fixture}: {e}");
+        }
+    }
+
+    // Without the check, WASIp2 sockets and files (outside the quota) link.
+    let engine = nanovm::engine::build(&node_cfg("refused_linking", 2)).unwrap();
+    let linker = nanovm::app::linker(&engine).unwrap();
+    for fixture in ["p2_sockets", "p2_filesystem"] {
+        let component = wasmtime::component::Component::new(&engine, refused(fixture)).unwrap();
+        linker.instantiate_pre(&component).unwrap_or_else(|e| panic!("{fixture}: {e:#}"));
+        assert!(nanovm::app::check_imports(&engine, &component).is_err(), "{fixture}");
+    }
+}
+
+/// The same refusal through a registry and a jailed worker: the request is
+/// answered `worker-down`, naming the import, and so is the next one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_jailed_worker_refuses_a_component_importing_sockets() {
+    let (_sup, addr) = supervised("a_jailed_worker_refuses_sockets").await;
+    let sockets = publish_wasm("refused-sockets", &app("counter"), refused("p3_sockets")).await;
+    for _ in 0..2 {
+        let (status, body) = app_get(addr, &sockets, "/a/").await;
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("worker-down") && body.contains("import `wasi:sockets/types@0.3"), "{body}");
+    }
+}
+
 /// A switch, once begun, finishes even if the request that began it goes
 /// away mid-drain: the old worker is killed and the new one serves, so the
 /// app never runs in two.
