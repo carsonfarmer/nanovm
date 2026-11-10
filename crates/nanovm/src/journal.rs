@@ -27,9 +27,8 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
 
-use crate::{committed, config::CaptureConfig, object::ObjShared};
+use crate::{committed, config::CaptureConfig, metrics::thread_cpu_ns, object::ObjShared};
 
 const LOG: &str = "log";
 /// Overwritten bytes are kept in records of at most this many.
@@ -181,7 +180,7 @@ impl Journal {
         // An I/O failure may leave a complete or partial record. Do not
         // permit more mutations or a commit until recovery has run.
         self.poisoned = true;
-        let t0 = Instant::now();
+        let t0 = thread_cpu_ns();
         if self.log.is_none() {
             // The directories the log is first made in must be durable too.
             std::fs::create_dir_all(&self.dir)?;
@@ -197,7 +196,7 @@ impl Journal {
         tests::sync_point()?;
         log.sync_data()?;
         self.poisoned = false;
-        self.obj.uncharge(t0.elapsed());
+        self.obj.uncharge(t0);
         Ok(())
     }
 
@@ -395,12 +394,12 @@ impl Journal {
         })
     }
 
-    /// Runs `f`, whose waits for the disk aren't charged as CPU; if it
-    /// fails, the journal needs recovery.
+    /// Runs `f`, whose CPU isn't charged to the guest; if it fails, the
+    /// journal needs recovery.
     fn or_poison(&mut self, f: impl FnOnce(&mut Self) -> std::io::Result<()>) -> std::io::Result<()> {
-        let t0 = Instant::now();
+        let t0 = thread_cpu_ns();
         let result = f(self);
-        self.obj.uncharge(t0.elapsed());
+        self.obj.uncharge(t0);
         self.poisoned |= result.is_err();
         result
     }
@@ -423,7 +422,7 @@ impl Journal {
         // Any error leaves the outcome uncertain. In particular, taking the
         // log must not make a second commit look like an empty successful one.
         self.poisoned = true;
-        let t0 = Instant::now();
+        let t0 = thread_cpu_ns();
         for p in self.touched.drain() {
             sync_if_there(&self.base.join(p))?;
         }
@@ -438,7 +437,7 @@ impl Journal {
         if self.capture.is_some() {
             committed::finish(&self.dir, &out, &self.obj)?;
         }
-        self.obj.uncharge(t0.elapsed());
+        self.obj.uncharge(t0);
         clear(&self.dir)?;
         self.sized.clear();
         self.created.clear();
