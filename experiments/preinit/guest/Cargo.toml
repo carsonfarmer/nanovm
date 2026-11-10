@@ -1,0 +1,30 @@
+[package]
+name = "preinit-guest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace and lockfile, out of guests/ (which publishes on push).
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Builds a 50,000-entry table on first use, as an app with a router,
+# templates or a parsed config would.
+heavy = []
+# The initializer reads /data: pre-initialization must fail.
+touch-data = []
+
+[dependencies]
+util = { path = "../../../guests/util" }
+wasip3 = { version = "0.9.0", features = ["async-spawn"] }
+wit-bindgen = "0.62"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+debug = false

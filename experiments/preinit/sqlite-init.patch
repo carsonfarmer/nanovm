@@ -1,0 +1,26 @@
+--- a/provider/src/lib.rs
++++ b/provider/src/lib.rs
+@@ -16,6 +16,23 @@
+ bindings::export!(Provider with_types_in bindings);
+ 
+ struct Provider;
++
++/// For the pre-initialization spike (experiments/preinit): run once at build
++/// time, with every host import trapping. sqlite3_initialize sets up
++/// SQLite's mutexes, allocator and page cache and registers the VFS
++/// (sqlite3_os_init); it opens no file.
++mod init {
++    wit_bindgen::generate!({
++        inline: "package nanovm:preinit; world init { export wizer-initialize: func(); }",
++    });
++    export!(Init);
++    struct Init;
++    impl Guest for Init {
++        fn wizer_initialize() {
++            assert_eq!(unsafe { rusqlite::ffi::sqlite3_initialize() }, 0);
++        }
++    }
++}
+ pub struct Database(rusqlite::Connection, Slot);
+ // Reserve before any filesystem suspension; failed opens release the slot too.
+ struct Slot;
