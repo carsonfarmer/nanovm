@@ -77,7 +77,17 @@ const CASES: &[Case] = &[
     case("docs", "cold start: first get after restart, 10,000 docs, 1 index", DOCS_10K, ("GET", "/doc?id=d000001", ""), 1, true),
     case("docs", "cold start: first get after restart, 10,000 docs, no index", &[("POST", "/bulk?count=10000&size=100", "")], ("GET", "/doc?id=d000001", ""), 1, true),
     case("docs", "cold start: unknown route after restart (no load)", &[("POST", "/bulk?count=10000&size=100", "")], NONE, 1, true),
+    case("timeseries", "baseline: unknown route (404)", &[], NONE, 1, false),
+    case("timeseries", "write 1 point / request", &[], ("POST", "/write", "1000 1.5"), 1, false),
+    case("timeseries", "write 1,000 points in one call (per point)", &[], ("POST", "/write?n=1000&start=0&every=1000", ""), 1000, false),
+    case("timeseries", "aggregate 3 days by day (rollups) / request", TS_3D, ("GET", "/agg?from=0&to=259200000&step=86400000", ""), 1, false),
+    case("timeseries", "aggregate 1 day by hour (rollups) / request", TS_3D, ("GET", "/agg?from=0&to=86400000&step=3600000", ""), 1, false),
+    case("timeseries", "aggregate 1 day by 15 min (1,440 raw points) / request", TS_3D, ("GET", "/agg?from=0&to=86400000&step=900000", ""), 1, false),
+    case("timeseries", "range 1 hour (60 raw points) / request", TS_3D, ("GET", "/range?from=0&to=3600000", ""), 1, false),
 ];
+
+/// Three days of one point a minute.
+const TS_3D: &[(&str, &str, &str)] = &[("POST", "/write?n=4320&start=0&every=60000", "")];
 
 const DOC: &str = r#"{"tag":"t1","n":12345,"name":"Ada Lovelace","email":"ada@example.com","pad":"0123456789012345678901234567890123456789012345678901234567890123456789"}"#;
 const B100: &str =

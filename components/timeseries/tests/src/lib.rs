@@ -12,7 +12,9 @@ struct App;
 const DAY: u64 = 86_400_000;
 
 fn buckets(list: &[Bucket]) -> Value {
-    list.iter().map(|b| json!([b.start_ms, b.count, b.sum, b.min, b.max])).collect()
+    list.iter()
+        .map(|b| json!([b.start_ms, b.count, b.sum, b.min, b.max]))
+        .collect()
 }
 
 fn points(list: &[Point]) -> Value {
@@ -27,14 +29,22 @@ fn fail(e: Error) -> Result<Response, ErrorCode> {
 fn parse(req: &util::Req) -> Vec<Point> {
     if let Some(n) = req.q("n") {
         let (start, every) = (req.q_u64("start", 0), req.q_u64("every", 1000));
-        return (0..n.parse::<u64>().unwrap()).map(|i| Point { time_ms: start + i * every, value: i as f64 }).collect();
+        return (0..n.parse::<u64>().unwrap())
+            .map(|i| Point {
+                time_ms: start + i * every,
+                value: i as f64,
+            })
+            .collect();
     }
     String::from_utf8(req.body.clone())
         .unwrap()
         .lines()
         .map(|l| {
             let (t, v) = l.split_once(' ').unwrap();
-            Point { time_ms: t.parse().unwrap(), value: v.parse().unwrap() }
+            Point {
+                time_ms: t.parse().unwrap(),
+                value: v.parse().unwrap(),
+            }
         })
         .collect()
 }
@@ -42,17 +52,26 @@ fn parse(req: &util::Req) -> Vec<Point> {
 impl util::wasip3::exports::http::handler::Guest for App {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
         let req = util::read_req(request).await;
-        let s = Series::open(req.q("series").unwrap_or("cpu").into()).await.expect("open");
+        let s = Series::open(req.q("series").unwrap_or("cpu").into())
+            .await
+            .expect("open");
         let out = match req.path.as_str() {
             "/write" => match s.write(parse(&req)).await {
                 Ok(()) => json!({}),
                 Err(e) => return fail(e),
             },
             "/range" => {
-                let got = s.range(req.q_u64("from", 0), req.q_u64("to", u64::MAX), req.q_u64("limit", 10_000) as u32);
+                let got = s.range(
+                    req.q_u64("from", 0),
+                    req.q_u64("to", u64::MAX),
+                    req.q_u64("limit", 10_000) as u32,
+                );
                 points(&got.await.expect("range"))
             }
-            "/agg" => match s.aggregate(req.q_u64("from", 0), req.q_u64("to", 0), req.q_u64("step", 0)).await {
+            "/agg" => match s
+                .aggregate(req.q_u64("from", 0), req.q_u64("to", 0), req.q_u64("step", 0))
+                .await
+            {
                 Ok(b) => buckets(&b),
                 Err(e) => return fail(e),
             },
@@ -82,7 +101,12 @@ impl util::wasip3::exports::http::handler::Guest for App {
             "/fill" => {
                 let mut batches = 0u64;
                 let err = loop {
-                    let pts = (0..1000).map(|i| Point { time_ms: (batches * 1000 + i) * 1000, value: 1.0 }).collect();
+                    let pts = (0..1000)
+                        .map(|i| Point {
+                            time_ms: (batches * 1000 + i) * 1000,
+                            value: 1.0,
+                        })
+                        .collect();
                     match s.write(pts).await {
                         Ok(()) => batches += 1,
                         Err(e) => break e,
@@ -93,7 +117,10 @@ impl util::wasip3::exports::http::handler::Guest for App {
             }
             "/contracts" => {
                 for bad in ["", "../x", "a/b", &"n".repeat(65)] {
-                    assert!(matches!(Series::open(bad.into()).await, Err(Error::InvalidName)), "{bad}");
+                    assert!(
+                        matches!(Series::open(bad.into()).await, Err(Error::InvalidName)),
+                        "{bad}"
+                    );
                 }
                 let c = Series::open("contracts".into()).await.expect("open");
                 assert!(c.latest().await.expect("latest").is_none());
@@ -105,24 +132,59 @@ impl util::wasip3::exports::http::handler::Guest for App {
                 }
                 assert!(matches!(c.range(0, 1, 0).await, Err(Error::InvalidArgument(_))));
                 assert!(matches!(c.aggregate(0, 1, 0).await, Err(Error::InvalidArgument(_))));
-                assert!(matches!(c.aggregate(0, 10_001, 1).await, Err(Error::InvalidArgument(_))));
+                assert!(matches!(
+                    c.aggregate(0, 10_001, 1).await,
+                    Err(Error::InvalidArgument(_))
+                ));
                 // Out of order, equal times, across a day boundary.
-                let pts = [(DAY + 5, 7.0), (DAY - 1, -1.0), (DAY + 5, 8.0), (10, 2.5), (DAY + 1, 3.0)];
-                c.write(pts.iter().map(|&(t, v)| Point { time_ms: t, value: v }).collect()).await.expect("write");
-                let got: Vec<_> = c.range(0, u64::MAX, 100).await.expect("range").iter().map(|p| (p.time_ms, p.value)).collect();
-                assert_eq!(got, [(10, 2.5), (DAY - 1, -1.0), (DAY + 1, 3.0), (DAY + 5, 7.0), (DAY + 5, 8.0)]);
+                let pts = [
+                    (DAY + 5, 7.0),
+                    (DAY - 1, -1.0),
+                    (DAY + 5, 8.0),
+                    (10, 2.5),
+                    (DAY + 1, 3.0),
+                ];
+                c.write(pts.iter().map(|&(t, v)| Point { time_ms: t, value: v }).collect())
+                    .await
+                    .expect("write");
+                let got: Vec<_> = c
+                    .range(0, u64::MAX, 100)
+                    .await
+                    .expect("range")
+                    .iter()
+                    .map(|p| (p.time_ms, p.value))
+                    .collect();
+                assert_eq!(
+                    got,
+                    [
+                        (10, 2.5),
+                        (DAY - 1, -1.0),
+                        (DAY + 1, 3.0),
+                        (DAY + 5, 7.0),
+                        (DAY + 5, 8.0)
+                    ]
+                );
                 assert_eq!(c.range(DAY, DAY + 5, 100).await.expect("range").len(), 1);
                 assert_eq!(c.range(0, u64::MAX, 2).await.expect("limit").len(), 2);
                 let latest = c.latest().await.expect("latest").unwrap();
                 assert_eq!((latest.time_ms, latest.value), (DAY + 5, 8.0));
                 let days = c.aggregate(0, 2 * DAY, DAY).await.expect("days");
-                assert_eq!(buckets(&days), json!([[0, 2, 1.5, -1.0, 2.5], [DAY, 3, 18.0, 3.0, 8.0]]));
+                assert_eq!(
+                    buckets(&days),
+                    json!([[0, 2, 1.5, -1.0, 2.5], [DAY, 3, 18.0, 3.0, 8.0]])
+                );
                 let two_days = c.aggregate(0, 2 * DAY, 2 * DAY).await.expect("2 days");
                 assert_eq!(buckets(&two_days), json!([[0, 5, 19.5, -1.0, 8.0]]));
                 let raw = c.aggregate(DAY, DAY + 10, 5).await.expect("5 ms");
-                assert_eq!(buckets(&raw), json!([[DAY, 1, 3.0, 3.0, 3.0], [DAY + 5, 2, 15.0, 7.0, 8.0]]));
+                assert_eq!(
+                    buckets(&raw),
+                    json!([[DAY, 1, 3.0, 3.0, 3.0], [DAY + 5, 2, 15.0, 7.0, 8.0]])
+                );
                 let hours = c.aggregate(DAY - 1, DAY + 1, HOUR_MS).await.expect("hours");
-                assert_eq!(buckets(&hours), json!([[DAY - HOUR_MS, 1, -1.0, -1.0, -1.0], [DAY, 3, 18.0, 3.0, 8.0]]));
+                assert_eq!(
+                    buckets(&hours),
+                    json!([[DAY - HOUR_MS, 1, -1.0, -1.0, -1.0], [DAY, 3, 18.0, 3.0, 8.0]])
+                );
                 json!("ok")
             }
             _ => return util::text(404, "no such route"),

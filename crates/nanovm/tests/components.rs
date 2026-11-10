@@ -604,9 +604,30 @@ async fn timeseries_rollups_survive_eviction_restart_and_raw_trim() {
     // Three days of one point a minute (value = minute index), in two
     // requests, the second out of order.
     let day0 = 20_000 * DAY;
-    ok(&node, "POST", "t", &format!("/write?n=2880&start={day0}&every=60000"), "").await;
-    ok(&node, "POST", "t", &format!("/write?n=1440&start={}&every=60000", day0 + 2 * DAY), "").await;
-    let days = ok(&node, "GET", "t", &format!("/agg?from={day0}&to={}&step={DAY}", day0 + 3 * DAY), "").await;
+    ok(
+        &node,
+        "POST",
+        "t",
+        &format!("/write?n=2880&start={day0}&every=60000"),
+        "",
+    )
+    .await;
+    ok(
+        &node,
+        "POST",
+        "t",
+        &format!("/write?n=1440&start={}&every=60000", day0 + 2 * DAY),
+        "",
+    )
+    .await;
+    let days = ok(
+        &node,
+        "GET",
+        "t",
+        &format!("/agg?from={day0}&to={}&step={DAY}", day0 + 3 * DAY),
+        "",
+    )
+    .await;
     let sum = |a: u64, b: u64| ((a..b).sum::<u64>()) as f64;
     assert_eq!(
         days,
@@ -617,27 +638,91 @@ async fn timeseries_rollups_survive_eviction_restart_and_raw_trim() {
         ])
     );
     evict(&node, "/latest").await;
-    let hours = ok(&node, "GET", "t", &format!("/agg?from={}&to={}&step={HOUR}", day0 + DAY, day0 + DAY + 2 * HOUR), "").await;
+    let hours = ok(
+        &node,
+        "GET",
+        "t",
+        &format!("/agg?from={}&to={}&step={HOUR}", day0 + DAY, day0 + DAY + 2 * HOUR),
+        "",
+    )
+    .await;
     assert_eq!(
         hours,
-        json!([[day0 + DAY, 60, sum(1440, 1500), 1440.0, 1499.0], [day0 + DAY + HOUR, 60, sum(1500, 1560), 1500.0, 1559.0]])
+        json!([
+            [day0 + DAY, 60, sum(1440, 1500), 1440.0, 1499.0],
+            [day0 + DAY + HOUR, 60, sum(1500, 1560), 1500.0, 1559.0]
+        ])
     );
     // A 15-minute step reads raw points.
-    let quarter = ok(&node, "GET", "t", &format!("/agg?from={day0}&to={}&step=900000", day0 + HOUR), "").await;
+    let quarter = ok(
+        &node,
+        "GET",
+        "t",
+        &format!("/agg?from={day0}&to={}&step=900000", day0 + HOUR),
+        "",
+    )
+    .await;
     assert_eq!(quarter.as_array().unwrap().len(), 4);
     assert_eq!(quarter[1], json!([day0 + 900_000, 15, sum(15, 30), 15.0, 29.0]));
     node = restart(node, &cfg, &app).await;
-    assert_eq!(ok(&node, "GET", "t", "/latest", "").await, json!([day0 + 3 * DAY - 60_000, 1439.0]));
-    let range = ok(&node, "GET", "t", &format!("/range?from={}&to={}", day0 + DAY - 60_000, day0 + DAY + 60_001), "").await;
-    assert_eq!(range, json!([[day0 + DAY - 60_000, 1439.0], [day0 + DAY, 1440.0], [day0 + DAY + 60_000, 1441.0]]));
+    assert_eq!(
+        ok(&node, "GET", "t", "/latest", "").await,
+        json!([day0 + 3 * DAY - 60_000, 1439.0])
+    );
+    let range = ok(
+        &node,
+        "GET",
+        "t",
+        &format!("/range?from={}&to={}", day0 + DAY - 60_000, day0 + DAY + 60_001),
+        "",
+    )
+    .await;
+    assert_eq!(
+        range,
+        json!([
+            [day0 + DAY - 60_000, 1439.0],
+            [day0 + DAY, 1440.0],
+            [day0 + DAY + 60_000, 1441.0]
+        ])
+    );
     // Retention: drop the first two days of raw points; rollups remain.
-    ok(&node, "POST", "t", &format!("/trim?level=raw&before={}", day0 + 2 * DAY + 5), "").await;
+    ok(
+        &node,
+        "POST",
+        "t",
+        &format!("/trim?level=raw&before={}", day0 + 2 * DAY + 5),
+        "",
+    )
+    .await;
     let dir = volume(&cfg, "timeseries", "t").join(".ts/cpu");
-    let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
     files.sort();
-    assert_eq!(files, [format!("d{}", 20_000 / 1024), format!("h{}", 20_000 * 24 / 768), format!("r{}", 20_002)]);
-    assert_eq!(ok(&node, "GET", "t", &format!("/range?to={}", day0 + 2 * DAY), "").await, json!([]));
-    assert_eq!(ok(&node, "GET", "t", &format!("/agg?from={day0}&to={}&step={DAY}", day0 + 3 * DAY), "").await, days);
+    assert_eq!(
+        files,
+        [
+            format!("d{}", 20_000 / 1024),
+            format!("h{}", 20_000 * 24 / 768),
+            format!("r{}", 20_002)
+        ]
+    );
+    assert_eq!(
+        ok(&node, "GET", "t", &format!("/range?to={}", day0 + 2 * DAY), "").await,
+        json!([])
+    );
+    assert_eq!(
+        ok(
+            &node,
+            "GET",
+            "t",
+            &format!("/agg?from={day0}&to={}&step={DAY}", day0 + 3 * DAY),
+            ""
+        )
+        .await,
+        days
+    );
     // Objects don't share series.
     settle(&node).await;
     assert_eq!(ok(&node, "GET", "other", "/latest", "").await, Value::Null);
@@ -654,8 +739,14 @@ async fn timeseries_failed_request_rolls_back() {
         let r = request(&node, "POST", "t", probe, "1500 100\n90000000 5").await;
         assert!(r.error.is_some(), "{probe}: {}", r.body);
     }
-    assert_eq!(ok(&node, "GET", "t", "/range", "").await, json!([[1000, 1.0], [2000, 2.0]]));
-    assert_eq!(ok(&node, "GET", "t", &format!("/agg?from=0&to={}&step={DAY}", 2 * DAY), "").await, json!([[0, 2, 3.0, 1.0, 2.0]]));
+    assert_eq!(
+        ok(&node, "GET", "t", "/range", "").await,
+        json!([[1000, 1.0], [2000, 2.0]])
+    );
+    assert_eq!(
+        ok(&node, "GET", "t", &format!("/agg?from=0&to={}&step={DAY}", 2 * DAY), "").await,
+        json!([[0, 2, 3.0, 1.0, 2.0]])
+    );
     node.shutdown().await;
 }
 
@@ -685,10 +776,21 @@ async fn timeseries_quota_exhaustion_is_refused_cleanly() {
     let node = start(&cfg, &app);
     ok(&node, "POST", "t", "/write", "1000 1").await; // .ts, cpu, r0, h0, d0
     let r = request(&node, "POST", "t", "/write", &format!("2000 2\n{} 3", DAY + 1)).await;
-    assert_eq!((r.status, r.json()["error"].as_str()), (409, Some("Error::Full")), "{}", r.body);
+    assert_eq!(
+        (r.status, r.json()["error"].as_str()),
+        (409, Some("Error::Full")),
+        "{}",
+        r.body
+    );
     assert_eq!(ok(&node, "GET", "t", "/range", "").await, json!([[1000, 1.0]]));
-    assert_eq!(ok(&node, "GET", "t", &format!("/agg?from=0&to={DAY}&step={HOUR}"), "").await, json!([[0, 1, 1.0, 1.0, 1.0]]));
-    assert_eq!(ok(&node, "GET", "t", &format!("/agg?from=0&to={DAY}&step={DAY}"), "").await, json!([[0, 1, 1.0, 1.0, 1.0]]));
+    assert_eq!(
+        ok(&node, "GET", "t", &format!("/agg?from=0&to={DAY}&step={HOUR}"), "").await,
+        json!([[0, 1, 1.0, 1.0, 1.0]])
+    );
+    assert_eq!(
+        ok(&node, "GET", "t", &format!("/agg?from=0&to={DAY}&step={DAY}"), "").await,
+        json!([[0, 1, 1.0, 1.0, 1.0]])
+    );
     let raw = volume(&cfg, "timeseries", "t").join(".ts/cpu/r0");
     assert_eq!(std::fs::metadata(raw).unwrap().len(), 16);
     node.shutdown().await;

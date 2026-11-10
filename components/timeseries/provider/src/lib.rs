@@ -72,12 +72,22 @@ impl Agg {
     }
 
     fn of(v: f64) -> Agg {
-        Agg { count: 1, sum: v, min: v, max: v }
+        Agg {
+            count: 1,
+            sum: v,
+            min: v,
+            max: v,
+        }
     }
 
     fn decode(b: &[u8]) -> Agg {
         let f = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        Agg { count: f(0), sum: f64::from_bits(f(8)), min: f64::from_bits(f(16)), max: f64::from_bits(f(24)) }
+        Agg {
+            count: f(0),
+            sum: f64::from_bits(f(8)),
+            min: f64::from_bits(f(16)),
+            max: f64::from_bits(f(24)),
+        }
     }
 
     fn encode(&self, out: &mut [u8]) {
@@ -96,8 +106,16 @@ struct Rollup {
     per_file: u64,
 }
 
-const HOURS: Rollup = Rollup { prefix: 'h', unit: HOUR, per_file: HOURS_PER_FILE };
-const DAYS: Rollup = Rollup { prefix: 'd', unit: DAY, per_file: DAYS_PER_FILE };
+const HOURS: Rollup = Rollup {
+    prefix: 'h',
+    unit: HOUR,
+    per_file: HOURS_PER_FILE,
+};
+const DAYS: Rollup = Rollup {
+    prefix: 'd',
+    unit: DAY,
+    per_file: DAYS_PER_FILE,
+};
 
 /// How to put back one change if a later step of the same call fails.
 enum Undo {
@@ -107,7 +125,8 @@ enum Undo {
 }
 
 async fn undo(steps: Vec<Undo>) {
-    let trap = |e: ErrorCode| -> ! { panic!("timeseries: cannot undo a refused write ({e:?}); the request must roll back") };
+    let trap =
+        |e: ErrorCode| -> ! { panic!("timeseries: cannot undo a refused write ({e:?}); the request must roll back") };
     for step in steps.into_iter().rev() {
         match step {
             Undo::Unlink(path) => match util::mount("/data").unwrap().unlink_file_at(path).await {
@@ -115,11 +134,15 @@ async fn undo(steps: Vec<Undo>) {
                 Err(e) => trap(e),
             },
             Undo::Truncate(path, len) => {
-                let fd = util::open("/data", &path, OpenFlags::empty(), DescriptorFlags::WRITE).await.unwrap_or_else(|e| trap(e));
+                let fd = util::open("/data", &path, OpenFlags::empty(), DescriptorFlags::WRITE)
+                    .await
+                    .unwrap_or_else(|e| trap(e));
                 fd.set_size(len).await.unwrap_or_else(|e| trap(e));
             }
             Undo::Restore(path, at, bytes) => {
-                let fd = util::open("/data", &path, OpenFlags::empty(), DescriptorFlags::WRITE).await.unwrap_or_else(|e| trap(e));
+                let fd = util::open("/data", &path, OpenFlags::empty(), DescriptorFlags::WRITE)
+                    .await
+                    .unwrap_or_else(|e| trap(e));
                 util::write_all(&fd, bytes, at).await.unwrap_or_else(|e| trap(e));
             }
         }
@@ -207,9 +230,14 @@ impl State {
             _ => self.days.contains(&n),
         };
         if exists {
-            let fd = util::open("/data", &path, OpenFlags::empty(), DescriptorFlags::READ | DescriptorFlags::WRITE)
-                .await
-                .map_err(error)?;
+            let fd = util::open(
+                "/data",
+                &path,
+                OpenFlags::empty(),
+                DescriptorFlags::READ | DescriptorFlags::WRITE,
+            )
+            .await
+            .map_err(error)?;
             let len = fd.stat().await.map_err(error)?.size;
             Ok((fd, len))
         } else {
@@ -270,7 +298,12 @@ impl State {
             let mut files: BTreeMap<u64, BTreeMap<u64, Agg>> = BTreeMap::new();
             for p in points {
                 let unit = p.time_ms / rollup.unit;
-                files.entry(unit / rollup.per_file).or_default().entry(unit % rollup.per_file).or_default().add(Agg::of(p.value));
+                files
+                    .entry(unit / rollup.per_file)
+                    .or_default()
+                    .entry(unit % rollup.per_file)
+                    .or_default()
+                    .add(Agg::of(p.value));
             }
             for (n, slots) in files {
                 let (fd, len) = self.open_for_write(rollup.prefix, n, steps, added).await?;
@@ -329,8 +362,12 @@ impl State {
         }
         let days: Vec<u64> = self.raw.range(from / DAY..=(to - 1) / DAY).copied().collect();
         for day in days {
-            let mut points: Vec<Point> =
-                self.day(day).await?.into_iter().filter(|p| (from..to).contains(&p.time_ms)).collect();
+            let mut points: Vec<Point> = self
+                .day(day)
+                .await?
+                .into_iter()
+                .filter(|p| (from..to).contains(&p.time_ms))
+                .collect();
             points.sort_by_key(|p| p.time_ms);
             out.extend(points);
             if out.len() >= limit as usize {
@@ -349,7 +386,9 @@ impl State {
             return Ok(Vec::new());
         }
         if (to - 1) / step - from / step >= MAX_BUCKETS {
-            return Err(Error::InvalidArgument(format!("more than {MAX_BUCKETS} buckets; narrow the range")));
+            return Err(Error::InvalidArgument(format!(
+                "more than {MAX_BUCKETS} buckets; narrow the range"
+            )));
         }
         let mut buckets: BTreeMap<u64, Agg> = BTreeMap::new();
         let rollup = match step {
@@ -365,7 +404,9 @@ impl State {
                     let lo = first.max(base) - base;
                     let hi = last.min(base + rollup.per_file - 1) - base;
                     let path = self.path(rollup.prefix, n);
-                    let fd = util::open("/data", &path, OpenFlags::empty(), DescriptorFlags::READ).await.map_err(error)?;
+                    let fd = util::open("/data", &path, OpenFlags::empty(), DescriptorFlags::READ)
+                        .await
+                        .map_err(error)?;
                     let span = read_at(&fd, lo * SLOT as u64, (hi - lo + 1) * SLOT as u64).await?;
                     for (i, slot) in span.as_chunks::<SLOT>().0.iter().enumerate() {
                         let agg = Agg::decode(slot);
@@ -381,7 +422,10 @@ impl State {
                 for day in days {
                     for p in self.day(day).await? {
                         if (from..to).contains(&p.time_ms) {
-                            buckets.entry(p.time_ms / step * step).or_default().add(Agg::of(p.value));
+                            buckets
+                                .entry(p.time_ms / step * step)
+                                .or_default()
+                                .add(Agg::of(p.value));
                         }
                     }
                 }
@@ -389,7 +433,13 @@ impl State {
         }
         Ok(buckets
             .into_iter()
-            .map(|(start_ms, a)| Bucket { start_ms, count: a.count, sum: a.sum, min: a.min, max: a.max })
+            .map(|(start_ms, a)| Bucket {
+                start_ms,
+                count: a.count,
+                sum: a.sum,
+                min: a.min,
+                max: a.max,
+            })
             .collect())
     }
 
@@ -399,7 +449,12 @@ impl State {
             Level::Hour => ('h', HOURS.unit * HOURS.per_file),
             Level::Day => ('d', DAYS.unit * DAYS.per_file),
         };
-        let doomed: Vec<u64> = self.files(prefix).iter().copied().take_while(|n| (n + 1) * span <= before).collect();
+        let doomed: Vec<u64> = self
+            .files(prefix)
+            .iter()
+            .copied()
+            .take_while(|n| (n + 1) * span <= before)
+            .collect();
         let data = util::mount("/data").unwrap();
         for (i, n) in doomed.into_iter().enumerate() {
             // Each file goes whole or not at all; stopping early leaves a
@@ -468,7 +523,10 @@ impl Guest for Provider {
 
 impl GuestSeries for Series {
     async fn open(name: String) -> Result<Handle, Error> {
-        if !(1..=64).contains(&name.len()) || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        if !(1..=64).contains(&name.len())
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
         {
             return Err(Error::InvalidName);
         }
@@ -501,7 +559,10 @@ impl GuestSeries for Series {
             return Err(Error::InvalidArgument(format!("write 1 to {MAX_POINTS} points")));
         }
         if let Some(p) = points.iter().find(|p| p.time_ms > MAX_TIME || !p.value.is_finite()) {
-            return Err(Error::InvalidArgument(format!("bad point at {} ms: {}", p.time_ms, p.value)));
+            return Err(Error::InvalidArgument(format!(
+                "bad point at {} ms: {}",
+                p.time_ms, p.value
+            )));
         }
         let mut state = self.loaded().await?;
         // Once started, a write runs to completion or restoration even if the
@@ -523,7 +584,9 @@ impl GuestSeries for Series {
             return Ok(None);
         };
         let points = state.day(day).await?;
-        Ok(points.into_iter().reduce(|best, p| if p.time_ms >= best.time_ms { p } else { best }))
+        Ok(points
+            .into_iter()
+            .reduce(|best, p| if p.time_ms >= best.time_ms { p } else { best }))
     }
 
     async fn trim(&self, level: Level, before_ms: u64) -> Result<(), Error> {
