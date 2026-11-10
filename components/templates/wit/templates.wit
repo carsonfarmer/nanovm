@@ -1,0 +1,33 @@
+package nanovm:templates@0.1.0;
+
+/// Jinja2-style templates (minijinja). Pure computation: no filesystem,
+/// no state beyond a per-instance cache of compiled template sets.
+interface render {
+  variant error {
+    /// A template doesn't parse; the message names the template and line.
+    syntax(string),
+    /// Rendering failed: an unknown filter, a type error, a missing include.
+    render(string),
+    /// The context is not a JSON object, or the name is not in the set.
+    invalid-argument(string),
+  }
+
+  /// A set of named templates that can include, import and extend each other.
+  /// Names ending in `.html`, `.htm` or `.xml` escape values for HTML.
+  resource templates {
+    /// Compiles `(name, source)` pairs. Compiling the same set again in the
+    /// same instance returns the cached set without parsing.
+    compile: static func(sources: list<tuple<string, string>>) -> result<templates, error>;
+
+    /// Renders template `name` with `context`, a JSON object.
+    render: func(name: string, context: string) -> result<string, error>;
+  }
+}
+
+world provider {
+  export render;
+}
+
+world client {
+  import render;
+}

@@ -1,0 +1,13 @@
+[package]
+name = "templates-provider"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.62"
+serde_json = "1"
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "macros", "multi_template", "loader", "json", "std_collections"] }

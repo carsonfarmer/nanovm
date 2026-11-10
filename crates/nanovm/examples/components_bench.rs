@@ -84,6 +84,11 @@ const CASES: &[Case] = &[
     case("timeseries", "aggregate 1 day by hour (rollups) / request", TS_3D, ("GET", "/agg?from=0&to=86400000&step=3600000", ""), 1, false),
     case("timeseries", "aggregate 1 day by 15 min (1,440 raw points) / request", TS_3D, ("GET", "/agg?from=0&to=86400000&step=900000", ""), 1, false),
     case("timeseries", "range 1 hour (60 raw points) / request", TS_3D, ("GET", "/range?from=0&to=3600000", ""), 1, false),
+    case("templates", "baseline: unknown route (404)", &[], NONE, 1, false),
+    case("templates", "render a 20-row page via the component / request", &[], ("GET", "/page?via=component", ""), 1, false),
+    case("templates", "render a 20-row page via the linked crate / request", &[], ("GET", "/page?via=crate", ""), 1, false),
+    case("templates", "100 renders via the component (per render)", &[], ("GET", "/page?via=component&n=100", ""), 100, false),
+    case("templates", "100 renders via the linked crate (per render)", &[], ("GET", "/page?via=crate&n=100", ""), 100, false),
 ];
 
 /// Three days of one point a minute.

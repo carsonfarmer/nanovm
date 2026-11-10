@@ -37,6 +37,7 @@ jobs:
             components/queue -> ../../target/components
             components/docs -> ../../target/components
             components/timeseries -> ../../target/components
+            components/templates -> ../../target/components
       - name: Prepare host limits
         run: sudo sysctl -w vm.max_map_count=1048576
       - name: Check offline backup tooling
@@ -83,7 +84,7 @@ jobs:
           ulimit -n "$(ulimit -Hn)"
           bash components/keyvalue/build.sh --test-hooks
           env -u RUST_BACKTRACE cargo run --locked -p nanovm --example spin_kv_probe -- --test-hooks
-      - name: Build and test the filesystem components (queue, docs, timeseries, ...)
+      - name: Build and test the filesystem components (queue, docs, timeseries, templates, ...)
         run: |
           ulimit -n "$(ulimit -Hn)"
           bash scripts/build-components.sh

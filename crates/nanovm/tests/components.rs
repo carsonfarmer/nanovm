@@ -795,3 +795,24 @@ async fn timeseries_quota_exhaustion_is_refused_cleanly() {
     assert_eq!(std::fs::metadata(raw).unwrap().len(), 16);
     node.shutdown().await;
 }
+
+// ---- templates ------------------------------------------------------------
+// Pure computation: no volume, so nothing to persist, roll back or fill.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/templates/build.sh"]
+async fn templates_contracts() {
+    let cfg = node_cfg("templates_contracts", 4);
+    let node = start(&cfg, &app("templates", json!({})));
+    assert_eq!(ok(&node, "GET", "t", "/contracts", "").await, json!("ok"));
+    let r = request(&node, "GET", "t", "/page?via=component&n=3", "").await;
+    assert_eq!(r.status, 200);
+    assert!(
+        r.body
+            .starts_with("<!doctype html><title>Ada &amp; co's orders</title>"),
+        "{}",
+        r.body
+    );
+    assert_eq!(r.body, request(&node, "GET", "t", "/page?via=crate", "").await.body);
+    node.shutdown().await;
+}
