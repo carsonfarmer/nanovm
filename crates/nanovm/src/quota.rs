@@ -152,16 +152,6 @@ impl QuotaGuard {
         self.0.lock().journaled(f)
     }
 
-    /// Removes the volume's file at `path`, of `bytes`, into the journal:
-    /// where it now is.
-    pub fn remove(&self, path: &Path, bytes: u64) -> Result<std::path::PathBuf, ErrorCode> {
-        let mut q = self.0.lock();
-        let slot = q.journaled(|j| j.remove(path, bytes))?;
-        q.bytes = q.bytes.saturating_sub(bytes);
-        q.files = q.files.saturating_sub(1);
-        Ok(slot)
-    }
-
     pub fn unlink(&self, path: &Path, bytes: u64) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
         q.journaled(|j| j.unlink(path, bytes))?;
@@ -178,25 +168,18 @@ impl QuotaGuard {
         operation: impl std::future::Future<Output = FilesystemResult<()>>,
     ) -> FilesystemResult<()> {
         let src = std::fs::symlink_metadata(from).map_err(|_| ErrorCode::NoEntry)?;
-        let (mut file, mut dir) = (None, false);
-        match std::fs::symlink_metadata(to) {
-            Ok(d) if d.is_file() && src.is_dir() => return Err(ErrorCode::NotDirectory.into()),
-            Ok(d) if d.is_file() => file = Some((self.remove(to, d.len())?, d.len())),
-            Ok(_) => {
-                self.journal(|j| j.removing_dir(to))?;
-                dir = true;
-            }
-            Err(_) => {}
+        let replaced = std::fs::symlink_metadata(to).ok();
+        if replaced.as_ref().is_some_and(|d| d.is_file()) && src.is_dir() {
+            return Err(ErrorCode::NotDirectory.into());
         }
-        let record = match self.journal(|j| j.renaming(from, to)) {
-            Ok(at) => at,
-            Err(e) => {
-                self.restore_rename(to, file, None)?;
-                return Err(e.into());
-            }
-        };
+        let dir = replaced.as_ref().is_some_and(|d| !d.is_file());
+        let (record, slot) = self.journal(|j| j.renaming(from, to, replaced.as_ref()))?;
+        let file = slot.map(|slot| (slot, replaced.as_ref().map_or(0, |d| d.len())));
+        if let Some((_, bytes)) = file {
+            self.adjust(-(bytes as i64), -1);
+        }
         if let Err(e) = operation.await {
-            self.restore_rename(to, file, Some(record))?;
+            self.restore_rename(to, file, record)?;
             return Err(e);
         }
         self.journal(|j| {
@@ -210,30 +193,30 @@ impl QuotaGuard {
         Ok(())
     }
 
-    /// Failed renames restore their staged target even when logging failed.
+    /// A failed rename restores its staged target and cancels its record.
     /// Restoration/cancellation errors poison the journal, so a guest cannot
     /// catch the error and commit the missing target.
-    fn restore_rename(
-        &self,
-        to: &Path,
-        file: Option<(std::path::PathBuf, u64)>,
-        record: Option<u64>,
-    ) -> Result<(), ErrorCode> {
+    fn restore_rename(&self, to: &Path, file: Option<(std::path::PathBuf, u64)>, record: u64) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
         if let Some((slot, bytes)) = file {
             q.journal.restore(&slot, to, bytes).map_err(|_| ErrorCode::Io)?;
             q.bytes += bytes;
             q.files += 1;
         }
-        if let Some(at) = record {
-            q.journal.cancel_rename(at).map_err(|_| ErrorCode::Io)?;
-        }
-        Ok(())
+        q.journal.cancel_rename(record).map_err(|_| ErrorCode::Io)
     }
 
-    /// Makes the current request's changes durable.
-    pub fn commit(&self) -> std::io::Result<()> {
-        self.0.lock().journal.commit()
+    /// Makes the current request's changes durable, on a thread of its own:
+    /// a commit waits for the disk, which blocked the worker thread and every
+    /// object it runs, so a node had no more commits in flight than threads.
+    /// A request that changed nothing commits here: handing it over cost a
+    /// read 130 µs of CPU.
+    pub async fn commit(&self) -> std::io::Result<()> {
+        if !self.0.lock().journal.changed() {
+            return self.0.lock().journal.commit();
+        }
+        let q = self.0.clone();
+        tokio::task::spawn_blocking(move || q.lock().journal.commit()).await?
     }
 
     pub fn adjust(&self, bytes: i64, files: i64) {
@@ -435,8 +418,6 @@ macro_rules! delegate {
 impl HostDescriptorWithStore<ObjState> for QuotaFs {
     delegate! {
         advise(offset: Filesize, length: Filesize, advice: Advice) -> FilesystemResult<()>;
-        sync_data() -> FilesystemResult<()>;
-        sync() -> FilesystemResult<()>;
         get_flags() -> FilesystemResult<DescriptorFlags>;
         get_type() -> FilesystemResult<DescriptorType>;
         stat() -> FilesystemResult<DescriptorStat>;
@@ -447,6 +428,17 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         is_same_object(other: Resource<Descriptor>) -> wasmtime::Result<bool>;
         metadata_hash() -> FilesystemResult<MetadataHashValue>;
         metadata_hash_at(flags: PathFlags, path: String) -> FilesystemResult<MetadataHashValue>;
+    }
+
+    /// A guest's sync waits for nothing: a request's writes are durable
+    /// once it commits, and rolled back if it fails, synced or not. SQLite
+    /// syncs several times per transaction.
+    async fn sync_data(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
+        WasiFilesystem::get_flags(&stock(store), fd).await.map(drop)
+    }
+
+    async fn sync(store: &Accessor<ObjState, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
+        Self::sync_data(store, fd).await
     }
 
     fn read_via_stream(
@@ -722,7 +714,7 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), b"target");
         assert_eq!(std::fs::read(&from).unwrap(), b"source");
         assert_eq!(g.usage(), (12, 2));
-        g.commit().unwrap();
+        g.commit().await.unwrap();
         drop(g);
         let g = volume_guard(&v, 180);
         assert_eq!(g.usage(), (12, 2));
@@ -760,7 +752,7 @@ mod tests {
         .unwrap();
         assert_eq!(g.usage(), (6, 1));
         assert_eq!(std::fs::read(&to).unwrap(), b"source");
-        g.commit().unwrap();
+        g.commit().await.unwrap();
         drop(g);
         assert_eq!(volume_guard(&v, 1 << 20).usage(), (6, 1));
         std::fs::remove_dir_all(base).unwrap();
@@ -818,7 +810,7 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(g.commit().is_err());
+        assert!(g.commit().await.is_err());
         assert!(g.journal(|j| j.creating(&v.join("later"))).is_err());
         assert_eq!(g.usage(), (6, 1), "no credit for a failed restoration");
         std::fs::remove_dir(&to).unwrap(); // Repair the injected obstruction.
@@ -983,7 +975,7 @@ mod tests {
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
         let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj, None).unwrap();
         let f = std::fs::File::options().write(true).open(dir.join("f")).unwrap();
-        g.remove(&dir.join("f"), 10).unwrap();
+        g.unlink(&dir.join("f"), 10).unwrap();
         assert_eq!(usage(&g), (10, 1));
         g.set_size(&f, 0).unwrap();
         assert_eq!(usage(&g).0, 10);
@@ -994,8 +986,8 @@ mod tests {
 
     /// Unlinked new files keep their data and removal-time storage charge
     /// until every independent open and stream clone has gone away.
-    #[test]
-    fn new_unlinked_files_pay_until_the_last_handle_closes() {
+    #[tokio::test]
+    async fn new_unlinked_files_pay_until_the_last_handle_closes() {
         let dir = tempdir("new-unlinked").canonicalize().unwrap();
         let limits = Limits { disk_mb: 1, ..Limits::default() };
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
@@ -1029,7 +1021,7 @@ mod tests {
         drop(reader);
         assert!(matches!(g.unlink(&dir.join("b"), 600 << 10), Err(ErrorCode::InsufficientSpace)));
         // A commit cannot forgive storage still owned by a live stream.
-        g.commit().unwrap();
+        g.commit().await.unwrap();
         assert!(matches!(g.unlink(&dir.join("b"), 600 << 10), Err(ErrorCode::InsufficientSpace)));
         drop(stream);
         g.unlink(&dir.join("b"), 600 << 10).unwrap();

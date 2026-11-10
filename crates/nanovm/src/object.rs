@@ -453,7 +453,7 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
         let s = s.data_mut();
         (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
     });
-    quota.commit()?;
+    quota.commit().await?;
     if let crate::egress::Route::Supervisor(up) = route
         && !held.is_empty()
     {

@@ -3,7 +3,7 @@
 //! per-object memory, CPU, disk and egress limits.
 
 pub mod app;
-mod committed;
+pub mod committed;
 pub mod config;
 pub mod egress;
 pub mod engine;
@@ -16,6 +16,7 @@ pub mod proxy;
 pub mod quota;
 pub mod registry;
 pub mod server;
+pub mod ship;
 pub mod supervisor;
 pub mod table;
 pub mod telemetry;

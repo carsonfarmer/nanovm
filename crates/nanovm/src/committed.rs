@@ -1,25 +1,63 @@
-//! Immutable full-volume captures, staged under the journal's commit decision.
-//! The app's existing storage lock owns this tree; no distributed fence is implied.
+//! Immutable versions of an object's committed volume, staged under the
+//! journal's commit decision: the whole volume every `snapshot_every`
+//! versions, otherwise what one commit changed against the version before.
+//! The app's existing storage lock owns this tree; no distributed fence is
+//! implied.
+//!
+//! `~committed/<object>/<sequence>.tar` is a published version. One being
+//! staged is `<sequence>.<decision>.staged` beside them, where `<decision>`
+//! names the journal key its commit replaces: recovery discards it while
+//! that is still the journal's key, and publishes it once it isn't.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
+use std::ops::Range;
+use std::os::unix::fs::FileExt;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{config::CaptureConfig, journal::sync, object::ObjShared};
 
-const STAGED: &str = "capture";
+const FORMAT: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Version {
-    format: u32,
-    app: String,
-    object: String,
-    sequence: u64,
-    parent: String,
+pub struct Version {
+    pub format: u32,
+    pub app: String,
+    pub object: String,
+    pub sequence: u64,
+    /// The fencing epoch of the node that made it.
+    pub epoch: u64,
+    /// SHA-256 of the version before, or empty for the first.
+    pub parent: String,
+    /// The whole volume, not a change to the version before.
+    pub snapshot: bool,
+}
+
+/// What a commit changed in its volume; paths are relative to it.
+#[derive(Default)]
+pub(crate) struct Changes {
+    /// Directories whose entries changed.
+    pub listed: Vec<PathBuf>,
+    /// Files and directory trees taken whole.
+    pub whole: Vec<PathBuf>,
+    /// Files changed in place, with the ranges of them that changed.
+    pub patched: Vec<(PathBuf, Vec<Range<u64>>)>,
+}
+
+/// How a version that is a change records it: each listed directory's
+/// entries (and whether each is a directory), whole entries (under `data/`)
+/// and each patched file's length and changed ranges (bytes under `patch/`).
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    listed: BTreeMap<String, BTreeSet<(String, bool)>>,
+    whole: BTreeSet<String>,
+    patched: BTreeMap<String, (u64, Vec<(u64, u64)>)>,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -35,31 +73,33 @@ fn filename(sequence: u64) -> String {
     format!("{sequence:020}.tar")
 }
 
-fn digest(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
+/// What a version staged under journal key `key` ends its name with.
+fn decided_by(key: &[u8; 8]) -> String {
+    format!(".{}.staged", &format!("{:x}", Sha256::digest(key))[..16])
+}
+
+pub fn digest(path: &Path) -> io::Result<String> {
     let mut hash = Sha256::new();
-    let mut buffer = [0; 65536];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-    }
+    io::copy(&mut File::open(path)?, &mut hash)?;
     Ok(format!("{:x}", hash.finalize()))
 }
 
-// No independent mutable cursor: the contiguous immutable filenames are the head.
-fn head(dir: &Path) -> io::Result<(u64, u64)> {
+// No independent mutable cursor: the contiguous immutable filenames are the
+// head. Returns the last sequence, and how many versions and bytes are here:
+// a shipper removes those it shipped but the last, maybe meanwhile.
+fn head(dir: &Path) -> io::Result<(u64, u64, u64)> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0, 0)),
         Err(e) => return Err(e),
     };
-    let (mut count, mut last, mut bytes) = (0u64, 0u64, 0u64);
+    let (mut count, mut first, mut last, mut bytes) = (0u64, u64::MAX, 0u64, 0u64);
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
+        if name.to_str().is_some_and(|n| n.ends_with(".staged")) {
+            continue;
+        }
         let sequence = name
             .to_str()
             .and_then(|s| s.strip_suffix(".tar"))
@@ -68,16 +108,18 @@ fn head(dir: &Path) -> io::Result<(u64, u64)> {
         if sequence == 0 || name != filename(sequence).as_str() || !entry.file_type()?.is_file() {
             return Err(invalid("invalid committed version entry"));
         }
+        let len = match entry.metadata() {
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            len => len?.len(),
+        };
         count += 1;
-        last = last.max(sequence);
-        bytes = bytes
-            .checked_add(entry.metadata()?.len())
-            .ok_or_else(|| invalid("capture size overflow"))?;
+        (first, last) = (first.min(sequence), last.max(sequence));
+        bytes = bytes.checked_add(len).ok_or_else(|| invalid("capture size overflow"))?;
     }
-    if count != last {
+    if count > 0 && count != last - first + 1 {
         return Err(invalid("gap in committed versions"));
     }
-    Ok((last, bytes))
+    Ok((last, count, bytes))
 }
 
 struct Bounded {
@@ -99,48 +141,52 @@ impl Write for Bounded {
     }
 }
 
+fn name(path: &Path) -> io::Result<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| invalid("non-UTF-8 path"))
+}
+
+/// Stages the version a commit of `volume` makes, before the journal
+/// replaces its key `key`: a snapshot, or `changes` to the last version.
 pub(super) fn prepare(
     volume: &Path,
-    journal: &Path,
     out: &Path,
     obj: &ObjShared,
     cap: &CaptureConfig,
+    key: &[u8; 8],
+    changes: &Changes,
 ) -> io::Result<()> {
-    let (last, used) = head(out)?;
+    let (last, count, used) = head(out)?;
     let limit = cap
         .max_mb
         .checked_mul(1 << 20)
         .ok_or_else(|| invalid("capture limit overflow"))?;
-    if last >= cap.max_versions || used >= limit {
+    if count >= cap.max_versions || used >= limit {
         return Err(ErrorKind::StorageFull.into());
     }
     let version = Version {
-        format: 1,
+        format: FORMAT,
         app: obj.app.to_string(),
         object: obj.id.to_string(),
         sequence: last
             .checked_add(1)
             .ok_or_else(|| invalid("capture sequence overflow"))?,
+        epoch: cap.epoch,
         parent: if last == 0 {
             String::new()
         } else {
             digest(&out.join(filename(last)))?
         },
+        snapshot: last % cap.snapshot_every.max(1) == 0,
     };
     let metadata = serde_json::to_vec(&version)?;
-    if metadata.len() > 4096 {
-        return Err(invalid("capture identity too large"));
+    if !out.try_exists()? {
+        fs::create_dir_all(out)?;
+        // Persist the archive directory's name before a commit can depend on it.
+        for dir in [out, out.parent().expect("inside ~committed"), volume.parent().expect("inside app")] {
+            sync(dir)?;
+        }
     }
-    fs::create_dir_all(out)?;
-    // Persist the archive directory's name before a commit can depend on it.
-    for dir in [
-        out,
-        out.parent().expect("inside ~committed"),
-        volume.parent().expect("inside app"),
-    ] {
-        sync(dir)?;
-    }
-    let staged = journal.join(STAGED);
+    let staged = out.join(format!("{:020}{}", version.sequence, decided_by(key)));
     let writer = Bounded {
         file: File::options().write(true).create_new(true).open(&staged)?,
         remaining: limit - used,
@@ -148,59 +194,124 @@ pub(super) fn prepare(
     let mut archive = tar::Builder::new(writer);
     archive.follow_symlinks(false);
     archive.sparse(false);
-    let mut header = tar::Header::new_gnu();
-    header.set_size(metadata.len() as u64);
-    header.set_mode(0o600);
-    archive.append_data(&mut header, "nanovm.json", &metadata[..])?;
-    archive.append_dir("data", volume)?;
-    let mut pending = vec![volume.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if !kind.is_dir() && !kind.is_file() {
-                return Err(invalid("unsupported capture file type"));
+    let mut append = |name: &str, bytes: &[u8]| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o600);
+        archive.append_data(&mut header, name, bytes)
+    };
+    append("nanovm.json", &metadata)?;
+    let mut whole = vec![PathBuf::new()];
+    if !version.snapshot {
+        let mut manifest = Manifest::default();
+        for dir in &changes.listed {
+            let mut entries = BTreeSet::new();
+            for entry in fs::read_dir(volume.join(dir))? {
+                let entry = entry?;
+                entries.insert((name(Path::new(&entry.file_name()))?, entry.file_type()?.is_dir()));
             }
-            let path = entry.path();
-            archive.append_path_with_name(
-                &path,
-                Path::new("data").join(path.strip_prefix(volume).expect("inside volume")),
-            )?;
-            if kind.is_dir() {
-                pending.push(path);
+            manifest.listed.insert(name(dir)?, entries);
+        }
+        for (path, ranges) in &changes.patched {
+            let len = fs::metadata(volume.join(path))?.len();
+            let ranges = ranges.iter().map(|r| (r.start, r.end - r.start)).collect();
+            manifest.patched.insert(name(path)?, (len, ranges));
+        }
+        manifest.whole = changes.whole.iter().map(|p| name(p)).collect::<io::Result<_>>()?;
+        append("changes.json", &serde_json::to_vec(&manifest)?)?;
+        for (path, (_, ranges)) in &manifest.patched {
+            let file = File::open(volume.join(path))?;
+            let mut bytes = vec![];
+            for &(at, len) in ranges {
+                let start = bytes.len();
+                bytes.resize(start + len as usize, 0);
+                file.read_exact_at(&mut bytes[start..], at)?;
+            }
+            append(&format!("patch/{path}"), &bytes)?;
+        }
+        whole = changes.whole.clone();
+    }
+    // Directories before what is in them, so a reader can make each in turn.
+    while let Some(path) = whole.pop() {
+        let source = volume.join(&path);
+        let kind = fs::symlink_metadata(&source)?.file_type();
+        if !kind.is_dir() && !kind.is_file() {
+            return Err(invalid("unsupported capture file type"));
+        }
+        archive.append_path_with_name(&source, Path::new("data").join(&path))?;
+        if kind.is_dir() {
+            for entry in fs::read_dir(&source)? {
+                whole.push(path.join(entry?.file_name()));
             }
         }
     }
     drop(archive.into_inner()?);
     sync(&staged)?;
-    sync(journal)
+    sync(out)
 }
 
-// Must precede rollback, including rollback's eventual deletion of the log:
-// otherwise a second recovery could mistake a rejected version for a commit.
-pub(super) fn discard(journal: &Path) -> io::Result<()> {
-    match fs::remove_file(journal.join(STAGED)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    // An earlier removal may be visible but not durable after a failed sync.
-    sync(journal)
+/// Publishes the version staged under journal key `key`, which the journal
+/// has replaced, and returns its sequence. Recovery does it again if the
+/// rename is lost.
+pub(super) fn publish(out: &Path, key: &[u8; 8]) -> io::Result<u64> {
+    let next = head(out)?.0 + 1;
+    fs::rename(out.join(format!("{next:020}{}", decided_by(key))), out.join(filename(next)))?;
+    Ok(next)
 }
 
-// Called only after the log's deletion is durable, or on recovery without a log.
-pub(super) fn finish(journal: &Path, out: &Path, obj: &ObjShared) -> io::Result<()> {
-    let staged = journal.join(STAGED);
-    let file = match File::open(&staged) {
-        Ok(file) => file,
+/// Settles what commits left staged when their instance stopped, given the
+/// journal's key `key`: a version staged under it never decided and is
+/// discarded. When the journal has records to roll back (`undecided`), the
+/// discard is durable first, even one an earlier recovery made: a second
+/// recovery must not mistake a rejected version for a commit. Any other
+/// decided, and is published once `decided` has made the decision durable.
+pub(super) fn settle(
+    out: &Path,
+    obj: &ObjShared,
+    key: &[u8; 8],
+    undecided: bool,
+    decided: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut staged = vec![];
+    match fs::read_dir(out) {
+        Ok(entries) => {
+            for entry in entries {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".staged") {
+                    staged.push(name);
+                }
+            }
+        }
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
-    };
-    // Recovery may observe a log unlink whose directory sync never completed.
-    // Establish that decision before making any capture visible to a receiver.
-    sync(journal)?;
-    let mut archive = tar::Archive::new(file);
-    let mut entries = archive.entries()?;
+    }
+    staged.sort();
+    if let Some(i) = staged.iter().position(|n| n.ends_with(&decided_by(key))) {
+        fs::remove_file(out.join(staged.remove(i)))?;
+    }
+    if undecided {
+        sync(out)?;
+    }
+    if staged.is_empty() {
+        return Ok(());
+    }
+    // A decision seen here may not be durable yet: make it so before any
+    // capture becomes visible to a receiver.
+    decided()?;
+    for name in staged {
+        let (last, ..) = head(out)?;
+        let path = out.join(&name);
+        let version = read_version(&mut tar::Archive::new(File::open(&path)?).entries()?)?;
+        let parent = if last == 0 { String::new() } else { digest(&out.join(filename(last)))? };
+        if version.app != *obj.app || version.object != *obj.id || version.sequence != last + 1 || version.parent != parent {
+            return Err(invalid("out-of-order committed version"));
+        }
+        fs::rename(&path, out.join(filename(version.sequence)))?;
+    }
+    sync(out)
+}
+
+fn read_version<R: Read>(entries: &mut tar::Entries<R>) -> io::Result<Version> {
     let mut entry = entries.next().ok_or_else(|| invalid("missing capture identity"))??;
     if entry.path()? != Path::new("nanovm.json") || entry.size() > 4096 {
         return Err(invalid("invalid capture identity"));
@@ -208,29 +319,107 @@ pub(super) fn finish(journal: &Path, out: &Path, obj: &ObjShared) -> io::Result<
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
     let version: Version = serde_json::from_slice(&bytes)?;
-    if version.format != 1 || version.app != *obj.app || version.object != *obj.id || version.sequence == 0 {
+    if version.format != FORMAT || version.sequence == 0 {
         return Err(invalid("wrong capture identity"));
     }
-    let (last, _) = head(out)?;
-    let target = out.join(filename(version.sequence));
-    if version.sequence == last {
-        if digest(&staged)? != digest(&target)? {
-            return Err(invalid("conflicting committed version"));
-        }
-    } else {
-        let parent = if last == 0 {
-            String::new()
-        } else {
-            digest(&out.join(filename(last)))?
-        };
-        if last.checked_add(1) != Some(version.sequence) || version.parent != parent {
-            return Err(invalid("out-of-order committed version"));
-        }
-        // Keep the durable staged name until the destination name is durable.
-        // A rename could lose the only recoverable name between directory syncs.
-        fs::hard_link(&staged, &target)?;
+    Ok(version)
+}
+
+/// `path`, which a version names, under `root`, if it can't leave it.
+fn under(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    match path.components().all(|c| matches!(c, Component::Normal(_))) {
+        true => Ok(root.join(path)),
+        false => Err(invalid("unsafe path in a committed version")),
     }
-    sync(out)?;
-    fs::remove_file(&staged)?;
-    sync(journal)
+}
+
+fn remove(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(md) if md.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Applies the version in `file` to the volume at `root`: a snapshot to an
+/// empty directory, a change to what the version before left. Returns it.
+pub fn apply(root: &Path, file: &Path) -> io::Result<Version> {
+    let mut archive = tar::Archive::new(File::open(file)?);
+    let mut entries = archive.entries()?;
+    let version = read_version(&mut entries)?;
+    let mut manifest = Manifest::default();
+    if !version.snapshot {
+        let mut entry = entries.next().ok_or_else(|| invalid("missing changes"))??;
+        if entry.path()? != Path::new("changes.json") {
+            return Err(invalid("missing changes"));
+        }
+        manifest = serde_json::from_reader(&mut entry)?;
+        for (dir, keep) in &manifest.listed {
+            let dir = under(root, Path::new(dir))?;
+            fs::create_dir_all(&dir)?;
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                if !keep.contains(&(name(Path::new(&entry.file_name()))?, entry.file_type()?.is_dir())) {
+                    remove(&entry.path())?;
+                }
+            }
+        }
+        for path in &manifest.whole {
+            remove(&under(root, Path::new(path))?)?;
+        }
+    }
+    for entry in entries {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        if let Ok(rest) = path.strip_prefix("data") {
+            entry.unpack(under(root, rest)?)?;
+        } else if let Some((rest, (len, ranges))) =
+            path.strip_prefix("patch").ok().and_then(|p| Some((p, manifest.patched.get(p.to_str()?)?)))
+        {
+            let file = File::options().write(true).open(under(root, rest)?)?;
+            file.set_len(*len)?;
+            for &(at, n) in ranges {
+                let mut bytes = vec![0; n as usize];
+                entry.read_exact(&mut bytes)?;
+                file.write_all_at(&bytes, at)?;
+            }
+        } else {
+            return Err(invalid("unexpected entry in a committed version"));
+        }
+    }
+    Ok(version)
+}
+
+/// Rebuilds at `root`, which must not exist yet, the volume that the
+/// versions in `dir` (`<sequence>.tar`) end with: the last snapshot, then
+/// each change after it, checked against the version before. Returns the
+/// last version's sequence.
+pub fn restore(dir: &Path, root: &Path) -> io::Result<u64> {
+    let mut versions = vec![];
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let n = name.to_str().and_then(|n| n.strip_suffix(".tar")?.parse::<u64>().ok());
+        versions.push(n.filter(|&n| name == filename(n).as_str()).ok_or_else(|| invalid("invalid committed version name"))?);
+    }
+    versions.sort();
+    let mut snapshot = None;
+    for &n in versions.iter().rev() {
+        if read_version(&mut tar::Archive::new(File::open(dir.join(filename(n)))?).entries()?)?.snapshot {
+            snapshot = Some(n);
+            break;
+        }
+    }
+    let snapshot = snapshot.ok_or_else(|| invalid("no snapshot"))?;
+    fs::create_dir(root)?;
+    let mut parent = None;
+    for &n in versions.iter().filter(|&&n| n >= snapshot) {
+        let path = dir.join(filename(n));
+        let version = apply(root, &path)?;
+        if version.sequence != n || parent.as_ref().is_some_and(|p| *p != version.parent) {
+            return Err(invalid("broken chain of committed versions"));
+        }
+        parent = Some(digest(&path)?);
+    }
+    Ok(snapshot.max(*versions.last().expect("a snapshot is one")))
 }

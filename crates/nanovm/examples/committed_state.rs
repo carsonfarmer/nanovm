@@ -96,11 +96,8 @@ fn tree(root: &Path) -> Result<Tree> {
 
 // Must run under exclusive mutation ownership, after a successful local commit
 // and before any subsequent guest execution (including post-return execution).
-fn capture(volume: &Path, sequence: u64, parent: String) -> Result<Vec<u8>> {
-    ensure!(
-        !volume.parent().unwrap().join("~journal/o/log").try_exists()?,
-        "tentative state"
-    );
+fn capture(volume: &Path, j: &Journal, sequence: u64, parent: String) -> Result<Vec<u8>> {
+    ensure!(!j.changed(), "tentative state");
     let version = Version {
         app: "app".into(),
         object: "o".into(),
@@ -249,18 +246,18 @@ fn drill(transfer: impl Fn(&Path, &[u8]) -> Result<()>) -> Result<()> {
     let empty = volume.join("empty");
     j.creating(&empty)?;
     fs::create_dir(&empty)?;
-    ensure!(capture(&volume, 1, String::new()).is_err(), "captured tentative bytes");
+    ensure!(capture(&volume, &j, 1, String::new()).is_err(), "captured tentative bytes");
     j.commit()?;
-    let first = capture(&volume, 1, String::new())?;
+    let first = capture(&volume, &j, 1, String::new())?;
     // Next commit models post-return changes; it is NOT the same recovery point.
     write(&mut j, &volume, "data", b"post-ret")?;
-    j.renaming(&volume.join("data"), &volume.join("renamed"))?;
+    j.renaming(&volume.join("data"), &volume.join("renamed"), None)?;
     fs::rename(volume.join("data"), volume.join("renamed"))?;
     j.renamed(&volume.join("data"), &volume.join("renamed"));
     j.removing_dir(&empty)?;
     fs::remove_dir(&empty)?;
     j.commit()?;
-    let second = capture(&volume, 2, hash(&first))?;
+    let second = capture(&volume, &j, 2, hash(&first))?;
     ensure!(
         serde_json::from_slice::<Version>(&first)?.tree["data"] == Some(b"response".to_vec()),
         "mutable capture"
