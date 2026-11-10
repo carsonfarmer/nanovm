@@ -368,6 +368,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** a connection is pooled only if it is also ready for the next request (`SendRequest::is_ready`, the check `checkout` already made); otherwise it is dropped, which drops the body and lets the client's connection close. No new runtime lines.
 - **Status:** fixed on `cf/hardening`
 
+### N-681: the node's front end has no header timeout
+- **Where:** `main.rs` (`front` → `server::serve_http1` → `serve_conn(…, None, …)`); hyper's default 30 s header timeout needs a timer, which isn't set
+- **Scenario:** found by the hardening agent while fixing N-505. The proxy gives a client 10 s for a request's headers; the node's own listener gives none, so a client that reaches the node directly can hold a connection (and an fd) by sending a request head a byte at a time. Bodies are bounded since N-505; heads are not. Behind the proxy, as deployed (the node listens on loopback), only the proxy reaches it.
+- **Reproduced:** by reading: `Dur::Default` timeouts are dropped without a timer (`hyper::common::time::Time::check`). Not run.
+- **Suggestion:** set a header timeout at the node longer than the proxy's pool idle timeout (hyper-util's 90 s default), or the node would close idle pooled connections as the proxy reuses them; or lower the proxy's pool idle timeout below the node's.
+- **Status:** open
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
