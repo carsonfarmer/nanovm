@@ -89,6 +89,14 @@ const CASES: &[Case] = &[
     case("templates", "render a 20-row page via the linked crate / request", &[], ("GET", "/page?via=crate", ""), 1, false),
     case("templates", "100 renders via the component (per render)", &[], ("GET", "/page?via=component&n=100", ""), 100, false),
     case("templates", "100 renders via the linked crate (per render)", &[], ("GET", "/page?via=crate&n=100", ""), 100, false),
+    case("auth", "baseline: unknown route (404)", &[], NONE, 1, false),
+    case("auth", "verify RS256 (inline JWK Set) / request", &[], ("GET", "/verify?case=rs256", ""), 1, false),
+    case("auth", "verify ES256 (inline JWK Set) / request", &[], ("GET", "/verify?case=es256", ""), 1, false),
+    case("auth", "verify EdDSA (inline JWK Set) / request", &[], ("GET", "/verify?case=eddsa", ""), 1, false),
+    case("auth", "argon2id hash, 19 MiB x 2 passes (default) / request", &[], ("POST", "/password", "hunter2"), 1, false),
+    case("auth", "argon2id hash, 8 MiB x 1 pass / request", &[], ("POST", "/password?m=8192&t=1", "hunter2"), 1, false),
+    case("auth", "session create / request", &[], ("POST", "/session/create", ""), 1, false),
+    case("auth", "session get / request", &[("POST", "/session/fixed", "")], ("GET", "/session/get-fixed", ""), 1, false),
 ];
 
 /// Three days of one point a minute.

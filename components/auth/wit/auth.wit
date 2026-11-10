@@ -1,0 +1,138 @@
+package nanovm:auth@0.1.0;
+
+/// JSON Web Token verification (and HS256 signing for an app's own tokens).
+interface jwt {
+  /// Where the verification key comes from.
+  variant key {
+    /// A shared secret, for HS256, HS384 and HS512 only.
+    hmac(list<u8>),
+    /// A JWK Set (JSON text). The token's `kid` picks the key; without one,
+    /// the only key of the right type.
+    jwks(string),
+    /// A URL serving a JWK Set, fetched through the app's egress allowlist
+    /// and cached in the object's volume for `ttl-s` seconds. A `kid` not in
+    /// the cached set refetches it, at most once a minute.
+    jwks-url(jwks-source),
+  }
+
+  record jwks-source {
+    url: string,
+    ttl-s: u32,
+  }
+
+  record options {
+    /// Accepted `alg` values (HS256/384/512, RS256/384/512, PS256/384/512,
+    /// ES256, ES384, EdDSA). Empty accepts any the key supports; `none` is
+    /// never accepted.
+    algorithms: list<string>,
+    /// If set, `iss` must equal it.
+    issuer: option<string>,
+    /// If set, `aud` must equal it or, as an array, contain it.
+    audience: option<string>,
+    /// Clock skew allowed for `exp` and `nbf`, in seconds.
+    leeway-s: u32,
+    /// Refuse tokens without `exp`.
+    require-exp: bool,
+  }
+
+  variant error {
+    /// Not three base64url parts of JSON, or a header this verifier refuses.
+    malformed(string),
+    /// The algorithm isn't accepted, or doesn't match the key.
+    unsupported(string),
+    /// No key in the set matches the token.
+    no-key(string),
+    bad-signature,
+    expired,
+    not-yet-valid,
+    /// `iss`, `aud` or a required `exp` doesn't match.
+    claim(string),
+    /// The JWK Set couldn't be fetched or parsed (and nothing was cached).
+    fetch(string),
+    other(string),
+  }
+
+  /// Verifies `token`; its claims (a JSON object, as text) if valid.
+  verify: async func(token: string, key: key, options: options) -> result<string, error>;
+
+  /// An HS256 token carrying `claims` (a JSON object, as text).
+  sign-hs256: func(claims: string, secret: list<u8>) -> result<string, error>;
+}
+
+/// Argon2id password hashing, sized to a request's CPU budget.
+interface passwords {
+  /// Argon2 cost: memory in KiB (8-65,536) and passes (1-10); one lane.
+  record params {
+    memory-kib: u32,
+    iterations: u32,
+  }
+
+  variant error {
+    /// Params out of range, or a password over 4 KiB.
+    invalid-argument(string),
+    /// Not an argon2 PHC string, or one whose params are out of range.
+    invalid-hash(string),
+  }
+
+  /// The PHC string (`$argon2id$v=19$m=...`) of `password` with a random
+  /// salt. Without params: 19,456 KiB and 2 passes (OWASP's minimum).
+  hash: func(password: string, params: option<params>) -> result<string, error>;
+
+  /// Whether `password` matches `hash`, in constant time.
+  verify: func(password: string, hash: string) -> result<bool, error>;
+
+  /// Whether `hash` is weaker than `params` (or not argon2id): rehash it after
+  /// the next successful login.
+  needs-rehash: func(hash: string, params: params) -> result<bool, error>;
+}
+
+/// Server-side sessions in the object's volume, one file per session, named
+/// by a hash of the token so the volume never holds a usable token.
+interface sessions {
+  record session {
+    subject: string,
+    /// The app's own data (any text, up to 64 KiB).
+    data: string,
+    created-s: u64,
+    expires-s: u64,
+  }
+
+  /// Errors. A call that returns an error has changed nothing.
+  variant error {
+    invalid-argument(string),
+    /// The object's disk or file quota is full.
+    full,
+    other(string),
+  }
+
+  /// A new session for `subject` that lasts `ttl-s` seconds (1 to 10 years);
+  /// its token: 43 base64url characters, 256 random bits.
+  create: async func(subject: string, data: string, ttl-s: u32) -> result<string, error>;
+
+  /// The session, unless the token is unknown or it has expired.
+  get: async func(token: string) -> result<option<session>, error>;
+
+  /// Makes a live session last `ttl-s` seconds from now; whether it was live.
+  refresh: async func(token: string, ttl-s: u32) -> result<bool, error>;
+
+  /// Ends a session; whether it existed.
+  destroy: async func(token: string) -> result<bool, error>;
+
+  /// Ends every session of `subject` (log out everywhere); how many.
+  destroy-subject: async func(subject: string) -> result<u32, error>;
+
+  /// Deletes up to `limit` expired sessions; how many.
+  sweep: async func(limit: u32) -> result<u32, error>;
+}
+
+world provider {
+  export jwt;
+  export passwords;
+  export sessions;
+}
+
+world client {
+  import jwt;
+  import passwords;
+  import sessions;
+}

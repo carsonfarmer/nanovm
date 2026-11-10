@@ -816,3 +816,252 @@ async fn templates_contracts() {
     assert_eq!(r.body, request(&node, "GET", "t", "/page?via=crate", "").await.body);
     node.shutdown().await;
 }
+
+// ---- auth -----------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/auth/build.sh"]
+async fn auth_jwt_and_password_contracts() {
+    let cfg = node_cfg("auth_contracts", 4);
+    let node = start(&cfg, &app("auth", json!({})));
+    assert_eq!(ok(&node, "GET", "a", "/jwt-contracts", "").await, json!("ok"));
+    assert_eq!(ok(&node, "GET", "a", "/password-contracts", "").await, json!("ok"));
+    assert_eq!(ok(&node, "GET", "a", "/session/contracts", "").await, json!("ok"));
+    // The default (OWASP minimum) cost fits a request's CPU budget.
+    let hash = ok(&node, "POST", "a", "/password", "hunter2").await["hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "{hash}");
+    let path = format!("/password?hash={}", urlencode(&hash));
+    assert_eq!(ok(&node, "POST", "a", &path, "hunter2").await, json!({"ok": true}));
+    assert_eq!(ok(&node, "POST", "a", &path, "hunter3").await, json!({"ok": false}));
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/auth/build.sh"]
+async fn auth_jwks_url_is_fetched_once_and_cached_in_the_volume() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let vectors: Value =
+        serde_json::from_str(&std::fs::read_to_string(repo().join("components/auth/tests/src/vectors.json")).unwrap())
+            .unwrap();
+    let full = vectors["jwks"].as_str().unwrap().to_string();
+    // Without the Ed25519 key, as before a rotation.
+    let mut set: Value = serde_json::from_str(&full).unwrap();
+    set["keys"].as_array_mut().unwrap().retain(|k| k["kid"] != "ed1");
+    let before = set.to_string();
+    let (hits, rotated, broken) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (h, r, b) = (hits.clone(), rotated.clone(), broken.clone());
+    let server = tokio::spawn(nanovm::server::serve_http1(listener, move |_req| {
+        h.fetch_add(1, Relaxed);
+        let body = if r.load(Relaxed) { full.clone() } else { before.clone() };
+        let broken = b.load(Relaxed);
+        async move {
+            match broken {
+                true => nanovm::object::error_response(500, "down", "down"),
+                false => nanovm::server::ok_json(serde_json::from_str(&body).unwrap()),
+            }
+        }
+    }));
+    let cfg = node_cfg("auth_jwks", 1);
+    let app = app("auth", json!({"egress": [format!("127.0.0.1:{port}")]}));
+    let mut node = start(&cfg, &app);
+    let url = urlencode(&format!("http://127.0.0.1:{port}/jwks"));
+    let verify = |case: &str, ttl: u32| format!("/jwks-url?case={case}&url={url}&ttl={ttl}");
+    assert_eq!(ok(&node, "GET", "a", &verify("rs256", 3600), "").await["sub"], "alice");
+    assert_eq!(ok(&node, "GET", "a", &verify("es256", 3600), "").await["sub"], "alice");
+    assert_eq!(hits.load(Relaxed), 1, "fetched once");
+    // Within a minute of the fetch, an unknown kid doesn't refetch.
+    let r = request(&node, "GET", "a", &verify("eddsa", 3600), "").await;
+    assert!(r.body.contains("NoKey"), "{}", r.body);
+    assert_eq!(hits.load(Relaxed), 1);
+    // A restart reads the cached set from the volume.
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(ok(&node, "GET", "a", &verify("rs256", 3600), "").await["sub"], "alice");
+    assert_eq!(hits.load(Relaxed), 1);
+    // The issuer rotates in a new key; once the cache is a minute old, the
+    // new kid refetches (aged here by editing the cached file while stopped).
+    node.shutdown().await;
+    drop(node);
+    let dir = volume(&cfg, "auth", "a").join(".auth/jwks");
+    let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+    let mut cached: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    cached["fetched"] = json!(cached["fetched"].as_u64().unwrap() - 120);
+    std::fs::write(&file, cached.to_string()).unwrap();
+    rotated.store(true, Relaxed);
+    node = start(&cfg, &app);
+    assert_eq!(ok(&node, "GET", "a", &verify("eddsa", 3600), "").await["sub"], "alice");
+    assert_eq!(hits.load(Relaxed), 2);
+    // An expired cache refetches; if the issuer is down, the stale set serves.
+    broken.store(true, Relaxed);
+    assert_eq!(ok(&node, "GET", "a", &verify("es256", 0), "").await["sub"], "alice");
+    assert_eq!(hits.load(Relaxed), 3);
+    // With no cache at all, the failure is reported.
+    let other = urlencode(&format!("http://127.0.0.1:{port}/other"));
+    let r = request(&node, "GET", "a", &format!("/jwks-url?case=rs256&url={other}"), "").await;
+    assert!(
+        r.status == 409 && r.body.contains("Fetch") && r.body.contains("500"),
+        "{}",
+        r.body
+    );
+    node.shutdown().await;
+    server.abort();
+}
+
+/// Every file under `dir`, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten() {
+            let p = e.unwrap().path();
+            if p.is_dir() { stack.push(p) } else { out.push(p) }
+        }
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/auth/build.sh"]
+async fn auth_sessions_persist_expire_and_roll_back() {
+    let cfg = node_cfg("auth_sessions", 1);
+    let app = app("auth", json!({}));
+    let mut node = start(&cfg, &app);
+    let create = |subject: &str, ttl: u32| format!("/session/create?subject={subject}&ttl={ttl}");
+    let token = ok(&node, "POST", "s", &create("alice", 3600), "{\"cart\":3}").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let get = format!("/session/get?token={token}");
+    assert_eq!(
+        ok(&node, "GET", "s", &get, "").await,
+        json!({"subject": "alice", "data": "{\"cart\":3}", "ttl": 3600})
+    );
+    // The volume never holds the token itself.
+    let sessions = volume(&cfg, "auth", "s").join(".auth/sessions");
+    for f in files_under(&sessions) {
+        assert!(!String::from_utf8_lossy(&std::fs::read(f).unwrap()).contains(&token));
+    }
+    evict(&node, "/session/get?token=x").await;
+    assert_eq!(ok(&node, "GET", "s", &get, "").await["subject"], "alice");
+    node = restart(node, &cfg, &app).await;
+    assert_eq!(ok(&node, "GET", "s", &get, "").await["subject"], "alice");
+    // A failed request's session never existed.
+    let count = || files_under(&sessions).len();
+    let r = request(&node, "POST", "s", "/session/fail", "").await;
+    assert_eq!(r.error.as_deref(), Some("guest-error"), "{}", r.body);
+    // The next instance start replays the undo journal.
+    assert_eq!(ok(&node, "GET", "s", &get, "").await["subject"], "alice");
+    assert_eq!(count(), 1);
+    // Log out everywhere ends only that subject's sessions.
+    for _ in 0..3 {
+        ok(&node, "POST", "s", &create("bob", 3600), "").await;
+    }
+    assert_eq!(
+        ok(&node, "POST", "s", "/session/destroy-subject?subject=bob", "").await,
+        3
+    );
+    assert_eq!(count(), 1);
+    assert_eq!(ok(&node, "GET", "s", &get, "").await["subject"], "alice");
+    // Expiry, refresh and sweeping.
+    ok(&node, "POST", "s", &format!("/session/refresh?token={token}&ttl=1"), "").await;
+    let short = ok(&node, "POST", "s", &create("dave", 1), "").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(ok(&node, "GET", "s", &get, "").await, Value::Null);
+    assert_eq!(
+        ok(&node, "POST", "s", &format!("/session/refresh?token={short}"), "").await,
+        false
+    );
+    assert_eq!(ok(&node, "POST", "s", "/session/sweep", "").await, 2);
+    assert_eq!(count(), 0);
+    let live = ok(&node, "POST", "s", &create("erin", 3600), "").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        ok(&node, "POST", "s", &format!("/session/destroy?token={live}"), "").await,
+        true
+    );
+    assert_eq!(
+        ok(&node, "POST", "s", &format!("/session/destroy?token={live}"), "").await,
+        false
+    );
+    node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs components/auth/build.sh"]
+async fn auth_sessions_quota_exhaustion_is_refused_cleanly() {
+    let cfg = node_cfg("auth_quota", 2);
+    // .auth, .auth/sessions and three session files.
+    let app = app("auth", json!({"max_files": 5}));
+    let node = start(&cfg, &app);
+    let mut tokens = Vec::new();
+    for _ in 0..3 {
+        tokens.push(
+            ok(&node, "POST", "s", "/session/create", "").await["token"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let r = request(&node, "POST", "s", "/session/create", "").await;
+    assert_eq!(
+        (r.status, r.json()["error"].as_str()),
+        (409, Some("Error::Full")),
+        "{}",
+        r.body
+    );
+    assert_eq!(files_under(&volume(&cfg, "auth", "s")).len(), 3);
+    assert_eq!(
+        ok(&node, "POST", "s", &format!("/session/destroy?token={}", tokens[0]), "").await,
+        true
+    );
+    ok(&node, "POST", "s", "/session/create", "").await;
+    // A refresh needs a temporary entry: refused whole on a full volume.
+    let r = request(
+        &node,
+        "POST",
+        "s",
+        &format!("/session/refresh?token={}&ttl=60", tokens[1]),
+        "",
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json()["error"].as_str()),
+        (409, Some("Error::Full")),
+        "{}",
+        r.body
+    );
+    let session = ok(&node, "GET", "s", &format!("/session/get?token={}", tokens[1]), "").await;
+    assert_eq!(session["ttl"], 3600);
+    assert_eq!(files_under(&volume(&cfg, "auth", "s")).len(), 3);
+    node.shutdown().await;
+    // Out of bytes: a session whose write is refused leaves no file.
+    let cfg = node_cfg("auth_bytes", 2);
+    let node = start(&cfg, &crate::app("auth", json!({"disk_mb": 1})));
+    let data = "d".repeat(60 << 10);
+    let mut created = 0;
+    loop {
+        let r = request(&node, "POST", "s", "/session/create", &data).await;
+        if r.status == 409 {
+            assert_eq!(r.json()["error"], "Error::Full", "{}", r.body);
+            break;
+        }
+        assert_eq!(r.status, 200, "{}", r.body);
+        created += 1;
+    }
+    assert!((10..18).contains(&created), "{created}");
+    assert_eq!(files_under(&volume(&cfg, "auth", "s")).len(), created);
+    node.shutdown().await;
+}
