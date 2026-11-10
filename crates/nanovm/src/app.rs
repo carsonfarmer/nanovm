@@ -18,7 +18,7 @@ use crate::object::{ObjState, Scratch};
 /// Import prefixes a guest may use. Everything else (sockets, the WASIp2
 /// filesystem, anything custom) is refused at load time, so the only paths
 /// out of the sandbox are the quota'd filesystem and allowlisted HTTP.
-const ALLOWED_IMPORTS: &[&str] = &[
+pub const ALLOWED_IMPORTS: &[&str] = &[
     "wasi:io/",
     "wasi:clocks/",
     "wasi:random/",
@@ -54,11 +54,17 @@ pub fn linker(engine: &Engine) -> anyhow::Result<Linker<ObjState>> {
     Ok(linker)
 }
 
+/// Whether a guest may import `name`; also for tools that report on a
+/// component (`tools/inspect`).
+pub fn import_allowed(name: &str) -> bool {
+    ALLOWED_IMPORTS.iter().any(|p| name.starts_with(p))
+}
+
 /// Rejects components that import anything outside [`ALLOWED_IMPORTS`].
 pub fn check_imports(engine: &Engine, component: &Component) -> anyhow::Result<()> {
     let ty = component.component_type();
     for (name, _) in ty.imports(engine) {
-        if !ALLOWED_IMPORTS.iter().any(|p| name.starts_with(p)) {
+        if !import_allowed(name) {
             bail!("import `{name}` is not permitted");
         }
     }
