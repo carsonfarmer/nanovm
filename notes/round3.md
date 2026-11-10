@@ -31,6 +31,10 @@ over at least three rounds. Read them as before/after on the same machine.
 | 37dd88e | N-552: workers start from the supervisor's own image (`/proc/self/exe`) | replacing the binary under a running node started mismatched workers (502) | +2 |
 | ac3c71f | N-507: the proxy refuses a TXT trust identity containing a comma | the node then refused every request for that host; found by fuzzing | 0 |
 | 51d517e, 5a9fe61 | N-640: the CPU budget charges the thread's CPU clock, not wall time inside polls | **on a busy node, waiting for a core was billed as CPU**, so overload turned into CPU kills and restarts. Before: 178 of 1.4M GETs and 94 of 140k writes killed at load ~25; a request needing 33 ms of CPU was killed after 12–16 ms. After: none; the kill comes at 102–103 ms of real CPU for a 100 ms budget. Also fixes N-600 (SQLite's fsync waits were billed as CPU). Cost about 1.3 µs (~2%) per warm GET, within noise | +3 |
+| 50ef6d9, af293c7 | N-505: request bodies must keep coming, at the proxy and the node (408 `body-timeout`); N-680: a link connection answered before its body was sent is not pooled | **a client trickling a body held a connection, a link and an object as long as it liked**; now cut after about 10 s (any upload at 4 KiB/s or more is never cut). Before: all four entry points still open after 40 s; after: 408 at 10.0 s. CPU per request unchanged within noise | +66 |
+| 59c0b58 | N-500: the linker defines only the WASIp2 interfaces the allowlist permits | defense in depth: the raw WASIp2 filesystem and sockets can't be reached even if the allowlist changes; linker build 148 → 90 µs | +12 |
+| cc0aca8 | N-506: the node refuses a `nanovm-host` that isn't a DNS name | an invalid app name could be formed from a header starting with `.` | +3 |
+| 2310766 | N-671: preflight explains an address-space limit too small for the pool | under `ulimit -v`, every worker failed with an unexplained mapping error; now `serve` refuses to start and says why | +15 |
 
 Plus the merge of `origin/main` 59b3783 (Amp's W-9 local capture), unchanged.
 
@@ -132,10 +136,9 @@ instance shares them (W-640). JavaScript keeps its pre-initialization.
 5. **W-600**: let a request roll back and still choose its status (a declined checkout can only
    answer 500 today). **W-601**: an app can't serve `/`.
 6. **N-603**: the SQLite provider now allows the read-only pragmas FTS5 needs.
-7. **N-505** (open): request bodies have no time limit at any hop.
 
 ## 5. Open items found this round
 
-N-500 (the linker defines all of WASIp2; the import allowlist is the only guard), N-505, N-506,
-N-670 (Landlock ABI 2 needed for cross-directory renames), N-671 (`ulimit -v` makes workers fail
+N-681 (the node's own listener has no header timeout; matters only if it is reachable without
+the proxy), N-670 (Landlock ABI 2 needed for cross-directory renames), N-671 (`ulimit -v` makes workers fail
 without a clear message), W-621..W-623, W-90's remaining window, N-165 and N-166.
