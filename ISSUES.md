@@ -389,6 +389,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** those four setters are shadowed in the node's linker by the same setters behind a check: one that would take the request's head (headers, counted as wasi-http's field limit counts them, plus method, scheme, authority and path) past `MAX_HEAD` (64 KiB) is refused with the setter's WIT error. That is the head the node accepts from a client, so a request resource still holds at most 64 KiB and N-75's resource cap keeps the instance within its memory limit. Responses hold only a status code and request options only durations, so nothing else is guest-sized. After: all 264 sets refused, nothing held; an extension method, an 8 KiB path with 8 KiB of headers, a 60 KiB path alone and a 253-byte host are still taken.
 - **Status:** fixed on `cf/main-next`
 
+### N-692: held publishes kept the guest's whole request, headers and all
+- **Where:** `egress.rs` (`hold`, `EgressHooks::held`), `object.rs` (`commit`)
+- **Scenario:** found by the independent review of PR #1 (it predates the PR). A publish to `http://nanovm/publish/` is held in the worker until its request commits. `hold` bounded what a request holds by the publishes' bodies (`max_response_body_kb`), but kept each whole request: the guest's headers (up to N-75's 64 KiB a request), its URI and the request itself. Sent requests have left the resource table, so N-75's cap no longer counts them, and nothing else bounded them: 300 publishes of a 12-byte body with 60 KiB of headers held about 18 MB, past a 16 MiB object's memory; 5,461 empty-item publishes held 25 times their bodies. The supervisor reads none of it: it forwards a publish's body with the app it names and the object the worker names.
+- **Reproduced:** yes: `held_publishes_are_bounded_like_one_publish` (unit): 300 such publishes retained 18,524,700 bytes against an 8 MiB publish limit; 5,461 tiny ones 1,660,144 bytes against 64 KiB.
+- **Fix:** only the body is held, and the commit sends it as `POST http://nanovm/publish` named with the object's id (what `hold` used to add). `hold` checks the method and path the supervisor checks, answering 404 as it would (before, the guest was told 200 and the supervisor's 404 was dropped). Each held body counts its slot toward the limit too, under one lock. After: 13,200 bytes and 65,516 bytes (1,489 publishes).
+- **Status:** fixed on `cf/main-next`
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

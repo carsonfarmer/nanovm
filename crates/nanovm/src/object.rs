@@ -449,9 +449,9 @@ enum Exit {
 /// Makes the request's changes durable, then sends what it published (the
 /// changes stand whether or not a publish gets through).
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route) = acc.with(|mut s| {
+    let (quota, held, route, id) = acc.with(|mut s| {
         let s = s.data_mut();
-        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
+        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.shared.id.clone())
     });
     quota.commit()?;
     if let crate::egress::Route::Supervisor(up) = route
@@ -459,8 +459,13 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
     {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {
-            for req in held {
-                if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
+            for body in held {
+                // All a held publish is: its body, named with its object so
+                // it reaches only that object's sockets.
+                let req = http::Request::post(format!("http://{}/publish", crate::ws::PUBLISH_HOST));
+                let req = req.header(crate::ws::OBJECT_HEADER, &*id);
+                let req = req.body(Full::new(body).map_err(|e| match e {}).boxed_unsync()).expect("ids are header-safe");
+                if let Ok(res) = up.send(req).await {
                     let _ = res.into_body().collect().await;
                 }
             }

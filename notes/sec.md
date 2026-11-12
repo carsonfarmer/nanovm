@@ -73,8 +73,9 @@ OTLP traces decode:           1023 KiB -> peak 198 MiB (198x), 146-270 ms
 - Calls between objects (`Node::wait_for`): the cycle check and record are under
   the table lock; the caller's concurrency permit is taken after the record and
   released with it; bodies are capped.
-- Held publishes: bounded per request by `max_response_body_kb`; the object header
-  is replaced, not appended.
+- Held publishes: only their bodies are kept (the object is named when they are
+  sent), bounded together per request by `max_response_body_kb`, each counting
+  its slot (N-692; they used to keep the guest's headers too).
 - Guest headers: wasi-http strips `host`, `connection`, `transfer-encoding`,
   `upgrade` and the rest of its forbidden list from guest requests and
   responses, and refuses duplicate `content-length`; a body shorter or longer
