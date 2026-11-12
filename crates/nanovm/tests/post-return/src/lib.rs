@@ -2,19 +2,23 @@
 use std::cell::RefCell;
 
 use util::wasip3;
-use wasip3::http::types::{ErrorCode, Fields, Request, Response};
+use wasip3::http::types::{ErrorCode, Fields, Method, Request, Response};
 
 wasip3::http::service::export!(Probe);
 struct Probe;
 
 thread_local! {
     static HELD: RefCell<Vec<Fields>> = RefCell::default();
+    static REQUESTS: RefCell<Vec<(Request, usize)>> = RefCell::default();
 }
 
 impl wasip3::exports::http::handler::Guest for Probe {
     async fn handle(request: Request) -> Result<Response, ErrorCode> {
         if request.get_path_with_query().is_some_and(|p| p.starts_with("/headers")) {
             return headers(request);
+        }
+        if request.get_path_with_query().is_some_and(|p| p.starts_with("/strings")) {
+            return strings(request);
         }
         let req = util::read_req(request).await;
         if req.path == "/callee" {
@@ -56,4 +60,38 @@ fn headers(request: Request) -> Result<Response, ErrorCode> {
         HELD.with(|h| h.borrow_mut().push(held));
     }
     util::text(200, HELD.with(|h| h.borrow().len()).to_string())
+}
+
+/// `/strings?part=…&len=…&n=…&hlen=…`: makes `n` requests, each with an
+/// `hlen`-byte header and a `len`-byte `method`, `path` or `authority`
+/// (`part`), and holds those that took it, for good. Answers the bytes they
+/// hold in those parts and headers, and how many refused it.
+fn strings(request: Request) -> Result<Response, ErrorCode> {
+    let q = request.get_path_with_query().unwrap_or_default();
+    let arg = |k: &str| q.split(['?', '&']).find_map(|kv| kv.strip_prefix(k)?.strip_prefix('='));
+    let num = |k: &str| arg(k).and_then(|v| v.parse().ok()).unwrap_or(0usize);
+    let (part, len, n, hlen) = (arg("part").unwrap_or_default(), num("len"), num("n"), num("hlen"));
+    let fail = |e| ErrorCode::InternalError(Some(format!("{e:?}")));
+    let mut refused = 0;
+    for _ in 0..n {
+        let headers = Fields::new();
+        if hlen > 0 {
+            headers.append("x-held", &vec![b'x'; hlen]).map_err(fail)?;
+        }
+        let (trailers_tx, trailers_rx) = wasip3::wit_future::new(|| Ok(None));
+        drop(trailers_tx);
+        let (req, _) = Request::new(headers, None, trailers_rx, None);
+        let took = match part {
+            "method" => req.set_method(&Method::Other("X".repeat(len))),
+            "path" => req.set_path_with_query(Some(&format!("/{}", "p".repeat(len.max(1) - 1)))),
+            "authority" => req.set_authority(Some(&"a".repeat(len))),
+            _ => return util::text(400, "part"),
+        };
+        match took {
+            Ok(()) => REQUESTS.with(|r| r.borrow_mut().push((req, len + hlen))),
+            Err(()) => refused += 1,
+        }
+    }
+    let held: usize = REQUESTS.with(|r| r.borrow().iter().map(|(_, bytes)| bytes).sum());
+    util::text(200, format!("{held} {refused}"))
 }

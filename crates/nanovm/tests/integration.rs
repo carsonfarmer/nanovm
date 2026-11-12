@@ -3775,6 +3775,39 @@ async fn guest_header_maps_are_bounded_by_the_memory_limit() {
     assert_eq!(get("/e/headers?n=100&kb=60", 50 << 10).await, (200, "100".into()), "within the limits");
 }
 
+/// Nor does a method, authority or path a guest sets on its requests take
+/// what the host holds for them past its memory limit (N-691): a request's
+/// head (those, its scheme and its headers) is at most 64 KiB, as every head
+/// the node is sent, so a resource still holds at most that.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_request_heads_are_bounded_by_the_memory_limit() {
+    let mut app = app("hostile");
+    app.limits.memory_mb = 16;
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    let node = Node::new(node_cfg("guest_request_heads", 8), &app, &probe(), None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| nanovm::server::handle(node.clone(), req)));
+    let get = async |path: &str| raw(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), b"").await;
+    // Each is more than 16 MiB: 32 methods or authorities of 1 MiB, or 200
+    // paths of 60 KiB beside 60 KiB of headers.
+    for (path, n) in [("/a/strings?part=method&len=1048576&n=32", 32), ("/b/strings?part=authority&len=1048576&n=32", 32),
+        ("/c/strings?part=path&len=61440&hlen=61440&n=200", 200)] {
+        let (status, body) = get(path).await;
+        let counts = body.split_once(' ').and_then(|(h, r)| Some((h.parse::<usize>().ok()?, r.parse::<usize>().ok()?)));
+        let (held, refused) = counts.unwrap_or_else(|| panic!("{path}: {status} {body}"));
+        assert!(status == 200 && held <= 16 << 20, "{path}: the host holds {held} bytes of them");
+        assert_eq!(refused, n, "{path}");
+    }
+    // Real ones fit: an extension method, an 8 KiB path with 8 KiB of
+    // headers, a 60 KiB path alone, the longest host name.
+    for (path, held) in [("/d/strings?part=method&len=20&n=10", 200), ("/e/strings?part=path&len=8192&hlen=8192&n=10", 163840),
+        ("/f/strings?part=path&len=61440&n=10", 614400), ("/g/strings?part=authority&len=253&n=10", 2530)] {
+        assert_eq!(get(path).await, (200, format!("{held} 0")), "{path}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn post_return_work_keeps_context_and_reports_commit_failure() {
     use http_body_util::BodyExt;
