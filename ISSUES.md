@@ -328,7 +328,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `journal.rs` (`creating`, `removing_dir`, `renaming`, `recover`)
 - **Scenario:** found by the second hostile guest (D-58). A guest reaches any depth by opening each directory from its parent's descriptor; the journal names entries by absolute path. Creating a directory whose path reaches PATH_MAX (16 levels of 255-byte names under a 72-byte volume path) was recorded, made, then failed the commit (`File name too long`) and every later recovery: the object answered 503 `instantiate-failed` for good. A directory renamed under a deep one could also move what is under it out of the journal's reach.
 - **Reproduced:** yes (`/deep` on `ideas/hostile2`: depths 12-15 commit and roll back; 16-20 brick the object).
-- **Fix (one class with N-502, N-503):** `creating` and `removing_dir` record only when `symlink_metadata` says NotFound (or, for `removing_dir`, a directory); any other error is returned, so the guest gets the error the syscall would give (`not-directory`, `name-too-long`) and nothing is recorded. Returning rather than recording nothing: for a whole path too long for the journal but not for the guest's descriptor, the create would succeed out of the journal's reach. `renaming` refuses a move that would put anything under it at PATH_MAX or more (walking a moved directory, at most `max_files` entries). Recovery treats path-shape errors (NotFound, NotADirectory, ENAMETOOLONG, and ELOOP) as "nothing there" for every record, repairing logs already written; real I/O errors stay fatal.
+- **Fix (one class with N-502, N-503):** `creating` and `removing_dir` record only when `symlink_metadata` says NotFound (or, for `removing_dir`, a directory); any other error is returned, so the guest gets the error the syscall would give (`not-directory`, `name-too-long`) and nothing is recorded. Returning rather than recording nothing: for a whole path too long for the journal but not for the guest's descriptor, the create would succeed out of the journal's reach. `renaming` refuses a move that would put anything under it at PATH_MAX or more (walking a moved directory, at most `max_files` entries). Recovery treats path-shape errors (NotFound, NotADirectory, ENAMETOOLONG, and ELOOP) as "nothing there" for every record, repairing logs already written; real I/O errors stay fatal (since N-690, ENAMETOOLONG only for a name past NAME_MAX: recovery reaches entries through descriptors).
 - **Status:** fixed on `ideas/recover-class`
 
 
@@ -374,6 +374,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** by reading: `Dur::Default` timeouts are dropped without a timer (`hyper::common::time::Time::check`). Not run.
 - **Suggestion:** set a header timeout at the node longer than the proxy's pool idle timeout (hyper-util's 90 s default), or the node would close idle pooled connections as the proxy reuses them; or lower the proxy's pool idle timeout below the node's.
 - **Status:** open
+
+### N-690: recovery dropped the undo of a real entry whose whole path is past PATH_MAX
+- **Where:** `journal.rs` (`recover`)
+- **Scenario:** found by the independent review of PR #1 (a regression from N-504). Recovery took ENAMETOOLONG as "nothing there" for every record. But a log written by the binary before N-504, in the same encoding, can name a real entry whose whole path is past PATH_MAX while each of its names fits: `creating` then recorded `Created` on any error, and the guest made the entry through its parent's descriptor. Recovery skipped the record, truncated the log and kept the uncommitted entry, so the failed request's changes were partly kept; the recovery before N-504 failed closed. A base an operator moved deeper turns any record into such a path.
+- **Reproduced:** yes: `long_paths_in_old_logs_are_undone` (every record kind, 200-byte names in a directory whose own path is 3,996 bytes, the changes made through its descriptor): recovery succeeded and kept all seven changes.
+- **Fix:** recovery reaches each entry through its parent's descriptor, opened one name at a time from the base (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and undoes and syncs it relative to that parent (`fstatat`, `unlinkat`, `mkdirat`, `renameat`, `openat`). ENAMETOOLONG then only means a name past NAME_MAX, which nothing can have. N-502..N-504's tests pass unchanged, and new writes still refuse paths at PATH_MAX.
+- **Status:** fixed on `cf/main-next`
 
 ## Planned work
 
