@@ -9,6 +9,9 @@
 //! bundles attached as referrers (GitHub artifact attestations are), signed
 //! over the manifest digest, which in turn pins every blob.
 //!
+//! `nanovm publish` pushes an app with [`Oci::push_app`], on the developer's
+//! machine.
+//!
 //! An app's data belongs to its repository: every version of it, whoever
 //! signed it, sees the same volumes. Only those who can push to a repository
 //! can put a signed artifact in it, so naming another identity's app can
@@ -37,6 +40,7 @@ pub const WASM_TYPE: &str = "application/wasm";
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const BUNDLE_TYPE: &str = "application/vnd.dev.sigstore.bundle.v0.3+json";
+const OCTETS: &str = "application/octet-stream";
 
 /// The fields of an OCI manifest the node reads.
 #[derive(Deserialize)]
@@ -342,9 +346,10 @@ impl Registry {
     }
 }
 
-/// Anonymous reads from OCI registries, each bounded in size. Registries are
-/// named by whoever deploys an app, so none of them may be on a private
-/// address, unless `dev`: then loopback ones are spoken to over plain HTTP.
+/// Anonymous reads from OCI registries, each bounded in size, and pushes
+/// (`nanovm publish`). Registries are named by whoever deploys an app, so
+/// none of them may be on a private address, unless `dev`: then loopback
+/// ones are spoken to over plain HTTP.
 pub struct Oci {
     http: reqwest::Client,
     dev: bool,
@@ -352,20 +357,33 @@ pub struct Oci {
 
 impl Oci {
     pub fn new(dev: bool) -> anyhow::Result<Oci> {
+        Oci::build(dev, false, Duration::from_secs(30))
+    }
+
+    /// For `nanovm publish`, a developer pushing to a registry they chose: at
+    /// any address, through their proxy if they have one, loopback over plain
+    /// HTTP. A request's read timeout runs from its start, so it allows for
+    /// uploading a component over a slow link.
+    pub fn publisher() -> anyhow::Result<Oci> {
+        Oci::build(true, true, Duration::from_secs(600))
+    }
+
+    fn build(dev: bool, proxy: bool, read_timeout: Duration) -> anyhow::Result<Oci> {
         let redirect = reqwest::redirect::Policy::custom(move |a| match a.url().host_str() {
             _ if a.previous().len() > 5 => a.error("too many redirects"),
             Some(h) if allowed(h, dev) => a.follow(),
             _ => a.error("a redirect to a private address"),
         });
-        let http = reqwest::Client::builder()
-            // A forward proxy would resolve names itself, past `PublicOnly`.
-            .no_proxy()
+        let mut http = reqwest::Client::builder()
             .dns_resolver(Arc::new(PublicOnly(dev)))
             .redirect(redirect)
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
-            .build()?;
-        Ok(Oci { http, dev })
+            .read_timeout(read_timeout);
+        if !proxy {
+            // A forward proxy would resolve names itself, past `PublicOnly`.
+            http = http.no_proxy();
+        }
+        Ok(Oci { http: http.build()?, dev })
     }
 
     /// `GET /v2/<repository>/<kind>/<what>`, at most `max` bytes of it;
@@ -386,42 +404,186 @@ impl Oci {
         Ok(format!("sha256:{:x}", Sha256::digest(manifest.context("no such tag")?)))
     }
 
-    async fn send(&self, r: &Reference, kind: &str, what: &str, accept: &str) -> anyhow::Result<reqwest::Response> {
+    /// `https://<registry>/v2/<path>`, if the registry may be spoken to.
+    fn url(&self, r: &Reference, path: &str) -> anyhow::Result<reqwest::Url> {
         let host = r.resolve_registry();
-        let mut url = reqwest::Url::parse(&format!("https://{host}/v2/{}/{kind}/{what}", r.repository()))?;
+        let mut url = reqwest::Url::parse(&format!("https://{host}/v2/{path}"))?;
         // Checked as parsed, which is how it will be connected to: `127.1`
         // is 127.0.0.1 by then.
         ensure!(url.host_str().is_some_and(|h| allowed(h, self.dev)), "registry {host} is on a private address");
         if self.dev && url.host_str().is_some_and(loopback) {
             url.set_scheme("http").expect("http is a valid scheme");
         }
+        Ok(url)
+    }
+
+    async fn send(&self, r: &Reference, kind: &str, what: &str, accept: &str) -> anyhow::Result<reqwest::Response> {
+        let url = self.url(r, &format!("{}/{kind}/{what}", r.repository()))?;
         let req = || self.http.get(url.clone()).header(http::header::ACCEPT, accept);
         let res = req().send().await?;
         if res.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(res);
         }
         let challenge = res.headers().get(http::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok());
-        let token = self.token(challenge.context("401 without a challenge")?).await?;
+        let token = self.token(challenge.context("401 without a challenge")?, None).await?;
         Ok(req().bearer_auth(token).send().await?)
     }
 
-    /// An anonymous token for a `Bearer realm="…",service="…",scope="…"`
-    /// challenge.
-    async fn token(&self, challenge: &str) -> anyhow::Result<String> {
+    /// A token for a `Bearer realm="…",service="…",scope="…"` challenge:
+    /// anonymous and for its scope, or for a push's own scope and login.
+    async fn token(&self, challenge: &str, push: Option<(&str, Option<&Login>)>) -> anyhow::Result<String> {
         let params = challenge.strip_prefix("Bearer ").context("not a bearer challenge")?;
-        let params: HashMap<_, _> = params
+        let mut params: HashMap<_, _> = params
             .split("\",")
             .filter_map(|kv| kv.trim().split_once('='))
             .map(|(k, v)| (k, v.trim_matches('"')))
             .collect();
         let realm = reqwest::Url::parse(params.get("realm").context("no realm")?)?;
         ensure!(realm.host_str().is_some_and(|h| allowed(h, self.dev)), "token realm on a private address");
+        let mut req = self.http.get(realm.clone());
+        if let Some((scope, login)) = push {
+            params.insert("scope", scope);
+            if let Some((user, password)) = login {
+                ensure!(realm.scheme() == "https" || realm.host_str().is_some_and(loopback), "credentials for {realm}");
+                req = req.basic_auth(user, Some(password));
+            }
+        }
         let query = ["service", "scope"].into_iter().filter_map(|k| Some((k, *params.get(k)?)));
-        let res = self.http.get(realm).query(&query.collect::<Vec<_>>()).send().await?.error_for_status()?;
+        let res = req.query(&query.collect::<Vec<_>>()).send().await?;
+        let res = if push.is_some() { ok(res).await? } else { res.error_for_status()? };
         let v: serde_json::Value = serde_json::from_slice(&read(res, MAX_METADATA).await?)?;
         let token = v.get("token").or_else(|| v.get("access_token")).and_then(|t| t.as_str());
         Ok(token.context("no token")?.to_string())
     }
+
+    /// Pushes an app as [`Registry::load`] reads it, under `r`'s tag: `spec`
+    /// as its config, `component` as its one layer, at `version`. Returns
+    /// the manifest's digest. Blobs the repository has are not sent again.
+    pub async fn push_app(
+        &self,
+        r: &Reference,
+        login: Option<&Login>,
+        spec: Vec<u8>,
+        component: Vec<u8>,
+        version: &semver::Version,
+    ) -> anyhow::Result<String> {
+        let tag = r.tag().context("no tag to push to")?;
+        let push = Push::new(self, r, login).await?;
+        let descriptor = |media_type: &str, (digest, size): (String, usize)| {
+            serde_json::json!({ "mediaType": media_type, "digest": digest, "size": size })
+        };
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MANIFEST_TYPE,
+            "artifactType": APP_TYPE,
+            "config": descriptor(CONFIG_TYPE, push.blob(spec).await?),
+            "layers": [descriptor(WASM_TYPE, push.blob(component).await?)],
+            "annotations": { VERSION: version.to_string() },
+        });
+        push.manifest(tag, serde_json::to_vec(&manifest)?).await
+    }
+}
+
+/// A user and a password or token, for a registry that asks.
+pub type Login = (String, String);
+
+/// A push to one repository, with what its registry authenticates.
+struct Push<'a> {
+    oci: &'a Oci,
+    r: &'a Reference,
+    /// `/v2/` on the registry: only its origin is sent `auth`.
+    registry: reqwest::Url,
+    auth: Option<http::HeaderValue>,
+}
+
+impl<'a> Push<'a> {
+    /// Authenticates as `r`'s registry asks (at `/v2/`), if it does: with a
+    /// token for `repository:<name>:pull,push`, for `login` if given; or, if
+    /// it asks for Basic credentials, with `login` itself.
+    async fn new(oci: &'a Oci, r: &'a Reference, login: Option<&Login>) -> anyhow::Result<Push<'a>> {
+        let registry = oci.url(r, "")?;
+        let res = oci.http.get(registry.clone()).send().await?;
+        let mut push = Push { oci, r, registry, auth: None };
+        if res.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(push);
+        }
+        let challenge = res.headers().get(http::header::WWW_AUTHENTICATE).and_then(|v| v.to_str().ok());
+        let challenge = challenge.context("401 without a challenge")?;
+        let auth = if challenge.starts_with("Basic") {
+            use base64::Engine;
+            let (user, password) = login.context("the registry asks for credentials")?;
+            format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}")))
+        } else {
+            let scope = format!("repository:{}:pull,push", r.repository());
+            format!("Bearer {}", oci.token(challenge, Some((&scope, login))).await?)
+        };
+        let mut auth = http::HeaderValue::try_from(auth)?;
+        auth.set_sensitive(true);
+        push.auth = Some(auth);
+        Ok(push)
+    }
+
+    /// Uploads `bytes` unless the repository has them, in one request (a
+    /// PATCH, as `docker push` sends them); their digest and size.
+    async fn blob(&self, bytes: Vec<u8>) -> anyhow::Result<(String, usize)> {
+        let (digest, size) = (format!("sha256:{:x}", Sha256::digest(&bytes)), bytes.len());
+        let repo = self.r.repository();
+        let head = self.send(reqwest::Method::HEAD, self.oci.url(self.r, &format!("{repo}/blobs/{digest}"))?, None).await?;
+        if head.status() == reqwest::StatusCode::OK {
+            return Ok((digest, size));
+        }
+        let uploads = self.oci.url(self.r, &format!("{repo}/blobs/uploads/"))?;
+        let at = self.location(self.send(reqwest::Method::POST, uploads, Some((OCTETS, vec![]))).await?).await?;
+        let mut at = self.location(self.send(reqwest::Method::PATCH, at, Some((OCTETS, bytes))).await?).await?;
+        at.query_pairs_mut().append_pair("digest", &digest);
+        ok(self.send(reqwest::Method::PUT, at, Some((OCTETS, vec![]))).await?).await?;
+        Ok((digest, size))
+    }
+
+    /// Puts `manifest` under `tag`; its digest.
+    async fn manifest(&self, tag: &str, manifest: Vec<u8>) -> anyhow::Result<String> {
+        let digest = format!("sha256:{:x}", Sha256::digest(&manifest));
+        let url = self.oci.url(self.r, &format!("{}/manifests/{tag}", self.r.repository()))?;
+        let res = ok(self.send(reqwest::Method::PUT, url, Some((MANIFEST_TYPE, manifest))).await?).await?;
+        let stored = res.headers().get("docker-content-digest").map(|d| d.to_str()).transpose()?;
+        ensure!(stored.is_none_or(|d| d == digest), "the registry stored {stored:?}, not {digest}");
+        Ok(digest)
+    }
+
+    /// Where an upload goes on: `res`'s `Location`, relative to its URL.
+    async fn location(&self, res: reqwest::Response) -> anyhow::Result<reqwest::Url> {
+        let res = ok(res).await?;
+        let to = res.headers().get(http::header::LOCATION).context("an upload without a Location")?;
+        let url = res.url().join(to.to_str()?)?;
+        ensure!(url.host_str().is_some_and(|h| allowed(h, self.oci.dev)), "an upload to a private address");
+        Ok(url)
+    }
+
+    async fn send(&self, method: reqwest::Method, url: reqwest::Url, body: Option<(&str, Vec<u8>)>)
+    -> anyhow::Result<reqwest::Response> {
+        let mut req = self.oci.http.request(method, url.clone());
+        if let Some(auth) = self.auth.clone().filter(|_| url.origin() == self.registry.origin()) {
+            req = req.header(http::header::AUTHORIZATION, auth);
+        }
+        if let Some((media_type, body)) = body {
+            req = req.header(http::header::CONTENT_TYPE, media_type).header(http::header::CONTENT_LENGTH, body.len());
+            req = req.body(body);
+        }
+        Ok(req.send().await?)
+    }
+}
+
+/// `res` if it succeeded; else an error with the start of its body.
+async fn ok(mut res: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+    if res.status().is_success() {
+        return Ok(res);
+    }
+    let (status, mut url, mut body) = (res.status(), res.url().clone(), Vec::new());
+    while body.len() < 1024 && let Some(chunk) = res.chunk().await? {
+        body.extend_from_slice(&chunk);
+    }
+    url.set_query(None);
+    bail!("{url}: {status}: {}", String::from_utf8_lossy(&body[..body.len().min(1024)]).trim())
 }
 
 /// A response's body, if it is at most `max` bytes.
@@ -651,5 +813,188 @@ mod tests {
         }
         assert!(loopback("localhost") && loopback("127.0.0.2") && loopback("[::1]"));
         assert!(!loopback("ghcr.io") && !loopback("10.0.0.1"));
+    }
+
+    use crate::object::RespBody;
+    use http_body_util::BodyExt;
+
+    /// What a scripted registry heard: `METHOD host/path?query authorization
+    /// content-type`, and the body.
+    type Heard = Arc<parking_lot::Mutex<Vec<(String, bytes::Bytes)>>>;
+
+    /// A registry on loopback answering `(method, path?query, its port)`.
+    async fn scripted(answer: fn(&str, &str, u16) -> http::Response<RespBody>) -> (u16, Heard) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let heard = Heard::default();
+        let h = heard.clone();
+        tokio::spawn(crate::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| {
+            let h = h.clone();
+            async move {
+                let header = |k| req.headers().get(k).map_or("-", |v| v.to_str().unwrap()).to_string();
+                let (method, path) = (req.method().to_string(), req.uri().path_and_query().unwrap().to_string());
+                let line = [&method, &(header(http::header::HOST) + &path), &header(http::header::AUTHORIZATION),
+                    &header(http::header::CONTENT_TYPE)].map(|s| s.as_str()).join(" ");
+                let body = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+                h.lock().push((line, body));
+                answer(&method, &path, port)
+            }
+        }));
+        (port, heard)
+    }
+
+    fn answer(status: u16, headers: &[(&str, &str)], body: RespBody) -> http::Response<RespBody> {
+        let mut res = http::Response::builder().status(status);
+        for (k, v) in headers {
+            res = res.header(*k, *v);
+        }
+        res.body(body).unwrap()
+    }
+
+    fn full(b: &'static str) -> RespBody {
+        http_body_util::Full::new(bytes::Bytes::from_static(b.as_bytes())).map_err(|e| match e {}).boxed_unsync()
+    }
+
+    /// A body without end, at about 16 MiB/s: reading all of it times out
+    /// well before it fills memory.
+    fn endless() -> RespBody {
+        let chunk = async |()| {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            Some((Ok::<_, crate::object::BoxError>(http_body::Frame::data(bytes::Bytes::from_static(&[b'x'; 1 << 14]))), ()))
+        };
+        http_body_util::StreamBody::new(futures::stream::unfold((), chunk)).boxed_unsync()
+    }
+
+    fn sha256(b: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(b))
+    }
+
+    /// A push asks the registry how to authenticate, trades the login for a
+    /// token scoped to push to the repository, skips the blob it has,
+    /// follows each upload's `Location` (a path, then a URL elsewhere, where
+    /// no credentials go), finishes it with the digest, then puts the
+    /// manifest a node reads, returning its digest.
+    #[tokio::test]
+    async fn pushes_follow_the_distribution_protocol() {
+        fn registry(method: &str, path: &str, port: u16) -> http::Response<RespBody> {
+            let realm = format!("Bearer realm=\"http://127.0.0.1:{port}/token\",service=\"reg\",scope=\"repository:acme/app:pull\"");
+            let elsewhere = format!("http://localhost:{port}/elsewhere/1?state=b");
+            match (method, path) {
+                ("GET", "/v2/") => answer(401, &[("www-authenticate", &realm)], full("")),
+                ("GET", p) if p.starts_with("/token?") => answer(200, &[], full(r#"{"token":"T"}"#)),
+                ("HEAD", p) => answer(if p.ends_with(&sha256(b"{}")) { 200 } else { 404 }, &[], full("")),
+                ("POST", "/v2/acme/app/blobs/uploads/") => answer(202, &[("location", "/v2/acme/app/blobs/uploads/1?state=a")], full("")),
+                ("PATCH", "/v2/acme/app/blobs/uploads/1?state=a") => answer(202, &[("location", &elsewhere)], full("")),
+                ("PUT", p) if p.starts_with("/elsewhere/1?state=b&digest=") => answer(201, &[], full("")),
+                ("PUT", "/v2/acme/app/manifests/1.2.3") => answer(201, &[], full("")),
+                _ => answer(400, &[], full("unexpected")),
+            }
+        }
+        let (port, heard) = scripted(registry).await;
+        let r: Reference = format!("127.0.0.1:{port}/acme/app:1.2.3").parse().unwrap();
+        let (login, component) = (("me".to_string(), "secret".to_string()), b"\0asm, say".to_vec());
+        let oci = Oci::new(true).unwrap();
+        let digest = oci.push_app(&r, Some(&login), b"{}".to_vec(), component.clone(), &"1.2.3".parse().unwrap()).await.unwrap();
+
+        let (at, spec, layer) = (format!("127.0.0.1:{port}"), sha256(b"{}"), sha256(&component));
+        let heard = heard.lock().clone();
+        let lines: Vec<_> = heard.iter().map(|(line, _)| line.as_str()).collect();
+        assert_eq!(lines, [
+            format!("GET {at}/v2/ - -"),
+            format!("GET {at}/token?service=reg&scope=repository%3Aacme%2Fapp%3Apull%2Cpush Basic bWU6c2VjcmV0 -"),
+            format!("HEAD {at}/v2/acme/app/blobs/{spec} Bearer T -"),
+            format!("HEAD {at}/v2/acme/app/blobs/{layer} Bearer T -"),
+            format!("POST {at}/v2/acme/app/blobs/uploads/ Bearer T {OCTETS}"),
+            format!("PATCH {at}/v2/acme/app/blobs/uploads/1?state=a Bearer T {OCTETS}"),
+            format!("PUT localhost:{port}/elsewhere/1?state=b&digest={} - {OCTETS}", layer.replace(':', "%3A")),
+            format!("PUT {at}/v2/acme/app/manifests/1.2.3 Bearer T {MANIFEST_TYPE}"),
+        ]);
+        assert!(heard[4].1.is_empty() && heard[6].1.is_empty());
+        assert_eq!(heard[5].1, component, "the component, in one request");
+        let manifest = &heard[7].1;
+        assert_eq!(digest, sha256(manifest));
+        let v: serde_json::Value = serde_json::from_slice(manifest).unwrap();
+        assert_eq!((v["schemaVersion"].as_u64(), v["mediaType"].as_str()), (Some(2), Some(MANIFEST_TYPE)));
+        let m: Manifest = serde_json::from_slice(manifest).unwrap();
+        assert_eq!(m.artifact_type.as_deref(), Some(APP_TYPE));
+        assert_eq!((m.config.media_type.as_str(), m.config.digest.as_str(), m.config.size), (CONFIG_TYPE, spec.as_str(), 2));
+        let [l] = &m.layers[..] else { panic!("{v}") };
+        assert_eq!((l.media_type.as_str(), l.digest.as_str(), l.size), (WASM_TYPE, layer.as_str(), component.len() as u64));
+        assert_eq!(m.annotations[VERSION], "1.2.3");
+    }
+
+    /// A registry that asks for Basic credentials gets the login itself, and
+    /// a push without one stops there; one that asks for none gets none. A
+    /// registry that stored the manifest under another digest is an error.
+    #[tokio::test]
+    async fn pushes_send_credentials_only_as_asked() {
+        fn basic(method: &str, path: &str, _: u16) -> http::Response<RespBody> {
+            match (method, path) {
+                ("GET", "/v2/") => answer(401, &[("www-authenticate", "Basic realm=\"reg\"")], full("")),
+                ("HEAD", _) => answer(200, &[], full("")),
+                ("PUT", "/v2/acme/app/manifests/1.0.0") => answer(201, &[], full("")),
+                _ => answer(400, &[], full("unexpected")),
+            }
+        }
+        fn open(method: &str, path: &str, _: u16) -> http::Response<RespBody> {
+            let other = [("docker-content-digest", "sha256:0000000000000000000000000000000000000000000000000000000000000000")];
+            match (method, path) {
+                ("GET", "/v2/") | ("HEAD", _) => answer(200, &[], full("")),
+                ("PUT", "/v2/acme/app/manifests/1.0.0") => answer(201, &[], full("")),
+                ("PUT", "/v2/acme/app/manifests/2.0.0") => answer(201, &other, full("")),
+                _ => answer(400, &[], full("unexpected")),
+            }
+        }
+        let oci = Oci::new(true).unwrap();
+        let login = ("me".to_string(), "secret".to_string());
+        let push = async |port: u16, tag: &str, login| {
+            let r = format!("127.0.0.1:{port}/acme/app:{tag}").parse().unwrap();
+            oci.push_app(&r, login, b"{}".to_vec(), vec![0], &semver::Version::new(1, 0, 0)).await.map_err(|e| format!("{e:#}"))
+        };
+        let lines = |heard: &Heard| heard.lock().drain(..).map(|(line, _)| line).collect::<Vec<_>>();
+
+        let (port, heard) = scripted(basic).await;
+        let e = push(port, "1.0.0", None).await.unwrap_err();
+        assert!(e.contains("asks for credentials"), "{e}");
+        assert_eq!(lines(&heard), [format!("GET 127.0.0.1:{port}/v2/ - -")]);
+        push(port, "1.0.0", Some(&login)).await.unwrap();
+        let heard = lines(&heard);
+        assert_eq!(heard.len(), 4, "{heard:?}");
+        assert!(heard[1..].iter().all(|l| l.contains(" Basic bWU6c2VjcmV0 ")), "{heard:?}");
+
+        let (port, heard) = scripted(open).await;
+        push(port, "1.0.0", Some(&login)).await.unwrap();
+        let heard = lines(&heard);
+        assert!(heard.len() == 4 && heard.iter().all(|l| l.split(' ').nth(2) == Some("-")), "{heard:?}");
+        let e = push(port, "2.0.0", None).await.unwrap_err();
+        assert!(e.contains("the registry stored"), "{e}");
+    }
+
+    /// What a push reads of a registry's answers is bounded however much it
+    /// sends: a token at most `MAX_METADATA`, an error only its first KiB.
+    #[tokio::test]
+    async fn push_reads_are_bounded() {
+        fn registry(method: &str, path: &str, port: u16) -> http::Response<RespBody> {
+            let realm = format!("Bearer realm=\"http://127.0.0.1:{port}/token\"");
+            match (method, path) {
+                ("GET", "/v2/") => answer(401, &[("www-authenticate", &realm)], full("")),
+                ("GET", p) if p.contains("big%2Ftoken") => answer(200, &[], endless()),
+                ("GET", _) => answer(200, &[], full(r#"{"token":"T"}"#)),
+                ("HEAD", _) => answer(404, &[], full("")),
+                _ => answer(500, &[], endless()),
+            }
+        }
+        let (port, _) = scripted(registry).await;
+        let oci = Oci::new(true).unwrap();
+        let push = async |repo: &str| {
+            let r = format!("127.0.0.1:{port}/{repo}:1.0.0").parse().unwrap();
+            let version = semver::Version::new(1, 0, 0);
+            let push = oci.push_app(&r, None, b"{}".to_vec(), vec![0], &version);
+            format!("{:#}", tokio::time::timeout(Duration::from_secs(5), push).await.expect("bounded").unwrap_err())
+        };
+        let e = push("big/token").await;
+        assert!(e.contains(&format!("over {MAX_METADATA} bytes")), "{e}");
+        let e = push("big/error").await;
+        assert!(e.contains("/v2/big/error/blobs/uploads/: 500 Internal Server Error: xxx") && e.len() < 1200, "{e}");
     }
 }
