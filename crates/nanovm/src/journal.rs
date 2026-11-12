@@ -31,12 +31,15 @@
 //! keeps at most `KEEP` bytes.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
 
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, mkdirat, openat, renameat_with, statat, unlinkat};
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
 use crate::{committed, config::CaptureConfig, metrics::thread_cpu_ns, object::ObjShared};
@@ -633,38 +636,34 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
     // here resumes where it stopped; the undo it was in may run twice, which
     // each tolerates. A record cut short by a crash was never acted on.
     for (at, undo) in undos.into_iter().rev() {
-        let abs = |p: &PathBuf| base.join(p);
-        let open = |p: &PathBuf| File::options().write(true).open(abs(p));
-        // Recovery also takes a symlink loop (only made from outside) as nothing there.
-        let shape = |e: &std::io::Error| no_entry(e) || e.raw_os_error() == Some(libc::ELOOP);
-        let there = |p: &PathBuf| match std::fs::symlink_metadata(abs(p)) {
-            Err(e) if shape(&e) => Ok(None),
-            md => md.map(Some),
+        let open = |p: &Path| -> std::io::Result<File> {
+            let (dir, name) = parent_at(base, p)?;
+            Ok(openat(&dir, name, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?.into())
         };
         match &undo {
             Undo::Size(p, n) => open(p).and_then(|f| f.set_len(*n)),
             Undo::Bytes(p, at, data) => open(p).and_then(|f| f.write_all_at(data, *at)),
-            Undo::Created(p) => match there(p)? {
-                Some(md) if md.is_dir() => std::fs::remove_dir(abs(p)),
-                Some(_) => std::fs::remove_file(abs(p)),
+            Undo::Created(p) => parent_at(base, p).and_then(|(dir, name)| match is_dir_at(&dir, name)? {
+                Some(true) => Ok(unlinkat(&dir, name, AtFlags::REMOVEDIR)?),
+                Some(false) => Ok(unlinkat(&dir, name, AtFlags::empty())?),
                 None => Ok(()),
-            },
-            Undo::RemovedDir(p) => std::fs::create_dir(abs(p)).or_else(|e| {
-                if e.kind() == ErrorKind::AlreadyExists && std::fs::symlink_metadata(abs(p))?.is_dir() {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
             }),
-            Undo::Renamed(from, to) => {
+            Undo::RemovedDir(p) => parent_at(base, p).and_then(|(dir, name)| match mkdirat(&dir, name, 0o777.into()) {
+                Err(e) if e == Errno::EXIST && is_dir_at(&dir, name)? == Some(true) => Ok(()),
+                made => Ok(made?),
+            }),
+            Undo::Renamed(from, to) => (|| {
                 // The source is present after an earlier replay or a failed
                 // syscall. Both may be absent for a discarded new file.
-                if there(from)?.is_some() || there(to)?.is_none() {
-                    Ok(())
-                } else {
-                    std::fs::rename(abs(to), abs(from))
+                let (a, x) = parent_at(base, from)?;
+                if is_dir_at(&a, x)?.is_none() {
+                    let (b, y) = parent_at(base, to)?;
+                    if is_dir_at(&b, y)?.is_some() {
+                        renameat_with(&b, y, &a, x, RenameFlags::empty())?;
+                    }
                 }
-            }
+                Ok(())
+            })(),
             Undo::Cancelled => Ok(()),
         }
         // A path that can't name an entry has nothing to undo (N-502, N-503).
@@ -674,11 +673,11 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
             Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
             Undo::Cancelled => Path::new(""),
         };
-        sync_if_there(&base.join(p))?;
+        sync_at(base, p)?;
         if let Undo::Renamed(_, to) = &undo {
             // A cross-directory rename changes both parents. Persist both
             // before dropping its undo, including when replay runs twice.
-            sync_if_there(&base.join(to.parent().unwrap_or(Path::new(""))))?;
+            sync_at(base, to.parent().unwrap_or(Path::new("")))?;
         }
         #[cfg(test)]
         tests::crash_point()?;
@@ -690,6 +689,57 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
     file.set_len(file.metadata()?.len().min(KEEP))?;
     clear(dir)?;
     Ok(Some(key))
+}
+
+/// The directory holding `p` (relative to `base`), opened one name at a
+/// time and never through a symlink, and `p`'s name in it. Recovery reaches
+/// entries so: a log written before N-504 can name a real entry whose whole
+/// path is past PATH_MAX, made through a guest's descriptor, while each of
+/// its names fits. Only a name past NAME_MAX is then too long, and nothing
+/// can have one (N-690).
+fn parent_at<'a>(base: &Path, p: &'a Path) -> std::io::Result<(File, &'a OsStr)> {
+    let name = p.file_name().ok_or(ErrorKind::InvalidInput)?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // `openat` and `renameat2`: on x86_64 rustix's `open` is SYS_open, and
+    // on aarch64 its `renameat` is SYS_renameat, neither in the jail's list.
+    let mut dir = openat(CWD, base, flags, Mode::empty())?;
+    for c in p.parent().expect("named").components() {
+        let Component::Normal(c) = c else { return Err(ErrorKind::InvalidInput.into()) };
+        dir = openat(&dir, c, flags | OFlags::NOFOLLOW, Mode::empty())?;
+    }
+    Ok((dir.into(), name))
+}
+
+/// Whether `name` in `dir` is a directory; `None` if nothing can be there.
+fn is_dir_at(dir: &File, name: &OsStr) -> std::io::Result<Option<bool>> {
+    match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from) {
+        Ok(st) => Ok(Some(FileType::from_raw_mode(st.st_mode).is_dir())),
+        Err(e) if shape(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Syncs `p` (relative to `base`, reached as by [`parent_at`]; `""` is the
+/// base) unless nothing can be there.
+fn sync_at(base: &Path, p: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::sync_point()?;
+    let file = match p.file_name() {
+        None => File::open(base),
+        Some(_) => parent_at(base, p).and_then(|(dir, name)| {
+            Ok(openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?.into())
+        }),
+    };
+    match file {
+        Err(e) if shape(&e) => Ok(()),
+        file => file?.sync_all(),
+    }
+}
+
+/// Whether recovery has nothing to undo at a path: [`no_entry`], or a
+/// symlink (only made from outside), which recovery never follows.
+fn shape(e: &std::io::Error) -> bool {
+    no_entry(e) || e.raw_os_error() == Some(libc::ELOOP)
 }
 
 /// A key no guest can guess.
@@ -1747,6 +1797,63 @@ mod tests {
         drop(j);
         reopen(&v, 1 << 30).expect("recovery succeeds");
         assert_eq!(tree(&v), before);
+    }
+
+    /// A log written before N-504 (its records made here through `record`,
+    /// in this log's format) can name a real entry whose whole path is past
+    /// PATH_MAX while each name fits: the guest made it through a
+    /// directory's descriptor. Recovery undoes it
+    /// through descriptors, for every kind of record, rather than taking it
+    /// for nothing there and dropping the undo (N-690).
+    #[test]
+    fn long_paths_in_old_logs_are_undone() {
+        use rustix::fs::renameat;
+        use std::os::fd::AsRawFd;
+        let v = volume();
+        // A directory whose own path fits, holding 200-byte names that don't.
+        let mut deep = v.clone();
+        while deep.as_os_str().len() < libc::PATH_MAX as usize - 100 {
+            let room = libc::PATH_MAX as usize - 100 - deep.as_os_str().len();
+            deep.push("c".repeat(room.clamp(2, 256) - 1));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let dir = File::open(&deep).unwrap();
+        let name = |c: &str| c.repeat(200);
+        let write = |c: &str, data: &[u8]| {
+            let f = openat(&dir, name(c), OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC, 0o644.into()).unwrap();
+            File::from(f).write_all_at(data, 0).unwrap();
+        };
+        write("f", b"hello world");
+        write("g", b"gee");
+        write("h", b"aitch");
+        mkdirat(&dir, name("e"), Mode::from(0o755)).unwrap();
+        // Short paths for the descriptor's directory and what is in it.
+        let listing = || tree(Path::new(&format!("/proc/self/fd/{}", dir.as_raw_fd())));
+        let before = listing();
+        let mut j = open(&v);
+        let rel = |c: &str| {
+            let p = deep.join(name(c));
+            assert!(p.as_os_str().len() >= libc::PATH_MAX as usize);
+            j.rel(&p)
+        };
+        // Each change as the journal before N-504 recorded it, then made by
+        // the guest through the directory's descriptor.
+        let undos = [Undo::Created(rel("n")), Undo::Created(rel("m")), Undo::Size(rel("f"), 11),
+            Undo::Bytes(rel("f"), 0, b"hello world".to_vec()), Undo::RemovedDir(rel("e")),
+            Undo::Renamed(rel("g"), j.rel(&j.dir.join("1"))), Undo::Renamed(rel("h"), rel("i"))];
+        for undo in undos {
+            j.record(undo).unwrap();
+        }
+        write("n", b"new");
+        mkdirat(&dir, name("m"), Mode::from(0o755)).unwrap();
+        write("f", b"HELLO WORLD, AND MORE");
+        unlinkat(&dir, name("e"), AtFlags::REMOVEDIR).unwrap();
+        renameat(&dir, name("g"), File::open(&j.dir).unwrap(), "1").unwrap();
+        renameat(&dir, name("h"), &dir, name("i")).unwrap();
+        assert_ne!(listing(), before);
+        drop(j);
+        open(&v);
+        assert_eq!(listing(), before);
     }
 
     /// The parent of `p` (whatever the length of `p`) and `p`'s name, for

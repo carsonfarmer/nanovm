@@ -493,9 +493,10 @@ enum Exit {
 /// changes stand whether or not a publish gets through). Only while the node
 /// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route, node) = acc.with(|mut s| {
+    let (quota, held, route, node, id) = acc.with(|mut s| {
         let s = s.data_mut();
-        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.hooks.node.clone())
+        let held = std::mem::take(&mut *s.hooks.held.lock());
+        (s.quota.clone(), held, s.hooks.route.clone(), s.hooks.node.clone(), s.shared.id.clone())
     });
     // Only while the node holds the object's lease (see `Journal::commit`):
     // otherwise neither its changes nor its publishes go out.
@@ -503,7 +504,11 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
     if !held.is_empty() {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {
-            for req in held {
+            for body in held {
+                // All a held publish is: its body, named with its object so
+                // it reaches only that object's sockets.
+                let req = http::Request::post(format!("http://{}/publish", crate::ws::PUBLISH_HOST));
+                let req = req.header(crate::ws::OBJECT_HEADER, &*id).body(body).expect("ids are header-safe");
                 match (&route, node.upgrade()) {
                     (crate::egress::Route::Supervisor(up), _) => {
                         if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {

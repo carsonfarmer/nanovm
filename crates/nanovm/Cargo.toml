@@ -42,7 +42,7 @@ tar = { version = "0.4", default-features = false }
 libc = "0.2"
 parking_lot = "0.12"
 scopeguard = "1.2"
-rustix = { version = "1.1", features = ["net"] }
+rustix = { version = "1.1", features = ["fs", "net"] }
 oci-spec = { version = "0.10", default-features = false, features = ["distribution"] }
 sigstore-verify = "0.15.1"
 # Only the embedded trusted root, not its TUF client.

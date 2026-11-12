@@ -13,7 +13,7 @@ Landlock ABI 7.
 | N-71 | client → proxy → object | A client could forge a WebSocket event, with a `Connection-Id` of its choosing, by sending the events content type second, in other case, with parameters, or comma-joined. The proxy checked only the first header, exactly. | Any `Content-Type` value (or comma-joined part) whose media type is the events type is refused. | `the_proxy_routes_hosts_by_dns`: the counter guest answered a forged `TEXT id` with `m:7` (the client's id); now 400. Unit test covers each spelling. |
 | N-72 | guest → shared proxy | A guest's 8 MiB publish parsed as a JSON `Value` held 192 MiB and 200–370 ms in the proxy every app shares (and again in its worker). | Parse into typed structs; unread parts are skipped. | `publishes_parse_in_bounded_memory` (counts allocations): 1 MiB held 25 MB before; now under 1× for unread data, 5× for a flood of minimal items. |
 | N-73 | worker → egress | A compromised worker could send an allowed CDN a `Host` the allowlist never named (domain fronting). | `Host` is set from the checked authority. | `the_upstream_hears_the_allowed_host`: the upstream heard `elsewhere.example` before. |
-| N-75 (98c1698) | guest → worker memory | A guest could keep 10,000 `wasi:http` header maps of 128 KiB each (~1.25 GiB), or copies of a received ~400 KB head (~4 GiB), against a 64 MiB `memory_mb`. | A head is at most 64 KiB at every hop (hyper `max_header_size`), a guest's map at most 64 KiB, and an instance holds at most `memory_mb × 16` resources (256 at 16 MiB, 1,024 at 64 MiB). | `guest_header_maps_are_bounded_by_the_memory_limit` (test-only probe route): at 32 MiB it held 600 maps of 60 KiB, new or copied, and a 100 KiB map; each part mutation-checked. |
+| N-75 (98c1698) | guest → worker memory | A guest could keep 10,000 `wasi:http` header maps of 128 KiB each (~1.25 GiB), or copies of a received ~400 KB head (~4 GiB), against a 64 MiB `memory_mb`. | A head is at most 64 KiB at every hop (hyper `max_header_size`), a guest's map at most 64 KiB, and an instance holds at most `memory_mb × 16` resources (256 at 16 MiB, 1,024 at 64 MiB). Later (N-691): a guest request's method, scheme, authority and path, which this left unbounded, count toward its 64 KiB head. | `guest_header_maps_are_bounded_by_the_memory_limit` (test-only probe route): at 32 MiB it held 600 maps of 60 KiB, new or copied, and a 100 KiB map; each part mutation-checked. |
 
 Measurements for N-72 and N-74 used a counting allocator in a scratch crate over the
 same crate versions (`serde_json` 1, `opentelemetry-proto` 0.33), on a busy machine:
@@ -73,8 +73,9 @@ OTLP traces decode:           1023 KiB -> peak 198 MiB (198x), 146-270 ms
 - Calls between objects (`Node::wait_for`): the cycle check and record are under
   the table lock; the caller's concurrency permit is taken after the record and
   released with it; bodies are capped.
-- Held publishes: bounded per request by `max_response_body_kb`; the object header
-  is replaced, not appended.
+- Held publishes: only their bodies are kept (the object is named when they are
+  sent), bounded together per request by `max_response_body_kb`, each counting
+  its slot (N-692; they used to keep the guest's headers too).
 - Guest headers: wasi-http strips `host`, `connection`, `transfer-encoding`,
   `upgrade` and the rest of its forbidden list from guest requests and
   responses, and refuses duplicate `content-length`; a body shorter or longer

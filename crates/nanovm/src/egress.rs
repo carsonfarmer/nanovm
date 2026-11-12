@@ -150,8 +150,9 @@ pub struct EgressHooks {
     pub sem: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
     pub obj: Arc<crate::object::ObjShared>,
-    /// Publishes to the object's sockets, held until its request commits.
-    pub held: Arc<parking_lot::Mutex<Vec<http::Request<bytes::Bytes>>>>,
+    /// The bodies of publishes to the object's sockets, held until its
+    /// request commits (see [`hold`]).
+    pub held: Arc<parking_lot::Mutex<Vec<bytes::Bytes>>>,
     pub publish_max: usize,
 }
 
@@ -176,7 +177,7 @@ impl WasiHttpHooks for EgressHooks {
         let internal = request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS);
         if !internal && request.uri().host() == Some(crate::ws::PUBLISH_HOST) {
             let (held, max) = (self.held.clone(), self.publish_max);
-            return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
+            return Box::new(async move { Ok((hold(request, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
         }
         let node = self.node.clone();
         Box::new(async move {
@@ -328,25 +329,32 @@ fn client_response<B>(span: &mut crate::telemetry::Span, result: Result<&http::R
     }
 }
 
-/// Holds a publish until the request commits, named with its object so it
-/// reaches only that object's sockets; answers what the supervisor would.
+/// Holds a publish's body until the request commits, refusing at once what
+/// the supervisor would (another method or path, N-201). Nothing else of it
+/// is kept: a publish is its body and the object it comes from, which the
+/// commit names (N-692). What a request holds is bounded like one publish,
+/// each counting its slot.
 async fn hold(
     req: http::Request<WasiBody>,
-    obj: &crate::object::ObjShared,
-    held: &parking_lot::Mutex<Vec<http::Request<bytes::Bytes>>>,
+    held: &parking_lot::Mutex<Vec<bytes::Bytes>>,
     max: usize,
 ) -> http::Response<WasiBody> {
-    let (mut parts, body) = req.into_parts();
-    let status = match http_body_util::Limited::new(body, max).collect().await.map(|b| b.to_bytes()) {
-        Err(_) => 413,
-        Ok(_) if parts.uri.path().trim_end_matches('/') != "/publish" => 404,
-        Ok(body) if !crate::ws::well_formed(&body) => 400,
-        // What a request holds is bounded like one publish.
-        Ok(body) if held.lock().iter().map(|r| r.body().len()).sum::<usize>() + body.len() > max => 413,
-        Ok(body) => {
-            parts.headers.insert(crate::ws::OBJECT_HEADER, obj.id.parse().expect("object ids are header-safe"));
-            held.lock().push(http::Request::from_parts(parts, body));
-            200
+    let size = |body: &bytes::Bytes| body.len() + size_of::<bytes::Bytes>();
+    let status = if req.method() != http::Method::POST || req.uri().path().trim_end_matches('/') != "/publish" {
+        404
+    } else {
+        match http_body_util::Limited::new(req.into_body(), max).collect().await.map(|b| b.to_bytes()) {
+            Err(_) => 413,
+            Ok(body) if !crate::ws::well_formed(&body) => 400,
+            Ok(body) => {
+                let mut held = held.lock();
+                if held.iter().map(size).sum::<usize>() + size(&body) > max {
+                    413
+                } else {
+                    held.push(body);
+                    200
+                }
+            }
         }
     };
     let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
@@ -749,5 +757,35 @@ mod tests {
             refused("http://localhost/").await.as_deref(),
             Some("DestinationIpProhibited")
         );
+    }
+
+    /// What its held publishes retain: each its slot and its body.
+    fn retained(held: &parking_lot::Mutex<Vec<bytes::Bytes>>) -> usize {
+        held.lock().iter().map(|b| size_of_val(b) + b.len()).sum()
+    }
+
+    /// What a request holds to publish is bounded like one publish: 300
+    /// publishes with 60 KiB of headers each retained 18 MB, past a 16 MiB
+    /// object's memory, and tiny ones 25 times their bodies (N-692).
+    #[tokio::test]
+    async fn held_publishes_are_bounded_like_one_publish() {
+        let publish = |header: usize| {
+            let body = http_body_util::Full::new(bytes::Bytes::from_static(br#"{"items":[]}"#));
+            let body = body.map_err(|e| match e {}).boxed_unsync();
+            let mut req = http::Request::post("http://nanovm/publish/").body(body).unwrap();
+            if header > 0 {
+                req.headers_mut().insert("x-big", "x".repeat(header).parse().unwrap());
+            }
+            req
+        };
+        for (header, max, n) in [(60 << 10, 8 << 20, 300), (0, 64 << 10, 100_000)] {
+            let held = Default::default();
+            let mut taken = 0;
+            while taken < n && hold(publish(header), &held, max).await.status() == 200 {
+                taken += 1;
+            }
+            let bytes = retained(&held);
+            assert!(bytes <= max, "{taken} publishes with {header}-byte headers retain {bytes} bytes, past {max}");
+        }
     }
 }
