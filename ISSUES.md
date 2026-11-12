@@ -200,7 +200,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### N-31 (removable): code the phase 7 review found removable
 - **What:** `check_digest` in `AppRef::from_headers` repeats the one in `fetch`, which runs before any path (1 line); TLS in the proxy (`proxy.rs` `tls`, `tls_cert`/`tls_key`, about 30 lines) if a terminator in front is assumed (owner's call: there is no ACME anyway); depending on `oci-spec` directly instead of oci-client, which the runtime now uses only for its re-exports (fewer dependencies, not lines).
-- **Status:** partly done in 57d17a4: the runtime depends on `oci-spec` instead of oci-client (10 fewer crates in the runtime build; three small serde structs read the manifest fields it needs). The `check_digest` in `from_headers` stays on purpose: Reference parsing accepts upper case and other algorithms, and the early check answers a malformed digest with a 400 before any start lock or registry work. Its last part, dropping TLS from the proxy, is W-14 (decided).
+- **Status:** partly done in 57d17a4: the runtime depends on `oci-spec` instead of oci-client (10 fewer crates in the runtime build; three small serde structs read the manifest fields it needs). The `check_digest` in `from_headers` stays on purpose: Reference parsing accepts upper case and other algorithms, and the early check answers a malformed digest with a 400 before any start lock or registry work. Its last part, dropping TLS from the proxy, is W-14 (decided). Since `cf/oci-push` oci-client is gone entirely (owner's decision): `nanovm publish`, `examples/dev-registry.rs` and the test helpers push through `registry::Oci::push_app`, and 7 more crates left the build.
 
 ### N-32 (tests): persistence tests coupled to small CPU budgets
 - **W-9 baseline evidence (2026-11-08):** unchanged `kv_counts_against_the_disk_quota` fails repeatedly at 100 ms CPU (expected 198 small keys, then eight 1 MiB values in a targeted run); `kv_refuses_bad_names_and_streams_keys` hits its 10 s deadline in the full serial suite, then passes targeted. Same runtime passed CI 42437123623 on docs-only `fed57b1`. Production limits and fixtures are not changed in the storage experiment; this remains unresolved, not cured by a rerun.
@@ -558,7 +558,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-7: `nanovm publish`
 - **What:** one command that pushes an app with `oras` (layout as in `publish-guests.yml`) and signs it keylessly (`cosign` with a browser sign-in, or a CI attestation).
-- **Status:** done on `cf/onramp` (e74577c): `nanovm publish` pushes the same layout itself (oci-client), checks the component as a node will first, and prints the signing steps and TXT record; `.github/workflows/publish-app.yml` is the manual attestation template. Signing stays outside the CLI (W-102).
+- **Status:** done on `cf/onramp` (e74577c): `nanovm publish` pushes the same layout itself (with oci-client; since `cf/oci-push`, nanovm's own `registry::Oci`), checks the component as a node will first, and prints the signing steps and TXT record; `.github/workflows/publish-app.yml` is the manual attestation template. Signing stays outside the CLI (W-102).
 
 ### W-8: benchmarks against workerd and Spin
 - **What:** density (memory per object), cold starts and warm latency against workerd (Durable Objects) and Spin, on the same machine, with the method written down.

@@ -158,7 +158,9 @@ the layout `publish-guests.yml` makes with oras (artifact type
 `application/vnd.nanovm.app.v1+json`, `nanovm.json` as the config blob, the
 component as the one `application/wasm` layer, the semver tag as
 `org.opencontainers.image.version`), using `oci-client` (already a test
-dependency; the node's own client still only pulls). Before pushing it
+dependency; the node's own client only pulled). Since `cf/oci-push` it
+pushes through that client, `registry::Oci::push_app`, and oci-client is
+gone (the owner's call). Before pushing it
 compiles the component and runs the node's own import check and handler
 link, so an app a node would refuse never reaches the registry. Keyless
 signing needs an OIDC identity: from CI that is GitHub's artifact

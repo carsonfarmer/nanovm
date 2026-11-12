@@ -58,15 +58,14 @@ const PUBLISH: &str = "nanovm publish <app.wasm> <registry>/<repository>:<versio
 /// Credentials, if the registry wants them: `NANOVM_REGISTRY_USER` and
 /// `NANOVM_REGISTRY_TOKEN`. A loopback registry is plain HTTP.
 fn publish(wasm: &str, target: &str, flags: &[String]) -> anyhow::Result<()> {
-    use nanovm::registry::{APP_TYPE, CONFIG_TYPE, VERSION, WASM_TYPE};
-    use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
     let spec = match flags {
         [k, v] if k == "--manifest" => std::fs::read(v).with_context(|| format!("reading {v}"))?,
         [] => std::fs::read("nanovm.json").unwrap_or_else(|_| b"{}".into()),
         _ => bail!("usage: {PUBLISH}"),
     };
     serde_json::from_slice::<nanovm::registry::AppSpec>(&spec).context("the manifest")?;
-    let r: oci_client::Reference = target.parse().with_context(|| format!("{target} is not <registry>/<repository>:<version>"))?;
+    let r: oci_spec::distribution::Reference =
+        target.parse().with_context(|| format!("{target} is not <registry>/<repository>:<version>"))?;
     let version = r.tag().and_then(|t| semver::Version::parse(t).ok());
     let version = version.context("the tag is the app's version, nodes' `min=` compares it: :1.0.0, not :latest")?;
     // What a node checks when it loads the app: its imports and its handler.
@@ -76,22 +75,10 @@ fn publish(wasm: &str, target: &str, flags: &[String]) -> anyhow::Result<()> {
     nanovm::app::check_imports(&engine, &component).map_err(compose_hint)?;
     let pre = nanovm::app::linker(&engine)?.instantiate_pre(&component);
     pre.and_then(wasmtime_wasi_http::p3::bindings::ServicePre::new).map_err(anyhow::Error::from)?;
-    let host = r.registry().rsplit_once(':').map_or(r.registry(), |(h, _)| h);
-    let local = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-    let protocol = if local { ClientProtocol::Http } else { ClientProtocol::Https };
-    let client = oci_client::Client::new(ClientConfig { protocol, ..Default::default() });
-    let auth = match (std::env::var("NANOVM_REGISTRY_USER"), std::env::var("NANOVM_REGISTRY_TOKEN")) {
-        (Ok(user), Ok(token)) => oci_client::secrets::RegistryAuth::Basic(user, token),
-        _ => oci_client::secrets::RegistryAuth::Anonymous,
-    };
-    let (layer, config) = (ImageLayer::new(wasm, WASM_TYPE.into(), None), Config::new(spec, CONFIG_TYPE.into(), None));
-    let annotations = [(VERSION.to_string(), version.to_string())].into();
-    let mut manifest = oci_client::manifest::OciImageManifest::build(std::slice::from_ref(&layer), &config, Some(annotations));
-    (manifest.media_type, manifest.artifact_type) = (Some(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.into()), Some(APP_TYPE.into()));
-    let digest = tokio::runtime::Runtime::new()?.block_on(async {
-        client.push(&r, &[layer], config, &auth, Some(manifest)).await.with_context(|| format!("pushing {target}"))?;
-        client.fetch_manifest_digest(&r, &auth).await.context("reading back its digest")
-    })?;
+    let login = std::env::var("NANOVM_REGISTRY_USER").ok().zip(std::env::var("NANOVM_REGISTRY_TOKEN").ok());
+    let oci = nanovm::registry::Oci::publisher()?;
+    let push = oci.push_app(&r, login.as_ref(), spec, wasm, &version);
+    let digest = tokio::runtime::Runtime::new()?.block_on(push).with_context(|| format!("pushing {target}"))?;
     let repo = format!("{}/{}", r.registry(), r.repository());
     println!("{repo}:{version}@{digest}");
     eprintln!(

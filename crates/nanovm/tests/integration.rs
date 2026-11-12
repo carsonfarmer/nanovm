@@ -1103,26 +1103,12 @@ async fn publish_wasm(repo: &str, app: &AppConfig, wasm: Vec<u8>) -> String {
 }
 
 async fn publish_version(repo: &str, app: &AppConfig, wasm: Vec<u8>, version: &str) -> String {
-    use nanovm::registry::{APP_TYPE, CONFIG_TYPE, VERSION, WASM_TYPE};
-    use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
-    let layer = ImageLayer::new(wasm, WASM_TYPE.into(), None);
     let spec = serde_json::json!({ "limits": app.limits, "env": app.env, "config": app.config });
-    let config = Config::new(serde_json::to_vec(&spec).unwrap(), CONFIG_TYPE.into(), None);
-    let mut manifest = oci_client::manifest::OciImageManifest::build(
-        std::slice::from_ref(&layer),
-        &config,
-        Some([(VERSION.to_string(), version.to_string())].into()),
-    );
-    manifest.artifact_type = Some(APP_TYPE.into());
-    manifest.media_type = Some(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.into());
-    let r: oci_client::Reference = format!("{}/nanovm/{repo}:latest", registry()).parse().unwrap();
-    let client = oci_client::Client::new(ClientConfig {
-        protocol: ClientProtocol::Http,
-        ..Default::default()
-    });
-    let auth = oci_client::secrets::RegistryAuth::Anonymous;
-    client.push(&r, &[layer], config, &auth, Some(manifest)).await.unwrap();
-    let digest = nanovm::registry::Oci::new(true).unwrap().digest(&r).await.unwrap();
+    let r = format!("{}/nanovm/{repo}:latest", registry()).parse().unwrap();
+    let oci = nanovm::registry::Oci::new(true).unwrap();
+    let version = version.parse().unwrap();
+    let digest = oci.push_app(&r, None, serde_json::to_vec(&spec).unwrap(), wasm, &version).await.unwrap();
+    assert_eq!(oci.digest(&r).await.unwrap(), digest, "the tag names what was pushed");
     format!("{}/nanovm/{repo}@{digest}", registry())
 }
 
@@ -1761,23 +1747,16 @@ async fn a_drain_that_runs_out_of_time_kills_the_old_worker() {
 
 /// Published versions, oldest first, as `(version, ghcr.io/…@digest)`.
 async fn published(name: &str) -> Result<Vec<(semver::Version, String)>, String> {
-    use oci_client::{Reference, secrets::RegistryAuth};
     let repo = format!("ghcr.io/carsonfarmer/nanovm-{name}");
-    let client = oci_client::Client::default();
-    let r: Reference = format!("{repo}:latest").parse().unwrap();
-    let tags = client
-        .list_tags(&r, &RegistryAuth::Anonymous, None, None)
-        .await
-        .map_err(|e| format!("can't list {repo}: {e}"))?;
+    let oci = nanovm::registry::Oci::new(false).unwrap();
+    let r = format!("{repo}:latest").parse().unwrap();
+    let tags = oci.get(&r, "tags", "list", "application/json", 1 << 20).await.map_err(|e| format!("can't list {repo}: {e:#}"))?;
+    let tags = tags.ok_or_else(|| format!("nothing published at {repo}"))?;
+    let tags: serde_json::Value = serde_json::from_slice(&tags).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for tag in tags.tags {
+    for tag in tags["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()) {
         let Ok(v) = tag.parse::<semver::Version>() else { continue };
-        let r: Reference = format!("{repo}:{tag}").parse().unwrap();
-        let accept = [oci_client::manifest::OCI_IMAGE_MEDIA_TYPE];
-        let (_, digest) = client
-            .pull_manifest_raw(&r, &RegistryAuth::Anonymous, &accept)
-            .await
-            .map_err(|e| e.to_string())?;
+        let digest = oci.digest(&format!("{repo}:{tag}").parse().unwrap()).await.map_err(|e| format!("{e:#}"))?;
         out.push((v, format!("{repo}@{digest}")));
     }
     out.sort();

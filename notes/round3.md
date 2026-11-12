@@ -70,7 +70,8 @@ spare), and `tests/dev.rs` reads the pulled component from its cache file (C5).
   analytics, reminders, offline-first todos, webhooks, LLM gateway, feeds, OAuth), each with an
   end-to-end test that checks eviction and restart. See `notes/examples.md`.
 - Runtime: +171 lines (onramp) and +6 (N-602, `nanovm run` says when it lowers a limit).
-  `oci-client` becomes part of the production binary (for `nanovm publish`).
+  `oci-client` becomes part of the production binary (for `nanovm publish`); since dropped
+  (`cf/oci-push`, below).
 
 ### Many nodes and caller identity (`cf/multinode`, ported as d4e0c7d and 748e488)
 
@@ -131,7 +132,11 @@ instance shares them (W-640). JavaScript keeps its pre-initialization.
    becomes a hard dependency (N-181); expiry by each node's own clock; keep `object_store`; calls
    go through the proxy when leases are on; cross-node cycles not along one chain end at the
    timeout (N-180).
-3. **On-ramp**: `oci-client` in the production binary, +171 runtime lines.
+3. **On-ramp**: `oci-client` in the production binary, +171 runtime lines. Decided: no oci-client
+   at all. `cf/oci-push` adds push to nanovm's own `registry::Oci` (token auth with push scope,
+   existing blobs skipped, one-request uploads, bounded reads; +114 runtime lines) and drops the
+   crate from the binary and the tests (7 crates fewer). A CI job that publishes to GHCR is the
+   follow-up that checks it against a real registry.
 4. **N-228**: every worker start syncs about 30 directories; cheaper but touches N-38's guarantee.
 5. **W-600**: let a request roll back and still choose its status (a declined checkout can only
    answer 500 today). **W-601**: an app can't serve `/`.
