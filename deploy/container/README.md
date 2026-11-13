@@ -51,28 +51,30 @@ container. Don't use `--privileged` for anything else.
 
 ## What was validated, and what wasn't
 
-Building needs two base images from Docker Hub, which this sandbox may not pull,
-so **the image as written has not been built here**. Checked instead:
+On round 3 (`beta/deployable`), with Docker 29.9.2 (cgroup v1, its default
+seccomp profile) and a dev build of that branch; method and output in
+[notes/beta-deployable.md](../../notes/beta-deployable.md):
 
-- The build stage's context: `Cargo.toml`, `Cargo.lock` and `crates/nanovm`
-  alone (what the Dockerfile copies) pass `cargo metadata --locked --offline`.
-  A full release build from them was not run.
 - The runtime stage and the run flags, with [test/local.sh](test/local.sh): the
   real Dockerfile, with its build stage replaced by a locally built binary
   (BuildKit `--build-context build=…`) and `debian:trixie-slim` by a stand-in
-  imported from this host's glibc and busybox. With the flags above (except
-  `nofile`, which this sandbox caps at 20000), Docker 29.9.2's default seccomp
-  profile and cgroup v1: workers run as uid 200000 with seccomp and
-  `no_new_privs`, the hostile guest's spin and escapes are stopped, data survives
-  a new container on the same volume, the proxy answers as nobody on a
-  read-only root, and `docker stop` with `--init` takes about 0.1 s (3.2 s,
-  the full `-t 3`, as PID 1). Docker mounts `/sys/fs/cgroup` read-only
-  (seen on cgroup v1 here).
-- Running as PID 1 (no `--init`, or a Kubernetes pod) failed every worker with
-  `entering the jail: supervisor exited`: the worker took "parent is pid 1" to
-  mean its supervisor had died. Fixed in this branch (the worker now compares
-  its parent with the supervisor's pid); the same test passes as PID 1 after it.
+  imported from this host's glibc and busybox (for `wget` and `ps` in the
+  checks). With the flags above (`nofile` at 20000, this sandbox's cap): 11/11
+  checks. Workers run as uid 200000 with seccomp and `no_new_privs`, the hostile
+  guest's spin and escapes are stopped, data survives a new container on the
+  same volume, the proxy answers as nobody on a read-only root, `docker stop`
+  with `--init` takes 0.2 s (3.2 s, the full `-t 3`, as PID 1), and workers
+  start with the supervisor as PID 1 (N-551). The image was 92 MB.
+- The same runtime stage on the real `debian:trixie-slim` (pulled), with the
+  image's own `nanovm.toml` and `proxy.toml`: the node is ready (204) and the
+  proxy answers (502 with no network for its resolver). 200 MB with the debug
+  binary.
+- The build stage: its base tag, `rust:1.99.1-slim-trixie`, exists (`docker
+  manifest inspect`); `Cargo.toml`, `Cargo.lock` and `crates/nanovm` alone
+  (what the Dockerfile copies) pass `cargo metadata --locked --offline`, and
+  the crate includes nothing from outside its directory.
 
-Not validated: the real base images and tags, image size (the stand-in image
-was 66 MB with a debug binary), arm64, Podman, rootless Docker, user namespaces,
-cgroup v2, Kubernetes.
+Not validated: a full build of the image (the release build in the build stage
+needs several GB of disk this shared host didn't have), image size with a
+release binary, arm64, Podman, rootless Docker, user namespaces, cgroup v2,
+Kubernetes. Docker mounts `/sys/fs/cgroup` read-only (seen on cgroup v1 here).

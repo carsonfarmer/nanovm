@@ -14,14 +14,14 @@ Three facts every runbook leans on:
 - **Stopping is not graceful.** SIGTERM ends the supervisor; workers die with it
   and in-flight requests roll back, their clients unsure whether they committed.
   Close ingress at the TLS terminator first.
-- **Never delete anything under `objects/*/~journal/` or `objects/*/~committed/`.**
-  A log in `~journal` is a request's undo record: the object recovers it on its
-  next start, and deleting it can leave half a request's writes in place.
-  `~committed` is capture's version history (`[capture]`, off by default):
-  with a `store`, nanovm removes what it has shipped itself (all but the last
-  version); don't prune it, and don't remove `[capture]` from a node that has
-  history (its objects then refuse to start: `committed history requires
-  capture to remain enabled`).
+- **Never delete anything under `objects/*/~journal/`, `~committed/` or
+  `~shipped/`.** A log in `~journal` is a request's undo record: the object
+  recovers it on its next start, and deleting it can leave half a request's
+  writes in place. `~committed` is capture's version history (`[capture]`, off
+  by default): with a `store`, nanovm removes what it has shipped itself (all
+  but the last version) and records it in `~shipped`. Don't prune either, and
+  don't remove `[capture]` from a node that has history (its objects then
+  refuse to start: `committed history requires capture to remain enabled`).
 - **Uids are data.** An app's uid is the owner of its `objects/<app>` directory.
   Keep `jail_uid_base`, run as root, and preserve numeric owners.
 
@@ -96,7 +96,15 @@ systemctl start nanovm      # same nanovm build, same jail_uid_base, same app id
 ```
 
 Read and write an object before opening ingress; keep `/var/lib/nanovm.old`
-until you are sure. [drills/backup-restore.sh](drills/backup-restore.sh): count 3
+until you are sure.
+
+With a capture `store` (single-node guide, step 7), committed versions also
+ship off the VM as they happen; `nanovm::ship::restore` rebuilds an object from
+the store on a fresh root.
+
+> **Placeholder (`beta/recovery`):** restoring one app or one object on a
+> running node, from the store or a backup, with `nanovm admin`. Filled in when
+> `beta/recovery` is integrated. [drills/backup-restore.sh](drills/backup-restore.sh): count 3
 and a KV value before; after restoring into a fresh root, the same values, app
 uids 200000/200001 preserved, and the next write gives 4. Run `restic check
 --read-data` on a schedule; a backup you haven't restored is a hope.
