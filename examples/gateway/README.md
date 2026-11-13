@@ -31,8 +31,9 @@ What it shows:
   at the end would make a cut-off stream free. So the request reserves
   `max_tokens` before answering (that commits with the answer), and the
   stream gives back what it didn't use when it finishes. A stream cut off
-  by the client or the deadline keeps its reservation; an upstream error
-  is answered `502` before anything is reserved.
+  by the client, the deadline or the upstream (its body breaks off:
+  `Streaming::next` is an error, not an end) keeps its reservation; an
+  upstream error status is answered `502` before anything is reserved.
 - **Streams hold their object.** While a user's completion streams, their
   other requests wait; other users are not held up. Long completions need a
   `post_return_timeout_ms` to match.

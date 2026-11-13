@@ -76,7 +76,9 @@ Each in its own commit, found by an example:
 - `after(work)`: work that runs once the handler has answered, committed
   when it is done (webhooks).
 - `Fetch::stream` / `Streaming::next`: read an outbound answer as it
-  arrives (gateway).
+  arrives (gateway). `next()` is `Result<Option<_>, ErrorCode>`: a body
+  cut short upstream ends in an error, as `send()` returns one, rather
+  than passing for the whole answer (review D3).
 
 An app that uses none of them is unchanged: `shortener.wasm` is 400,751
 bytes before and after the SQLite module, with no `spin:sqlite` import.

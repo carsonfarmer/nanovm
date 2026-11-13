@@ -1324,8 +1324,9 @@ async fn webhooks_verify_answer_then_relay_with_retries() {
 }
 
 /// A completion API on loopback: a prompt `n N ms M` streams N tokens as
-/// Server-Sent Events, one every M ms, then `[DONE]`; `fail` is a 500. It
-/// records each request's authorization header.
+/// Server-Sent Events, one every M ms, then `[DONE]`; `cut N` streams N
+/// and then breaks the connection (a chunked body with no last chunk);
+/// `fail` is a 500. It records each request's authorization header.
 async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let keys = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1339,6 +1340,19 @@ async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
             let body = http_body_util::BodyExt::collect(req.into_body()).await.unwrap().to_bytes();
             let prompt = serde_json::from_slice::<Value>(&body).unwrap()["prompt"].as_str().unwrap().to_string();
             let words: Vec<&str> = prompt.split(' ').collect();
+            if let ["cut", n] = words[..] {
+                let n: u32 = n.parse().unwrap();
+                let tokens = futures::stream::unfold(0, move |i| async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    match i {
+                        i if i < n => Some((Ok(http_body::Frame::data(bytes::Bytes::from(format!("data: {{\"token\":\"t{i}\"}}\n\n")))), i + 1)),
+                        i if i == n => Some((Err::<http_body::Frame<bytes::Bytes>, nanovm::object::BoxError>("cut".into()), i + 1)),
+                        _ => None,
+                    }
+                });
+                let body = http_body_util::BodyExt::boxed_unsync(http_body_util::StreamBody::new(tokens));
+                return http::Response::builder().header("content-type", "text/event-stream").body(body).unwrap();
+            }
             let ["n", n, "ms", ms] = words[..] else { return nanovm::object::error_response(500, "scripted", "fail") };
             let (n, ms): (u32, u64) = (n.parse().unwrap(), ms.parse().unwrap());
             let tokens = futures::stream::unfold(0, move |i| async move {
@@ -1359,13 +1373,14 @@ async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
 /// examples/gateway (on an in-process node, to reach a loopback API): a
 /// streamed completion passed through as it is generated; the quota
 /// reserved before streaming and refunded after, so a stream cut off by
-/// the client or by post_return_timeout_ms keeps its reservation.
+/// the client, the upstream or post_return_timeout_ms keeps its
+/// reservation.
 #[tokio::test(flavor = "multi_thread")]
 async fn gateway_streams_completions_within_quotas() {
     let (api, keys) = llm().await;
     let patch = json!({
         "limits": {"egress": [api], "post_return_timeout_ms": 1500},
-        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "300", "max_tokens": "100"},
+        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "400", "max_tokens": "100"},
         "env": {"UPSTREAM_KEY": "test-key"},
     });
     let app = Local::start("gateway", patch);
@@ -1400,12 +1415,18 @@ async fn gateway_streams_completions_within_quotas() {
     http_body_util::BodyExt::frame(&mut body).await.unwrap().unwrap();
     drop(body);
     assert_eq!(usage(&app).await, 105);
+    // So does one the upstream breaks off: what came of it is no measure.
+    let res = complete(&app, "cut 3").await;
+    let text = http_body_util::BodyExt::collect(res.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
+    let text = String::from_utf8_lossy(&text);
+    assert!(text.matches("token").count() == 3 && !text.contains("[DONE]"), "{text}");
+    assert_eq!(usage(&app).await, 205, "not refunded as if 3 tokens were all of it");
     // So does one that outlives post_return_timeout_ms: its refund rolls back.
     let res = complete(&app, "n 50 ms 100").await;
     let text = http_body_util::BodyExt::collect(res.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
     assert!(!String::from_utf8_lossy(&text).contains("[DONE]"), "cut short");
-    assert_eq!(usage(&app).await, 205);
-    // 205 + 100 > 300: refused before anything is sent upstream.
+    assert_eq!(usage(&app).await, 305);
+    // 305 + 100 > 400: refused before anything is sent upstream.
     let calls = keys.lock().unwrap().len();
     let over = app.send("POST", "/ann/complete", &[], r#"{"prompt":"n 1 ms 0"}"#).await;
     assert_eq!((over.status, &over.json()["error"]), (429, &json!("quota")));
@@ -1413,9 +1434,9 @@ async fn gateway_streams_completions_within_quotas() {
     assert_eq!(app.send("GET", "/bob/usage", &[], "").await.json()["used"], 0, "quotas are per user");
 
     app.evicted().await;
-    assert_eq!(usage(&app).await, 205);
+    assert_eq!(usage(&app).await, 305);
     let app = app.restart().await;
-    assert_eq!(usage(&app).await, 205);
+    assert_eq!(usage(&app).await, 305);
 }
 
 /// Feeds on loopback: `/rss` and `/atom` serve the documents in `docs`

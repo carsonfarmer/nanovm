@@ -89,7 +89,10 @@ no need for write-to-temp-then-rename.
 - `config::get(key)`: the manifest's `config` table.
 - `fetch(url).method(..).header(..).body(..).send()`: outbound HTTP to hosts
   in the manifest's `egress` list; `.stream()` instead reads the answer's
-  body as it arrives (`next()`).
+  body as it arrives (`next()`: `Ok(Some(piece))`, then `Ok(None)` once
+  all of it has come). A body that breaks off (the connection closes before
+  its `content-length` or last chunk) is an error from `send()`, and from
+  `next()` where it ends, never a short body that looks whole.
 - `object("lobby").post(path, body).send()`: calls another object of the
   app, through its queue; it commits before it answers.
 - `ws::events(&req)`, `ws::Answer` (`accept`, `subscribe`, `text`, `binary`,

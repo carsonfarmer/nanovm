@@ -51,7 +51,13 @@ async fn handle(req: Request) -> Result {
             kv::set(&used_key, (used + max).to_string()).await?;
             Response::stream("text/event-stream", move |mut body| async move {
                 let mut tokens = 0;
-                while let Some(piece) = upstream.next().await {
+                loop {
+                    let piece = match upstream.next().await {
+                        Ok(Some(piece)) => piece,
+                        Ok(None) => break,
+                        // The upstream broke off: the reservation stands.
+                        Err(_) => return,
+                    };
                     tokens += String::from_utf8_lossy(&piece).matches("data: {").count() as i64;
                     if !body.write(piece).await {
                         return; // The client left: the reservation stands.

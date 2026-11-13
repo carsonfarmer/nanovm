@@ -33,7 +33,8 @@ build compiles the runtime (minutes); each app after that takes seconds.
 (to the object's log), timers, `queueMicrotask`, `crypto.getRandomValues`
 and `randomUUID`; `env.kv` (`get`, `put`, `delete`, `list`; values are
 JSON) on the composed Spin key-value provider, committed with the response;
-outbound `fetch` under the app's egress policy; `env.objects.get(id).fetch()`
+outbound `fetch` under the app's egress policy (it rejects if the body
+breaks off before its end); `env.objects.get(id).fetch()`
 between objects; `env.config`, `env.id`, `env.publish(channel, message)`;
 `ctx.waitUntil`; WebSocket handlers `webSocketOpen` (return `false` to
 refuse), `webSocketMessage` and `webSocketClose`, with `ws.send`,
@@ -41,6 +42,6 @@ refuse), `webSocketMessage` and `webSocketClose`, with `ws.send`,
 the request and rolls back its writes. Bodies are whole (no streams), one
 module (bundle imports first), no `performance`.
 
-Tests: `crates/nanovm/tests/js.rs` (nine, on an in-process node) and
+Tests: `crates/nanovm/tests/js.rs` (ten, on an in-process node) and
 `javascript_apps_run_and_publish` in `crates/nanovm/tests/run.rs`.
 Measurements: notes/js.md and notes/qjs.md on branch cf/optimistic-feynman.

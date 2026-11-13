@@ -169,6 +169,50 @@ async fn outbound_fetch_round_trips() {
     server.abort();
 }
 
+/// `fetch()` rejects an answer whose body the upstream cut short (fewer
+/// bytes than its content-length, or a chunked body with no last chunk),
+/// rather than resolving with the part that came as if it were all of it.
+/// It goes through the Rust SDK's `Fetch::send`.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_fetch_rejects_a_truncated_upstream_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut got, mut buf) = (vec![], [0; 4096]);
+                while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => got.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let answer: &[u8] = match String::from_utf8_lossy(&got).split(' ').nth(1) {
+                    Some("/short") => b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nonly ten b",
+                    Some("/cut") => b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                    _ => b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nwhole",
+                };
+                let _ = socket.write_all(answer).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                // Dropped: the connection closes there.
+            });
+        }
+    });
+    let mut app = app();
+    app.limits.egress.push(format!("127.0.0.1:{port}"));
+    let node = node_with(node_cfg("js_fetch_truncated", 8), app);
+    let r = get(&node, "f", &format!("/fetch?url=http://127.0.0.1:{port}/whole")).await;
+    assert_eq!((r.status, &r.json()["body"]), (200, &serde_json::json!("whole")), "{}", r.body);
+    for path in ["/short", "/cut"] {
+        let r = get(&node, "f", &format!("/fetch?url=http://127.0.0.1:{port}{path}")).await;
+        assert_eq!(r.status, 502, "{path}: a part of a body is not the body: {}", r.body);
+        assert!(r.json()["denied"].as_str().unwrap().contains("ErrorCode::"), "{path}: {}", r.body);
+    }
+    server.abort();
+}
+
 /// `env.objects.get(id).fetch()` calls another object, which commits first.
 #[tokio::test(flavor = "multi_thread")]
 async fn objects_call_objects() {
