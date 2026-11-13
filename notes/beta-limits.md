@@ -82,9 +82,47 @@ does. `scripts/vm-test.sh` now includes the test, which checks the placement and
 
 ## Evidence
 
-All on this sandbox (4 vCPU, shared with several other agents' builds and tests throughout, load
-average 5–10), as root. Runtime lines (CI's count): 7,410 → 7,728 (+318: `gate.rs` 145, `quota.rs`
-+98, `supervisor.rs` +43, `config.rs` +19, `proxy.rs` +7, the rest +6).
+All on this sandbox (4 vCPU, 16 GiB, ext4), as root, shared with several other agents' builds and
+tests: load average 5–30 most of the time, near 0 for one short window. Runtime lines (CI's count):
+7,410 → 7,728 (+318: `gate.rs` 145, `quota.rs` +98, `supervisor.rs` +43, `config.rs` +19, `proxy.rs`
++7, the rest +6).
+
+### CPU per request (the hot path)
+
+Method as AGENTS.md: release builds (`--features dev`) of `cf/round3` (`old`) and this branch
+(`new`) side by side, each a supervisor with one jailed counter worker on loopback (no cgroup),
+oha against 100 objects, process CPU of the supervisor and worker from `/proc` per request,
+alternating old/new each round and reversing the order every other round. `new` runs the gate in
+its most expensive form: `trusted = []` (so every request is a limited client) and rates of 10⁹/s
+(checked on every request, never reached): an extension lookup, the `X-Forwarded-For` scan, two
+keyed GCRA checks. Writes (`POST /incr`) also take the reserve's `fstatfs` twice (the new temporary
+file and its growth) and the app budget's compare-and-swap.
+
+| Run | old: median [range] µs/request | new | Machine |
+|---|---|---|---|
+| GET, 1 client, 5 rounds × 20,000 | 150.5 [138.0–266.0] | 174.0 [138.0–196.5] | load near 0, rising in rounds 1–3 |
+| — of those, rounds 4 and 5 | 138.0, 140.0 | 138.0, 141.5 | idle |
+| GET, 64 clients, 5 × 100,000 | 74.8 [68.6–79.8] | 77.1 [71.0–79.9] | idle |
+| — supervisor only (where the gate runs) | 21.4 [19.4–22.4] | 21.8 [20.7–23.2] | idle |
+| GET, 64 clients, 5 × 100,000 | 111.4 [101.6–113.7] | 105.5 [102.8–111.5] | load ~20 |
+| POST /incr, 64 clients, 5 × 40,000 | 1,021.8 [949.0–1,052.5] | 1,037.8 [1,005.5–1,066.5] | load ~20 |
+| POST /incr, 64 clients, 3 × 20,000 | 844.5 [622.5–909.0] | 864.5 [852.5–898.0] | load ~30 |
+
+No difference stands out of the noise: every pair of ranges overlaps, the medians move both ways,
+and where they moved most (GET, one client, the first three rounds and a later loaded rerun with
+old 189 vs new 281) the worker's CPU moved as much as the supervisor's although nothing in the
+worker's read path changed, so it was the machine. In the two rounds taken while it was idle, old
+and new are within 1.5 µs. For scale, `fstatvfs` costs 213 ns of CPU on this ext4 (a C loop of 10⁶
+calls), against about 1 ms of CPU per committed write.
+
+### Worker start (the app's disk is measured when it loads)
+
+`nanovm run` (in-process node) until it is ready, with N objects of 5 files of 100 bytes each,
+old/new alternating, the first run of each (compiling) dropped, machine loaded (load ~25):
+no objects 40–57 ms both; 2,000 objects (10,000 files) old 17–30 ms, new 42–118 ms; 10,000 objects
+(50,000 files) old 28–82 ms, new 153–277 ms. So the walk costs roughly 3–4 µs a file, warm, on every
+worker start (an app's first request, a version switch, a restart). The objects cap bounds it; a
+walk in the background with a short window of soft budget is the alternative (B-307).
 
 ### Tests
 

@@ -579,6 +579,16 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** a worker counts an object without an instance at what its volume held when last measured; a volume removed under a running worker (an operator delete, `beta/objects`) stays counted until the worker restarts. The delete path should drop the object from `Disk::idle` (and its bytes from `used`).
 - **Status:** open (for whoever lands object deletion)
 
+### B-307: a worker measures all its app's volumes when it starts
+- **Where:** `quota::Disk::open` (from `App::load`)
+- **Scenario:** the app budget starts from a walk of every object's volume, on each worker start (first request, version switch, restart): measured about 3–4 µs a file, warm, so 10,000 objects of 5 files add 150–250 ms. The objects cap bounds it. Alternatives: walk in the background with a short window in which only the objects' own quotas hold, or keep each object's usage in a small file its commits update.
+- **Status:** open
+
+### B-308: rate limits are per listener, and WebSocket messages aren't requests
+- **Where:** `gate.rs`
+- **Scenario:** each proxy (and each node a client reaches directly) keeps its own counts, so with several proxies a client or an app gets the rate at each; a socket's messages count only as the request that opened it (their own bounds are the socket backlog and caps).
+- **Status:** open (by design for one node)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
