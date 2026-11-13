@@ -5054,8 +5054,10 @@ mod nodes {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert!(refused["detail"].as_str().unwrap().contains("no longer holds the object's lease"), "{refused}");
-        assert!(object_dir(&objects_a.join(&app), &object).join("data/after.txt").exists(), "A wrote after answering");
-        assert!(object_dir(&objects_a.join(&app), &object).join("journal/log").exists(), "the write is uncommitted");
+        // What it wrote after answering is rolled back as its instance ends.
+        let volume = object_dir(&objects_a.join(&app), &object).join("data");
+        eventually("A to roll back its uncommitted write", || !volume.join("after.txt").exists()).await;
+        assert!(volume.join("before.txt").exists());
     }
 
     /// A guest answering as a node that doesn't hold its object (421, naming
