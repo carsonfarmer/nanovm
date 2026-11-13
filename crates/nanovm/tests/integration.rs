@@ -1148,6 +1148,68 @@ async fn stats_json(addr: std::net::SocketAddr) -> serde_json::Value {
     captured.lock().snapshot()
 }
 
+/// `nanovm admin --config … <args>` against the node `cfg` describes: its
+/// exit status, and what it printed.
+fn admin(cfg: &NodeConfig, args: &[&str]) -> (bool, String) {
+    let config = cfg.data_dir.join("admin.toml");
+    std::fs::write(&config, format!("data_dir = {:?}\n", cfg.data_dir)).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nanovm"))
+        .args(["admin", "--config"]).arg(&config).args(args).output().unwrap();
+    let text = [out.stdout, out.stderr].concat();
+    (out.status.success(), String::from_utf8_lossy(&text).into_owned())
+}
+
+/// The admin socket answers the supervisor's own user (root here) and no
+/// one else: its directory refuses any other user, no HTTP route reaches it,
+/// and the jail lets no worker make a socket (`jail_blocks_escapes`).
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_socket_is_the_supervisors_own() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let cfg = node_cfg("admin_socket_is_the_supervisors_own", 8);
+    let (_sup, addr) = supervised_with(cfg.clone()).await;
+    let counter = publish("counter", &app("counter")).await;
+    assert_eq!(app_get(addr, &counter, "/a/").await.0, 200);
+
+    let (ok, out) = admin(&cfg, &["apps"]);
+    assert!(ok, "{out}");
+    let apps: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(apps[0]["app"], worker(&counter), "{out}");
+    let (ok, out) = admin(&cfg, &["nonsense"]);
+    assert!(!ok && out.contains("unknown command"), "{out}");
+
+    let socket = nanovm::admin::socket(&cfg);
+    let dir = std::fs::metadata(socket.parent().unwrap()).unwrap();
+    assert_eq!((dir.permissions().mode() & 0o777, dir.uid()), (0o700, unsafe { libc::geteuid() }));
+    // Another user can't connect.
+    if unsafe { libc::geteuid() } == 0 {
+        let path = std::ffi::CString::new(socket.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the child makes only async-signal-safe calls, then exits.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                addr.sun_family = libc::AF_UNIX as u16;
+                let bytes = path.as_bytes_with_nul();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr().cast(), addr.sun_path.as_mut_ptr(), bytes.len());
+                if libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(65534) != 0 || libc::setuid(65534) != 0 {
+                    libc::_exit(100);
+                }
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let r = libc::connect(fd, (&raw const addr).cast(), size_of::<libc::sockaddr_un>() as u32);
+                libc::_exit(if r == 0 { 0 } else { *libc::__errno_location() });
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(libc::WEXITSTATUS(status), libc::EACCES, "another user connected (0) or failed otherwise");
+    }
+    // No HTTP route leads there, with or without an app.
+    for path in ["/_nanovm/admin", "/_nanovm/command", "/_nanovm/delete"] {
+        assert_eq!(http_get(addr, path).await.0, 404, "{path}");
+        assert_eq!(app_get(addr, &counter, path).await.0, 400, "{path}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn supervised_workers_contain_attacks() {
     let (_sup, addr) = supervised("supervised_workers_contain_attacks").await;
@@ -1313,7 +1375,9 @@ fn jail_blocks_escapes() {
     if unsafe { libc::geteuid() } == 0 {
         std::os::unix::fs::chown(dir.join("mine"), Some(200_099), Some(200_099)).unwrap();
     }
-    // A host service's datagram socket, for the probe to try to reach.
+    // A host service's datagram socket, for the probe to try to reach, and
+    // a socket as the admin socket is.
+    let _admin = std::os::unix::net::UnixListener::bind(dir.join("admin.sock")).unwrap();
     let service = format!("nanovm-jail-probe-{}", std::process::id());
     let service_sock = {
         use std::os::linux::net::SocketAddrExt;
@@ -1359,6 +1423,7 @@ fn jail_blocks_escapes() {
         ("tcp_socket", "denied"),
         ("unix_socket", "denied"),
         ("unix_datagram", "denied"),
+        ("admin_socket", "denied"),
         ("fork", "denied"),
         ("exec", "denied"),
         ("setuid_root", "denied"),
@@ -1432,6 +1497,7 @@ fn jailed(dir: &Path) {
             a.send_to_addr(b"x", &std::os::unix::net::SocketAddr::from_abstract_name(&service)?)
         });
         report("unix_datagram", sent.is_ok());
+        report("admin_socket", std::os::unix::net::UnixStream::connect(dir.join("admin.sock")).is_ok());
         let pid = libc::fork();
         if pid == 0 {
             libc::_exit(0);

@@ -500,6 +500,20 @@ CI runs both privilege variants of the CLI tests and the SQL restore drill;
 orb setup installs restic idempotently. Runtime size remains 5,085 lines, with
 89 additional operator-tool lines counted separately.
 
+## Operator commands
+
+`nanovm admin --config <nanovm.toml> <command> [<argument>…]` runs a command in a
+running node, through the node's one control path: a Unix socket at
+`<data_dir>/admin/socket`, owned by the supervisor. Its directory has mode 0700,
+so only the supervisor's own user (root in production) can connect. Workers run
+as other users, and the jail lets no worker make a socket; no HTTP route, public
+or private, leads to it. A command is one line of JSON (an array of strings)
+and its answer one line, `{"ok": …}` or `{"error": "…"}`, which the CLI prints.
+
+| Command | What it does |
+|---|---|
+| `apps` | The apps this node knows, with the version and pid of each running worker. |
+
 ## Commits
 
 A request's changes to `/data` (files, SQL and key-value alike) commit locally before its initial response is released. A guest error, trap, CPU/time limit or worker crash before commit rolls back those changes. An answer of any status commits. Held WebSocket publishes are released after their corresponding commit, but delivery is best effort: a crash or failed send can lose a publish after storage commits. This is not a durable outbox.
