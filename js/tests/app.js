@@ -80,6 +80,47 @@ const routes = {
     })());
     return new Response("answered first");
   },
+  // review2: waitUntil work that writes and rejects before the handler
+  // has answered; the answer itself is fine.
+  "POST /later-throw-early": async (req, env, ctx) => {
+    ctx.waitUntil((async () => {
+      await env.kv.put("early", hits);
+      throw new Error("waitUntil work failed");
+    })());
+    await new Promise((r) => setTimeout(r, 50));
+    await env.kv.put("answered", hits);
+    return new Response("answered first");
+  },
+  // review2: waitUntil work that writes while the handler is running and
+  // rejects after it has answered.
+  "POST /later-throw-straddle": async (req, env, ctx) => {
+    ctx.waitUntil((async () => {
+      await env.kv.put("early", hits);
+      await new Promise((r) => setTimeout(r, 200));
+      throw new Error("waitUntil work failed");
+    })());
+    await new Promise((r) => setTimeout(r, 50));
+    return new Response("answered first");
+  },
+  // review2: waitUntil work that registers more waitUntil work after the
+  // answer; that work writes, then rejects.
+  "POST /later-nested": async (req, env, ctx) => {
+    ctx.waitUntil((async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      ctx.waitUntil((async () => {
+        await env.kv.put("nested", hits);
+        throw new Error("nested waitUntil work failed");
+      })());
+      await new Promise((r) => setTimeout(r, 200));
+    })());
+    return new Response("answered first");
+  },
+  // review2: a waitUntil promise that can never settle.
+  "POST /later-never": async (req, env, ctx) => {
+    ctx.waitUntil(new Promise(() => {}));
+    await env.kv.put("answered", hits);
+    return new Response("answered first");
+  },
   // Nothing of the build's pre-initialization may be shared by instances.
   "GET /fresh": () => Response.json({ random: Math.random(), uuid: crypto.randomUUID(), now: Date.now() }),
   "GET /web": async () => {

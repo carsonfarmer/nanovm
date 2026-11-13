@@ -1492,6 +1492,25 @@ async fn review_gateway_counts_tokens_split_across_http_chunks() {
     assert_eq!(usage().await, 112, "the upstream's count, not the events seen");
 }
 
+/// review2 (D3 through the gateway): `Streaming::next` now tells the gateway
+/// that the upstream broke off, but `Response::stream` has no way to pass
+/// that on (its trailers are always `Ok(None)`), so the gateway's own answer
+/// ends as if whole: its client gets a short body that looks complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_gateway_tells_its_client_when_the_upstream_breaks_off() {
+    let (api, _) = llm().await;
+    let patch = json!({
+        "limits": {"egress": [api], "post_return_timeout_ms": 5000},
+        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "1000", "max_tokens": "100"},
+    });
+    let app = Local::start("gateway", patch);
+    let req = http::Request::post("http://x/complete").body(bytes::Bytes::from(json!({"prompt": "cut 3"}).to_string())).unwrap();
+    let res = app.node.dispatch("ann", req).await;
+    assert_eq!(res.status(), 200);
+    let body = http_body_util::BodyExt::collect(res.into_body()).await.map(|b| b.to_bytes());
+    assert!(body.is_err(), "the upstream broke off after 3 tokens, yet the gateway's answer ended whole: {body:?}");
+}
+
 /// Feeds on loopback: `/rss` and `/atom` serve the documents in `docs`
 /// (each with an ETag, and `304` for a matching If-None-Match); every
 /// request's path and If-None-Match is recorded.
