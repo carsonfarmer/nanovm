@@ -22,24 +22,26 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, config, fetch, kv, serde_json};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, Result, config, fetch, kv, serde_json};
 use serde_json::json;
 
 nanovm_sdk::serve!(handle);
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     let day = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() / 86_400;
     let used_key = format!("used:{day}");
     let used = kv::get_text(&used_key).await?.and_then(|n| n.parse().ok()).unwrap_or(0i64);
     let (limit, max) = (setting("tokens_per_day", 2000), setting("max_tokens", 200));
-    Ok(match (req.method(), req.path()) {
-        ("GET", "/usage") => Response::json(json!({ "used": used, "limit": limit, "day": day }).to_string()),
+    Ok(match (req.method().as_str(), req.uri().path()) {
+        ("GET", "/usage") => json(200, json!({ "used": used, "limit": limit, "day": day }).to_string())?,
         ("POST", "/complete") => {
-            let Some(prompt) = req.json::<serde_json::Value>().ok().and_then(|p| p["prompt"].as_str().map(String::from)) else {
-                return Ok(Response::text("{\"prompt\": \"…\"}\n").status(400));
+            let Some(prompt) = req.body().json::<serde_json::Value>().ok().and_then(|p| p["prompt"].as_str().map(String::from)) else {
+                return text(400, "{\"prompt\": \"…\"}\n");
             };
             if used + max > limit {
-                return Ok(Response::json(json!({ "error": "quota", "used": used, "limit": limit }).to_string()).status(429));
+                return json(429, json!({ "error": "quota", "used": used, "limit": limit }).to_string());
             }
             let url = config::get("upstream").ok().flatten().unwrap_or_default();
             let mut upstream = fetch(url)
@@ -49,8 +51,8 @@ async fn handle(req: Request) -> Result {
                 .body(json!({ "prompt": prompt, "max_tokens": max, "stream": true }).to_string())
                 .stream()
                 .await?;
-            if upstream.status != 200 {
-                return Ok(Response::text(format!("upstream answered {}\n", upstream.status)).status(502));
+            if upstream.status() != 200 {
+                return text(502, format!("upstream answered {}\n", upstream.status()));
             }
             // Reserved now: this commits with the answer, before any token flows.
             kv::set(&used_key, (used + max).to_string()).await?;
@@ -77,7 +79,7 @@ async fn handle(req: Request) -> Result {
             })
             .header("cache-control", "no-cache")
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
@@ -143,4 +145,14 @@ impl Events {
 
 fn setting(key: &str, default: i64) -> i64 {
     config::get(key).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

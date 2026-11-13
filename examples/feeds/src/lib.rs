@@ -10,7 +10,9 @@
 //! - `PUT /{reader}/follows` `["f-…", …]`; `GET /{reader}/timeline`: newest
 //!   first, after pulling what is new
 
-use nanovm_sdk::{Request, Response, Result, fetch, kv, object, serde_json};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, fetch, kv, object, serde_json};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -23,7 +25,7 @@ struct Item {
     link: String,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     if nanovm_sdk::id().starts_with("f-") {
         feed(&req).await
     } else {
@@ -31,33 +33,33 @@ async fn handle(req: Request) -> Result {
     }
 }
 
-async fn feed(req: &Request) -> Result {
-    Ok(match (req.method(), req.path()) {
+async fn feed(req: &Request<Body>) -> Result {
+    Ok(match (req.method().as_str(), req.uri().path()) {
         ("PUT", "/") => {
-            let url = req.json::<serde_json::Value>().ok().and_then(|v| v["url"].as_str().map(String::from));
+            let url = req.body().json::<serde_json::Value>().ok().and_then(|v| v["url"].as_str().map(String::from));
             match url.filter(|u| u.starts_with("http")) {
                 Some(url) => {
                     kv::set("url", url.as_str()).await?;
-                    Response::new(204)
+                    Response::builder().status(204).body(Body::empty())?
                 }
-                None => Response::text("{\"url\": \"https://…\"}\n").status(400),
+                None => text(400, "{\"url\": \"https://…\"}\n")?,
             }
         }
         ("POST", "/refresh") => {
-            let Some(url) = kv::get_text("url").await? else { return Ok(Response::not_found()) };
+            let Some(url) = kv::get_text("url").await? else { return text(404, "not found") };
             let mut get = fetch(url.as_str()).header("accept", "application/rss+xml, application/atom+xml");
             if let Some(etag) = kv::get_text("etag").await? {
                 get = get.header("if-none-match", etag);
             }
             let reply = get.send().await?;
-            if reply.status == 304 {
-                return Ok(Response::json(r#"{"new":0,"unchanged":true}"#));
+            if reply.status() == 304 {
+                return json(200, r#"{"new":0,"unchanged":true}"#);
             }
-            if reply.status != 200 {
-                return Ok(Response::text(format!("the feed answered {}\n", reply.status)).status(502));
+            if reply.status() != 200 {
+                return text(502, format!("the feed answered {}\n", reply.status()));
             }
-            let Ok(found) = items(&String::from_utf8_lossy(&reply.body)) else {
-                return Ok(Response::text("not RSS or Atom\n").status(502));
+            let Ok(found) = items(&String::from_utf8_lossy(reply.body())) else {
+                return text(502, "not RSS or Atom\n");
             };
             let mut new = 0;
             // Oldest first, so sequence numbers follow the feed's order.
@@ -75,7 +77,7 @@ async fn feed(req: &Request) -> Result {
             if let Some((_, etag)) = reply.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("etag")) {
                 kv::set("etag", etag.as_str()).await?;
             }
-            Response::json(format!(r#"{{"new":{new}}}"#))
+            json(200, format!(r#"{{"new":{new}}}"#))?
         }
         ("GET", "/items") => {
             let after: i64 = req.query_or("after", 0);
@@ -85,20 +87,20 @@ async fn feed(req: &Request) -> Result {
             for key in keys.into_iter().filter(|k| k[5..].parse::<i64>().is_ok_and(|s| s > after)).take(100) {
                 out.push(serde_json::from_slice::<Item>(&kv::get(&key).await?.unwrap_or_default())?);
             }
-            Response::json(serde_json::to_string(&out)?)
+            json(200, serde_json::to_string(&out)?)?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
-async fn reader(req: &Request) -> Result {
-    Ok(match (req.method(), req.path()) {
-        ("PUT", "/follows") => match req.json::<Vec<String>>() {
+async fn reader(req: &Request<Body>) -> Result {
+    Ok(match (req.method().as_str(), req.uri().path()) {
+        ("PUT", "/follows") => match req.body().json::<Vec<String>>() {
             Ok(feeds) if feeds.len() <= 50 && feeds.iter().all(|f| f.starts_with("f-")) => {
                 kv::set("follows", serde_json::to_vec(&feeds)?).await?;
-                Response::new(204)
+                Response::builder().status(204).body(Body::empty())?
             }
-            _ => Response::text("[\"f-…\", …], up to 50\n").status(400),
+            _ => text(400, "[\"f-…\", …], up to 50\n")?,
         },
         ("GET", "/timeline") => {
             let follows: Vec<String> = serde_json::from_slice(&kv::get("follows").await?.unwrap_or(b"[]".into()))?;
@@ -108,8 +110,8 @@ async fn reader(req: &Request) -> Result {
                 // How far this reader has read each feed.
                 let read_key = format!("read:{feed}");
                 let after = kv::get_text(&read_key).await?.unwrap_or("0".into());
-                let reply = object(&feed).get(&format!("/items?after={after}")).send().await?;
-                let Ok(new) = serde_json::from_slice::<Vec<Item>>(&reply.body) else { continue };
+                let reply = object(&feed).get(&format!("/items?after={after}")).await?;
+                let Ok(new) = serde_json::from_slice::<Vec<Item>>(reply.body()) else { continue };
                 if let Some(last) = new.last() {
                     kv::set(&read_key, last.seq.to_string()).await?;
                 }
@@ -120,9 +122,9 @@ async fn reader(req: &Request) -> Result {
             timeline.drain(..timeline.len().saturating_sub(500));
             kv::set("timeline", serde_json::to_vec(&timeline)?).await?;
             let newest_first: Vec<&Item> = timeline.iter().rev().collect();
-            Response::json(serde_json::to_string(&newest_first)?)
+            json(200, serde_json::to_string(&newest_first)?)?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
@@ -149,4 +151,14 @@ fn items(xml: &str) -> core::result::Result<Vec<(String, String, String)>, roxml
 /// A key for a guid of any length: FNV-1a, hex.
 fn fnv(s: &str) -> String {
     format!("{:016x}", s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)))
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

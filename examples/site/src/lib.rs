@@ -9,7 +9,9 @@
 
 use std::hash::{Hash, Hasher};
 
-use nanovm_sdk::{Request, Response, Result, kv};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, Result, kv};
 
 nanovm_sdk::serve!(handle);
 
@@ -22,10 +24,10 @@ const FILES: &[(&str, &str, &str, &[u8])] = &[
     ("/app.js", "text/javascript; charset=utf-8", "public, max-age=3600", include_bytes!("public/app.js")),
 ];
 
-async fn handle(req: Request) -> Result {
-    match (req.method(), req.path()) {
+async fn handle(req: Request<Body>) -> Result {
+    match (req.method().as_str(), req.uri().path()) {
         (_, "/api/likes") => {
-            let likes = match req.method() {
+            let likes = match req.method().as_str() {
                 "POST" => kv::increment("likes", 1).await?,
                 _ => kv::get_text("likes").await?.and_then(|n| n.parse().ok()).unwrap_or(0),
             };
@@ -38,15 +40,15 @@ async fn handle(req: Request) -> Result {
         }
         _ => {}
     }
-    Ok(Response::not_found())
+    text(404, "not found")
 }
 
-fn file(req: &Request, content_type: &str, cache: &str, bytes: &[u8]) -> Response {
+fn file(req: &Request<Body>, content_type: &str, cache: &str, bytes: &[u8]) -> Response {
     let mut hasher = std::hash::DefaultHasher::new();
     bytes.hash(&mut hasher);
     let etag = format!("\"{:016x}\"", hasher.finish());
     let response = match req.header("if-none-match") {
-        Some(tags) if tags.split(',').any(|t| t.trim() == etag || t.trim() == "*") => Response::new(304),
+        Some(tags) if tags.split(',').any(|t| t.trim() == etag || t.trim() == "*") => Response::builder().status(304).body(Body::empty())?,
         // A HEAD gets a GET's headers, its length included, and no body.
         _ if req.method() == "HEAD" => {
             Response::stream(content_type, |_| async {}).header("content-length", bytes.len().to_string())
@@ -54,4 +56,9 @@ fn file(req: &Request, content_type: &str, cache: &str, bytes: &[u8]) -> Respons
         _ => Response::bytes(content_type, bytes),
     };
     response.header("etag", &etag).header("cache-control", cache)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

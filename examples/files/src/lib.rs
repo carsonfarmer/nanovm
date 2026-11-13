@@ -10,7 +10,9 @@
 use std::hash::{Hash, Hasher};
 
 use nanovm_sdk::fs::{self, DescriptorFlags, OpenFlags};
-use nanovm_sdk::{Request, Response, Result, data, kv, serde_json};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, Result, data, kv, serde_json};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -27,31 +29,31 @@ struct Meta {
 const UPLOAD: &str = ".upload";
 const PIECE: u64 = 64 << 10;
 
-async fn handle(req: Request) -> Result {
-    let path: Vec<&str> = req.path().trim_matches('/').split('/').collect();
+async fn handle(req: Request<Body>) -> Result {
+    let path: Vec<&str> = req.uri().path().trim_matches('/').split('/').collect();
     let file = match path.as_slice() {
         ["files", name] if valid(name) => name.to_string(),
         [""] if req.method() == "GET" => return list().await,
-        _ => return Ok(Response::not_found()),
+        _ => return text(404, "not found"),
     };
     let file = file.as_str();
     let meta: Option<Meta> = match kv::get(file).await? {
         Some(json) => Some(serde_json::from_slice(&json)?),
         None => None,
     };
-    Ok(match (req.method(), meta) {
+    Ok(match (req.method().as_str(), meta) {
         ("PUT", _) => upload(file, req).await?,
         ("GET" | "HEAD", Some(meta)) => download(&req, meta).await?,
         ("DELETE", Some(_)) => {
             data().remove(&format!("f-{file}")).await?;
             kv::delete(file).await?;
-            Response::new(204)
+            Response::builder().status(204).body(Body::empty())?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
-async fn upload(name: &str, req: Request) -> Result {
+async fn upload(name: &str, req: Request<Body>) -> Result {
     let content_type = req.header("content-type").unwrap_or("application/octet-stream").to_string();
     let body = req.into_body();
     let mut hasher = std::hash::DefaultHasher::new();
@@ -64,7 +66,7 @@ async fn upload(name: &str, req: Request) -> Result {
     if let Err(e) = data().write(UPLOAD, body).await {
         let _ = data().remove(UPLOAD).await;
         return Ok(match fs::code(&e).as_str() {
-            "insufficient-space" | "quota" => Response::text(format!("over this bucket's disk quota ({})\n", fs::code(&e))).status(507),
+            "insufficient-space" | "quota" => text(507, format!("over this bucket's disk quota ({})\n", fs::code(&e)))?,
             _ => return Err(e.into()),
         });
     }
@@ -74,7 +76,7 @@ async fn upload(name: &str, req: Request) -> Result {
     Ok(Response::json(json).status(201).header("etag", &meta.etag))
 }
 
-async fn download(req: &Request, meta: Meta) -> Result {
+async fn download(req: &Request<Body>, meta: Meta) -> Result {
     if req.header("if-none-match") == Some(&meta.etag) {
         return Ok(Response::new(304).header("etag", &meta.etag));
     }
@@ -137,10 +139,20 @@ async fn list() -> Result {
     }
     files.sort_by(|a, b| a.name.cmp(&b.name));
     let bytes: u64 = files.iter().map(|f| f.size).sum();
-    Ok(Response::json(serde_json::json!({ "files": files, "bytes": bytes }).to_string()))
+    json(200, serde_json::json!({ "files": files, "bytes": bytes }).to_string())
 }
 
 /// A file name: 1-100 letters, digits, `.`, `_` or `-`, not starting with `.`.
 fn valid(name: &str) -> bool {
     (1..=100).contains(&name.len()) && !name.starts_with('.') && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

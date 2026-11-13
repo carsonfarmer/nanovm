@@ -16,26 +16,29 @@
 
 use std::time::Duration;
 
-use nanovm_sdk::{Request, Response, Result, data, kv, serde_json, sse};
+use nanovm_sdk::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, data, kv, serde_json, sse};
 
 nanovm_sdk::serve!(handle);
 
 const LOG: &str = "events.log";
 
-async fn handle(req: Request) -> Result {
-    Ok(match (req.method(), req.path()) {
+async fn handle(req: Request<Body>) -> Result {
+    Ok(match (req.method().as_str(), req.uri().path()) {
         ("POST", "/events") => {
-            let text = req.text()?;
-            if text.len() > 4096 {
-                return Ok(Response::text("an event is at most 4 KiB\n").status(400));
+            let event = req.body().text()?;
+            if event.len() > 4096 {
+                return text(400, "an event is at most 4 KiB\n");
             }
             let id = kv::increment("events", 1).await?;
             // One line per event: its id, a space, its data as a JSON string.
-            data().append(LOG, format!("{id} {}\n", serde_json::to_string(text)?)).await?;
-            Response::json(format!(r#"{{"id":{id}}}"#)).status(201)
+            data().append(LOG, format!("{id} {}\n", serde_json::to_string(event)?)).await?;
+            json(201, format!(r#"{{"id":{id}}}"#))?
         }
         ("GET", "/events") => {
-            let after: u64 = req.header("last-event-id").or(req.query("after")).and_then(|i| i.parse().ok()).unwrap_or(0);
+            let last = req.headers().get("last-event-id").and_then(|v| v.to_str().ok()).map(String::from);
+            let after: u64 = last.or(req.query("after")).and_then(|i| i.parse().ok()).unwrap_or(0);
             let log = data().read_text(LOG).await?.unwrap_or_default();
             let mut out = String::from("retry: 1000\n\n");
             for (id, text) in log.lines().filter_map(|l| l.split_once(' ')) {
@@ -44,15 +47,15 @@ async fn handle(req: Request) -> Result {
                 }
             }
             // Everything there is, at once: no stream needs to stay open.
-            Response::bytes("text/event-stream", out).header("cache-control", "no-cache")
+            events().body(out.into())?
         }
         ("GET", "/countdown") => {
             let from = req.query_or("from", 5u32).min(100);
             let every = Duration::from_millis(req.query_or("every_ms", 200u64).min(10_000));
-            Response::stream("text/event-stream", move |mut body| async move {
+            events().body(Body::stream(move |mut body| async move {
                 for n in (1..=from).rev() {
                     if !body.write(sse(None, Some("tick"), &n.to_string())).await {
-                        return;
+                        return Ok(());
                     }
                     nanovm_sdk::sleep(every).await;
                 }
@@ -60,13 +63,28 @@ async fn handle(req: Request) -> Result {
                 // Changed after answering: this commits when the stream ends,
                 // or rolls back if the stream outlives post_return_timeout_ms.
                 let _ = kv::increment("countdowns", 1).await;
-            })
-            .header("cache-control", "no-cache")
+                Ok(())
+            }))?
         }
         ("GET", "/") => {
             let get = async |k| kv::get_text(k).await.map(|v| v.unwrap_or("0".into()));
-            Response::json(format!(r#"{{"events":{},"countdowns":{}}}"#, get("events").await?, get("countdowns").await?))
+            json(200, format!(r#"{{"events":{},"countdowns":{}}}"#, get("events").await?, get("countdowns").await?))?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
+}
+
+/// An event stream's start.
+fn events() -> nanovm_sdk::http::response::Builder {
+    Response::builder().header(CONTENT_TYPE, "text/event-stream").header(CACHE_CONTROL, "no-cache")
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

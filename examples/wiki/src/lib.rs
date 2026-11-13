@@ -20,18 +20,20 @@
 use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, quote, sqlite};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, quote, sqlite};
 use pulldown_cmark::{CowStr, Event, Parser, Tag, TagEnd, html};
 
 nanovm_sdk::serve!(handle);
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     schema().await?;
-    let path: Vec<&str> = req.path().trim_matches('/').split('/').collect();
-    Ok(match (req.method(), path.as_slice()) {
+    let path: Vec<&str> = req.uri().path().trim_matches('/').split('/').collect();
+    Ok(match (req.method().as_str(), path.as_slice()) {
         ("GET", [""]) => {
             let pages = sqlite::query("SELECT page, max(rev) AS rev FROM revisions GROUP BY page ORDER BY page", &[]).await?;
-            Response::json(pages.json().to_string())
+            json(200, pages.json().to_string())?
         }
         ("PUT", ["pages", page]) if valid(page) => save(page, &req).await?,
         ("GET", ["pages", page]) => {
@@ -40,7 +42,7 @@ async fn handle(req: Request) -> Result {
                 None => latest(page).await?,
             };
             let found = sqlite::query("SELECT body FROM revisions WHERE page = ? AND rev = ?", &[page, &rev]).await?;
-            let Some(row) = found.first() else { return Ok(Response::not_found()) };
+            let Some(row) = found.first() else { return text(404, "not found") };
             let body: String = row.get("body")?;
             let page = match req.query("raw") {
                 Some(_) => Response::bytes("text/markdown; charset=utf-8", body),
@@ -56,7 +58,7 @@ async fn handle(req: Request) -> Result {
                 &[page],
             )
             .await?;
-            if history.is_empty() { Response::not_found() } else { Response::json(history.json().to_string()) }
+            if history.is_empty() { text(404, "not found")? } else { json(200, history.json().to_string())? }
         }
         ("GET", ["pages", page, "diff"]) => {
             let body = async |rev: &str| -> Result<Option<String>> {
@@ -73,26 +75,26 @@ async fn handle(req: Request) -> Result {
                     let diff = diff.unified_diff().header(&format!("{page}@{from}"), &format!("{page}@{to}")).to_string();
                     Response::bytes("text/x-diff; charset=utf-8", diff)
                 }
-                _ => Response::not_found(),
+                _ => text(404, "not found")?,
             }
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
 /// A new revision of `page`, if it was edited from the latest one. Checking
 /// and saving are one statement, and the wiki serves one request at a time.
-async fn save(page: &str, req: &Request) -> Result {
+async fn save(page: &str, req: &Request<Body>) -> Result {
     let author = req.query("author").unwrap_or("anonymous");
     let base: i64 = match req.header("if-match").map(|r| r.trim_matches('"').parse()) {
         Some(Ok(rev)) => rev,
-        _ => return Ok(Response::text("if-match: the revision you edited (0 for a new page)\n").status(428)),
+        _ => return text(428, "if-match: the revision you edited (0 for a new page)\n"),
     };
     let at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     let saved = sqlite::execute(
         "INSERT INTO revisions SELECT ?1, coalesce(max(rev), 0) + 1, ?2, ?3, ?4 FROM revisions WHERE page = ?1 \
          HAVING coalesce(max(rev), 0) = ?5",
-        &[&page, &req.text()?, &author, &at, &base],
+        &[&page, &req.body().text()?, &author, &at, &base],
     )
     .await?;
     let rev = latest(page).await?;
@@ -167,4 +169,14 @@ async fn schema() -> Result<()> {
         READY.set(true);
     }
     Ok(())
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }
