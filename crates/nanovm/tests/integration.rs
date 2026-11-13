@@ -4262,6 +4262,12 @@ fn probe() -> Vec<u8> {
 /// `crates/nanovm/tests/sdk-after`: an app on nanovm-sdk whose routes do
 /// work after the answer and fail in it, served on a node of its own.
 fn sdk_after(test: &str) -> Arc<Node> {
+    let (app, wasm) = sdk_after_app();
+    Node::new(node_cfg(test, 8), &app, &wasm, None).unwrap()
+}
+
+/// The `sdk-after` app and its component.
+fn sdk_after_app() -> (AppConfig, Vec<u8>) {
     let build = std::process::Command::new("cargo").args([
         "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
         "crates/nanovm/tests/sdk-after/Cargo.toml", "--target-dir", "target/test-guest",
@@ -4270,7 +4276,25 @@ fn sdk_after(test: &str) -> Arc<Node> {
     let wasm = std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/sdk_after_probe.wasm")).unwrap();
     let mut app = app("counter");
     (app.name, app.limits.memory_mb, app.limits.post_return_timeout_ms) = ("sdk".into(), 32, 2000);
-    Node::new(node_cfg(test, 8), &app, &wasm, None).unwrap()
+    (app, wasm)
+}
+
+/// Work after the answer (`after`: 500 ms, then a write) is part of its
+/// request, so retiring its worker (a switch to another version here) lets
+/// it finish and commit, as the drain lets requests finish, rather than
+/// roll it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_workers_work_after_the_answer_commits() {
+    let (mut app, wasm) = sdk_after_app();
+    let (_sup, addr) = supervised("a_retired_workers_work_after_the_answer_commits").await;
+    let v1 = publish_version("retired-after", &app, wasm.clone(), "1.0.0").await;
+    app.env.insert("NEXT".into(), "1".into());
+    let v2 = publish_version("retired-after", &app, wasm, "1.0.1").await;
+    assert_eq!(app_get(addr, &v1, "/a/slow").await, (200, "answered".to_string()));
+    let (status, files) = app_get(addr, &v2, "/a/files").await;
+    assert_eq!(status, 200, "{files}");
+    let files: serde_json::Value = serde_json::from_str(&files).unwrap();
+    assert_eq!(files["later"], true, "work after the answer was cut off by the switch: {files}");
 }
 
 /// What `/files` says: requests the instance has served, and which files the

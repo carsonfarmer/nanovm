@@ -51,8 +51,9 @@ pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// A worker that failed to start is not retried for this long.
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
-/// How long a worker asked to stop has to flush its telemetry and exit
-/// before it is killed (see `drain`).
+/// How long a worker asked to stop has to flush its telemetry and exit,
+/// past the time its objects may take to finish their work after their
+/// answers (`post_return_timeout_ms`), before it is killed (see `drain`).
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Compiling a large component on first start can take a while.
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -137,9 +138,9 @@ struct Live {
     drain: Duration,
     /// Its slot among `max_apps`, passed on to the worker that replaces it.
     slot: Mutex<Option<OwnedSemaphorePermit>>,
-    /// Sending true gives the worker `STOP_TIMEOUT` to exit before it is
-    /// killed (see `drain`); dropping this kills it at once. Closure
-    /// acknowledges actual process exit, not just receipt of the request.
+    /// Sending true gives the worker time to exit before it is killed (see
+    /// `drain`); dropping this kills it at once. Closure acknowledges
+    /// actual process exit, not just receipt of the request.
     kill: watch::Sender<bool>,
 }
 
@@ -447,12 +448,13 @@ impl Supervisor {
         // after it, also when this start fails.
         let (kill, mut killed) = watch::channel(false);
         let (name, dir) = (w.name.clone(), cgroup.as_ref().map(|c| c.0.clone()));
+        let stop = Duration::from_millis(app.limits.post_return_timeout_ms) + STOP_TIMEOUT;
         tokio::spawn(async move {
             tokio::select! {
                 status = child.wait() => eprintln!("nanovm: worker for app {name:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
-                stop = killed.changed() => {
+                asked = killed.changed() => {
                     // Asked to stop, it exits by itself; dropped, it is killed at once.
-                    if stop.is_err() || tokio::time::timeout(STOP_TIMEOUT, child.wait()).await.is_err() {
+                    if asked.is_err() || tokio::time::timeout(stop, child.wait()).await.is_err() {
                         let _ = child.kill().await;
                     }
                 }
@@ -717,8 +719,9 @@ async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<Re
 /// their bodies have been read), or its longest request has had its time,
 /// then asks the worker to stop and waits for it to be gone: what still
 /// holds it can't keep it running beside the next version. Hung up on, a
-/// worker flushes its telemetry and exits (see `worker_main`); one that
-/// takes over `STOP_TIMEOUT` is killed.
+/// worker lets its objects finish their work after their answers, flushes
+/// its telemetry and exits (see `worker_main`); one that takes longer than
+/// that work may, and `STOP_TIMEOUT` more, is killed.
 async fn drain(old: Arc<Live>) {
     let deadline = Instant::now() + old.drain;
     while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
@@ -856,7 +859,8 @@ fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
 
 /// `nanovm worker`: reads its spec and component from stdin, jails itself,
 /// then serves its app to the supervisor until the supervisor hangs up, and
-/// flushes its telemetry before it exits.
+/// lets its objects finish their work and flushes its telemetry before it
+/// exits.
 pub fn worker_main() -> anyhow::Result<()> {
     use std::io::BufRead;
     let mut input = std::io::stdin().lock();
@@ -894,10 +898,10 @@ pub fn worker_main() -> anyhow::Result<()> {
         // Pool 0 for the runtime's threads, 1 for the telemetry export thread.
         let upstream = Dialer::new(upstream, 2);
         let node = Node::with_engine(engine, &linker, cfg, &app, Wasm::File(wasm, &digest), Some(upstream))?;
-        let telemetry = node.telemetry.clone();
-        let requests = tokio::net::UnixStream::from_std(requests)?;
-        link::serve(requests, vec![], move |req| crate::server::handle(node.clone(), req)).await?;
-        tokio::task::spawn_blocking(move || telemetry.flush()).await?
+        let (requests, serving) = (tokio::net::UnixStream::from_std(requests)?, node.clone());
+        link::serve(requests, vec![], move |req| crate::server::handle(serving.clone(), req)).await?;
+        node.shutdown().await;
+        tokio::task::spawn_blocking(move || node.telemetry.flush()).await?
     })
 }
 
