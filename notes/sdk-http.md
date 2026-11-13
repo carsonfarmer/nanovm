@@ -84,7 +84,8 @@ async fn handle(_req: http::Request<Body>) -> Result {
 ```
 
 The new hello's answer has no `content-type` (`Response::text` set
-`text/plain`); `curl` doesn't care, and the builder adds one.
+`text/plain`); `curl` doesn't care, and an app that wants one sets it with
+the builder.
 
 **Round 3's fixes, carried over.** The branch merges `cf/round3` at 7b3f9c6,
 whose r3-dev fixes changed the old SDK (N-710, N-713), and keeps them on the
@@ -128,7 +129,25 @@ handler export +13 KB, `bytes` about 4 KB; our own SDK code shrank by
 `http_from_wasi_request` (above) took 11.8 KB of that back. Any app on
 `http` types pays the rest; the only way around it is not to use the crate.
 
-**CPU per request.** CPU_PLACEHOLDER
+**CPU per request.** `nanovm run` (a release build of this branch's node),
+one request at a time with `oha -c 1`, 500 to warm up, then CPU from the
+process's `utime + stime` in `/proc` (threads that exit included), builds
+alternated each round. The machine was shared with six other agents'
+builds and tests (load 13–24 on 4 cores, not idle), so differences under
+about 10 µs are within the noise.
+
+| request | 7b3f9c6 median (range) | this branch median (range) | paired difference |
+|---|---:|---:|---:|
+| hello `GET /alice/` (a write that commits), 5 × 2,000 | 1,315 µs (1,130–1,500) | 1,330 µs (1,095–1,420) | −35 µs median, either sign |
+| chat `GET /general/messages` (read only), 8 × 10,000 | 52 µs (47–57) | 57.5 µs (50–69) | +5 µs median, higher in 7 of 8 |
+
+A request that writes can't tell the two apart: the commit dominates. A
+cheap read-only one costs about 5 µs more, about 10%: parsing headers into a
+`HeaderMap` (each name through `HeaderName::from_bytes`), the URI, and the
+response's headers back into `Fields`. Earlier runs, under heavier load
+(about 26), gave +9.5 µs over 16 rounds before the merge and could not tell
+`http_from_wasi_request` (72.5 µs) from the direct build (67.5 µs) or round
+3 (68 µs).
 
 ## Tests
 
@@ -158,11 +177,16 @@ handler export +13 KB, `bytes` about 4 KB; our own SDK code shrank by
   | keep one value per header name (`insert`, not `append`) | echo: `["2"]`, not `["1", "2"]` |
   | header values made UTF-8, lossily | echo: `caf\u{fffd} …`, not `caf\xe9 \xff\x80` |
   | no `content-length` for bytes | echo: no `content-length` |
-  | a stream writer's error ignored | gateway: the client's stream ends cleanly |
+  | a stream writer's error ignored | `review2_gateway_tells_its_client_when_the_upstream_breaks_off` |
+  | a failed stream rolls nothing back | `a_streamed_body_whose_writer_fails_breaks_off_and_rolls_back`: `streamed` written, instance kept |
+  | `after` work starts before the answer is out | `after_work_that_panics_leaves_the_answer_standing`: `500 trap`, not `200` |
   | `query` keeps the first of several | SDK unit test: `7`, not `8` |
-- End-to-end, serially (`RUST_TEST_THREADS=1`): `examples.rs` 26 passed
-  (echo's new one included), `dev.rs` 9 (the quickstart's hello and
-  chat among them), `js.rs` 11.
+- End-to-end, serially (`RUST_TEST_THREADS=1`), after the merge:
+  `examples.rs` 28 passed (echo's and round 3's review2 tests included),
+  `dev.rs` 9 (the quickstart's hello and chat among them), `js.rs` 17
+  (`wait_until_*` included), and integration.rs's 4 `after`/stream tests.
+  The first four mutations ran before the merge (echo rebuilt each time),
+  the last four after it.
 
 ## JavaScript
 
@@ -175,7 +199,14 @@ with those bytes replaced, as before.
 ## Not done
 
 - Response helpers (`json`, `text`, `html` with their content types) are
-  not in the SDK; the examples keep their own. Owner question.
+  not in the SDK; the examples keep their own (46 copies of two-line
+  helpers, about 230 lines). An owner question: adding them would be about
+  ten lines in the SDK.
 - `fetch` of a request that carries a `host` header (copied from an incoming
   request) fails: `wasi:http` forbids it. `http-compat` moves it into the
   URI's authority; the SDK doesn't (B-703).
+- The old `Response::into_wit` (a response as `wasip3`'s, for a handler
+  written against the bindings directly) has no replacement; such a handler
+  uses `http-compat` itself.
+- The SQLite durability suite wasn't rerun: nothing here touches SQLite or
+  the runtime.
