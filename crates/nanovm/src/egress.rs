@@ -147,8 +147,9 @@ pub struct EgressHooks {
     pub sem: Arc<Semaphore>,
     pub metrics: Arc<Metrics>,
     pub obj: Arc<crate::object::ObjShared>,
-    /// Publishes to the object's sockets, held until its request commits.
-    pub held: Arc<parking_lot::Mutex<Vec<http::Request<bytes::Bytes>>>>,
+    /// The bodies of publishes to the object's sockets, held until its
+    /// request commits (see [`hold`]).
+    pub held: Arc<parking_lot::Mutex<Vec<bytes::Bytes>>>,
     pub publish_max: usize,
 }
 
@@ -171,7 +172,7 @@ impl WasiHttpHooks for EgressHooks {
         let internal = request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS);
         if !internal && request.uri().host() == Some(crate::ws::PUBLISH_HOST) && matches!(route, Route::Supervisor(_)) {
             let (held, max) = (self.held.clone(), self.publish_max);
-            return Box::new(async move { Ok((hold(request, &obj, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
+            return Box::new(async move { Ok((hold(request, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
         }
         let node = self.node.clone();
         Box::new(async move {
@@ -305,24 +306,31 @@ fn client_response<B>(span: &mut crate::telemetry::Span, result: Result<&http::R
     }
 }
 
-/// Holds a publish until the request commits, named with its object so it
-/// reaches only that object's sockets; answers what the supervisor would.
+/// Holds a publish's body until the request commits, answering what the
+/// supervisor would. Nothing else of it is kept: the supervisor forwards a
+/// publish's body and the object it names, which the commit names (N-692).
+/// What a request holds is bounded like one publish, each counting its slot.
 async fn hold(
     req: http::Request<WasiBody>,
-    obj: &crate::object::ObjShared,
-    held: &parking_lot::Mutex<Vec<http::Request<bytes::Bytes>>>,
+    held: &parking_lot::Mutex<Vec<bytes::Bytes>>,
     max: usize,
 ) -> http::Response<WasiBody> {
-    let (mut parts, body) = req.into_parts();
-    let status = match http_body_util::Limited::new(body, max).collect().await.map(|b| b.to_bytes()) {
-        Err(_) => 413,
-        Ok(body) if !crate::ws::well_formed(&body) => 400,
-        // What a request holds is bounded like one publish.
-        Ok(body) if held.lock().iter().map(|r| r.body().len()).sum::<usize>() + body.len() > max => 413,
-        Ok(body) => {
-            parts.headers.insert(crate::ws::OBJECT_HEADER, obj.id.parse().expect("object ids are header-safe"));
-            held.lock().push(http::Request::from_parts(parts, body));
-            200
+    let size = |body: &bytes::Bytes| body.len() + size_of::<bytes::Bytes>();
+    let status = if req.method() != http::Method::POST || req.uri().path().trim_end_matches('/') != "/publish" {
+        404
+    } else {
+        match http_body_util::Limited::new(req.into_body(), max).collect().await.map(|b| b.to_bytes()) {
+            Err(_) => 413,
+            Ok(body) if !crate::ws::well_formed(&body) => 400,
+            Ok(body) => {
+                let mut held = held.lock();
+                if held.iter().map(size).sum::<usize>() + size(&body) > max {
+                    413
+                } else {
+                    held.push(body);
+                    200
+                }
+            }
         }
     };
     let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
@@ -456,7 +464,9 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
 
     let (mut sender, conn) = tokio::time::timeout(
         connect_timeout,
-        hyper::client::conn::http1::Builder::new().handshake(wasmtime_wasi_http::io::TokioIo::new(io)),
+        hyper::client::conn::http1::Builder::new()
+            .max_header_size(crate::server::MAX_HEAD)
+            .handshake(wasmtime_wasi_http::io::TokioIo::new(io)),
     )
     .await
     .map_err(|_| Error::ConnectionTimeout)??;
@@ -465,6 +475,10 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
         .path_and_query(uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"))
         .build()
         .map_err(|_| Error::HttpRequestUriInvalid)?;
+    // The host the policy allowed, not whatever `Host` a worker sent: a shared
+    // front end (a CDN) routes by it.
+    let authority = uri.authority().map_or("", |a| a.as_str().rsplit_once('@').map_or(a.as_str(), |(_, h)| h));
+    req.headers_mut().insert(http::header::HOST, authority.parse().map_err(|_| Error::HttpRequestUriInvalid)?);
 
     // The connection runs as its own task; it ends once the request and
     // response bodies are done or dropped.
@@ -678,6 +692,26 @@ mod tests {
         http::Request::get(uri).body(body).unwrap()
     }
 
+    /// The upstream hears the host the policy allowed, whatever `Host` a
+    /// (compromised) worker's request carries: a shared front end, as on a
+    /// CDN, would route by that header to a host the list never named.
+    #[tokio::test]
+    async fn the_upstream_hears_the_allowed_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(crate::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| {
+            let _ = tx.send(req.headers().get_all(http::header::HOST).iter().cloned().collect::<Vec<_>>());
+            async { crate::server::ok_json(serde_json::json!({})) }
+        }));
+        let p = policy(&[&format!("127.0.0.1:{port}")]);
+        let mut req = get(&format!("http://127.0.0.1:{port}/"));
+        req.headers_mut().insert(http::header::HOST, "elsewhere.example".parse().unwrap());
+        let (res, _conn) = send(req, None, &p).await.unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(heard.recv().await.unwrap(), [format!("127.0.0.1:{port}")]);
+    }
+
     /// Requests are checked before any connection: not on the list (with
     /// the scheme's default port), no host, or an allowed name pointing at a
     /// private address, whether written as an IP or resolved.
@@ -699,5 +733,35 @@ mod tests {
             refused("http://localhost/").await.as_deref(),
             Some("DestinationIpProhibited")
         );
+    }
+
+    /// What its held publishes retain: each its slot and its body.
+    fn retained(held: &parking_lot::Mutex<Vec<bytes::Bytes>>) -> usize {
+        held.lock().iter().map(|b| size_of_val(b) + b.len()).sum()
+    }
+
+    /// What a request holds to publish is bounded like one publish: 300
+    /// publishes with 60 KiB of headers each retained 18 MB, past a 16 MiB
+    /// object's memory, and tiny ones 25 times their bodies (N-692).
+    #[tokio::test]
+    async fn held_publishes_are_bounded_like_one_publish() {
+        let publish = |header: usize| {
+            let body = http_body_util::Full::new(bytes::Bytes::from_static(br#"{"items":[]}"#));
+            let body = body.map_err(|e| match e {}).boxed_unsync();
+            let mut req = http::Request::post("http://nanovm/publish/").body(body).unwrap();
+            if header > 0 {
+                req.headers_mut().insert("x-big", "x".repeat(header).parse().unwrap());
+            }
+            req
+        };
+        for (header, max, n) in [(60 << 10, 8 << 20, 300), (0, 64 << 10, 100_000)] {
+            let held = Default::default();
+            let mut taken = 0;
+            while taken < n && hold(publish(header), &held, max).await.status() == 200 {
+                taken += 1;
+            }
+            let bytes = retained(&held);
+            assert!(bytes <= max, "{taken} publishes with {header}-byte headers retain {bytes} bytes, past {max}");
+        }
     }
 }

@@ -1,0 +1,41 @@
+[package]
+name = "refused-imports"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+# The library is the control: a service that imports only what nanovm
+# offers. Each example is the same service plus one thing nanovm refuses.
+[lib]
+crate-type = ["cdylib"]
+
+[[example]]
+name = "p2_sockets"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "p3_sockets"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "p2_filesystem"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "custom_import"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "command"
+crate-type = ["cdylib"]
+
+[dependencies]
+util = { path = "../../../../guests/util" }
+wit-bindgen = "0.62"
+wasip2 = "2.0.1"
+
+[profile.release]
+opt-level = "s"
+strip = true

@@ -22,14 +22,17 @@
 //! hold as much as the object's quota.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
 
-use crate::{committed, config::CaptureConfig, object::ObjShared};
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, mkdirat, openat, renameat_with, statat, unlinkat};
+use rustix::io::Errno;
+
+use crate::{committed, config::CaptureConfig, metrics::thread_cpu_ns, object::ObjShared};
 
 const LOG: &str = "log";
 /// Overwritten bytes are kept in records of at most this many.
@@ -181,7 +184,7 @@ impl Journal {
         // An I/O failure may leave a complete or partial record. Do not
         // permit more mutations or a commit until recovery has run.
         self.poisoned = true;
-        let t0 = Instant::now();
+        let t0 = thread_cpu_ns();
         if self.log.is_none() {
             // The directories the log is first made in must be durable too.
             std::fs::create_dir_all(&self.dir)?;
@@ -197,7 +200,7 @@ impl Journal {
         tests::sync_point()?;
         log.sync_data()?;
         self.poisoned = false;
-        self.obj.uncharge(t0.elapsed());
+        self.obj.uncharge(t0);
         Ok(())
     }
 
@@ -250,8 +253,13 @@ impl Journal {
     /// Before the entry at `path` is created, if nothing is there yet.
     pub fn creating(&mut self, path: &Path) -> std::io::Result<()> {
         let path: PathBuf = path.components().collect();
-        if std::fs::symlink_metadata(&path).is_ok() {
-            return Ok(());
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => return Ok(()),
+            // Under a file, or a name or path too long: the create would fail
+            // the same way, unless (a path too long for us, not the guest's
+            // descriptor) it made what we couldn't reach to undo. Refuse.
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+            Err(_) => {}
         }
         let p = self.rel(&path);
         self.record(Undo::Created(p.clone()))?;
@@ -311,8 +319,11 @@ impl Journal {
 
     /// Before the empty directory at `path` is removed, if one is there.
     pub fn removing_dir(&mut self, path: &Path) -> std::io::Result<()> {
-        if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
-            return Ok(());
+        match std::fs::symlink_metadata(path) {
+            Ok(md) if md.is_dir() => {}
+            // As in `creating`: only a missing entry or a file is left to the syscall.
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+            _ => return Ok(()),
         }
         let p = self.rel(path);
         self.record(Undo::RemovedDir(p.clone()))?;
@@ -340,6 +351,7 @@ impl Journal {
     /// Before `from` is renamed to `to`, where nothing is or an empty
     /// directory (removed with [`Self::removing_dir`]) is.
     pub fn renaming(&mut self, from: &Path, to: &Path) -> std::io::Result<u64> {
+        within_path_max(to, from)?;
         let (from, to) = (self.rel(from), self.rel(to));
         let at = self.held.0;
         self.record(Undo::Renamed(from.clone(), to.clone()))?;
@@ -386,12 +398,12 @@ impl Journal {
         })
     }
 
-    /// Runs `f`, whose waits for the disk aren't charged as CPU; if it
-    /// fails, the journal needs recovery.
+    /// Runs `f`, whose CPU isn't charged to the guest; if it fails, the
+    /// journal needs recovery.
     fn or_poison(&mut self, f: impl FnOnce(&mut Self) -> std::io::Result<()>) -> std::io::Result<()> {
-        let t0 = Instant::now();
+        let t0 = thread_cpu_ns();
         let result = f(self);
-        self.obj.uncharge(t0.elapsed());
+        self.obj.uncharge(t0);
         self.poisoned |= result.is_err();
         result
     }
@@ -414,7 +426,7 @@ impl Journal {
         // Any error leaves the outcome uncertain. In particular, taking the
         // log must not make a second commit look like an empty successful one.
         self.poisoned = true;
-        let t0 = Instant::now();
+        let t0 = thread_cpu_ns();
         for p in self.touched.drain() {
             sync_if_there(&self.base.join(p))?;
         }
@@ -429,7 +441,7 @@ impl Journal {
         if self.capture.is_some() {
             committed::finish(&self.dir, &out, &self.obj)?;
         }
-        self.obj.uncharge(t0.elapsed());
+        self.obj.uncharge(t0);
         clear(&self.dir)?;
         self.sized.clear();
         self.created.clear();
@@ -457,45 +469,48 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<()> {
     // each tolerates. A record cut short by a crash was never acted on.
     let file = File::options().write(true).open(dir.join(LOG))?;
     for (at, undo) in decode(&log).into_iter().rev() {
-        let abs = |p: &PathBuf| base.join(p);
-        let open = |p: &PathBuf| File::options().write(true).open(abs(p));
+        let open = |p: &Path| -> std::io::Result<File> {
+            let (dir, name) = parent_at(base, p)?;
+            Ok(openat(&dir, name, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?.into())
+        };
         match &undo {
             Undo::Size(p, n) => open(p).and_then(|f| f.set_len(*n)),
             Undo::Bytes(p, at, data) => open(p).and_then(|f| f.write_all_at(data, *at)),
-            Undo::Created(p) => match std::fs::symlink_metadata(abs(p)) {
-                Ok(md) if md.is_dir() => std::fs::remove_dir(abs(p)),
-                Ok(_) => std::fs::remove_file(abs(p)),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            },
-            Undo::RemovedDir(p) => std::fs::create_dir(abs(p)).or_else(|e| {
-                if e.kind() == ErrorKind::AlreadyExists && std::fs::symlink_metadata(abs(p))?.is_dir() {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
+            Undo::Created(p) => parent_at(base, p).and_then(|(dir, name)| match is_dir_at(&dir, name)? {
+                Some(true) => Ok(unlinkat(&dir, name, AtFlags::REMOVEDIR)?),
+                Some(false) => Ok(unlinkat(&dir, name, AtFlags::empty())?),
+                None => Ok(()),
             }),
-            Undo::Renamed(from, to) => {
+            Undo::RemovedDir(p) => parent_at(base, p).and_then(|(dir, name)| match mkdirat(&dir, name, 0o777.into()) {
+                Err(e) if e == Errno::EXIST && is_dir_at(&dir, name)? == Some(true) => Ok(()),
+                made => Ok(made?),
+            }),
+            Undo::Renamed(from, to) => (|| {
                 // The source is present after an earlier replay or a failed
                 // syscall. Both may be absent for a discarded new file.
-                if abs(from).try_exists()? || !abs(to).try_exists()? {
-                    Ok(())
-                } else {
-                    std::fs::rename(abs(to), abs(from))
+                let (a, x) = parent_at(base, from)?;
+                if is_dir_at(&a, x)?.is_none() {
+                    let (b, y) = parent_at(base, to)?;
+                    if is_dir_at(&b, y)?.is_some() {
+                        renameat_with(&b, y, &a, x, RenameFlags::empty())?;
+                    }
                 }
-            }
+                Ok(())
+            })(),
             Undo::Cancelled => Ok(()),
-        }?;
+        }
+        // A path that can't name an entry has nothing to undo (N-502, N-503).
+        .or_else(|e| if shape(&e) { Ok(()) } else { Err(e) })?;
         let p = match &undo {
             Undo::Size(p, _) | Undo::Bytes(p, ..) => p.as_path(),
             Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
             Undo::Cancelled => Path::new(""),
         };
-        sync_if_there(&base.join(p))?;
+        sync_at(base, p)?;
         if let Undo::Renamed(_, to) = &undo {
             // A cross-directory rename changes both parents. Persist both
             // before dropping its undo, including when replay runs twice.
-            sync_if_there(&base.join(to.parent().unwrap_or(Path::new(""))))?;
+            sync_at(base, to.parent().unwrap_or(Path::new("")))?;
         }
         #[cfg(test)]
         tests::crash_point()?;
@@ -507,6 +522,57 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<()> {
     std::fs::remove_file(dir.join(LOG))?;
     sync(dir)?;
     clear(dir)
+}
+
+/// The directory holding `p` (relative to `base`), opened one name at a
+/// time and never through a symlink, and `p`'s name in it. Recovery reaches
+/// entries so: a log written before N-504 can name a real entry whose whole
+/// path is past PATH_MAX, made through a guest's descriptor, while each of
+/// its names fits. Only a name past NAME_MAX is then too long, and nothing
+/// can have one (N-690).
+fn parent_at<'a>(base: &Path, p: &'a Path) -> std::io::Result<(File, &'a OsStr)> {
+    let name = p.file_name().ok_or(ErrorKind::InvalidInput)?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // `openat` and `renameat2`: on x86_64 rustix's `open` is SYS_open, and
+    // on aarch64 its `renameat` is SYS_renameat, neither in the jail's list.
+    let mut dir = openat(CWD, base, flags, Mode::empty())?;
+    for c in p.parent().expect("named").components() {
+        let Component::Normal(c) = c else { return Err(ErrorKind::InvalidInput.into()) };
+        dir = openat(&dir, c, flags | OFlags::NOFOLLOW, Mode::empty())?;
+    }
+    Ok((dir.into(), name))
+}
+
+/// Whether `name` in `dir` is a directory; `None` if nothing can be there.
+fn is_dir_at(dir: &File, name: &OsStr) -> std::io::Result<Option<bool>> {
+    match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from) {
+        Ok(st) => Ok(Some(FileType::from_raw_mode(st.st_mode).is_dir())),
+        Err(e) if shape(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Syncs `p` (relative to `base`, reached as by [`parent_at`]; `""` is the
+/// base) unless nothing can be there.
+fn sync_at(base: &Path, p: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::sync_point()?;
+    let file = match p.file_name() {
+        None => File::open(base),
+        Some(_) => parent_at(base, p).and_then(|(dir, name)| {
+            Ok(openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?.into())
+        }),
+    };
+    match file {
+        Err(e) if shape(&e) => Ok(()),
+        file => file?.sync_all(),
+    }
+}
+
+/// Whether recovery has nothing to undo at a path: [`no_entry`], or a
+/// symlink (only made from outside), which recovery never follows.
+fn shape(e: &std::io::Error) -> bool {
+    no_entry(e) || e.raw_os_error() == Some(libc::ELOOP)
 }
 
 /// A record: a tag, then its fields; a path or bytes as a length and the
@@ -614,9 +680,39 @@ pub(crate) fn sync_ancestors(dir: &Path) -> std::io::Result<()> {
 /// Syncs `p` unless a later change removed it or replaced an ancestor with a file.
 fn sync_if_there(p: &Path) -> std::io::Result<()> {
     match sync(p) {
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(()),
+        Err(e) if no_entry(&e) => Ok(()),
         r => r,
     }
+}
+
+/// Whether `e` says, from a path's shape rather than the disk, that nothing
+/// can be there: missing, under a file, a name or path too long. Anything
+/// else (EIO, EACCES, ...) is a real failure.
+fn no_entry(e: &std::io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory | ErrorKind::InvalidFilename)
+}
+
+/// Refuses to move `from` (and what is under it) to `to` where a path would
+/// reach PATH_MAX: the journal, commits and recovery reach entries by path,
+/// while a guest's descriptors reach deeper (`creating` refuses such creates).
+fn within_path_max(to: &Path, from: &Path) -> std::io::Result<()> {
+    let dir = std::fs::symlink_metadata(from).is_ok_and(|m| m.is_dir());
+    let mut dirs: Vec<PathBuf> = Some(from.to_path_buf()).filter(|_| dir).into_iter().collect();
+    let mut deepest = 0;
+    while let Some(dir) = dirs.pop() {
+        for e in std::fs::read_dir(&dir)? {
+            // The entry's own type: no stat, and never through a symlink.
+            let (p, is_dir) = e.and_then(|e| Ok((e.path(), e.file_type()?.is_dir())))?;
+            deepest = deepest.max(p.as_os_str().len() - from.as_os_str().len());
+            if is_dir {
+                dirs.push(p);
+            }
+        }
+    }
+    if to.as_os_str().len() + deepest >= libc::PATH_MAX as usize {
+        return Err(ErrorKind::InvalidFilename.into());
+    }
+    Ok(())
 }
 
 /// Where the file behind `file` is now.
@@ -1189,6 +1285,245 @@ mod tests {
         drop(j);
         open(&v);
         assert_eq!(tree(&v), before);
+    }
+
+    /// A create that can't succeed where the journal can name it (under a
+    /// file, a name over NAME_MAX, a path reaching PATH_MAX) is refused, not
+    /// recorded: a record of it used to fail every later recovery, so the
+    /// object answered 503 `instantiate-failed` for good (N-502, N-503).
+    #[test]
+    fn creates_the_journal_cannot_name_are_refused() {
+        let v = volume();
+        let mut j = open(&v);
+        let deep: PathBuf = std::iter::repeat_n("n".repeat(255), 16).collect();
+        let long = "n".repeat(256);
+        for (p, kind) in [("a/x", ErrorKind::NotADirectory), ("f/x/y", ErrorKind::NotADirectory),
+            (long.as_str(), ErrorKind::InvalidFilename), (deep.to_str().unwrap(), ErrorKind::InvalidFilename)] {
+            assert_eq!(j.creating(&v.join(p)).unwrap_err().kind(), kind, "{p}");
+            assert_eq!(j.removing_dir(&v.join(p)).unwrap_err().kind(), kind, "{p}");
+        }
+        assert!(j.log.is_none());
+        // Nor may a rename put what is under a directory past PATH_MAX: a
+        // chain that fits, moved under a directory deep enough that it
+        // wouldn't. The chain's files are walked too.
+        let levels = |n| std::iter::repeat_n("n".repeat(255), n).collect::<PathBuf>();
+        std::fs::create_dir_all(v.join("c").join(levels(7))).unwrap();
+        std::fs::write(v.join("c").join(levels(7)).join("n".repeat(255)), b"x").unwrap();
+        std::fs::create_dir_all(v.join(levels(8))).unwrap();
+        let too_deep = j.renaming(&v.join("c"), &v.join(levels(8)).join("c"));
+        assert_eq!(too_deep.unwrap_err().kind(), ErrorKind::InvalidFilename);
+        assert!(j.log.is_none());
+        j.renaming(&v.join("c"), &v.join(levels(7)).join("c")).unwrap();
+        // The walk never follows a symlink: an operator's link to an
+        // ancestor (guests can't make one) would otherwise never end.
+        std::fs::create_dir(v.join("s")).unwrap();
+        std::os::unix::fs::symlink("..", v.join("s/up")).unwrap();
+        std::os::unix::fs::symlink(v.join("s"), v.join("link")).unwrap();
+        j.renaming(&v.join("s"), &v.join("s2")).unwrap();
+        j.renaming(&v.join("link"), &v.join("link2")).unwrap();
+    }
+
+    /// Logs written before that, naming such paths in any record, recover.
+    #[test]
+    fn logs_naming_impossible_paths_recover() {
+        let v = volume();
+        let before = tree(&v);
+        let mut j = open(&v);
+        let long = "n".repeat(256);
+        for p in ["a/x", "f/x/y", long.as_str(), "missing/x"] {
+            let p = j.rel(&v.join(p));
+            for undo in [Undo::Created(p.clone()), Undo::RemovedDir(p.clone()), Undo::Size(p.clone(), 0),
+                Undo::Bytes(p.clone(), 0, b"x".to_vec()), Undo::Renamed(p.clone(), j.rel(&v.join("a")))] {
+                j.record(undo).unwrap();
+            }
+        }
+        drop(j);
+        reopen(&v, 1 << 30).expect("recovery succeeds");
+        assert_eq!(tree(&v), before);
+    }
+
+    /// A log written before N-504, in the same encoding, can name a real
+    /// entry whose whole path is past PATH_MAX while each name fits: the
+    /// guest made it through a directory's descriptor. Recovery undoes it
+    /// through descriptors, for every kind of record, rather than taking it
+    /// for nothing there and dropping the undo (N-690).
+    #[test]
+    fn long_paths_in_old_logs_are_undone() {
+        use rustix::fs::renameat;
+        use std::os::fd::AsRawFd;
+        let v = volume();
+        // A directory whose own path fits, holding 200-byte names that don't.
+        let mut deep = v.clone();
+        while deep.as_os_str().len() < libc::PATH_MAX as usize - 100 {
+            let room = libc::PATH_MAX as usize - 100 - deep.as_os_str().len();
+            deep.push("c".repeat(room.clamp(2, 256) - 1));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let dir = File::open(&deep).unwrap();
+        let name = |c: &str| c.repeat(200);
+        let write = |c: &str, data: &[u8]| {
+            let f = openat(&dir, name(c), OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC, 0o644.into()).unwrap();
+            File::from(f).write_all_at(data, 0).unwrap();
+        };
+        write("f", b"hello world");
+        write("g", b"gee");
+        write("h", b"aitch");
+        mkdirat(&dir, name("e"), Mode::from(0o755)).unwrap();
+        // Short paths for the descriptor's directory and what is in it.
+        let listing = || tree(Path::new(&format!("/proc/self/fd/{}", dir.as_raw_fd())));
+        let before = listing();
+        let mut j = open(&v);
+        let rel = |c: &str| {
+            let p = deep.join(name(c));
+            assert!(p.as_os_str().len() >= libc::PATH_MAX as usize);
+            j.rel(&p)
+        };
+        // Each change as the journal before N-504 recorded it, then made by
+        // the guest through the directory's descriptor.
+        let undos = [Undo::Created(rel("n")), Undo::Created(rel("m")), Undo::Size(rel("f"), 11),
+            Undo::Bytes(rel("f"), 0, b"hello world".to_vec()), Undo::RemovedDir(rel("e")),
+            Undo::Renamed(rel("g"), j.rel(&j.dir.join("1"))), Undo::Renamed(rel("h"), rel("i"))];
+        for undo in undos {
+            j.record(undo).unwrap();
+        }
+        write("n", b"new");
+        mkdirat(&dir, name("m"), Mode::from(0o755)).unwrap();
+        write("f", b"HELLO WORLD, AND MORE");
+        unlinkat(&dir, name("e"), AtFlags::REMOVEDIR).unwrap();
+        renameat(&dir, name("g"), File::open(&j.dir).unwrap(), "1").unwrap();
+        renameat(&dir, name("h"), &dir, name("i")).unwrap();
+        assert_ne!(listing(), before);
+        drop(j);
+        open(&v);
+        assert_eq!(listing(), before);
+    }
+
+    /// The parent of `p` (whatever the length of `p`) and `p`'s name, for
+    /// the `*at` calls a guest's descriptors make.
+    fn at(p: &Path) -> Option<(File, std::ffi::CString)> {
+        use std::os::unix::ffi::OsStrExt;
+        let parent = File::open(p.parent()?).ok()?;
+        Some((parent, std::ffi::CString::new(p.file_name()?.as_bytes()).ok()?))
+    }
+
+    /// Random path shapes (files as parents, 255- and 256-byte names, a
+    /// chain of directories ending just short of PATH_MAX and past it,
+    /// missing parents) through creates, mkdirs, overwrites, unlinks, rmdirs
+    /// and renames, driving the journal as `quota.rs` does and making the
+    /// syscalls as a guest's descriptors would; then the request fails. The
+    /// next open always recovers, to the tree as it was.
+    #[test]
+    fn random_path_shapes_always_roll_back() {
+        use std::os::fd::AsRawFd;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut pick = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let n = |c: &str, len| c.repeat(len);
+        for round in 0..300 {
+            let v = volume();
+            let mut chain = v.clone();
+            while chain.as_os_str().len() + 2 * 256 < libc::PATH_MAX as usize {
+                chain.push(n("c", 255));
+            }
+            std::fs::create_dir_all(&chain).unwrap();
+            let deep = chain.strip_prefix(&v).unwrap().to_path_buf();
+            let shapes: Vec<PathBuf> = vec![
+                "a".into(), "a/x".into(), "d".into(), "d/b".into(), "d/x".into(), "e".into(), "e/x".into(),
+                "f".into(), "m/x".into(), n("n", 255).into(), n("n", 256).into(), PathBuf::from("d").join(n("o", 255)),
+                deep.join("x"), deep.join(n("p", 255)), deep.join(n("p", 255)).join(n("q", 255)),
+                deep.join(n("p", 255)).join("x"),
+            ];
+            let before = tree(&v);
+            let mut j = open(&v);
+            let mut ops = vec![];
+            for _ in 0..8 {
+                let (p, q) = (v.join(&shapes[pick(shapes.len())]), v.join(&shapes[pick(shapes.len())]));
+                let op = pick(6);
+                let short = |p: &Path| {
+                    let c = p.strip_prefix(&v).unwrap().iter().map(|c| c.to_string_lossy().into_owned());
+                    c.map(|c| if c.len() > 8 { format!("{}*{}", &c[..1], c.len()) } else { c }).collect::<Vec<_>>().join("/")
+                };
+                ops.push((op, short(&p), short(&q)));
+                match op {
+                    0 | 1 if j.creating(&p).is_ok() => {
+                        // `open_at`: only a file that wasn't there is new.
+                        let existed = std::fs::symlink_metadata(&p).is_ok();
+                        let Some((dir, name)) = at(&p) else { continue };
+                        // SAFETY: plain *at calls on a descriptor we own.
+                        let made = unsafe {
+                            if op == 1 {
+                                libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) == 0
+                            } else {
+                                let fd = libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_CREAT | libc::O_WRONLY | libc::O_CLOEXEC, 0o644);
+                                fd >= 0 && libc::close(fd) == 0
+                            }
+                        };
+                        if made && op == 0 && !existed {
+                            let _ = j.created(&p);
+                        }
+                    }
+                    2 => {
+                        if let Ok(f) = File::options().write(true).open(&p)
+                            && j.writing(&f, 0, 4).is_ok()
+                        {
+                            f.write_all_at(b"XXXX", 0).unwrap();
+                        }
+                    }
+                    3 => match std::fs::symlink_metadata(&p) {
+                        Ok(md) if md.is_file() => _ = j.unlink(&p, md.len()),
+                        _ => _ = std::fs::remove_file(&p),
+                    },
+                    4 if j.removing_dir(&p).is_ok() => _ = std::fs::remove_dir(&p),
+                    5 if p != q => {
+                        // `QuotaGuard::rename`.
+                        let Ok(src) = std::fs::symlink_metadata(&p) else { continue };
+                        let mut file = None;
+                        match std::fs::symlink_metadata(&q) {
+                            Ok(d) if d.is_file() && src.is_dir() => continue,
+                            Ok(d) if d.is_file() => match j.remove(&q, d.len()) {
+                                Ok(slot) => file = Some((slot, d.len())),
+                                Err(_) => continue,
+                            },
+                            Ok(_) if j.removing_dir(&q).is_err() => continue,
+                            _ => {}
+                        }
+                        let record = j.renaming(&p, &q);
+                        let moved = record.is_ok() && match (at(&p), at(&q)) {
+                            // SAFETY: as above.
+                            (Some((a, x)), Some((b, y))) => unsafe {
+                                libc::renameat(a.as_raw_fd(), x.as_ptr(), b.as_raw_fd(), y.as_ptr()) == 0
+                            },
+                            _ => false,
+                        };
+                        if moved {
+                            j.renamed(&p, &q);
+                            if let Some((slot, len)) = file {
+                                j.discard_created(&slot, len).unwrap();
+                            }
+                            continue;
+                        }
+                        if let Some((slot, len)) = file {
+                            j.restore(&slot, &q, len).unwrap();
+                        }
+                        if let Ok(at) = record {
+                            j.cancel_rename(at).unwrap();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            drop(j);
+            reopen(&v, 1 << 30).unwrap_or_else(|e| panic!("round {round}: recovery failed ({e}) after {ops:?}"));
+            let after = tree(&v);
+            let differ: Vec<_> = before.keys().chain(after.keys()).filter(|k| before.get(*k) != after.get(*k))
+                .map(|k| (k.iter().map(|c| c.len().min(9)).sum::<usize>(), k.file_name().map(|n| n.len()), after.get(k).cloned())).collect();
+            assert!(differ.is_empty(), "round {round}: {ops:?}: differ (short length, name length, now) {differ:?}");
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+        }
     }
 
     /// A file's size is recorded once per file, not per path: writing one

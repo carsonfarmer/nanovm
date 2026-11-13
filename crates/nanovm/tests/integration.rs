@@ -35,8 +35,7 @@ fn guest(name: &str) -> Vec<u8> {
 /// them.
 fn app(name: &str) -> AppConfig {
     let limits = match name {
-        // A generous CPU budget: oversubscribed CI hosts inflate the
-        // wall-time budget; CPU kills are tested on `hostile`.
+        // A generous CPU budget: CPU kills are tested on `hostile`.
         "counter" => serde_json::json!({
             "memory_mb": 16, "cpu_ms": 500, "request_timeout_ms": 2000,
             "idle_timeout_ms": 60000, "disk_mb": 1, "max_files": 100,
@@ -324,6 +323,82 @@ async fn start_up_is_charged_guest_cpu_not_host_work() {
     }
 }
 
+/// CPU time of the calling thread.
+#[cfg(target_os = "linux")]
+fn thread_cpu() -> Duration {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) }, 0);
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+}
+
+/// Regression (N-640): the budget charged wall time inside each poll, so a
+/// guest whose thread was waiting for a core was charged for the wait, and
+/// an overloaded node killed honest requests for CPU. Here the node shares
+/// one core with seven busy threads: a request that needs a third of its
+/// budget succeeds however long it takes, and one that spins forever is
+/// still killed after about its budget of CPU.
+#[cfg(target_os = "linux")]
+#[test]
+fn cpu_budget_is_cpu_not_time_waiting_for_a_core() {
+    std::thread::spawn(|| {
+        // This thread, and the threads it starts (the node's runtime and
+        // epoch ticker, the busy threads), run on one CPU.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            assert_eq!(libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set), 0);
+            let cpu = (0..libc::CPU_SETSIZE as usize).rev().find(|&c| libc::CPU_ISSET(c, &set)).unwrap();
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(cpu, &mut set);
+            assert_eq!(libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set), 0);
+        }
+        // One thread runs the whole node, so its CPU time is the node's.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let budget = Duration::from_millis(100);
+            let mut hostile = app("hostile");
+            hostile.limits.cpu_ms = budget.as_millis() as u64;
+            hostile.limits.request_timeout_ms = 30_000;
+            let node = node_with(node_cfg("cpu_budget_is_cpu", 8), hostile);
+            let measured = async |path: &str| {
+                let (cpu, wall) = (thread_cpu(), Instant::now());
+                let r = get(&node, "o", path).await;
+                (r, thread_cpu() - cpu, wall.elapsed())
+            };
+            assert_eq!(get(&node, "o", "/").await.status, 200);
+            // Steps that take about a third of the budget, timed alone.
+            let probe = 1u64 << 22;
+            let (r, cpu, _) = measured(&format!("/spin?n={probe}")).await;
+            assert_eq!(r.status, 200, "{:?} {}", r.error, r.body);
+            let steps = (probe as f64 * budget.as_secs_f64() / 3.0 / cpu.as_secs_f64()) as u64;
+
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let busy: Vec<_> = (0..7)
+                .map(|_| {
+                    let stop = stop.clone();
+                    std::thread::spawn(move || while !stop.load(Relaxed) { std::hint::spin_loop() })
+                })
+                .collect();
+            let (r, cpu, wall) = measured(&format!("/spin?n={steps}")).await;
+            let (spun, spun_cpu, spun_wall) = measured("/spin").await;
+            stop.store(true, Relaxed);
+            busy.into_iter().for_each(|b| b.join().unwrap());
+
+            println!("{steps} steps: {} after {cpu:?} of CPU in {wall:?}; spinning: {} after {spun_cpu:?} in {spun_wall:?}",
+                r.status, spun.status);
+            assert!(wall > 3 * cpu, "no contention: {cpu:?} of CPU in {wall:?}");
+            assert_eq!(r.status, 200, "{:?} {} after {cpu:?} of CPU in {wall:?}", r.error, r.body);
+            assert_eq!(spun.error.as_deref(), Some("cpu"), "{}", spun.body);
+            assert!(
+                spun_cpu > budget * 9 / 10 && spun_cpu < budget * 3 / 2,
+                "killed after {spun_cpu:?} of CPU in {spun_wall:?}"
+            );
+            node.shutdown().await;
+        });
+    })
+    .join()
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn wall_clock_limit() {
     let node = node("wall_clock_limit", "hostile", 8);
@@ -373,7 +448,12 @@ async fn kills_do_not_disturb_neighbours() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cpu_hogs_leave_cores_for_short_requests() {
-    let node = node("cpu_hogs_leave_cores_for_short_requests", "hostile", 128);
+    // Hogs that take turns on two lanes of a loaded host get their 100 ms
+    // of CPU after more than hostile's 1 s deadline: the budget, not the
+    // deadline, is under test.
+    let mut hostile = app("hostile");
+    hostile.limits.request_timeout_ms = 10_000;
+    let node = node_with(node_cfg("cpu_hogs_leave_cores_for_short_requests", 128), hostile);
     let cores = std::thread::available_parallelism().unwrap().get();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Four spinners per core: without heavy lanes they hold every worker.
@@ -414,10 +494,12 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
 
 /// `hostile` with room for heavy file work: writes and creates run inline
 /// and count against the CPU budget, which on a loaded host (the full suite)
-/// can pass 100 ms. These tests are about quotas, not CPU.
+/// can pass 100 ms, and their syncs can take seconds. These tests are about
+/// quotas, not limits.
 fn filler() -> AppConfig {
     let mut hostile = app("hostile");
     hostile.limits.cpu_ms = 1_000;
+    hostile.limits.request_timeout_ms = 10_000;
     hostile
 }
 
@@ -1059,9 +1141,17 @@ fn jail_blocks_escapes() {
     if unsafe { libc::geteuid() } == 0 {
         std::os::unix::fs::chown(dir.join("mine"), Some(200_099), Some(200_099)).unwrap();
     }
+    // A host service's datagram socket, for the probe to try to reach.
+    let service = format!("nanovm-jail-probe-{}", std::process::id());
+    let service_sock = {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&service).unwrap();
+        std::os::unix::net::UnixDatagram::bind_addr(&addr).unwrap()
+    };
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "jail_probe", "--nocapture", "--test-threads", "1"])
         .env("NANOVM_JAIL_PROBE", &dir)
+        .env("NANOVM_JAIL_PROBE_SERVICE", &service)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1093,6 +1183,7 @@ fn jail_blocks_escapes() {
         ("list_root", "denied"),
         ("tcp_socket", "denied"),
         ("unix_socket", "denied"),
+        ("unix_datagram", "denied"),
         ("fork", "denied"),
         ("exec", "denied"),
         ("setuid_root", "denied"),
@@ -1107,6 +1198,8 @@ fn jail_blocks_escapes() {
     for (k, v) in expect {
         assert_eq!(results.get(k).copied(), Some(v), "{k}\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
     }
+    service_sock.set_nonblocking(true).unwrap();
+    assert!(service_sock.recv(&mut [0; 8]).is_err(), "a datagram left the jail");
 }
 
 /// The jailed half of `jail_blocks_escapes`; a no-op when run directly.
@@ -1119,6 +1212,7 @@ fn jail_probe() {
     let root = unsafe { libc::geteuid() } == 0;
     nanovm::jail::Jail {
         uid: root.then_some(200_099),
+        parent: std::os::unix::process::parent_id(),
         read_write: vec![dir.join("mine")],
         read_only: vec![],
     }
@@ -1139,6 +1233,13 @@ fn jail_probe() {
     unsafe {
         report("tcp_socket", sys(libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) as i64));
         report("unix_socket", sys(libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) as i64));
+        // A datagram pair can send to any socket on the host with a name.
+        let service = std::env::var("NANOVM_JAIL_PROBE_SERVICE").unwrap();
+        let sent = std::os::unix::net::UnixDatagram::pair().and_then(|(a, _)| {
+            use std::os::linux::net::SocketAddrExt;
+            a.send_to_addr(b"x", &std::os::unix::net::SocketAddr::from_abstract_name(&service)?)
+        });
+        report("unix_datagram", sent.is_ok());
         let pid = libc::fork();
         if pid == 0 {
             libc::_exit(0);
@@ -1605,7 +1706,7 @@ async fn kv_values_persist_in_the_volume() {
 /// budget, which `/data` and `/tmp` share.
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_counts_against_the_disk_quota() {
-    let node = node("kv_quota", "hostile", 8);
+    let node = node_with(node_cfg("kv_quota", 8), filler());
     // An 8 MiB budget holds exactly eight 1 MiB values.
     let r = get(&node, "q", "/kv?op=fill&size=1048576&n=100").await;
     assert_eq!(r.json()["set"], 8, "{}", r.body);
@@ -1624,11 +1725,12 @@ async fn kv_counts_against_the_disk_quota() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn kv_refuses_bad_names_and_streams_keys() {
-    // Writing 1,500 keys takes real CPU; give it room on a loaded host.
+    // Writing 1,500 keys takes real CPU, and on a busy disk more than 10 s
+    // (N-32); give it room on a loaded host.
     let mut hostile = app("hostile");
     hostile.limits.cpu_ms = 5_000;
     hostile.limits.max_files = 3000;
-    hostile.limits.request_timeout_ms = 10_000;
+    hostile.limits.request_timeout_ms = 60_000;
     let node = node_with(node_cfg("kv_refuses", 8), hostile);
     let call = |path: &'static str| {
         let node = node.clone();
@@ -2215,7 +2317,9 @@ async fn sqlite_journal_pressure_matrix() {
     let cfg = node_cfg("sqlite_pressure", 8);
     let mut app = app("counter");
     app.limits.cpu_ms = 5000;
-    app.limits.request_timeout_ms = 15_000;
+    // 1,000 synced statements wait for a busy disk for up to 16 s while
+    // using under 1 s of CPU.
+    app.limits.request_timeout_ms = 60_000;
     let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
     let node = Node::new(cfg, &app, &wasm, None).unwrap();
     let expected = |changed: bool| {
@@ -2283,7 +2387,8 @@ async fn sqlite_handled_storage_exhaustion() {
     let cfg = node_cfg("sqlite_handled_exhaustion", 8);
     let mut app = app("counter");
     app.limits.cpu_ms = 5000;
-    app.limits.request_timeout_ms = 15_000;
+    // As in the pressure matrix: the disk, not the CPU, sets the time.
+    app.limits.request_timeout_ms = 60_000;
     let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
     let node = Node::new(cfg, &app, &wasm, None).unwrap();
     for object in ["insert", "bulk"] {
@@ -2307,6 +2412,31 @@ async fn sqlite_handled_storage_exhaustion() {
             "file": "after", "key": "after", "integrity": "ok", "aux_integrity": "ok"}),
             "a failed statement must not commit, including partial multi-page updates");
         println!("handled exhaustion: {completed} successful statements committed without corruption");
+    }
+    node.shutdown().await;
+}
+
+/// Regression (N-640, N-600): a guest's waits for its own syncs aren't CPU.
+/// 100 one-row transactions with `synchronous=FULL` each wait for several
+/// fsyncs; at the default 200 ms budget they were killed for CPU while using
+/// a fraction of it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_sync_waits_are_not_charged_as_cpu() {
+    let mut app = app("counter");
+    app.limits.memory_mb = 64;
+    app.limits.disk_mb = 8;
+    app.limits.cpu_ms = 200;
+    app.limits.request_timeout_ms = 30_000;
+    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
+    let node = Node::new(node_cfg("sqlite_sync_waits", 8), &app, &wasm, None).unwrap();
+    assert_eq!(get(&node, "o", "/bench?op=init").await.status, 200);
+    for seq in 0..3 {
+        let cpu = node.metrics.guest_cpu_ns.load(Relaxed);
+        let r = get(&node, "o", &format!("/bench?op=autocommit&seq={seq}")).await;
+        let cpu = Duration::from_nanos(node.metrics.guest_cpu_ns.load(Relaxed) - cpu);
+        println!("100 synced transactions: {} after {cpu:?} of CPU in {:?}", r.status, r.elapsed);
+        assert_eq!(r.status, 200, "{:?} {}", r.error, r.body);
     }
     node.shutdown().await;
 }
@@ -2913,6 +3043,36 @@ mod sockets {
     }
 }
 
+/// Under an address-space limit (`ulimit -v`) smaller than the pooling
+/// allocator reserves, `nanovm serve` refuses to start and says what it
+/// needs, instead of starting and then failing every app's worker with
+/// "failed to create memory pool mapping" (N-671).
+#[test]
+fn serve_explains_an_address_space_limit() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("address_space_limit");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("nanovm.toml");
+    let toml = format!("listen = \"127.0.0.1:0\"\ndata_dir = {:?}\nmax_live_objects = 8\nmemory_reservation_mb = 64\n", dir.join("data"));
+    std::fs::write(&cfg, toml).unwrap();
+    // 4 GiB: plenty for the supervisor, a third of what 40 slots reserve.
+    let cmd = format!("ulimit -v {} && exec {} serve --config {}", 4 << 20, env!("CARGO_BIN_EXE_nanovm"), cfg.display());
+    let mut child = std::process::Command::new("sh").args(["-c", &cmd]).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let t0 = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if t0.elapsed() > Duration::from_secs(10) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("nanovm serve started under ulimit -v 4 GiB");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("reserves about 12 GiB of address space, but RLIMIT_AS is 4096 MiB") && stderr.contains("ulimit -v unlimited"), "{stderr}");
+}
+
 // ---- the proxy -------------------------------------------------------------
 
 /// A DNS-over-HTTPS stub answering TXT queries from `records`, by name.
@@ -2984,6 +3144,14 @@ async fn the_proxy_routes_hosts_by_dns() {
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&at("counter.test", &counter)), "{body}");
     assert_eq!(get("counter.test", "/_nanovm/stats", "").await.0, 400);
+    // Nor can it claim to be a socket's event (and pick its `Connection-Id`),
+    // however it spells the type: counter's own parsing reads the last one.
+    for types in ["text/plain\r\nContent-Type: application/websocket-events", "Application/WebSocket-Events; charset=utf-8"] {
+        let head = format!("POST /room/ws HTTP/1.1\r\nHost: counter.test\r\nContent-Type: {types}\r\n\
+            Connection-Id: 7\r\nContent-Length: 12\r\nConnection: close\r\n\r\n");
+        let (status, body) = raw(proxy, &head, b"TEXT 2\r\nid\r\n").await;
+        assert_eq!(status, 400, "{types}: {body}");
+    }
     // Another host naming the same repository runs an app of its own: it
     // can choose the version it runs, but not the one counter.test runs.
     record("other.test", &[&format!("app={tagged}; trust=dev dev")]);
@@ -3094,6 +3262,83 @@ async fn a_refused_app_leaves_nothing_on_disk() {
     let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes").join(test).join("registry");
     let kept: Vec<_> = std::fs::read_dir(&cache).into_iter().flatten().flatten().map(|e| e.file_name()).collect();
     assert!(kept.is_empty(), "{kept:?}");
+}
+
+/// Test-only components from `crates/nanovm/tests/refused` (outside
+/// guests/**): `allowed` imports only what nanovm offers; each other one
+/// adds one import nanovm refuses, or has no `wasi:http/handler`.
+fn refused(name: &str) -> Vec<u8> {
+    static BUILT: std::sync::Once = std::sync::Once::new();
+    BUILT.call_once(|| {
+        let build = std::process::Command::new("cargo").args([
+            "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
+            "crates/nanovm/tests/refused/Cargo.toml", "--target-dir", "target/test-guest", "--lib", "--examples",
+        ]).current_dir(repo()).status().unwrap();
+        assert!(build.success());
+    });
+    let out = repo().join("target/test-guest/wasm32-wasip2/release");
+    std::fs::read(match name {
+        "allowed" => out.join("refused_imports.wasm"),
+        _ => out.join("examples").join(format!("{name}.wasm")),
+    })
+    .unwrap()
+}
+
+/// Components that import what nanovm refuses (sockets of either WASI
+/// version, the WASIp2 filesystem, an unknown interface) or export no HTTP
+/// handler are refused when loaded, before any object exists, and the error
+/// names the import. The node's linker doesn't define WASIp2 sockets or
+/// files either, so the import check isn't the only thing in the way.
+#[tokio::test(flavor = "multi_thread")]
+async fn components_importing_refused_interfaces_are_rejected_by_name() {
+    let load = |fixture: &str| Node::new(node_cfg(&format!("refused_{fixture}"), 2), &app("counter"), &refused(fixture), None);
+    let control = load("allowed").unwrap_or_else(|e| panic!("the control was refused: {e:#}"));
+    let res = get(&control, "a", "/").await;
+    assert_eq!((res.status, res.body.as_str()), (200, "allowed"));
+
+    for (fixture, named) in [
+        ("p2_sockets", "import `wasi:sockets/"),
+        ("p3_sockets", "import `wasi:sockets/types@0.3"),
+        ("p2_filesystem", "import `wasi:filesystem/"),
+        ("custom_import", "import `acme:backdoor/shell"),
+        ("command", "wasi:http/handler"),
+    ] {
+        let Err(e) = load(fixture) else { panic!("{fixture} was loaded") };
+        let e = format!("{e:#}");
+        assert!(e.contains(named) && e.contains(r#"app "counter""#), "{fixture}: {e}");
+        if fixture != "command" {
+            assert!(e.contains("is not permitted"), "{fixture}: {e}");
+        }
+        if fixture == "p2_filesystem" {
+            assert!(e.contains("@0.2"), "{fixture}: {e}");
+        }
+    }
+
+    // Without the check, WASIp2 sockets and files (outside the quota) still
+    // don't link: the linker defines only what the check allows (N-500).
+    let engine = nanovm::engine::build(&node_cfg("refused_linking", 2)).unwrap();
+    let linker = nanovm::app::linker(&engine).unwrap();
+    for (fixture, missing) in [("p2_sockets", "wasi:sockets/"), ("p2_filesystem", "wasi:filesystem/")] {
+        let component = wasmtime::component::Component::new(&engine, refused(fixture)).unwrap();
+        let Err(e) = linker.instantiate_pre(&component) else { panic!("{fixture} links against app::linker") };
+        assert!(format!("{e:#}").contains(missing), "{fixture}: {e:#}");
+        assert!(nanovm::app::check_imports(&engine, &component).is_err(), "{fixture}");
+    }
+    let allowed = wasmtime::component::Component::new(&engine, refused("allowed")).unwrap();
+    linker.instantiate_pre(&allowed).unwrap();
+}
+
+/// The same refusal through a registry and a jailed worker: the request is
+/// answered `worker-down`, naming the import, and so is the next one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_jailed_worker_refuses_a_component_importing_sockets() {
+    let (_sup, addr) = supervised("a_jailed_worker_refuses_sockets").await;
+    let sockets = publish_wasm("refused-sockets", &app("counter"), refused("p3_sockets")).await;
+    for _ in 0..2 {
+        let (status, body) = app_get(addr, &sockets, "/a/").await;
+        assert_eq!(status, 502, "{body}");
+        assert!(body.contains("worker-down") && body.contains("import `wasi:sockets/types@0.3"), "{body}");
+    }
 }
 
 /// A switch, once begun, finishes even if the request that began it goes
@@ -3300,6 +3545,92 @@ async fn the_proxy_outlasts_idle_and_excess_connections() {
     assert!(took >= Duration::from_secs(9), "{took:?}");
 }
 
+/// Sends `head`, then the `len` bytes of body its Content-Length promised,
+/// `chunk` bytes every `every`, while reading the answer. Returns its
+/// status and body (what arrived before any reset) and when it came.
+async fn trickle(addr: std::net::SocketAddr, head: String, len: usize, chunk: usize, every: Duration) -> (u16, String, Duration) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut rx, mut tx) = tokio::net::TcpStream::connect(addr).await.unwrap().into_split();
+    let t0 = Instant::now();
+    tx.write_all(head.as_bytes()).await.unwrap();
+    let writer = tokio::spawn(async move {
+        for sent in (0..len).step_by(chunk) {
+            if tx.write_all(&vec![b'x'; chunk.min(len - sent)]).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(every).await;
+        }
+        std::future::pending::<()>().await;
+    });
+    let mut out = Vec::new();
+    let read = async {
+        let mut buf = [0; 4096];
+        while let Ok(n @ 1..) = rx.read(&mut buf).await {
+            out.extend_from_slice(&buf[..n]);
+        }
+    };
+    let ended = tokio::time::timeout(Duration::from_secs(40), read).await;
+    let took = t0.elapsed();
+    assert!(ended.is_ok(), "{addr}: still open after {took:?}: {:?}", String::from_utf8_lossy(&out));
+    writer.abort();
+    let text = String::from_utf8_lossy(&out).to_string();
+    let status = text.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (status, text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default(), took)
+}
+
+/// A client trickling a request body (a byte every 200 ms) holds nothing for
+/// long at any entry point (an in-process node, the supervisor, the proxy,
+/// and a proxy whose node never reads): after about `CLIENT_TIMEOUT` it is
+/// answered 408 `body-timeout` and its connection is closed. An upload sent
+/// steadily at 8 KiB/s through the proxy takes longer than that and is not
+/// cut (N-505).
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_request_bodies_are_cut_at_every_entry_point() {
+    let node = node("slow_bodies", "counter", 8);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let direct = listener.local_addr().unwrap();
+    let n = node.clone();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| nanovm::server::handle(n.clone(), req)));
+    let (_sup, sup) = supervised("slow_bodies_supervised").await;
+    let counter = publish("counter", &app("counter")).await;
+    let records = Arc::new(parking_lot::Mutex::default());
+    let proxy = proxied(sup, doh(records.clone()).await).await;
+    let tagged = format!("{}:latest", counter.split_once('@').unwrap().0);
+    records.lock().insert("_nanovm.slow.test".to_string(), vec![format!("app={tagged}; trust=dev dev")]);
+    let entries = [(direct, String::new()), (sup, names(&counter)), (proxy, String::new())];
+    let head = |extra: &str, method: &str, path: &str, len: usize| {
+        format!("{method} {path} HTTP/1.1\r\nHost: slow.test\r\n{extra}Content-Length: {len}\r\n\r\n")
+    };
+    // Ordinary uploads first, which also start the worker.
+    for (addr, extra) in &entries {
+        let (status, body) = raw(*addr, &head(extra, "PUT", "/a/kv/k", 5).replace("\r\n\r\n", "\r\nConnection: close\r\n\r\n"), b"hello").await;
+        assert_eq!(status, 204, "{addr}: {body}");
+    }
+    // A node that takes requests and never reads them: the proxy's own rule.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let deaf = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::server::serve_http1(listener, |req: http::Request<hyper::body::Incoming>| async move {
+        let _held = req;
+        std::future::pending().await
+    }));
+    let entries = [&entries[..], &[(proxied(deaf, doh(records.clone()).await).await, String::new())]].concat();
+    let slow = entries.iter().map(|(addr, extra)| tokio::spawn(trickle(*addr, head(extra, "PUT", "/a/kv/k", 1000), 1000, 1, Duration::from_millis(200))));
+    let steady = tokio::spawn(trickle(proxy, head("", "PUT", "/a/kv/big", 128 << 10), 128 << 10, 1024, Duration::from_millis(125)));
+    for (s, (addr, _)) in slow.collect::<Vec<_>>().into_iter().zip(&entries) {
+        let (status, body, took) = s.await.unwrap();
+        eprintln!("{addr}: {status} after {took:?}");
+        assert_eq!(status, 408, "{addr}: {body}");
+        assert!(body.contains("body-timeout"), "{addr}: {body}");
+        let limit = nanovm::server::CLIENT_TIMEOUT;
+        assert!(took >= limit && took < limit + Duration::from_secs(3), "{addr}: {took:?}");
+    }
+    let (status, body, took) = steady.await.unwrap();
+    assert_eq!(status, 204, "{body}");
+    assert!(took > Duration::from_secs(15), "{took:?}");
+    let (status, body) = raw(proxy, "GET /a/kv/big HTTP/1.1\r\nHost: slow.test\r\nConnection: close\r\n\r\n", b"").await;
+    assert_eq!((status, body.len()), (200, 128 << 10));
+}
+
 /// Hop-by-hop headers, and the ones a client's `Connection` lists, stay on
 /// the client's connection; the rest reach the node.
 #[tokio::test(flavor = "multi_thread")]
@@ -3406,18 +3737,83 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     collector.abort();
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn post_return_work_keeps_context_and_reports_commit_failure() {
-    use http_body_util::BodyExt;
-    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
-    use prost::Message;
-    // A private fixture, outside guests/** and its publishing workflow.
+/// A private fixture, outside guests/** and its publishing workflow.
+fn probe() -> Vec<u8> {
     let build = std::process::Command::new("cargo").args([
         "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
         "crates/nanovm/tests/post-return/Cargo.toml", "--target-dir", "target/test-guest",
     ]).current_dir(repo()).status().unwrap();
     assert!(build.success());
-    let wasm = std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap();
+    std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap()
+}
+
+/// What the host holds for a guest's header maps stays within its memory
+/// limit: a map holds at most 64 KiB (its own, or a copy of one it was sent;
+/// bigger heads are refused before it), and an instance holds no more
+/// resources than its memory limit has room for at that size.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_header_maps_are_bounded_by_the_memory_limit() {
+    let mut app = app("hostile");
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    // 32 MiB: room for 512 maps of 64 KiB, of its 2,000 resources.
+    let node = Node::new(node_cfg("guest_header_maps", 8), &app, &probe(), None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| nanovm::server::handle(node.clone(), req)));
+    let get = async |path: &str, header: usize| {
+        let head = format!("GET {path} HTTP/1.1\r\nHost: x\r\nx-big: {}\r\nConnection: close\r\n\r\n", "x".repeat(header));
+        raw(addr, &head, b"").await
+    };
+    // 600 maps of 60 KiB, new or copies of a request's, are over 32 MiB.
+    for (path, header) in [("/a/headers?n=600&kb=60", 0), ("/b/headers?n=600", 60 << 10)] {
+        let (status, body) = get(path, header).await;
+        assert!(status == 500 && body.contains("resource-table"), "{path}: {status} {body}");
+    }
+    assert_eq!(get("/c/headers?n=1&kb=100", 0).await.0, 500, "a map over 64 KiB");
+    assert_eq!(get("/d/headers?n=0", 100 << 10).await.0, 431, "a head over 64 KiB");
+    assert_eq!(get("/e/headers?n=100&kb=60", 50 << 10).await, (200, "100".into()), "within the limits");
+}
+
+/// Nor does a method, authority or path a guest sets on its requests take
+/// what the host holds for them past its memory limit (N-691): a request's
+/// head (those, its scheme and its headers) is at most 64 KiB, as every head
+/// the node is sent, so a resource still holds at most that.
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_request_heads_are_bounded_by_the_memory_limit() {
+    let mut app = app("hostile");
+    app.limits.memory_mb = 16;
+    app.limits.cpu_ms = 2000;
+    app.limits.request_timeout_ms = 5000;
+    let node = Node::new(node_cfg("guest_request_heads", 8), &app, &probe(), None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::server::serve_http1(listener, move |req| nanovm::server::handle(node.clone(), req)));
+    let get = async |path: &str| raw(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), b"").await;
+    // Each is more than 16 MiB: 32 methods or authorities of 1 MiB, or 200
+    // paths of 60 KiB beside 60 KiB of headers.
+    for (path, n) in [("/a/strings?part=method&len=1048576&n=32", 32), ("/b/strings?part=authority&len=1048576&n=32", 32),
+        ("/c/strings?part=path&len=61440&hlen=61440&n=200", 200)] {
+        let (status, body) = get(path).await;
+        let counts = body.split_once(' ').and_then(|(h, r)| Some((h.parse::<usize>().ok()?, r.parse::<usize>().ok()?)));
+        let (held, refused) = counts.unwrap_or_else(|| panic!("{path}: {status} {body}"));
+        assert!(status == 200 && held <= 16 << 20, "{path}: the host holds {held} bytes of them");
+        assert_eq!(refused, n, "{path}");
+    }
+    // Real ones fit: an extension method, an 8 KiB path with 8 KiB of
+    // headers, a 60 KiB path alone, the longest host name.
+    for (path, held) in [("/d/strings?part=method&len=20&n=10", 200), ("/e/strings?part=path&len=8192&hlen=8192&n=10", 163840),
+        ("/f/strings?part=path&len=61440&n=10", 614400), ("/g/strings?part=authority&len=253&n=10", 2530)] {
+        assert_eq!(get(path).await, (200, format!("{held} 0")), "{path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_return_work_keeps_context_and_reports_commit_failure() {
+    use http_body_util::BodyExt;
+    use opentelemetry_proto::tonic::{collector, common::v1::any_value::Value};
+    use prost::Message;
+    let wasm = probe();
     let spans = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let logs = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

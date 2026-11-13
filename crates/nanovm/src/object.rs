@@ -26,7 +26,7 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::app::App;
 use crate::egress::EgressHooks;
-use crate::metrics::{Metrics, Poison, now_ns};
+use crate::metrics::{Metrics, Poison, now_ns, thread_cpu_ns};
 use crate::quota::QuotaGuard;
 use crate::table::Node;
 
@@ -77,9 +77,10 @@ pub struct ObjShared {
     phase: AtomicU8,
     /// When the current phase began; for an idle object, its last use.
     since_ns: AtomicU64,
-    /// Guest CPU charged to the current request.
+    /// CPU charged to the current request, up to the poll in progress.
     cpu_accum_ns: AtomicU64,
-    /// Start of the in-progress poll of the store, if any.
+    /// The polling thread's CPU clock ([`thread_cpu_ns`]) when the poll in
+    /// progress, or the request if it began in that poll, started.
     poll_start_ns: AtomicU64,
     /// The heavy lane this object's request holds until its next yield.
     lane: Mutex<Option<OwnedSemaphorePermit>>,
@@ -96,7 +97,6 @@ impl ObjShared {
             id: id.into(),
             phase: AtomicU8::new(Phase::Cold as u8),
             since_ns: now.into(),
-            poll_start_ns: now.into(),
             ..Default::default()
         }
     }
@@ -122,7 +122,7 @@ impl ObjShared {
     /// instance's start-up.
     fn begin_start(&self) {
         self.cpu_accum_ns.store(0, Relaxed);
-        self.poll_start_ns.store(now_ns(), Relaxed);
+        self.poll_start_ns.store(thread_cpu_ns(), Relaxed);
     }
 
     fn begin_request(&self) {
@@ -130,17 +130,19 @@ impl ObjShared {
         self.set_phase(Phase::Handling);
     }
 
-    /// Drives `fut`, charging the time spent inside each poll (where guest
-    /// code runs) to the current request or start-up, never time spent
-    /// waiting to be scheduled. Pinned by the caller: moved in, it was held
-    /// twice by this future, which made an idle object's actor 7 KB bigger.
+    /// Drives `fut`, charging the CPU its thread uses inside each poll
+    /// (where guest code and the host calls it makes run) to the current
+    /// request or start-up. Time waiting to be polled, for a core or for the
+    /// disk isn't CPU, so an overloaded node doesn't turn into CPU kills.
+    /// Pinned by the caller: moved in, it was held twice by this future,
+    /// which made an idle object's actor 7 KB bigger.
     async fn charged<F: Future>(&self, metrics: &Metrics, mut fut: Pin<&mut F>) -> F::Output {
         poll_fn(|cx| {
-            let t0 = now_ns();
+            let t0 = thread_cpu_ns();
             self.poll_start_ns.store(t0, Relaxed);
             let poll = fut.as_mut().poll(cx);
             // Re-read: a request that began during this poll reset the start.
-            let (t1, start) = (now_ns(), self.poll_start_ns.load(Relaxed));
+            let (t1, start) = (thread_cpu_ns(), self.poll_start_ns.load(Relaxed));
             self.cpu_accum_ns.fetch_add(t1.saturating_sub(start), Relaxed);
             metrics.guest_cpu_ns.fetch_add(t1 - t0, Relaxed);
             poll
@@ -148,16 +150,18 @@ impl ObjShared {
         .await
     }
 
-    /// Leaves `d`, spent in the poll in progress waiting for the disk, out
-    /// of the CPU charge.
-    pub fn uncharge(&self, d: Duration) {
-        self.poll_start_ns.fetch_add(d.as_nanos() as u64, Relaxed);
+    /// Leaves the CPU this thread used since `t0`, a [`thread_cpu_ns`] in
+    /// the poll in progress, out of the charge: the journal's undo records
+    /// and commits (and captures) are the node's work, not the guest's.
+    pub fn uncharge(&self, t0: u64) {
+        self.poll_start_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Relaxed);
     }
 
     /// CPU charged to the current request, including the poll in progress.
+    /// Only on the polling thread, in a poll: the epoch callback.
     fn cpu_used_ns(&self) -> u64 {
         let start = self.poll_start_ns.load(Relaxed);
-        self.cpu_accum_ns.load(Relaxed) + now_ns().saturating_sub(start)
+        self.cpu_accum_ns.load(Relaxed) + thread_cpu_ns().saturating_sub(start)
     }
 }
 
@@ -368,8 +372,13 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     };
     b.stdout(output("stdout")).stderr(output("stderr"));
 
+    // A resource can hold a header map of up to `MAX_HEAD` on the host (the
+    // guest's own, or a copy of one it was sent), so an instance holds no
+    // more than its memory limit has room for.
     let mut table = ResourceTable::new();
-    table.set_max_capacity(limits.max_resources);
+    table.set_max_capacity(limits.max_resources.min((limits.memory_mb << 20) as usize / crate::server::MAX_HEAD));
+    let mut http = WasiHttpCtx::new();
+    http.set_field_size_limit(crate::server::MAX_HEAD);
 
     // `/tmp` starts empty, so only the persistent volume holds usage.
     let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone(), node.cfg.capture.as_ref())?;
@@ -377,7 +386,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     let state = ObjState {
         wasi: b.build(),
         table,
-        http: WasiHttpCtx::new(),
+        http,
         hooks: EgressHooks {
             route: app.egress.clone(),
             node: Arc::downgrade(node),
@@ -440,9 +449,9 @@ enum Exit {
 /// Makes the request's changes durable, then sends what it published (the
 /// changes stand whether or not a publish gets through).
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route) = acc.with(|mut s| {
+    let (quota, held, route, id) = acc.with(|mut s| {
         let s = s.data_mut();
-        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone())
+        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.shared.id.clone())
     });
     quota.commit()?;
     if let crate::egress::Route::Supervisor(up) = route
@@ -450,8 +459,13 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
     {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {
-            for req in held {
-                if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
+            for body in held {
+                // All a held publish is: its body, named with its object so
+                // it reaches only that object's sockets.
+                let req = http::Request::post(format!("http://{}/publish", crate::ws::PUBLISH_HOST));
+                let req = req.header(crate::ws::OBJECT_HEADER, &*id);
+                let req = req.body(Full::new(body).map_err(|e| match e {}).boxed_unsync()).expect("ids are header-safe");
+                if let Ok(res) = up.send(req).await {
                     let _ = res.into_body().collect().await;
                 }
             }
@@ -909,10 +923,15 @@ mod tests {
         assert_eq!(v, serde_json::json!({"error": "busy", "detail": "try \"later\""}));
     }
 
-    /// Only time inside a poll is charged, not time spent waiting; a new
-    /// start resets the charge, and phases name themselves.
+    /// Only CPU used inside a poll is charged: not waiting to be polled,
+    /// nor blocking inside a poll, nor a commit; a new start resets the
+    /// charge, and phases name themselves.
     #[tokio::test]
     async fn cpu_is_charged_only_inside_polls() {
+        let spin = |ns| {
+            let t0 = thread_cpu_ns();
+            while thread_cpu_ns() - t0 < ns {}
+        };
         let metrics = Metrics::default();
         let shared = ObjShared::new("a".into(), "o");
         assert_eq!(shared.phase().0, Phase::Cold);
@@ -921,15 +940,26 @@ mod tests {
         shared
             .charged(&metrics, pin!(tokio::time::sleep(Duration::from_millis(50))))
             .await;
-        let waited = shared.cpu_accum_ns.load(Relaxed);
-        assert!(waited < 25_000_000, "waiting was charged {waited}ns");
         shared
-            .charged(&metrics, pin!(async { std::thread::sleep(Duration::from_millis(30)) }))
+            .charged(&metrics, pin!(async { std::thread::sleep(Duration::from_millis(50)) }))
             .await;
-        assert!(shared.cpu_accum_ns.load(Relaxed) >= 30_000_000);
+        let waited = shared.cpu_accum_ns.load(Relaxed);
+        assert!(waited < 5_000_000, "waiting was charged {waited}ns");
+        shared.charged(&metrics, pin!(async { spin(30_000_000) })).await;
+        let used = shared.cpu_accum_ns.load(Relaxed);
+        assert!(used >= 30_000_000);
         assert!(metrics.guest_cpu_ns.load(Relaxed) >= 30_000_000);
+        let commit = async {
+            let t0 = thread_cpu_ns();
+            spin(30_000_000);
+            shared.uncharge(t0);
+        };
+        shared.charged(&metrics, pin!(commit)).await;
+        let committed = shared.cpu_accum_ns.load(Relaxed) - used;
+        assert!(committed < 5_000_000, "a commit was charged {committed}ns");
+        assert!(metrics.guest_cpu_ns.load(Relaxed) >= 60_000_000, "but counted as object CPU");
         shared.begin_start();
-        assert!(shared.cpu_used_ns() < 25_000_000);
+        assert!(shared.cpu_used_ns() < 5_000_000);
         let names = Phase::ALL.map(Phase::as_str);
         assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold"]);
     }

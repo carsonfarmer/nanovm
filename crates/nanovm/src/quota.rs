@@ -241,13 +241,6 @@ impl QuotaGuard {
         q.bytes = q.bytes.saturating_add_signed(bytes);
         q.files = q.files.saturating_add_signed(files);
     }
-
-    /// Bytes and entries in use.
-    #[cfg(test)]
-    pub(crate) fn usage(&self) -> (u64, u64) {
-        let q = self.0.lock();
-        (q.bytes, q.files)
-    }
 }
 
 impl Inner {
@@ -259,6 +252,9 @@ impl Inner {
             .and_then(|()| f(&mut self.journal))
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::StorageFull => self.full(),
+                // A path the journal refuses (`Journal::creating`), as the syscall would.
+                std::io::ErrorKind::NotADirectory => ErrorCode::NotDirectory,
+                std::io::ErrorKind::InvalidFilename => ErrorCode::NameTooLong,
                 _ => ErrorCode::Io,
             })
     }
@@ -1039,5 +1035,14 @@ mod tests {
         g.unlink(&dir.join("b"), 600 << 10).unwrap();
         assert_eq!(usage(&g), (2, 0), "post-removal growth keeps the existing conservative charge");
         assert_eq!(b.metadata().unwrap().len(), 600 << 10);
+    }
+}
+
+#[cfg(test)]
+impl QuotaGuard {
+    /// Bytes and entries in use.
+    pub(crate) fn usage(&self) -> (u64, u64) {
+        let q = self.0.lock();
+        (q.bytes, q.files)
     }
 }

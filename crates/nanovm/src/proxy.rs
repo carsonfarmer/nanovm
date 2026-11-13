@@ -34,9 +34,7 @@ use crate::object::{RespBody, error_response};
 use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
 use crate::ws::{self, Sockets};
 
-/// How long a client may take over each request's headers (or idle between
-/// requests).
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::server::CLIENT_TIMEOUT;
 
 /// What `_nanovm.<host>` says.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +102,7 @@ impl<T: Clone> Cache<T> {
     }
 }
 
-pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, hyper::Error>;
+pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, crate::object::BoxError>;
 
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> anyhow::Result<Arc<Proxy>> {
@@ -177,14 +175,17 @@ impl Proxy {
         parts.uri = format!("http://{}{pq}", self.cfg.node).parse().map_err(|_| (StatusCode::BAD_REQUEST, pq.to_string()))?;
 
         if upgrading {
-            return Ok(self.socket(name, host, Request::from_parts(parts, body.boxed_unsync())).await);
+            let req = Request::from_parts(parts, body.map_err(Into::into).boxed_unsync());
+            return Ok(self.socket(name, host, req).await);
         }
         parts.headers.extend(headers);
-        let res = self
-            .node
-            .request(Request::from_parts(parts, body.boxed_unsync()))
-            .await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        // The node cuts a slow body too; this holds even if it doesn't.
+        let req = Request::from_parts(parts, crate::server::Paced::new(body).boxed_unsync());
+        let res = match self.node.request(req).await {
+            Ok(res) => res,
+            Err(e) if crate::server::timed_out(&e) => return Ok(crate::server::body_timeout()),
+            Err(e) => return Err((StatusCode::BAD_GATEWAY, e.to_string())),
+        };
         Ok(res.map(|b| b.map_err(Into::into).boxed_unsync()))
     }
 
@@ -290,9 +291,10 @@ fn parse(txt: &str) -> anyhow::Result<Route> {
     for field in txt.split(';').map(str::trim).filter(|f| !f.is_empty()) {
         match field.split_once('=') {
             Some(("app", a)) if app.is_none() => app = Some(a.trim().parse::<Reference>().context("app")?),
+            // The node reads them as one comma-separated header.
             Some(("trust", t)) => match t.split_whitespace().collect::<Vec<_>>()[..] {
-                [issuer, subject] => trust.push(format!("{issuer} {subject}")),
-                _ => bail!("trust is `<issuer> <subject>`"),
+                [issuer, subject] if !t.contains(',') => trust.push(format!("{issuer} {subject}")),
+                _ => bail!("trust is `<issuer> <subject>`, without commas"),
             },
             Some(("min", m)) if min.is_none() => min = Some(m.trim().parse::<semver::Version>()?.to_string()),
             _ => bail!("unknown or repeated field {field:?}"),
@@ -407,9 +409,35 @@ mod tests {
             "app=ghcr.io/org/app:prod; trust=a b; min=x",
             "app=ghcr.io/org/app:prod; app=ghcr.io/x/y:z; trust=a b",
             "app=ghcr.io/org/app:prod; trust=a b; extra=1",
+            // The node splits trust on commas, and would refuse every request.
+            "app=ghcr.io/org/app:prod; trust=https://token,actions.githu mbruepo",
+            "app=ghcr.io/org/app:prod; trust=https://i repo:o/a:ref:refs/heads/x,y",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
         assert_eq!(unquote(r#""app=x:y; " "trust=a b""#), "app=x:y; trust=a b");
+    }
+
+    /// A record the proxy accepts names a policy the node accepts: the node
+    /// reads `nanovm-trust` as comma-separated `<issuer> <subject>` pairs, so
+    /// a comma inside one (found by fuzzing, D-45) made every request to the
+    /// host fail at the node instead of the record being refused.
+    #[test]
+    fn accepted_records_are_policies_the_node_accepts() {
+        use crate::registry::{APP_HEADER, AppRef, TRUST_HEADER};
+        for record in [
+            "app=ghcr.io/org/app:prod; trust=https://i s1; trust=https://i s2",
+            "app=ghcr.io/org/app:prod; trust=https://token,actions.githu mbruepo",
+            "app=ghcr.io/org/app:prod; trust=https://i repo:o/a:ref:refs/heads/x,y",
+            "app=ghcr.io/org/app:prod; trust=, s",
+        ] {
+            let Ok(route) = parse(record) else { continue };
+            let mut headers = http::HeaderMap::new();
+            let app = format!("{}/{}@sha256:{}", route.app.registry(), route.app.repository(), "0".repeat(64));
+            headers.insert(APP_HEADER, app.parse().unwrap());
+            headers.insert(TRUST_HEADER, route.trust.parse().unwrap());
+            let r = AppRef::from_headers(&headers);
+            assert!(r.as_ref().is_ok_and(Option::is_some), "{record}: {:?}", r.err());
+        }
     }
 }

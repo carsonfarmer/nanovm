@@ -179,6 +179,7 @@ A worker reads its config and component from stdin, then jails itself while it s
   - no memory that is writable and executable at once
   - limits can be read, never raised
   - `fcntl` for descriptor flags and OFD file locks, plus `flock`: no `F_SETOWN` or `F_SETSIG`, which would have the kernel signal another process of the same uid
+  - `socketpair` for a local stream pair only: a datagram socket could `sendto` any named or abstract socket on the host
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
@@ -213,7 +214,9 @@ That is the repository and the tag deployed, each identity whose signature is ac
 - looks each host or tag up once however many requests ask at once, keeps a failed lookup's answer for 5 s rather than asking again, and remembers at most 10,000 of each;
 - drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards HTTP requests; it holds WebSockets itself and forwards their events;
 - speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
-- gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too).
+- gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too);
+- makes a client keep sending a request's body: it may keep the proxy waiting 10 s in all, plus a second for every 4 KiB it sends, or gets a 408 (`body-timeout`) and its connection is closed. A body trickled a byte at a time is cut after about 10 s; an upload at 4 KiB/s or faster never is. The node applies the same rule as it reads a body, so a client that reaches it directly is held to it too;
+- refuses a request head over 64 KiB (431), as every hop does (node, worker links, egress responses).
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
@@ -236,7 +239,7 @@ The node trusts these headers because only the proxy can reach it, and strips th
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
 2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
-3. **Then the worker.** The app's limits are clamped to the operator's `limits`, and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
+3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB head on the host: a header map, or a request's headers with the method, scheme, authority and path the guest set on it, which together may not pass 64 KiB; 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
 
@@ -350,7 +353,7 @@ Sockets are indexed by object within each app; a publish visits that object's so
 - **Events.** Each later event (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` queued with the object's other requests, so events are ordered with everything else the object serves. The answer carries events for that socket.
   - A socket has one event in flight at a time, and its next message is read once that is answered. Messages for the client are written meanwhile.
   - An event waits for room in a full queue rather than being refused; the sockets bound how many wait.
-  - Only the proxy sends events: it refuses a client request of type `application/websocket-events`, so an object can trust `Connection-Id`. The node trusts events from its private front end just like the app headers.
+  - Only the proxy sends events: it refuses a client request any of whose `Content-Type` headers names `application/websocket-events` (in any case, with any parameters), so an object can trust `Connection-Id` however it reads the type. The node trusts events from its private front end just like the app headers.
 - **Fan-out within an object**, as in Durable Objects (an object is a room). An object that answers `Sec-WebSocket-Extensions: grip` sends `m:` messages and `c:` controls. `{"type":"subscribe","channel":"…"}` subscribes the socket to a channel of its own object. The object reaches every subscribed socket, from any request, by posting GRIP's publish format to `http://nanovm/publish/`; the worker stamps that request with the object's id.
 - **Lifetime.** Sockets outlive instances, workers and version switches. Each event resolves the app's current digest from the proxy's caches; subscriptions remain intact. If the host changes app identity (record owner or repository), or an event cannot reach the node, the socket closes with 1011. Events have a 240 s overall deadline, including cold deployment. A proxy restart drops its sockets.
 - **Limits.**
@@ -471,7 +474,7 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 - **Rollback** has one path. A failed request ends its instance, and every instance start replays any log left behind backwards, so a crash is handled the same way. Recovery trims each step off the log as it completes, so a crash during recovery resumes where it stopped.
 - **Costs:**
   - One fsync per record that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request. Requests that change nothing pay nothing.
-  - Fsync time isn't charged to the guest's CPU budget.
+  - Waiting for the disk isn't charged to the guest's CPU budget, and neither is the journal's own CPU (records and commit).
   - The byte quota counts logical file lengths, not allocated filesystem blocks or metadata. While a request runs, the log and retained files may each hold as much again: at most three quota-sized logical content budgets. Small files and filesystem metadata add physical overhead; `max_files` independently bounds directory entries. Size the backing disk for both limits, not just `3 × disk_mb`.
 - **Safety:**
   - Guest paths reach only the volume. The journal sits beside it, out of reach.
@@ -542,10 +545,11 @@ Every scenario completed with 0 failed requests.
 
 ### Host requirements on Linux
 
-Each worker checks these at startup and refuses to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
+The supervisor and each worker check these at startup and refuse to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
 
 - **File descriptors:** each live object holds 2 (`/data` and `/tmp`). The check needs about `2 × max_live_objects + 1024`. The worker raises its soft limit to the hard limit itself, before it jails itself; the demo's 8,000 objects per app need `ulimit -n` of at least 17,088.
 - **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 8,000 needs `sysctl -w vm.max_map_count=68352` or more.
+- **Address space:** the engine reserves each pool slot's 4 memories (`memory_reservation_mb` + 64 KiB each), stacks and tables up front, about 522 GiB at the defaults. Under `ulimit -v` or `LimitAS=` below that, `nanovm serve` refuses to start with the number; remove the limit or lower `max_live_objects` or `memory_reservation_mb`.
 - **The jail** needs Landlock (Linux 5.13+) and seccomp. A separate uid per app needs the supervisor to run as root.
 - **Don't run with `RUST_BACKTRACE` set.** wasmtime then captures a stack backtrace for every guest-visible error. That includes routine ones, like reading a file that doesn't exist yet. With it set, warm throughput across 1,000 objects fell from 63K/s to 23K/s.
 
@@ -696,6 +700,6 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 ## Known limits of this phase
 
 - **Inline filesystem calls can't be interrupted by the epoch.** Each one is bounded by the quotas and charged to the guest's CPU budget.
-- **The CPU budget is wall time inside each poll of the guest.** It inflates when the host is oversubscribed, which errs on the side of killing hogs early.
+- **The CPU budget is the CPU time of the thread polling the guest** (user and kernel, so the guest's own file calls count; waiting for a core or the disk doesn't). An overloaded node slows a request down to its wall-clock deadline (504) rather than failing it for CPU ([N-640](ISSUES.md)).
 - **Without root, apps share the supervisor's uid.** Landlock and seccomp still separate them.
 - **A worker's stderr lines are passed on whole up to 4 KiB**; longer ones are split.

@@ -216,6 +216,10 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** real stalled headers and JSON body both fail the new regression without the fix.
 - **Status:** fixed in 225cfc4; a ten-second absolute route deadline covers cache waiting and resolver I/O. Full suite, mutation/restoration and demo pass.
 
+- **Reproduced:** from source, not a live stalled-resolver test
+- **Also (sec review):** the tag lookup that follows (`Oci::digest`, against the registry the record names) has the same gap: `read_timeout` is per read, so a registry trickling its manifest holds the lookup as long as a client waits. One deadline around `Cache::get`'s lookup covers both.
+- **Status:** open; bound the initial lookup and add a stalled-resolver test
+
 ### N-34 (tests): forged worker publish identity lacks a direct regression test
 - **Where:** `supervisor.rs`, the egress link's publish branch
 - **Scenario:** W-3 constructs fresh publish headers and stamps the worker's app, ignoring any worker-supplied `nanovm-app`, including duplicates. The review found no runtime flaw, but the normal-guest isolation tests do not exercise a compromised worker forging those headers.
@@ -268,6 +272,129 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `integration.rs`, `a_node_runs_at_most_max_apps`
 - **Observed:** branch CI 42313030490 returned 200 when the fixture expected a full-capacity refusal. It holds workers busy with 600/900 ms sleeps while loading another app, then assumes they are still busy. Runtime sources are unchanged by backup/restore.
 - **Status:** fixed on main through `1e5f18ad`, with passing CI: observed upstream requests stay gated until the capacity assertion completes. An injected 1100 ms delay reproduces the old failure and passes with the fix. Allowing eviction of busy workers fails the corrected regression; restored with `git checkout --` and empty unstaged diff verified. Restored full suite passes (99 unit, 69 integration, 12 ignored). Runtime and guests unchanged. Recovery's main CI 42313034048 passed independently; this fixes the race rather than relying on that rerun-equivalent success.
+
+### N-70: a jailed worker can send datagrams to any unix socket on the host
+- **Where:** `jail.rs` (the `socketpair` rule)
+- **Scenario:** found by the sec review at `491e790`. The seccomp filter allowed `socketpair(AF_UNIX)` of any type. A datagram socket's `sendto` takes a destination even when connected, so code that got out of Wasm could send datagrams (and `SCM_RIGHTS` descriptors) to any named or abstract unix datagram socket it has DAC access to: journald and syslog (`/run/systemd/journal/socket`, `/dev/log`, both world-writable), systemd's notify socket, abstract sockets of other services. Landlock's filesystem rules do not cover socket sends (ABI 6's abstract-socket scope would block only abstract ones), so the README's "a worker's only channels are its two control sockets" did not hold.
+- **Reproduced:** yes: `jail_probe` sent a datagram from the jail to an abstract socket the test bound (`probe unix_datagram=ok`); a Python PoC under the same Landlock ruleset also reached a pathname socket.
+- **Status:** fixed in 32de17e: `socketpair` is allowed for `SOCK_STREAM` only (tokio's signal driver uses one); `jail_blocks_escapes` expects `unix_datagram=denied` and checks nothing arrived.
+
+### N-71: a client can forge a WebSocket event by spelling its content type differently
+- **Where:** `ws.rs` (`is_event`), `proxy.rs` (`forward`)
+- **Scenario:** found by the sec review at `491e790`. The proxy refused a client request as a forged socket event only if its *first* `Content-Type` was exactly `application/websocket-events`. With `Content-Type: text/plain` followed by the events type, or the type in other case or with parameters, it reached the object, which may read any of them: the counter guest keeps the last header, and GRIP libraries strip parameters. The client also chooses `Connection-Id`, so it could speak as another user's socket, contrary to the README's "an object can trust `Connection-Id`".
+- **Reproduced:** yes: through the proxy, counter answered a forged `TEXT id` with `m:7`, the id the client sent.
+- **Status:** fixed in fdf0fee and bbc92f6: an event is any request with a `Content-Type` value (also each comma-joined part) whose media type is the events type, in any case, with any parameters. `the_proxy_routes_hosts_by_dns` sends two forgeries (400; 200 with `m:7` before), `upgrades_and_events_are_recognised` covers the spellings.
+
+### N-72: a guest's publish costs the shared proxy 24 times its size in memory
+- **Where:** `ws.rs` (`messages`), reached from `egress.rs` (`hold`, in the worker) and `Proxy::publish`
+- **Scenario:** found by the sec review at `491e790`. Every publish (up to `max_response_body_kb`, 8 MiB) was parsed as a `serde_json::Value`, by the guest's worker when held and by the proxy, which every app shares. 8 MiB of tiny values beside `"items": []` peaked at 192 MiB and 200–370 ms of a proxy thread, from plain Wasm, once per request.
+- **Reproduced:** yes (a counting allocator over the same parse): 8 MiB → 192 MiB peak.
+- **Status:** fixed in fd7dfe4: publishes are read into typed structs and the rest is skipped unbuilt (the same body: under 1 MiB, 21 ms; 8 MiB of minimal items: 42 MiB). `publishes_parse_in_bounded_memory` fails with the old parser (1 MiB held 25 MB). What the proxy buffers across all apps is still unbounded: W-35.
+
+### N-73: a compromised worker chooses the `Host` its allowed upstream sees
+- **Where:** `egress.rs` (`send`)
+- **Scenario:** found by the sec review at `491e790`. The supervisor matched a worker's request against the allowlist by its URI host, then sent the worker's own headers. Guests cannot set `Host` (wasi-http forbids it), but a compromised worker can: a request to an allowed name on a shared front end (a CDN), carrying the `Host` of a site the list never named, reaches that site (domain fronting). The public-address filter still held.
+- **Reproduced:** yes: `the_upstream_hears_the_allowed_host` saw `Host: elsewhere.example`.
+- **Status:** fixed in 9890e6d: `send` sets `Host` from the checked authority.
+
+### N-74: a compromised worker's telemetry batch costs the supervisor 200 times its size
+- **Where:** `telemetry.rs` (`Relay::handle` → `stamp`)
+- **Scenario:** found by the sec review at `491e790` (sec's entry has the full text). The relay decoded each worker batch (up to 1 MiB) into prost structs to replace its resource and drop identity attributes. 1 MiB of 2-byte empty spans allocated 278 MB and took 308 ms of the supervisor's single control thread per batch.
+- **Reproduced:** yes (`stamping_a_batch_costs_about_its_size` fails with the decoding stamp: 277,873,410 bytes allocated)
+- **Fix:** `stamp` rewrites the batch at the wire level: each `ResourceSpans`/`ResourceLogs` resource is replaced by the stamped one (repeated resource fields included), and identity attributes (`service.name`, `service.version`, `nanovm.app`, or any key by string-table index) are still dropped from scopes, spans, events, links and log records, judging a key given twice by the last one, as decoders do. Everything else is copied as bytes. The span-level scrub stays: the Collector's span-metrics connector reads `nanovm.app` and `service.version` from span attributes before resource attributes. Hostile batch: 278 MB → 3.1 MB allocated, 308 → 9.9 ms. A normal 256-span batch: 837 → 176 µs, 802 → 120 KB allocated (release, loaded machine). `stamping_matches_decoding_and_scrubbing` checks the output against decoding and scrubbing; mutations (decode again, skip event attributes, first key wins, keep the worker's resource, ignore string-table keys) each fail it.
+- **Status:** fixed in the perf branch (see `notes/perf.md`)
+
+### N-75: a guest can hold many times its memory limit in host-side headers
+- **Where:** `object.rs` (`new_store`: the resource table's capacity, `WasiHttpCtx`'s field size limit), `server.rs`/`link.rs`/`egress.rs` (hyper's head size)
+- **Scenario:** found by the sec review at `491e790`. Each `wasi:http` `fields` resource held up to wasi-http's 128 KiB in worker memory, outside the object's `memory_mb`, and an instance may keep `max_resources` (10,000) resources across requests: about 1.25 GiB against a 64 MiB cap. Worse, the limit applies only to maps the guest builds: `clone` of a received map (a request's headers, up to hyper's ~400 KB head) shares it, and the first change copies it whole before any size check, so 10,000 copies are about 4 GiB. Its own app's worker suffers first (other objects, or its cgroup's OOM kill); without a worker cgroup, the node.
+- **Reproduced:** yes: with `memory_mb = 32`, the test probe held 600 maps of 60 KiB, new or copied from a 60 KiB request header (36 MB each way), and a 100 KiB map.
+- **Status:** fixed in 98c1698: a head is at most 64 KiB at every hop (hyper's `max_header_size`, which also bounds trailers; over it a client gets 431), a guest's map at most 64 KiB, and an instance holds at most `memory_mb / 64 KiB` resources (`max_resources` is the lower of the two: 1,024 at 64 MiB, 256 at the counter's 16 MiB). So header maps the host holds for an instance stay within its memory limit, and 64 KiB is twice what nginx accepts by default (four 8 KiB header buffers). A request's method, authority and path were left out: N-691. `guest_header_maps_are_bounded_by_the_memory_limit` (a test-only probe route) fails without each part.
+
+### N-502: a failed create under a file bricks the object if its request then fails
+- **Where:** `journal.rs` (`recover`, the `Undo::Created` arm; `creating` records the create first)
+- **Scenario:** found by the quality agent's model-based quota test (D-46). A guest creates `d/a` (a file or a directory) where `d` is a file: `creating` records `Created(d/a)` (its `symlink_metadata` fails with ENOTDIR, not NotFound), and the create then fails. If that request fails (an error answer, a trap, CPU, a crash), the next start recovers the log; `symlink_metadata(d/a)` fails with ENOTDIR again, which recovery treated as an error, so the journal refuses to start the object, every time: the object answers 503 `instantiate-failed` (`Not a directory`) for good. Any app that creates paths from request data can be bricked by a client who makes it create under a file and then fail.
+- **Reproduced:** yes: `quota_usage_always_matches_the_model` shrank it to two requests (commit an empty file `d`; then `mkdir d/a` in a request that fails); `a_failed_create_under_a_file_rolls_back` fails without the fix (`recovery succeeds: NotADirectory`).
+- **Fix:** recovery treats NotADirectory like NotFound for a `Created` record: nothing can be there, so the create never happened. One line; also repairs logs already written.
+- **Status:** fixed in 6fdb057 (recovery); the class is closed on `ideas/recover-class`: `creating` and `removing_dir` refuse what they can't name instead of recording it (see N-503, N-504)
+
+### N-503: a failed create of an over-long name bricks the object if its request then fails
+- **Where:** `journal.rs` (`creating`, `recover`)
+- **Scenario:** found by the quality agent's second hostile guest (D-58). The N-502 class with another errno: a 256-byte name fails `symlink_metadata` with ENAMETOOLONG, is recorded as `Created`, the create fails, and a failed request leaves recovery failing on every start (503 `instantiate-failed`, `File name too long`). Any app that names files from request data can be bricked by a long name and a failing request.
+- **Reproduced:** yes (`unusual_names_commit_and_roll_back` on `ideas/hostile2`; `logs_naming_impossible_paths_recover` and `random_path_shapes_always_roll_back` fail without the fix).
+- **Fix:** see N-504.
+- **Status:** fixed on `ideas/recover-class`
+
+### N-504: a directory chain deeper than PATH_MAX bricks the object
+- **Where:** `journal.rs` (`creating`, `removing_dir`, `renaming`, `recover`)
+- **Scenario:** found by the second hostile guest (D-58). A guest reaches any depth by opening each directory from its parent's descriptor; the journal names entries by absolute path. Creating a directory whose path reaches PATH_MAX (16 levels of 255-byte names under a 72-byte volume path) was recorded, made, then failed the commit (`File name too long`) and every later recovery: the object answered 503 `instantiate-failed` for good. A directory renamed under a deep one could also move what is under it out of the journal's reach.
+- **Reproduced:** yes (`/deep` on `ideas/hostile2`: depths 12-15 commit and roll back; 16-20 brick the object).
+- **Fix (one class with N-502, N-503):** `creating` and `removing_dir` record only when `symlink_metadata` says NotFound (or, for `removing_dir`, a directory); any other error is returned, so the guest gets the error the syscall would give (`not-directory`, `name-too-long`) and nothing is recorded. Returning rather than recording nothing: for a whole path too long for the journal but not for the guest's descriptor, the create would succeed out of the journal's reach. `renaming` refuses a move that would put anything under it at PATH_MAX or more (walking a moved directory, at most `max_files` entries). Recovery treats path-shape errors (NotFound, NotADirectory, ENAMETOOLONG, and ELOOP) as "nothing there" for every record, repairing logs already written; real I/O errors stay fatal (since N-690, ENAMETOOLONG only for a name past NAME_MAX: recovery reaches entries through descriptors).
+- **Status:** fixed on `ideas/recover-class`
+
+
+### N-551: a supervisor running as pid 1 (a container without an init) starts no worker
+- **Where:** `jail.rs` (`Jail::enter`: `ensure!(getppid() != 1, "supervisor exited")`)
+- **Scenario:** found by the ops agent building the container image. A worker took "my parent is pid 1" to mean its supervisor had died before `PR_SET_PDEATHSIG` was armed. In a container without `--init`, or a Kubernetes pod, the supervisor *is* pid 1, so every worker refused to start (`502 worker-down`, worker's last words `entering the jail: supervisor exited`). The check also passed wrongly under a child subreaper, which adopts orphans instead of pid 1.
+- **Reproduced:** yes, `deploy/container/test/local.sh` ("as PID 1, workers start" fails before the fix).
+- **Fix:** the supervisor puts its pid in the worker's spec, and the worker compares `getppid()` with it. +2 runtime lines.
+- **Status:** fixed on `ideas/container-image`
+
+### N-552: a binary replaced under a running supervisor starts workers of the new version
+- **Where:** `main.rs`/`supervisor.rs` (`Supervisor::new(cfg, std::env::current_exe()?, …)`; `start` spawns `self.exe`)
+- **Scenario:** found by the ops agent writing the upgrade runbook. The supervisor resolved its executable's path once at start and spawned every worker from that path. Installing a new binary (`install`, `mv`, a package manager's upgrade before its restart) while the node ran made new workers the new version under the old supervisor; their private spec or link protocol can differ.
+- **Reproduced:** yes, `docs/ops/drills/binary-swap.sh` with builds before and after N-551: the running app kept serving, a new app got `502 worker-down` (`worker spec: invalid length 3, expected a tuple of size 4`).
+- **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
+- **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
+
+### N-640: the CPU budget charged time waiting for a core, so overload became CPU kills
+- **Where:** `object.rs` (`ObjShared::charged`, `cpu_used_ns`, `uncharge`, the epoch callback), `journal.rs` (its three `uncharge` sites)
+- **Scenario:** found by the orchestrator on a 4-core VM at load ~20. The per-request budget read the wall clock before and after each poll, so time the guest's thread spent descheduled, or blocked in an fsync the guest asked for, was billed as CPU. On an overloaded node honest requests got 500 `cpu`, and the restarts added load. `sqlite_repeated_updates_remain_bounded`, `sqlite_handled_storage_exhaustion` and `sqlite_journal_pressure_matrix` (5–10 s budgets) and `kv_counts_against_the_disk_quota` (100 ms, see N-32) failed under load and passed idle. N-600 (examples agent) is the same bug: the SQLite provider's synced one-row writes were charged their fsync waits.
+- **Reproduced:** yes. `cpu_budget_is_cpu_not_time_waiting_for_a_core` runs the node on one CPU shared with seven busy threads: before, a request needing about 33 ms of CPU was killed after 12–16 ms of CPU, and `/spin` after 14–18 ms, against a 100 ms budget (5 runs). `sqlite_sync_waits_are_not_charged_as_cpu` (100 synced one-row transactions, default 200 ms budget) failed 3 of 3 at load 16.
+- **Fix:** each poll is charged the change in the polling thread's `CLOCK_THREAD_CPUTIME_ID`: user and kernel time, so the guest's own file calls count and waiting for a core or the disk doesn't. The epoch callback runs on that thread and reads the poll in progress the same way; nothing reads it from another thread. The journal's own work (undo records, renames into the journal, the commit and any capture) stays uncharged, measured with the same clock instead of as wall time, so no request is charged more than before. `guest_cpu_ns` is now CPU time. The wall-clock deadlines (504) still stop requests that are slow for any reason. After: the test's request succeeds with 31–40 ms of CPU and `/spin` is killed after 102–103 ms (5 runs); the SQLite tests above and the new one pass under load 21–37 where the old build fails 4 of 5. Tests whose fixtures assumed wall billing get deadlines sized for a busy disk (`filler`, the two 1,000-statement SQLite tests, the 1,500-key KV test) or for lane turns (`cpu_hogs_leave_cores_for_short_requests`), and the quota test `kv_counts_against_the_disk_quota` moves to `filler` like its siblings: its 198 writes use 100–160 ms of real CPU on this loaded host, half of it kernel time. Cost: about 0.16 µs per clock read, 8.1 reads per warm GET (≈2%). Details: `notes/cpuclock.md`.
+- **Status:** fixed on `cf/cpu-clock`
+
+### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
+- **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
+- **Scenario:** found by the quality agent while writing D-52. The node's linker defines every WASIp2 interface, including `wasi:filesystem@0.2` and `wasi:sockets@0.2`, and the WASIp2 filesystem shares the `WasiCtx`'s read-write preopens. A guest using `std::fs` links (`instantiate_pre` succeeds). Today `ALLOWED_IMPORTS` refuses it at load, by name, so nothing is exploitable; but that check is the single layer between a guest and writes to `/data` that bypass the quota and the journal (no rollback). Sockets have a second layer (wasmtime's default address check denies every address).
+- **Reproduced:** yes (`components_importing_refused_interfaces_are_rejected_by_name`: `p2_filesystem` and `p2_sockets` link against `app::linker`; with `check_imports` disabled, `p2_sockets was loaded`).
+- **Suggestion:** link only the WASIp2 interfaces `ALLOWED_IMPORTS` permits (io, clocks, random, cli), so a regression in the allowlist fails at link time instead of opening `/data`. Defense in depth, not a bug.
+- **Fix:** `app::linker` defines only the WASIp2 interfaces the allowlist permits (io, clocks, random, cli), so the fixtures fail to link (`wasi:sockets/…`, `wasi:filesystem/…` not found) even without the check. Building the linker got cheaper (median 148 → 90 µs); instantiation is unchanged (`notes/hardening.md`).
+- **Status:** fixed on `cf/hardening`
+
+### N-680: a link connection answered before its request body was sent went back to the pool, holding the body
+- **Where:** `link.rs` (`LinkBody::poll_frame` pooled the connection once the response ended if it was still open)
+- **Scenario:** found by the hardening agent while testing N-505 through the supervisor. A worker that answers before reading the whole request body (a 408 `body-timeout`, or a 413) leaves the supervisor's link connection still sending that body. If the response's last frame was read before the connection saw the worker hang up, the connection went into the idle pool, where nothing polls it: it kept the client's body, and so the client's connection to the node, open indefinitely, with the 408 already sent. `checkout` never reuses such a connection (it isn't ready), so it only leaked.
+- **Reproduced:** yes: 1 run in 5 of `slow_request_bodies_are_cut_at_every_entry_point`, the supervisor's client got its 408 and the connection stayed open (40 s and more); `a_connection_answered_before_its_body_is_sent_is_not_pooled` fails every time without the fix.
+- **Fix:** a connection is pooled only if it is also ready for the next request (`SendRequest::is_ready`, the check `checkout` already made); otherwise it is dropped, which drops the body and lets the client's connection close. No new runtime lines.
+- **Status:** fixed on `cf/hardening`
+
+### N-681: the node's front end has no header timeout
+- **Where:** `main.rs` (`front` → `server::serve_http1` → `serve_conn(…, None, …)`); hyper's default 30 s header timeout needs a timer, which isn't set
+- **Scenario:** found by the hardening agent while fixing N-505. The proxy gives a client 10 s for a request's headers; the node's own listener gives none, so a client that reaches the node directly can hold a connection (and an fd) by sending a request head a byte at a time. Bodies are bounded since N-505; heads are not. Behind the proxy, as deployed (the node listens on loopback), only the proxy reaches it.
+- **Reproduced:** by reading: `Dur::Default` timeouts are dropped without a timer (`hyper::common::time::Time::check`). Not run.
+- **Suggestion:** set a header timeout at the node longer than the proxy's pool idle timeout (hyper-util's 90 s default), or the node would close idle pooled connections as the proxy reuses them; or lower the proxy's pool idle timeout below the node's.
+- **Status:** open
+
+### N-690: recovery dropped the undo of a real entry whose whole path is past PATH_MAX
+- **Where:** `journal.rs` (`recover`)
+- **Scenario:** found by the independent review of PR #1 (a regression from N-504). Recovery took ENAMETOOLONG as "nothing there" for every record. But a log written by the binary before N-504, in the same encoding, can name a real entry whose whole path is past PATH_MAX while each of its names fits: `creating` then recorded `Created` on any error, and the guest made the entry through its parent's descriptor. Recovery skipped the record, truncated the log and kept the uncommitted entry, so the failed request's changes were partly kept; the recovery before N-504 failed closed. A base an operator moved deeper turns any record into such a path.
+- **Reproduced:** yes: `long_paths_in_old_logs_are_undone` (every record kind, 200-byte names in a directory whose own path is 3,996 bytes, the changes made through its descriptor): recovery succeeded and kept all seven changes.
+- **Fix:** recovery reaches each entry through its parent's descriptor, opened one name at a time from the base (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and undoes and syncs it relative to that parent (`fstatat`, `unlinkat`, `mkdirat`, `renameat`, `openat`). ENAMETOOLONG then only means a name past NAME_MAX, which nothing can have. N-502..N-504's tests pass unchanged, and new writes still refuse paths at PATH_MAX.
+- **Status:** fixed on `cf/main-next`
+
+### N-691: a guest's request methods, authorities and paths were held on the host without bound
+- **Where:** `app.rs` (`linker`: wasi-http's `request.set-method`, `set-authority`, `set-path-with-query`, `set-scheme`)
+- **Scenario:** found by the independent review of PR #1 (it predates the PR). N-75 bounds what a resource holds by its header map, but a request also holds the method, scheme, authority and path the guest sets, on the host. An extension method (`http::Method`'s extension storage) and an authority took any length, and a path up to `http`'s 64 KiB limit beside 64 KiB of headers. A guest that never sends these requests keeps them all for the instance's life.
+- **Reproduced:** yes, with a real guest at `memory_mb = 16` (`guest_request_heads_are_bounded_by_the_memory_limit`, the test-only probe's `/strings` route): 32 methods of 1 MiB, 32 authorities of 1 MiB and 200 paths of 60 KiB beside 60 KiB of headers were all taken and held (33,554,432, 33,554,432 and 24,576,000 bytes), and each request answered 200.
+- **Fix:** those four setters are shadowed in the node's linker by the same setters behind a check: one that would take the request's head (headers, counted as wasi-http's field limit counts them, plus method, scheme, authority and path) past `MAX_HEAD` (64 KiB) is refused with the setter's WIT error. That is the head the node accepts from a client, so a request resource still holds at most 64 KiB and N-75's resource cap keeps the instance within its memory limit. Responses hold only a status code and request options only durations, so nothing else is guest-sized. After: all 264 sets refused, nothing held; an extension method, an 8 KiB path with 8 KiB of headers, a 60 KiB path alone and a 253-byte host are still taken.
+- **Status:** fixed on `cf/main-next`
+
+### N-692: held publishes kept the guest's whole request, headers and all
+- **Where:** `egress.rs` (`hold`, `EgressHooks::held`), `object.rs` (`commit`)
+- **Scenario:** found by the independent review of PR #1 (it predates the PR). A publish to `http://nanovm/publish/` is held in the worker until its request commits. `hold` bounded what a request holds by the publishes' bodies (`max_response_body_kb`), but kept each whole request: the guest's headers (up to N-75's 64 KiB a request), its URI and the request itself. Sent requests have left the resource table, so N-75's cap no longer counts them, and nothing else bounded them: 300 publishes of a 12-byte body with 60 KiB of headers held about 18 MB, past a 16 MiB object's memory; 5,461 empty-item publishes held 25 times their bodies. The supervisor reads none of it: it forwards a publish's body with the app it names and the object the worker names.
+- **Reproduced:** yes: `held_publishes_are_bounded_like_one_publish` (unit): 300 such publishes retained 18,524,700 bytes against an 8 MiB publish limit; 5,461 tiny ones 1,660,144 bytes against 64 KiB.
+- **Fix:** only the body is held, and the commit sends it as `POST http://nanovm/publish` named with the object's id (what `hold` used to add). `hold` checks the method and path the supervisor checks, answering 404 as it would (before, the guest was told 200 and the supervisor's 404 was dropped). Each held body counts its slot toward the limit too, under one lock. After: 13,200 bytes and 65,516 bytes (1,489 publishes).
+- **Status:** fixed on `cf/main-next`
 
 ## Planned work
 
@@ -418,3 +545,10 @@ The checkpoints below are historical, not outstanding product decisions.
 - **Composition gate:** synchronous WIT calls cannot block on async P3 filesystem I/O, as W-1 demonstrated. Establish a valid standard-interface/ABI strategy or preload mechanism first; fewer host handlers must not come at the cost of a custom backchannel, a quota bypass or more lifecycle machinery. Report separately whether KV and config genuinely reduce host coupling.
 - **Acceptance:** run the existing KV/config integration contracts against composed providers, including KV quota/rollback cases and config isolation; inventory the host code removed and the bootstrap responsibilities retained. Compare against the current implementation and recommend keep/move independently for each.
 - **Status:** in progress (migration and filesystem evaluation requested by owner)
+
+- **Status:** open (exploration requested by owner)
+
+### W-35: bound what the proxy buffers for objects across all apps
+- **What:** each event answer and each publish is collected whole in the proxy, up to `max_response_body_kb` (8 MiB), with no bound across sockets, objects or apps: 1,000 sockets of one app answered at once is 8 GiB, and publishes are as many as objects committing at once. One app's plain Wasm can so exhaust the proxy every app shares. Parsing is not the problem: an answer is parsed and applied within one poll, so its parse (about 6–14 times its size, `ws::parse`) is bounded by the proxy's threads, and publishes now parse in about their size (N-72). Found by the sec review.
+- **Design:** (1) collect an answer up to `socket_backlog_kb`, not `max_response_body_kb` (in `Proxy::socket`'s `deliver`): `apply` queues an answer's messages at once, each costing its length plus 64, so an answer bigger than the socket's backlog overflows it and drops the socket anyway (only a flood of subscribe controls would fit). Answers then cost at most one backlog per socket, within the per-socket budgets the proxy already has. (2) publishes: a proxy-wide semaphore of publish bytes in flight (an operator setting, or `max_sockets_per_app × socket_backlog_kb` per app), acquired for the declared or collected size before buffering, so one app's commits wait rather than grow the proxy.
+- **Status:** open

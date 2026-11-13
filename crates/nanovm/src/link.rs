@@ -111,7 +111,8 @@ where
         }
         drop(theirs);
         mine.set_nonblocking(true)?;
-        let (tx, conn) = http1::handshake(TokioIo::new(UnixStream::from_std(mine)?)).await?;
+        let io = TokioIo::new(UnixStream::from_std(mine)?);
+        let (tx, conn) = http1::Builder::new().max_header_size(crate::server::MAX_HEAD).handshake(io).await?;
         Ok(Conn { tx, conn: Some(conn) })
     }
 
@@ -159,8 +160,11 @@ where
         if (frame.is_none() || this.inner.is_end_stream())
             && let Some(mut c) = this.conn.take()
         {
-            // Let the connection see the end of the response before reuse.
-            if c.poll_conn(cx) {
+            // Let the connection see the end of the response before reuse,
+            // and reuse it only if it is idle: one still sending its request
+            // (answered early, say 408 or 413) would hold that body and its
+            // sender with nothing driving it (N-680).
+            if c.poll_conn(cx) && c.tx.is_ready() {
                 let mut idle = this.dialer.pool().lock();
                 if idle.len() < MAX_IDLE {
                     idle.push(c);
@@ -268,6 +272,33 @@ mod tests {
         for s in sends {
             assert_eq!(s.await.unwrap().unwrap(), "ok");
         }
+    }
+
+    /// A connection whose response ends before its request body has been
+    /// sent is dropped, not pooled: in the pool nothing would drive it, and
+    /// it would keep the body, and whoever is sending it, open for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_answered_before_its_body_is_sent_is_not_pooled() {
+        use futures::Stream;
+        type Endless = http_body_util::StreamBody<Pin<Box<dyn Stream<Item = Result<Frame<Bytes>, std::convert::Infallible>> + Send>>>;
+        let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        // Answers at once, and goes on reading the body.
+        tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), vec![], |req: Request<Incoming>| async move {
+            tokio::spawn(req.into_body().collect());
+            Response::new(Full::new(Bytes::from_static(b"early")))
+        }));
+        let dialer = Dialer::<Endless>::new(ctl, 1);
+        let (sending, dropped) = tokio::sync::oneshot::channel::<()>();
+        let body = futures::stream::unfold(sending, |sending| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Some((Ok(Frame::data(Bytes::from_static(b"x"))), sending))
+        });
+        let res = dialer.send(Request::post("/").body(http_body_util::StreamBody::new(Box::pin(body) as Pin<Box<_>>)).unwrap()).await.unwrap();
+        assert_eq!(res.into_body().collect().await.unwrap().to_bytes(), "early");
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(1), dropped).await;
+        assert!(gone.is_ok(), "the request body is still held");
+        assert!(dialer.pool().lock().is_empty());
     }
 
     /// A dialer gets at most its own cap of connections served at once, and

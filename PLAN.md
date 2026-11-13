@@ -118,13 +118,13 @@ nanovm/
   | `PostReturn` | `post_return_timeout` | the streaming body is aborted with an error frame, so a truncated response doesn't look complete |
   | `Idle` | `idle_timeout` | clean eviction |
 - **CPU budget:**
-  - The outer `poll_fn` times every poll of the store's event loop and charges it to the current request. That covers guest code and inline filesystem calls; it is wall time, so it inflates when the host is oversubscribed.
+  - The outer `poll_fn` reads the thread's CPU clock (`CLOCK_THREAD_CPUTIME_ID`) around every poll of the store's event loop and charges the difference to the current request. That covers guest code and inline filesystem calls, user and kernel time, but not time waiting for a core or the disk, nor the journal's own work: undo records and the commit (N-640).
   - An epoch ticker thread runs every `epoch_tick_ms` (default 5 ms). Each Store's `epoch_deadline_callback` checks the charge including the poll in progress, and past `cpu_ms` returns an `Err(CpuExceeded)` trap.
   - Otherwise it returns `Yield(1)`, so a spinning guest still yields to tokio.
   - **Heavy lanes:** once a request has used 10 ms (`HEAVY_AFTER_NS`), the callback returns `YieldCustom`, which waits for one of `heavy_lanes` permits before the guest runs again. The permit is handed back at every tick. This stops CPU hogs from yielding straight back onto every worker.
   - The Store is per object and serves one request at a time, so per-store accounting is per-request accounting.
 - **Memory:** a custom `ResourceLimiter` holds the total across *all* linear memories of the object; upstream `StoreLimits` is per memory. Growing past it returns `Err(MemoryLimitExceeded)`. Table elements, instance count and table count are also capped.
-- **Other per-store caps:** `ResourceTable::set_max_capacity(max_resources)`. Header field size uses the `WasiHttpCtx` default (128 KiB).
+- **Other per-store caps:** `ResourceTable::set_max_capacity(min(max_resources, memory_mb × 16))`, and a guest's header map holds at most 64 KiB (`server::MAX_HEAD`, also hyper's head limit at every hop), so host-held header maps stay within `memory_mb` (N-75).
 - **Poisoning:**
   - Any `Err` from run_concurrent poisons the Store upstream, so we drop it.
   - The pending reply gets 500 or 504 with an `x-nanovm-error` reason: `cpu`, `memory`, `timeout`, `trap`, `resource-table`.
@@ -183,13 +183,13 @@ nanovm/
 | Knob | Default | Enforced by |
 |---|---|---|
 | `memory_mb` | 64 | custom ResourceLimiter (all memories) + pool `max_memory_size` |
-| `cpu_ms` per request | 200 | wall time inside store polls, checked by the epoch callback |
+| `cpu_ms` per request | 200 | thread CPU time inside store polls, checked by the epoch callback |
 | `request_timeout_ms` / `post_return_timeout_ms` / `idle_timeout_ms` | 5000 / 5000 / 30000 | outer deadline wrapper |
 | `max_request_body_kb` / `max_response_body_kb` | 1024 / 8192 | body wrappers |
 | `disk_mb` / `max_files` | 64 / 1000 | QuotaGuard (shared by `/data` and `/tmp`) |
 | `max_queue` | 64 | bounded mailbox |
 | `max_outbound_concurrency` | 4 | egress semaphore |
-| `max_resources` | 10000 | ResourceTable + component handles |
+| `max_resources` | 10000 | ResourceTable + component handles; at most `memory_mb × 16` (256 at 16 MiB) |
 | `egress` | `[]` (deny all) | allowlist |
 
 Node-level settings: `max_live_objects` (1000), `memory_reservation_mb` (128), `listen` (127.0.0.1:8080), `data_dir` (nanovm-data), `epoch_tick_ms` (5), `heavy_lanes` (cores that requests past 10 ms of CPU may occupy at once; 0 means half the cores).
@@ -230,7 +230,7 @@ Each test spins up a `Node` in-process with small limits.
   - an allowed request to `https://example.com` succeeds (ignored by default: needs the internet)
 - **Resources:** `/leak` past `max_resources` traps and poisons the object; the object recovers.
 - **Capacity:** with `max_live` objects full, a new object evicts the LRU idle one.
-- **Validation:** a component importing sockets is rejected at deploy time. *(Not written yet.)*
+- **Validation:** components importing WASIp2 or WASIp3 sockets, the WASIp2 filesystem or an unknown interface, or exporting no HTTP handler, are rejected when loaded, by name, in-process and through a jailed worker (fixtures in `crates/nanovm/tests/refused`).
 - **Leaks:** RSS and open fds stay flat over long runs and churn. *(Not written yet.)*
 
 ## Benchmarks (`examples/bench.rs`)

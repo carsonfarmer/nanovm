@@ -146,9 +146,12 @@ pub fn wants<B>(req: &Request<B>) -> bool {
 }
 
 /// Whether `req` claims to be a socket's event, which only the proxy may
-/// send.
+/// send: any of its content types is that type, in any case and with any
+/// parameters, since an object may read any of them in any of these ways
+/// (repeated headers are often joined with commas, so those split them too).
 pub fn is_event<B>(req: &Request<B>) -> bool {
-    req.headers().get(CONTENT_TYPE).is_some_and(|v| v == EVENTS)
+    let types = req.headers().get_all(CONTENT_TYPE).into_iter().flat_map(|v| v.as_bytes().split(|&b| b == b','));
+    types.map(|t| t.split(|&b| b == b';').next().unwrap_or_default()).any(|t| t.trim_ascii().eq_ignore_ascii_case(EVENTS.as_bytes()))
 }
 
 /// One app's sockets, ordered by object so publishing visits only its own.
@@ -400,23 +403,46 @@ pub fn well_formed(json: &[u8]) -> bool {
     messages(json).is_some()
 }
 
+/// The parts of GRIP's publish format a socket takes. Read into these rather
+/// than a `serde_json::Value`, which costs about 24 bytes of memory for each
+/// byte of a guest's publish; what isn't read is skipped, not built.
+#[derive(serde::Deserialize)]
+struct Publish {
+    items: Vec<Item>,
+}
+
+#[derive(serde::Deserialize)]
+struct Item {
+    channel: String,
+    formats: Formats,
+}
+
+#[derive(serde::Deserialize)]
+struct Formats {
+    #[serde(rename = "ws-message")]
+    ws: Option<WsMessage>,
+}
+
+#[derive(serde::Deserialize)]
+enum WsMessage {
+    #[serde(rename = "content")]
+    Text(String),
+    #[serde(rename = "content-bin")]
+    Binary(String),
+}
+
 /// The (channel, message) of each item of a publish that has one for a
 /// socket; `None` unless all are well formed.
 fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
-    let publish: Value = serde_json::from_slice(json).ok()?;
-    let items = publish.get("items")?.as_array().filter(|i| i.len() <= MAX_ITEMS)?;
-    let message = |item: &Value| -> Option<Option<(String, Message)>> {
-        let channel = item.get("channel")?.as_str()?.to_string();
-        let Some(m) = item.get("formats")?.get("ws-message") else { return Some(None) };
-        let m = m.as_object().filter(|m| m.len() == 1)?;
-        let m = match (m.get("content"), m.get("content-bin")) {
-            (Some(t), None) => Message::text(t.as_str()?),
-            (None, Some(b)) => Message::binary(B64.decode(b.as_str()?).ok()?),
-            _ => return None,
-        };
-        Some(Some((channel, m)))
+    let items = serde_json::from_slice::<Publish>(json).ok()?.items;
+    if items.len() > MAX_ITEMS {
+        return None;
+    }
+    let message = |(channel, m)| match m {
+        WsMessage::Text(t) => Some((channel, Message::text(t))),
+        WsMessage::Binary(b) => Some((channel, Message::binary(B64.decode(b).ok()?))),
     };
-    items.iter().map(message).collect::<Option<Vec<_>>>().map(|m| m.into_iter().flatten().collect())
+    items.into_iter().filter_map(|i| Some((i.channel, i.formats.ws?))).map(message).collect()
 }
 
 /// Serves a socket until it ends. The client's messages go to the object one
@@ -591,6 +617,26 @@ mod tests {
             [r#"{}"#, r#"{"items":[{"formats":{}}]}"#, r#"{"items":[{"channel":"a","formats":{"ws-message":{}}}]}"#]
         {
             assert!(messages(bad.as_bytes()).is_none(), "{bad}");
+        }
+    }
+
+    /// A publish is the guest's, and both its worker and the proxy parse it:
+    /// that holds a few times its size at most, whatever it holds (tiny
+    /// values parsed as `serde_json::Value` held 24 times).
+    #[test]
+    fn publishes_parse_in_bounded_memory() {
+        let filled = |head: &str, item: &str, tail: &str| {
+            let mut json = head.to_string();
+            while json.len() < 1 << 20 {
+                json += item;
+            }
+            json + tail
+        };
+        let unread = filled(r#"{"items":[],"x":["#, "0,", "0]}");
+        let items = filled(r#"{"items":["#, r#"{"channel":"a","formats":{}},"#, r#"{"channel":"a","formats":{}}]}"#);
+        for json in [unread, items] {
+            let peak = crate::counting::peak(|| _ = messages(json.as_bytes()));
+            assert!(peak < 8 * json.len(), "parsing {} bytes held {peak}", json.len());
         }
     }
 
@@ -857,8 +903,8 @@ mod tests {
         assert!(rxs.iter_mut().all(|rx| drain(rx).is_empty()));
     }
 
-    /// An upgrade is any case of `websocket`; an event is exactly the events
-    /// content type.
+    /// An upgrade is any case of `websocket`; an event is any request one of
+    /// whose content types is the events type, however spelled.
     #[test]
     fn upgrades_and_events_are_recognised() {
         let req = |k: HeaderName, v: &'static str| Request::get("/").header(k, v).body(()).unwrap();
@@ -866,8 +912,12 @@ mod tests {
             assert!(wants(&req(http::header::UPGRADE, v)));
         }
         assert!(!wants(&req(http::header::UPGRADE, "h2c")) && !wants(&Request::new(())));
-        assert!(is_event(&req(CONTENT_TYPE, EVENTS)));
-        assert!(!is_event(&req(CONTENT_TYPE, "application/websocket-events; x=1")) && !is_event(&Request::new(())));
+        for v in [EVENTS, "application/websocket-events; x=1", " Application/WebSocket-Events ", "text/plain, application/websocket-events"] {
+            assert!(is_event(&req(CONTENT_TYPE, v)), "{v}");
+        }
+        let second = Request::get("/").header(CONTENT_TYPE, "text/plain").header(CONTENT_TYPE, EVENTS).body(()).unwrap();
+        assert!(is_event(&second));
+        assert!(!is_event(&req(CONTENT_TYPE, "application/websocket-events-x")) && !is_event(&Request::new(())));
     }
 
     type Log = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;
