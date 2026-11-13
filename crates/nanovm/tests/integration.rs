@@ -920,6 +920,14 @@ async fn data_quota_survives_restart() {
     assert!(node.metrics.fs_denied.load(Relaxed) >= 1);
 }
 
+/// `hostile` with room for file work (see `filler`) and a 2 MiB quota: a
+/// new object needs that much free on the small disk below.
+fn small_filler() -> AppConfig {
+    let mut f = filler();
+    f.limits.disk_mb = 2;
+    f
+}
+
 /// A supervisor whose data is on a tmpfs of `mb` MiB, as the audit's 8 MiB
 /// root was, with `app_disk_mb` and `disk_reserve_mb`; why not, unless root.
 async fn on_a_small_disk(test: &str, mb: u64, budget: u64, reserve: u64) -> Result<(Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, SmallDisk), String> {
@@ -964,7 +972,7 @@ async fn a_full_app_budget_refuses_only_that_apps_writes() {
         Ok(s) => s,
         Err(why) => return eprintln!("skipped: {why}"),
     };
-    let (a, b) = (publish("budget-a", &filler()).await, publish("budget-b", &filler()).await);
+    let (a, b) = (publish("budget-a", &small_filler()).await, publish("budget-b", &small_filler()).await);
     let fill = async |app: &str, object: &str, name: &str, mb: u32| {
         let (status, body) = app_get(addr, app, &format!("/{object}/fill?mount=data&mb={mb}&name={name}")).await;
         (status, serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default())
@@ -992,14 +1000,23 @@ async fn the_disk_reserve_keeps_writes_committing() {
         Ok(s) => s,
         Err(why) => return eprintln!("skipped: {why}"),
     };
-    let (files, counter) = (publish("reserve-files", &filler()).await, publish("reserve-counter", &app("counter")).await);
+    let (files, counter) = (publish("reserve-files", &small_filler()).await, publish("reserve-counter", &app("counter")).await);
     let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(raw(addr, &format!("POST /c0/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await.0, 200);
-    // One object fills the disk down to the reserve.
-    let (status, body) = app_get(addr, &files, "/hog/fill?mount=data&mb=8").await;
-    assert_eq!(status, 507, "{body}");
-    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk is below its 3 MiB reserve")));
+    // Objects of 2 MiB fill the disk down to the reserve: the first refused
+    // is refused by it (a new object needs only its 2 MiB free).
+    let mut hogs = 0;
+    let body = loop {
+        let (status, body) = app_get(addr, &files, &format!("/hog{hogs}/fill?mount=data&mb=2")).await;
+        hogs += 1;
+        if status != 200 {
+            assert_eq!(status, 507, "{body}");
+            break body;
+        }
+    };
+    assert!(body.contains("insufficient-space"), "{body}");
+    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk is below its 3.0 MiB reserve")));
     // Every app's growth is refused by the app, as on a full disk: never a
     // failed commit, as the audit saw on every write.
     let incr = async |object: &str| {
@@ -1013,7 +1030,9 @@ async fn the_disk_reserve_keeps_writes_committing() {
     // A write in place still commits.
     let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(app_get(addr, &files, "/hog/clean?mount=data").await.0, 200);
+    for hog in 0..hogs {
+        assert_eq!(app_get(addr, &files, &format!("/hog{hog}/clean?mount=data")).await.0, 200);
+    }
     let (status, body) = incr("c1").await;
     assert_eq!(status, 200, "{body}");
 }

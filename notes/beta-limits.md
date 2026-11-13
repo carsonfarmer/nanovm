@@ -51,7 +51,8 @@ instance's last reference is dropped before its volume's lock is, so a new insta
 before the old one's usage is settled.
 
 The reserve is `fstatvfs` on the app's `objects/` directory (a new `fstatfs` in the worker's
-seccomp allowlist) before any growth and any new entry: below `disk_reserve_mb` free (`f_bavail`,
+seccomp allowlist) before any growth and any new entry: below `disk_reserve_mb` free (default a
+twentieth of the filesystem, at most 1 GiB, so a small disk isn't all reserve; `f_bavail`,
 what the worker's uid may use), those are refused with `insufficient-space`, while writes in place,
 truncation, removal, rollback and commit go on. Each refusal is an `fs-denied` event naming its
 cause: `the app's N MiB disk budget is full`, `the node's disk is below its N MiB reserve`, the
@@ -144,8 +145,8 @@ New, each a hostile test of one limit:
 | `clients_past_their_rate_are_refused_however_they_forward` | proxy at 1 request/s per client: 10 at once from an untrusted peer, each with a different forged `X-Forwarded-For`, are 1–3 served and the rest 429 with `Retry-After`; behind a trusted peer, a client is limited by its own address, and four forgeries written left of it (another address, the terminator's, junk) are all refused; another client is served; the terminator's own requests never are refused; a node reached directly refuses past its rate too |
 | `apps_past_their_rate_are_refused` | one app at 1 request/s: 10 clients at once share it; another app is served |
 | `connections_are_capped_per_client_and_in_all` | a third connection from one address gets 503 `too-many-connections` with `Retry-After: 1`, the other two are served, and a closed one frees its slot; with 2 in all, a third waits until one closes, then is served |
-| `a_full_app_budget_refuses_only_that_apps_writes` | 8 MiB tmpfs, 3 MiB budget, jailed workers: app A writes 2 MiB in one object and is cut at exactly 1 MiB in another (`insufficient-space`, `fs-denied` "the app's 3 MiB disk budget is full"); app B then writes 2 MiB; A deletes and writes again |
-| `the_disk_reserve_keeps_writes_committing` | 8 MiB tmpfs, 3 MiB reserve, budget above the disk: one object fills the disk to the reserve (`fs-denied` "below its 3 MiB reserve"); 20 counter objects' increments are each a clean 507, never `500 commit-failed`; an overwrite in place commits; after a delete, increments work again |
+| `a_full_app_budget_refuses_only_that_apps_writes` | 8 MiB tmpfs, 3 MiB budget, objects of 2 MiB quota, jailed workers: app A writes 2 MiB in one object and is cut at exactly 1 MiB in another (`insufficient-space`, `fs-denied` "the app's 3 MiB disk budget is full"); app B then writes 2 MiB; A deletes and writes again |
+| `the_disk_reserve_keeps_writes_committing` | 8 MiB tmpfs, 3 MiB reserve, budget above the disk: objects of 2 MiB fill the disk until one is refused, by the reserve (`fs-denied` "below its 3.0 MiB reserve"), not by the objects branch's new-object check; 20 counter objects' increments are each a clean 507, never `500 commit-failed`; an overwrite in place commits; after a delete, increments work again |
 | `workers_run_under_host_sized_limits_or_the_node_refuses_to_start` | `cgroup = "auto"` here refuses to start, naming `cgroup = "off"`; where cgroup v2 can be delegated, checks the supervisor moved to `<own>/supervisor`, the worker is in `<own>/workers/…` and its `memory.max`/`cpu.max` are the defaults |
 | unit: `clients_are_named_only_by_trusted_forwarders`, `rates_are_per_client_and_per_app`, `connections_are_capped_per_client`, `trusted_takes_addresses_and_ranges` | the gate's rules, IPv6 /64, IPv4-mapped addresses |
 | unit: `objects_share_their_apps_budget`, `below_the_reserve_only_growth_is_refused` | the budget across objects (cut short, refused, freed), journals not counted, `/tmp` released at instance end, an uncommitted removal counted until rollback; growth and entries refused below the reserve while overwrites and shrinking go on |

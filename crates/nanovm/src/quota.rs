@@ -72,7 +72,8 @@ impl Default for Disk {
 
 impl Disk {
     /// The disk of the app whose objects are under `objects`, measured
-    /// there; a budget of 0 MiB is a quarter of their filesystem.
+    /// there; a budget of 0 MiB is a quarter of their filesystem, a reserve
+    /// of 0 a twentieth, at most 1 GiB.
     pub fn open(objects: &Path, budget_mb: u64, reserve_mb: u64) -> std::io::Result<Disk> {
         let fs = std::fs::File::open(objects)?;
         let st = rustix::fs::fstatvfs(&fs)?;
@@ -91,7 +92,7 @@ impl Disk {
             max: if budget_mb == 0 { st.f_blocks * st.f_frsize / 4 } else { budget_mb << 20 },
             idle: Mutex::new(idle),
             fs: Some(fs),
-            reserve: reserve_mb << 20,
+            reserve: if reserve_mb == 0 { (st.f_blocks * st.f_frsize / 20).min(1 << 30) } else { reserve_mb << 20 },
         })
     }
 
@@ -99,7 +100,7 @@ impl Disk {
     /// reserve (or can't say how much it has free).
     fn low(&self) -> Option<String> {
         let free = rustix::fs::fstatvfs(self.fs.as_ref()?).map_or(0, |st| st.f_bavail * st.f_frsize);
-        (free < self.reserve).then(|| format!("write refused, the node's disk is below its {} MiB reserve", self.reserve >> 20))
+        (free < self.reserve).then(|| format!("write refused, the node's disk is below its {:.1} MiB reserve", self.reserve as f64 / 1048576.0))
     }
 
     /// Up to `want` more bytes, none while the node's disk is below its

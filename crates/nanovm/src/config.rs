@@ -108,8 +108,9 @@ config! {
         app_disk_mb: u64 = 0u64,
         /// Free space kept on `data_dir`'s filesystem, in MiB: below it,
         /// writes that need more space are refused for every app, so
-        /// commits, rollbacks and deletes always find room.
-        disk_reserve_mb: u64 = 512u64,
+        /// commits, rollbacks and deletes always find room. 0 is a
+        /// twentieth of the filesystem, at most 1 GiB.
+        disk_reserve_mb: u64 = 0u64,
     }
 }
 
