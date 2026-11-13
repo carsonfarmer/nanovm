@@ -51,7 +51,8 @@ systemd-run -q --unit=devreg /usr/local/bin/dev-registry
 check "install.sh (and its host check)" '"$HERE/install.sh" /usr/local/bin/nanovm >$W/install.log 2>&1'
 sed -n '/^  /p;/^WARN\|^FAIL/p' $W/install.log
 sed -i '1i dev = true' /etc/nanovm/nanovm.toml
-sed -i -e '1i dev = true' -e 's|^resolver = .*|resolver = "http://127.0.0.1:5353/dns-query"|' /etc/nanovm/proxy.toml
+sed -i -e '1i dev = true' -e 's|^resolver = .*|resolver = "http://127.0.0.1:5353/dns-query"|' \
+    -e 's|^hosts = .*|hosts = ["app.test", "other.test"]|' -e 's|^signers = .*|signers = ["dev dev"]|' /etc/nanovm/proxy.toml
 sed -e 's/^app.example.com, www.app.example.com {/app.test {\n\ttls internal/' -e 's/^\temail ops@example.com/\tskip_install_trust/' \
     "$HERE/Caddyfile" >/etc/caddy/Caddyfile
 systemctl enable -q --now nanovm nanovm-proxy
@@ -66,6 +67,7 @@ for _ in 1 2 3; do c -XPOST https://app.test/alice/incr; echo; done
 check "https://app.test/alice/ through Caddy (verified TLS), proxy, node: count 3" 'c https://app.test/alice/ | grep -q "\"count\":3"'
 check "a client cannot name the app itself" '[ "$(c -o /dev/null -w "%{http_code}" -H "nanovm-app: x" https://app.test/alice/)" = 200 ]'
 check "a host with no TXT record: 404 from the proxy" '[ "$(curl -s -o /dev/null -w "%{http_code}" -H "Host: other.test" http://127.0.0.1:8443/alice/)" = 404 ]'
+check "a host the proxy doesn't serve: 403" '[ "$(curl -s -o /dev/null -w "%{http_code}" -H "Host: evil.test" http://127.0.0.1:8443/alice/)" = 403 ]'
 # The node (8080) and publish (8444) listeners: present, and on 127.0.0.1 only.
 loopback_only() { python3 -c 'import sys
 seen = set()

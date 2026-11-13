@@ -22,7 +22,8 @@ fn files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// `nanovm serve` reads a node's `*.toml` with `NodeConfig::load`, `nanovm
 /// proxy` a `proxy.toml` with `ProxyConfig::load`, and `nanovm publish` and
-/// `nanovm run` an app's `nanovm.json` as an `AppSpec`.
+/// `nanovm run` an app's `nanovm.json` as an `AppSpec`. The deploy references
+/// also admit hosts, signers and egress, as an operator's must.
 #[test]
 fn every_shipped_config_loads() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35,17 +36,26 @@ fn every_shipped_config_loads() {
     let (mut loaded, mut failed) = (Vec::new(), Vec::new());
     for path in &all {
         let name = path.file_name().unwrap().to_str().unwrap();
+        let shown = path.strip_prefix(&root).unwrap().display().to_string();
+        // The proxy's `hosts` and `signers` and the node's egress are empty by
+        // default: a deploy reference without them starts a proxy that serves
+        // nothing and apps that reach nothing.
+        let serves = |set: bool, why: &str| match shown.starts_with("deploy/") && !set {
+            true => Err(anyhow::anyhow!("{why}")),
+            false => Ok(()),
+        };
         let result = match name {
             // Other tools' files.
             "Cargo.toml" | "rustfmt.toml" => continue,
-            "proxy.toml" => ProxyConfig::load(path).map(drop),
-            _ if name.ends_with(".toml") => NodeConfig::load(path).map(drop),
+            "proxy.toml" => ProxyConfig::load(path)
+                .and_then(|c| serves(!c.hosts.is_empty() && !c.signers.is_empty(), "no `hosts` or `signers`: it would serve nothing")),
+            _ if name.ends_with(".toml") => NodeConfig::load(path)
+                .and_then(|c| serves(!c.limits.egress.is_empty(), "no `[limits] egress`: its apps would reach nothing")),
             "nanovm.json" => serde_json::from_slice::<AppSpec>(&std::fs::read(path).unwrap())
                 .map(drop)
                 .map_err(Into::into),
             _ => continue,
         };
-        let shown = path.strip_prefix(&root).unwrap().display().to_string();
         match result {
             Ok(()) => loaded.push(shown),
             Err(e) => failed.push(format!("{shown}: {e:#}")),

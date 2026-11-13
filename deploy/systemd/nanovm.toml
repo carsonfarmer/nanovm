@@ -31,6 +31,10 @@ cpu_ms = 200
 request_timeout_ms = 5000
 disk_mb = 64
 max_files = 1000
+# The operator's egress cap: an app reaches only what its own `egress` and
+# this list both allow. Empty (the default): no app reaches anything. These
+# are what examples/oauth signs in with; list what your developers' apps need.
+egress = ["github.com:443", "api.github.com:443"]
 
 # Whole-worker limits, applied only through `cgroup`. 0 leaves one unset.
 [worker]

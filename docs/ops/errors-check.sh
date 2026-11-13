@@ -77,9 +77,10 @@ show "capture turned off, history kept" -H @"$W/counter.h" "$U/c/"
 
 # The proxy, with a resolver that isn't there.
 P=http://127.0.0.1:$((PORT + 1))
-printf 'dev = true\nlisten = "%s"\nnodes = ["127.0.0.1:%s"]\npublish_listen = "127.0.0.1:%s"\nresolver = "http://127.0.0.1:9/dns-query"\ntelemetry_endpoint = "http://127.0.0.1:9"\n' \
+printf 'dev = true\nlisten = "%s"\nnodes = ["127.0.0.1:%s"]\npublish_listen = "127.0.0.1:%s"\nresolver = "http://127.0.0.1:9/dns-query"\ntelemetry_endpoint = "http://127.0.0.1:9"\nhosts = ["example.com"]\nsigners = ["dev dev"]\n' \
     "${P#http://}" "$PORT" "$((PORT + 2))" >"$W/proxy.toml"
 "$BIN/nanovm" proxy --config "$W/proxy.toml" >"$W/proxy.log" 2>&1 & pids+=($!)
 for _ in $(seq 50); do curl -s -o /dev/null "$P/" && break; sleep 0.1; done
+show "proxy: a host it doesn't serve" -H 'Host: evil.example' "$P/x/"
 show "proxy: no DNS answer" -H 'Host: example.com' "$P/x/"
 show "proxy: client-sent socket event" -H 'Host: example.com' -H 'content-type: application/websocket-events' "$P/x/"

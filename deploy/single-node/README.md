@@ -106,7 +106,8 @@ to the node's:
   per request), `request_timeout_ms`, `post_return_timeout_ms`, `disk_mb` and
   `max_files` for `/data` and `/tmp`, `max_request_body_kb`,
   `max_response_body_kb`, `max_queue`, `max_outbound_concurrency`,
-  `max_resources`. `egress` stays the app's own list.
+  `max_resources`. `egress` is different: not a ceiling to clamp to but
+  your list of the hosts any app may reach (step 5).
 - `[worker]` with `cgroup`: memory, CPUs and pids for each app's whole worker.
   Install with `install.sh --cgroup` (the [cgroup drop-in](../systemd/nanovm-cgroup.conf));
   without `cgroup` these aren't applied, and check-host warns.
@@ -125,7 +126,8 @@ to the node's:
 `/etc/nanovm/proxy.toml` ([the reference](../systemd/proxy.toml)): `listen =
 "127.0.0.1:8443"` behind Caddy, `nodes = ["127.0.0.1:8080"]` (this node, as its
 `listen`), `publish_listen = "127.0.0.1:8444"`, the DNS-over-HTTPS `resolver`
-(Cloudflare's by default) and `tag_ttl_s` (30 s).
+(Cloudflare's by default), `tag_ttl_s` (30 s), and the `hosts` it serves and
+the `signers` who may deploy (step 5).
 
 **Caddy.** `apt install caddy`, then put your app hosts in
 [Caddyfile](Caddyfile) at `/etc/caddy/Caddyfile` and set its `email`. Caddy
@@ -147,13 +149,46 @@ _nanovm.app.example.com. TXT "app=ghcr.io/org/app:prod; trust=https://token.acti
 The node runs only a version signed by a `trust=` identity, at or above an
 optional `min=` floor. Deploying is moving the tag; rolling an app back is
 moving it back ([runbooks](../../docs/ops/runbooks.md#roll-back-nanovm), last
-paragraph). An app reaches only the hosts in its `nanovm.json`'s `egress` list,
-on public addresses.
+paragraph).
 
-> **Placeholder (`beta/deploy`):** which hosts and identities this node accepts
-> (so pointing DNS at the proxy isn't enough to deploy), and the operator's cap
-> on an app's egress: keys, reference values, and how to add a developer.
-> Filled in when `beta/deploy` is integrated.
+**You decide which hosts are served and who deploys** (README, ["The
+proxy"](../../README.md#the-proxy)). Pointing DNS at the VM isn't enough: in
+`proxy.toml`,
+
+```toml
+hosts = ["app.example.com", "www.app.example.com"]   # or "*.apps.example.com"
+signers = ["https://token.actions.githubusercontent.com https://github.com/org/*"]
+```
+
+- `hosts`: names, or `*.name` for any name under it. Any other host gets 403
+  before its record is looked up. Keep it the same as the Caddyfile's list
+  (B-407).
+- `signers`: `<issuer> <subject>`, the subject exact or ending in `*` (end
+  the prefix with `/`). A record's `trust=` entries are cut to these; an app
+  signed by anyone else is refused even if its record trusts them, and a
+  record trusting none of them gets 403.
+- Both are empty by default: a proxy without them serves nothing. The
+  [reference](../systemd/proxy.toml) lists the Caddyfile's example hosts and
+  an example CI identity; replace them with yours.
+- **To add a developer:** their host in `hosts` and the Caddyfile, their CI
+  identity (or their `cosign` identity) in `signers`, then `systemctl restart
+  nanovm-proxy` and `systemctl reload caddy`. They publish the `_nanovm`
+  record.
+- **Aliases:** a name that CNAMEs onto another's `_nanovm` record serves that
+  app only if the record lists it (`alias=www.app.example.com`); otherwise
+  403.
+
+**Egress.** The node's `[limits] egress` in `nanovm.toml` is your cap on every
+app: a request out must match both the app's `egress` list and yours, so an
+app asking for `*.com` reaches only what you list. Empty (the default) means
+no app reaches anything. The [reference](../systemd/nanovm.toml) lists
+GitHub's hosts, which examples/oauth signs in with; list the APIs your
+developers' apps need. Private addresses are refused in both lists.
+
+**Outages.** The proxy keeps serving a host's last route and a tag's last
+digest for up to a day while the resolver or the registry fails (serve-stale,
+asking again every 30 s), but a worker that restarts meanwhile needs the
+registry (B-406), and a restarted proxy has no stale routes.
 
 ## 6. App secrets
 

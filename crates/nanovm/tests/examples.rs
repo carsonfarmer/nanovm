@@ -1768,7 +1768,8 @@ impl Served {
         // The package: what `nanovm publish` would push, which holds no secret.
         let manifest: Value = serde_json::from_slice(&std::fs::read(repo().join(format!("examples/{name}/nanovm.json"))).unwrap()).unwrap();
         let manifest = patched(manifest, &patch);
-        nanovm::secrets::check_package(&serde_json::from_value(manifest.clone()).unwrap()).unwrap();
+        let spec: nanovm::registry::AppSpec = serde_json::from_value(manifest.clone()).unwrap();
+        nanovm::secrets::check_package(&spec).unwrap();
         for value in secrets.as_object().unwrap().values() {
             assert!(!manifest.to_string().contains(value.as_str().unwrap()), "the package holds a secret");
         }
@@ -1782,7 +1783,7 @@ impl Served {
         let host = format!("{name}.example");
         let file = dir.join(format!("{}.json", nanovm::registry::app_name(&host, &app.parse().unwrap())));
         std::fs::write(file, secrets.to_string()).unwrap();
-        let cfg = nanovm::config::NodeConfig {
+        let mut cfg = nanovm::config::NodeConfig {
             data_dir: data,
             secrets: Some(dir),
             max_live_objects: 16,
@@ -1790,6 +1791,8 @@ impl Served {
             dev: true,
             ..Default::default()
         };
+        // The operator allows the egress the app asks for.
+        cfg.limits.egress = spec.limits.egress;
         let sup = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

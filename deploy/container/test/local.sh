@@ -82,7 +82,7 @@ docker run -d --name nv-proxy --network container:nv-node --init --security-opt 
     -v "$WORK/proxy.toml:/etc/nanovm/proxy.toml:ro" nanovm:local-test proxy --config /etc/nanovm/proxy.toml >/dev/null
 sleep 1
 check "proxy answers as nobody, read-only (502: no resolver here)" \
-    'x wget -S -O - --header "Host: example.com" http://127.0.0.1:8443/alice/ 2>&1 | grep -q "HTTP/1.1 502"'
+    'x wget -S -O - --header "Host: app.example.com" http://127.0.0.1:8443/alice/ 2>&1 | grep -q "HTTP/1.1 502"'
 t0=$(date +%s%N); docker stop nv-node >/dev/null; t1=$(date +%s%N)
 echo "docker stop with --init: $(((t1 - t0) / 1000000)) ms"
 check "stop with --init takes under 5 s" '[ $(((t1 - t0) / 1000000)) -lt 5000 ]'

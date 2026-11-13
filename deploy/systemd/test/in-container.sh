@@ -80,7 +80,7 @@ check "uid stable after restart" '[ "$(ps -o uid= -p $(pgrep -f "nanovm worker" 
 systemctl start nanovm-proxy
 sleep 1
 check "proxy active" '[ "$(systemctl is-active nanovm-proxy)" = active ]'
-code=$(curl -s -o /run/px.json -w '%{http_code}' -H "Host: example.com" http://127.0.0.1:8443/alice/)
+code=$(curl -s -o /run/px.json -w '%{http_code}' -H "Host: app.example.com" http://127.0.0.1:8443/alice/)
 echo "proxy: $code $(cat /run/px.json)"
 check "proxy answers (no resolver in a private net: 502)" '[ "$code" = 502 ]'
 echo "proxy: $(grep -E 'Uid|CapEff|NoNewPrivs|Seccomp:' "/proc/$(systemctl show -p MainPID --value nanovm-proxy)/status" | tr '\n' ' ')"

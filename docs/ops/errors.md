@@ -69,7 +69,9 @@ only as `error.type = post-return-commit-failed` on the span and an event.
 | Status | `x-nanovm-error` | What happened |
 |---|---|---|
 | 404 | `proxy` | `no app at <host>`: no TXT record at `_nanovm.<host>`. |
-| 502 | `proxy` | The record couldn't be used: the DNS-over-HTTPS resolver failed or timed out, more than one TXT record, a malformed one (`app=` must name a tag, not a digest; `trust=` is required; an unknown or repeated field), the tag couldn't be resolved at the registry, or no node could be reached within `failover_ms`. The detail says which. |
+| 403 | `proxy` | The operator's lists ([guide, step 5](../../deploy/single-node/README.md#5-who-may-deploy-and-egress)): `this proxy doesn't serve <host>` (not in `hosts`; no DNS lookup was made), `<host> is an alias of <owner>, whose record doesn't list it` (no `alias=`), or `<owner>'s record trusts no identity that may deploy here` (no `trust=` that `signers` matches). |
+| 503 | `proxy` | `too many names without an answer are remembered: try again soon`: 1,000 hosts or tags without an answer are being looked up or remembered, as in a flood of made-up names under a `*.` entry in `hosts`. Hosts that have an app are served as usual. |
+| 502 | `proxy` | The record couldn't be used: the DNS-over-HTTPS resolver failed or timed out (any answer but NOERROR or NXDOMAIN, such as SERVFAIL; a host or tag found before is served stale through this for up to a day), more than one TXT record, a malformed one (`app=` must name a tag, not a digest; `trust=` is required; an unknown or repeated field), the tag couldn't be resolved at the registry, or no node could be reached within `failover_ms`. The detail says which. |
 | 504 | `proxy` | A node took the request but didn't answer within `failover_ms` ("the request may have run there"); the proxy never sends it again. |
 | 400 | `proxy` | A client sent a WebSocket event itself ("socket events come from the proxy"). |
 | 400, 426, 431, 503, 502 | `socket-refused` | A WebSocket open refused: not a handshake (400), not version 13 (426), headers too large (431), `max_sockets` for the proxy, the app or the object (503), or the object refused it or answered `OPEN` with something a socket can't take (502). |
@@ -83,10 +85,12 @@ Outbound calls never pass an upstream's `x-nanovm-error` on as nanovm's.
 Every reason above is from an `error_response` call in `crates/nanovm/src`
 (`object.rs`, `server.rs`, `table.rs`, `egress.rs`, `supervisor.rs`,
 `proxy.rs`, `ws.rs`, `table.rs`), and the poison reasons from `metrics::Poison` and
-`object::classify`. [errors-check.sh](errors-check.sh) triggers 18 of them (20 checks, two of them with local capture) against
+`object::classify`. [errors-check.sh](errors-check.sh) triggers 18 of them (21 checks, two of them with local capture) against
 a dev-mode node and proxy, with the counter and hostile guests, and prints
 status, header and detail; the details quoted above are its output, again on
-round 3 (`beta/deployable`, notes/beta-deployable.md). Not
+round 3 (`beta/deployable`, notes/beta-deployable.md), and with the proxy's
+`hosts` and `signers` and the secrets on `beta/integration` (the 403 for a
+host it doesn't serve). Not
 triggered there: `commit-failed` from the disk or the store, `object-unavailable`,
 `bad-request-body`, `bad-uri`, `body-timeout`, `not-held`, the proxy's 504,
 `500 worker-down` and the WebSocket refusals (covered by the integration tests,

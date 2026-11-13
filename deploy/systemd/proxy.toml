@@ -11,3 +11,11 @@ publish_listen = "127.0.0.1:8444"
 telemetry_endpoint = "http://127.0.0.1:4318"
 resolver = "https://cloudflare-dns.com/dns-query"
 tag_ttl_s = 30
+# Which hosts this proxy serves: a name, or `*.name` for any name under it.
+# Any other host gets 403 before a DNS lookup. Keep the Caddyfile's names
+# here. Empty (the default): it serves nothing.
+hosts = ["app.example.com", "www.app.example.com"]
+# Who may deploy: `<issuer> <subject>`, the subject exact or ending in `*`
+# (end the prefix with `/`). A record's trust= entries are cut to these.
+# Empty (the default): no app deploys. Replace with your developers' CI.
+signers = ["https://token.actions.githubusercontent.com https://github.com/org/*"]

@@ -17,3 +17,7 @@ jail_uid_base = 200000
 memory_mb = 64
 cpu_ms = 200
 disk_mb = 64
+# The operator's egress cap: an app reaches only what its own `egress` and
+# this list both allow. Empty (the default): no app reaches anything. These
+# are what examples/oauth signs in with; list what your developers' apps need.
+egress = ["github.com:443", "api.github.com:443"]
