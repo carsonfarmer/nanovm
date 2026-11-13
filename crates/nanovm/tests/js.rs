@@ -339,6 +339,20 @@ async fn review2_wait_until_registered_after_the_answer_commits_its_write_when_i
     assert!(kv.get("nested").is_none(), "the rejected waitUntil work's write committed: {kv}");
 }
 
+/// review2 (D4): a `waitUntil` promise that can never settle counts as
+/// failed work after the answer, which the docs say leaves the answer and
+/// the handler's own writes standing. `settle` finds it can never settle on
+/// its first poll and aborts before the host has taken the answer: every
+/// such request fails as a trap and its handler's write rolls back.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_wait_until_that_never_settles_fails_the_answered_request() {
+    let node = node("js_wait_until_never", 8);
+    let r = post(&node, "v", "/later-never").await;
+    let kv = get(&node, "v", "/kv").await.json();
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}; storage after: {kv}", r.error);
+    assert_eq!(kv["answered"], 1, "the handler's own write stands: {kv}");
+}
+
 /// The component starts from a snapshot taken at build time; nothing in it
 /// may be shared by instances or stale: randomness, the clock, the id.
 #[tokio::test(flavor = "multi_thread")]

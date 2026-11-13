@@ -115,6 +115,12 @@ const routes = {
     })());
     return new Response("answered first");
   },
+  // review2: a waitUntil promise that can never settle.
+  "POST /later-never": async (req, env, ctx) => {
+    ctx.waitUntil(new Promise(() => {}));
+    await env.kv.put("answered", hits);
+    return new Response("answered first");
+  },
   // Nothing of the build's pre-initialization may be shared by instances.
   "GET /fresh": () => Response.json({ random: Math.random(), uuid: crypto.randomUUID(), now: Date.now() }),
   "GET /web": async () => {
