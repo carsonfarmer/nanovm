@@ -545,6 +545,54 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Suggestion:** treat it as the existing ambiguous-outcome case ("Do not interpret every error as a rollback", README "Commits"), or have the node finish the answer's commit before reporting the trap.
 - **Status:** open
 
+### N-700: startup removed every empty directory under `cgroup` (round-3 review 2, W1)
+- **Where:** `supervisor.rs` (`Supervisor::new`, the sweep of an earlier run's worker cgroups)
+- **Scenario:** the sweep rmdir'ed every empty entry under `cgroup`, not only `worker-<n>`: an operator's empty cgroup there went, and with `cgroup` set by mistake to a plain directory, so did its empty subdirectories (each spawn then failed with "No such file or directory", naming no `cgroup.procs`). A leftover whose worker had not exited yet was busy, skipped and never removed.
+- **Reproduced:** yes: `review2_startup_removes_only_cgroups_it_made` (`reserved` and `keep` removed), `startup_removes_an_earlier_runs_worker_cgroups` (a leftover holding a process was still there 10 s later).
+- **Fix:** `Cgroup::take` refuses a `cgroup` that is not a cgroup v2 directory (by its filesystem magic), and removes only `worker-<digits>`, killing what is left in one (`cgroup.kill`) and removing it once empty. spawn names `cgroup.procs` when it can't open it.
+- **Status:** fixed in ab37a00 (`fix/r3-worker`)
+
+### N-701: a worker's cgroup leaked when the worker was dropped without being waited for (round-3 review 2)
+- **Where:** `supervisor.rs` (`Cgroup`'s drop; the spare, the reaper task, `spawn`)
+- **Scenario:** dropping a `tokio::process::Child` SIGKILLs it without waiting, and the cgroup's removal ran at once, failed (the process still inside) and was never retried: the spare and the cancelled reaper when a supervisor goes, a spawn that fails at its stdin write.
+- **Reproduced:** yes: `a_dropped_supervisors_worker_cgroups_go` (the spare's `worker-1` still there 10 s after its supervisor's runtime was dropped).
+- **Fix:** a cgroup found busy when dropped has what is in it killed, and a short-lived thread removes it once empty (bounded at 10 s). The reaped path is unchanged.
+- **Status:** fixed in ab37a00 (`fix/r3-worker`)
+
+### N-702: two nodes sharing one `cgroup` could remove each other's fresh worker cgroups (round-3 review 2, suspected)
+- **Where:** `supervisor.rs` (startup sweep; `Cgroup::new` makes `worker-<n>` before its worker enters it)
+- **Scenario:** a node's new `worker-<n>` is empty from its `mkdir` until the worker enters it at exec. Another node configured with the same `cgroup` and starting then removed it, and the first node's spawn failed. With the sweep now killing what is in an earlier run's cgroups (N-700), sharing would be worse: one node would kill the other's workers.
+- **Reproduced:** yes: `two_nodes_cannot_share_a_cgroup` makes an empty `worker-<n>` in the first node's cgroup, as its spawn does; the second node's startup removed it.
+- **Fix:** a node holds an exclusive lock on `cgroup` for its life; a second one refuses to start ("another node runs its workers in cgroup …"). The first keeps serving.
+- **Status:** fixed in ab37a00 (`fix/r3-worker`)
+
+### N-703: a retired worker's last telemetry was lost (round-3 review 2, W2)
+- **Where:** `supervisor.rs` (`drain`, the reaper, `worker_main`)
+- **Scenario:** a jailed worker never drops its telemetry, and retiring it (a version switch, an eviction for another app's slot) SIGKILLed it outright: what it recorded since its last export (up to 1 s), egress-denied events among it, never reached the collector.
+- **Reproduced:** yes: `review2_a_retired_workers_last_telemetry_reaches_the_collector` (3 of 3 rounds lost).
+- **Fix:** `drain` hangs up on the worker (`Dialer::hang_up`); the worker's serve loop returns, it flushes its telemetry and exits; the reaper kills it if it hasn't exited within `STOP_TIMEOUT` (2 s). Retirement took 10-16 ms in the test (debug build). A later graceful node shutdown can call `drain` for each worker.
+- **Status:** fixed in 7fbdeb4 (`fix/r3-worker`)
+
+### N-704: a `[worker] memory_mb` below a spare's use OOM-killed it at hand-over, and the start failed with "Broken pipe" (round-3 review 2, suspected)
+- **Where:** `supervisor.rs` (`limit`, called when a spare is given its app)
+- **Scenario:** a spare builds its engine before it has an app and before its cgroup has the `[worker]` limits. Setting a `memory.max` below what it then holds makes the kernel OOM-kill it, and the start fails at the next write to it.
+- **Reproduced:** yes, in the VM (`scripts/vm-test.sh`): `a_worker_memory_limit_below_a_spares_use_is_refused_clearly` (`memory_mb = 1`) got `502 {"detail":"Broken pipe (os error 32)","error":"worker-down"}` with one `oom_kill`.
+- **Fix:** before setting `memory.max`, `limit` compares it with the cgroup's `memory.current` and refuses the start: "[worker] memory_mb = 1 is below the N MiB a worker holds before it has an app". No OOM kill.
+- **Status:** fixed on `fix/r3-worker`
+
+### N-705: retiring a worker cut off its objects' work after the answer
+- **Where:** `supervisor.rs` (`drain`, `slot`), `object.rs` (post-return phase)
+- **Scenario:** found while fixing N-703. A drain waits for requests and their response bodies, not for work a guest does after its answer (`after`, `waitUntil`, a streamed body's tail), which the node commits when it ends. A switch or an eviction for another app's slot then killed the worker, and that work's writes rolled back at the object's next start. The drain's own bound (request plus post-return time) shows the work was meant to be waited for. Before N-703 the kill came at once; with N-703 alone, at the flush.
+- **Reproduced:** yes: `a_retired_workers_work_after_the_answer_commits` (`/slow` in `tests/sdk-after`: 500 ms, then a write; then a request to the next version): `"later": false`.
+- **Fix:** a worker asked to stop runs `Node::shutdown` (its objects finish their queued and after-answer work and commit) before it flushes its telemetry; the supervisor gives it `post_return_timeout_ms` plus 2 s before it kills it.
+- **Status:** fixed on `fix/r3-worker`
+
+### N-706: `scripts/vm-test.sh` could no longer run the cgroup tests; the `cgroup` doc named per-app limits (round-3 review 2)
+- **Where:** `scripts/vm-test.sh`, `config.rs` (`cgroup`), PLAN.md
+- **Scenario:** the script copied the deleted `demo/static` (`set -e` stopped it), and the VM had no CA certificates, so every test failed building its HTTP client. Worker limits are the node's `[worker]`, not an app's `[app.worker]`.
+- **Fix:** the script copies the host's CA bundle and no longer `demo/static`, links `sleep`, and its default set includes the `cgroup` tests. Docs corrected.
+- **Status:** fixed on `fix/r3-worker`
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

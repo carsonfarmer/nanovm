@@ -1810,7 +1810,8 @@ async fn two_nodes_cannot_share_a_cgroup() {
     cfg.cgroup = Some(root.clone());
     let (first, addr) = supervised_with(cfg).await;
     let counter = publish("counter", &app("counter")).await;
-    assert_eq!(app_get(addr, &counter, "/x/").await.0, 200);
+    let (status, body) = app_get(addr, &counter, "/x/").await;
+    assert_eq!(status, 200, "{body}");
     let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].clone();
     // As the first node makes a worker's cgroup, before the worker is in it.
     let fresh = root.join("worker-999999");
@@ -1847,7 +1848,8 @@ fn a_dropped_supervisors_worker_cgroups_go() {
         cfg.cgroup = Some(root.clone());
         let (_sup, addr) = supervised_with(cfg).await;
         let counter = publish("counter", &app("counter")).await;
-        assert_eq!(app_get(addr, &counter, "/x/").await.0, 200);
+        let (status, body) = app_get(addr, &counter, "/x/").await;
+        assert_eq!(status, 200, "{body}");
         // The app's worker and the next spare.
         eventually("a spare", || workers().len() == 2).await;
         workers()
