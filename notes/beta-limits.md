@@ -58,6 +58,12 @@ cause: `the app's N MiB disk budget is full`, `the node's disk is below its N Mi
 object's own quota as before, and now `the node's disk is full` for an ENOSPC the journal meets
 (before, that was reported as the object's quota).
 
+With `beta/objects` merged, an app's objects are `objects/<app>/<shard>/<id>/data`, an object has
+a directory only from its first change, and its journal rolls back what an instance left uncommitted
+when the instance ends: the budget walks each `<shard>/<id>/data` at load, and an ended instance's
+volume is measured after that rollback (a `Park` field dropped after the journal), so the app counts
+exactly what stays; a volume the journal removed because it emptied counts 0.
+
 Both limits count logical bytes, as the object quota does. Journals (68 KiB per object between
 requests), the capture outbox and block rounding are on top (B-304); the objects cap on
 `beta/objects` bounds how many objects there are, and the reserve keeps the disk from reaching zero.
@@ -84,8 +90,13 @@ does. `scripts/vm-test.sh` now includes the test, which checks the placement and
 
 All on this sandbox (4 vCPU, 16 GiB, ext4), as root, shared with several other agents' builds and
 tests: load average 5–30 most of the time, near 0 for one short window. Runtime lines (CI's count):
-7,410 → 7,728 (+318: `gate.rs` 145, `quota.rs` +98, `supervisor.rs` +43, `config.rs` +19, `proxy.rs`
-+7, the rest +6).
+this branch merges `beta/objects` (its object layout, `objects/<app>/<shard>/<id>/data`, and per-app
+object cap), as the coordinator asked, so its delta is counted against that: 7,686 → 8,013 (+327:
+`gate.rs` 145, `quota.rs` +112, `supervisor.rs` +43, `config.rs` +19, `proxy.rs` +7, the rest +1).
+Before that merge, against `cf/round3`: 7,410 → 7,728 (+318).
+
+The measurements below were taken before the merge (the hot path they cover, the gate and the
+write path's checks, didn't change in it).
 
 ### CPU per request (the hot path)
 
@@ -139,3 +150,51 @@ New, each a hostile test of one limit:
 | unit: `clients_are_named_only_by_trusted_forwarders`, `rates_are_per_client_and_per_app`, `connections_are_capped_per_client`, `trusted_takes_addresses_and_ranges` | the gate's rules, IPv6 /64, IPv4-mapped addresses |
 | unit: `objects_share_their_apps_budget`, `below_the_reserve_only_growth_is_refused` | the budget across objects (cut short, refused, freed), journals not counted, `/tmp` released at instance end, an uncommitted removal counted until rollback; growth and entries refused below the reserve while overwrites and shrinking go on |
 | unit: `worker_limits_are_sized_from_the_host` | the defaults, and 0 still unsets |
+
+### Without the fixes
+
+- **The audit's run** (`nanovm run` counter on an 8 MiB tmpfs, before this branch): about 560
+  objects' first increments succeeded, then every write on the node failed `500 commit-failed`, and
+  the event blamed the object's own quota ("64 MiB disk quota full").
+- **Without the reserve** (mutation M6 below, the message check skipped): the filler takes the tmpfs
+  to zero, every counter increment then gets `io` from its write (ENOSPC), and no `fs-denied` event
+  says why. With it: a clean `insufficient-space` 507, and the event names the reserve.
+- **Without the app budget** (M5): app A's second object writes its full 2 MiB past the 3 MiB budget.
+
+### Mutation checks
+
+Each breaks one mechanism, runs the tests that should catch it, then `git checkout --` the file and
+checks `git diff` is empty (all 13 were). Run before the `beta/objects` merge.
+
+| # | Mutation | Caught by |
+|---|---|---|
+| M1 | trust `X-Forwarded-For` from any peer | `clients_are_named_only_by_trusted_forwarders`, `clients_past_their_rate_are_refused_however_they_forward` |
+| M2 | no per-client rate | `rates_are_per_client_and_per_app`, `clients_past_their_rate_…` |
+| M3 | no per-client connection cap | `connections_are_capped_per_client`, `connections_are_capped_per_client_and_in_all` |
+| M4 | no total connection cap | `connections_are_capped_per_client_and_in_all` |
+| M5 | grant growth past the app's budget | `objects_share_their_apps_budget`, `a_full_app_budget_refuses_only_that_apps_writes` |
+| M6 | never below the reserve | `below_the_reserve_only_growth_is_refused`, `the_disk_reserve_keeps_writes_committing` |
+| M7 | don't re-measure an ended instance's volume | `objects_share_their_apps_budget` |
+| M8 | forget an uncommitted removal at instance end | `objects_share_their_apps_budget` |
+| M9 | no `fstatfs` in the jail | `a_full_app_budget_refuses_only_that_apps_writes` |
+| M10 | `cgroup = "auto"` runs without cgroups | `workers_run_under_host_sized_limits_or_the_node_refuses_to_start` |
+| M11 | `[worker] memory_mb` defaults to 0 | `worker_limits_are_sized_from_the_host` |
+| M12 | new entries ignore the reserve | `below_the_reserve_only_growth_is_refused` |
+| M13 | IPv6 clients by address, not /64 | `clients_are_named_only_by_trusted_forwarders`, `connections_are_capped_per_client` |
+
+M8 was for the pre-merge design (the removal added back at measuring time); after the merge the
+journal rolls it back first, and the same test checks the count (`objects_share_their_apps_budget`,
+now on objects-backed journals in the sharded layout).
+
+### Not done or not verified
+
+- **cgroup v2 here:** not writable with controllers (they are on cgroup v1), so only the refusal is
+  tested; `scripts/vm-test.sh` (QEMU, no KVM here) wasn't run: it needs a release build of the
+  integration tests, which the shared disk (3–8 GB free) couldn't spare.
+- **W-35 / N-182** (a global budget for what the proxy buffers): not taken; they bound memory, not
+  requests or disk, and this branch is already +327 lines.
+- **Four example tests** (`gateway`, `oauth`) didn't run: their apps need `wac` to build, which isn't
+  installed here, and the other worktrees' builds of them differ.
+- **The proxy's CPU per request** wasn't measured separately: it runs the same gate code as the node's
+  front end, which was.
+
