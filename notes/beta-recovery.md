@@ -136,7 +136,7 @@ Mutation checks (each applied alone or with others caught by other tests, then
 | | Mutation | Caught by |
 |---|---|---|
 | M1 | snapshot every 16 regardless of the backlog | outage test (`[49, 33, 17, 1]`) |
-| M2 | refuse at 16 waiting versions again | outage test |
+| M2 | refuse at 16 waiting versions again | outage test (write 17); also the end-to-end test's other app, with the store up: refused at its 82nd write, the shipper's 20 ms rounds having fallen 16 versions behind a steady writer |
 | M3 | ignore the pause when an instance starts | end-to-end (200, not 503) |
 | M4 | keep the old journal when installing | cut test |
 | M5 | `recover` installs undecided restores | cut test |
@@ -147,8 +147,10 @@ Mutation checks (each applied alone or with others caught by other tests, then
 
 ## Runtime lines
 
-7,410 (round 3) + 78 (control path, merged) = 7,488 → see the final commit for
-the count with this branch (CI's method).
+CI's method: `cf/round3` (7b3f9c6) 7,418; with the merged control path 7,496;
+this branch 7,798: **+302** (ship.rs restore, install, recover, pause, backlog,
+`Store::list`: +173; supervisor restore, pause, commands, backlog count: +116;
+worker pause check and evict: +14; `committed`, `config`, `journal`: −2).
 
 ## Not done
 
