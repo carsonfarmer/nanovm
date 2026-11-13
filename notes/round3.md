@@ -67,6 +67,14 @@ spare's engine memory is charged where its app's limits apply (W1; worker cgroup
 restart with cgroups enabled went 25.1 → 9.0 ms because the cgroup move now happens when the spare
 is spawned. A worker's telemetry export thread now stops with its owner (W2).
 
+Second review's fixes (`fix/r3-worker`, N-700..N-706, evidence in `notes/r3-worker.md`): the
+startup sweep removes only an earlier run's `worker-<n>` cgroups (killing what is left in them),
+`cgroup` must be a cgroup v2 directory no other node holds, and a worker's cgroup goes once the
+worker has exited on every path. A retired worker is asked to stop: its objects finish their work
+after the answer, it flushes its telemetry and exits (10–16 ms when idle), or is killed
+`post_return_timeout_ms` + 2 s later. A `[worker] memory_mb` below a spare's use is refused
+rather than OOM-killing it. `scripts/vm-test.sh` runs again.
+
 Not taken: H4 (link sockets registered for reads only, `cf/speed` ea938cf): a further ~10% one-client
 CPU for +64 lines and two `unsafe` blocks. Optional.
 

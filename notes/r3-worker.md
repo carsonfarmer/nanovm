@@ -69,6 +69,13 @@ Mutation checks (each restored with the saved file, `git diff` checked):
   (`worker-1` left) and `startup_removes_an_earlier…` fail.
 - the whole `src` change reverted → all four cgroup tests and the W2 test fail.
 
+## Full suite
+
+`env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked -p nanovm` on the final branch (with
+the example and JavaScript apps built as CI builds them): unit 155 passed; `dev` 9, `examples` 27,
+`integration` 105 (14 ignored: the SQLite durability suite and others behind `--ignored`, not run),
+`js` 17, all passed. `cargo check --locked -p nanovm --bin nanovm` passes.
+
 ## Runtime lines
 
 7410 → 7428 (cgroups, +18) → 7437 (retirement, +9); after merging `cf/round3` (+8 from r3-dev)
