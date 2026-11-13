@@ -102,6 +102,18 @@ writes near full. That is the disk budget (`beta/limits`).
   and the app serves again from nothing. Bad names are refused.
 - **No automatic deletion of data:** nothing removes a volume that holds anything.
 
+## On `cf/round3`'s lease fixes (0d60e6c)
+
+The lease review's B-502 made the supervisor (root) mark, drop and prune an object's copy
+through descriptors opened a name at a time from the app's directory, never through a
+symlink the app's worker planted. On this layout one function does that (`ship::object_at`:
+`<shard>/<object>` from the app's directory); `mark` writes `shipped` there, the prune opens
+its `committed`, `discard` removes `data`, `journal`, `restore`, `shipped`, then
+`committed`. `the_supervisor_never_follows_a_symlink_the_app_planted` plants the object's
+directory as a symlink (mark and discard refused), then its `committed` (the prune
+refused), and nothing outside changes. The post-claim `chown` still walks paths, as on
+`cf/round3` (B-210).
+
 ## The control path
 
 `<data_dir>/admin/socket`, in a 0700 directory that must be the supervisor's own; bound and
@@ -133,6 +145,7 @@ empty `git diff`:
 | admin directory and socket world-writable | `admin_socket_is_the_supervisors_own` (mode, and uid 65534 connected) |
 | jail allows `socket`/`connect` | `jail_blocks_escapes` |
 | socket bound by its full path | `the_admin_socket_takes_a_long_data_dir` |
+| `object_at` opens the object's directory by path (follows symlinks) | `the_supervisor_never_follows_a_symlink_the_app_planted` ("marked through the object's directory") |
 
 ## CPU per request
 
@@ -157,3 +170,12 @@ object's volume exists, so `place` returns at once). A cold start of a new objec
 `mkdir` for a `stat`, a pool directory and a `statfs`; its first write adds a `rename` and
 two directory syncs (the shard and the app directory, and the object's directory at
 commit); a cold start of an existing object a `stat` for the `mkdir` that failed.
+
+## Runtime lines
+
+7,549 on `cf/round3` (0d60e6c) → 7,826 here (+277): admin.rs +70 (the socket and CLI),
+app.rs +67 (`Objects`: count, cap, room, pool, settle; shards), supervisor.rs +55 (`command`,
+`delete`, `remove`), journal.rs +51 (`place`, the `Drop` that settles, the per-object
+directory), ship.rs +16 (`Store::remove`, `object_at`, the walk over shards, the delete
+lock), object.rs +7, quota.rs +7, main.rs +2, config.rs, jail.rs and lib.rs +1 each,
+committed.rs −1.
