@@ -505,6 +505,40 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** round-3 review S2 asked that a node keep what main's build left in its data directory: a capture main had decided but not published, and main's whole-volume versions without an epoch. 7d03ade built that: recovery adopted main's staged capture, and versions were read in main's format as well as this one. Separately, M4 (3acd297) judged a session record without `lease_ms` by the taker's own.
 - **Status:** not supported, see AGENTS.md rule 1: there is exactly one version of nanovm, v1. All three were removed on `fix/no-compat`. A version says `"format": 1` and is read only so; a log is refused unless its first block is the `nanovmj1` tag and a key; a session record without `lease_ms` doesn't parse and is refused. Operators start from a fresh data directory.
 
+### B-301: no rate limits or connection caps (beta audit)
+- **Where:** `proxy.rs` (`serve`), the node's front end (`main.rs`, `server::serve_http1`)
+- **Scenario:** a client could send any number of requests a second, to any app, and hold any number of connections, at the proxy and at a node reached directly; one client or one app could take all of either.
+- **Fix:** `gate` (both listeners, `[clients]`): requests a second per client address (an IPv6 /64) and per app (`governor`, GCRA; 429 with `Retry-After`), connections per client address (503 with `Retry-After`) and in all (the listener stops accepting). The client behind a trusted forwarder is the last untrusted address in `X-Forwarded-For`; trusted peers (default loopback) aren't limited. Hostile tests: `clients_past_their_rate_are_refused_however_they_forward` (spoofed and prepended `X-Forwarded-For`), `apps_past_their_rate_are_refused`, `connections_are_capped_per_client_and_in_all`. Evidence: notes/beta-limits.md.
+- **Status:** fixed on `beta/limits`
+
+### B-302: one app could fill a node's disk and stop every app's writes (beta audit)
+- **Where:** `quota.rs`
+- **Scenario:** objects had a quota each but an app had none, and nothing kept the node's disk from filling: on an 8 MiB root, about 560 counter objects filled it and every write on the node then failed `500 commit-failed`, reported as the object's own quota being full.
+- **Fix:** a per-app budget (`app_disk_mb`, default a quarter of `data_dir`'s filesystem) over the same logical bytes each object's quota counts, shared by the app's instances (`quota::Disk`), and a free-space reserve (`disk_reserve_mb`, default 512): below it, growth and new entries are refused for every app while writes in place, deletes, rollbacks and commits go on. ENOSPC from the journal now says the node's disk is full. Tests on an 8 MiB tmpfs: `a_full_app_budget_refuses_only_that_apps_writes`, `the_disk_reserve_keeps_writes_committing`; unit: `objects_share_their_apps_budget`, `below_the_reserve_only_growth_is_refused`.
+- **Status:** fixed on `beta/limits`
+
+### B-303: workers ran without cgroup limits by default (beta audit)
+- **Where:** `config.rs` (`cgroup`, `[worker]`), `supervisor.rs`
+- **Scenario:** `cgroup` was unset and `[worker]` limits 0 by default (and in the ops reference config), so one app could touch `memory_mb × max_live_objects` (64 GiB) and use every core.
+- **Fix:** `[worker]` defaults to a quarter of the host's memory and all its cores but one; `cgroup = "auto"` (default) makes the supervisor's own cgroup v2 the workers' subtree (it moves itself into `<own>/supervisor`, workers go in `<own>/workers`) and refuses to start where it can't, naming `cgroup = "off"`. Owner question: fail closed (built) or warn and run.
+- **Reproduced:** this sandbox's controllers are on cgroup v1, so only the refusal is tested here (`workers_run_under_host_sized_limits_or_the_node_refuses_to_start`); its delegated branch runs in `scripts/vm-test.sh`.
+- **Status:** fixed on `beta/limits` (for `deployable`: the ops configs should drop their `[worker] = 0` lines and the `cgroup` path, and keep `Delegate=yes`)
+
+### B-304: an app's disk budget counts logical bytes, not blocks or its journals
+- **Where:** `quota.rs`
+- **Scenario:** the budget counts what each object's quota counts. An object's journal (up to 68 KiB between requests, more during one), its capture outbox, directories and block rounding are on top, so many tiny objects cost far more disk than their budget says (the audit's ~14 KiB a counter object on tmpfs). The objects cap (`beta/objects`) bounds how many there are; the reserve keeps a full disk from failing commits.
+- **Status:** open (by design for now)
+
+### B-305: the reserve counts bytes, not inodes
+- **Where:** `quota.rs` (`Disk::low`)
+- **Scenario:** a filesystem out of inodes (ext4's are fixed at mkfs) refuses new files with free bytes left; the reserve doesn't look at `f_favail`. `max_files` per object and the objects cap bound it.
+- **Status:** open
+
+### B-306: deleting an object must tell its app's disk budget
+- **Where:** `quota::Disk` (`idle`)
+- **Scenario:** a worker counts an object without an instance at what its volume held when last measured; a volume removed under a running worker (an operator delete, `beta/objects`) stays counted until the worker restarts. The delete path should drop the object from `Disk::idle` (and its bytes from `used`).
+- **Status:** open (for whoever lands object deletion)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
