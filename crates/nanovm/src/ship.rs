@@ -558,7 +558,7 @@ mod tests {
     fn version(dir: &Path, n: u64, epoch: u64, parent: &str, text: &str) -> String {
         let object = dir.file_name().unwrap().to_str().unwrap();
         let id = serde_json::json!({
-            "format": 3, "app": "app", "object": object, "sequence": n, "epoch": epoch, "parent": parent, "snapshot": true,
+            "format": 1, "app": "app", "object": object, "sequence": n, "epoch": epoch, "parent": parent, "snapshot": true,
         });
         let mut tar = tar::Builder::new(vec![]);
         for (path, bytes) in [("nanovm.json", id.to_string().into_bytes()), ("data/v", text.as_bytes().to_vec())] {

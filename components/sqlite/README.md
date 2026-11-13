@@ -4,7 +4,7 @@ SQLite runs inside a composed Wasm component over nanovm's existing Preview 3
 filesystem. Apps use the vendored, unchanged `spin:sqlite/sqlite@3.1.0` async
 interface. No SQLite host import, new journal format, or special filesystem is
 required. This source beta is not a published package or a promise of full Spin
-behavior. Use it with this branch's host recovery fixes, not an older nanovm.
+behavior. It relies on the host's journal to roll back and recover its files.
 
 ## Build and run
 

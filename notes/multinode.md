@@ -135,7 +135,7 @@ already defeated: the head, below.
 
 ### Committed state across nodes: the head (W-90, `fix/lease-r3fix`)
 
-An object's committed versions (W-9's capture, format 3, each carrying the
+An object's committed versions (W-9's capture, each carrying the
 lease epoch) are shipped by the supervisor to `capture.store`, which every
 node shares. With leases a node must have one: another node restores an
 object it takes over from there.

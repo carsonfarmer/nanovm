@@ -54,41 +54,16 @@ undo, Amp's 14 commit + 28 rollback capture cuts including subprocess exits,
 `sqlite_composed_recovery_cuts` 114 VFS cuts, `sqlite_journal_pressure_matrix`
 in DELETE/TRUNCATE/PERSIST/MEMORY/WAL), and new tests cover what the new
 protocol adds, each mutation-checked: records past the request's (an old key, a
-guessed key) are not undone; a log in another format is refused, not taken as
-empty; a log cut short while being made is ignored; the log shrinks after a big
+guessed key) are not undone; a log without the tag and key is refused, not taken
+as empty; a log cut short while being made is ignored; the log shrinks after a big
 request; sync counts per operation; a commit doesn't block its runtime (one
 worker thread) nor wait for a blocking thread when there's nothing to commit;
 parallel commit syncs are faster and fail if any path fails.
 
-Upgrade note: a log left uncommitted by a binary before this format is refused
-(InvalidData); drain cleanly before upgrading.
-
-### Upgrading from main's capture (format 1, S2)
-
-Main staged each version as `~journal/<object>/capture` (the whole volume), deleted
-the undo log (the decision), then hard-linked the capture to
-`~committed/<object>/<seq>.tar` and removed it. The first open under this format:
-
-- **Main's log still there** (its commit undecided): refused, InvalidData, with the
-  log and the staged capture kept. Drain main (or let it recover) before upgrading.
-- **A staged capture without main's log**: main decided that commit. It is published
-  as main's `finish` would have (sync the journal directory, check the identity,
-  sequence and parent, hard link, sync, remove) before anything in the journal
-  directory is cleared. Before, recovery cleared it as a leftover: the volume kept
-  a commit no version held, and the next version's parent skipped it.
-- **Main's published history** is migrated by reading it, not rewriting it: a
-  format-1 version is a whole volume with no epoch, so it reads as a snapshot at
-  epoch 0 (a single node's epoch; main had no leases). The next version is format 3,
-  a change to main's last (its parent that file's digest) unless its sequence falls
-  on a snapshot; `restore` starts from the last snapshot of either format. Main's
-  files and digests stay valid, and a shipper ships them with the rest; with leases,
-  epoch 0 matches no lease record, so they ship only while the record names this
-  node. Before, the first format-3 change made the history unrestorable (`restore`
-  refused main's versions: "missing field `epoch`").
-
-`review_upgrade_preserves_decided_legacy_capture` builds main's layout byte for byte
-(its `prepare`'s tar, its `finish`'s link) and checks both; a second test checks the
-refusal keeps main's log and capture.
+One version, v1: the log's tag is `nanovmj1` and a committed version says
+`"format": 1`; a log or a version that isn't v1 is refused. Data written by
+earlier builds is not supported and there is no upgrade path from them: operators
+start from a fresh data directory (AGENTS.md, rule 1).
 
 ## Numbers
 
@@ -130,7 +105,7 @@ Reproduce: `cargo build --example bench`; for exact counts make a loop device
 
 On top of Amp's W-9 local capture (b7bf806):
 
-- **Versions are changes** (format 2): the whole volume every `snapshot_every`
+- **Versions are changes**: the whole volume every `snapshot_every`
   (16) versions, otherwise what the commit changed, taken from what the journal
   already tracks: final listings of directories whose entries changed; new
   files and anything a rename moved, whole (directory trees too); files changed
@@ -155,7 +130,7 @@ On top of Amp's W-9 local capture (b7bf806):
   one's parent). A key already holding other bytes (another writer) stops
   shipping. On cf/storage, before round3, this had its own SigV4 client and a
   fence object; on cf/storage-r3 both gave way to `object_store` and the lease.
-- **Under the lease (W-90, cf/storage-r3).** Versions (format 3) carry the lease
+- **Under the lease (W-90, cf/storage-r3).** Versions carry the lease
   epoch they were committed under; the lease is checked right before the
   journal's new key, so a lapsed lease refuses the commit and recovery discards
   what capture staged. The shipper reads the object's lease record and ships a
@@ -198,7 +173,7 @@ On top of Amp's W-9 local capture (b7bf806):
   (kept if it holds the head's version and no other node has claimed the object
   since this one did, or it is exactly the head's; otherwise dropped and
   restored), so a takeover never serves state older than the head and never ships
-  history the head has moved past. Versions (format 3) carry the lease epoch they
+  history the head has moved past. Versions carry the lease epoch they
   were committed under; the lease is still checked right before the journal's new
   key, so a lapsed lease refuses the commit and recovery discards what capture
   staged. The capture limits bound the unshipped outbox: with the store down,

@@ -1768,7 +1768,7 @@ async fn open_response_bodies_count_against_outbound_concurrency() {
 // ---- registry apps -------------------------------------------------------
 //
 // Signature checks load the artifacts CI publishes to GHCR without running
-// their older guest interfaces. Worker drains use locally composed guests.
+// them. Worker drains use locally composed guests.
 
 const SIGNER: &str = "https://token.actions.githubusercontent.com \
     https://github.com/carsonfarmer/nanovm/.github/workflows/publish-guests.yml@refs/heads/main";

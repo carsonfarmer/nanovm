@@ -617,19 +617,13 @@ impl Journal {
 /// operations may be skipped.
 fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[u8; 8]>> {
     let log = match std::fs::read(dir.join(LOG)) {
-        Ok(log) => Some(log),
-        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Ok(log) => log,
+        Err(e) if e.kind() == ErrorKind::NotFound => return clear(dir).map(|()| None),
         Err(e) => return Err(e),
     };
-    // A log in another format, as main's left undecided, is refused, with
-    // what main staged under it. Without one, what main staged is decided:
-    // it is published before anything here is cleared (S2).
-    let key = log.as_ref().map(|log| log.strip_prefix(MAGIC).and_then(|k| k.get(..8)?.try_into().ok()));
-    if key == Some(None) {
+    let Some(key) = log.strip_prefix(MAGIC).and_then(|k| k.get(..8)?.try_into().ok()) else {
         return Err(std::io::Error::new(ErrorKind::InvalidData, "not a journal log"));
-    }
-    committed::adopt(dir, &committed::directory(base, dir), obj)?;
-    let (Some(log), Some(Some(key))) = (log, key) else { return clear(dir).map(|()| None) };
+    };
     let file = File::options().write(true).open(dir.join(LOG))?;
     let undos = decode(&log, &key);
     // What commits staged settles first; a key seen here may not be durable yet.
@@ -699,10 +693,11 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
 
 /// The directory holding `p` (relative to `base`), opened one name at a
 /// time and never through a symlink, and `p`'s name in it. Recovery reaches
-/// entries so: a log written before N-504 can name a real entry whose whole
-/// path is past PATH_MAX, made through a guest's descriptor, while each of
-/// its names fits. Only a name past NAME_MAX is then too long, and nothing
-/// can have one (N-690).
+/// entries so: the log's paths are relative to `base`, which can move deeper
+/// between a crash and the recovery after it (a backup restored into a
+/// longer root), so a real entry's whole path can be past PATH_MAX while
+/// each of its names fits. Only a name past NAME_MAX is then too long, and
+/// nothing can have one (N-690).
 fn parent_at<'a>(base: &Path, p: &'a Path) -> std::io::Result<(File, &'a OsStr)> {
     let name = p.file_name().ok_or(ErrorKind::InvalidInput)?;
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
@@ -1139,10 +1134,27 @@ mod tests {
         assert_eq!(archive_tree(&v, 2), tree(&v));
     }
 
+    /// A version is read in its one format, 1: one naming any other is
+    /// refused.
+    #[test]
+    fn a_version_of_another_format_is_refused() {
+        for format in [1, 0, 2] {
+            let id = format!(r#"{{"format":{format},"app":"app","object":"o","sequence":1,"epoch":0,"parent":"","snapshot":true}}"#);
+            let mut tar = tar::Builder::new(vec![]);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(id.len() as u64);
+            header.set_mode(0o600);
+            tar.append_data(&mut header, "nanovm.json", id.as_bytes()).unwrap();
+            match committed::identity(&tar.into_inner().unwrap()[..]) {
+                Ok(version) => assert_eq!(version.format, 1),
+                Err(e) => assert!(format != 1 && e.kind() == ErrorKind::InvalidData, "{format}: {e}"),
+            }
+        }
+    }
+
     /// A version can't reach outside the volume it is applied to, to list,
     /// remove, write or patch: not by `..`, nor through a symlink there, as
-    /// each name is opened without following one (S4). These were format 2,
-    /// refused for that alone, and each overwrote the last: only one ran.
+    /// each name is opened without following one (S4).
     #[test]
     fn a_version_cannot_write_outside_its_root() {
         let base = volume().parent().unwrap().to_path_buf();
@@ -1164,7 +1176,7 @@ mod tests {
                 header.set_cksum();
                 tar.append(&header, bytes).unwrap();
             };
-            let id = r#"{"format":3,"app":"app","object":"o","sequence":2,"epoch":0,"parent":"","snapshot":false}"#;
+            let id = r#"{"format":1,"app":"app","object":"o","sequence":2,"epoch":0,"parent":"","snapshot":false}"#;
             put(b"nanovm.json", id.as_bytes());
             put(b"changes.json", changes.as_bytes());
             if let Some(name) = entry {
@@ -1235,7 +1247,7 @@ mod tests {
                     }
                 };
                 let (n, snapshot) = (i + 1, changes.is_empty());
-                let id = format!(r#"{{"format":3,"app":"app","object":"o","sequence":{n},"epoch":0,"parent":"{parent}","snapshot":{snapshot}}}"#);
+                let id = format!(r#"{{"format":1,"app":"app","object":"o","sequence":{n},"epoch":0,"parent":"{parent}","snapshot":{snapshot}}}"#);
                 add("nanovm.json", Regular, &id);
                 match snapshot {
                     true => add("data", Directory, ""),
@@ -1254,97 +1266,6 @@ mod tests {
             let e = e.expect(name);
             assert_eq!(e.kind(), ErrorKind::InvalidData, "{name}: {e}");
         }
-    }
-
-    /// What main's format (1) left for a commit of `v` as version
-    /// `sequence`: the whole volume, staged in the journal as `capture`, the
-    /// tar its `committed::prepare` wrote, byte for byte; then, if
-    /// `finished`, published as its `committed::finish` did. Main deleted
-    /// the undo log before either: that decided the commit.
-    fn legacy(v: &Path, sequence: u64, finished: bool) -> PathBuf {
-        let base = v.parent().unwrap();
-        let (journal, out) = (base.join("~journal/o"), base.join("~committed/o"));
-        std::fs::create_dir_all(&journal).unwrap();
-        std::fs::create_dir_all(&out).unwrap();
-        let parent = match sequence {
-            1 => String::new(),
-            n => committed::digest(&out.join(format!("{:020}.tar", n - 1))).unwrap(),
-        };
-        let id = format!(r#"{{"format":1,"app":"app","object":"o","sequence":{sequence},"parent":"{parent}"}}"#);
-        let staged = journal.join("capture");
-        let mut archive = tar::Builder::new(File::options().write(true).create_new(true).open(&staged).unwrap());
-        archive.follow_symlinks(false);
-        archive.sparse(false);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(id.len() as u64);
-        header.set_mode(0o600);
-        archive.append_data(&mut header, "nanovm.json", id.as_bytes()).unwrap();
-        archive.append_dir("data", v).unwrap();
-        let mut pending = vec![v.to_path_buf()];
-        while let Some(dir) = pending.pop() {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let entry = entry.unwrap();
-                let path = entry.path();
-                archive.append_path_with_name(&path, Path::new("data").join(path.strip_prefix(v).unwrap())).unwrap();
-                if entry.file_type().unwrap().is_dir() {
-                    pending.push(path);
-                }
-            }
-        }
-        archive.into_inner().unwrap();
-        if finished {
-            std::fs::hard_link(&staged, out.join(format!("{sequence:020}.tar"))).unwrap();
-            std::fs::remove_file(&staged).unwrap();
-        }
-        staged
-    }
-
-    /// A node upgraded from main keeps what main committed: a version
-    /// staged under a commit main decided but hadn't published is published
-    /// as main would have, not cleared with the journal's leftovers, which
-    /// lost the only copy of a commit the volume holds (S2). Main's history
-    /// goes on in this format: its whole volumes are snapshots, so the last
-    /// is what the changes after it apply to.
-    #[test]
-    fn review_upgrade_preserves_decided_legacy_capture() {
-        let cap = CaptureConfig { snapshot_every: 4, ..Default::default() };
-        let v = volume();
-        let out = v.parent().unwrap().join("~committed/o");
-        legacy(&v, 1, true);
-        std::fs::write(v.join("a"), "main's second commit").unwrap();
-        std::fs::write(v.join("n"), "new in it").unwrap();
-        let staged = std::fs::read(legacy(&v, 2, false)).unwrap();
-        let mut j = captured(&v, &cap).unwrap();
-        let second = out.join(format!("{:020}.tar", 2));
-        assert_eq!(std::fs::read(&second).expect("main's decided version is published"), staged);
-        assert!(!v.parent().unwrap().join("~journal/o/capture").exists());
-        assert_eq!(committed::identity(std::fs::File::open(&second).unwrap()).unwrap().epoch, 0, "main had no leases");
-        assert_eq!(archive_tree(&v, 2), tree(&v));
-        // Changes to main's last version, then a snapshot (5), then changes.
-        for n in 3..=7 {
-            write(&mut j, &v, "a", 0, format!("v{n}").as_bytes());
-            j.creating(&v.join(format!("n{n}"))).unwrap();
-            std::fs::write(v.join(format!("n{n}")), "new").unwrap();
-            j.commit().unwrap();
-            assert_eq!(archive_tree(&v, n), tree(&v), "version {n}");
-        }
-    }
-
-    /// What main left undecided (its undo log is there) can't be rolled
-    /// back in this format: the volume is refused, and the log and what
-    /// main staged are kept for main to settle.
-    #[test]
-    fn an_older_binarys_undecided_commit_is_refused_and_kept() {
-        let v = volume();
-        let journal = v.parent().unwrap().join("~journal/o");
-        legacy(&v, 1, false);
-        // A record as main wrote one: "remove o/n", unsigned.
-        let log: Vec<u8> = [&[2u8][..], b"o/n"].iter().flat_map(|f| [&(f.len() as u64).to_le_bytes()[..], f].concat()).collect();
-        std::fs::write(journal.join(LOG), &log).unwrap();
-        let e = captured(&v, &CaptureConfig::default()).err().expect("refused");
-        assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
-        assert_eq!(std::fs::read(journal.join(LOG)).unwrap(), log);
-        assert!(journal.join("capture").exists());
     }
 
     /// A small change to a big file is captured as the bytes that changed.
@@ -1443,7 +1364,7 @@ mod tests {
         j.commit().unwrap();
         let mut archive = tar::Archive::new(File::open(v.parent().unwrap().join(format!("~committed/o/{:020}.tar", 1))).unwrap());
         let version: serde_json::Value = serde_json::from_reader(archive.entries().unwrap().next().unwrap().unwrap()).unwrap();
-        assert_eq!((version["format"].as_u64(), version["epoch"].as_u64()), (Some(3), Some(7)));
+        assert_eq!((version["format"].as_u64(), version["epoch"].as_u64()), (Some(1), Some(7)));
         drop(j);
         // Without capture, the decision is the only check the journal makes.
         let w = volume();
@@ -1955,80 +1876,87 @@ mod tests {
         j.renaming(&v.join("link"), &v.join("link2"), None).unwrap();
     }
 
-    /// Logs written before that, naming such paths in any record, recover.
+    /// What a request leaves in the log of operations that can't succeed
+    /// recovers: a create under a missing directory, then a rename to under
+    /// a file, under a name past NAME_MAX or under a missing directory,
+    /// whose record is synced but whose cancellation never is (a crash, or a
+    /// failed write, between the two). Such a path names nothing: there is
+    /// nothing to undo there, nor a directory to sync.
     #[test]
-    fn logs_naming_impossible_paths_recover() {
-        let v = volume();
-        let before = tree(&v);
-        let mut j = open(&v);
+    fn records_of_operations_that_cannot_succeed_recover() {
         let long = "n".repeat(256);
-        for p in ["a/x", "f/x/y", long.as_str(), "missing/x"] {
-            let p = j.rel(&v.join(p));
-            for undo in [Undo::Created(p.clone()), Undo::RemovedDir(p.clone()), Undo::Size(p.clone(), 0),
-                Undo::Bytes(p.clone(), 0, b"x".to_vec()), Undo::Renamed(p.clone(), j.rel(&v.join("a")))] {
-                j.record(undo).unwrap();
-            }
+        for to in ["f/x/y".to_string(), format!("{long}/x"), "missing/x".into()] {
+            let v = volume();
+            let before = tree(&v);
+            let mut j = open(&v);
+            j.creating(&v.join("missing/x")).unwrap();
+            // As `QuotaGuard::rename` asks: nothing can be at `to` to replace.
+            assert!(std::fs::symlink_metadata(v.join(&to)).is_err());
+            j.renaming(&v.join("a"), &v.join(&to), None).unwrap();
+            drop(j);
+            reopen(&v, 1 << 30).unwrap_or_else(|e| panic!("{}: recovery failed: {e}", &to[to.len() - 3..]));
+            assert_eq!(tree(&v), before);
+            std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
         }
-        drop(j);
-        reopen(&v, 1 << 30).expect("recovery succeeds");
-        assert_eq!(tree(&v), before);
     }
 
-    /// A log written before N-504 (its records made here through `record`,
-    /// in this log's format) can name a real entry whose whole path is past
-    /// PATH_MAX while each name fits: the guest made it through a
-    /// directory's descriptor. Recovery undoes it
-    /// through descriptors, for every kind of record, rather than taking it
-    /// for nothing there and dropping the undo (N-690).
+    /// The log's paths are relative to the data root, which can move deeper
+    /// between a crash and the recovery after it (a backup restored into a
+    /// longer root): an entry whose whole path fitted is then past PATH_MAX,
+    /// while each of its names fits. Recovery undoes each kind of record
+    /// there through descriptors, rather than taking it for nothing there
+    /// and dropping the undo (N-690).
     #[test]
-    fn long_paths_in_old_logs_are_undone() {
-        use rustix::fs::renameat;
+    fn long_paths_after_the_root_moves_are_undone() {
         use std::os::fd::AsRawFd;
         let v = volume();
-        // A directory whose own path fits, holding 200-byte names that don't.
+        let base = v.parent().unwrap().to_path_buf();
+        let name = |c: &str| c.repeat(200);
+        // A directory whose entries' whole paths fit, by 300 bytes or more.
         let mut deep = v.clone();
-        while deep.as_os_str().len() < libc::PATH_MAX as usize - 100 {
-            let room = libc::PATH_MAX as usize - 100 - deep.as_os_str().len();
-            deep.push("c".repeat(room.clamp(2, 256) - 1));
+        while deep.as_os_str().len() + 256 + 201 + 300 < libc::PATH_MAX as usize {
+            deep.push("c".repeat(255));
         }
         std::fs::create_dir_all(&deep).unwrap();
+        for (c, data) in [("f", "hello world"), ("g", "gee"), ("h", "aitch")] {
+            std::fs::write(deep.join(name(c)), data).unwrap();
+        }
+        std::fs::create_dir(deep.join(name("e"))).unwrap();
         let dir = File::open(&deep).unwrap();
-        let name = |c: &str| c.repeat(200);
-        let write = |c: &str, data: &[u8]| {
-            let f = openat(&dir, name(c), OFlags::CREATE | OFlags::WRONLY | OFlags::CLOEXEC, 0o644.into()).unwrap();
-            File::from(f).write_all_at(data, 0).unwrap();
-        };
-        write("f", b"hello world");
-        write("g", b"gee");
-        write("h", b"aitch");
-        mkdirat(&dir, name("e"), Mode::from(0o755)).unwrap();
-        // Short paths for the descriptor's directory and what is in it.
+        // Short paths for the directory and what is in it, wherever it is.
         let listing = || tree(Path::new(&format!("/proc/self/fd/{}", dir.as_raw_fd())));
         let before = listing();
+        // A change of each kind, recorded as the filesystem host records it.
+        let at = |c: &str| deep.join(name(c));
         let mut j = open(&v);
-        let rel = |c: &str| {
-            let p = deep.join(name(c));
-            assert!(p.as_os_str().len() >= libc::PATH_MAX as usize);
-            j.rel(&p)
-        };
-        // Each change as the journal before N-504 recorded it, then made by
-        // the guest through the directory's descriptor.
-        let undos = [Undo::Created(rel("n")), Undo::Created(rel("m")), Undo::Size(rel("f"), 11),
-            Undo::Bytes(rel("f"), 0, b"hello world".to_vec()), Undo::RemovedDir(rel("e")),
-            Undo::Renamed(rel("g"), j.rel(&j.dir.join("1"))), Undo::Renamed(rel("h"), rel("i"))];
-        for undo in undos {
-            j.record(undo).unwrap();
-        }
-        write("n", b"new");
-        mkdirat(&dir, name("m"), Mode::from(0o755)).unwrap();
-        write("f", b"HELLO WORLD, AND MORE");
-        unlinkat(&dir, name("e"), AtFlags::REMOVEDIR).unwrap();
-        renameat(&dir, name("g"), File::open(&j.dir).unwrap(), "1").unwrap();
-        renameat(&dir, name("h"), &dir, name("i")).unwrap();
+        j.creating(&at("n")).unwrap();
+        std::fs::write(at("n"), "new").unwrap();
+        j.created(&at("n")).unwrap();
+        j.creating(&at("m")).unwrap();
+        std::fs::create_dir(at("m")).unwrap();
+        let f = File::options().write(true).open(at("f")).unwrap();
+        j.writing(&f, 0, 21).unwrap();
+        f.write_all_at(b"HELLO WORLD, AND MORE", 0).unwrap();
+        j.removing_dir(&at("e")).unwrap();
+        std::fs::remove_dir(at("e")).unwrap();
+        j.unlink(&at("g"), 3).unwrap();
+        j.renaming(&at("h"), &at("i"), None).unwrap();
+        std::fs::rename(at("h"), at("i")).unwrap();
+        j.renamed(&at("h"), &at("i"));
         assert_ne!(listing(), before);
         drop(j);
-        open(&v);
+        // The root moves deeper, past what those whole paths can take.
+        let mut moved = base.clone().into_os_string();
+        moved.push("-moved");
+        let moved = PathBuf::from(moved);
+        let root = moved.join("m".repeat(255)).join("m".repeat(255)).join("m".repeat(255)).join("root");
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::rename(&base, &root).unwrap();
+        let now = root.join("o").join(deep.strip_prefix(&v).unwrap()).join(name("n"));
+        assert!(now.as_os_str().len() >= libc::PATH_MAX as usize);
+        open(&root.join("o"));
         assert_eq!(listing(), before);
+        std::fs::remove_dir_all(moved).unwrap();
     }
 
     /// The parent of `p` (whatever the length of `p`) and `p`'s name, for
@@ -2263,14 +2191,14 @@ mod tests {
         }
     }
 
-    /// A log from another format is refused, not taken as empty: rolling
-    /// nothing back would keep what a crash left half done.
+    /// A log whose first block isn't the tag and a key is refused, not taken
+    /// as empty: rolling nothing back would keep what a crash left half done.
     #[test]
-    fn a_log_of_another_format_is_refused() {
+    fn a_log_without_its_tag_is_refused() {
         let v = volume();
         let log = v.parent().unwrap().join("~journal/o/log");
         std::fs::create_dir_all(log.parent().unwrap()).unwrap();
-        // The previous format: unsigned records from the start.
+        // Records from the start, with no tag or key before them.
         let old = [&[1, 0, 0, 0, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0][..], b"o/a"].concat();
         std::fs::write(&log, &old).unwrap();
         let e = reopen(&v, 1 << 30).err().expect("an unknown log must be refused");
