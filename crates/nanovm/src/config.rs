@@ -173,11 +173,13 @@ config! {
 }
 
 config! {
-    /// Operator-owned limits for each object's immutable local capture history.
-    /// Exhaustion rejects new writes; versions are never silently discarded.
+    /// Each object's committed versions, captured here and shipped to `store`.
     pub struct CaptureConfig {
+        /// The most an object's versions may take here, in MiB: those not
+        /// shipped yet (all of them while the store is down), and the last.
+        /// Writes to the object are refused beyond it, never versions
+        /// dropped. Size the disk for it beside the objects' `disk_mb`.
         max_mb: u64 = 256u64,
-        max_versions: u64 = 16u64,
         /// Every this many versions, one holds the whole volume; the rest
         /// hold what a commit changed.
         snapshot_every: u64 = 16u64,

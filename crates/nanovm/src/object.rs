@@ -578,10 +578,13 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         let Some(mut job) = rx.recv().await else { return };
         *shared.context.lock() = job.context.clone();
         shared.set_phase(Phase::Starting);
-        // Boxed: only nodes with leases wait on it.
-        if node.leases.is_some()
-            && let Err(response) = Box::pin(node.acquire(&shared)).await
-        {
+        // Not while a restore has it; boxed: only nodes with leases wait on it.
+        let admitted = match () {
+            _ if crate::ship::paused(&app.objects.dir, &shared.id) => Err(error_response(503, "object-restoring", "the object is being restored")),
+            _ if node.leases.is_some() => Box::pin(node.acquire(&shared)).await,
+            _ => Ok(()),
+        };
+        if let Err(response) = admitted {
             crate::telemetry::response(&mut job.span, &response);
             let _ = job.reply.send(response);
             shared.set_phase(Phase::Cold);

@@ -167,8 +167,8 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
     for (name, count) in [("ship_restored", 3), ("ship_restored_again", 4)] {
         let fresh = shipping(name);
         let objects = fresh.app_dirs("counter")[0].clone();
-        let last = nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &objects).await.unwrap();
-        assert_eq!(last, count);
+        let restored = nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &objects, None, 0).await.unwrap();
+        assert_eq!((restored.version, restored.head), (count, count));
         let node = node_with(fresh.clone(), app("counter"));
         assert_eq!(get(&node, "o", "/").await.json()["count"], count);
         assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], count + 1);
@@ -185,8 +185,9 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
 
 /// With remote acknowledgement, a commit whose version can't be stored is
 /// not acknowledged, though it stands here, and the object serves nothing
-/// until it counts (N-725); and with the store down, once the capture
-/// limits are reached writes are refused, never versions dropped.
+/// until it counts (N-725); and with the store down, writes go on until the
+/// versions waiting here reach `max_mb`, then are refused, never versions
+/// dropped; the backlog says what waits.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() {
     for remote_ack in [true, false] {
@@ -194,7 +195,7 @@ async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() 
         cfg.capture = Some(nanovm::config::CaptureConfig {
             // A store no write reaches.
             store: Some("/dev/null/store".into()),
-            max_versions: 3,
+            max_mb: 1,
             remote_ack,
             ..Default::default()
         });
@@ -207,13 +208,18 @@ async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() 
             assert_eq!(get(&node, "o", "/").await.error.as_deref(), Some("not-stored"), "served before it counts");
         } else {
             assert_eq!(r.json()["count"], 1);
-            for n in 2..=3 {
-                assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
+            // Each version about 300 KiB: three fit in 1 MiB with the first.
+            let value = |n: u8| String::from_utf8(vec![b'a' + n; 300 << 10]).unwrap();
+            for n in 1..=3 {
+                assert_eq!(request(&node, "PUT", "o", "/kv/k", &value(n)).await.status, 204, "write {n}");
             }
-            let r = request(&node, "POST", "o", "/incr", "").await;
+            let r = request(&node, "PUT", "o", "/kv/k", &value(4)).await;
             assert_eq!(r.error.as_deref(), Some("commit-failed"), "a full outbox refuses: {}", r.body);
-            assert_eq!(get(&node, "o", "/").await.json()["count"], 3);
-            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 3, "every unshipped version kept");
+            assert_eq!(get(&node, "o", "/kv/k").await.body, value(3));
+            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 4, "every unshipped version kept");
+            let backlog = nanovm::ship::backlog(&cfg.data_dir.join("objects"));
+            assert_eq!((backlog.versions, backlog.objects), (4, 1));
+            assert!(backlog.bytes > 900 << 10, "{backlog:?}");
         }
         node.shutdown().await;
     }
@@ -243,6 +249,78 @@ async fn a_slow_acknowledgement_is_not_cut_short_by_the_apps_deadline() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(t0.elapsed() >= Duration::from_millis(900), "answered before the store acknowledged: {:?}", t0.elapsed());
     held.join().unwrap();
+    node.shutdown().await;
+}
+
+/// With the store down, a node that answers once a write is durable here
+/// keeps answering writes, many more than the 16 versions it once held,
+/// without a snapshot of the volume for each 16; once the store is back,
+/// every version ships, in order, and the backlog empties. Another object
+/// that stopped writing ships too.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_go_on_through_a_store_outage_and_ship_in_order_after() {
+    use nanovm::ship::Dir;
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ship-outage");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let (store, down) = (base.join("store"), base.join("store.down"));
+    let mut cfg = node_cfg("ship_outage", 8);
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
+    let node = node_with(cfg.clone(), app("counter"));
+    let head = |o: &str| {
+        let bytes = std::fs::read(store.join("counter").join(o).join("head")).ok();
+        bytes.map_or(0, |h| serde_json::from_slice::<nanovm::ship::Head>(&h).unwrap().sequence)
+    };
+    // A big file in the volume, which a snapshot would copy whole.
+    assert_eq!(request(&node, "PUT", "o", "/kv/big", &"b".repeat(200 << 10)).await.status, 204);
+    assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], 1);
+    // Shipped, and marked so (just after the head moves).
+    let objects = cfg.data_dir.join("objects");
+    eventually("shipped", || head("o") == 2 && nanovm::ship::backlog(&objects).versions == 0).await;
+    // The store goes away: a file where its directory was.
+    std::fs::rename(&store, &down).unwrap();
+    std::fs::write(&store, "down").unwrap();
+    for n in 2..=60 {
+        let r = request(&node, "POST", "o", "/incr", "").await;
+        assert_eq!(r.status, 200, "write {n} during the outage: {}", r.body);
+        assert_eq!(r.json()["count"], n);
+        if n == 3 {
+            assert_eq!(request(&node, "POST", "p", "/incr", "").await.json()["count"], 1);
+        }
+    }
+    let backlog = nanovm::ship::backlog(&objects);
+    assert_eq!((backlog.versions, backlog.objects), (60, 2));
+    println!("{} bytes wait to be shipped", backlog.bytes);
+    // The store is back.
+    std::fs::remove_file(&store).unwrap();
+    std::fs::rename(&down, &store).unwrap();
+    let t0 = Instant::now();
+    while head("o") < 61 || head("p") < 1 || nanovm::ship::backlog(&objects).versions > 0 {
+        assert!(t0.elapsed() < Duration::from_secs(20), "shipped {} and {} of 61 and 1", head("o"), head("p"));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // In order: each version in the store follows the one before. Of the
+    // 16-version marks, only the first in the outage (17, with 15 waiting)
+    // took a snapshot.
+    let (head, _) = nanovm::ship::head(&Dir(store.clone()), "counter", "o").await.unwrap();
+    let (mut digest, mut snapshots) = (head.digest.clone(), vec![]);
+    for n in (1..=61).rev() {
+        let bytes = std::fs::read(store.join(format!("counter/o/{n:020}-{digest}.tar"))).unwrap();
+        let version = nanovm::committed::identity(&bytes[..]).unwrap();
+        assert_eq!(version.sequence, n);
+        snapshots.extend(version.snapshot.then_some(n));
+        digest = version.parent;
+    }
+    assert_eq!(digest, "", "version 1 is the first");
+    assert_eq!(snapshots, [17, 1]);
+    node.shutdown().await;
+    drop(node);
+    // A fresh root restores all of it.
+    let mut fresh = node_cfg("ship_outage_restored", 8);
+    fresh.capture = cfg.capture.clone();
+    nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &fresh.app_dirs("counter")[0], None, 0).await.unwrap();
+    let node = node_with(fresh, app("counter"));
+    assert_eq!(get(&node, "o", "/").await.json()["count"], 60);
     node.shutdown().await;
 }
 
@@ -1520,6 +1598,147 @@ async fn eventually_long(what: &str, mut f: impl FnMut() -> bool) {
     while !f() {
         assert!(t0.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `POST path` on `app`, with no body.
+async fn app_post(addr: std::net::SocketAddr, app: &str, path: &str) -> (u16, String) {
+    let head = format!("POST {path} HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(app));
+    raw(addr, &head, b"").await
+}
+
+/// `nanovm admin` with `args`, off the runtime's threads: the command's
+/// JSON answer, or its error.
+async fn admin_json(cfg: &NodeConfig, args: &[&str]) -> Result<serde_json::Value, String> {
+    let (cfg, args) = (cfg.clone(), args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+    let (ok, out) = tokio::task::spawn_blocking(move || admin(&cfg, &args.iter().map(String::as_str).collect::<Vec<_>>())).await.unwrap();
+    if ok { Ok(serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))) } else { Err(out) }
+}
+
+/// An operator restores one object, then all of one app's objects, from the
+/// store into a running node, through `nanovm admin`: to an older version
+/// (which becomes the version after the head: the head only moves on, and
+/// the versions between stay in the store), and to the head, over a damaged
+/// volume. Another app writes throughout without missing a write; while an
+/// object is paused for a restore it answers 503 and the app's other objects
+/// serve. Bad names and a damaged version in the store are refused, and
+/// nothing changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn restores_an_object_and_an_app_into_a_running_node() {
+    let store = Path::new(env!("CARGO_TARGET_TMPDIR")).join("restore-store");
+    let _ = std::fs::remove_dir_all(&store);
+    let mut cfg = node_cfg("restore_running", 8);
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
+    let (sup, addr) = supervised_with(cfg.clone()).await;
+    let (a, b) = (publish("restore-a", &app("counter")).await, publish("restore-b", &app("counter")).await);
+    let (wa, wb) = (worker(&a), worker(&b));
+    let head = |app: &str, o: &str| {
+        let bytes = std::fs::read(store.join(app).join(o).join("head")).ok();
+        bytes.map_or(0, |h| serde_json::from_slice::<nanovm::ship::Head>(&h).unwrap().sequence)
+    };
+    let count = |(status, body): (u16, String)| {
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["count"].as_u64().unwrap()
+    };
+    // B writes throughout.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = tokio::spawn({
+        let (b, stop) = (b.clone(), stop.clone());
+        async move {
+            let mut n = 0;
+            while !stop.load(Relaxed) {
+                n += 1;
+                let (status, body) = app_post(addr, &b, "/w/incr").await;
+                assert_eq!((status, serde_json::from_str::<serde_json::Value>(&body).unwrap()["count"].as_u64()), (200, Some(n)), "{body}");
+            }
+            n
+        }
+    });
+    for n in 1..=5 {
+        assert_eq!(count(app_post(addr, &a, "/o/incr").await), n);
+    }
+    assert_eq!(count(app_post(addr, &a, "/p/incr").await), 1);
+    let t0 = Instant::now();
+    while head(&wa, "o") < 5 || head(&wa, "p") < 1 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "never shipped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Back to version 3, live: made version 6.
+    let done = admin_json(&cfg, &["restore", &wa, "o", "3"]).await.unwrap();
+    assert_eq!((&done[0]["object"], &done[0]["version"], &done[0]["head"]), (&"o".into(), &3.into(), &6.into()), "{done}");
+    assert!(done[0]["said"].as_str().unwrap().contains("versions 4 to 5 stay in the store"), "{done}");
+    assert_eq!(head(&wa, "o"), 6, "the restore shipped its version");
+    assert_eq!(count(app_get(addr, &a, "/o/").await), 3);
+    assert_eq!(count(app_post(addr, &a, "/o/incr").await), 4);
+    eventually("version 7 shipped", || head(&wa, "o") == 7).await;
+    let versions = admin_json(&cfg, &["versions", &wa, "o"]).await.unwrap();
+    assert_eq!(versions["head"], 7, "{versions}");
+    let listed: Vec<_> = versions["versions"].as_array().unwrap().iter().map(|v| v["version"].as_u64().unwrap()).collect();
+    assert_eq!(listed, (1..=7).collect::<Vec<_>>());
+    assert!(admin_json(&cfg, &["versions"]).await.unwrap().as_array().unwrap().contains(&wb.clone().into()));
+
+    // The volume is damaged under the running node: back to the head.
+    let volume = object_dir(&cfg.app_dirs(&wa)[0], "o").join("data");
+    std::fs::write(volume.join("count"), "999").unwrap();
+    assert_eq!(count(app_get(addr, &a, "/o/").await), 999);
+    let done = admin_json(&cfg, &["restore", &wa, "o"]).await.unwrap();
+    assert_eq!((&done[0]["version"], &done[0]["head"]), (&7.into(), &7.into()), "{done}");
+    assert_eq!(count(app_get(addr, &a, "/o/").await), 4);
+
+    // Paused, an object answers 503 and the app's others serve.
+    let objects = cfg.app_dirs(&wa)[0].clone();
+    sup.pause(&wa, "o", &objects).await.unwrap();
+    assert_eq!(app_get(addr, &a, "/o/").await, (503, r#"{"detail":"the object is being restored","error":"object-restoring"}"#.into()));
+    assert_eq!(count(app_get(addr, &a, "/p/").await), 1);
+    assert!(admin_json(&cfg, &["restore", &wa, "o"]).await.unwrap_err().contains("being restored already"));
+    nanovm::ship::resume(&objects, "o").unwrap();
+
+    // All of the app's objects, to their heads.
+    let done = admin_json(&cfg, &["restore", &wa]).await.unwrap();
+    let mut restored: Vec<_> = done.as_array().unwrap().iter().map(|r| (r["object"].as_str().unwrap().to_owned(), r["version"].as_u64().unwrap())).collect();
+    restored.sort();
+    assert_eq!(restored, [("o".to_owned(), 7), ("p".to_owned(), 1)]);
+    assert_eq!((count(app_get(addr, &a, "/o/").await), count(app_get(addr, &a, "/p/").await)), (4, 1));
+
+    // A version here the store refuses (it doesn't follow the head) stops a
+    // restore, which would drop it, unless the operator says to drop it.
+    let committed = object_dir(&objects, "o").join("committed");
+    std::fs::copy(committed.join(format!("{:020}.tar", 7)), committed.join(format!("{:020}.tar", 8))).unwrap();
+    let e = admin_json(&cfg, &["restore", &wa, "o"]).await.unwrap_err();
+    assert!(e.contains("versions the store doesn't"), "{e}");
+    assert!(committed.join(format!("{:020}.tar", 8)).exists());
+    let done = admin_json(&cfg, &["restore", &wa, "o", "--discard-unshipped"]).await.unwrap();
+    assert_eq!(done[0]["version"], 7, "{done}");
+    assert!(!committed.join(format!("{:020}.tar", 8)).exists());
+
+    // Refused: names that aren't one, a version the store doesn't have, and a
+    // version whose bytes aren't what its key names. Nothing changes.
+    for args in [vec!["restore", "..", "o"], vec!["restore", &wa, "../p"], vec!["restore", &wa, "_nanovm"], vec!["restore", &wa, "o", "8"], vec!["versions", "..", "o"]] {
+        assert!(admin_json(&cfg, &args).await.is_err(), "{args:?}");
+    }
+    let key = std::fs::read_dir(store.join(&wa).join("o")).unwrap().map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(&format!("{:020}-", 2))).unwrap();
+    let mut bytes = std::fs::read(&key).unwrap();
+    let last = bytes.len() - 1024 - 1;
+    bytes[last / 2] ^= 1;
+    std::fs::write(&key, bytes).unwrap();
+    let e = admin_json(&cfg, &["restore", &wa, "o", "2"]).await.unwrap_err();
+    assert!(e.contains("isn't what its key names"), "{e}");
+    assert_eq!(count(app_get(addr, &a, "/o/").await), 4);
+    assert_eq!(count(app_post(addr, &a, "/o/incr").await), 5);
+    // Neither a client nor a guest reaches the worker's eviction.
+    assert_eq!(http_get(addr, "/_nanovm/evict/o").await.0, 404);
+    assert_eq!(app_get(addr, &a, "/_nanovm/evict/o").await.0, 400);
+
+    stop.store(true, Relaxed);
+    let writes = writer.await.unwrap();
+    assert!(writes > 10, "B wrote {writes} times");
+    eventually("everything shipped", || head(&wb, "w") == writes && head(&wa, "o") == 8).await;
+    // Marked shipped just after the head moves.
+    let t0 = Instant::now();
+    while admin_json(&cfg, &["backlog"]).await.unwrap() != serde_json::json!({ "versions": 0, "bytes": 0, "objects": 0 }) {
+        assert!(t0.elapsed() < Duration::from_secs(2), "versions still wait");
     }
 }
 
@@ -3074,10 +3293,13 @@ async fn sqlite_survives_a_jailed_worker_crash() {
     }
 }
 
-/// A real process crash followed by offline backup and recovery elsewhere.
+/// The node is lost after a real process crash; a fresh node restores the
+/// app from the store its versions were shipped to, through `nanovm admin`,
+/// and serves: what was committed, without what the crash cut short, then
+/// new writes, which survive another restart.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the SQLite experiment and restic"]
-async fn sqlite_backup_restores_into_a_fresh_root() {
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_restores_a_lost_node_from_the_store() {
     async fn start(cfg: &NodeConfig, path: &Path) -> (tokio::process::Child, std::net::SocketAddr) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3101,30 +3323,25 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
         }
     }
 
-    let mut cfg = node_cfg("sqlite_backup_source", 8);
-    let workspace = node_cfg("sqlite_backup_drill", 8).data_dir;
+    let mut cfg = node_cfg("sqlite_restore_source", 8);
+    let workspace = node_cfg("sqlite_restore_drill", 8).data_dir;
+    let store = workspace.join("store");
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
     let mut app = app("counter");
     app.limits.memory_mb = 64;
     app.limits.cpu_ms = 2000;
     app.limits.request_timeout_ms = 30_000;
     cfg.limits.cpu_ms = app.limits.cpu_ms;
     let wasm = std::fs::read(repo().join("target/sqlite-filesystem/composed.wasm")).unwrap();
-    let image = publish_wasm("backup-probe", &app, wasm).await;
+    let image = publish_wasm("restore-probe", &app, wasm).await;
     let name = worker(&image);
-    let run = |program: &str, args: &[&str]| {
-        std::process::Command::new(program).args(args)
-            .env("RESTIC_REPOSITORY", workspace.join("repository"))
-            .env("RESTIC_PASSWORD", "disposable-restore-drill")
-            .env("RESTIC_CACHE_DIR", workspace.join("restic-cache"))
-            .output().unwrap()
-    };
-    assert!(run("restic", &["init"]).status.success());
-    let script = repo().join("scripts/backup.py");
-    let backup = || run("python3", &[script.to_str().unwrap(), "backup", cfg.data_dir.to_str().unwrap(), "--stopped"]);
+    let shipped = |n: u64| std::fs::read(store.join(&name).join("a/head")).ok()
+        .is_some_and(|h| serde_json::from_slice::<nanovm::ship::Head>(&h).unwrap().sequence >= n);
     let (mut source, addr) = start(&cfg, &workspace.join("source.toml")).await;
     let (status, body) = app_get(addr, &image, "/a/?v=durable").await;
     assert_eq!(status, 200, "{body}");
-    assert!(!backup().status.success(), "backup must refuse a live jailed owner");
+    let source_objects = cfg.data_dir.join("objects");
+    eventually("the durable write shipped", || shipped(1) && nanovm::ship::backlog(&source_objects).versions == 0).await;
     let children: Vec<i32> = std::fs::read_dir(format!("/proc/{}/task", source.id().unwrap())).unwrap()
         .flat_map(|thread| std::fs::read_to_string(thread.unwrap().path().join("children")).unwrap()
             .split_whitespace().map(|pid| pid.parse().unwrap()).collect::<Vec<_>>())
@@ -3139,7 +3356,7 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
         async move { app_get(addr, &image, "/a/?v=uncommitted&then=sleep").await }
     });
     let objects = cfg.app_dirs(&name)[0].clone();
-    eventually("tentative SQL/file/KV changes before backup", || {
+    eventually("tentative SQL/file/KV changes", || {
         std::fs::read(object_dir(&objects, "a").join("data/marker")).is_ok_and(|v| v == b"uncommitted")
             && std::fs::read(object_dir(&objects, "a").join("data/.kv/default/bWFya2Vy")).is_ok_and(|v| v == b"uncommitted")
     }).await;
@@ -3147,24 +3364,19 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
     let _ = pending.await;
     eventually("worker reaped", || !Path::new(&format!("/proc/{pid}")).exists()).await;
     source.kill().await.unwrap();
-    assert!(object_dir(&objects, "a").join("journal/log").exists(), "backup must include crash-left undo");
-    let saved = backup();
-    assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stderr));
-    let snapshot = String::from_utf8(saved.stdout).unwrap();
-    let snapshot = snapshot.trim();
-    assert_eq!(snapshot.len(), 64);
-    // Make the source unavailable: the fresh root cannot rely on its cache or files.
-    std::fs::rename(&cfg.data_dir, workspace.join("offline-source")).unwrap();
-    let fresh = workspace.join("fresh");
-    let restored = run("python3", &[script.to_str().unwrap(), "restore", snapshot, fresh.to_str().unwrap()]);
-    assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
-    assert!(!fresh.join("cache").exists());
-    assert!(!fresh.join("tmp").exists());
-    let restored_objects = fresh.join("objects").join(&name);
-    assert_eq!(std::fs::read(object_dir(&restored_objects, "a").join("data/marker")).unwrap(), b"uncommitted");
-    assert!(object_dir(&restored_objects, "a").join("journal/log").exists());
-    cfg.data_dir = fresh;
+    assert!(object_dir(&objects, "a").join("journal/log").exists(), "the crash left undo");
+    // The node is lost: a fresh one, on an empty root, restores the app.
+    std::fs::remove_dir_all(&cfg.data_dir).unwrap();
+    cfg.data_dir = workspace.join("fresh");
+    std::fs::create_dir_all(&cfg.data_dir).unwrap();
     let (mut destination, addr) = start(&cfg, &workspace.join("restored.toml")).await;
+    let (ok, out) = tokio::task::spawn_blocking({
+        let (cfg, name) = (cfg.clone(), name.clone());
+        move || admin(&cfg, &["restore", &name])
+    }).await.unwrap();
+    assert!(ok, "{out}");
+    let restored_objects = cfg.app_dirs(&name)[0].clone();
+    assert!(!object_dir(&restored_objects, "a").join("journal/log").exists());
     let (status, body) = app_get(addr, &image, "/a/").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(),
@@ -3182,7 +3394,7 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(),
         serde_json::json!({"rows": ["durable", "after-restore"], "file": "after-restore", "key": "after-restore", "reused": false}));
     reopened.kill().await.unwrap();
-    println!("fresh-root restore: crash-left SQL/file/KV rolled back together; new writes survived another restart");
+    println!("lost node restored from the store: crash-left SQL/file/KV absent; new writes survived another restart");
 }
 
 /// Faults at every VFS mutation/sync boundary of a multi-database transaction.
@@ -5728,6 +5940,50 @@ mod nodes {
         };
         assert_eq!(read, one, "B serves what A last served");
         assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+    }
+
+    /// With leases, an object is restored on the node holding it: the restore
+    /// takes its lease and claims its head, going back to an older version as
+    /// the version after the head. The other node refuses to restore it while
+    /// it is held. The proxy then serves the restored object, and its history
+    /// goes on from the restore.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_object_is_restored_on_the_node_holding_it() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("restore_leased_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("restore_leased_b", &lb, private.local_addr().unwrap());
+        let shipped = PathBuf::from(cfg_a.capture.as_ref().unwrap().store.clone().unwrap());
+        let a = serve(cfg_a, la, store.clone()).await;
+        let b = serve(cfg_b, lb, store.clone()).await;
+        // A write waits for its version to count in the store (remote ack)
+        // in its post-return phase: hostile's 500 ms is short for a busy disk.
+        let mut hostile = app("hostile");
+        hostile.limits.post_return_timeout_ms = 5_000;
+        let published = publish("nodes-restore", &hostile).await;
+        let (proxy, app) = proxy(&names, private, "restore.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let head = || serde_json::from_slice::<nanovm::ship::Head>(&std::fs::read(shipped.join(&app).join(&object).join("head")).unwrap()).unwrap();
+        for v in ["one", "two", "three"] {
+            let written = get(proxy, "restore.test", &format!("/{object}/commit?v={v}")).await;
+            assert_eq!(written.0, 200, "{written:?}");
+        }
+        let before = head();
+        assert_eq!(before.node, names[0]);
+        let args = |a: &[&str]| a.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let e = b.command(&args(&["restore", &app, &object, "1"])).await.unwrap_err();
+        assert!(format!("{e:#}").contains(&format!("Held(\"{}\")", names[0])), "{e:#}");
+        let done = a.command(&args(&["restore", &app, &object, "1"])).await.unwrap();
+        assert_eq!((&done[0]["version"], &done[0]["head"]), (&1.into(), &(before.sequence + 1).into()), "{done}");
+        assert_eq!(head().sequence, before.sequence + 1, "shipped under the restore's lease");
+        assert_eq!(get(proxy, "restore.test", &format!("/{object}/commit")).await, (200, r#"{"file":"one","key":"one"}"#.into()));
+        let written = get(proxy, "restore.test", &format!("/{object}/commit?v=four")).await;
+        assert_eq!(written.0, 200, "{written:?}");
+        let after = head();
+        assert_eq!((after.sequence, after.node.as_str()), (before.sequence + 2, names[0].as_str()));
+        assert!(after.lease > before.lease, "taken again after the restore: {after:?}");
     }
 
     /// Node A answers a request and works on after answering; meanwhile it

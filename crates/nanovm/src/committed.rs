@@ -94,14 +94,15 @@ pub fn digest(path: &Path) -> io::Result<String> {
 
 // No independent mutable cursor: the contiguous immutable filenames are the
 // head. Returns the last sequence, and how many versions and bytes are here:
-// a shipper removes those it shipped but the last, maybe meanwhile.
+// a shipper removes those it shipped but the last, maybe meanwhile, in any
+// order, so this may see some of them and not others (B-503).
 fn head(dir: &Path) -> io::Result<(u64, u64, u64)> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0, 0)),
         Err(e) => return Err(e),
     };
-    let (mut count, mut first, mut last, mut bytes) = (0u64, u64::MAX, 0u64, 0u64);
+    let (mut count, mut last, mut bytes) = (0u64, 0u64, 0u64);
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
@@ -120,12 +121,8 @@ fn head(dir: &Path) -> io::Result<(u64, u64, u64)> {
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             len => len?.len(),
         };
-        count += 1;
-        (first, last) = (first.min(sequence), last.max(sequence));
+        (count, last) = (count + 1, last.max(sequence));
         bytes = bytes.checked_add(len).ok_or_else(|| invalid("capture size overflow"))?;
-    }
-    if count > 0 && count != last - first + 1 {
-        return Err(invalid("gap in committed versions"));
     }
     Ok((last, count, bytes))
 }
@@ -153,24 +150,31 @@ fn name(path: &Path) -> io::Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| invalid("non-UTF-8 path"))
 }
 
-/// Stages the version a commit of `volume` makes, before the journal
-/// replaces its key `key`: a snapshot, or `changes` to the last version.
+/// Stages the version a commit of `volume` under lease epoch `epoch`
+/// makes, before the journal replaces its key `key`: `changes` to the last
+/// version, or with none (or when one is due) a snapshot. What waits here
+/// is bounded in bytes (`max_mb`), not in versions, so a store that is down
+/// for a while doesn't stop writes; nor does a snapshot fall due while
+/// more than `snapshot_every` versions wait, so what waits grows with what
+/// is written, not with the volume (B-501).
 pub(super) fn prepare(
     volume: &Path,
     out: &Path,
     obj: &ObjShared,
+    epoch: u64,
     cap: &CaptureConfig,
     key: &[u8; 8],
-    changes: &Changes,
+    changes: Option<&Changes>,
 ) -> io::Result<()> {
     let (last, count, used) = head(out)?;
     let limit = cap
         .max_mb
         .checked_mul(1 << 20)
         .ok_or_else(|| invalid("capture limit overflow"))?;
-    if count >= cap.max_versions || used >= limit {
+    if used >= limit {
         return Err(ErrorKind::StorageFull.into());
     }
+    let every = cap.snapshot_every.max(1);
     let version = Version {
         format: FORMAT,
         app: obj.app.to_string(),
@@ -178,13 +182,13 @@ pub(super) fn prepare(
         sequence: last
             .checked_add(1)
             .ok_or_else(|| invalid("capture sequence overflow"))?,
-        epoch: obj.lease_epoch()?,
+        epoch,
         parent: if last == 0 {
             String::new()
         } else {
             digest(&out.join(filename(last)))?
         },
-        snapshot: last % cap.snapshot_every.max(1) == 0,
+        snapshot: changes.is_none() || (last % every == 0 && count <= every),
     };
     let metadata = serde_json::to_vec(&version)?;
     if !out.try_exists()? {
@@ -210,7 +214,7 @@ pub(super) fn prepare(
     };
     append("nanovm.json", &metadata)?;
     let mut whole = vec![PathBuf::new()];
-    if !version.snapshot {
+    if let Some(changes) = changes.filter(|_| !version.snapshot) {
         let mut manifest = Manifest::default();
         for dir in &changes.listed {
             let mut entries = BTreeSet::new();

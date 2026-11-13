@@ -635,7 +635,8 @@ impl Journal {
         sync_all(&paths)?;
         let (out, old) = (committed::directory(&self.base), self.key);
         if let Some(cap) = &self.capture {
-            committed::prepare(&self.volume, &out, &self.obj, cap, &old, &self.changes(&paths)?)?;
+            let epoch = self.obj.lease_epoch()?;
+            committed::prepare(&self.volume, &out, &self.obj, epoch, cap, &old, Some(&self.changes(&paths)?))?;
         }
         // Only while the node holds the object's lease, at the decision: a
         // lapsed lease leaves the records signed, so recovery undoes the
@@ -1107,7 +1108,7 @@ mod tests {
     fn stage(j: &Journal, cap: &CaptureConfig) {
         let paths: Vec<_> = j.touched.iter().map(|p| j.base.join(p)).collect();
         let out = committed::directory(&j.base);
-        committed::prepare(&j.volume, &out, &j.obj, cap, &j.key, &j.changes(&paths).unwrap()).unwrap();
+        committed::prepare(&j.volume, &out, &j.obj, 0, cap, &j.key, Some(&j.changes(&paths).unwrap())).unwrap();
     }
 
     /// Every version, restored from the snapshot before it and the changes
@@ -1116,7 +1117,7 @@ mod tests {
     /// (over files and empty directories), removals and type changes.
     #[test]
     fn changes_restore_every_version() {
-        let cap = CaptureConfig { max_mb: 64, max_versions: 1000, snapshot_every: 7, ..Default::default() };
+        let cap = CaptureConfig { max_mb: 64, snapshot_every: 7, ..Default::default() };
         let v = volume();
         let out = v.parent().unwrap().join("committed");
         let mut j = captured(&v, &cap).unwrap();
@@ -1586,11 +1587,11 @@ mod tests {
 
     #[test]
     fn capture_caps_reject_without_discarding_accepted_history() {
-        for byte_limit in [false, true] {
+        {
             let v = volume();
             // Snapshots only, so the byte limit binds.
-            let cap = CaptureConfig { max_mb: 1, max_versions: if byte_limit { 16 } else { 1 }, snapshot_every: 1, ..Default::default() };
-            if byte_limit { std::fs::write(v.join("large"), vec![7; 600_000]).unwrap(); }
+            let cap = CaptureConfig { max_mb: 1, snapshot_every: 1, ..Default::default() };
+            std::fs::write(v.join("large"), vec![7; 600_000]).unwrap();
             let mut j = captured(&v, &cap).unwrap();
             write(&mut j, &v, "a", 0, b"accepted");
             j.commit().unwrap();
@@ -1607,6 +1608,25 @@ mod tests {
             assert!(reopen(&v, 1 << 30).is_err(), "disabling capture must not create silent gaps");
             std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
         }
+    }
+
+    /// The shipper removes shipped versions but the last while commits list
+    /// them, in any order: a commit that sees some below the last and not
+    /// others goes on from the last (B-503).
+    #[test]
+    fn a_commit_goes_on_past_versions_pruned_out_of_order() {
+        let (v, cap) = (volume(), CaptureConfig::default());
+        let out = v.parent().unwrap().join("committed");
+        let mut j = captured(&v, &cap).unwrap();
+        for n in 1..=3 {
+            write(&mut j, &v, "a", 0, &[b'0' + n]);
+            j.commit().unwrap();
+        }
+        std::fs::remove_file(out.join(format!("{:020}.tar", 2))).unwrap();
+        write(&mut j, &v, "a", 0, b"4");
+        j.commit().unwrap();
+        assert!(out.join(format!("{:020}.tar", 4)).exists());
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
     }
 
     /// Writes as the filesystem host does: journal first, then the write.
@@ -2494,14 +2514,14 @@ mod tests {
         assert_eq!((head.sequence, head.node.as_str()), (2, "b"));
         let version = store.get(&format!("app/o/{:020}-{}.tar", 2, head.digest)).await.unwrap().unwrap();
         assert_eq!(crate::committed::identity(&version[..]).unwrap().epoch, 2, "the store's second version is B's");
-        let third = root("c");
-        let _ = std::fs::remove_dir_all(&third);
+        let third = root("c").join("objects/app");
+        let _ = std::fs::remove_dir_all(root("c"));
         std::fs::create_dir_all(&third).unwrap();
-        assert_eq!(crate::ship::restore(&store, "app", "o", &third).await.unwrap(), 2);
+        assert_eq!(crate::ship::restore(&store, "app", "o", &third, None, 0).await.unwrap().version, 2);
         let vc = crate::app::object_dir(&third, "o").join(VOLUME);
         assert_eq!(tree(&vc), tree(&vb));
         assert_eq!(std::fs::read(vc.join("a")).unwrap(), b"B'sst world");
-        for d in [objects_a.parent().unwrap(), &objects_b, &third] {
+        for d in [objects_a.parent().unwrap(), &objects_b, &root("c")] {
             std::fs::remove_dir_all(d).unwrap();
         }
     }
