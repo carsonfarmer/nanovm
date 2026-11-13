@@ -69,9 +69,7 @@ struct NodeRecord {
     beat: u64,
     /// The node's `lease_ms`: how long another waits, seeing the record
     /// unchanged, before it takes the node's objects. The holder's, not the
-    /// taker's, so nodes needn't agree on it (0, from an older node: the
-    /// taker's).
-    #[serde(default)]
+    /// taker's, so nodes needn't agree on it.
     lease_ms: u64,
 }
 
@@ -248,7 +246,7 @@ impl Leases {
             if *seen_version != version {
                 (*seen_version, *since) = (version.clone(), Instant::now());
             }
-            if since.elapsed() < Some(rec.lease_ms).filter(|&ms| ms > 0).map_or(self.ttl, Duration::from_millis) {
+            if since.elapsed() < Duration::from_millis(rec.lease_ms) {
                 return Ok(true);
             }
         }
