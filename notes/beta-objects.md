@@ -145,6 +145,7 @@ empty `git diff`:
 | admin directory and socket world-writable | `admin_socket_is_the_supervisors_own` (mode, and uid 65534 connected) |
 | jail allows `socket`/`connect` | `jail_blocks_escapes` |
 | socket bound by its full path | `the_admin_socket_takes_a_long_data_dir` |
+| `object_at` opens the object's directory by path (follows symlinks) | `the_supervisor_never_follows_a_symlink_the_app_planted` ("marked through the object's directory") |
 
 ## CPU per request
 
