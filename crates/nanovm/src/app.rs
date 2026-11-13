@@ -221,6 +221,18 @@ impl Objects {
         if self.count.load(Relaxed) >= self.max {
             return Err(self.most());
         }
+        self.disk()
+    }
+
+    /// Takes a place for a new object, if there is [`room`](Self::room):
+    /// at most `max` however many take one at once.
+    pub fn admit(&self) -> std::io::Result<()> {
+        self.disk()?;
+        let more = self.count.try_update(Relaxed, Relaxed, |n| (n < self.max).then_some(n + 1));
+        more.map(drop).map_err(|_| self.most())
+    }
+
+    fn disk(&self) -> std::io::Result<()> {
         let fs = rustix::fs::statvfs(&self.dir)?;
         if fs.f_bavail * fs.f_frsize < self.need.0 || (fs.f_files > 0 && fs.f_favail < self.need.1) {
             let (mb, files) = (self.need.0 >> 20, self.need.1);
@@ -228,13 +240,6 @@ impl Objects {
             return Err(std::io::Error::new(ErrorKind::StorageFull, detail));
         }
         Ok(())
-    }
-
-    /// Takes a place for a new object, if there is [`room`](Self::room).
-    pub fn admit(&self) -> std::io::Result<()> {
-        self.room()?;
-        let more = self.count.try_update(Relaxed, Relaxed, |n| (n < self.max).then_some(n + 1));
-        more.map(drop).map_err(|_| self.most())
     }
 
     /// An object's place, given back: it has no directory any more.
