@@ -1082,10 +1082,10 @@ mod tests {
         mark(&dir, 1).unwrap();
         std::fs::create_dir_all(objects.join("o")).unwrap();
         std::fs::write(objects.join("o/v"), "two").unwrap();
-        // The order discard removes things in, as `remove_dir_all` here does.
-        let order: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(order[0], format!("{:020}.tar", 2)[..], "this filesystem lists the newest first");
         // A's claim at epoch 3 is cut short: the volume went, then version 2.
+        // Made by hand, so the test doesn't depend on the order a filesystem
+        // lists a directory in (the review's ext4 listed the newest first, so
+        // the old `remove_dir_all` left exactly this; CI's filesystem doesn't).
         std::fs::remove_dir_all(objects.join("o")).unwrap();
         std::fs::remove_file(dir.join(format!("{:020}.tar", 2))).unwrap();
         // A claims again, at epoch 4.
