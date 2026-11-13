@@ -1824,6 +1824,8 @@ impl Served {
             max_live_objects: 16,
             memory_reservation_mb: 64,
             dev: true,
+            // Workers without cgroup limits: this host may delegate none.
+            cgroup: "off".into(),
             ..Default::default()
         };
         // The operator allows the egress the app asks for.

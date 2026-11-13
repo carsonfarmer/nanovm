@@ -4626,7 +4626,12 @@ async fn gated(test: &str, clients: nanovm::config::ClientLimits) -> (Arc<nanovm
         let app = publish(&format!("{test}-{name}"), &app(name)).await;
         records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", app.split_once('@').unwrap().0)]);
     }
-    let cfg = nanovm::config::ProxyConfig { nodes: vec![node.to_string()], resolver: doh(records).await, dev: true, listen: "127.0.0.1:0".into(), clients, ..Default::default() };
+    let cfg = nanovm::config::ProxyConfig {
+        nodes: vec![node.to_string()], resolver: doh(records).await, dev: true, listen: "127.0.0.1:0".into(), clients,
+        // The operator serves both hosts and lets the dev identity deploy.
+        hosts: vec!["counter.test".into(), "hostile.test".into()], signers: vec!["dev dev".into()],
+        ..Default::default()
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
