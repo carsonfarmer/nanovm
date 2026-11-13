@@ -501,9 +501,9 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
     ) -> FilesystemResult<()> {
         let quota = guard(store);
         quota.check_new_entry()?;
-        if let Some(p) = local(store, &fd, &path) {
+        if let Some(mut p) = local(store, &fd, &path) {
             quota.journal(|j| {
-                let p = j.place(&p)?;
+                j.place(&mut p)?;
                 j.creating(&p)
             })?;
         }
@@ -546,7 +546,7 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
                     quota.check_new_entry()?;
                     if let Some(p) = &mut local {
                         quota.journal(|j| {
-                            *p = j.place(p)?;
+                            j.place(p)?;
                             j.creating(p)
                         })?;
                     }

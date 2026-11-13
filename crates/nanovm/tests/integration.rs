@@ -420,6 +420,7 @@ async fn a_full_disk_makes_no_new_objects() {
         }
     }
     let (n, r) = refused.expect("the disk filled");
+    eprintln!("a 4 MiB disk held {n} counters before the first refusal: {}", r.body);
     assert_eq!((r.status, r.error.as_deref()), (507, Some("disk-full")), "{}", r.body);
     let made = objects_in(&objects);
     assert_eq!(made.len(), n, "every object before the refusal, none after");

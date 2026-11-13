@@ -326,6 +326,23 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// An app's objects are spread over 256 shards, so 65,000 of them (a
+    /// filesystem's subdirectory limit, N-35) put a few hundred in each
+    /// directory, and an id always lands in the same one.
+    #[test]
+    fn objects_are_sharded() {
+        let mut shards = std::collections::HashMap::<PathBuf, usize>::new();
+        for n in 0..65_000 {
+            let dir = object_dir(Path::new("/o"), &format!("user-{n}"));
+            assert_eq!(dir.file_name().unwrap(), format!("user-{n}").as_str());
+            assert_eq!(dir.parent().unwrap().parent().unwrap(), Path::new("/o"));
+            *shards.entry(dir.parent().unwrap().to_path_buf()).or_default() += 1;
+        }
+        assert_eq!(shards.len(), 256);
+        assert!(shards.values().all(|&n| n < 400), "{:?}", shards.values().max());
+        assert_eq!(object_dir(Path::new("/o"), "a"), Path::new("/o/ca/a"));
+    }
+
     /// An object goes when its volume is empty or gone and it has no
     /// captured history; any entry in its volume, or history, keeps it.
     #[test]

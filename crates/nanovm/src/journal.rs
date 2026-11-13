@@ -138,12 +138,13 @@ impl Journal {
             return Err(std::io::Error::other("committed history requires capture to remain enabled"));
         }
         let mut fresh = None;
-        if let Some(objects) = objects {
+        if let Some(objects) = objects
+            && !volume.try_exists()?
+        {
+            // What a crash left of an object without a volume goes.
             objects.settle(&base)?;
-            if !volume.try_exists()? {
-                objects.room()?;
-                fresh = Some(objects.pool.take()?);
-            }
+            objects.room()?;
+            fresh = Some(objects.pool.take()?);
         }
         let md = std::fs::metadata(fresh.as_ref().map_or(volume, |t| &t.0))?;
         Ok(Journal {
@@ -214,11 +215,11 @@ impl Journal {
         &self.volume
     }
 
-    /// `path`, in the volume, where it is once the volume is in its place:
-    /// the first change to an object without a volume moves the pool's
-    /// directory there, if the app has room for another object.
-    pub fn place(&mut self, path: &Path) -> std::io::Result<PathBuf> {
-        let (Some(tmp), Some(objects)) = (&mut self.fresh, &self.objects) else { return Ok(path.to_path_buf()) };
+    /// Makes `path`, in the volume, where it is once the volume is in its
+    /// place: the first change to an object without a volume moves the
+    /// pool's directory there, if the app has room for another object.
+    pub fn place(&mut self, path: &mut PathBuf) -> std::io::Result<()> {
+        let (Some(tmp), Some(objects)) = (&mut self.fresh, &self.objects) else { return Ok(()) };
         objects.admit()?;
         let volume = self.base.join(VOLUME);
         if let Err(e) = std::fs::create_dir_all(&self.base).and_then(|()| std::fs::rename(&tmp.0, &volume)) {
@@ -226,12 +227,12 @@ impl Journal {
             let _ = std::fs::remove_dir(&self.base);
             return Err(e);
         }
-        let rest = path.strip_prefix(std::mem::take(&mut tmp.0)).expect("in the volume").to_path_buf();
+        *path = volume.join(path.strip_prefix(std::mem::take(&mut tmp.0)).expect("in the volume"));
         self.fresh = None;
         // Its name in the object's directory is made durable at commit.
         self.touched.insert(PathBuf::new());
         self.volume = volume;
-        Ok(self.volume.join(rest))
+        Ok(())
     }
 
     fn rel(&self, abs: &Path) -> PathBuf {
