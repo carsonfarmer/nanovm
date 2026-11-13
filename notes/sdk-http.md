@@ -86,39 +86,47 @@ async fn handle(_req: http::Request<Body>) -> Result {
 The new hello's answer has no `content-type` (`Response::text` set
 `text/plain`); `curl` doesn't care, and the builder adds one.
 
-**Streams that fail.** A `Body::stream` writer returns `Result<()>`. An `Err`
-resolves the body's trailers future to an error, so the host ends the body
-without its last chunk: the client sees it cut off, not a short body that
-looks whole. examples/gateway uses it: an upstream that breaks off now
-breaks the client's stream off too (`examples.rs` checks it); before, the
-client got a clean end after three tokens. examples/files breaks a download
-off if a read fails.
+**Round 3's fixes, carried over.** The branch merges `cf/round3` at 7b3f9c6,
+whose r3-dev fixes changed the old SDK (N-710, N-713), and keeps them on the
+new types. `after` work starts only once the answer is out (the future
+`wit::Response::new` returns for its transmission), and `after` called
+from it runs at once, before the next request. A `Body::stream` writer
+returns `Result<()>`: an `Err` resolves the body's trailers to an error, so
+the client sees the body cut off rather than a short one that looks whole,
+and rolls back what was changed since answering, as a panic does. A
+streamed request body (`fetch`) that fails only fails that request.
+examples/gateway passes an upstream's break on to its client this way.
 
 ## Cost
 
-**Code.** The SDK's code lines (non-blank, non-comment, before tests): 815 →
-753. `lib.rs` 307 → 264, the outbound module 107 → 83, `ws.rs` 83 → 88.
-The examples grew: 2,897 → 3,195 lines for the 24 that existed (+298, +10%),
+All against `cf/round3` at 7b3f9c6, which this branch merges.
+
+**Code.** The SDK's code lines (non-blank, non-comment, before tests): 830 →
+776. `lib.rs` 322 → 286, the outbound module 107 → 84, `ws.rs` 83 → 88.
+The examples grew: 2,909 → 3,208 lines for the 24 that existed (+299, +10%),
 most of it 46 copies of two-line `json(status, body)` / `text(status, body)`
 helpers that set `content-type`, which `Response::json` and friends did.
 
 **Size.** Composed components as `tools/build-app.sh` builds them (release,
-`opt-level = "s"`, LTO, stripped), round 3 against this branch:
+`opt-level = "s"`, LTO, stripped), both built at paths of the same length
+(panic messages carry source paths):
 
-| app | before | after | |
+| app | 7b3f9c6 | this branch | |
 |---|---:|---:|---:|
-| hello | 332,938 | 389,076 | +56,138 (+16.9%) |
-| chat | 474,995 | 545,036 | +70,041 (+14.7%) |
-| the other small apps | 388–510 KB | | +58–77 KB (+13–18%) |
-| apps with SQLite, the JS runtime | 1.53–1.80 MB | | +60–68 KB (+3.4–4.0%) |
+| hello | 340,219 | 383,330 | +43,111 (+12.7%) |
+| chat | 481,608 | 542,530 | +60,922 (+12.6%) |
+| the other small apps | 396–515 KB | | +48–69 KB (+10.6–15.1%) |
+| apps with SQLite | 1.53–1.81 MB | | +51–59 KB (+2.9–3.4%) |
 
-That is noticeable. A linker map of hello (`-C link-arg=--Map`, unstripped)
-puts it in the `http` crate itself: code 110,174 → 158,021 bytes, data
-15,852 → 21,782. `HeaderName::from_bytes` alone is 16.9 KB (its table of
-standard header names), `HeaderName::as_str` 2 KB, URI and `HeaderMap`
-code inlined into the handler export +13 KB, `bytes` about 4 KB. Our own
-SDK code shrank by 1.8 KB. Any app on `http` types pays this; the only way
-around it is not to use the crate.
+That is noticeable. A linker map of hello (`-C link-arg=--Map`, unstripped,
+on the first version of this branch, against round 3 at 9784334) puts it in
+the `http` crate itself: code 110,174 → 158,021 bytes, data 15,852 → 21,782.
+`HeaderName::from_bytes` alone is 16.9 KB (its table of standard header
+names), `HeaderName::as_str` 2 KB, URI and `HeaderMap` code inlined into the
+handler export +13 KB, `bytes` about 4 KB; our own SDK code shrank by
+1.8 KB. Building requests directly instead of through
+`http_from_wasi_request` (above) took 11.8 KB of that back. Any app on
+`http` types pays the rest; the only way around it is not to use the crate.
 
 **CPU per request.** CPU_PLACEHOLDER
 
@@ -136,8 +144,11 @@ around it is not to use the crate.
   app's 500 not a failure), every value of a repeated header in order, header
   bytes that aren't UTF-8, the method, the URI within the object, the body's
   bytes and its `content-length`.
-- `gateway_streams_completions_within_quotas` now also checks that an
-  upstream that breaks off breaks the client's stream off (B-703).
+- Round 3's tests of the same behaviour pass on the new types:
+  `review2_gateway_tells_its_client_when_the_upstream_breaks_off`
+  (examples.rs), the `wait_until_*` tests (js.rs), and in integration.rs
+  `after_work_*` and `a_streamed_body_whose_writer_fails_breaks_off_and_rolls_back`,
+  on `crates/nanovm/tests/sdk-after`, ported to `http::Request<Body>`.
 - Mutation checks, each restored with `git checkout -- sdk/rust/src/lib.rs`
   and an empty `git diff`, the app rebuilt both times:
 
@@ -167,4 +178,4 @@ with those bytes replaced, as before.
   not in the SDK; the examples keep their own. Owner question.
 - `fetch` of a request that carries a `host` header (copied from an incoming
   request) fails: `wasi:http` forbids it. `http-compat` moves it into the
-  URI's authority; the SDK doesn't (B-704).
+  URI's authority; the SDK doesn't (B-703).

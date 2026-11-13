@@ -1485,7 +1485,6 @@ async fn gateway_streams_completions_within_quotas() {
         text += &String::from_utf8_lossy(&frame.into_data().unwrap_or_default());
     }
     assert!(text.matches("token").count() == 3 && !text.contains("[DONE]"), "{text}");
-    assert!(broke, "the answer ends in an error, not a clean end");
     assert_eq!(usage(&app).await, 205, "not refunded as if 3 tokens were all of it");
     // So does one that outlives post_return_timeout_ms: its refund rolls back.
     let res = complete(&app, "n 50 ms 100").await;
