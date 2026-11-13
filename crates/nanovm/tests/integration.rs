@@ -158,8 +158,8 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
     for (name, count) in [("ship_restored", 3), ("ship_restored_again", 4)] {
         let fresh = shipping(name);
         let objects = fresh.app_dirs("counter")[0].clone();
-        let last = nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &objects).await.unwrap();
-        assert_eq!(last, count);
+        let restored = nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &objects, None, 0).await.unwrap();
+        assert_eq!((restored.version, restored.head), (count, count));
         let node = node_with(fresh.clone(), app("counter"));
         assert_eq!(get(&node, "o", "/").await.json()["count"], count);
         assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], count + 1);
@@ -175,8 +175,9 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
 }
 
 /// With remote acknowledgement, a commit whose version can't be stored is
-/// not acknowledged, though it stands here; and with the store down, once
-/// the capture limits are reached writes are refused, never versions dropped.
+/// not acknowledged, though it stands here; and with the store down, writes
+/// go on until the versions waiting here reach `max_mb`, then are refused,
+/// never versions dropped; the backlog says what waits.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() {
     for remote_ack in [true, false] {
@@ -184,7 +185,7 @@ async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() 
         cfg.capture = Some(nanovm::config::CaptureConfig {
             // A store no write reaches.
             store: Some("/dev/null/store".into()),
-            max_versions: 3,
+            max_mb: 1,
             remote_ack,
             ..Default::default()
         });
@@ -195,17 +196,92 @@ async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() 
             assert_eq!(get(&node, "o", "/").await.json()["count"], 1, "the commit stands here");
         } else {
             assert_eq!(r.json()["count"], 1);
-            for n in 2..=3 {
-                assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
+            // Each version about 300 KiB: three fit in 1 MiB with the first.
+            let value = |n: u8| String::from_utf8(vec![b'a' + n; 300 << 10]).unwrap();
+            for n in 1..=3 {
+                assert_eq!(request(&node, "PUT", "o", "/kv/k", &value(n)).await.status, 204, "write {n}");
             }
-            let r = request(&node, "POST", "o", "/incr", "").await;
+            let r = request(&node, "PUT", "o", "/kv/k", &value(4)).await;
             assert_eq!(r.error.as_deref(), Some("commit-failed"), "a full outbox refuses: {}", r.body);
-            assert_eq!(get(&node, "o", "/").await.json()["count"], 3);
+            assert_eq!(get(&node, "o", "/kv/k").await.body, value(3));
             let local = cfg.app_dirs("counter")[0].join("~committed/o");
-            assert_eq!(std::fs::read_dir(local).unwrap().count(), 3, "every unshipped version kept");
+            assert_eq!(std::fs::read_dir(local).unwrap().count(), 4, "every unshipped version kept");
+            let backlog = nanovm::ship::backlog(&cfg.data_dir.join("objects"));
+            assert_eq!((backlog.versions, backlog.objects), (4, 1));
+            assert!(backlog.bytes > 900 << 10, "{backlog:?}");
         }
         node.shutdown().await;
     }
+}
+
+/// With the store down, a node that answers once a write is durable here
+/// keeps answering writes, many more than the 16 versions it once held,
+/// without a snapshot of the volume for each 16; once the store is back,
+/// every version ships, in order, and the backlog empties. Another object
+/// that stopped writing ships too.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_go_on_through_a_store_outage_and_ship_in_order_after() {
+    use nanovm::ship::Dir;
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ship-outage");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let (store, down) = (base.join("store"), base.join("store.down"));
+    let mut cfg = node_cfg("ship_outage", 8);
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
+    let node = node_with(cfg.clone(), app("counter"));
+    let head = |o: &str| {
+        let bytes = std::fs::read(store.join("counter").join(o).join("head")).ok();
+        bytes.map_or(0, |h| serde_json::from_slice::<nanovm::ship::Head>(&h).unwrap().sequence)
+    };
+    // A big file in the volume, which a snapshot would copy whole.
+    assert_eq!(request(&node, "PUT", "o", "/kv/big", &"b".repeat(200 << 10)).await.status, 204);
+    assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], 1);
+    eventually("shipped", || head("o") == 2).await;
+    // The store goes away: a file where its directory was.
+    std::fs::rename(&store, &down).unwrap();
+    std::fs::write(&store, "down").unwrap();
+    for n in 2..=60 {
+        let r = request(&node, "POST", "o", "/incr", "").await;
+        assert_eq!(r.status, 200, "write {n} during the outage: {}", r.body);
+        assert_eq!(r.json()["count"], n);
+        if n == 3 {
+            assert_eq!(request(&node, "POST", "p", "/incr", "").await.json()["count"], 1);
+        }
+    }
+    let objects = cfg.data_dir.join("objects");
+    let backlog = nanovm::ship::backlog(&objects);
+    assert_eq!((backlog.versions, backlog.objects), (60, 2));
+    println!("{} bytes wait to be shipped", backlog.bytes);
+    // The store is back.
+    std::fs::remove_file(&store).unwrap();
+    std::fs::rename(&down, &store).unwrap();
+    let t0 = Instant::now();
+    while head("o") < 61 || head("p") < 1 || nanovm::ship::backlog(&objects).versions > 0 {
+        assert!(t0.elapsed() < Duration::from_secs(20), "shipped {} and {} of 61 and 1", head("o"), head("p"));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // In order: each version in the store follows the one before. Of the
+    // 16-version marks, only the first in the outage (17, with 15 waiting)
+    // took a snapshot.
+    let (head, _) = nanovm::ship::head(&Dir(store.clone()), "counter", "o").await.unwrap();
+    let (mut digest, mut snapshots) = (head.digest.clone(), vec![]);
+    for n in (1..=61).rev() {
+        let bytes = std::fs::read(store.join(format!("counter/o/{n:020}-{digest}.tar"))).unwrap();
+        let version = nanovm::committed::identity(&bytes[..]).unwrap();
+        assert_eq!(version.sequence, n);
+        snapshots.extend(version.snapshot.then_some(n));
+        digest = version.parent;
+    }
+    assert_eq!(digest, "", "version 1 is the first");
+    assert_eq!(snapshots, [17, 1]);
+    node.shutdown().await;
+    drop(node);
+    // A fresh root restores all of it.
+    let fresh = node_cfg("ship_outage_restored", 8);
+    nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &fresh.app_dirs("counter")[0], None, 0).await.unwrap();
+    let node = node_with(fresh, app("counter"));
+    assert_eq!(get(&node, "o", "/").await.json()["count"], 60);
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

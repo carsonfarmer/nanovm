@@ -335,6 +335,16 @@ impl Node {
         }
     }
 
+    /// Stops object `id`'s instance, if it has one, for a restore that has
+    /// paused it (see `ship::pause`): its actor serves what is queued, then
+    /// exits. Returns once it has, and its storage is free.
+    pub async fn evict(&self, id: &str) {
+        let Some(gone) = self.objects.lock().remove(id).map(|e| Arc::downgrade(&e.shared)) else { return };
+        while gone.strong_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Drops the table's handle on the least recently used idle object; its
     /// actor drains its queue and exits.
     fn evict_lru(&self, objects: &mut HashMap<Arc<str>, Entry>) -> bool {

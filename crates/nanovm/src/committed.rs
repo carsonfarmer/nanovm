@@ -152,24 +152,31 @@ fn name(path: &Path) -> io::Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| invalid("non-UTF-8 path"))
 }
 
-/// Stages the version a commit of `volume` makes, before the journal
-/// replaces its key `key`: a snapshot, or `changes` to the last version.
+/// Stages the version a commit of `volume` under lease epoch `epoch`
+/// makes, before the journal replaces its key `key`: `changes` to the last
+/// version, or with none (or when one is due) a snapshot. What waits here
+/// is bounded in bytes (`max_mb`), not in versions, so a store that is down
+/// for a while doesn't stop writes; nor does a snapshot fall due while
+/// more than `snapshot_every` versions wait, so what waits grows with what
+/// is written, not with the volume (B-501).
 pub(super) fn prepare(
     volume: &Path,
     out: &Path,
     obj: &ObjShared,
+    epoch: u64,
     cap: &CaptureConfig,
     key: &[u8; 8],
-    changes: &Changes,
+    changes: Option<&Changes>,
 ) -> io::Result<()> {
     let (last, count, used) = head(out)?;
     let limit = cap
         .max_mb
         .checked_mul(1 << 20)
         .ok_or_else(|| invalid("capture limit overflow"))?;
-    if count >= cap.max_versions || used >= limit {
+    if used >= limit {
         return Err(ErrorKind::StorageFull.into());
     }
+    let every = cap.snapshot_every.max(1);
     let version = Version {
         format: FORMAT,
         app: obj.app.to_string(),
@@ -177,13 +184,13 @@ pub(super) fn prepare(
         sequence: last
             .checked_add(1)
             .ok_or_else(|| invalid("capture sequence overflow"))?,
-        epoch: obj.lease_epoch()?,
+        epoch,
         parent: if last == 0 {
             String::new()
         } else {
             digest(&out.join(filename(last)))?
         },
-        snapshot: last % cap.snapshot_every.max(1) == 0,
+        snapshot: changes.is_none() || (last % every == 0 && count <= every),
     };
     let metadata = serde_json::to_vec(&version)?;
     if !out.try_exists()? {
@@ -209,7 +216,7 @@ pub(super) fn prepare(
     };
     append("nanovm.json", &metadata)?;
     let mut whole = vec![PathBuf::new()];
-    if !version.snapshot {
+    if let Some(changes) = changes.filter(|_| !version.snapshot) {
         let mut manifest = Manifest::default();
         for dir in &changes.listed {
             let mut entries = BTreeSet::new();
@@ -345,12 +352,12 @@ fn names(path: &Path) -> io::Result<&Path> {
     }
 }
 
-const DIR: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+pub(crate) const DIR: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
 
 /// The directory `path` names in `root`, opened a name at a time and never
 /// through a symlink, as journal recovery reaches entries, so nothing it
 /// reaches is outside; made where missing if `make`.
-fn dir_at(root: &OwnedFd, path: &Path, make: bool) -> io::Result<OwnedFd> {
+pub(crate) fn dir_at(root: &OwnedFd, path: &Path, make: bool) -> io::Result<OwnedFd> {
     let mut dir = openat(root, ".", DIR, Mode::empty())?;
     for name in names(path)? {
         if make && let Err(e) = mkdirat(&dir, name, Mode::from_raw_mode(0o777)) && e != Errno::EXIST {
@@ -386,7 +393,7 @@ fn listing(dir: &OwnedFd) -> io::Result<Vec<(OsString, bool)>> {
 }
 
 /// Removes `name` from `dir`, and all in it, never through a symlink.
-fn remove_at(dir: &OwnedFd, name: &OsStr) -> io::Result<()> {
+pub(crate) fn remove_at(dir: &OwnedFd, name: &OsStr) -> io::Result<()> {
     match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Err(Errno::NOENT) => Ok(()),
         Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Directory => {

@@ -18,19 +18,32 @@
 //! makes the node's copy of the object the head's, restoring it from the
 //! store when it isn't: a node never serves state older than the head. Shipped versions
 //! are removed here but the last, which the next names as its parent; what
-//! isn't shipped yet stays, within the capture limits, which refuse writes
-//! once they are reached (the store down, say), never dropping a version.
+//! isn't shipped yet stays, within the capture limit (`max_mb`), which
+//! refuses writes once it is reached (the store down a long while, say),
+//! never dropping a version. `backlog` says how much waits.
+//!
+//! A restore (`restore`) rebuilds an object here from the store: its head's
+//! version, or an earlier one, which then becomes the version after the
+//! head, so the head only moves on. It is staged outside the app's
+//! directory, where no worker reaches, then put in place (`install`) once
+//! decided, from wherever a crash stopped it (`recover`); meanwhile the
+//! object is paused (`pause`), so no instance of it runs. The supervisor
+//! (root) reaches what it changes in an app's directory, which the app's
+//! worker writes, by name from a descriptor, never through a symlink.
 
 use std::io::{self, ErrorKind};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, openat, renameat, statat};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::committed::{DIR, remove_at};
 use crate::config::CaptureConfig;
 use crate::lease::Leases;
 
@@ -57,6 +70,8 @@ pub trait Store: Send + Sync {
     /// Writes the record at `key` if it is still at `tag` (none: absent):
     /// its new version, or none if it has moved.
     async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>>;
+    /// The names one level under `prefix`.
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
 }
 
 /// The store `cap` names, if any: a directory (`/path` or `file:///path`),
@@ -169,6 +184,11 @@ impl Store for Dir {
         })
         .await?
     }
+
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let entries = entries(&self.0.join(prefix))?;
+        Ok(entries.into_iter().filter_map(|e| e.file_name().into_string().ok()).collect())
+    }
 }
 
 /// An object store (S3 and the like): a put is conditional on nothing
@@ -207,6 +227,12 @@ impl Store for Objects {
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => Ok(None),
             Err(e) => Err(io::Error::other(e)),
         }
+    }
+
+    async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        let found = self.0.list_with_delimiter(Some(&prefix.into())).await.map_err(io::Error::other)?;
+        let paths = found.common_prefixes.into_iter().chain(found.objects.into_iter().map(|o| o.location));
+        Ok(paths.filter_map(|p| p.filename().map(str::to_owned)).collect())
     }
 }
 
@@ -255,6 +281,41 @@ fn mark(marker: &Path, sequence: u64) -> io::Result<()> {
     std::fs::create_dir_all(marker.parent().expect("in ~shipped"))?;
     std::fs::write(&new, sequence.to_string())?;
     std::fs::rename(new, marker)
+}
+
+/// The directory at `path`, its last name not a symlink.
+fn open_dir(path: &Path) -> io::Result<OwnedFd> {
+    Ok(openat(CWD, path, DIR, Mode::empty())?)
+}
+
+/// Directory `name` in `app` (an app's directory), made, and given to `uid`,
+/// if it isn't there.
+fn sub(app: &OwnedFd, name: &str, uid: Option<u32>) -> io::Result<OwnedFd> {
+    let made = match rustix::fs::mkdirat(app, name, Mode::from_raw_mode(0o755)) {
+        Err(Errno::EXIST) => false,
+        made => made.map(|()| true)?,
+    };
+    let dir = openat(app, name, DIR, Mode::empty())?;
+    if made && uid.is_some() {
+        std::os::unix::fs::fchown(&dir, uid, uid)?;
+    }
+    Ok(dir)
+}
+
+/// Removes `name`, and all in it, from directory `dir` of `app`.
+fn remove_in(app: &OwnedFd, dir: &str, name: &str) -> io::Result<()> {
+    match openat(app, dir, DIR, Mode::empty()) {
+        Err(Errno::NOENT) => Ok(()),
+        dir => remove_at(&dir?, name.as_ref()),
+    }
+}
+
+/// The entries of `dir`, none if it isn't there.
+fn entries(dir: &Path) -> io::Result<Vec<std::fs::DirEntry>> {
+    match std::fs::read_dir(dir) {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(vec![]),
+        entries => entries?.collect(),
+    }
 }
 
 /// Waits, two seconds at most (within an instance's post-return deadline),
@@ -319,7 +380,8 @@ pub(crate) async fn ship_object(store: &dyn Store, leases: Option<&Leases>, app:
             // Unless the head names it already (it was shipped, not marked).
             if (n, &digest) != (head.sequence, &head.digest) {
                 let version = crate::committed::identity(&bytes[..])?;
-                if n != head.sequence + 1 || version.parent != head.digest || version.epoch > lease {
+                let follows = (n, version.parent.as_str(), version.app.as_str(), version.object.as_str()) == (head.sequence + 1, &head.digest, app, object);
+                if !follows || version.epoch > lease {
                     return Err(io::Error::other(format!("{app}/{object} version {n} doesn't follow its head, {}", head.sequence)));
                 }
                 if let Put::Conflict = store.put(&version_key(app, object, n, &digest), bytes).await? {
@@ -377,6 +439,34 @@ pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Lea
     }
 }
 
+/// What waits on this node to be shipped: versions, their bytes, and the
+/// objects they are of.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Backlog {
+    pub versions: u64,
+    pub bytes: u64,
+    pub objects: u64,
+}
+
+/// The backlog under `objects` (`<data_dir>/objects`): each object's
+/// versions after the last its head named, as the shipper recorded it.
+pub fn backlog(objects: &Path) -> Backlog {
+    let mut out = Backlog::default();
+    for app in entries(objects).unwrap_or_default() {
+        for object in entries(&app.path().join("~committed")).unwrap_or_default() {
+            let dir = object.path();
+            let shipped: u64 = std::fs::read_to_string(marker(&dir)).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let waiting = published(&dir).map(|v| v.0).unwrap_or_default().into_iter().filter(|&n| n > shipped);
+            let sizes: Vec<u64> = waiting.filter_map(|n| std::fs::metadata(dir.join(format!("{n:020}.tar"))).ok()).map(|m| m.len()).collect();
+            if !sizes.is_empty() {
+                (out.objects, out.versions) = (out.objects + 1, out.versions + sizes.len() as u64);
+                out.bytes += sizes.iter().sum::<u64>();
+            }
+        }
+    }
+    out
+}
+
 /// Claims the head of object `object` of app `app` for this node's lease on
 /// it, at epoch `lease`, before the object is served here: by a conditional
 /// write, after which no node with an earlier lease can move the head. This
@@ -401,7 +491,7 @@ pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object:
             continue;
         }
         if !current && head.sequence > 0 {
-            restore(store, app, object, objects).await?;
+            restore(store, app, object, objects, None, lease).await?;
         }
         return Ok(());
     }
@@ -438,49 +528,176 @@ fn discard(objects: &Path, object: &str) -> io::Result<()> {
     }
 }
 
-/// Rebuilds object `object` of app `app` from what `store` holds, as the
-/// volume under `objects` (`<data_dir>/objects/<app>`, where it must not be
-/// yet): the version its head names, from the last snapshot before it,
-/// which is kept here so history goes on from it. Returns its sequence.
-pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path) -> io::Result<u64> {
+/// What a restore did: the version of the object it restored, and its head
+/// after (one past the head before, for an older version).
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct Restored {
+    pub object: String,
+    pub version: u64,
+    pub head: u64,
+}
+
+/// Where a restore of `object` (under `objects`, `<data_dir>/objects/<app>`)
+/// is staged: `<data_dir>/restore/<app>/<object>`, which no worker reaches.
+fn staging(objects: &Path, object: &str) -> PathBuf {
+    let data = objects.parent().and_then(Path::parent).expect("in <data_dir>/objects");
+    data.join("restore").join(objects.file_name().expect("an app's")).join(object)
+}
+
+/// The uid that owns `objects` (an app's directory) when this process is
+/// root, which gives what it makes there to the app.
+fn owner(objects: &Path) -> io::Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: no arguments, no memory.
+    Ok((unsafe { libc::geteuid() } == 0).then(|| std::fs::metadata(objects).map(|m| m.uid())).transpose()?)
+}
+
+/// Gives `path`, and all in it, to `uid`: a tree only this process reaches.
+fn own(path: &Path, uid: u32) -> io::Result<()> {
+    std::os::unix::fs::lchown(path, Some(uid), Some(uid))?;
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            own(&entry?.path(), uid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rebuilds object `object` of app `app` here (under `objects`) as version
+/// `to` of it in `store`, or as its head's: fetched back from the head,
+/// each version the parent the one after it names and checked against its
+/// digest, to `to` and on to the last snapshot before it. The head's is
+/// kept so history goes on from it. An older version is restored as a new
+/// one after the head, under lease epoch `epoch`, so the head only moves on
+/// (once it is shipped) and the versions after the one restored stay in the
+/// store. The object's volume, journal and versions here are replaced by
+/// `install`. A crash before the restore is decided leaves the object as it
+/// was; one after, `recover` finishes.
+pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path, to: Option<u64>, epoch: u64) -> io::Result<Restored> {
     let (head, _) = head(store, app, object).await?;
     if head.sequence == 0 {
         return Err(io::Error::new(ErrorKind::NotFound, format!("nothing of {app}/{object} counts in the store")));
     }
-    let staging = objects.join("~restore").join(object);
+    let to = to.unwrap_or(head.sequence);
+    if !(1..=head.sequence).contains(&to) {
+        return Err(io::Error::new(ErrorKind::InvalidInput, format!("{app}/{object} has versions 1 to {}", head.sequence)));
+    }
+    std::fs::create_dir_all(objects)?;
+    let stage = staging(objects, object);
     // What a restore cut short left.
-    if let Err(e) = std::fs::remove_dir_all(&staging)
+    if let Err(e) = std::fs::remove_dir_all(&stage)
         && e.kind() != ErrorKind::NotFound
     {
         return Err(e);
     }
-    std::fs::create_dir_all(&staging)?;
-    // Back from the head to the last snapshot, each version the parent the
-    // one after it names.
+    let (versions, history) = (stage.join("versions"), stage.join("history"));
+    std::fs::create_dir_all(&versions)?;
+    std::fs::create_dir(&history)?;
     let (mut n, mut digest) = (head.sequence, head.digest.clone());
     loop {
         let missing = || io::Error::new(ErrorKind::NotFound, format!("{app}/{object} version {n} is not in the store"));
         let bytes = store.get(&version_key(app, object, n, &digest)).await?.ok_or_else(missing)?;
         let version = crate::committed::identity(&bytes[..])?;
-        if hex(&bytes) != digest || version.sequence != n {
+        if hex(&bytes) != digest || (version.sequence, version.app.as_str(), version.object.as_str()) != (n, app, object) {
             return Err(io::Error::new(ErrorKind::InvalidData, format!("{app}/{object} version {n} isn't what its key names")));
         }
-        std::fs::write(staging.join(format!("{n:020}.tar")), &bytes)?;
-        if version.snapshot || n == 1 {
-            break;
+        let file = |dir: &Path| dir.join(format!("{n:020}.tar"));
+        if n == head.sequence && n > to {
+            std::fs::write(file(&history), &bytes)?;
+        }
+        if n <= to {
+            std::fs::write(file(&versions), &bytes)?;
+            if version.snapshot || n == 1 {
+                break;
+            }
         }
         (n, digest) = (n - 1, version.parent);
     }
-    let last = crate::committed::restore(&staging, &objects.join(object))?;
-    // The volume first, then the version that says it is there.
+    let volume = stage.join("volume");
+    crate::committed::restore(&versions, &volume)?;
+    if to == head.sequence {
+        std::fs::rename(versions.join(format!("{to:020}.tar")), history.join(format!("{to:020}.tar")))?;
+    } else {
+        let obj = crate::object::ObjShared::new(app.into(), object);
+        let cap = CaptureConfig { max_mb: u64::MAX >> 20, ..CaptureConfig::default() };
+        crate::committed::prepare(&volume, &history, &obj, epoch, &cap, &[0; 8], None)?;
+        crate::committed::publish(&history, &[0; 8])?;
+    }
+    std::fs::remove_dir_all(&versions)?;
+    if let Some(uid) = owner(objects)? {
+        own(&volume, uid)?;
+        own(&history, uid)?;
+    }
+    // Decided once all of it is durable.
+    sync_fs(&stage)?;
+    std::fs::File::create(stage.join("ready"))?;
+    crate::journal::sync(&stage)?;
+    install(objects, object)?;
+    Ok(Restored { object: object.into(), version: to, head: head.sequence + u64::from(to < head.sequence) })
+}
+
+/// Puts what a restore of `object` staged and decided in place under
+/// `objects` (see `restore`): its volume and versions, the first of them
+/// marked shipped, the journal of the volume they replace gone. Each step
+/// can be taken again, so a crash in the middle is finished by `recover`.
+fn install(objects: &Path, object: &str) -> io::Result<()> {
+    let (app, stage) = (open_dir(objects)?, staging(objects, object));
+    let at = open_dir(&stage)?;
+    let staged = |name: &str| statat(&at, name, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+    remove_in(&app, "~journal", object)?;
+    if staged("volume") {
+        remove_at(&app, object.as_ref())?;
+        renameat(&at, "volume", &app, object)?;
+    }
+    if staged("history") {
+        let first = published(&stage.join("history"))?.0.first().copied();
+        let first = first.ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "a restore without versions"))?;
+        mark(&marker(&objects.join("~committed").join(object)), first)?;
+        let committed = sub(&app, "~committed", owner(objects)?)?;
+        remove_at(&committed, object.as_ref())?;
+        renameat(&at, "history", &committed, object)?;
+    }
     sync_fs(objects)?;
-    let out = objects.join("~committed").join(object);
-    std::fs::create_dir_all(&out)?;
-    std::fs::rename(staging.join(format!("{last:020}.tar")), out.join(format!("{last:020}.tar")))?;
-    mark(&marker(&out), last)?;
-    std::fs::remove_dir_all(staging)?;
-    sync_fs(objects)?;
-    Ok(last)
+    std::fs::remove_dir_all(stage)
+}
+
+/// Before any worker starts: finishes each restore a crash cut short once it
+/// was decided, drops the others, and resumes every paused object. `data`
+/// is the node's `data_dir`.
+pub fn recover(data: &Path) -> io::Result<()> {
+    for app in entries(&data.join("restore"))? {
+        for object in entries(&app.path())? {
+            match object.path().join("ready").exists() {
+                true => install(&data.join("objects").join(app.file_name()), &object.file_name().to_string_lossy())?,
+                false => std::fs::remove_dir_all(object.path())?,
+            }
+        }
+    }
+    for app in entries(&data.join("objects"))?.into_iter().filter(|a| a.file_type().is_ok_and(|t| t.is_dir())) {
+        remove_at(&open_dir(&app.path())?, "~paused".as_ref())?;
+    }
+    Ok(())
+}
+
+/// Pauses `object` (under `objects`, an app's) for a restore: no instance
+/// of it starts, on any worker of the app, until `resume`. Refused if it is
+/// paused already.
+pub fn pause(objects: &Path, object: &str) -> io::Result<()> {
+    let paused = sub(&open_dir(objects)?, "~paused", None)?;
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    match openat(&paused, object, flags, Mode::from_raw_mode(0o644)) {
+        Err(Errno::EXIST) => Err(io::Error::new(ErrorKind::AlreadyExists, format!("{object} is being restored already"))),
+        made => made.map(drop).map_err(Into::into),
+    }
+}
+
+pub fn resume(objects: &Path, object: &str) -> io::Result<()> {
+    remove_in(&open_dir(objects)?, "~paused", object)
+}
+
+/// Whether object `id` (under `objects`, an app's) is paused for a restore.
+pub fn paused(objects: &Path, id: &str) -> bool {
+    objects.join("~paused").join(id).exists()
 }
 
 /// Syncs the filesystem `path` is on.
@@ -578,7 +795,7 @@ mod tests {
     async fn restored(store: &dyn Store, object: &str, root: &Path) -> Result<String, String> {
         let _ = std::fs::remove_dir_all(root);
         std::fs::create_dir_all(root).unwrap();
-        restore(store, "app", object, root).await.map_err(|e| e.to_string())?;
+        restore(store, "app", object, root, None, 0).await.map_err(|e| e.to_string())?;
         Ok(std::fs::read_to_string(root.join(object).join("v")).unwrap())
     }
 
@@ -631,7 +848,7 @@ mod tests {
         let shipped = Head { sequence: 3, digest: parent.clone(), node: "".into(), lease: 0 };
         assert_eq!(head(&store, "app", "o").await.unwrap().0, shipped);
         assert_eq!((local(), std::fs::read_to_string(marker(&dir)).unwrap()), (vec![3], "3".into()));
-        assert_eq!(restored(&store, "o", &base.join("fresh")).await.unwrap(), "v3");
+        assert_eq!(restored(&store, "o", &base.join("fresh/objects/app")).await.unwrap(), "v3");
         // Another writer moves the head on.
         let (_, tag) = head(&store, "app", "o").await.unwrap();
         let theirs = Head { sequence: 4, digest: "0".repeat(64), ..shipped };
@@ -670,6 +887,9 @@ mod tests {
         async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>> {
             self.store.swap(key, bytes, tag).await
         }
+        async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+            self.store.list(prefix).await
+        }
     }
 
     /// Node A uploads a version; before the upload lands, A's lease runs out
@@ -686,7 +906,7 @@ mod tests {
             gate: tokio::sync::Semaphore::new(0),
         };
         let (a, b) = (Leases::new(records.clone(), "a", Duration::from_millis(200)), Leases::new(records, "b", Duration::from_secs(5)));
-        let (a_objects, b_objects) = (base.join("a"), base.join("b"));
+        let (a_objects, b_objects) = (base.join("a/objects/app"), base.join("b/objects/app"));
         let (a_dir, b_dir) = (a_objects.join("~committed/o"), b_objects.join("~committed/o"));
         let ga = take(&store, &a, "o", &a_objects).await;
         version(&a_dir, 1, ga.epoch, "", "A's");
@@ -703,7 +923,7 @@ mod tests {
         ship_object(&store, Some(&b), "app", "o", &b_dir).await.unwrap();
         let ours = Head { sequence: 1, digest, node: "b".into(), lease: gb.epoch };
         assert_eq!(head(&store, "app", "o").await.unwrap().0, ours);
-        assert_eq!(restored(&store, "o", &base.join("fresh")).await.unwrap(), "B's");
+        assert_eq!(restored(&store, "o", &base.join("fresh/objects/app")).await.unwrap(), "B's");
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -717,7 +937,7 @@ mod tests {
         let records: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let store = Objects(Arc::new(object_store::memory::InMemory::new()));
         let (a, b) = (Leases::new(records.clone(), "a", Duration::from_millis(200)), Leases::new(records, "b", Duration::from_secs(5)));
-        let (a_objects, b_objects) = (base.join("a"), base.join("b"));
+        let (a_objects, b_objects) = (base.join("a/objects/app"), base.join("b/objects/app"));
         let dir = a_objects.join("~committed/o");
         let text = |objects: &Path| std::fs::read_to_string(objects.join("o/v")).ok();
         // A version and the volume as it leaves it.
@@ -762,7 +982,7 @@ mod tests {
         let store = Objects(Arc::new(object_store::memory::InMemory::new()));
         let ttl = Duration::from_millis(200);
         let (a, b) = (Leases::new(records.clone(), "a", ttl), Leases::new(records, "b", ttl * 25));
-        let objects = base.join("a");
+        let objects = base.join("a/objects/app");
         // A has a version of `object`, committed at `epoch`; it must not count.
         let mut shipped = vec![];
         let mut refused = async |object: &str, epoch: u64| {
@@ -786,7 +1006,7 @@ mod tests {
         // A lease taken again, after B held the object: the record names A,
         // at a later epoch than the version's.
         let first = take(&store, &a, "moved", &objects).await;
-        let theirs = take(&store, &b, "moved", &base.join("b")).await;
+        let theirs = take(&store, &b, "moved", &base.join("b/objects/app")).await;
         b.release("app/moved", &theirs).await;
         a.renew().await;
         let again = loop {

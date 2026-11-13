@@ -86,6 +86,8 @@ pub struct Supervisor {
     leases: Option<Arc<crate::lease::Leases>>,
     /// Where objects' committed versions are shipped (`capture.store`).
     capture: Option<Arc<dyn crate::ship::Store>>,
+    /// What waits to be shipped, as last counted.
+    backlog: Mutex<crate::ship::Backlog>,
     /// A worker spawned ahead of need: see [`Spawned`].
     spare: tokio::sync::Mutex<Option<Spawned>>,
     relay: Arc<crate::telemetry::Relay>,
@@ -157,6 +159,8 @@ impl Supervisor {
         let ttl = Duration::from_millis(cfg.lease_ms);
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
+        // Restores a crash cut short, before any worker serves their objects.
+        crate::ship::recover(&cfg.data_dir).context("recovering restores")?;
         // Workers' cgroups that an earlier run left: the empty ones go.
         for dir in cfg.cgroup.iter().flat_map(std::fs::read_dir).flatten().flatten() {
             let _ = std::fs::remove_dir(dir.path());
@@ -177,6 +181,7 @@ impl Supervisor {
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
+            backlog: Mutex::default(),
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
@@ -187,6 +192,7 @@ impl Supervisor {
         // Jailed workers can't reach a store: their versions ship from here.
         if let Some(store) = sup.capture.clone() {
             tokio::spawn(crate::ship::run(sup.cfg.data_dir.join("objects"), store, sup.leases.clone()));
+            tokio::spawn(count_backlog(Arc::downgrade(&sup)));
         }
         if let Some(leases) = sup.leases.clone() {
             let weak = Arc::downgrade(&sup);
@@ -211,6 +217,14 @@ impl Supervisor {
                 ("process.memory.usage".into(), (rss_bytes() as i64).into()),
                 ("process.uptime".into(), sup.started.elapsed().as_secs_f64().into()),
             ]);
+            if sup.capture.is_some() {
+                let b = sup.backlog.lock();
+                sup.telemetry.snapshot(vec![
+                    ("nanovm.capture.waiting.versions".into(), (b.versions as i64).into()),
+                    ("nanovm.capture.waiting.bytes".into(), (b.bytes as i64).into()),
+                    ("nanovm.capture.waiting.objects".into(), (b.objects as i64).into()),
+                ]);
+            }
             let workers: Vec<_> = sup.workers.lock().values().cloned().collect();
             for w in workers {
                 let live = w.live();
@@ -243,6 +257,87 @@ impl Supervisor {
         tokio::task::spawn_blocking(move || telemetry.flush()).await??;
         anyhow::ensure!(!failed, "a live worker failed to flush telemetry");
         Ok(())
+    }
+
+    /// Restores object `object` of app `app` (its name on this node), or
+    /// with none each of the app's objects in the store, from the store, into
+    /// this running node: to version `to`, or to the head's (see
+    /// `ship::restore`). Its other objects, and other apps, keep serving;
+    /// the object answers 503 until it is done. What the object committed
+    /// here first goes to the store, so no acknowledged write is lost; if it
+    /// can't, the restore stops, unless `discard` (then it is dropped).
+    pub async fn restore(&self, app: &str, object: Option<&str>, to: Option<u64>, discard: bool) -> anyhow::Result<Vec<crate::ship::Restored>> {
+        anyhow::ensure!(crate::table::valid_name(app), "{app:?} is not an app's name");
+        let store = self.capture.clone().context("restoring needs a store (capture.store)")?;
+        let objects = self.cfg.app_dirs(app)[0].clone();
+        if !objects.exists() {
+            let (cfg, name, uids) = (self.cfg.clone(), app.to_owned(), self.uids.clone());
+            tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
+        }
+        let ids = match object {
+            Some(o) => vec![o.to_owned()],
+            None => store.list(app).await?,
+        };
+        let mut done = vec![];
+        for id in ids.iter().filter(|o| object.is_some() || crate::table::valid_object(o)) {
+            anyhow::ensure!(crate::table::valid_object(id), "{id:?} is not an object id");
+            crate::ship::pause(&objects, id)?;
+            let restored = self.restore_object(&*store, app, id, &objects, to, discard).await;
+            crate::ship::resume(&objects, id)?;
+            let before = done.iter().map(|r: &crate::ship::Restored| r.object.as_str()).collect::<Vec<_>>().join(", ");
+            done.push(restored.with_context(|| format!("restoring {app}/{id} (restored before it: [{before}])"))?);
+        }
+        Ok(done)
+    }
+
+    /// `restore` of one object, paused.
+    async fn restore_object(&self, store: &dyn crate::ship::Store, app: &str, id: &str, objects: &Path, to: Option<u64>, discard: bool) -> anyhow::Result<crate::ship::Restored> {
+        // Its instance, if it has one, stops; being paused, it starts no
+        // other, on this worker or the next.
+        let live = self.workers.lock().get(app).and_then(|w| w.live());
+        if let Some(live) = live {
+            let mut evict = get(&format!("/_nanovm/evict/{id}"));
+            *evict.method_mut() = http::Method::POST;
+            let res = live.link.send(evict).await?;
+            anyhow::ensure!(res.status() == 204, "the app's worker answered {} to stopping the object", res.status());
+        }
+        let key = format!("{app}/{id}");
+        let grant = match &self.leases {
+            None => None,
+            Some(leases) => {
+                let grant = leases.acquire(&key).await.map_err(|e| anyhow::anyhow!("taking {key}'s lease: {e:?}"))?;
+                if let Err(e) = crate::ship::claim(store, leases.node(), grant.epoch, app, id, objects).await {
+                    leases.release(&key, &grant).await;
+                    return Err(e.into());
+                }
+                leases.hold(&key, grant.clone());
+                Some(grant)
+            }
+        };
+        let restored = async {
+            // What it committed here goes to the store first (the shipper may
+            // be at it too, which moves the head under a try).
+            let dir = objects.join("~committed").join(id);
+            let mut shipped = Ok(());
+            for _ in 0..3 {
+                shipped = crate::ship::ship_object(store, self.leases.as_deref(), app, id, &dir).await;
+                if shipped.is_ok() {
+                    break;
+                }
+            }
+            if let Err(e) = shipped
+                && !discard
+            {
+                anyhow::bail!("it has versions the store doesn't, which a restore would drop ({e}); to drop them, discard them");
+            }
+            // A version made to restore an older one ships as any other.
+            Ok(crate::ship::restore(store, app, id, objects, to, grant.as_ref().map_or(0, |g| g.epoch)).await?)
+        }
+        .await;
+        if let (Some(leases), Some(grant)) = (&self.leases, &grant) {
+            leases.release(&key, grant).await;
+        }
+        restored
     }
 
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
@@ -504,8 +599,7 @@ impl Supervisor {
                         // this lease's, and the object here is the head's.
                         let claim = async |object: &str, grant: &crate::lease::Grant| {
                             let Some(store) = &capture else { return Ok(()) };
-                            crate::ship::claim(&**store, leases.node(), grant.epoch, &app, object, &objects).await?;
-                            restored(&objects, object)
+                            crate::ship::claim(&**store, leases.node(), grant.epoch, &app, object, &objects).await
                         };
                         return crate::lease::serve(leases, &app, req, claim).await.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync());
                     }
@@ -781,21 +875,6 @@ fn chown_tree(dir: &Path, uid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Gives what a claim restored of `object` (under `objects`, an app's) to
-/// the app's uid, the owner of `objects`, when the supervisor is root.
-fn restored(objects: &Path, object: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(());
-    }
-    let uid = std::fs::metadata(objects)?.uid();
-    let committed = objects.join("~committed");
-    for d in [committed.join(object), committed, objects.join(object)].iter().filter(|d| d.exists()) {
-        chown_tree(d, uid).map_err(std::io::Error::other)?;
-    }
-    Ok(())
-}
-
 /// Gives a worker's cgroup its app's worker limits.
 fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
     let set = |file: &str, value: String| {
@@ -811,6 +890,27 @@ fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
         set("pids.max", w.pids.to_string())?;
     }
     Ok(())
+}
+
+/// Counts what waits on the node to be shipped every 10 s, while the
+/// supervisor lives, for its snapshots, and says so when versions start to
+/// wait, every minute while they do, and when none does again.
+async fn count_backlog(sup: std::sync::Weak<Supervisor>) {
+    let mut said = None::<Instant>;
+    loop {
+        let Some(objects) = sup.upgrade().map(|s| s.cfg.data_dir.join("objects")) else { return };
+        let Ok(b) = tokio::task::spawn_blocking(move || crate::ship::backlog(&objects)).await else { return };
+        if b.versions > 0 && said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+            eprintln!("nanovm: {} versions ({} bytes) of {} objects wait to be shipped", b.versions, b.bytes, b.objects);
+            said = Some(Instant::now());
+        } else if b.versions == 0 && said.take().is_some() {
+            eprintln!("nanovm: every version is shipped");
+        }
+        let Some(s) = sup.upgrade() else { return };
+        *s.backlog.lock() = b;
+        drop(s);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
 }
 
 /// `nanovm worker`: reads its spec and component from stdin, jails itself,
