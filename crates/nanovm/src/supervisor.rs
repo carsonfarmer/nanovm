@@ -86,6 +86,8 @@ pub struct Supervisor {
     leases: Option<Arc<crate::lease::Leases>>,
     /// Where objects' committed versions are shipped (`capture.store`).
     capture: Option<Arc<dyn crate::ship::Store>>,
+    /// Held while shipping an object, or deleting (see `ship::run`).
+    shipping: Arc<tokio::sync::Mutex<()>>,
     /// A worker spawned ahead of need: see [`Spawned`].
     spare: tokio::sync::Mutex<Option<Spawned>>,
     relay: Arc<crate::telemetry::Relay>,
@@ -157,6 +159,8 @@ impl Supervisor {
         let ttl = Duration::from_millis(cfg.lease_ms);
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
+        // What deletes an earlier run cut short left.
+        let _ = std::fs::remove_dir_all(cfg.data_dir.join("deleted"));
         // Workers' cgroups that an earlier run left: the empty ones go.
         for dir in cfg.cgroup.iter().flat_map(std::fs::read_dir).flatten().flatten() {
             let _ = std::fs::remove_dir(dir.path());
@@ -177,6 +181,7 @@ impl Supervisor {
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
+            shipping: Arc::default(),
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
@@ -187,7 +192,7 @@ impl Supervisor {
         // Renews the node's session, and tells each worker it holds.
         // Jailed workers can't reach a store: their versions ship from here.
         if let Some(store) = sup.capture.clone() {
-            tokio::spawn(crate::ship::run(sup.cfg.data_dir.join("objects"), store, sup.leases.clone()));
+            tokio::spawn(crate::ship::run(sup.cfg.data_dir.join("objects"), store, sup.leases.clone(), sup.shipping.clone()));
         }
         if let Some(leases) = sup.leases.clone() {
             let weak = Arc::downgrade(&sup);
@@ -293,8 +298,35 @@ impl Supervisor {
                 let live = w.live();
                 serde_json::json!({ "app": w.name, "running": live.as_ref().map(|l| &l.digest), "pid": live.map(|l| l.pid) })
             }).collect()),
-            _ => bail!("unknown command {args:?}; the commands are: apps"),
+            ["delete", app, object] => self.delete(app, Some(object)).await,
+            ["delete-app", app] => self.delete(app, None).await,
+            _ => bail!("unknown command {args:?}; the commands are: apps, delete <app> <object>, delete-app <app>"),
         }
+    }
+
+    /// Deletes object `object` of app `app` on this node, or (`None`) all of
+    /// the app's data. The app's worker drains and stops first, as for a
+    /// version switch, so nothing of it is live, being committed or being
+    /// shipped; it starts again with the app's next request. What the node
+    /// shipped of it goes from the store too, before the node's copy.
+    async fn delete(&self, app: &str, object: Option<&str>) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(self.leases.is_none(), "deleting on a node with leases (several nodes) is not supported");
+        anyhow::ensure!(crate::table::valid_name(app) && object.is_none_or(crate::table::valid_object), "not an app and object");
+        let new = || Arc::new(Worker { name: app.into(), ..Default::default() });
+        let w = self.workers.lock().entry(app.into()).or_insert_with(new).clone();
+        let _starting = w.starting.lock().await;
+        let live = w.live.lock().take();
+        if let Some(old) = live {
+            drain(old).await;
+        }
+        let _turn = self.shipping.lock().await;
+        let prefix = object.map_or(app.to_string(), |o| format!("{app}/{o}"));
+        if let Some(store) = &self.capture {
+            store.remove(&prefix).await.context("removing it from the store")?;
+        }
+        let (cfg, app, object) = (self.cfg.clone(), app.to_string(), object.map(String::from));
+        tokio::task::spawn_blocking(move || remove(&cfg, &app, object.as_deref())).await??;
+        Ok(serde_json::json!({ "deleted": prefix }))
     }
 
     /// The node's own routes, for requests that name no app.
@@ -774,6 +806,32 @@ fn app_dirs(cfg: &NodeConfig, name: &str, uids: &Mutex<()>) -> anyhow::Result<Op
         crate::journal::sync_ancestors(&d)?;
     }
     Ok(uid)
+}
+
+/// Removes object `object` of app `app` (under the app's storage lock, which
+/// no worker then holds), or all of the app's directories: each is moved
+/// into `<data_dir>/deleted` at once, then removed, so a delete cut short
+/// leaves it whole or gone (the rest goes when the node next starts).
+fn remove(cfg: &NodeConfig, app: &str, object: Option<&str>) -> anyhow::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dirs = cfg.app_dirs(app);
+    let lock = match std::fs::File::open(&dirs[0]) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        lock => lock?,
+    };
+    lock.try_lock().context("the app's storage is in use")?;
+    let trash = cfg.data_dir.join("deleted").join(NEXT.fetch_add(1, Relaxed).to_string());
+    std::fs::create_dir_all(&trash)?;
+    let doomed = object.map_or(dirs.to_vec(), |o| vec![crate::app::object_dir(&dirs[0], o)]);
+    for (i, dir) in doomed.iter().enumerate() {
+        match std::fs::rename(dir, trash.join(i.to_string())) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            moved => moved?,
+        }
+        crate::journal::sync(dir.parent().expect("in a data directory"))?;
+    }
+    std::fs::remove_dir_all(trash)?;
+    Ok(())
 }
 
 /// Gives `uid` a directory tree it will own inside its jail. Skipped when the

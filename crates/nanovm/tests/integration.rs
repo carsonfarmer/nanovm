@@ -374,7 +374,12 @@ async fn an_app_has_at_most_its_objects() {
     assert_eq!(get(&node, &kept[0], "/clean?mount=data&n=1").await.status, 200);
     assert_eq!(get(&node, &kept[0], "/panic").await.status, 500);
     eventually("the emptied object to go", || objects_in(&objects).len() == 4).await;
-    assert_eq!(get(&node, "another", "/files?mount=data&n=1").await.status, 200);
+    // Its place is given back once its directory is removed, a moment later.
+    let t0 = Instant::now();
+    while get(&node, "another", "/files?mount=data&n=1").await.status != 200 {
+        assert!(t0.elapsed() < Duration::from_secs(2), "no room made");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let r = get(&node, "one-more", "/files?mount=data&n=1").await;
     assert_eq!((r.status, r.error.as_deref()), (507, Some("object-limit")));
     node.shutdown().await;
@@ -1376,6 +1381,59 @@ async fn admin_socket_is_the_supervisors_own() {
     for path in ["/_nanovm/admin", "/_nanovm/command", "/_nanovm/delete"] {
         assert_eq!(http_get(addr, path).await.0, 404, "{path}");
         assert_eq!(app_get(addr, &counter, path).await.0, 400, "{path}");
+    }
+}
+
+/// An operator deletes an object, then all of an app's data, on a running
+/// node: its worker stops first, the node's copy and what it shipped go,
+/// the rest of the app is untouched, and the app goes on from nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_deletes_an_object_and_an_app() {
+    let mut cfg = node_cfg("an_operator_deletes_an_object_and_an_app", 8);
+    let store = cfg.data_dir.join("store");
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
+    let (_sup, addr) = supervised_with(cfg.clone()).await;
+    let counter = publish("counter", &app("counter")).await;
+    let name = worker(&counter);
+    let objects = cfg.app_dirs(&name)[0].clone();
+    let incr = async |id: &str| raw(addr, &format!("POST /{id}/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await;
+    let count = async |id: &str| serde_json::from_str::<serde_json::Value>(&app_get(addr, &counter, &format!("/{id}/")).await.1).unwrap()["count"].clone();
+    let shipped = |id: &str| store.join(&name).join(id).join("head");
+    for id in ["a", "a", "b"] {
+        assert_eq!(incr(id).await.0, 200);
+    }
+    eventually_long("both shipped", || shipped("a").exists() && shipped("b").exists()).await;
+
+    let (ok, out) = admin(&cfg, &["delete", &name, "a"]);
+    assert!(ok, "{out}");
+    assert!(!object_dir(&objects, "a").exists() && !store.join(&name).join("a").exists(), "a is gone, here and in the store");
+    assert!(object_dir(&objects, "b").exists() && shipped("b").exists(), "b is untouched");
+    assert_eq!((count("a").await, count("b").await), (0.into(), 1.into()));
+    // It goes on from nothing, and ships again.
+    assert_eq!(incr("a").await.0, 200);
+    eventually_long("a shipped again", || shipped("a").exists()).await;
+
+    let (ok, out) = admin(&cfg, &["delete-app", &name]);
+    assert!(ok, "{out}");
+    for dir in cfg.app_dirs(&name) {
+        assert!(!dir.exists(), "{} is left", dir.display());
+    }
+    assert!(!store.join(&name).exists(), "nothing of the app in the store");
+    assert_eq!(std::fs::read_dir(cfg.data_dir.join("deleted")).unwrap().count(), 0, "nothing left over");
+    assert_eq!((count("a").await, count("b").await), (0.into(), 0.into()), "the app starts from nothing");
+
+    for bad in [vec!["delete", "../x", "a"], vec!["delete", &name, ".."], vec!["delete", &name, "_nanovm"], vec!["delete-app", "a/b"]] {
+        let (ok, out) = admin(&cfg, &bad);
+        assert!(!ok && out.contains("not an app and object"), "{bad:?}: {out}");
+    }
+}
+
+/// Waits until `f` holds, for up to 10 s.
+async fn eventually_long(what: &str, mut f: impl FnMut() -> bool) {
+    let t0 = Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

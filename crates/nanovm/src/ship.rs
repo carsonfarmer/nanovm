@@ -57,6 +57,8 @@ pub trait Store: Send + Sync {
     /// Writes the record at `key` if it is still at `tag` (none: absent):
     /// its new version, or none if it has moved.
     async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>>;
+    /// Removes everything under `prefix` (`<app>` or `<app>/<object>`).
+    async fn remove(&self, prefix: &str) -> io::Result<()>;
 }
 
 /// The store `cap` names, if any: a directory (`/path` or `file:///path`),
@@ -169,6 +171,13 @@ impl Store for Dir {
         })
         .await?
     }
+
+    async fn remove(&self, prefix: &str) -> io::Result<()> {
+        match tokio::fs::remove_dir_all(self.0.join(prefix)).await {
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            removed => removed,
+        }
+    }
 }
 
 /// An object store (S3 and the like): a put is conditional on nothing
@@ -207,6 +216,12 @@ impl Store for Objects {
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => Ok(None),
             Err(e) => Err(io::Error::other(e)),
         }
+    }
+
+    async fn remove(&self, prefix: &str) -> io::Result<()> {
+        use futures::{StreamExt, TryStreamExt};
+        let keys = self.0.list(Some(&prefix.into())).map_ok(|m| m.location).boxed();
+        self.0.delete_stream(keys).try_collect::<Vec<_>>().await.map(drop).map_err(io::Error::other)
     }
 }
 
@@ -343,8 +358,9 @@ pub(crate) async fn ship_object(store: &dyn Store, leases: Option<&Leases>, app:
 /// Ships, until the runtime stops, the versions published under `objects`
 /// (`<data_dir>/objects`): every app's, every object's, retrying failures
 /// a second later. An object this node holds no live lease on waits, quietly,
-/// until it does.
-pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Leases>>) {
+/// until it does. It ships an object while it holds `turn`, which an
+/// operator's delete takes, so neither sees the other half done.
+pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Leases>>, turn: Arc<tokio::sync::Mutex<()>>) {
     let mut seen = std::collections::HashMap::new();
     loop {
         let entries = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten();
@@ -363,6 +379,7 @@ pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Lea
                 continue;
             }
             let (app, id) = (app.to_string_lossy(), object.file_name().to_string_lossy().into_owned());
+            let _turn = turn.lock().await;
             match ship_object(&*store, leases.as_deref(), &app, &id, &versions).await {
                 Ok(()) => _ = seen.insert(versions, changed),
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
@@ -668,6 +685,9 @@ mod tests {
         }
         async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>> {
             self.store.swap(key, bytes, tag).await
+        }
+        async fn remove(&self, prefix: &str) -> io::Result<()> {
+            self.store.remove(prefix).await
         }
     }
 
