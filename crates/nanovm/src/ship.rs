@@ -387,14 +387,25 @@ pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Lea
 pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object: &str, objects: &Path) -> io::Result<()> {
     let dir = objects.join("~committed").join(object);
     for _ in 0..4 {
+        // This copy as it is before the head is read: the shipper may move
+        // the head meanwhile (under the grant it began with), and removes
+        // the versions it passed only after, so a head read after names a
+        // version listed here, if this copy has it.
+        let here = published(&dir)?;
         let (head, tag) = head(store, app, object).await?;
         if head.lease > lease || (head.lease == lease && head.node != node) {
             return Err(io::Error::other(format!("{app}/{object} is claimed at a later epoch, {}", head.lease)));
         }
-        // Dropped before the claim, which makes what is here count.
-        let current = current(&dir, &head, node)?;
+        let current = match current(objects, object, here, &head, node) {
+            // The shipper removed it: the head has moved on.
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            current => current?,
+        };
+        // Dropped, durably, before the claim, which makes what is here count.
         if !current {
             discard(objects, object)?;
+            std::fs::create_dir_all(objects)?;
+            sync_fs(objects)?;
         }
         let claimed = Head { node: node.into(), lease, ..head.clone() };
         if store.swap(&head_key(app, object), serde_json::to_vec(&claimed)?, tag.as_ref()).await?.is_none() {
@@ -408,34 +419,35 @@ pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object:
     Err(io::Error::other(format!("{app}/{object}'s head keeps moving")))
 }
 
-/// Whether this node's copy of an object, its versions in `dir`, is the
-/// head's: it has the head's version, and versions after it count only if
-/// no other node has claimed the object since this one (`node`) did, which
-/// another node can't have served.
-fn current(dir: &Path, head: &Head, node: &str) -> io::Result<bool> {
-    let (versions, staged) = published(dir)?;
-    let at = |n: u64| dir.join(format!("{n:020}.tar"));
-    let has = head.sequence == 0 || (versions.contains(&head.sequence) && crate::committed::digest(&at(head.sequence))? == head.digest);
+/// Whether this node's copy of `object` (under `objects`), with `versions`
+/// published (and whether one is being staged), is the head's: it has its
+/// volume and the head's version, and versions after it count only if no
+/// other node has claimed the object since this one (`node`) did, which
+/// another node can't have served. A copy with versions and no volume is
+/// one a discard cut short.
+fn current(objects: &Path, object: &str, (versions, staged): (Vec<u64>, bool), head: &Head, node: &str) -> io::Result<bool> {
+    let at = objects.join("~committed").join(object).join(format!("{:020}.tar", head.sequence));
+    let whole = (versions.is_empty() && !staged) || objects.join(object).is_dir();
+    let has = head.sequence == 0 || (versions.contains(&head.sequence) && crate::committed::digest(&at)? == head.digest);
     let ours = head.node == node || head.lease == 0;
-    Ok(has && (ours || (!staged && versions.last().is_none_or(|&n| n == head.sequence))))
+    Ok(whole && has && (ours || (!staged && versions.last().is_none_or(|&n| n == head.sequence))))
 }
 
-/// Drops this node's copy of `object` (under `objects`): its volume,
-/// journal and marker, then its versions, which say whether a copy is
-/// current, so a discard cut short is never taken for one.
+/// Drops this node's copy of `object` (under `objects`): its volume first,
+/// which a copy with versions has (see `current`), then its journal and
+/// marker, and its versions last; so a discard cut short is never taken
+/// for a current copy.
 fn discard(objects: &Path, object: &str) -> io::Result<()> {
     let [journal, staging, marker, versions] = ["~journal", "~restore", "~shipped", "~committed"].map(|d| objects.join(d).join(object));
-    for path in [objects.join(object), journal, staging, versions] {
-        if let Err(e) = std::fs::remove_dir_all(&path)
-            && e.kind() != ErrorKind::NotFound
-        {
-            return Err(e);
-        }
-    }
-    match std::fs::remove_file(marker) {
+    let gone = |done: io::Result<()>| match done {
         Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
         _ => Ok(()),
+    };
+    for path in [objects.join(object), journal, staging] {
+        gone(std::fs::remove_dir_all(path))?;
     }
+    gone(std::fs::remove_file(marker))?;
+    gone(std::fs::remove_dir_all(versions))
 }
 
 /// Rebuilds object `object` of app `app` from what `store` holds, as the
@@ -485,6 +497,8 @@ pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path)
 
 /// Syncs the filesystem `path` is on.
 fn sync_fs(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    tests::sync_point()?;
     let dir = std::fs::File::open(path)?;
     // SAFETY: `dir` is open for the call.
     match unsafe { libc::syncfs(dir.as_raw_fd()) } {
@@ -502,6 +516,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    thread_local! {
+        /// Whether `sync_fs` fails on this thread (a disk that can't sync).
+        static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn sync_point() -> io::Result<()> {
+        match FAIL_SYNC.get() {
+            true => Err(io::Error::from_raw_os_error(libc::EIO)),
+            false => Ok(()),
+        }
+    }
+
+    /// A store each of whose puts and reads can be held once: the next put
+    /// waits before it is made, the next read once it is made, after
+    /// telling `started`, for a permit from `go`.
+    #[derive(Default)]
+    struct Stepped {
+        store: Option<Objects>,
+        put: Step,
+        read: Step,
+    }
+
+    struct Step {
+        armed: std::sync::atomic::AtomicBool,
+        started: tokio::sync::Notify,
+        go: tokio::sync::Semaphore,
+    }
+
+    impl Default for Step {
+        fn default() -> Step {
+            Step { armed: false.into(), started: Default::default(), go: tokio::sync::Semaphore::new(0) }
+        }
+    }
+
+    impl Step {
+        async fn pass(&self) {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.started.notify_one();
+                self.go.acquire().await.unwrap().forget();
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Store for Stepped {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> io::Result<Put> {
+            self.put.pass().await;
+            self.store.as_ref().unwrap().put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+            self.store.as_ref().unwrap().get(key).await
+        }
+        async fn read(&self, key: &str) -> io::Result<Option<(Vec<u8>, Tag)>> {
+            let read = self.store.as_ref().unwrap().read(key).await;
+            self.read.pass().await;
+            read
+        }
+        async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>> {
+            self.store.as_ref().unwrap().swap(key, bytes, tag).await
+        }
+    }
+
+    /// The shipper ships under the grant it found when it began, which its
+    /// object's actor may give up meanwhile, and take again: a claim then
+    /// races the shipper on the same node. The shipper moves the head past
+    /// the version the claim read it at, and removes that version here; the
+    /// claim must still keep the copy, with the version committed (and, with
+    /// local acknowledgement, answered) after the shipper listed its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_racing_the_shippers_old_grant_keeps_later_versions() {
+        let base = tempdir("racing-claim");
+        let records: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = Arc::new(Stepped { store: Some(Objects(Arc::new(object_store::memory::InMemory::new()))), ..Default::default() });
+        let a = Arc::new(Leases::new(records, "a", Duration::from_secs(5)));
+        let objects = base.join("a");
+        let dir = objects.join("~committed/o");
+        let commit = |n: u64, parent: &str, v: &str| {
+            std::fs::create_dir_all(objects.join("o")).unwrap();
+            std::fs::write(objects.join("o/v"), v).unwrap();
+            version(&dir, n, 1, parent, v)
+        };
+        let first = take(&*store, &a, "o", &objects).await;
+        let mut parent = String::new();
+        for n in 1..=3 {
+            parent = commit(n, &parent, &format!("v{n}"));
+        }
+        ship_object(&*store, Some(&a), "app", "o", &dir).await.unwrap();
+        let four = commit(4, &parent, "v4");
+        // The shipper lists version 4, reads the head (at 3) and waits to
+        // put it.
+        store.put.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let shipper = tokio::spawn({
+            let (store, a, dir) = (store.clone(), a.clone(), dir.clone());
+            async move { ship_object(&*store, Some(&a), "app", "o", &dir).await }
+        });
+        store.put.started.notified().await;
+        commit(5, &four, "v5");
+        // The object's actor exits and comes back: its lease is given up
+        // and taken again, and claimed. The claim reads the head at 3, then
+        // the shipper moves it to 4 and removes version 3 here.
+        a.release("app/o", &first).await;
+        let again = a.acquire("app/o").await.unwrap();
+        store.read.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let claimed = tokio::spawn({
+            let (store, objects) = (store.clone(), objects.clone());
+            async move { claim(&*store, "a", again.epoch, "app", "o", &objects).await }
+        });
+        store.read.started.notified().await;
+        store.put.go.add_permits(1);
+        shipper.await.unwrap().unwrap();
+        store.read.go.add_permits(1);
+        claimed.await.unwrap().unwrap();
+        let text = std::fs::read_to_string(objects.join("o/v")).map_err(|e| e.to_string());
+        assert_eq!((text, published(&dir).unwrap().0), (Ok("v5".into()), vec![4, 5]), "the claim dropped version 5");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A claim that drops this node's copy (another node claimed the object
+    /// since, and this copy has a version the head never named) makes the
+    /// drop durable before its claim makes what is here count: else a power
+    /// loss could bring the dropped version back, under this node's claim,
+    /// and ship it. Where the disk can't sync, nothing is claimed.
+    #[tokio::test]
+    async fn a_claim_syncs_what_it_dropped_before_claiming() {
+        let base = tempdir("durable-drop");
+        let store = Objects(Arc::new(object_store::memory::InMemory::new()));
+        let objects = base.join("a");
+        version(&objects.join("~committed/o"), 1, 1, "", "one");
+        std::fs::create_dir_all(objects.join("o")).unwrap();
+        std::fs::write(objects.join("o/v"), "one").unwrap();
+        let theirs = Head { sequence: 0, digest: String::new(), node: "b".into(), lease: 2 };
+        store.swap(&head_key("app", "o"), serde_json::to_vec(&theirs).unwrap(), None).await.unwrap().unwrap();
+        FAIL_SYNC.set(true);
+        let claimed = claim(&store, "a", 3, "app", "o", &objects).await;
+        FAIL_SYNC.set(false);
+        assert!(claimed.is_err(), "claimed though the drop can't be made durable");
+        assert_eq!(head(&store, "app", "o").await.unwrap().0, theirs);
+        claim(&store, "a", 3, "app", "o", &objects).await.unwrap();
+        assert_eq!(head(&store, "app", "o").await.unwrap().0.node, "a");
+        assert!(!objects.join("o").exists() && published(&objects.join("~committed/o")).unwrap().0.is_empty());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// Both stores keep the first bytes put at a key: the same again is
