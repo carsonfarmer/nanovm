@@ -1387,6 +1387,17 @@ async fn restores_an_object_and_an_app_into_a_running_node() {
     assert_eq!(restored, [("o".to_owned(), 7), ("p".to_owned(), 1)]);
     assert_eq!((count(app_get(addr, &a, "/o/").await), count(app_get(addr, &a, "/p/").await)), (4, 1));
 
+    // A version here the store refuses (it doesn't follow the head) stops a
+    // restore, which would drop it, unless the operator says to drop it.
+    let committed = objects.join("~committed/o");
+    std::fs::copy(committed.join(format!("{:020}.tar", 7)), committed.join(format!("{:020}.tar", 8))).unwrap();
+    let e = admin_json(&cfg, &["restore", &wa, "o"]).await.unwrap_err();
+    assert!(e.contains("versions the store doesn't"), "{e}");
+    assert!(committed.join(format!("{:020}.tar", 8)).exists());
+    let done = admin_json(&cfg, &["restore", &wa, "o", "--discard-unshipped"]).await.unwrap();
+    assert_eq!(done[0]["version"], 7, "{done}");
+    assert!(!committed.join(format!("{:020}.tar", 8)).exists());
+
     // Refused: names that aren't one, a version the store doesn't have, and a
     // version whose bytes aren't what its key names. Nothing changes.
     for args in [vec!["restore", "..", "o"], vec!["restore", &wa, "../p"], vec!["restore", &wa, "_nanovm"], vec!["restore", &wa, "o", "8"], vec!["versions", "..", "o"]] {
