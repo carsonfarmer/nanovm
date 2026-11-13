@@ -51,6 +51,22 @@ Pick in this order; each line says what it depends on.
 | f23cda4 | C5: the worker opens its cached component file and compiles only on a miss | restart of a 5.6 MB component 31.2 → 8.9 ms. With C4: restart 19.9 → 10.2 ms, 5.6 MB 41.1 → 11.0 ms, LRU retirement 22.4 → 12.9 ms | +21 |
 | 70df4d9, 285d96b | H3: the store re-polls on its own wakes; the worker exports telemetry from its own thread | HTTP through supervisor + jailed worker, one client: CPU per request 467 → 302 µs (×0.62), throughput +17–28%, worker context switches 4.7 → 1.1 per request. 256 clients: about ×0.94 CPU. Spans delivered 99.7–100%. Taken after N-640: with CPU billing, kills under load were 0 with and without H3 | +61 |
 
+**Independent audit** (PR #2 review: idle 4-vCPU machine, 3 alternating pairs, `/proc` CPU, medians
+[ranges]; these replace the authors' numbers above where they differ):
+- Combined restart (C4 + C5): small component 22.12 [21.94–22.32] → 11.19 [11.06–11.47] ms; synthetic
+  5.6 MB component 44.43 [43.49–45.01] → 11.16 [10.81–12.22] ms. Reproduced.
+- One-client jailed HTTP (H3): CPU per request 519 [517–520] → 408 [389–437] µs (−21.4%, not −38%);
+  throughput +11.2% (not +17–28%).
+- Saturated jailed HTTP: CPU ranges overlap, throughput slightly lower and p99 higher. No benefit at
+  saturation is established (three rounds don't establish a regression either).
+- Not independently verified: span-delivery percentages and the isolated C4, C5 and H2 numbers.
+
+Review fixes on this area (`fix/worker-r3fix`): each worker now starts in a cgroup of its own, so the
+spare's engine memory is charged where its app's limits apply (W1; worker cgroups are now
+`<cgroup>/worker-<n>`, and `[worker] memory_mb` must cover the engine, about 19 MiB at 8,192 slots);
+restart with cgroups enabled went 25.1 → 9.0 ms because the cgroup move now happens when the spare
+is spawned. A worker's telemetry export thread now stops with its owner (W2).
+
 Not taken: H4 (link sockets registered for reads only, `cf/speed` ea938cf): a further ~10% one-client
 CPU for +64 lines and two `unsafe` blocks. Optional.
 
