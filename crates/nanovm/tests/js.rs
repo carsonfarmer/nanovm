@@ -297,6 +297,20 @@ async fn review_wait_until_exception_rolls_back_partial_work() {
     assert_eq!(r.json()["hits"], 2, "a fresh instance since: {}", r.body);
 }
 
+/// review2 (D4): `waitUntil` work starts when the promise is made, not after
+/// the answer. Work that writes while the handler is still running, and
+/// rejects once it has answered, has that write committed with the answer;
+/// the instance is stopped only afterwards, when it can no longer roll back.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_wait_until_that_wrote_before_the_answer_commits_that_write_when_it_rejects() {
+    let node = node("js_wait_until_straddle_reject", 8);
+    let r = post(&node, "s", "/later-throw-straddle").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}", r.error);
+    // Served once the waitUntil work is over.
+    let kv = get(&node, "s", "/kv").await.json();
+    assert!(kv.get("early").is_none(), "the rejected waitUntil work's write committed: {kv}");
+}
+
 /// The component starts from a snapshot taken at build time; nothing in it
 /// may be shared by instances or stale: randomness, the clock, the id.
 #[tokio::test(flavor = "multi_thread")]
