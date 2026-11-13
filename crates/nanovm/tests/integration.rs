@@ -1556,7 +1556,14 @@ fn cgroup_stat(dir: &Path, file: &str, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Each worker lands in `<cgroup>/<app>`.
+/// The cgroup `pid` runs in, under the cgroup v2 mount `root` is in.
+fn cgroup_of(root: &Path, pid: u64) -> PathBuf {
+    let cgroups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    root.parent().unwrap().join(cgroups.lines().find_map(|l| l.strip_prefix("0::/")).unwrap())
+}
+
+/// Each worker runs in a cgroup of its own under `<cgroup>`, removed once
+/// the worker has exited.
 #[tokio::test(flavor = "multi_thread")]
 async fn workers_are_placed_in_their_cgroups() {
     let root = match test_cgroup("placed", &[]) {
@@ -1571,11 +1578,72 @@ async fn workers_are_placed_in_their_cgroups() {
         assert_eq!(app_get(addr, a, "/x/").await.0, 200);
     }
     let v = stats_json(addr).await;
+    let mut groups = Vec::new();
     for app in [worker(&counter), worker(&hostile)] {
         let pid = v["workers"][&app]["pid"].as_u64().unwrap();
-        let procs = std::fs::read_to_string(root.join(&app).join("cgroup.procs")).unwrap();
-        assert!(procs.lines().any(|p| p == pid.to_string()), "{app}: {procs}");
+        let group = cgroup_of(&root, pid);
+        assert_eq!(group.parent(), Some(root.as_path()), "{app}");
+        assert_eq!(std::fs::read_to_string(group.join("cgroup.procs")).unwrap().trim(), pid.to_string(), "{app}");
+        groups.push((pid, group));
     }
+    assert_ne!(groups[0].1, groups[1].1);
+    let (pid, group) = &groups[0];
+    unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+    eventually("the exited worker's cgroup to go", || !group.exists()).await;
+    drop(sup);
+    remove_cgroup(&root).await;
+}
+
+/// Waits until a worker spawned ahead has built its engine (its stacks and
+/// their guard pages take at least two mappings a slot) and waits for its
+/// app on stdin; returns its pid.
+async fn spare_built(slots: usize) -> u64 {
+    let me = std::process::id().to_string();
+    let t0 = Instant::now();
+    loop {
+        for p in std::fs::read_dir("/proc").unwrap().flatten() {
+            let stat = std::fs::read_to_string(p.path().join("stat")).unwrap_or_default();
+            if stat.rsplit(") ").next().and_then(|s| s.split(' ').nth(1)) == Some(me.as_str())
+                && std::fs::read_to_string(p.path().join("maps")).is_ok_and(|m| m.lines().count() > 2 * slots)
+                && std::fs::read_to_string(p.path().join("syscall")).is_ok_and(|s| s.starts_with("0 0x0 "))
+            {
+                return p.file_name().to_str().unwrap().parse().unwrap();
+            }
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "no spare worker built its engine");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A spare worker builds its engine before it has an app: at 8,192 slots,
+/// some 8 MiB of anonymous memory (and as much kernel memory for 33,000
+/// mappings). It does so in a cgroup of its own, which gets its app's
+/// limits when it is given its app, so those cover it: pages stay charged
+/// to the cgroup a process was in when it touched them, wherever it moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_spare_engine_memory_is_charged_to_the_app() {
+    let root = match test_cgroup("charged", &["memory"]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let slots = 8192;
+    let mut cfg = node_cfg("review_spare_engine_memory_is_charged_to_the_app", slots);
+    cfg.cgroup = Some(root.clone());
+    cfg.worker.memory_mb = 512;
+    let (sup, addr) = supervised_with(cfg).await;
+    let counter = publish("counter", &app("counter")).await;
+    let spare = spare_built(slots).await;
+    assert_eq!(app_get(addr, &counter, "/x/").await.0, 200);
+    let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
+    assert_eq!(pid, spare, "the start took the spare");
+    let group = cgroup_of(&root, pid);
+    assert_eq!(std::fs::read_to_string(group.join("memory.max")).unwrap().trim(), (512u64 << 20).to_string());
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let anon = status.lines().find_map(|l| l.strip_prefix("RssAnon:")).unwrap().trim().trim_end_matches(" kB");
+    let anon = anon.parse::<u64>().unwrap() << 10;
+    // memory.stat may lag by a batch of pages per CPU.
+    let charged = cgroup_stat(&group, "memory.stat", "anon ");
+    assert!(charged + (2 << 20) >= anon, "the worker has {anon} bytes of anonymous memory, its cgroup is charged {charged}");
     drop(sup);
     remove_cgroup(&root).await;
 }
@@ -1598,15 +1666,16 @@ async fn worker_memory_max_kills_only_that_worker() {
     big.limits.request_timeout_ms = 30_000;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &big).await);
     assert_eq!(app_get(addr, &hostile, "/x/").await.0, 200);
-    let group = root.join(worker(&hostile));
+    let pid = stats_json(addr).await["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap();
+    let group = cgroup_of(&root, pid);
     assert_eq!(std::fs::read_to_string(group.join("memory.max")).unwrap().trim(), (160u64 << 20).to_string());
 
-    let pid = stats_json(addr).await["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap();
     let mut statuses = Vec::new();
     for i in 0..8 {
         statuses.push(app_get(addr, &hostile, &format!("/m{i}/alloc?mb=30")).await.0);
     }
-    assert!(cgroup_stat(&group, "memory.events", "oom_kill ") >= 1, "no OOM kill: {statuses:?}");
+    // The killed worker's cgroup is gone; events count in its parent too.
+    assert!(cgroup_stat(&root, "memory.events", "oom_kill ") >= 1, "no OOM kill: {statuses:?}");
     assert_eq!(app_get(addr, &counter, "/n/").await.0, 200, "the other app kept serving");
     // The next request starts a fresh worker.
     assert_eq!(app_get(addr, &hostile, "/after/").await.0, 200);
@@ -1631,7 +1700,8 @@ async fn worker_cpu_and_pids_limits_hold() {
     let (sup, addr) = supervised_with(cfg).await;
     let hostile = publish("hostile", &app("hostile")).await;
     assert_eq!(app_get(addr, &hostile, "/x/").await.0, 200);
-    let group = root.join(worker(&hostile));
+    let pid = stats_json(addr).await["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap();
+    let group = cgroup_of(&root, pid);
     assert_eq!(std::fs::read_to_string(group.join("cpu.max")).unwrap().trim(), "20000 100000");
     assert_eq!(std::fs::read_to_string(group.join("pids.max")).unwrap().trim(), "64");
 

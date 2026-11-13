@@ -15,7 +15,7 @@
 set -e
 cd "$(dirname "$0")/.."
 N=$(pwd)
-TESTS=${1:-workers_are_placed,worker_memory,worker_cpu,jail_blocks_escapes}
+TESTS=${1:-workers_are_placed,worker_memory,worker_cpu,spare_engine_memory,jail_blocks_escapes}
 [ "$TESTS" = all ] && TESTS=
 V=$N/target/vm
 mkdir -p "$V"
@@ -53,6 +53,7 @@ mount -t cgroup2 none /sys/fs/cgroup
 echo "+memory +cpu +pids" > /sys/fs/cgroup/cgroup.subtree_control
 ip link set lo up
 sysctl -qw vm.max_map_count=1048576
+ulimit -n 20000
 echo "== kernel \$(cut -d' ' -f3 /proc/version), cgroup v2: \$(cat /sys/fs/cgroup/cgroup.controllers)"
 cd $N
 $N/target/release/deps/integration \$(echo "$TESTS" | tr , ' ') --test-threads 1 2>&1

@@ -36,7 +36,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, watch};
 
-use crate::config::{AppConfig, NodeConfig};
+use crate::config::{AppConfig, NodeConfig, WorkerLimits};
 use crate::egress::{EgressPolicy, serve_forwarded};
 use crate::engine::Wasm;
 use crate::jail::Jail;
@@ -155,6 +155,10 @@ impl Supervisor {
         let ttl = Duration::from_millis(cfg.lease_ms);
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
+        // Workers' cgroups that an earlier run left: the empty ones go.
+        for dir in cfg.cgroup.iter().flat_map(std::fs::read_dir).flatten().flatten() {
+            let _ = std::fs::remove_dir(dir.path());
+        }
         let sup = Arc::new(Supervisor {
             runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
@@ -391,8 +395,8 @@ impl Supervisor {
     }
 
     /// Gets the app version `want` names, retires the running worker, then
-    /// takes the spare worker (or spawns one), places it in its cgroup,
-    /// hands it its app and component, and waits until it answers.
+    /// takes the spare worker (or spawns one), gives its cgroup the app's
+    /// limits, hands it its app and component, and waits until it answers.
     async fn start(&self, w: &Worker, want: &AppRef) -> anyhow::Result<Arc<Live>> {
         let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
         let app = AppConfig {
@@ -424,13 +428,29 @@ impl Supervisor {
 
         let mut spare = self.spare.lock().await.take();
         // One that has died meanwhile is replaced.
-        let Spawned { mut child, mut stdin, requests, egress } = match spare.take_if(|s| s.child.try_wait().is_ok_and(|s| s.is_none())) {
+        let Spawned { mut child, mut stdin, requests, egress, cgroup } = match spare.take_if(|s| s.child.try_wait().is_ok_and(|s| s.is_none())) {
             Some(s) => s,
             None => self.spawn().await?,
         };
         let pid = child.id().context("worker exited at once")?;
-        if let Some(root) = &self.cfg.cgroup {
-            place_in_cgroup(root, &app, pid)?;
+        let stderr = child.stderr.take().expect("piped");
+
+        // Keep the receiver until the child is reaped: sender closure is
+        // the drain barrier even when killing takes time. Its cgroup goes
+        // after it, also when this start fails.
+        let (kill, mut killed) = watch::channel(false);
+        let (name, dir) = (w.name.clone(), cgroup.as_ref().map(|c| c.0.clone()));
+        tokio::spawn(async move {
+            tokio::select! {
+                status = child.wait() => eprintln!("nanovm: worker for app {name:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
+                _ = killed.changed() => {
+                    let _ = child.kill().await;
+                }
+            }
+            drop(cgroup);
+        });
+        if let Some(dir) = dir {
+            limit(&dir, &app.worker)?;
         }
 
         // The rest of the worker's spec: its app, its uid, its component and our pid.
@@ -447,7 +467,7 @@ impl Supervisor {
         // most `MAX_LINE`) at a time. It closes when the worker exits, and
         // the last line explains a failed start.
         let app = w.name.clone();
-        let mut stderr = tokio::io::BufReader::new(child.stderr.take().expect("piped"));
+        let mut stderr = tokio::io::BufReader::new(stderr);
         let last_words = tokio::spawn(async move {
             let (mut line, mut last) = (Vec::new(), String::new());
             loop {
@@ -457,19 +477,6 @@ impl Supervisor {
                     Ok(_) => last = String::from_utf8_lossy(&line).trim_end().to_string(),
                 }
                 eprintln!("nanovm[{app}]: {last}");
-            }
-        });
-
-        // Keep the receiver until the child is reaped: sender closure is
-        // the drain barrier even when killing takes time.
-        let (kill, mut killed) = watch::channel(false);
-        let app = w.name.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                status = child.wait() => eprintln!("nanovm: worker for app {app:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
-                _ = killed.changed() => {
-                    let _ = child.kill().await;
-                }
             }
         });
 
@@ -543,12 +550,18 @@ impl Supervisor {
         bail!("worker did not start ({e}): {}", words.ok().and_then(Result::ok).unwrap_or_default())
     }
 
-    /// Spawns a worker and gives it the node's config, from which it builds
-    /// its engine; it then waits for its app (see `worker_main`).
+    /// Spawns a worker into a cgroup of its own and gives it the node's
+    /// config, from which it builds its engine; it then waits for its app
+    /// (see `worker_main`).
     async fn spawn(&self) -> anyhow::Result<Spawned> {
         let (requests, worker_requests) = UnixStream::pair()?;
         let (egress, worker_egress) = UnixStream::pair()?;
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
+        let cgroup = self.cfg.cgroup.as_deref().map(Cgroup::new).transpose()?;
+        let into = cgroup.as_ref().map(|c| format!(" into {}", c.0.display())).unwrap_or_default();
+        let procs = cgroup.as_ref().map(|c| std::fs::OpenOptions::new().write(true).open(c.0.join("cgroup.procs"))).transpose();
+        let procs = procs.with_context(|| format!("spawning {}{into}", self.exe.display()))?;
+        let c = procs.as_ref().map_or(-1, |f| f.as_raw_fd());
         let mut cmd = Command::new(&self.exe);
         cmd.arg("worker")
             .env_clear()
@@ -556,10 +569,15 @@ impl Supervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         // SAFETY: only async-signal-safe calls between fork and exec. The
-        // sockets are first moved above fd 4 so neither dup2 clobbers the
-        // other, then dup2 puts them at 3 and 4 without close-on-exec.
+        // child first enters its cgroup (writing 0 moves the writer), so all
+        // it ever allocates is charged there. The sockets are then moved
+        // above fd 4 so neither dup2 clobbers the other, and dup2 puts them
+        // at 3 and 4 without close-on-exec.
         unsafe {
             cmd.pre_exec(move || {
+                if c >= 0 && libc::write(c, b"0".as_ptr().cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 let a = libc::fcntl(a, libc::F_DUPFD_CLOEXEC, 10);
                 let b = libc::fcntl(b, libc::F_DUPFD_CLOEXEC, 10);
                 if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
@@ -568,12 +586,12 @@ impl Supervisor {
                 Ok(())
             });
         }
-        let mut child = cmd.spawn().with_context(|| format!("spawning {}", self.exe.display()))?;
+        let mut child = cmd.spawn().with_context(|| format!("spawning {}{into}", self.exe.display()))?;
         let mut stdin = child.stdin.take().expect("piped");
         let mut spec = serde_json::to_vec(&self.cfg)?;
         spec.push(b'\n');
         stdin.write_all(&spec).await?;
-        Ok(Spawned { child, stdin, requests, egress })
+        Ok(Spawned { child, stdin, requests, egress, cgroup })
     }
 
     /// Spawns the next worker ahead of need, unless one is waiting.
@@ -593,7 +611,7 @@ impl Supervisor {
 /// A worker process that has built its engine for this node (the pool
 /// alone took 7 ms) and waits for its app. One is kept spawned ahead, so a
 /// start skips spawning a process and building its engine. It is given
-/// nothing of an app's, nor any uid, cgroup or jail, until it is taken: what
+/// nothing of an app's, nor any uid, limits or jail, until it is taken: what
 /// it holds comes from the node's config alone, which a supervisor never
 /// changes. It exits when its stdin closes, so with the supervisor too.
 struct Spawned {
@@ -601,6 +619,35 @@ struct Spawned {
     stdin: tokio::process::ChildStdin,
     requests: UnixStream,
     egress: UnixStream,
+    cgroup: Option<Cgroup>,
+}
+
+/// A worker's cgroup, `<cgroup>/worker-<n>`. The worker enters it before
+/// it runs, and its app's limits are set on it when it is given its app,
+/// so they cover all of the worker: memory stays charged to the cgroup a
+/// process was in when it allocated it, and a spare builds its engine
+/// (about 2 KiB a slot, half of it the kernel's for four mappings) before
+/// it has an app. Removed when dropped, once the worker has exited.
+struct Cgroup(PathBuf);
+
+impl Cgroup {
+    fn new(root: &Path) -> anyhow::Result<Cgroup> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let dir = root.join(format!("worker-{}", NEXT.fetch_add(1, Relaxed)));
+            match std::fs::create_dir(&dir) {
+                // One an earlier run left, whose worker has not exited yet.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                made => return made.map(|()| Cgroup(dir.clone())).with_context(|| format!("creating cgroup {}", dir.display())),
+            }
+        }
+    }
+}
+
+impl Drop for Cgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.0);
+    }
 }
 
 async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
@@ -723,14 +770,11 @@ fn chown_tree(dir: &Path, uid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Moves `pid` into `<root>/<app>` with the app's worker limits.
-fn place_in_cgroup(root: &Path, app: &AppConfig, pid: u32) -> anyhow::Result<()> {
-    let dir = root.join(&app.name);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating cgroup {}", dir.display()))?;
+/// Gives a worker's cgroup its app's worker limits.
+fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
     let set = |file: &str, value: String| {
         std::fs::write(dir.join(file), &value).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
     };
-    let w = &app.worker;
     if w.memory_mb > 0 {
         set("memory.max", (w.memory_mb << 20).to_string())?;
     }
@@ -740,7 +784,7 @@ fn place_in_cgroup(root: &Path, app: &AppConfig, pid: u32) -> anyhow::Result<()>
     if w.pids > 0 {
         set("pids.max", w.pids.to_string())?;
     }
-    set("cgroup.procs", pid.to_string())
+    Ok(())
 }
 
 /// `nanovm worker`: reads its spec and component from stdin, jails itself,
