@@ -1139,15 +1139,22 @@ mod tests {
         assert_eq!(archive_tree(&v, 2), tree(&v));
     }
 
-    /// A version can't name a path outside the volume it is applied to,
-    /// whether to remove, list or write it.
+    /// A version can't reach outside the volume it is applied to, to list,
+    /// remove, write or patch: not by `..`, nor through a symlink there, as
+    /// each name is opened without following one (S4). These were format 2,
+    /// refused for that alone, and each overwrote the last: only one ran.
     #[test]
     fn a_version_cannot_write_outside_its_root() {
         let base = volume().parent().unwrap().to_path_buf();
         std::fs::write(base.join("victim"), "kept").unwrap();
+        std::fs::create_dir(base.join("out")).unwrap();
+        std::fs::write(base.join("out/v"), "kept").unwrap();
         let root = base.join("root");
         std::fs::create_dir(&root).unwrap();
-        let version = |changes: &str, entry: Option<&[u8]>| {
+        // None a version makes, but one in the root must not be followed.
+        std::os::unix::fs::symlink(base.join("out"), root.join("l")).unwrap();
+        let mut n = 0;
+        let mut version = |changes: &str, entry: Option<&[u8]>| {
             let mut tar = tar::Builder::new(vec![]);
             let mut put = |name: &[u8], bytes: &[u8]| {
                 let mut header = tar::Header::new_gnu();
@@ -1157,26 +1164,95 @@ mod tests {
                 header.set_cksum();
                 tar.append(&header, bytes).unwrap();
             };
-            let id = r#"{"format":2,"app":"app","object":"o","sequence":2,"epoch":0,"parent":"","snapshot":false}"#;
+            let id = r#"{"format":3,"app":"app","object":"o","sequence":2,"epoch":0,"parent":"","snapshot":false}"#;
             put(b"nanovm.json", id.as_bytes());
             put(b"changes.json", changes.as_bytes());
             if let Some(name) = entry {
                 put(name, b"evil");
             }
-            let path = base.join("evil.tar");
+            n += 1;
+            let path = base.join(format!("evil{n}.tar"));
             std::fs::write(&path, tar.into_inner().unwrap()).unwrap();
             path
         };
         let empty = r#"{"listed":{},"whole":[],"patched":{}}"#;
-        for path in [
-            version(r#"{"listed":{"..":[]},"whole":[],"patched":{}}"#, None),
-            version(r#"{"listed":{},"whole":["../victim"],"patched":{}}"#, None),
-            version(empty, Some(b"data/../victim")),
-            version(r#"{"listed":{},"whole":[],"patched":{"../victim":[1,[[0,4]]]}}"#, Some(b"patch/../victim")),
+        for (path, dots) in [
+            (version(r#"{"listed":{"..":[]},"whole":[],"patched":{}}"#, None), true),
+            (version(r#"{"listed":{},"whole":["../victim"],"patched":{}}"#, None), true),
+            (version(empty, Some(b"data/../victim")), true),
+            (version(r#"{"listed":{},"whole":[],"patched":{"../victim":[1,[[0,4]]]}}"#, Some(b"patch/../victim")), true),
+            (version(r#"{"listed":{"l":[]},"whole":[],"patched":{}}"#, None), false),
+            (version(r#"{"listed":{},"whole":["l/v"],"patched":{}}"#, None), false),
+            (version(empty, Some(b"data/l/v")), false),
+            (version(r#"{"listed":{},"whole":[],"patched":{"l/v":[4,[[0,4]]]}}"#, Some(b"patch/l/v")), false),
         ] {
             let e = committed::apply(&root, &path).err().expect("an unsafe version must be refused");
-            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+            if dots {
+                assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+            }
             assert_eq!(std::fs::read(base.join("victim")).unwrap(), b"kept");
+            assert_eq!(std::fs::read(base.join("out/v")).unwrap(), b"kept", "{}: {e}", path.display());
+        }
+    }
+
+    /// A version holds files and directories only. One with a symlink, a
+    /// hard link or a device is refused, and nothing outside the root it is
+    /// restored to changes. Before, a file under a symlink the version made
+    /// was written through it, and a later change patched what a hard link
+    /// named (S4).
+    #[test]
+    fn review_capture_symlink_cannot_escape_restore_root() {
+        use tar::EntryType::{Char, Directory, Fifo, Link, Regular, Symlink};
+        let base = volume().parent().unwrap().to_path_buf();
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "kept").unwrap();
+        let (dir, file) = (outside.to_str().unwrap(), victim.to_str().unwrap());
+        let patch = r#"{"listed":{},"whole":[],"patched":{"h":[4,[[0,4]]]}}"#;
+        let cases: [(&str, &[(&str, &[(&str, tar::EntryType, &str)])]); 4] = [
+            ("symlink", &[("", &[("data/l", Symlink, dir), ("data/l/victim", Regular, "evil")])]),
+            ("hardlink", &[("", &[("data/h", Link, file)]), (patch, &[("patch/h", Regular, "evil")])]),
+            ("char", &[("", &[("data/c", Char, "")])]),
+            ("fifo", &[("", &[("data/f", Fifo, "")])]),
+        ];
+        for (name, versions) in cases {
+            let history = base.join(name);
+            std::fs::create_dir(&history).unwrap();
+            let mut parent = String::new();
+            for (i, (changes, entries)) in versions.iter().enumerate() {
+                let mut tar = tar::Builder::new(vec![]);
+                let mut add = |path: &str, kind: tar::EntryType, data: &str| {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(kind);
+                    header.set_mode(0o644);
+                    if matches!(kind, Link | Symlink) {
+                        header.set_size(0);
+                        tar.append_link(&mut header, path, data).unwrap();
+                    } else {
+                        header.set_size(data.len() as u64);
+                        tar.append_data(&mut header, path, data.as_bytes()).unwrap();
+                    }
+                };
+                let (n, snapshot) = (i + 1, changes.is_empty());
+                let id = format!(r#"{{"format":3,"app":"app","object":"o","sequence":{n},"epoch":0,"parent":"{parent}","snapshot":{snapshot}}}"#);
+                add("nanovm.json", Regular, &id);
+                match snapshot {
+                    true => add("data", Directory, ""),
+                    false => add("changes.json", Regular, changes),
+                }
+                for &(path, kind, data) in *entries {
+                    add(path, kind, data);
+                }
+                let path = history.join(format!("{n:020}.tar"));
+                std::fs::write(&path, tar.into_inner().unwrap()).unwrap();
+                parent = committed::digest(&path).unwrap();
+            }
+            let e = committed::restore(&history, &base.join(format!("root-{name}"))).err();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"kept", "{name}");
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "{name}");
+            let e = e.expect(name);
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{name}: {e}");
         }
     }
 
