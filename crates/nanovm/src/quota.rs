@@ -1001,8 +1001,8 @@ mod tests {
     /// refused to every object of the app until one frees space. The budget
     /// counts every volume, not the journals or the pool, from the start; an
     /// instance counts what its volume holds, and when it ends hands back
-    /// what it held elsewhere (`/tmp`), measured after what it left
-    /// uncommitted is rolled back.
+    /// what it held elsewhere (`/tmp`), keeping what it removed uncommitted,
+    /// and an object it made and never committed is measured once gone.
     #[test]
     fn objects_share_their_apps_budget() {
         use crate::app::{Objects, object_dir};
@@ -1048,6 +1048,18 @@ mod tests {
         drop(a);
         assert_eq!(disk.used.load(Relaxed), 40 + 6 + 2);
         assert_eq!(guard("a").usage().0, 40, "rolled back");
+        // An object an instance made and never committed leaves nothing:
+        // what it wrote is counted until then, measured after it is gone.
+        let d = guard("d");
+        let mut p = d.0.lock().journal.volume().join("f");
+        d.journal(|j| j.place(&mut p).and_then(|()| j.creating(&p))).unwrap();
+        let f = Arc::new(std::fs::File::options().create_new(true).read(true).write(true).open(&p).unwrap());
+        d.journal(|j| j.created(&p).and_then(|()| j.opened(&f))).unwrap();
+        assert_eq!(d.write(&f, Some(0), &[1; 30]).unwrap(), 30);
+        assert_eq!(disk.used.load(Relaxed), 40 + 6 + 2 + 30);
+        drop((d, f));
+        assert_eq!(disk.used.load(Relaxed), 40 + 6 + 2, "rolled back and gone");
+        assert!(!object_dir(&dir, "d").exists());
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(scratch).unwrap();
     }
