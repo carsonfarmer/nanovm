@@ -12,18 +12,24 @@ No runtime code changed (`crates/nanovm/src`: +0 lines).
 
 - **`wasip3` 0.9's `http-compat` feature** (the bindings we already use, from
   the Bytecode Alliance) converts both ways: `http_from_wasi_request`,
-  `http_from_wasi_response`, `HeaderMap` ↔ `Fields`, `Method`, `Scheme`, and
-  a streaming `http_body::Body` for incoming bodies. Chosen: the SDK uses it
-  for every header, method, scheme and URI conversion.
+  `http_from_wasi_response`, `http_into_wasi_*`, `HeaderMap` ↔ `Fields`,
+  `Method`, `Scheme`, and a streaming `http_body::Body` for incoming bodies.
+  Chosen: the SDK uses its conversions for every header map, method and
+  scheme, both ways.
 - **spin-sdk** 6–8 is built on exactly this feature (8.0 on `wasip3` 0.10):
   handlers take `http::Request<IncomingRequestBody>` and return
   `impl IntoResponse`, with `http-body-util` and `futures` for bodies.
 - **wstd** (0.6.8) is WASI 0.2 only (`wasip2`), so it doesn't fit.
 
 Not used from `http-compat`, and why:
-- its streaming request body: the common case wants the bytes, so the SDK
-  takes the request back (`take_unstarted`) and reads the stream whole, as
-  before, one read loop instead of a boxed future per 16 KiB frame;
+- `http_from_wasi_request`/`_response`: they wrap the body in their streaming
+  `IncomingBody`, and the common case wants the bytes. Taking the message
+  back out of it (`take_unstarted`) works, but measured: building the parts
+  from `Method`, `Scheme` and `HeaderMap`'s conversions directly (a URI
+  builder, about ten lines) makes hello 11.8 KB and chat 8.7 KB smaller and
+  skips four host calls a request (options, a second `headers`, its
+  `content-length`, a drop). CPU per request couldn't tell the two apart on
+  this machine (below).
 - `http_into_wasi_response`/`_request`: they need an `http_body::Body` (so
   `http-body-util` for a plain byte body), never set `content-length` (so
   every answer would be chunked), always send a body (a `GET` would carry an

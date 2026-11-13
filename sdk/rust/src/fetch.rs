@@ -1,7 +1,7 @@
 //! Outbound HTTP: [`fetch`] reaches the internet (hosts the app's `egress`
 //! list allows), and [`object`] another object of this app.
 
-use http::{Method, Request, Response};
+use http::{Method, Request, Response, StatusCode};
 use wasip3::http::types::{self as wit, ErrorCode};
 use wasip3::wit_future;
 use wit_bindgen::rt::async_support::{FutureReader, FutureWriter, StreamReader, StreamResult};
@@ -38,8 +38,9 @@ pub async fn fetch_streaming(request: Request<impl Into<Body>>) -> Result<Respon
     request.set_authority(uri.authority().map(|a| a.as_str())).map_err(invalid)?;
     request.set_path_with_query(uri.path_and_query().map(|p| p.as_str())).map_err(invalid)?;
     let response = wasip3::http::client::send(request).await?;
-    let (parts, mut body) = wasip3::http_compat::http_from_wasi_response(response)?.into_parts();
-    let response = body.take_unstarted().expect("a new body is unread");
+    let mut parts = Response::new(()).into_parts().0;
+    parts.status = StatusCode::from_u16(response.get_status_code()).map_err(|_| ErrorCode::HttpProtocolError)?;
+    parts.headers = response.get_headers().try_into()?;
     let (done, result) = wit_future::new(|| Ok(()));
     let (body, end) = wit::Response::consume_body(response, result);
     let body = Streaming { body, closed: false, end: Some(end), ended: Ok(()), _done: done };

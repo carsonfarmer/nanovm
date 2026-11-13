@@ -104,10 +104,23 @@ pub async fn __serve<F: Future<Output = Result>>(
 }
 
 /// The request as `http`'s, its body read in full (the node bounds it by
-/// the app's `max_request_body_kb`).
+/// the app's `max_request_body_kb`). `http_compat::http_from_wasi_request`
+/// would wrap the body in a stream to take it back out; built here, a
+/// component is 12 KB smaller (notes/sdk-http.md).
 async fn read(request: wit::Request) -> core::result::Result<http::Request<Body>, wit::ErrorCode> {
-    let (parts, mut body) = wasip3::http_compat::http_from_wasi_request(request)?.into_parts();
-    let request = body.take_unstarted().expect("a new body is unread");
+    let invalid = || wit::ErrorCode::HttpRequestUriInvalid;
+    let mut uri = http::Uri::builder();
+    if let Some(scheme) = request.get_scheme() {
+        uri = uri.scheme(http::uri::Scheme::try_from(scheme).map_err(|_| invalid())?);
+    }
+    if let Some(authority) = request.get_authority() {
+        uri = uri.authority(authority);
+    }
+    let uri = uri.path_and_query(request.get_path_with_query().unwrap_or_else(|| "/".into())).build().map_err(|_| invalid())?;
+    let mut parts = http::Request::new(()).into_parts().0;
+    parts.method = request.get_method().try_into().map_err(|_| wit::ErrorCode::HttpRequestMethodInvalid)?;
+    parts.uri = uri;
+    parts.headers = request.get_headers().try_into()?;
     let (done, result) = wit_future::new(|| Ok(()));
     let (body, _trailers) = wit::Request::consume_body(request, result);
     let body = body.collect().await;
