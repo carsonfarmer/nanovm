@@ -628,12 +628,15 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
             }
             Err(e) => {
                 // A new object the app has no room for (`Objects::room`).
-                let refused = e.downcast_ref::<std::io::Error>().and_then(|e| e.get_ref()?.downcast_ref::<crate::app::Refused>());
-                let (status, reason) = refused.map_or((503, "instantiate-failed"), |r| (507, r.0));
-                let e = format!("{e:#}");
-                if refused.is_none() {
+                let (status, reason) = match e.downcast_ref::<std::io::Error>().map(std::io::Error::kind) {
+                    Some(std::io::ErrorKind::QuotaExceeded) => (507, "object-limit"),
+                    Some(std::io::ErrorKind::StorageFull) => (507, "disk-full"),
+                    _ => (503, "instantiate-failed"),
+                };
+                if status == 503 {
                     node.metrics.instantiate_failures.fetch_add(1, Relaxed);
                 }
+                let e = format!("{e:#}");
                 node.metrics.event(reason, &shared.id, &*e, &shared.context.lock());
                 let response = error_response(status, reason, &e);
                 crate::telemetry::response(&mut job.span, &response);

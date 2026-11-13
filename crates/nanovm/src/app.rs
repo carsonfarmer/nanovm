@@ -185,23 +185,6 @@ pub fn object_dir(objects: &Path, id: &str) -> PathBuf {
     objects.join(format!("{:02x}", sha2::Sha256::digest(id)[0])).join(id)
 }
 
-/// A new object refused: to the guest, a full disk.
-fn refused(reason: &'static str, detail: String) -> std::io::Error {
-    std::io::Error::new(ErrorKind::QuotaExceeded, Refused(reason, detail))
-}
-
-/// Why a new object was refused: a response's error, and its detail.
-#[derive(Debug)]
-pub struct Refused(pub &'static str, pub String);
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.1)
-    }
-}
-
-impl std::error::Error for Refused {}
-
 /// An app's objects on this node. An object has a directory only from its
 /// first change on (see `journal`); these are counted, up to the node's
 /// `max_objects_per_app`.
@@ -232,7 +215,8 @@ impl Objects {
     }
 
     /// Whether a new object may be made: refused while the app has its
-    /// most, or the disk has less free than the object's quota.
+    /// most (`QuotaExceeded`, answered `507 object-limit`), or the disk has
+    /// less free than the object's quota (`StorageFull`, `507 disk-full`).
     pub fn room(&self) -> std::io::Result<()> {
         if self.count.load(Relaxed) >= self.max {
             return Err(self.most());
@@ -240,7 +224,8 @@ impl Objects {
         let fs = rustix::fs::statvfs(&self.dir)?;
         if fs.f_bavail * fs.f_frsize < self.need.0 || (fs.f_files > 0 && fs.f_favail < self.need.1) {
             let (mb, files) = (self.need.0 >> 20, self.need.1);
-            return Err(refused("disk-full", format!("the disk has less free than a new object may use ({mb} MiB, {files} files)")));
+            let detail = format!("the disk has less free than a new object may use ({mb} MiB, {files} files)");
+            return Err(std::io::Error::new(ErrorKind::StorageFull, detail));
         }
         Ok(())
     }
@@ -260,7 +245,8 @@ impl Objects {
     }
 
     fn most(&self) -> std::io::Error {
-        refused("object-limit", format!("the app has its most objects, {} (max_objects_per_app)", self.max))
+        let detail = format!("the app has its most objects, {} (max_objects_per_app)", self.max);
+        std::io::Error::new(ErrorKind::QuotaExceeded, detail)
     }
 
     /// Removes `base`, an object's directory, if its volume is empty or
@@ -295,7 +281,11 @@ mod tests {
     }
 
     fn reason(e: std::io::Error) -> &'static str {
-        e.get_ref().and_then(|e| e.downcast_ref::<Refused>()).expect("refused").0
+        match e.kind() {
+            ErrorKind::QuotaExceeded => "object-limit",
+            ErrorKind::StorageFull => "disk-full",
+            _ => panic!("{e}"),
+        }
     }
 
     /// Objects are counted from their directories; a place is taken only

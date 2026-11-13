@@ -1385,6 +1385,20 @@ async fn admin_socket_is_the_supervisors_own() {
     }
 }
 
+/// A node whose data directory is too long for a socket's path (at most 107
+/// bytes) still serves its admin socket: it is bound, and reached, through
+/// the directory it is in, opened (recovery's B-508).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_admin_socket_takes_a_long_data_dir() {
+    let mut cfg = node_cfg("the_admin_socket_takes_a_long_data_dir", 8);
+    cfg.data_dir = cfg.data_dir.join("long".repeat(30));
+    let socket = nanovm::admin::socket(&cfg);
+    assert!(socket.as_os_str().len() > 160, "{}", socket.display());
+    let (_sup, _addr) = supervised_with(cfg.clone()).await;
+    let (ok, out) = admin(&cfg, &["apps"]);
+    assert!(ok && out.trim() == "[]", "{out}");
+}
+
 /// An operator deletes an object, then all of an app's data, on a running
 /// node: its worker stops first, the node's copy and what it shipped go,
 /// the rest of the app is untouched, and the app goes on from nothing.
