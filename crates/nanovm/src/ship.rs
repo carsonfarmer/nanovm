@@ -890,6 +890,57 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// With remote acknowledgement, a commit whose version doesn't count in
+    /// the store in time is answered 500 but stands on its node, which goes
+    /// on serving it. If that node then stops before shipping it, the node
+    /// taking the object over must not serve older state than the old node
+    /// served (README: "serves no older state").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_a_takeover_never_serves_older_state_than_was_served() {
+        use crate::journal::Journal;
+        use std::os::unix::fs::FileExt;
+        let base = tempdir("older");
+        let records: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = Objects(Arc::new(object_store::memory::InMemory::new()));
+        let (a, b) = (Leases::new(records.clone(), "a", Duration::from_millis(500)), Leases::new(records, "b", Duration::from_secs(5)));
+        let (a_objects, b_objects) = (base.join("a"), base.join("b"));
+        let ga = take(&store, &a, "o", &a_objects).await;
+        let (id, until) = a.renew().await;
+        let session = Arc::new(crate::lease::Session::default());
+        session.set(id, until);
+        let mut obj = crate::object::ObjShared::new("app".into(), "o");
+        (obj.leases, *obj.lease.get_mut()) = (Some(session), Some(ga));
+        let obj = Arc::new(obj);
+        let volume = a_objects.join("o");
+        std::fs::create_dir_all(&volume).unwrap();
+        std::fs::write(volume.join("v"), "zero").unwrap();
+        let volume = volume.canonicalize().unwrap();
+        // Writes `text` over `v` and commits, as a request does.
+        let commit = |remote_ack: bool, text: &str| {
+            let cap = CaptureConfig { remote_ack, store: Some("/unused".into()), ..Default::default() };
+            let mut j = Journal::open(&volume, 1 << 30, obj.clone(), Some(&cap)).unwrap();
+            let file = std::fs::File::options().write(true).open(volume.join("v")).unwrap();
+            j.writing(&file, 0, text.len() as u64).unwrap();
+            file.write_all_at(text.as_bytes(), 0).unwrap();
+            j.commit()
+        };
+        // "zero" counts in the store.
+        commit(false, "zero").unwrap();
+        ship_object(&store, Some(&a), "app", "o", &a_objects.join("~committed/o")).await.unwrap();
+        // "one!" is committed, but the store is slow: answered 500.
+        assert!(commit(true, "one!").is_err());
+        // A's next instance recovers the journal and serves the object.
+        drop(Journal::open(&volume, 1 << 30, obj.clone(), Some(&CaptureConfig::default())).unwrap());
+        let served = std::fs::read_to_string(volume.join("v")).unwrap();
+        assert_eq!(served, "one!", "A serves what it answered 500 for");
+        // A stops; B takes the object over.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        take(&store, &b, "o", &b_objects).await;
+        let theirs = std::fs::read_to_string(b_objects.join("o/v")).unwrap();
+        assert_eq!(theirs, served, "B serves older state than A served");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// A node ships an object's versions only under its live lease on the
     /// object, at the epoch it claimed the head with: not with no lease, nor
     /// a released, lapsed, or since-replaced one, though the lease record may
