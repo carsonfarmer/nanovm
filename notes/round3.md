@@ -116,7 +116,7 @@ spare), and `tests/dev.rs` reads the pulled component from its cache file (C5).
   write 932 → 749.5 µs (−19.6%). Serial writes are not flat: 323 → 530/s, at the same CPU per
   write (810 → 820 µs, +1.2%, ranges overlap). These replace the figures first given here, which
   they contradict: serial writes flat (385 → 394/s) at about 12% more CPU did not reproduce.
-- **Committed versions as changes (format 3).** A snapshot every 16 versions, changes in between
+- **Committed versions as changes.** A snapshot every 16 versions, changes in between
   (a 1-byte change to a 1 MiB file is a version under 8 KiB), each carrying the lease epoch.
 - **Shipping and restore.** Versions are shipped in order to a put-once store (a directory, or S3,
   R2 or MinIO through `object_store`), only while this node holds the object's lease (W-90), and an
@@ -125,14 +125,14 @@ spare), and `tests/dev.rs` reads the pulled component from its cache file (C5).
 - **Limits.** A short window between reading the lease record and the put remained (W-90; closed
   on `fix/lease-r3fix` by a fenced head, with restore on takeover and remote acknowledgement by
   default with leases); the shipper polls every 20 ms (N-165); restore read every version (N-166;
-  now from the last snapshot); a log left uncommitted by an older binary is refused, so drain
-  before upgrading.
+  now from the last snapshot). One version, v1: a log or a version that isn't v1 is refused, and
+  data written by earlier builds is not supported (AGENTS.md, rule 1).
 - **Review fixes** (`fix/storage-r3fix`). A commit that outlives a request killed at its deadline
   owns the volume until it ends: the next instance's recovery, and retirement, wait for it (S1).
-  Upgrading from main publishes a capture main decided but hadn't published, and reads main's
-  whole-volume history as snapshots the new changes apply to (S2, `notes/storage.md`). Restore
-  takes files and directories only and reaches everything from the root's descriptor without
-  following a symlink (S4). +125 runtime lines.
+  Restore takes files and directories only and reaches everything from the root's descriptor
+  without following a symlink (S4). S2 asked that a node keep what main's build left in its data
+  directory: not supported (AGENTS.md rule 1, N-693); its +46 runtime lines were removed on
+  `fix/no-compat`. +79 runtime lines without them.
 - +494 runtime lines, no new dependencies. All tests pass, including 114 SQLite recovery cuts and
   the new lease-fenced shipping tests.
 
