@@ -4732,6 +4732,71 @@ mod nodes {
         assert_eq!((head["sequence"].as_u64(), head["node"].as_str()), (Some(2), Some(names[1].as_str())));
     }
 
+    /// Acknowledging remotely, a write whose version doesn't count in the
+    /// store within the commit's wait is answered 500, though it stands on
+    /// its node. The node then serves the object nothing (503, Retry-After)
+    /// until its shipper has caught up: here it stops first, and the node
+    /// taking the object over serves what it last served, never older
+    /// (before: A served the write it had answered 500 for, then B the
+    /// state before it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_answered_500_is_served_only_once_it_counts() {
+        let store = Arc::new(InMemory::new());
+        let shipped = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes-store/unacknowledged");
+        let (_, _) = (std::fs::remove_file(&shipped), std::fs::remove_dir_all(shipped.with_extension("away")));
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        // Data roots of their own, one store to ship to (see `leased`).
+        let cfg_a = leased("unacknowledged_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("unacknowledged_b", &lb, private.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let leases: Arc<dyn ObjectStore> = store.clone();
+        let a = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let _a = serve(cfg_a, la, leases).await;
+                let _ = stopped.await;
+            })
+        });
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-unacknowledged", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "unacked.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let one = (200, r#"{"file":"one","key":"one"}"#.to_string());
+        assert_eq!(get(proxy, "unacked.test", &format!("/{object}/commit?v=one")).await, one);
+        // The store goes away (a file where its directory was).
+        let away = shipped.with_extension("away");
+        std::fs::rename(&shipped, &away).unwrap();
+        std::fs::write(&shipped, "").unwrap();
+        let written = get(proxy, "unacked.test", &format!("/{object}/commit?v=two")).await;
+        assert_eq!(written.0, 500, "{written:?}");
+        let read = {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            let head = format!("GET /{object}/commit HTTP/1.1\r\nHost: unacked.test\r\nConnection: close\r\n\r\n");
+            s.write_all(head.as_bytes()).await.unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).await.unwrap();
+            out.to_lowercase()
+        };
+        assert!(read.starts_with("http/1.1 503") && read.contains("retry-after: 1") && read.contains("not-stored"), "A serves what it answered 500 for: {read}");
+        // A stops, then the store is back; B takes the object over.
+        stop.send(()).unwrap();
+        a.join().unwrap();
+        std::fs::remove_file(&shipped).unwrap();
+        std::fs::rename(&away, &shipped).unwrap();
+        let t0 = Instant::now();
+        let read = loop {
+            let read = get(proxy, "unacked.test", &format!("/{object}/commit")).await;
+            if read.0 == 200 || t0.elapsed() > Duration::from_secs(15) {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(read, one, "B serves what A last served");
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+    }
+
     /// Node A answers a request and works on after answering; meanwhile it
     /// is cut off from the lease store. Its lease runs out, so it refuses the
     /// object's requests, and node B takes the lease and serves them. A's

@@ -278,6 +278,16 @@ pub(crate) fn stored(dir: &Path, sequence: u64) -> io::Result<()> {
     Err(io::Error::new(ErrorKind::TimedOut, format!("version {sequence} is not in the store")))
 }
 
+/// Whether every version published in `dir` counts in the store, waiting
+/// for the shipper as `stored` does. With `remote_ack` an instance starts
+/// only once they do: a commit whose wait ran out was answered 500 but
+/// stands here, and a node taking the object over before it ships would
+/// serve older state than this one had served.
+pub(crate) async fn caught_up(dir: &Path) -> io::Result<bool> {
+    let (last, dir) = (published(dir)?.0.last().copied().unwrap_or(0), dir.to_owned());
+    Ok(shipped(&dir) >= last || tokio::task::spawn_blocking(move || stored(&dir, last)).await?.is_ok())
+}
+
 /// The sequences of the versions published in `dir`, in order (none if it
 /// isn't there), and whether one is being staged.
 fn published(dir: &Path) -> io::Result<(Vec<u64>, bool)> {
@@ -1301,10 +1311,15 @@ mod tests {
         ship_object(&store, Some(&a), "app", "o", &a_objects.join("~committed/o"), &mut None).await.unwrap();
         // "one!" is committed, but the store is slow: answered 500.
         assert!(commit(true, "one!").is_err());
-        // A's next instance recovers the journal and serves the object.
-        drop(Journal::open(&volume, 1 << 30, obj.clone(), Some(&CaptureConfig::default())).unwrap());
-        let served = std::fs::read_to_string(volume.join("v")).unwrap();
-        assert_eq!(served, "one!", "A serves what it answered 500 for");
+        // A's next instance recovers the journal, then, as the node starts
+        // one (`object::run`, acknowledging remotely), serves the object
+        // only once all of it counts in the store: not yet, so A serves
+        // nothing; the last it served was "zero".
+        let cap = CaptureConfig { remote_ack: true, store: Some("/unused".into()), ..Default::default() };
+        drop(Journal::open(&volume, 1 << 30, obj.clone(), Some(&cap)).unwrap());
+        let a_dir = a_objects.join("~committed/o");
+        assert!(!caught_up(&a_dir).await.unwrap(), "A serves what it answered 500 for, which the store doesn't have");
+        let served = "zero";
         // A stops; B takes the object over.
         tokio::time::sleep(Duration::from_millis(500)).await;
         take(&store, &b, "o", &b_objects).await;
