@@ -223,6 +223,7 @@ async fn echo_maps_requests_and_responses_both_ways() {
         assert_eq!((headers["content-type"].to_str().unwrap(), headers.get("x-other")), ("application/x-test", None), "{path}");
         let seen = format!("PATCH {host}/x/y?status=418&q=%20");
         assert_eq!(headers["x-seen"].to_str().unwrap(), seen, "{path}: the method and URI, within the object");
+        assert_eq!(headers["content-length"].to_str().unwrap(), body.len().to_string(), "{path}: bytes have their length");
         assert_eq!(res.bytes().await.unwrap().to_vec(), body, "{path}: the body's bytes");
     }
     for status in [200, 201, 299, 404, 500, 599] {

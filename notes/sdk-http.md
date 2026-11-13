@@ -129,8 +129,23 @@ around it is not to use the crate.
   objects (all four conversions): the status the app picks (200 to 599, an
   app's 500 not a failure), every value of a repeated header in order, header
   bytes that aren't UTF-8, the method, the URI within the object, the body's
-  bytes. MUTATION_PLACEHOLDER
-- Every example's end-to-end test, `dev.rs` (hello, chat) and `js.rs`: TESTS_PLACEHOLDER
+  bytes and its `content-length`.
+- `gateway_streams_completions_within_quotas` now also checks that an
+  upstream that breaks off breaks the client's stream off (B-703).
+- Mutation checks, each restored with `git checkout -- sdk/rust/src/lib.rs`
+  and an empty `git diff`, the app rebuilt both times:
+
+  | break | caught by |
+  |---|---|
+  | answer every status as `200` | echo: `left: 200, right: 418` |
+  | keep one value per header name (`insert`, not `append`) | echo: `["2"]`, not `["1", "2"]` |
+  | header values made UTF-8, lossily | echo: `caf\u{fffd} …`, not `caf\xe9 \xff\x80` |
+  | no `content-length` for bytes | echo: no `content-length` |
+  | a stream writer's error ignored | gateway: the client's stream ends cleanly |
+  | `query` keeps the first of several | SDK unit test: `7`, not `8` |
+- End-to-end, serially (`RUST_TEST_THREADS=1`): `examples.rs` 26 passed
+  (echo's new one included), `dev.rs` 9 (the quickstart's hello and
+  chat among them), `js.rs` 11.
 
 ## JavaScript
 
