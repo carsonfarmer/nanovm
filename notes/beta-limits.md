@@ -77,10 +77,12 @@ bounds). `cgroup` is now a string: `"auto"` (default), a directory, or `"off"`. 
 supervisor reads its own cgroup v2 from `/proc/self/cgroup` and `/proc/self/mountinfo`, moves itself
 into `<own>/supervisor` (cgroup v2 keeps processes out of a group that hands controllers to its
 children), enables the controllers its limits need for `<own>`'s and `<own>/workers`' children, and
-places workers in `<own>/workers/worker-<n>` as before. Under systemd that needs only `Delegate=yes`
-(the ops drop-in's `ExecStartPre` and `cgroup` path are no longer needed). Where it can't (no cgroup
+places workers in `<own>/workers/worker-<n>` as before, through round 3's `Cgroup::take` (which
+refuses a directory that isn't cgroup v2, holds it for this node alone, and removes only an earlier
+run's `worker-<n>`), as for a directory named in `cgroup`. Under systemd that needs only `Delegate=yes` and
+`ProtectControlGroups=no` (the ops drop-in's `ExecStartPre` and `cgroup` path are no longer needed). Where it can't (no cgroup
 v2 with those controllers, a cgroup it doesn't own, other processes in it), the node refuses to start
-and says to set `cgroup = "off"` or name a delegated directory: fail closed (owner question 3).
+and says to set `cgroup = "off"` or name a delegated directory: fail closed (owner question 1).
 
 **Not verified here:** this sandbox gives the memory, cpu and pids controllers to cgroup v1 (its
 cgroup2 at `/sys/fs/cgroup/unified` has none), so the delegated branch can't run on it; the refusal
@@ -92,8 +94,9 @@ does. `scripts/vm-test.sh` now includes the test, which checks the placement and
 All on this sandbox (4 vCPU, 16 GiB, ext4), as root, shared with several other agents' builds and
 tests: load average 5–30 most of the time, near 0 for one short window. Runtime lines (CI's count):
 this branch merges `beta/objects` (its object layout, `objects/<app>/<shard>/<id>/data`, and per-app
-object cap), as the coordinator asked, so its delta is counted against that: 7,686 → 8,013 (+327:
-`gate.rs` 145, `quota.rs` +112, `supervisor.rs` +43, `config.rs` +19, `proxy.rs` +7, the rest +1).
+object cap), as the coordinator asked, and `cf/round3` at b12ffba (the worker fixes), so its delta is
+counted against the two merged: 7,717 → 8,044 (+327: `gate.rs` 145, `quota.rs` +112, `supervisor.rs`
++43, `config.rs` +19, `proxy.rs` +7, the rest +1).
 Before that merge, against `cf/round3`: 7,410 → 7,728 (+318).
 
 The measurements below were taken before the merge (the hot path they cover, the gate and the
@@ -198,4 +201,20 @@ now on objects-backed journals in the sharded layout).
   installed here, and the other worktrees' builds of them differ.
 - **The proxy's CPU per request** wasn't measured separately: it runs the same gate code as the node's
   front end, which was.
+
+## Owner questions
+
+1. **Without a cgroup subtree, refuse to start (built) or warn and run?** Recommended: refuse. Running
+   without caps is the audit's gap; `cgroup = "off"` is the explicit way to accept it (dev, containers
+   without a writable cgroup v2).
+2. **Client limit defaults** (100 requests/s per address, 1,000/s per app, bursts of twice that, 256
+   connections per address, 10,000 in all): recommended as they are for a beta of a few developers,
+   raised per node when an app needs more.
+3. **Trust loopback as a forwarder by default?** Recommended: yes. Caddy and the proxy sit on loopback
+   in the documented setup, and a local process can already reach a node directly; the alternative
+   limits everyone behind a local terminator as one client.
+4. **Disk defaults** (an app may hold a quarter of the data filesystem; a twentieth, at most 1 GiB, is
+   kept free): recommended, with `app_disk_mb` set explicitly once nodes have a known size.
+5. **Worker defaults** (a quarter of the host's memory, all cores but one): recommended; fair sharing
+   between workers under contention comes from cgroup v2's equal weights anyway.
 

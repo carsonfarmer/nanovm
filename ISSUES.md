@@ -670,8 +670,8 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### B-306: deleting an object must tell its app's disk budget
 - **Where:** `quota::Disk` (`idle`)
-- **Scenario:** a worker counts an object without an instance at what its volume held when last measured; a volume removed under a running worker (an operator delete, `beta/objects`) stays counted until the worker restarts. The delete path should drop the object from `Disk::idle` (and its bytes from `used`).
-- **Status:** open (for whoever lands object deletion)
+- **Scenario:** a worker counts an object without an instance at what its volume held when last measured, so a volume removed under a running worker would stay counted until the worker restarts.
+- **Status:** not an issue with `beta/objects`' delete, merged here: `nanovm admin delete` drains and stops the app's worker first, and the next one measures the app afresh. A volume a lease takeover restores is measured when its object next starts.
 
 ### B-307: a worker measures all its app's volumes when it starts
 - **Where:** `quota::Disk::open` (from `App::load`)
