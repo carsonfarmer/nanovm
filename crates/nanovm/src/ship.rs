@@ -48,23 +48,49 @@ pub fn store(cap: &CaptureConfig) -> anyhow::Result<Option<Arc<dyn Store>>> {
 /// replaces a name.
 pub struct Dir(pub PathBuf);
 
+/// Writes `bytes`, synced, to a new file in `dir` that no other write can
+/// open: its name is random and it is created exclusively. Returns its path.
+fn written(dir: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    use std::io::Write;
+    let mut name = [0u8; 8];
+    // SAFETY: getentropy writes at most `name.len()` bytes into `name`.
+    if unsafe { libc::getentropy(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let path = dir.join(format!("~new.{:016x}", u64::from_ne_bytes(name)));
+    let mut file = std::fs::File::options().write(true).create_new(true).open(&path)?;
+    match file.write_all(bytes).and_then(|()| file.sync_all()) {
+        Ok(()) => Ok(path),
+        Err(e) => Err(std::fs::remove_file(&path).err().unwrap_or(e)),
+    }
+}
+
 #[async_trait::async_trait]
 impl Store for Dir {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> io::Result<Put> {
-        let path = self.0.join(key);
+        let (root, path) = (self.0.clone(), self.0.join(key));
         tokio::task::spawn_blocking(move || {
             let dir = path.parent().expect("keys have a directory");
+            let fresh = !dir.exists();
             std::fs::create_dir_all(dir)?;
-            let new = path.with_extension(format!("new{}", std::process::id()));
-            std::fs::write(&new, &bytes)?;
-            std::fs::File::open(&new)?.sync_all()?;
+            let new = written(dir, &bytes)?;
+            // A link never replaces a name: of puts racing at a key, one
+            // stores its bytes, and the others find them.
             let linked = std::fs::hard_link(&new, &path);
             std::fs::remove_file(&new)?;
             match linked {
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
                     Ok(if std::fs::read(&path)? == bytes { Put::Same } else { Put::Conflict })
                 }
-                linked => linked.and_then(|()| std::fs::File::open(dir)?.sync_all()).map(|()| Put::Stored),
+                Err(e) => Err(e),
+                Ok(()) => {
+                    // The name; and those of the directories it may have made.
+                    let names = if fresh { dir.ancestors().position(|d| d == root).map_or(1, |n| n + 1) } else { 1 };
+                    for d in dir.ancestors().take(names) {
+                        std::fs::File::open(d)?.sync_all()?;
+                    }
+                    Ok(Put::Stored)
+                }
             }
         })
         .await?
@@ -263,6 +289,39 @@ mod tests {
             assert!(matches!(store.put("a/o/1", b"other".to_vec()).await.unwrap(), Put::Conflict));
             assert_eq!(store.get("a/o/1").await.unwrap().unwrap(), b"one");
         }
+    }
+
+    /// Puts racing at one key (two shippers of one object, say) each end
+    /// stored, the same, or refused, and the bytes a put stored are the ones
+    /// that stay there: no put changes another's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_concurrent_directory_put_keeps_acknowledged_bytes() {
+        let base = tempdir("racing");
+        let store = Arc::new(Dir(base.clone()));
+        for round in 0..40 {
+            let key = format!("a/o/{round:020}.tar");
+            let puts: Vec<_> = (0..8u8)
+                .map(|i| {
+                    let (store, key) = (store.clone(), key.clone());
+                    tokio::spawn(async move { (store.put(&key, vec![i; 256 << 10]).await, i) })
+                })
+                .collect();
+            let mut stored = vec![];
+            for put in puts {
+                match put.await.unwrap() {
+                    (Ok(Put::Stored), i) => stored.push(i),
+                    (Ok(Put::Conflict), _) => {}
+                    (Ok(Put::Same), i) => panic!("round {round}: put {i} found its own bytes"),
+                    (Err(e), i) => panic!("round {round}: put {i} failed: {e}"),
+                }
+            }
+            assert_eq!(stored.len(), 1, "round {round}: stored by {stored:?}");
+            let kept = store.get(&key).await.unwrap().unwrap();
+            assert!(kept == vec![stored[0]; 256 << 10], "round {round}: put {} stored, the key holds {}'s bytes", stored[0], kept[0]);
+        }
+        let left: Vec<_> = std::fs::read_dir(base.join("a/o")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left.len(), 40, "no temporary files are left: {left:?}");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// With leases, a node that isn't the holder ships a version only while
