@@ -30,7 +30,7 @@ node.
 | [reminders](../examples/reminders) | A-26 | acting on time without alarms: an external tick or client polling, each reminder fired once | 3.3 |
 | [todos](../examples/todos) | A-23 | offline-first sync: field-level merges, reported conflicts, retries that apply nothing twice | 2.1 |
 | [webhooks](../examples/webhooks) | A-7 | HMAC-verified webhooks answered at once, relayed after the answer (`after`), retried with backoff; egress allowlist | 3.0 |
-| [gateway](../examples/gateway) | A-17 | per-user token quotas in front of a streaming API: reserve before streaming, refund after, so cut streams aren't free | 3.7 |
+| [gateway](../examples/gateway) | A-17 | per-user token quotas in front of a streaming API: reserve before streaming, refund after a verified finish (`[DONE]`, body whole), so cut streams aren't free; events parsed across reads | 3.7 |
 | [feeds](../examples/feeds) | A-18 | a feed object as a shared cache: conditional GETs, items kept once; readers fan in through calls | 1.6 |
 | [oauth](../examples/oauth) | A-14 | GitHub sign-in: one-time state bound to the starting browser by a `__Host-` nonce cookie, token exchange over egress, cookies only the user's object accepts, `auth` vouching for sessions (W-602) | 0.6 |
 
@@ -148,3 +148,7 @@ Each with a `review_*` test that failed before it and passes after.
   (as a panic in Rust's `after` work does), so the host rolls back what
   the work wrote after the answer instead of committing it; the answer and
   the handler's own writes, committed when it was sent, stand.
+- **D5** gateway: Server-Sent Events parsed across reads (an event split
+  between HTTP chunks was zero tokens, so a split stream was refunded in
+  full); refunds only after `[DONE]` and a whole body, by the upstream's
+  `usage` when it reports one.

@@ -1324,9 +1324,12 @@ async fn webhooks_verify_answer_then_relay_with_retries() {
 }
 
 /// A completion API on loopback: a prompt `n N ms M` streams N tokens as
-/// Server-Sent Events, one every M ms, then `[DONE]`; `cut N` streams N
+/// Server-Sent Events, one every M ms, then `[DONE]` (`… nodone`: not,
+/// `… usage K`: after an event reporting K tokens used); `cut N` streams N
 /// and then breaks the connection (a chunked body with no last chunk);
-/// `fail` is a 500. It records each request's authorization header.
+/// `split N` streams N and `[DONE]`, each event in three HTTP chunks 20 ms
+/// apart (the first cut inside its `data: ` prefix, the second anywhere
+/// after); `fail` is a 500. It records each request's authorization header.
 async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let keys = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1340,6 +1343,22 @@ async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
             let body = http_body_util::BodyExt::collect(req.into_body()).await.unwrap().to_bytes();
             let prompt = serde_json::from_slice::<Value>(&body).unwrap()["prompt"].as_str().unwrap().to_string();
             let words: Vec<&str> = prompt.split(' ').collect();
+            if let ["split", n] = words[..] {
+                let n: usize = n.parse().unwrap();
+                let events = (0..n).map(|i| format!("data: {{\"token\":\"t{i}\"}}\n\n")).chain(["data: [DONE]\n\n".to_string()]);
+                let mut pieces = vec![];
+                for (i, e) in events.enumerate() {
+                    let a = 1 + i % 6;
+                    let b = a + 1 + (i * 7) % (e.len() - a - 1);
+                    pieces.extend([e[..a].to_string(), e[a..b].to_string(), e[b..].to_string()]);
+                }
+                let pieces = futures::stream::iter(pieces).then(|p| async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok::<_, nanovm::object::BoxError>(http_body::Frame::data(bytes::Bytes::from(p)))
+                });
+                let body = http_body_util::BodyExt::boxed_unsync(http_body_util::StreamBody::new(pieces));
+                return http::Response::builder().header("content-type", "text/event-stream").body(body).unwrap();
+            }
             if let ["cut", n] = words[..] {
                 let n: u32 = n.parse().unwrap();
                 let tokens = futures::stream::unfold(0, move |i| async move {
@@ -1353,15 +1372,23 @@ async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
                 let body = http_body_util::BodyExt::boxed_unsync(http_body_util::StreamBody::new(tokens));
                 return http::Response::builder().header("content-type", "text/event-stream").body(body).unwrap();
             }
-            let ["n", n, "ms", ms] = words[..] else { return nanovm::object::error_response(500, "scripted", "fail") };
+            let ["n", n, "ms", ms, ref then @ ..] = words[..] else { return nanovm::object::error_response(500, "scripted", "fail") };
             let (n, ms): (u32, u64) = (n.parse().unwrap(), ms.parse().unwrap());
-            let tokens = futures::stream::unfold(0, move |i| async move {
-                if i > n {
-                    return None;
+            let last = match then {
+                ["nodone"] => None,
+                ["usage", k] => Some(format!("data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":{k}}}}}\n\ndata: [DONE]\n\n")),
+                _ => Some("data: [DONE]\n\n".to_string()),
+            };
+            let tokens = futures::stream::unfold(0, move |i| {
+                let last = last.clone();
+                async move {
+                    if i > n || (i == n && last.is_none()) {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    let event = if i == n { last.unwrap() } else { format!("data: {{\"token\":\"t{i}\"}}\n\n") };
+                    Some((Ok::<_, nanovm::object::BoxError>(http_body::Frame::data(bytes::Bytes::from(event))), i + 1))
                 }
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                let event = if i == n { "data: [DONE]\n\n".to_string() } else { format!("data: {{\"token\":\"t{i}\"}}\n\n") };
-                Some((Ok::<_, nanovm::object::BoxError>(http_body::Frame::data(bytes::Bytes::from(event))), i + 1))
             });
             let body = http_body_util::BodyExt::boxed_unsync(http_body_util::StreamBody::new(tokens));
             http::Response::builder().header("content-type", "text/event-stream").body(body).unwrap()
@@ -1437,6 +1464,32 @@ async fn gateway_streams_completions_within_quotas() {
     assert_eq!(usage(&app).await, 305);
     let app = app.restart().await;
     assert_eq!(usage(&app).await, 305);
+}
+
+/// examples/gateway: a token's event split across the upstream's HTTP
+/// chunks (as TCP may split it anywhere) is still a token. The gateway reads
+/// Server-Sent Events across reads, and refunds only what a stream that
+/// verifiably finished (`[DONE]`, and its body whole) didn't use, by the
+/// upstream's own count if it gives one.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_gateway_counts_tokens_split_across_http_chunks() {
+    let (api, _) = llm().await;
+    let patch = json!({
+        "limits": {"egress": [api], "post_return_timeout_ms": 5000},
+        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "1000", "max_tokens": "100"},
+    });
+    let app = Local::start("gateway", patch);
+    let usage = async || app.send("GET", "/ann/usage", &[], "").await.json()["used"].as_i64().unwrap();
+    let res = app.send("POST", "/ann/complete", &[], json!({"prompt": "split 5"}).to_string()).await;
+    assert_eq!(res.status, 200);
+    let text = res.text();
+    assert!(text.matches("data: {\"token\"").count() == 5 && text.ends_with("data: [DONE]\n\n"), "passed on as sent: {text:?}");
+    assert_eq!(usage().await, 5, "5 tokens used, 95 of the 100 reserved given back");
+    let complete = async |prompt: &str| app.send("POST", "/ann/complete", &[], json!({"prompt": prompt}).to_string()).await.status;
+    assert_eq!(complete("n 3 ms 0 nodone").await, 200);
+    assert_eq!(usage().await, 105, "no [DONE], not known to be finished: the reservation stands");
+    assert_eq!(complete("n 3 ms 0 usage 7").await, 200);
+    assert_eq!(usage().await, 112, "the upstream's count, not the events seen");
 }
 
 /// Feeds on loopback: `/rss` and `/atom` serve the documents in `docs`
