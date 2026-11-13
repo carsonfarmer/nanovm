@@ -210,13 +210,19 @@ impl QuotaGuard {
     /// a commit waits for the disk, which blocked the worker thread and every
     /// object it runs, so a node had no more commits in flight than threads.
     /// A request that changed nothing commits here: handing it over cost a
-    /// read 130 µs of CPU.
+    /// read 130 µs of CPU. The thread, not this future, holds the volume
+    /// until the commit ends: a request killed at its deadline drops this.
     pub async fn commit(&self) -> std::io::Result<()> {
         if !self.0.lock().journal.changed() {
             return self.0.lock().journal.commit();
         }
-        let q = self.0.clone();
-        tokio::task::spawn_blocking(move || q.lock().journal.commit()).await?
+        let (q, obj) = (self.0.clone(), self.0.lock().obj.clone());
+        let held = obj.storage().await;
+        tokio::task::spawn_blocking(move || {
+            let _held = held;
+            q.lock().journal.commit()
+        })
+        .await?
     }
 
     pub fn adjust(&self, bytes: i64, files: i64) {

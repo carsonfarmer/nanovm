@@ -2900,6 +2900,44 @@ async fn a_failed_requests_writes_are_rolled_back() {
     assert_eq!(read().await, serde_json::json!({"file": "three", "key": "three"}));
 }
 
+/// A commit outlives a request killed at its deadline (here it waits for
+/// the one blocking thread past the post-return deadline), and it still owns
+/// the volume: the object's next instance recovers only once it has
+/// finished. Before, that instance recovered at once, and the key the late
+/// commit then wrote voided the records of the next request, which failed
+/// and kept its writes (S1). The killed request's own outcome is the
+/// commit's, as for any commit whose answer is lost: here it committed.
+#[test]
+fn review_cancelled_commit_cannot_outlive_recovery() {
+    let rt = tokio::runtime::Builder::new_multi_thread().max_blocking_threads(1).enable_all().build().unwrap();
+    rt.block_on(async {
+        let node = node("review_cancelled_commit_cannot_outlive_recovery", "hostile", 8);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let busy = tokio::task::spawn_blocking(move || held.recv());
+        let r = get(&node, "c", "/commit?v=one").await;
+        assert_eq!(r.status, 504, "{}", r.body);
+        let mut failing = tokio::spawn({
+            let node = node.clone();
+            async move { get(&node, "c", "/commit?v=two&then=error").await }
+        });
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut failing).await.ok();
+        let waited = early.is_none();
+        release.send(()).unwrap();
+        busy.await.unwrap().unwrap();
+        // Time for a late commit to end, were it still running.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let failed = match early {
+            Some(r) => r.unwrap(),
+            None => failing.await.unwrap(),
+        };
+        assert_eq!(failed.status, 500, "{}", failed.body);
+        let r = get(&node, "c", "/commit").await;
+        assert_eq!(r.json(), serde_json::json!({"file": "one", "key": "one"}), "a failed request's writes stayed");
+        assert!(waited, "the next instance started while the commit was still running");
+        node.shutdown().await;
+    });
+}
+
 /// The journal is out of a guest's reach, and commits work with a relative
 /// `data_dir` (the demo's).
 #[tokio::test(flavor = "multi_thread")]

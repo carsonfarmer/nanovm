@@ -96,6 +96,8 @@ pub struct ObjShared {
     pub context: Mutex<opentelemetry::Context>,
     /// Set by the epoch callback when it makes the guest yield.
     yielding: AtomicBool,
+    /// Held by a commit, which can outlive the instance it was for.
+    storage: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ObjShared {
@@ -186,6 +188,13 @@ impl ObjShared {
     /// and commits (and captures) are the node's work, not the guest's.
     pub fn uncharge(&self, t0: u64) {
         self.poll_start_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Relaxed);
+    }
+
+    /// Holds the object's volume for a commit until it ends, whatever comes
+    /// of the request it is for: one killed at its deadline leaves it
+    /// running with the disk (see `run`).
+    pub async fn storage(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.storage.clone().lock_owned().await
     }
 
     /// CPU charged to the current request, including the poll in progress.
@@ -598,7 +607,13 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         crate::telemetry::duration(&mut job.span, "nanovm.instantiate.duration_ms", t0);
         match started {
             Ok((store, svc)) => {
-                match serve(&node, &app, &shared, store, svc, job, &mut rx).await {
+                let exit = serve(&node, &app, &shared, store, svc, job, &mut rx).await;
+                // A commit its request's deadline cut short still owns the
+                // volume. Recovering it for the next instance (or another
+                // actor's, once this one retires) before the commit ends let
+                // the key it then wrote void that instance's records (S1).
+                drop(shared.storage().await);
+                match exit {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
                     Exit::Reset if shared.holds() => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),

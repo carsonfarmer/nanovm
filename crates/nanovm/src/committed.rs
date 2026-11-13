@@ -8,14 +8,26 @@
 //! staged is `<sequence>.<decision>.staged` beside them, where `<decision>`
 //! names the journal key its commit replaces: recovery discards it while
 //! that is still the journal's key, and publishes it once it isn't.
+//!
+//! Main's format (1) is read too: whole volumes, without an epoch, so a
+//! node upgraded from it keeps its history. Each is a snapshot, and the
+//! changes this format adds apply to the last. Main staged a version as
+//! `~journal/<object>/capture`, decided once main deleted the undo log:
+//! [`adopt`] publishes one left there.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, FileTimes};
 use std::io::{self, ErrorKind, Read, Write};
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
+use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, fchmod, mkdirat, openat, statat, unlinkat};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -60,6 +72,17 @@ struct Manifest {
     listed: BTreeMap<String, BTreeSet<(String, bool)>>,
     whole: BTreeSet<String>,
     patched: BTreeMap<String, (u64, Vec<(u64, u64)>)>,
+}
+
+/// How main's format (1) names its version.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Legacy {
+    format: u32,
+    app: String,
+    object: String,
+    sequence: u64,
+    parent: String,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -261,6 +284,39 @@ pub(super) fn publish(out: &Path, key: &[u8; 8]) -> io::Result<u64> {
     Ok(next)
 }
 
+/// Publishes the version main's format left staged in the journal at
+/// `journal`, if any, as main would have: its log is gone (or is this
+/// format's, made after), which decided its commit.
+pub(super) fn adopt(journal: &Path, out: &Path, obj: &ObjShared) -> io::Result<()> {
+    let staged = journal.join("capture");
+    let file = match File::open(&staged) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        file => file?,
+    };
+    // The log's deletion may not be durable yet: make it so first.
+    sync(journal)?;
+    let version = read_version(&mut tar::Archive::new(file).entries()?)?;
+    if version.format != 1 || version.app != *obj.app || version.object != *obj.id {
+        return Err(invalid("wrong capture identity"));
+    }
+    let (last, ..) = head(out)?;
+    let target = out.join(filename(version.sequence));
+    if version.sequence == last {
+        if digest(&staged)? != digest(&target)? {
+            return Err(invalid("conflicting committed version"));
+        }
+    } else {
+        let parent = if last == 0 { String::new() } else { digest(&out.join(filename(last)))? };
+        if last + 1 != version.sequence || version.parent != parent {
+            return Err(invalid("out-of-order committed version"));
+        }
+        fs::hard_link(&staged, &target)?;
+    }
+    sync(out)?;
+    fs::remove_file(&staged)?;
+    sync(journal)
+}
+
 /// Settles what commits left staged when their instance stopped, given the
 /// journal's key `key`: a version staged under it never decided and is
 /// discarded. When the journal has records to roll back (`undecided`), the
@@ -325,36 +381,92 @@ fn read_version<R: Read>(entries: &mut tar::Entries<R>) -> io::Result<Version> {
     }
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
-    let version: Version = serde_json::from_slice(&bytes)?;
-    if version.format != FORMAT || version.sequence == 0 {
+    let version = match serde_json::from_slice::<serde_json::Value>(&bytes)?["format"].as_u64() {
+        Some(1) => {
+            let Legacy { format, app, object, sequence, parent } = serde_json::from_slice(&bytes)?;
+            Version { format, app, object, sequence, epoch: 0, parent, snapshot: true }
+        }
+        _ => serde_json::from_slice::<Version>(&bytes)?,
+    };
+    if ![1, FORMAT].contains(&version.format) || version.sequence == 0 {
         return Err(invalid("wrong capture identity"));
     }
     Ok(version)
 }
 
-/// `path`, which a version names, under `root`, if it can't leave it.
-fn under(root: &Path, path: &Path) -> io::Result<PathBuf> {
+/// `path`, which a version names, if each part of it is a name.
+fn names(path: &Path) -> io::Result<&Path> {
     match path.components().all(|c| matches!(c, Component::Normal(_))) {
-        true => Ok(root.join(path)),
+        true => Ok(path),
         false => Err(invalid("unsafe path in a committed version")),
     }
 }
 
-fn remove(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(md) if md.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+const DIR: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+
+/// The directory `path` names in `root`, opened a name at a time and never
+/// through a symlink, as journal recovery reaches entries, so nothing it
+/// reaches is outside; made where missing if `make`.
+fn dir_at(root: &OwnedFd, path: &Path, make: bool) -> io::Result<OwnedFd> {
+    let mut dir = openat(root, ".", DIR, Mode::empty())?;
+    for name in names(path)? {
+        if make && let Err(e) = mkdirat(&dir, name, Mode::from_raw_mode(0o777)) && e != Errno::EXIST {
+            return Err(e.into());
+        }
+        dir = openat(&dir, name, DIR, Mode::empty())?;
+    }
+    Ok(dir)
+}
+
+/// The directory holding what `path` names in `root`, as [`dir_at`] opens
+/// it, and its name there.
+fn parent_at<'a>(root: &OwnedFd, path: &'a Path) -> io::Result<(OwnedFd, &'a OsStr)> {
+    let name = names(path)?.file_name().ok_or_else(|| invalid("unsafe path in a committed version"))?;
+    Ok((dir_at(root, path.parent().expect("named"), false)?, name))
+}
+
+/// The names in `dir`, each with whether it is a directory.
+fn listing(dir: &OwnedFd) -> io::Result<Vec<(OsString, bool)>> {
+    let mut out = vec![];
+    for entry in rustix::fs::Dir::read_from(dir)? {
+        let entry = entry?;
+        let name = OsStr::from_bytes(entry.file_name().to_bytes());
+        let kind = match entry.file_type() {
+            FileType::Unknown => FileType::from_raw_mode(statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?.st_mode),
+            kind => kind,
+        };
+        if name != "." && name != ".." {
+            out.push((name.to_owned(), kind == FileType::Directory));
+        }
+    }
+    Ok(out)
+}
+
+/// Removes `name` from `dir`, and all in it, never through a symlink.
+fn remove_at(dir: &OwnedFd, name: &OsStr) -> io::Result<()> {
+    match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => Ok(()),
+        Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Directory => {
+            let inner = openat(dir, name, DIR, Mode::empty())?;
+            for (name, _) in listing(&inner)? {
+                remove_at(&inner, &name)?;
+            }
+            Ok(unlinkat(dir, name, AtFlags::REMOVEDIR)?)
+        }
+        Ok(_) => Ok(unlinkat(dir, name, AtFlags::empty())?),
+        Err(e) => Err(e.into()),
     }
 }
 
 /// Applies the version in `file` to the volume at `root`: a snapshot to an
 /// empty directory, a change to what the version before left. Returns it.
+/// It holds files and directories only, and everything it names is reached
+/// through `root`'s descriptor as [`dir_at`] does (S4).
 pub fn apply(root: &Path, file: &Path) -> io::Result<Version> {
     let mut archive = tar::Archive::new(File::open(file)?);
     let mut entries = archive.entries()?;
     let version = read_version(&mut entries)?;
+    let root = openat(CWD, root, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
     let mut manifest = Manifest::default();
     if !version.snapshot {
         let mut entry = entries.next().ok_or_else(|| invalid("missing changes"))??;
@@ -363,28 +475,53 @@ pub fn apply(root: &Path, file: &Path) -> io::Result<Version> {
         }
         manifest = serde_json::from_reader(&mut entry)?;
         for (dir, keep) in &manifest.listed {
-            let dir = under(root, Path::new(dir))?;
-            fs::create_dir_all(&dir)?;
-            for entry in fs::read_dir(&dir)? {
-                let entry = entry?;
-                if !keep.contains(&(name(Path::new(&entry.file_name()))?, entry.file_type()?.is_dir())) {
-                    remove(&entry.path())?;
+            let dir = dir_at(&root, Path::new(dir), true)?;
+            for (entry, is_dir) in listing(&dir)? {
+                if !keep.contains(&(name(Path::new(&entry))?, is_dir)) {
+                    remove_at(&dir, &entry)?;
                 }
             }
         }
         for path in &manifest.whole {
-            remove(&under(root, Path::new(path))?)?;
+            match parent_at(&root, Path::new(path)) {
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                at => at.and_then(|(dir, name)| remove_at(&dir, name))?,
+            }
         }
     }
     for entry in entries {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
+        let (kind, mode, mtime) = (entry.header().entry_type(), entry.header().mode()? & 0o777, entry.header().mtime()?);
+        let mode = Mode::from_raw_mode(mode);
+        if !kind.is_file() && !(kind.is_dir() && path.starts_with("data")) {
+            return Err(invalid("unsupported entry type in a committed version"));
+        }
         if let Ok(rest) = path.strip_prefix("data") {
-            entry.unpack(under(root, rest)?)?;
+            if kind.is_dir() {
+                fchmod(dir_at(&root, rest, true)?, mode)?;
+                continue;
+            }
+            // A new file, not one already there under another name.
+            let (dir, name) = parent_at(&root, rest)?;
+            if let Err(e) = unlinkat(&dir, name, AtFlags::empty()) && e != Errno::NOENT {
+                return Err(e.into());
+            }
+            let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let mut file = File::from(openat(&dir, name, flags, mode)?);
+            io::copy(&mut entry, &mut file)?;
+            fchmod(&file, mode)?;
+            let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(mtime.max(1));
+            file.set_times(FileTimes::new().set_accessed(mtime).set_modified(mtime))?;
         } else if let Some((rest, (len, ranges))) =
             path.strip_prefix("patch").ok().and_then(|p| Some((p, manifest.patched.get(p.to_str()?)?)))
         {
-            let file = File::options().write(true).open(under(root, rest)?)?;
+            let (dir, name) = parent_at(&root, rest)?;
+            let file = File::from(openat(&dir, name, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?);
+            let md = file.metadata()?;
+            if !md.is_file() || md.nlink() != 1 {
+                return Err(invalid("a patched file that is not one file"));
+            }
             file.set_len(*len)?;
             for &(at, n) in ranges {
                 let mut bytes = vec![0; n as usize];
@@ -422,10 +559,12 @@ pub fn restore(dir: &Path, root: &Path) -> io::Result<u64> {
     let mut parent = None;
     for &n in versions.iter().filter(|&&n| n >= snapshot) {
         let path = dir.join(filename(n));
-        let version = apply(root, &path)?;
+        // Checked before it is applied.
+        let version = read_version(&mut tar::Archive::new(File::open(&path)?).entries()?)?;
         if version.sequence != n || parent.as_ref().is_some_and(|p| *p != version.parent) {
             return Err(invalid("broken chain of committed versions"));
         }
+        apply(root, &path)?;
         parent = Some(digest(&path)?);
     }
     Ok(snapshot.max(*versions.last().expect("a snapshot is one")))

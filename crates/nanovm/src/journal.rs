@@ -617,13 +617,19 @@ impl Journal {
 /// operations may be skipped.
 fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[u8; 8]>> {
     let log = match std::fs::read(dir.join(LOG)) {
-        Ok(log) => log,
-        Err(e) if e.kind() == ErrorKind::NotFound => return clear(dir).map(|()| None),
+        Ok(log) => Some(log),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
-    let Some(key) = log.strip_prefix(MAGIC).and_then(|k| k.get(..8)?.try_into().ok()) else {
+    // A log in another format, as main's left undecided, is refused, with
+    // what main staged under it. Without one, what main staged is decided:
+    // it is published before anything here is cleared (S2).
+    let key = log.as_ref().map(|log| log.strip_prefix(MAGIC).and_then(|k| k.get(..8)?.try_into().ok()));
+    if key == Some(None) {
         return Err(std::io::Error::new(ErrorKind::InvalidData, "not a journal log"));
-    };
+    }
+    committed::adopt(dir, &committed::directory(base, dir), obj)?;
+    let (Some(log), Some(Some(key))) = (log, key) else { return clear(dir).map(|()| None) };
     let file = File::options().write(true).open(dir.join(LOG))?;
     let undos = decode(&log, &key);
     // What commits staged settles first; a key seen here may not be durable yet.
@@ -1133,15 +1139,22 @@ mod tests {
         assert_eq!(archive_tree(&v, 2), tree(&v));
     }
 
-    /// A version can't name a path outside the volume it is applied to,
-    /// whether to remove, list or write it.
+    /// A version can't reach outside the volume it is applied to, to list,
+    /// remove, write or patch: not by `..`, nor through a symlink there, as
+    /// each name is opened without following one (S4). These were format 2,
+    /// refused for that alone, and each overwrote the last: only one ran.
     #[test]
     fn a_version_cannot_write_outside_its_root() {
         let base = volume().parent().unwrap().to_path_buf();
         std::fs::write(base.join("victim"), "kept").unwrap();
+        std::fs::create_dir(base.join("out")).unwrap();
+        std::fs::write(base.join("out/v"), "kept").unwrap();
         let root = base.join("root");
         std::fs::create_dir(&root).unwrap();
-        let version = |changes: &str, entry: Option<&[u8]>| {
+        // None a version makes, but one in the root must not be followed.
+        std::os::unix::fs::symlink(base.join("out"), root.join("l")).unwrap();
+        let mut n = 0;
+        let mut version = |changes: &str, entry: Option<&[u8]>| {
             let mut tar = tar::Builder::new(vec![]);
             let mut put = |name: &[u8], bytes: &[u8]| {
                 let mut header = tar::Header::new_gnu();
@@ -1151,27 +1164,187 @@ mod tests {
                 header.set_cksum();
                 tar.append(&header, bytes).unwrap();
             };
-            let id = r#"{"format":2,"app":"app","object":"o","sequence":2,"epoch":0,"parent":"","snapshot":false}"#;
+            let id = r#"{"format":3,"app":"app","object":"o","sequence":2,"epoch":0,"parent":"","snapshot":false}"#;
             put(b"nanovm.json", id.as_bytes());
             put(b"changes.json", changes.as_bytes());
             if let Some(name) = entry {
                 put(name, b"evil");
             }
-            let path = base.join("evil.tar");
+            n += 1;
+            let path = base.join(format!("evil{n}.tar"));
             std::fs::write(&path, tar.into_inner().unwrap()).unwrap();
             path
         };
         let empty = r#"{"listed":{},"whole":[],"patched":{}}"#;
-        for path in [
-            version(r#"{"listed":{"..":[]},"whole":[],"patched":{}}"#, None),
-            version(r#"{"listed":{},"whole":["../victim"],"patched":{}}"#, None),
-            version(empty, Some(b"data/../victim")),
-            version(r#"{"listed":{},"whole":[],"patched":{"../victim":[1,[[0,4]]]}}"#, Some(b"patch/../victim")),
+        for (path, dots) in [
+            (version(r#"{"listed":{"..":[]},"whole":[],"patched":{}}"#, None), true),
+            (version(r#"{"listed":{},"whole":["../victim"],"patched":{}}"#, None), true),
+            (version(empty, Some(b"data/../victim")), true),
+            (version(r#"{"listed":{},"whole":[],"patched":{"../victim":[1,[[0,4]]]}}"#, Some(b"patch/../victim")), true),
+            (version(r#"{"listed":{"l":[]},"whole":[],"patched":{}}"#, None), false),
+            (version(r#"{"listed":{},"whole":["l/v"],"patched":{}}"#, None), false),
+            (version(empty, Some(b"data/l/v")), false),
+            (version(r#"{"listed":{},"whole":[],"patched":{"l/v":[4,[[0,4]]]}}"#, Some(b"patch/l/v")), false),
         ] {
             let e = committed::apply(&root, &path).err().expect("an unsafe version must be refused");
-            assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+            if dots {
+                assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+            }
             assert_eq!(std::fs::read(base.join("victim")).unwrap(), b"kept");
+            assert_eq!(std::fs::read(base.join("out/v")).unwrap(), b"kept", "{}: {e}", path.display());
         }
+    }
+
+    /// A version holds files and directories only. One with a symlink, a
+    /// hard link or a device is refused, and nothing outside the root it is
+    /// restored to changes. Before, a file under a symlink the version made
+    /// was written through it, and a later change patched what a hard link
+    /// named (S4).
+    #[test]
+    fn review_capture_symlink_cannot_escape_restore_root() {
+        use tar::EntryType::{Char, Directory, Fifo, Link, Regular, Symlink};
+        let base = volume().parent().unwrap().to_path_buf();
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "kept").unwrap();
+        let (dir, file) = (outside.to_str().unwrap(), victim.to_str().unwrap());
+        let patch = r#"{"listed":{},"whole":[],"patched":{"h":[4,[[0,4]]]}}"#;
+        let cases: [(&str, &[(&str, &[(&str, tar::EntryType, &str)])]); 4] = [
+            ("symlink", &[("", &[("data/l", Symlink, dir), ("data/l/victim", Regular, "evil")])]),
+            ("hardlink", &[("", &[("data/h", Link, file)]), (patch, &[("patch/h", Regular, "evil")])]),
+            ("char", &[("", &[("data/c", Char, "")])]),
+            ("fifo", &[("", &[("data/f", Fifo, "")])]),
+        ];
+        for (name, versions) in cases {
+            let history = base.join(name);
+            std::fs::create_dir(&history).unwrap();
+            let mut parent = String::new();
+            for (i, (changes, entries)) in versions.iter().enumerate() {
+                let mut tar = tar::Builder::new(vec![]);
+                let mut add = |path: &str, kind: tar::EntryType, data: &str| {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(kind);
+                    header.set_mode(0o644);
+                    if matches!(kind, Link | Symlink) {
+                        header.set_size(0);
+                        tar.append_link(&mut header, path, data).unwrap();
+                    } else {
+                        header.set_size(data.len() as u64);
+                        tar.append_data(&mut header, path, data.as_bytes()).unwrap();
+                    }
+                };
+                let (n, snapshot) = (i + 1, changes.is_empty());
+                let id = format!(r#"{{"format":3,"app":"app","object":"o","sequence":{n},"epoch":0,"parent":"{parent}","snapshot":{snapshot}}}"#);
+                add("nanovm.json", Regular, &id);
+                match snapshot {
+                    true => add("data", Directory, ""),
+                    false => add("changes.json", Regular, changes),
+                }
+                for &(path, kind, data) in *entries {
+                    add(path, kind, data);
+                }
+                let path = history.join(format!("{n:020}.tar"));
+                std::fs::write(&path, tar.into_inner().unwrap()).unwrap();
+                parent = committed::digest(&path).unwrap();
+            }
+            let e = committed::restore(&history, &base.join(format!("root-{name}"))).err();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"kept", "{name}");
+            assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "{name}");
+            let e = e.expect(name);
+            assert_eq!(e.kind(), ErrorKind::InvalidData, "{name}: {e}");
+        }
+    }
+
+    /// What main's format (1) left for a commit of `v` as version
+    /// `sequence`: the whole volume, staged in the journal as `capture`, the
+    /// tar its `committed::prepare` wrote, byte for byte; then, if
+    /// `finished`, published as its `committed::finish` did. Main deleted
+    /// the undo log before either: that decided the commit.
+    fn legacy(v: &Path, sequence: u64, finished: bool) -> PathBuf {
+        let base = v.parent().unwrap();
+        let (journal, out) = (base.join("~journal/o"), base.join("~committed/o"));
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let parent = match sequence {
+            1 => String::new(),
+            n => committed::digest(&out.join(format!("{:020}.tar", n - 1))).unwrap(),
+        };
+        let id = format!(r#"{{"format":1,"app":"app","object":"o","sequence":{sequence},"parent":"{parent}"}}"#);
+        let staged = journal.join("capture");
+        let mut archive = tar::Builder::new(File::options().write(true).create_new(true).open(&staged).unwrap());
+        archive.follow_symlinks(false);
+        archive.sparse(false);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(id.len() as u64);
+        header.set_mode(0o600);
+        archive.append_data(&mut header, "nanovm.json", id.as_bytes()).unwrap();
+        archive.append_dir("data", v).unwrap();
+        let mut pending = vec![v.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                archive.append_path_with_name(&path, Path::new("data").join(path.strip_prefix(v).unwrap())).unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        archive.into_inner().unwrap();
+        if finished {
+            std::fs::hard_link(&staged, out.join(format!("{sequence:020}.tar"))).unwrap();
+            std::fs::remove_file(&staged).unwrap();
+        }
+        staged
+    }
+
+    /// A node upgraded from main keeps what main committed: a version
+    /// staged under a commit main decided but hadn't published is published
+    /// as main would have, not cleared with the journal's leftovers, which
+    /// lost the only copy of a commit the volume holds (S2). Main's history
+    /// goes on in this format: its whole volumes are snapshots, so the last
+    /// is what the changes after it apply to.
+    #[test]
+    fn review_upgrade_preserves_decided_legacy_capture() {
+        let cap = CaptureConfig { snapshot_every: 4, ..Default::default() };
+        let v = volume();
+        let out = v.parent().unwrap().join("~committed/o");
+        legacy(&v, 1, true);
+        std::fs::write(v.join("a"), "main's second commit").unwrap();
+        std::fs::write(v.join("n"), "new in it").unwrap();
+        let staged = std::fs::read(legacy(&v, 2, false)).unwrap();
+        let mut j = captured(&v, &cap).unwrap();
+        let second = out.join(format!("{:020}.tar", 2));
+        assert_eq!(std::fs::read(&second).expect("main's decided version is published"), staged);
+        assert!(!v.parent().unwrap().join("~journal/o/capture").exists());
+        assert_eq!(committed::epoch(&second).unwrap(), 0, "main had no leases");
+        assert_eq!(archive_tree(&v, 2), tree(&v));
+        // Changes to main's last version, then a snapshot (5), then changes.
+        for n in 3..=7 {
+            write(&mut j, &v, "a", 0, format!("v{n}").as_bytes());
+            j.creating(&v.join(format!("n{n}"))).unwrap();
+            std::fs::write(v.join(format!("n{n}")), "new").unwrap();
+            j.commit().unwrap();
+            assert_eq!(archive_tree(&v, n), tree(&v), "version {n}");
+        }
+    }
+
+    /// What main left undecided (its undo log is there) can't be rolled
+    /// back in this format: the volume is refused, and the log and what
+    /// main staged are kept for main to settle.
+    #[test]
+    fn an_older_binarys_undecided_commit_is_refused_and_kept() {
+        let v = volume();
+        let journal = v.parent().unwrap().join("~journal/o");
+        legacy(&v, 1, false);
+        // A record as main wrote one: "remove o/n", unsigned.
+        let log: Vec<u8> = [&[2u8][..], b"o/n"].iter().flat_map(|f| [&(f.len() as u64).to_le_bytes()[..], f].concat()).collect();
+        std::fs::write(journal.join(LOG), &log).unwrap();
+        let e = captured(&v, &CaptureConfig::default()).err().expect("refused");
+        assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        assert_eq!(std::fs::read(journal.join(LOG)).unwrap(), log);
+        assert!(journal.join("capture").exists());
     }
 
     /// A small change to a big file is captured as the bytes that changed.
