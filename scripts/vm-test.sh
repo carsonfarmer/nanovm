@@ -15,7 +15,7 @@
 set -e
 cd "$(dirname "$0")/.."
 N=$(pwd)
-TESTS=${1:-workers_are_placed,worker_memory,worker_cpu,spare_engine_memory,jail_blocks_escapes}
+TESTS=${1:-workers_are_placed,workers_run_under_host_sized,worker_memory,worker_cpu,spare_engine_memory,jail_blocks_escapes}
 [ "$TESTS" = all ] && TESTS=
 V=$N/target/vm
 mkdir -p "$V"

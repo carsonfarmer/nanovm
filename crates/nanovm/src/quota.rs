@@ -347,10 +347,11 @@ impl QuotaGuard {
 }
 
 impl Drop for Inner {
-    /// What the volume holds is its app's while the object has no instance;
-    /// what it held in `/tmp` goes with the instance.
+    /// What the volume holds is its app's while the object has no instance,
+    /// with what a rollback of a failed request would put back; what it
+    /// held in `/tmp` goes with the instance.
     fn drop(&mut self) {
-        let held = usage(&self.volume).map_or(self.bytes, |(bytes, _)| bytes);
+        let held = usage(&self.volume).map_or(self.bytes, |(bytes, _)| bytes + self.journal.removed());
         self.disk.park(&self.obj.id, self.bytes, held);
     }
 }
@@ -975,8 +976,8 @@ mod tests {
         std::fs::write(objects.join("a/old"), [0; 4]).unwrap();
         std::fs::create_dir_all(objects.join("c")).unwrap();
         std::fs::write(objects.join("c/old"), [0; 6]).unwrap();
-        std::fs::create_dir_all(objects.join("~journal/a")).unwrap();
-        std::fs::write(objects.join("~journal/a/log"), [0; 100]).unwrap();
+        std::fs::create_dir_all(objects.join("~journal/z")).unwrap();
+        std::fs::write(objects.join("~journal/z/log"), [0; 100]).unwrap();
         let disk = Arc::new(Disk::open(&objects, 1, 0).unwrap());
         assert_eq!((disk.used.load(Relaxed), disk.max), (10, 1 << 20));
         let guard = |id: &str| {
@@ -1002,6 +1003,14 @@ mod tests {
         std::fs::write(objects.join("a/old"), [0; 40]).unwrap();
         let a = guard("a");
         assert_eq!((disk.used.load(Relaxed), a.usage().0), (40 + 6 + 2, 40));
+        // A removal its request didn't commit is rolled back by the next
+        // instance, so it is counted until then.
+        a.unlink(&objects.join("a/old"), 40).unwrap();
+        assert_eq!(disk.used.load(Relaxed), 6 + 2);
+        drop(a);
+        assert_eq!(disk.used.load(Relaxed), 40 + 6 + 2);
+        let a = guard("a");
+        assert_eq!((disk.used.load(Relaxed), a.usage().0), (40 + 6 + 2, 40), "rolled back");
         std::fs::remove_dir_all(objects).unwrap();
         std::fs::remove_dir_all(scratch).unwrap();
     }

@@ -522,6 +522,12 @@ impl Journal {
         self.log.is_some()
     }
 
+    /// Bytes of the files the current request removed, which rolling it
+    /// back puts back in the volume.
+    pub fn removed(&self) -> u64 {
+        self.held.1
+    }
+
     pub fn check(&self) -> std::io::Result<()> {
         if self.poisoned {
             return Err(std::io::Error::other("journal requires recovery"));

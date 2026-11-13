@@ -416,6 +416,19 @@ mod tests {
         assert_eq!((cfg.limits.cpu_ms, cfg.limits.memory_mb), (9, 64));
     }
 
+    /// A worker may use a quarter of the host's memory and all its cores
+    /// but one (on one core, that core); 0 still leaves a limit unset.
+    #[test]
+    fn worker_limits_are_sized_from_the_host() {
+        let w = WorkerLimits::default();
+        assert!(host_memory_mb() >= 64 && w.memory_mb == host_memory_mb() / 4, "{w:?}");
+        let cores = std::thread::available_parallelism().unwrap().get();
+        assert_eq!(w.cpus, cores.saturating_sub(1).max(1) as f64);
+        assert_eq!(w.pids, 0);
+        let off: NodeConfig = toml::from_str("[worker]\nmemory_mb = 0\ncpus = 0.0").unwrap();
+        assert_eq!((off.worker.memory_mb, off.worker.cpus), (0, 0.0));
+    }
+
     /// A misspelt key anywhere is an error rather than silently a default,
     /// and apps come from registries, not the config.
     #[test]

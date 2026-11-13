@@ -93,14 +93,8 @@ impl Gate {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 let Some(gate) = weak.upgrade() else { return };
-                if let Some(l) = &gate.clients {
-                    l.retain_recent();
-                    l.shrink_to_fit();
-                }
-                if let Some(l) = &gate.apps {
-                    l.retain_recent();
-                    l.shrink_to_fit();
-                }
+                for l in &gate.clients { l.retain_recent(); l.shrink_to_fit() }
+                for l in &gate.apps { l.retain_recent(); l.shrink_to_fit() }
             }
         });
         Ok(gate)
@@ -136,47 +130,37 @@ impl Gate {
     /// trusted) to `app` (none: not known yet), or refuses it with 429 when
     /// either's rate is spent.
     pub fn admit(&self, client: Option<IpAddr>, app: Option<&String>) -> Result<(), Response<RespBody>> {
-        let Some(client) = client else { return Ok(()) };
-        let spent = match app {
-            None => self.clients.as_ref().map(|l| l.check_key(&client).map_err(|e| ("client", e))),
-            Some(app) => self.apps.as_ref().map(|l| l.check_key(app).map_err(|e| ("app", e))),
+        let spent = match (client, app) {
+            (None, _) => return Ok(()),
+            (Some(client), None) => self.clients.as_ref().map(|l| l.check_key(&client).map_err(|e| ("client", e))),
+            (Some(_), Some(app)) => self.apps.as_ref().map(|l| l.check_key(app).map_err(|e| ("app", e))),
         };
-        match spent {
-            Some(Err((who, until))) => {
-                let why = format!("this {who} has sent more requests a second than it may; try again later");
-                Err(refusal(429, "rate-limited", &why, until.wait_time_from(Instant::now())))
-            }
-            _ => Ok(()),
-        }
+        let Some(Err((who, until))) = spent else { return Ok(()) };
+        let why = format!("this {who} has sent more requests a second than it may; try again later");
+        Err(refusal(429, "rate-limited", &why, until.wait_time_from(Instant::now())))
     }
 
-    /// One of `peer`'s connections, if it may open another; dropping it
-    /// closes the slot.
+    /// One of `peer`'s connections, if it may open another (a trusted peer
+    /// always may); dropping it frees the slot.
     fn hold(self: &Arc<Self>, peer: IpAddr) -> Option<Held> {
-        if self.trusts(peer) {
-            return Some(Held(None));
-        }
-        let peer = key(peer);
-        let mut open = self.open.lock();
-        let n = open.entry(peer).or_default();
-        if *n >= self.per_client {
-            return None;
-        }
-        *n += 1;
-        Some(Held(Some((self.clone(), peer))))
+        let (mut open, client) = (self.open.lock(), key(peer));
+        let n = open.entry(client).or_default();
+        (*n < self.per_client || self.trusts(peer)).then(|| {
+            *n += 1;
+            Held(self.clone(), client)
+        })
     }
 }
 
-struct Held(Option<(Arc<Gate>, IpAddr)>);
+struct Held(Arc<Gate>, IpAddr);
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let Some((gate, peer)) = self.0.take() else { return };
-        let mut open = gate.open.lock();
-        if let Some(n) = open.get_mut(&peer) {
-            *n -= 1;
-            if *n == 0 {
-                open.remove(&peer);
+        let mut open = self.0.open.lock();
+        if let std::collections::hash_map::Entry::Occupied(mut n) = open.entry(self.1) {
+            *n.get_mut() -= 1;
+            if *n.get() == 0 {
+                n.remove();
             }
         }
     }
@@ -295,8 +279,9 @@ mod tests {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let (a, b) = (g.hold(ip("192.0.2.1")).unwrap(), g.hold(ip("192.0.2.1")).unwrap());
         assert!(g.hold(ip("192.0.2.1")).is_none());
-        assert!(g.hold(ip("2001:db8::1")).is_some() && g.hold(ip("2001:db8::2")).is_some());
+        let held = (g.hold(ip("2001:db8::1")).unwrap(), g.hold(ip("2001:db8::2")).unwrap());
         assert!(g.hold(ip("2001:db8::3")).is_none(), "one /64");
+        drop(held);
         let trusted: Vec<_> = (0..10).map(|_| g.hold(ip("10.0.0.1")).unwrap()).collect();
         drop((a, trusted));
         let _c = g.hold(ip("192.0.2.1")).unwrap();
