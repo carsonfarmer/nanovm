@@ -152,3 +152,122 @@ Each with a `review_*` test that failed before it and passes after.
   between HTTP chunks was zero tokens, so a split stream was refunded in
   full); refunds only after `[DONE]` and a whole body, by the upstream's
   `usage` when it reports one.
+
+## Review 2 fixes (PR #2, `fix/r3-dev`)
+
+Each with a test that failed before it and passes after (both runs below).
+
+### Work after the answer: one model (D4 findings 1-4; N-710, N-711, N-712)
+
+The four findings showed that the semantics of work after the answer had
+not been pinned down. The model, now in README "Commits" and followed by
+both the JavaScript runtime and the Rust SDK:
+
+1. The answer stands once sent and is never replaced. It commits
+   everything written until the node takes it: the handler's writes and
+   what background work wrote meanwhile. A waitUntil promise's work starts
+   when the promise is made, and a streamed body's writer as the handler
+   returns, so what they write before the node takes the answer shares its
+   commit and stands if they later fail (finding 2: documented, and its
+   test asserts it). Rust's `after` work starts only once the answer is
+   out, so it never shares the answer's commit.
+2. What is written after the answer is a second commit, made once all of
+   the work is done, including work registered meanwhile (`waitUntil` from
+   waitUntil work, `after` from `after` work): the set is tracked until it
+   is empty (finding 3).
+3. Any failure (a panic, a promise that rejects before or after the
+   answer, or can never settle, a streamed body's writer that returns an
+   error, the deadline) is logged, rolls back the second commit's writes
+   and replaces the instance. The answer stands (findings 1 and 4).
+4. "Out" means the client has read the answer whole (or has gone). The
+   node resolves the future `response.new` gives the guest then; the SDK
+   starts `after` work, and the JavaScript runtime's abort happens, only
+   after it.
+
+How this differs from the recommended model, and why:
+
+- Point 4 is the addition. A failure must come after the node has taken
+  the answer, or it fails the request (the root cause of findings 1 and
+  4: the abort ran in the same guest turn as the answer). But "the node
+  sent its reply" isn't late enough either: the node aborts a body when
+  its instance dies, so a failure while a slow client still reads a long
+  body cut the answer. `*_lets_a_slow_client_read_the_whole_answer`
+  (Rust and JS: a 1 MiB answer read 200 ms after its headers, work that
+  fails at once) shows it. WASI already has the signal: `response.new`
+  returns a future of the response's "result of transmission"; the node
+  passed the request body's result there, now the body's.
+- "Read whole" is when the body guard has given its last frame (or an
+  error), or is dropped, not only dropped: a reader may keep a body it has
+  read to the end (`gateway_streams_completions_within_quotas` does), and
+  the work after the answer then waited for the deadline and rolled back
+  (the gateway's refund was lost: `100 reserved, 95 given back`, left 100).
+- A rejection before the answer (finding 4) doesn't fail the request, but
+  it does fail the work after the answer: the writes after it roll back
+  and the instance is replaced, as for a rejection after it. So the
+  outcome of a rejection doesn't depend on when it lands; only where the
+  answer's commit falls does.
+
+Cloudflare, for comparison (from its documentation as summarised by
+search results; developers.cloudflare.com isn't reachable from this
+session): in Workers, a promise passed to `waitUntil` that rejects is
+reported as an uncaught exception in the logs and affects neither the
+response nor other `waitUntil` promises; there is no storage to roll
+back. In Durable Objects, `ctx.waitUntil` has no effect (an object stays
+alive while it has I/O pending), storage writes are not grouped per
+request (the output gate holds a response until the writes before it are
+durable), and nothing is rolled back when a promise rejects. Ours logs
+the failure as Workers do, holds the answer until its writes are durable
+as the output gate does, and is stricter after it: the writes after the
+answer are one group that commits only if all the work succeeds.
+
+Before (old runtime, reviewer's tests): never-settles and
+rejected-before each `500 trap` with storage `{}`; registered-after
+`{"nested":1}` committed; wrote-before `{"early":1}` (now the asserted
+behaviour). New Rust tests on the old node and SDK: `/panic-at-once` `500
+trap`; `after` from `after` work not run before the next request
+(`nested: false`, `served: 2`); `/big-panic` 500. After: all pass.
+
+### A broken upstream stream reaches the gateway's client broken (D3; N-713)
+
+`Response::stream`'s writer returns `Result<()>`. On `Err` the SDK ends
+the body with an error in its trailers, which the node turns into a
+failed body, so the client sees it break off; then, once the answer is
+out, it panics as `after` work, so what the writer wrote after the answer
+rolls back (as on a panic). The gateway uses `?` on `Streaming::next`.
+
+### The oauth session cookie is `__Host-` over https (D1; N-714)
+
+As the nonce cookie already was. A plain `session` cookie, which a sibling
+host can plant with its own valid session, signs no one in.
+
+### Tests and mutation checks
+
+Full suite (`env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked
+-p nanovm`, all 24 examples and the JS test app rebuilt): 155 unit, 9
+dev, 27 examples, 98 integration (14 ignored), 17 js, 2 committed_state;
+all pass.
+
+Each mutation broke the mechanism, failed a test, and was restored (`git
+diff` empty):
+
+| Mutation | Fails |
+|---|---|
+| SDK: `after` work starts without waiting for the answer to be out | `after_work_that_panics_leaves_the_answer_standing` (`500 trap`), `..._lets_a_slow_client_...` (500), `after_work_passed_on_...` |
+| SDK: `after` from work after the answer is queued, not started | `after_work_passed_on_by_after_work_runs_before_the_next_request` (`nested: false`) |
+| SDK: a failed writer's error isn't put in the trailers | `a_streamed_body_whose_writer_fails_breaks_off_and_rolls_back` (ended as if whole) |
+| SDK: a failed writer doesn't panic once the answer is out | the same (`streamed: true` committed) |
+| node: the answer is "out" at once | `after_work_that_panics_leaves_the_answer_standing` (`500 trap`), `..._lets_a_slow_client_...` (500) |
+| node: "out" only when the body is dropped, not at its end | `guarded_body_says_when_it_has_been_read` |
+| JS: `Promise.all` of the promises registered at the answer (D4's) | `review2_wait_until_registered_after_..._when_it_rejects` (`{"nested":1}`), `wait_until_registered_after_the_answer_is_waited_for` |
+| oauth: user objects take a plain `session` cookie | `review2_oauth_session_cookie_is_a_host_cookie_over_https` (planted cookie: 200) |
+
+The JavaScript runtime's abort waiting for the answer to be out is shown by
+the before runs (the old runtime spawned it at once): `500 trap` for the
+never-settling and the already-rejected promise.
+
+CPU per request was not measured: the node's change is one oneshot
+channel and one async wrapper per answered request (the wrapper replaces
+the request-body future the node already handed over), and apps without
+`after`, waitUntil or a streamed body spawn no new guest task. Disk was too
+low for the release builds the method needs (the coordinator asked for
+none this round).

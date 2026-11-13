@@ -49,7 +49,7 @@ fn file(req: &Request, content_type: &str, cache: &str, bytes: &[u8]) -> Respons
         Some(tags) if tags.split(',').any(|t| t.trim() == etag || t.trim() == "*") => Response::new(304),
         // A HEAD gets a GET's headers, its length included, and no body.
         _ if req.method() == "HEAD" => {
-            Response::stream(content_type, |_| async {}).header("content-length", bytes.len().to_string())
+            Response::stream(content_type, |_| async { Ok(()) }).header("content-length", bytes.len().to_string())
         }
         _ => Response::bytes(content_type, bytes),
     };
