@@ -336,6 +336,7 @@ version = "0.1.0"
 dependencies = [
  "nanovm-sdk",
  "serde",
+ "sha2",
 ]
 
 [[package]]

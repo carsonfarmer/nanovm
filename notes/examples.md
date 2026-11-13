@@ -32,7 +32,7 @@ node.
 | [webhooks](../examples/webhooks) | A-7 | HMAC-verified webhooks answered at once, relayed after the answer (`after`), retried with backoff; egress allowlist | 3.0 |
 | [gateway](../examples/gateway) | A-17 | per-user token quotas in front of a streaming API: reserve before streaming, refund after, so cut streams aren't free | 3.7 |
 | [feeds](../examples/feeds) | A-18 | a feed object as a shared cache: conditional GETs, items kept once; readers fan in through calls | 1.6 |
-| [oauth](../examples/oauth) | A-14 | GitHub sign-in: one-time state, token exchange over egress, cookies only the user's object accepts, `auth` vouching for sessions (W-602) | 0.6 |
+| [oauth](../examples/oauth) | A-14 | GitHub sign-in: one-time state bound to the starting browser by a `__Host-` nonce cookie, token exchange over egress, cookies only the user's object accepts, `auth` vouching for sessions (W-602) | 0.6 |
 
 The first twenty: 72 s in one run, 59 s in the full suite
 (`RUST_TEST_THREADS=1`, load average 11-17 on 4 shared cores). Most tests
