@@ -149,9 +149,10 @@ Mutation checks (each applied alone or with others caught by other tests, then
 ## Runtime lines
 
 CI's method: `cf/round3` (7b3f9c6) 7,418; with the merged control path 7,496;
-this branch 7,798: **+302** (ship.rs restore, install, recover, pause, backlog,
-`Store::list`: +173; supervisor restore, pause, commands, backlog count: +116;
-worker pause check and evict: +14; `committed`, `config`, `journal`: −2).
+this branch 7,805: **+309** (ship.rs restore, install, recover, pause, backlog,
+`Store::list`: +173; supervisor restore, pause, commands, backlog count, shipping
+the made version: +123; worker pause check and evict: +14; `committed`,
+`config`, `journal`: −2).
 
 ## Not done
 
