@@ -188,6 +188,7 @@ impl Supervisor {
             started: Instant::now(),
         });
         sup.clone().refill();
+        tokio::spawn(crate::admin::serve(crate::admin::listen(&sup.cfg)?, Arc::downgrade(&sup)));
         // Renews the node's session, and tells each worker it holds.
         // Jailed workers can't reach a store: their versions ship from here.
         if let Some(store) = sup.capture.clone() {
@@ -378,6 +379,17 @@ impl Supervisor {
             Err(res) => return res,
         };
         forward(&w, live, req).await
+    }
+
+    /// Runs an operator's command from the admin socket (see `admin`).
+    pub async fn command(&self, args: &[String]) -> anyhow::Result<serde_json::Value> {
+        match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+            ["apps"] => Ok(self.workers.lock().values().map(|w| {
+                let live = w.live();
+                serde_json::json!({ "app": w.name, "running": live.as_ref().map(|l| &l.digest), "pid": live.map(|l| l.pid) })
+            }).collect()),
+            _ => bail!("unknown command {args:?}; the commands are: apps"),
+        }
     }
 
     /// The node's own routes, for requests that name no app.
