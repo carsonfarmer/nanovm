@@ -92,6 +92,9 @@ config! {
         /// are plain HTTP. Allowed only in a build with the `dev` feature and
         /// with a loopback `listen`.
         dev: bool = false,
+        /// A directory only this user can use, holding each app's secrets
+        /// as `<app>.json` (see `secrets`). None: apps get none.
+        secrets: Option<PathBuf> = None::<PathBuf>,
     }
 }
 
@@ -110,6 +113,9 @@ pub struct AppConfig {
     /// Values the guest reads through `wasi:config/store`.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// The operator's secrets for the app, read with (and over) `config`.
+    #[serde(default)]
+    pub secrets: crate::secrets::Secrets,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -255,9 +261,11 @@ impl NodeConfig {
                 bail!("with leases, {key} is an object store every node shares, such as s3://bucket/prefix, not {url:?}");
             }
         }
-        // A relative data_dir is relative to the config file (joining keeps
-        // an absolute one as it is).
-        cfg.data_dir = path.parent().unwrap_or(Path::new(".")).join(&cfg.data_dir);
+        // A relative data_dir or secrets is relative to the config file
+        // (joining keeps an absolute one as it is).
+        let dir = path.parent().unwrap_or(Path::new("."));
+        cfg.data_dir = dir.join(&cfg.data_dir);
+        cfg.secrets = cfg.secrets.map(|s| dir.join(s));
         cfg.validate()?;
         Ok(cfg)
     }
@@ -460,8 +468,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Loading resolves a relative data directory against the config file's
-    /// directory, and validates.
+    /// Loading resolves a relative data or secrets directory against the
+    /// config file's directory, and validates.
     #[test]
     fn load_resolves_relative_paths_and_validates() {
         let dir = std::env::temp_dir().join(format!("nanovm-config-test-{}", std::process::id()));
@@ -473,6 +481,8 @@ mod tests {
         assert_eq!(cfg.app_dirs("a")[1], dir.join("nanovm-data/tmp/a"));
         std::fs::write(&path, "data_dir = \"/abs\"").unwrap();
         assert_eq!(NodeConfig::load(&path).unwrap().data_dir, Path::new("/abs"));
+        std::fs::write(&path, "secrets = \"s\"").unwrap();
+        assert_eq!(NodeConfig::load(&path).unwrap().secrets, Some(dir.join("s")));
 
         std::fs::write(&path, "dev = true\nlisten = \"0.0.0.0:1\"").unwrap();
         assert!(NodeConfig::load(&path).is_err(), "validated");

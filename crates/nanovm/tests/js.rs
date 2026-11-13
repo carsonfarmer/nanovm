@@ -31,6 +31,7 @@ fn app() -> AppConfig {
         digest: "test".into(),
         env: Default::default(),
         config: [("greeting".to_string(), "hello from config".to_string())].into(),
+        secrets: Default::default(),
         limits: serde_json::from_value(limits).unwrap(),
         worker: Default::default(),
     }

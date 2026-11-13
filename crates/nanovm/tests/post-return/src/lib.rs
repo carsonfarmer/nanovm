@@ -40,6 +40,20 @@ impl wasip3::exports::http::handler::Guest for Probe {
         if req.path == "/selfwake" {
             return selfwake().await;
         }
+        // Tries to have the host report its config value `key` (a secret):
+        // written to stdout and stderr, in the path of a request out (its
+        // span records the path), then in the error it fails with (`then=
+        // error`) or in the panic that ends it.
+        if req.path == "/leak" {
+            let secret = util::config::get(req.q("key").unwrap_or_default()).ok().flatten().unwrap_or_default();
+            println!("stdout {secret}");
+            eprintln!("stderr {secret}");
+            let _ = util::post("localhost:9", &format!("/leak/{secret}"), vec![]).await;
+            if req.q("then") == Some("error") {
+                return Err(ErrorCode::InternalError(Some(format!("error {secret}"))));
+            }
+            panic!("panic {secret}");
+        }
         util::write_file("/data", "before.txt", b"before".to_vec()).await.unwrap();
         let gate = req.q("gate").unwrap().to_owned();
         let (mut tx, rx) = wasip3::wit_stream::new();

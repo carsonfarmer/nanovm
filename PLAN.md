@@ -283,7 +283,7 @@ The goal: one node, as fast and secure as we can make it, that runs untrusted We
     - Sockets survive worker exits and version switches; every event resolves the current digest (Q53, superseding Q35). A changed app identity closes the socket rather than crossing apps (Q54).
     - Proxy settings bound sockets globally, per app and per object, message/answer size and per-socket backlog (Q55, superseding Q36).
   - **Alarms** (Q30, then Q41): skipped so far; queued as a scheduler outside the node (Roadmap 4).
-  - **Key-value** (done): composed Spin async KV stored as files under `/data`; no native host KV implementation. `wasi:filesystem` stays exposed. `wasi:config` serves each app's config values.
+  - **Key-value** (done): composed Spin async KV stored as files under `/data`; no native host KV implementation. `wasi:filesystem` stays exposed. `wasi:config` serves each app's config values, and the secrets the node's operator gives it from a root-only directory, never in the package (README "Secrets", B-100).
 - **Working rules:** least code; fix root causes; never write backward-compatibility code; every limit is proven by a hostile test; benchmarks never regress.
 - **Commits** (Q37–Q40): an undo journal under the filesystem host; see README.
 - **Out of scope for now:** one-shot runs of agent-written code, dashboards, static signing keys. Clustering is no longer out of scope: it is prepared for in Roadmap 8, after the proxy.

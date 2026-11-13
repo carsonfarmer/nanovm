@@ -6,6 +6,9 @@
 //! (`/u-{login}/`) accepts a session cookie only once `auth` has vouched for
 //! it, then remembers that it did.
 //!
+//! The client secret is the app's one secret (`secrets` in its manifest):
+//! the node's operator gives it, and the app reads it with its config.
+//!
 //! Why `auth` keeps the sessions: a call between objects can't prove who
 //! sent it (W-602), so a user object that took new sessions from a call
 //! would take them from anyone. Instead it asks `auth` about a cookie it was
@@ -78,7 +81,7 @@ async fn auth(req: &Request, now: u64) -> Result {
                 .body(
                     json!({
                         "client_id": setting("client_id"),
-                        "client_secret": nanovm_sdk::env("CLIENT_SECRET"),
+                        "client_secret": setting("client_secret"),
                         "code": req.query("code").unwrap_or_default(),
                     })
                     .to_string(),

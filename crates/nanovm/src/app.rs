@@ -36,7 +36,8 @@ pub struct App {
     pub cfg: AppConfig,
     pub pre: ServicePre<ObjState>,
     pub egress: Route,
-    /// Its `wasi:config` values, shared by every object of the app.
+    /// Its `wasi:config` values, shared by every object of the app: its
+    /// config, and its secrets over it.
     pub config: Arc<WasiConfigVariables>,
     /// Where its objects' volumes are, without symlinks: the journal
     /// compares a volume's path with where its open files really are.
@@ -168,7 +169,7 @@ impl App {
             cfg: cfg.clone(),
             pre,
             egress,
-            config: Arc::new(cfg.config.iter().collect()),
+            config: Arc::new(cfg.config.iter().chain(&cfg.secrets.0).collect()),
             objects: objects.canonicalize()?,
             scratch: Scratch::new(tmp)?,
             _ownership: ownership,

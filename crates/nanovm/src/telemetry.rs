@@ -53,6 +53,8 @@ struct Client {
     runtime: tokio::runtime::Handle,
     upstream: Option<Upstream>,
     relay: Option<Arc<Relay>>,
+    /// Masked in every batch: what the guest wrote may hold them.
+    secrets: Arc<crate::secrets::Secrets>,
 }
 
 impl std::fmt::Debug for Client {
@@ -63,6 +65,12 @@ impl std::fmt::Debug for Client {
 impl HttpClient for Client {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
         if request.body().len() > MAX_BATCH { return Err("telemetry batch too large".into()) }
+        let mut request = request;
+        if !self.secrets.0.is_empty() {
+            let mut body = request.body().to_vec();
+            self.secrets.mask(&mut body);
+            *request.body_mut() = body.into();
+        }
         let client = self.clone();
         let task = self.runtime.spawn(async move {
             tokio::time::timeout(DEADLINE, async {
@@ -96,7 +104,7 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
-    pub fn new(endpoint: &str, app: &str, digest: &str, upstream: Option<Upstream>) -> anyhow::Result<Self> {
+    pub fn new(endpoint: &str, app: &str, digest: &str, upstream: Option<Upstream>, secrets: &crate::secrets::Secrets) -> anyhow::Result<Self> {
         // A worker's export I/O runs on a thread of its own, so a batch never
         // waits behind guest work on the node's threads, which can hold one
         // for a tick (N-222); the supervisor isolates its control runtime the
@@ -119,6 +127,7 @@ impl Telemetry {
             runtime,
             relay: if upstream.is_none() { Some(Arc::new(Relay::new(endpoint)?)) } else { None },
             upstream,
+            secrets: Arc::new(secrets.clone()),
         };
         let resource = opentelemetry_sdk::Resource::builder_empty().with_attributes(identity(app, digest)).build();
         // Programmatic bounds override SDK environment settings. No retries:
@@ -553,7 +562,7 @@ mod tests {
         }));
         for (burst, expected) in [(1536, 1792), (4096, 2304)] {
             received.store(0, Relaxed);
-            let telemetry = Telemetry::new(&endpoint, "burst", "v1", None).unwrap();
+            let telemetry = Telemetry::new(&endpoint, "burst", "v1", None, &Default::default()).unwrap();
             for _ in 0..256 { drop(telemetry.span("request", "room", &Context::new(), SpanKind::Server)); }
             tokio::time::timeout(Duration::from_secs(2), arrived.notified()).await.unwrap();
             // Complete requests while an export is in flight. A short burst
@@ -623,7 +632,7 @@ mod tests {
         }));
         let upstream = crate::link::Dialer::new(ctl, 1);
         for upstream in [None, Some(upstream)] {
-            let client = Client { runtime: tokio::runtime::Handle::current(), upstream, relay: Some(relay.clone()) };
+            let client = Client { runtime: tokio::runtime::Handle::current(), upstream, relay: Some(relay.clone()), secrets: Default::default() };
             for behavior in 0..5 {
                 mode.store(behavior, Relaxed);
                 let request = Request::post("http://nanovm/v1/traces").body(Bytes::new()).unwrap();
@@ -662,7 +671,7 @@ mod tests {
                 http::Response::new(http_body_util::Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             }
         }));
-        let telemetry = Telemetry::new(&endpoint, "lifecycle", "v1", None).unwrap();
+        let telemetry = Telemetry::new(&endpoint, "lifecycle", "v1", None, &Default::default()).unwrap();
         use opentelemetry::trace::Span as _;
         let span = telemetry.span("last-request", "room", &Context::new(), SpanKind::Server);
         assert!(span.is_recording());
@@ -729,7 +738,7 @@ mod tests {
                     Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
                 }
             }));
-            let telemetry = Telemetry::new("http://127.0.0.1:9", "app", "v1", Some(crate::link::Dialer::new(ctl, 2))).unwrap();
+            let telemetry = Telemetry::new("http://127.0.0.1:9", "app", "v1", Some(crate::link::Dialer::new(ctl, 2)), &Default::default()).unwrap();
             drop(telemetry.span("last-request", "room", &Context::new(), SpanKind::Server));
             owners.push(telemetry);
         }
@@ -822,7 +831,7 @@ mod tests {
         assert_eq!(captured.lock().len(), 2, "invalid batches must never reach the collector");
 
         // The producer must bound the UTF-8 body, not merely its input bytes.
-        let telemetry = Telemetry::new(&endpoint, "real-app", "real-digest", None).unwrap();
+        let telemetry = Telemetry::new(&endpoint, "real-app", "real-digest", None, &Default::default()).unwrap();
         telemetry.log("room", ("log.iostream", "stdout"), &vec![0xff; 8192], &Context::new());
         tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
         let logs = collector::logs::v1::ExportLogsServiceRequest::decode(captured.lock()[2].clone()).unwrap();

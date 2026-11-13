@@ -1740,6 +1740,7 @@ dependencies = [
  "hyper-util",
  "landlock",
  "libc",
+ "memchr",
  "nanovm",
  "object_store",
  "oci-spec",

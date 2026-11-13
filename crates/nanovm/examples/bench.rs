@@ -55,6 +55,7 @@ fn node(name: &str, app: &str, max_live: usize, endpoint: Option<String>) -> any
         digest: "bench".into(),
         env: Default::default(),
         config: Default::default(),
+        secrets: Default::default(),
         limits: serde_json::from_value(limits)?,
         worker: Default::default(),
     };

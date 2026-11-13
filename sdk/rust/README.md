@@ -88,7 +88,8 @@ no need for write-to-temp-then-rename.
   costs its own syncs, so write a batch in one statement (`json_each(?)`).
   Building it needs `WASI_SDK_PATH` (SQLite is C);
   [examples/leaderboard](../../examples/leaderboard) uses it.
-- `config::get(key)`: the manifest's `config` table.
+- `config::get(key)`: the manifest's `config` table, and the secrets a node's
+  operator gives the app ([Secrets](../../README.md#secrets)).
 - `fetch(url).method(..).header(..).body(..).send()`: outbound HTTP to hosts
   in the manifest's `egress` list; `.stream()` instead reads the answer's
   body as it arrives (`next()`: `Ok(Some(piece))`, then `Ok(None)` once

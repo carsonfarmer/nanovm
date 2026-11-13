@@ -697,6 +697,27 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Runtime half:** `run` took a filesystem EACCES for "no lease" and swallowed it: N-728, fixed on round 3 (73dbc48).
 - **Status:** fixed on `beta/deployable` for the units (the store drop-in); the silent swallowing is N-728
 
+### B-100: an app's secrets were published in its public package (beta blocker)
+- **Where:** `registry.rs` (`AppSpec`: `env` and `config` are the OCI config blob), `main.rs` (`publish`: nodes pull anonymously, so the package is public), `examples/oauth`, `examples/gateway`
+- **Scenario:** an app's only inputs were its manifest's `env` and `config`, published with it. Every API key an app needed was readable by anyone who could pull it. The oauth and gateway examples said so ("needs a secret store", IDEAS G-78, which is in no file on this branch).
+- **Fix (`beta/secrets`):** a node's `secrets` directory (only the user nanovm runs as may use it, or the node doesn't start) holds each app's as `<app>.json`, keyed as apps are (`registry::app_name`). The supervisor reads it when it starts the app's worker and sends it over the spec channel (stdin); the guest reads it through `wasi:config/store`, over its package's config. A manifest declares the keys it needs (`"secrets": [...]`); a start without one of them, or with a file that isn't a JSON object of strings, fails closed with a 502 naming the file and the problem, never the content. A change to the file retires the worker within about a second; the next request starts one with the new values. The host masks every secret value in what it reports of what the guest wrote (telemetry batches, a failed request's detail). `nanovm publish` refuses declared secrets and credential-like keys or values in `config`/`env`. `nanovm run --secrets <file>` for local use. Both examples moved off package-held keys. Evidence and tests: notes/beta-secrets.md.
+- **Status:** fixed on `beta/secrets`
+
+### B-101: masking matches exact values only
+- **Where:** `secrets.rs` (`Secrets::mask`), used by `telemetry.rs` (`Client::send_bytes`) and `object.rs` (`serve`)
+- **Scenario:** the host masks the exact bytes of each secret. A guest that percent-encodes, escapes, splits or transforms its secret before writing it (a JSON-escaped secret holding `"`, a URL path with a percent-encoded character) is reported unmasked; so is one it sends out over its egress, which no mask could stop. A very short secret (a few bytes) masks unrelated bytes too, and can make a telemetry batch unparseable, which the supervisor then drops (fail closed: nothing leaks, but that app's telemetry for the batch is lost). Masking is a guard against accidents, not against a guest that means to leak.
+- **Status:** open (accepted for the beta; a minimum secret length or masking common encodings are the options)
+
+### B-104: without root, a worker is dumpable
+- **Where:** `jail.rs` (`Jail::enter`)
+- **Scenario:** with root, the worker's `setresuid` makes it non-dumpable (`fs.suid_dumpable` = 0): no core dump holds its secrets, and no process of its uid may trace it or read its memory (checked in `secrets_reach_only_their_apps_worker`: its `/proc/<pid>/environ` and `mem` are root's). Without root nothing changes its uid, so it stays dumpable, and a crash with core dumps enabled writes its memory, secrets included, where the user's core dumps go. `prctl(PR_SET_DUMPABLE, 0)` in the jail would close it; not done here because it also makes the worker's own `/proc/self` files root's, which a non-root worker may need, and the jail isn't this work's file.
+- **Status:** open (low: production runs as root)
+
+### B-105: a failed worker start's whole error chain goes to the client
+- **Where:** `supervisor.rs` (`ensure`: `down(&why)`)
+- **Scenario:** a client whose request starts an app that fails to start gets the full error as its 502 detail, for example a registry error or a missing secret's name and file name. Secret values are never in it (B-100), but it tells the public about the node's setup. Pre-existing; found while choosing what the secrets errors say (they name the file, not the directory).
+- **Status:** open (owner: log the detail, answer clients with its first line)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -897,3 +918,11 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-80: W-9 production capture, shipping and restore
 - **Done (bc8f45a, cf/storage):** crash-atomic capture of each committed version at both commit points as changes against the version before (listings, whole new or moved entries, byte ranges), snapshots every `snapshot_every`; a bounded local outbox (`max_versions`, `max_mb`: full means writes are refused); a put-once `Store` (directory, S3-compatible with SigV4 + `If-None-Match: *`); `remote_ack` (off by default: the owner hasn't chosen an RPO); an epoch and a fence object as the hook for W-10's leases; `ship::restore` on a fresh root.
 - **Open:** remote retention (N-166; the head is the snapshot pointer); a shipper notification (N-165); a `nanovm restore` command. Decided and done on `fix/lease-r3fix`: acknowledgement is remote by default with leases, local on one node; shipping is fenced by the head (W-90).
+
+### B-102: pulling from private registries with credentials (recorded, not built)
+- **What:** nodes pull anonymously, so packages must be public. With B-100, a package holds no secrets, so public packages leak only the code and its non-secret config. Private pulls are needed only if the code itself is confidential. If wanted: the node's operator gives registry credentials per registry host, in the same root-only directory (for example `registries.json`), and `registry::Oci` sends them only to that host and its token server, never across a redirect to another host. Publishing already takes `NANOVM_REGISTRY_USER`/`TOKEN`.
+- **Status:** deferred: not needed for the beta (owner question in notes/beta-secrets.md)
+
+### B-103: developers setting their own app's secrets
+- **What:** in the beta the operator sets secrets on the node. Letting a developer set their own needs to know who they are: an authenticated deploy (the `deploy` agent's identity work), then a channel that accepts secrets only from the identity the app's trust policy names, for example sealed to the node's public key so nothing in between can read them.
+- **Status:** deferred: owner question in notes/beta-secrets.md

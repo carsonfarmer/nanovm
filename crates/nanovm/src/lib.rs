@@ -16,6 +16,7 @@ pub mod object;
 pub mod proxy;
 pub mod quota;
 pub mod registry;
+pub mod secrets;
 pub mod server;
 pub mod ship;
 pub mod supervisor;

@@ -16,6 +16,9 @@
 //! rolls back what it changed) keeps the whole reservation, so a broken
 //! stream is never free.
 //!
+//! The upstream's API key is a secret (`secrets` in the manifest): the
+//! node's operator gives it, and the app reads it with its config.
+//!
 //! - `POST /{user}/complete` `{"prompt":"…"}`: a `text/event-stream` of the
 //!   upstream's tokens, `429` over quota
 //! - `GET /{user}/usage`: `{"used":n,"limit":n,"day":"…"}`
@@ -45,7 +48,7 @@ async fn handle(req: Request) -> Result {
             let mut upstream = fetch(url)
                 .method("POST")
                 .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {}", nanovm_sdk::env("UPSTREAM_KEY")))
+                .header("authorization", format!("Bearer {}", config::get("upstream_key").ok().flatten().unwrap_or_default()))
                 .body(json!({ "prompt": prompt, "max_tokens": max, "stream": true }).to_string())
                 .stream()
                 .await?;
