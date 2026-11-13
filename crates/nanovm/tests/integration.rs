@@ -1730,7 +1730,7 @@ async fn worker_cpu_and_pids_limits_hold() {
 /// `cgroup` instead: a cgroup the operator made there (not yet holding a
 /// process, say one with limits of its own) goes, and with `cgroup` set by
 /// mistake to a directory that is no cgroup at all, so do its empty
-/// subdirectories.
+/// subdirectories. Such a directory is refused, saying why.
 #[tokio::test(flavor = "multi_thread")]
 async fn review2_startup_removes_only_cgroups_it_made() {
     let root = match test_cgroup("foreign", &[]) {
@@ -1742,19 +1742,125 @@ async fn review2_startup_removes_only_cgroups_it_made() {
     let plain = Path::new(env!("CARGO_TARGET_TMPDIR")).join("review2-not-a-cgroup");
     let _ = std::fs::remove_dir_all(&plain);
     std::fs::create_dir_all(plain.join("keep")).unwrap();
-    let mut removed = vec![];
+    let (mut removed, mut started) = (vec![], vec![]);
     for (dir, kept) in [(&root, &theirs), (&plain, &plain.join("keep"))] {
         let mut cfg = node_cfg("review2_startup_removes_only_cgroups_it_made", 8);
         cfg.cgroup = Some(dir.clone());
-        let (sup, _) = supervised_with(cfg).await;
+        let sup = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None);
         if !kept.exists() {
             removed.push(kept.clone());
         }
-        drop(sup);
+        started.push(sup.map(drop).map_err(|e| format!("{e:#}")));
     }
     remove_cgroup(&root).await;
     let _ = std::fs::remove_dir_all(&plain);
     assert!(removed.is_empty(), "startup removed directories it did not make: {removed:?}");
+    assert!(started[0].is_ok(), "{:?}", started[0]);
+    let refused = started[1].as_ref().is_err_and(|e| e.ends_with(&format!("cgroup {} is not a cgroup v2 directory", plain.display())));
+    assert!(refused, "a directory that is no cgroup: {:?}", started[1]);
+}
+
+/// Waits up to 10 s for `paths` to be gone.
+async fn gone(paths: &[&Path]) {
+    let t0 = Instant::now();
+    while paths.iter().any(|p| p.exists()) && t0.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The `worker-<n>` cgroups an earlier run left go at startup, also one
+/// whose worker is still there (exiting, say, when its supervisor was
+/// restarted): it is killed, and its cgroup goes once it has exited,
+/// rather than being left for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_removes_an_earlier_runs_worker_cgroups() {
+    let root = match test_cgroup("earlier", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (idle, busy) = (root.join("worker-1000"), root.join("worker-1001"));
+    for dir in [&idle, &busy] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let mut left = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+    std::fs::write(busy.join("cgroup.procs"), left.id().to_string()).unwrap();
+    let mut cfg = node_cfg("startup_removes_an_earlier_runs_worker_cgroups", 8);
+    cfg.cgroup = Some(root.clone());
+    let (sup, _) = supervised_with(cfg).await;
+    gone(&[&idle, &busy]).await;
+    let kept: Vec<_> = [&idle, &busy].into_iter().filter(|d| d.exists()).cloned().collect();
+    let killed = left.try_wait().unwrap();
+    let _ = left.kill();
+    drop(sup);
+    remove_cgroup(&root).await;
+    assert!(kept.is_empty(), "an earlier run's worker cgroups are left: {kept:?}");
+    assert!(killed.is_some(), "an earlier run's worker still runs");
+}
+
+/// Two nodes can't run their workers in one cgroup: the second refuses to
+/// start, rather than remove at startup the empty `worker-<n>` cgroups it
+/// finds there, which can be the first's, made for a worker not yet in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_cannot_share_a_cgroup() {
+    let root = match test_cgroup("shared", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let mut cfg = node_cfg("two_nodes_cannot_share_a_cgroup", 8);
+    cfg.cgroup = Some(root.clone());
+    let (first, addr) = supervised_with(cfg).await;
+    let counter = publish("counter", &app("counter")).await;
+    assert_eq!(app_get(addr, &counter, "/x/").await.0, 200);
+    let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].clone();
+    // As the first node makes a worker's cgroup, before the worker is in it.
+    let fresh = root.join("worker-999999");
+    std::fs::create_dir(&fresh).unwrap();
+    let mut cfg = node_cfg("two_nodes_cannot_share_a_cgroup-second", 8);
+    cfg.cgroup = Some(root.clone());
+    let second = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None);
+    let second = second.map(drop).map_err(|e| format!("{e:#}"));
+    let kept = fresh.exists();
+    let served = app_get(addr, &counter, "/x/").await.0;
+    let now = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].clone();
+    drop(first);
+    remove_cgroup(&root).await;
+    assert!(kept, "the second node removed the first's fresh worker cgroup");
+    assert_eq!((served, now), (200, pid), "the first node's worker kept serving");
+    let refused = second.as_ref().is_err_and(|e| e.ends_with(&format!("another node runs its workers in cgroup {}: lock acquisition failed because the operation would block", root.display())));
+    assert!(refused, "{second:?}");
+}
+
+/// A worker's cgroup goes once the worker has exited, also when it is
+/// dropped without being waited for: here its supervisor's runtime ends,
+/// which drops the spare and cancels the task that waits for the app's
+/// worker. Either is killed, but its cgroup outlived it.
+#[test]
+fn a_dropped_supervisors_worker_cgroups_go() {
+    let root = match test_cgroup("dropped", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let workers = || std::fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect::<Vec<_>>();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let made = rt.block_on(async {
+        let mut cfg = node_cfg("a_dropped_supervisors_worker_cgroups_go", 8);
+        cfg.cgroup = Some(root.clone());
+        let (_sup, addr) = supervised_with(cfg).await;
+        let counter = publish("counter", &app("counter")).await;
+        assert_eq!(app_get(addr, &counter, "/x/").await.0, 200);
+        // The app's worker and the next spare.
+        eventually("a spare", || workers().len() == 2).await;
+        workers()
+    });
+    drop(rt);
+    let t0 = Instant::now();
+    while made.iter().any(|d| d.exists()) && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let left: Vec<_> = made.iter().filter(|d| d.exists()).collect();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(remove_cgroup(&root));
+    assert!(left.is_empty(), "worker cgroups left 10 s after their supervisor was dropped: {left:?}");
 }
 
 /// review2 (W2): a jailed worker is the only owner of an export runtime,

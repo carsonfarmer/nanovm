@@ -91,6 +91,9 @@ pub struct Supervisor {
     relay: Arc<crate::telemetry::Relay>,
     telemetry: Arc<crate::telemetry::Telemetry>,
     started: Instant,
+    /// Held open: the cgroup its workers run under is its alone (see
+    /// [`Cgroup::take`]).
+    _cgroup_held: Option<std::fs::File>,
 }
 
 #[derive(Default)]
@@ -157,10 +160,6 @@ impl Supervisor {
         let ttl = Duration::from_millis(cfg.lease_ms);
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
-        // Workers' cgroups that an earlier run left: the empty ones go.
-        for dir in cfg.cgroup.iter().flat_map(std::fs::read_dir).flatten().flatten() {
-            let _ = std::fs::remove_dir(dir.path());
-        }
         let sup = Arc::new(Supervisor {
             runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
@@ -177,6 +176,7 @@ impl Supervisor {
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
+            _cgroup_held: cfg.cgroup.as_deref().map(Cgroup::take).transpose()?,
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
@@ -570,8 +570,8 @@ impl Supervisor {
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
         let cgroup = self.cfg.cgroup.as_deref().map(Cgroup::new).transpose()?;
         let into = cgroup.as_ref().map(|c| format!(" into {}", c.0.display())).unwrap_or_default();
-        let procs = cgroup.as_ref().map(|c| std::fs::OpenOptions::new().write(true).open(c.0.join("cgroup.procs"))).transpose();
-        let procs = procs.with_context(|| format!("spawning {}{into}", self.exe.display()))?;
+        let procs = cgroup.as_ref().map(|c| c.0.join("cgroup.procs"));
+        let procs = procs.map(|p| std::fs::OpenOptions::new().write(true).open(&p).with_context(|| format!("opening {}", p.display()))).transpose()?;
         let c = procs.as_ref().map_or(-1, |f| f.as_raw_fd());
         let mut cmd = Command::new(&self.exe);
         cmd.arg("worker")
@@ -642,6 +642,21 @@ struct Spawned {
 struct Cgroup(PathBuf);
 
 impl Cgroup {
+    /// Takes `root` (a cgroup v2 directory no other supervisor holds) for
+    /// this one's workers while the returned file is open, and removes
+    /// the `worker-<n>` cgroups an earlier run left there, with whatever
+    /// of that run still runs in them.
+    fn take(root: &Path) -> anyhow::Result<std::fs::File> {
+        let held = std::fs::File::open(root).with_context(|| format!("cgroup {}", root.display()))?;
+        let v2 = rustix::fs::fstatfs(&held)?.f_type as i64 == libc::CGROUP2_SUPER_MAGIC as i64;
+        anyhow::ensure!(v2, "cgroup {} is not a cgroup v2 directory", root.display());
+        held.try_lock().with_context(|| format!("another node runs its workers in cgroup {}", root.display()))?;
+        let ours = |n: &str| n.strip_prefix("worker-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let left = std::fs::read_dir(root)?.flatten().filter(|e| e.file_name().to_str().is_some_and(ours));
+        left.for_each(|e| drop(Cgroup(e.path())));
+        Ok(held)
+    }
+
     fn new(root: &Path) -> anyhow::Result<Cgroup> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
@@ -657,7 +672,19 @@ impl Cgroup {
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+        // Its worker has been reaped, unless it was dropped without (its
+        // supervisor gone, a failed spawn) or is an earlier run's: then
+        // what is left in it is killed, and the cgroup goes once empty.
+        let busy = |dir: &Path| std::fs::remove_dir(dir).is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+        if busy(&self.0) {
+            let _ = std::fs::write(self.0.join("cgroup.kill"), "1");
+            let (dir, since) = (std::mem::take(&mut self.0), Instant::now());
+            std::thread::spawn(move || {
+                while busy(&dir) && since.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }
     }
 }
 
