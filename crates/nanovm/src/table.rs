@@ -313,7 +313,9 @@ impl Node {
         let (grant, id, until) = l.acquire(&obj.id).await.map_err(|owner| misdirected(owner.as_deref()))?;
         self.renewed(id, until);
         *obj.lease.lock() = Some(grant);
-        Ok(())
+        // The worker may have heard of a later session than the grant's
+        // meanwhile (the grant is released on exit all the same).
+        obj.holds().then_some(()).ok_or_else(|| misdirected(None))
     }
 
     /// Gives up `obj`'s lease, its actor having exited.

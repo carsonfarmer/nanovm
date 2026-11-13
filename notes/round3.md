@@ -106,9 +106,11 @@ spare), and `tests/dev.rs` reads the pulled component from its cache file (C5).
   R2 or MinIO through `object_store`), only while this node holds the object's lease (W-90), and an
   object can be restored on a fresh root. The default acknowledgement stays local; `remote_ack`
   holds a commit up to 2 s for the store.
-- **Limits.** A short window between reading the lease record and the put remains (W-90, needs a
-  head pointer written with `If-Match`); the shipper polls every 20 ms (N-165); restore reads every
-  version (N-166); a log left uncommitted by an older binary is refused, so drain before upgrading.
+- **Limits.** A short window between reading the lease record and the put remained (W-90; closed
+  on `fix/lease-r3fix` by a fenced head, with restore on takeover and remote acknowledgement by
+  default with leases); the shipper polls every 20 ms (N-165); restore read every version (N-166;
+  now from the last snapshot); a log left uncommitted by an older binary is refused, so drain
+  before upgrading.
 - **Review fixes** (`fix/storage-r3fix`). A commit that outlives a request killed at its deadline
   owns the volume until it ends: the next instance's recovery, and retirement, wait for it (S1).
   Upgrading from main publishes a capture main decided but hadn't published, and reads main's

@@ -21,7 +21,9 @@
 //! the node that does if it knows (see `lease`); the proxy tries that node,
 //! or the next in the object's ranking, as it does past a node it can't
 //! reach, until one answers or `failover_ms` passes. Neither kind of
-//! refusal ran the request, so trying again is safe.
+//! refusal ran the request, so trying again is safe. A node that took the
+//! request but hasn't answered by then may have run it: the proxy answers
+//! 504 and never sends it again.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -245,7 +247,13 @@ impl Proxy {
             });
             let mut req = Request::new(Full::new(body.clone()).map_err(|e| match e {}).boxed_unsync());
             (*req.method_mut(), *req.uri_mut(), *req.headers_mut()) = (parts.method.clone(), uri(node)?, parts.headers.clone());
-            match self.node.request(req).await {
+            // A node that took the request may have run it: past the
+            // deadline its outcome is unknown, and it is never sent again.
+            let Ok(sent) = tokio::time::timeout_at(deadline.into(), self.node.request(req)).await else {
+                let why = format!("no answer from {node} for {object} within failover_ms: the request may have run there");
+                return Err((StatusCode::GATEWAY_TIMEOUT, why));
+            };
+            match sent {
                 Ok(res) if res.status() != StatusCode::MISDIRECTED_REQUEST || !res.headers().contains_key(crate::lease::OWNER) => return Ok(res),
                 Ok(res) => {
                     let named = res.headers().get(crate::lease::OWNER).and_then(|o| o.to_str().ok());
@@ -314,10 +322,12 @@ impl Proxy {
         if name != caller {
             return Err((StatusCode::BAD_GATEWAY, format!("{host} serves another app now")));
         }
-        let pq = parts.uri.path_and_query().map_or("", |p| p.as_str()).strip_prefix("/objects").unwrap_or_default().to_owned();
-        let Some((object, _)) = crate::table::route(&pq) else {
+        // The object is the path's; the query goes on with it.
+        let path = parts.uri.path().strip_prefix("/objects").unwrap_or_default().to_owned();
+        let Some((object, _)) = crate::table::route(&path) else {
             return Err((StatusCode::BAD_REQUEST, crate::table::BAD_OBJECT.into()));
         };
+        let pq = parts.uri.query().map_or_else(|| path.clone(), |q| format!("{path}?{q}"));
         let theirs: Vec<_> = parts.headers.keys().filter(|k| k.as_str().starts_with("nanovm-") && *k != crate::egress::CALLERS).cloned().collect();
         for k in theirs {
             parts.headers.remove(k);
@@ -492,6 +502,41 @@ mod tests {
             cache.get(&i.to_string(), async { Ok((1, Duration::from_secs(60))) }).await.unwrap();
         }
         assert!(cache.0.lock().len() <= MAX_CACHED);
+    }
+
+    /// With several nodes, a node that takes a request and never answers
+    /// holds it no longer than `failover_ms`: the proxy answers 504 (the
+    /// request may have run there) and never sends it to another node.
+    #[tokio::test]
+    async fn review_failover_deadline_bounds_a_connected_silent_node() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use tokio::io::AsyncReadExt;
+        let (silent, other) = (tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(), tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let nodes = vec![silent.local_addr().unwrap().to_string(), other.local_addr().unwrap().to_string()];
+        tokio::spawn(async move {
+            let mut held = vec![];
+            loop {
+                let (mut socket, _) = silent.accept().await.unwrap();
+                let _ = socket.read(&mut [0; 4096]).await;
+                held.push(socket);
+            }
+        });
+        let reached = Arc::new(AtomicUsize::new(0));
+        let r = reached.clone();
+        tokio::spawn(async move {
+            while other.accept().await.is_ok() {
+                r.fetch_add(1, SeqCst);
+            }
+        });
+        let proxy = Proxy::new(ProxyConfig { nodes: nodes.clone(), failover_ms: 500, ..Default::default() }).unwrap();
+        let object = (0..).map(|i| format!("o{i}")).find(|o| rank(&nodes, "app", o)[0] == nodes[0]).unwrap();
+        let req = Request::post(format!("/{object}/charge")).body(Full::new(bytes::Bytes::from("once")).map_err(|e| match e {}).boxed_unsync());
+        let t0 = Instant::now();
+        let sent = tokio::time::timeout(Duration::from_secs(5), proxy.send("app", &object, req.unwrap())).await;
+        let (status, why) = sent.expect("still waiting long past failover_ms").unwrap_err();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{why}");
+        assert!(t0.elapsed() < Duration::from_millis(1500), "{:?}", t0.elapsed());
+        assert_eq!(reached.load(SeqCst), 0, "sent again to another node");
     }
 
     /// Every object ranks every node once, the homes spread evenly whatever

@@ -15,10 +15,14 @@ doesn't hold the object answers **421** with `nanovm-owner` naming the holder
 (or empty), and the proxy tries that node, else the next in the ranking, past
 nodes it can't connect to (1 s connect timeout), sleeping 100 ms after each
 full round, until `failover_ms` (30 s) passes (then 503). Neither refusal ran
-the request, so retrying is safe without request ids. With more than one node
+the request, so retrying is safe without request ids. A node that took the
+request and hasn't answered by the deadline may have run it: the proxy answers
+504 and never sends it again (`review_failover_deadline_bounds_a_connected_silent_node`). With more than one node
 the proxy buffers request bodies (up to `max_request_body_kb`) so it can send
 them again; with one node it streams as before and never retries.
-WebSocket events and calls between objects take the same path.
+WebSocket events and calls between objects take the same path; a call's object
+is its URI's path, the query going on with it
+(`review_cross_node_root_calls_accept_a_query_without_a_trailing_slash`).
 
 **Leases (`lease.rs`).** With `leases = "s3://bucket/prefix"` on the nodes,
 the leases live in an object store, through the `object_store` crate (S3 and
@@ -28,14 +32,17 @@ in-memory store is the test fake. Every write is conditional (`If-None-Match:
 - `objects/<app>/<object>` is `{node, session, epoch}`. Taking it writes
   `epoch + 1`, conditionally on what was read, so epochs only ever rise,
   across all nodes. Releasing writes no node, same epoch.
-- `nodes/<node>` is `{session, beat}`: one record per node renews all its
-  leases (one conditional PUT every `lease_ms / 4`, 0.4/s at the default
-  10 s), not one per object.
+- `nodes/<node>` is `{session, beat, lease_ms}`: one record per node renews
+  all its leases (one conditional PUT every `lease_ms / 4`, 0.4/s at the
+  default 10 s), not one per object. It carries the node's own `lease_ms`,
+  which another node waits out before taking the node's objects, so nodes
+  needn't agree on it (`review_shorter_observer_ttl_cannot_revoke_a_live_holder`:
+  a taker configured with 100 ms took a 1 s holder's object 766 ms early).
 - A node's leases hold until 7/8 of `lease_ms` after it **sent** its last
   renewal that succeeded. After that its workers serve none of those objects
   and commit nothing; the supervisor then starts a new session (`session + 1`).
 - Another node takes an object whose holder's session record it has seen
-  unchanged for a whole `lease_ms`, by its own monotonic clock. So clocks need
+  unchanged for the holder's whole `lease_ms`, by its own monotonic clock. So clocks need
   not agree, only tick at about the same rate (the 1/8 margin). Before taking
   the object it **ends** that session with a conditional write
   (`session + 1`), so that a renewal already on its way can't land afterwards
@@ -45,9 +52,21 @@ in-memory store is the test fake. Every write is conditional (`If-None-Match:
   own at epoch 0: no store, no session, no extra work per request.
 
 Why it is safe: B's takeover write at time k succeeded only if A's session
-record was still at the version B had seen for `lease_ms`. So A's last
-successful renewal was sent at least `lease_ms` before k, and A's leases ended
-`lease_ms / 8` before k. Every later renewal by A fails its condition.
+record was still at the version B had seen for A's `lease_ms`. So A's last
+successful renewal was sent at least that long before k, and A's leases ended
+an eighth of it before k. Every later renewal by A fails its condition.
+
+A grant is in the session its acquisition began in, so it counts only while
+that session is still the node's and live once the store has answered: the
+supervisor checks that, and answers the worker with that session's deadline,
+never a later session's (`Leases::until`). A worker's session only moves
+forward (a later session, or a later deadline for this one), since the
+supervisor's words can arrive out of order, and a worker refuses a grant that
+doesn't hold in the session it knows. Before, a store slow to answer let the
+session lapse, another node take the object, and the node start a new
+session; the worker then got the dead session's id with the new deadline and
+committed at epoch 1 beside the new owner's 2
+(`review_delayed_acquire_does_not_revive_a_dead_session`).
 
 **Nodes (supervisor + worker).** The supervisor owns the store client and
 the session. It renews the session and tells each live worker its session id
@@ -108,25 +127,90 @@ std::fs::remove_file(self.dir.join(LOG))?;   // deleting the log is the commit
 - A request that changed nothing still asks the journal, which checks the
   lease then too, so a node that lost the object publishes nothing for it.
 
-What remains for W-9's stream to make this a fence off the node (W-90):
+The local check is not the fence: it stops a node that knows it lost the
+lease, but one that doesn't know yet (a long pause between the check and the
+new key) can still commit locally. That is harmless only because a version
+can't count off the node without a conditional write that a takeover has
+already defeated: the head, below.
 
-1. **The local check is not the fence.** It stops a node that knows it lost
-   the lease. A node that doesn't know yet (a long pause between the check and
-   the unlink) can still commit locally. That is harmless only if the version
-   can't become durable off the node: **the write that ships a version must be
-   conditional on the lease record not having moved**. Proposed: keep the
-   stream's head in the lease record (`objects/<app>/<object>` gains `head`),
-   written `If-Match` the version that the grant (or the previous shipped
-   commit) produced. A 412 means another node took the object, so the version
-   is refused. `Grant` already carries that version (`e_tag`, `version`). The
-   supervisor, which holds the store client, would do the write when the
-   worker ships the version: one store round trip per commit, which remote
-   durability needs anyway.
-2. **Takeover.** B gets epoch e+1 only after ending A's session. Before
-   serving, B must restore the object up to the head recorded in the lease
-   record it overwrote. Until the stream exists, the failover test shares one
-   data root between the nodes, standing in for it.
-3. **Never delete lease records**: an object's epochs would restart.
+### Committed state across nodes: the head (W-90, `fix/lease-r3fix`)
+
+An object's committed versions (W-9's capture, format 3, each carrying the
+lease epoch) are shipped by the supervisor to `capture.store`, which every
+node shares. With leases a node must have one: another node restores an
+object it takes over from there.
+
+**Keys.** A version is put once at `<app>/<object>/<sequence>-<sha256>.tar`.
+The key names the bytes, so writers never clash: a version a node uploads
+after losing the object lands under its own key and is simply never named.
+A directory store puts with a hard link from a fresh, exclusively created,
+synced temporary file, then syncs the directory (and the directories it
+made).
+
+**The head.** `<app>/<object>/head` is `{sequence, digest, node, lease}`: the
+last version that counts, and the node that last claimed the object with
+the epoch of its lease then. A version counts only once the head names it.
+Every write of the head is conditional on the version read (`If-Match` the
+ETag on S3 and compatibles; on a directory store, a rename under a lock file,
+compared by digest):
+
+- **Claim** (`ship::claim`, in the supervisor, before a lease's grant goes to
+  the worker): the head's `node` and `lease` become this node's at the new
+  epoch. From then on no node with an earlier lease can move it, and its
+  in-flight move fails its condition. A head claimed at a later epoch refuses
+  the claim (the grant is stale), as does a store error: the grant is
+  released and the worker answers 421.
+- **Ship** (`ship::ship_object`): only under this node's live lease on the
+  object (a grant its worker holds, in the node's current session, not
+  lapsed; `Leases::epoch`), only if the head is claimed by this node at that
+  epoch, and only a version that follows the head (the next sequence, whose
+  parent digest is the head's). Upload, then move the head; then mark it
+  shipped locally. A move that fails its condition stops shipping: the node
+  lost the object.
+- **Restore** (`ship::restore`) follows the head back, parent by parent, to
+  the last snapshot: only versions from there are fetched (N-166's
+  pointer).
+- **Acknowledgement** (`remote_ack`) waits for the local marker, which is
+  written only after the head names the version.
+
+**Takeover restores before serving.** The claim decides whether this node's
+copy of the object is the head's: it must hold the head's version, and
+anything after it counts only if no other node has claimed the object since
+this node did (the head's `node` is this node), or, if another has, the copy
+must be exactly the head's (no later or staged versions). Otherwise the copy
+goes (the volume, the journal, the versions and the marker; the versions
+last, so a discard cut short is never taken for a current copy), the head is
+claimed, and the object is rebuilt from the head; the supervisor gives what
+it restored to the app's uid. Only then does the worker instantiate. So a
+node never serves state older than the head, and history a node committed
+but never shipped before another took the object is dropped there, never
+shipped.
+
+**Acknowledgement with leases is remote.** A node with leases answers a write
+only once its version counts in the store (the owner's decision): failover
+then loses nothing that was answered. `capture.remote_ack` defaults to true
+when `leases` is set (`false` keeps local acknowledgement, which a failover
+may lose); one node keeps local by default.
+
+**Why it is safe.** A version counts only through a conditional move of the
+head from the state its writer read. A takeover's claim moves the head
+before the new owner serves, so the old owner's move (from a state before
+the claim) fails, however late its upload lands. The new owner's copy is
+the head's before it serves, and its versions follow the head. Each claim
+raises the head's lease epoch, so the old owner can't claim it back with its
+stale grant either.
+
+The head lives in the capture store, not in the lease record as first
+proposed: the capture store is already shared and written conditionally, the
+head carries the claiming epoch itself (so it doesn't depend on the lease
+record's version, which every acquisition and release changes), and one node
+uses the same head at epoch 0. It costs a claim (a read and a conditional
+write) per acquisition, and per shipped version a head read per round and a
+conditional write; S3 needs its default `ETagMatch` conditional puts, as the
+leases do.
+
+**Never delete lease records or heads**: an object's epochs would restart,
+and a head's history with them.
 
 ## Tests (all hostile; each mutation-checked)
 
@@ -148,12 +232,40 @@ Unit (`lease.rs`, in-memory store; `journal.rs`; `proxy.rs`):
   home to 800–1,200; dropping a node moves only its objects; the list's order
   doesn't matter.
 
+From the round-3 review (`fix/lease-r3fix`; each failed before its fix, with
+the evidence in its commit, and is mutation-checked below):
+- `review_delayed_acquire_does_not_revive_a_dead_session` (M1),
+  `review_shorter_observer_ttl_cannot_revoke_a_live_holder` (M4): above.
+- `review_takeover_during_upload_fences_the_old_writer` (M2): A's upload
+  waits; B takes the object over; the upload lands. A's shipping fails and
+  marks nothing; B's version 1 is the head's, and a fresh root restores B's
+  (before: A's counted, B's conflicted).
+- `review_shipping_requires_a_live_matching_epoch_not_just_a_node_name` (M3):
+  no lease, a released one, a lapsed one, and one taken again after B held
+  the object: none ships (before: all four did).
+- `a_claim_keeps_only_history_no_other_node_has_moved_past`: a node keeps
+  its copy (and ships its later version) when it takes the object back with
+  no other node between; after another node held it, its unshipped version
+  goes and the head's is restored.
+- `review_concurrent_directory_put_keeps_acknowledged_bytes` (S3): racing
+  directory puts at one key: one stores, the others are refused, the bytes
+  stay.
+- `review_failover_deadline_bounds_a_connected_silent_node` (M6, proxy).
+
 Integration (`tests/integration.rs`, `mod nodes`; real jailed workers, two
-in-process supervisors, a proxy, a shared in-memory lease store):
+in-process supervisors, a proxy, a shared in-memory lease store, and a shared
+directory capture store, acknowledging remotely):
+- `review_failover_with_separate_disks_preserves_remote_acknowledged_state`
+  (M5): nodes on data roots of their own. A's write is answered with the head
+  already naming it; A stops; B serves `one` at epoch 2, restored from the
+  store (before: B served an empty object), and its next write moves the head
+  to 2.
+- `review_cross_node_root_calls_accept_a_query_without_a_trailing_slash` (M7):
+  `http://nanovm/objects/{y}?v=1` from x on A reaches y on B (before: 400).
 - `an_object_moves_to_another_node_when_its_node_stops`: A serves and commits
   `one`. A stops: its own runtime is dropped, killing its server, renewals and
-  workers. B serves `one` (shared data root) at epoch 2, no sooner than
-  `lease_ms` later.
+  workers. B serves `one` (here the nodes share a data root: B keeps the copy,
+  which is exactly the head's) at epoch 2, no sooner than `lease_ms` later.
 - `a_node_that_lost_an_objects_lease_cannot_commit_it`: A answers and works on
   after answering (the test-only probe). A is then cut off from the store.
   Within `lease_ms`, A evicts its idle objects and refuses the busy one. B takes
@@ -227,6 +339,29 @@ the known load failure N-640 (CPU budget billed as wall time; fixed on
 `cf/cpu-clock`), here at load 9–15. `committed_state` 2 pass. The production
 check (`cargo check --bin nanovm`) is clean.
 
+Mutation checks for the review's fixes (`fix/lease-r3fix`; each removes one
+mechanism, the named test then fails; restored after):
+
+| # | removed | caught by |
+|---|---|---|
+| R1 | a head move conditional on the head read (S3 store overwrites) | `review_takeover_during_upload_fences_the_old_writer` |
+| R2 | the lease's liveness in the shipper's authority | `review_shipping_requires_a_live_matching_epoch_not_just_a_node_name` |
+| R3 | the shipper's check that the head is claimed by this node at this epoch | same |
+| R4 | the claim's currency check (any copy kept) | `a_claim_keeps_only_history_no_other_node_has_moved_past` |
+| R5 | dropping versions written before another node's claim | same |
+| R6 | the worker's forward-only session | `review_delayed_acquire_does_not_revive_a_dead_session` |
+| R7 | `serve` answering with the grant's own session's deadline | same (it survived until the proof also covered a worker that hadn't heard of the new session) |
+| R8 | the holder's `lease_ms` (the taker's own instead) | `review_shorter_observer_ttl_cannot_revoke_a_live_holder` |
+| R9 | a fresh exclusive temporary file per directory put | `review_concurrent_directory_put_keeps_acknowledged_bytes` |
+| R10 | the proxy's deadline on a connected node's answer | `review_failover_deadline_bounds_a_connected_silent_node` |
+
+Suite on `fix/lease-r3fix`: `--lib` 151 pass; integration 92 pass, 14
+ignored (opt-in); the SQLite suite (`sqlite_ -- --ignored`) 12 pass; `dev`
+5 pass, 4 need the example and JavaScript app builds (absent here);
+`committed_state` 2 pass; `cargo check --bin nanovm` clean. Runtime lines
+7,068 (cf/round3 9f878a9) -> 7,301 (+233: ship.rs +175, lease.rs +25,
+supervisor.rs +20, config.rs +8, proxy.rs +5).
+
 ## Measurements
 
 Single node, A/B on the HTTP path, method from the shared bench harness (CPU
@@ -259,10 +394,13 @@ merge.
 
 ## Not done
 
-- Volumes don't move between nodes: B starts from its own disk unless the
-  nodes share a data root (the failover test's stand-in). Needs W-9's stream
-  and W-90.
-- The epoch isn't yet in any committed version (W-90).
+- Remote retention: every version stays in the store; a restore fetches only
+  from the last snapshot before the head (N-166).
+- A takeover restores the whole object (from its last snapshot) before
+  serving it, on the cold start's path: a large volume delays its first
+  request after failover. The claim adds a head read and a conditional write
+  to each acquisition (N-183).
+- One node streams to its node without a deadline (no failover to bound it).
 - A cycle of calls closed through waits on two other nodes is ended by the
   timeout, not refused (N-180).
 - Cold starts with leases wait on the store (N-183; W-91 proposes keeping
@@ -277,7 +415,11 @@ merge.
    faster failover but more renewals (one conditional PUT per `lease_ms / 4`
    per node: 0.4/s at 10 s, about $0.17 a day per node on S3 Standard), and a
    store latency spike of `lease_ms` / 8 can cost a node its session.
-   *Recommend 10 s, `failover_ms` 30 s.*
+   *Decided: 10 s, `failover_ms` 30 s.* Nodes may now differ: each waits out
+   the holder's own duration. `failover_ms` should exceed the longest.
+   A request a node took but hasn't answered within `failover_ms` gets a 504,
+   so it also bounds the longest request through the proxy with several nodes
+   (queueing included).
 2. **The store as a hard dependency (N-181).** If it is unreachable for
    `lease_ms`, every node stops serving. *Recommend accepting it, as with any
    lease service, and choosing a store at least as available as the cluster
@@ -298,3 +440,9 @@ merge.
    shared between nodes. *Recommend the timeout until a real app needs more.*
 7. **The proxy buffers bodies with more than one node (N-182).** *Recommend
    bounding it with W-35's proxy-wide budget.*
+8. **Acknowledgement with leases.** *Decided: remote.* A config file with
+   `leases` defaults `capture.remote_ack` to true (a write is answered once
+   the head names its version: about four store round trips, tens of ms on
+   S3); an explicit `false` keeps local acknowledgement, which a failover may
+   lose (the claim drops versions the head never named). Programmatic configs
+   (tests, embedding) set it themselves. One node stays local by default.

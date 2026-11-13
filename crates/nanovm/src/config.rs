@@ -46,7 +46,9 @@ config! {
         /// lease holder. Every node's must differ.
         name: String = "",
         /// How long a node's leases outlive its last renewal: the longest an
-        /// object is unavailable after its node stops (see `lease`).
+        /// object is unavailable after its node stops (see `lease`). Each
+        /// node's session record carries its own, which other nodes wait
+        /// out before taking its objects, so nodes may differ.
         lease_ms: u64 = 10_000u64,
         /// OTLP/HTTP collector base URL. Only the supervisor connects to it.
         telemetry_endpoint: String = "http://127.0.0.1:4318",
@@ -160,8 +162,11 @@ config! {
         /// `file:///path`; credentials and region from `AWS_*`). None keeps
         /// them all here.
         store: Option<String> = None::<String>,
-        /// Acknowledge a commit once its version is in the store, not once it
-        /// is durable here (the default).
+        /// Acknowledge a commit once its version counts in the store (its
+        /// head names it), not once it is durable here. Unset in a config
+        /// file, it is on for a node with `leases`: a node taking an object
+        /// over restores it from the store, so a write answered only here
+        /// would be lost. Off for one node.
         remote_ack: bool = false,
     }
 }
@@ -229,6 +234,13 @@ impl NodeConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut cfg: NodeConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        // With leases, a write is answered once its version counts in the
+        // store, unless the config says otherwise (see `CaptureConfig`).
+        let leased = !cfg.leases.is_empty();
+        let said = toml::from_str::<toml::Table>(&text)?.get("capture").is_some_and(|c| c.get("remote_ack").is_some());
+        if let Some(capture) = cfg.capture.as_mut().filter(|_| leased && !said) {
+            capture.remote_ack = true;
+        }
         // A relative data_dir is relative to the config file (joining keeps
         // an absolute one as it is).
         cfg.data_dir = path.parent().unwrap_or(Path::new(".")).join(&cfg.data_dir);
@@ -242,6 +254,9 @@ impl NodeConfig {
         }
         if self.capture.as_ref().is_some_and(|c| c.remote_ack && c.store.is_none()) {
             bail!("capture.remote_ack needs a capture.store");
+        }
+        if !self.leases.is_empty() && self.capture.as_ref().is_none_or(|c| c.store.is_none()) {
+            bail!("a node with leases ships its objects' versions (capture.store): another node restores an object it takes over from there");
         }
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
@@ -367,6 +382,26 @@ mod tests {
         ] {
             assert!(toml::from_str::<NodeConfig>(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A node with leases needs a store to ship to, from which another node
+    /// restores its objects, and answers a write once it is shipped unless
+    /// its config says otherwise; one node answers once it is durable here.
+    #[test]
+    fn leases_need_a_store_and_acknowledge_remotely_by_default() {
+        let dir = std::env::temp_dir().join(format!("nanovm-config-ack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("n.toml");
+        let ack = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            NodeConfig::load(&path).map(|c| c.capture.unwrap().remote_ack).map_err(|e| e.to_string())
+        };
+        let leased = "leases = \"memory:\"\nname = \"10.0.0.1:8080\"\n";
+        assert!(ack(leased).unwrap_err().contains("capture.store"));
+        assert_eq!(ack(&format!("{leased}[capture]\nstore = \"/s\"")), Ok(true));
+        assert_eq!(ack(&format!("{leased}[capture]\nstore = \"/s\"\nremote_ack = false")), Ok(false));
+        assert_eq!(ack("[capture]\nstore = \"/s\""), Ok(false));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Loading resolves a relative data directory against the config file's

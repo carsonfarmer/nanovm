@@ -406,7 +406,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### N-183: each instantiation with leases costs a store round trip
 - **Where:** `lease.rs`, `object.rs` (`run`)
 - **Scenario:** an object's actor takes its lease (a read and a conditional write) before instantiating and releases it (a write) when it exits, so a cold start waits on the store (tens of ms on S3) and LRU churn costs three store requests per instantiation.
-- **Status:** open; W-91 would keep released leases for a while
+- **Status:** open; W-91 would keep released leases for a while. Since `fix/lease-r3fix` each acquisition also claims the object's head (a read and a conditional write), and a takeover restores the object from the store before its first request.
 
 ### N-640: the CPU budget charged time waiting for a core, so overload became CPU kills
 - **Where:** `object.rs` (`ObjShared::charged`, `cpu_used_ns`, `uncharge`, the epoch callback), `journal.rs` (its three `uncharge` sites)
@@ -455,6 +455,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `ship.rs` (`restore`)
 - **Scenario:** keys are probed from sequence 1 until one is missing; only versions from the last snapshot on are needed, and the store keeps everything (no remote retention yet).
 - **Fix (proposed):** a pointer object to the last shipped snapshot, written after it, and retention of versions before the second-last snapshot.
+- **Status:** in part on `fix/lease-r3fix`: the object's head names its last version, and a restore follows parent digests back from it to the last snapshot, fetching only those. Retention (deleting versions before the second-last snapshot) remains.
 
 ### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
 - **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
@@ -690,7 +691,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-90: carry W-10's epoch in W-9's committed versions, fenced at the store
 - **What:** name each committed version `(app, object, epoch, seq)` from `Node::lease_epoch` (the line before `quota.commit()` in `object::commit`), and make the write that makes a version durable off the node conditional on the object's lease record (`If-Match` the version the grant, or the last commit, produced), so a node that lost the lease mid-commit can't publish a version. A taker restores up to the head it found. Contract in `notes/multinode.md`.
-- **Status:** done in part on `cf/storage-r3`: versions carry the lease epoch (format 3), and the shipper reads the object's lease record before shipping and ships a version only if the record names its node or still has the version's epoch; a node that lost the object can't ship its late versions (`a_node_that_lost_the_lease_cannot_ship`). Not yet the conditional write itself: between reading the record and the put-once of a version there is a window (a takeover then, and the old node's version can still land first at that sequence, so the new owner's put of it conflicts and its shipping stops, visibly). Closing it needs a head pointer in the lease record written with `If-Match` after each put, and restore up to that head.
+- **Status:** done on `fix/lease-r3fix` (round-3 review M1–M5, S3): versions carry the lease epoch (format 3, `cf/storage-r3`) and are put once at `<app>/<object>/<seq>-<sha256>.tar`; a version counts only once the object's head (`<app>/<object>/head`, `{sequence, digest, node, lease}`) names it, and every head write is conditional on the version read. Before a worker gets a lease, its supervisor claims the head at the lease's epoch (`ship::claim`), so a node with an earlier lease can't move it however late its upload lands (`review_takeover_during_upload_fences_the_old_writer`); the shipper moves it only under this node's live lease, once claimed, to a version that follows it (`review_shipping_requires_a_live_matching_epoch_not_just_a_node_name`); `remote_ack` and restore follow the head. The claim makes the node's copy the head's, restoring it if need be, so a takeover never serves older state (`nodes::review_failover_with_separate_disks_preserves_remote_acknowledged_state`); with leases a store is required and acknowledgement defaults to remote. The head lives in the capture store rather than the lease record (notes/multinode.md says why). Open: remote retention (N-166).
 
 ### W-91: keep a released lease for a while
 - **What:** an evicted object's node keeps its lease (it is in the node's session anyway) for a grace period after the instance goes, then releases it, so a cold start within the period skips the store (N-183). Meanwhile another node gets 421 and the proxy sends the request back to the holder, which is the object's home anyway unless the node list changed.
@@ -698,4 +699,4 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-80: W-9 production capture, shipping and restore
 - **Done (bc8f45a, cf/storage):** crash-atomic capture of each committed version at both commit points as changes against the version before (listings, whole new or moved entries, byte ranges), snapshots every `snapshot_every`; a bounded local outbox (`max_versions`, `max_mb`: full means writes are refused); a put-once `Store` (directory, S3-compatible with SigV4 + `If-None-Match: *`); `remote_ack` (off by default: the owner hasn't chosen an RPO); an epoch and a fence object as the hook for W-10's leases; `ship::restore` on a fresh root.
-- **Open:** remote retention and a snapshot pointer (N-166); a shipper notification (N-165); a `nanovm restore` command; choosing the acknowledgement policy (owner); fencing commits themselves, not only shipping (W-10).
+- **Open:** remote retention (N-166; the head is the snapshot pointer); a shipper notification (N-165); a `nanovm restore` command. Decided and done on `fix/lease-r3fix`: acknowledgement is remote by default with leases, local on one node; shipping is fenced by the head (W-90).

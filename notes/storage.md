@@ -172,13 +172,61 @@ On top of Amp's W-9 local capture (b7bf806):
   `shipped_versions_restore_an_object_on_a_fresh_root` serves it and ships the
   next version from there, twice.
 
+  key. With capture, `/incr`: 17 flushes and 39.8 writes -> 7 and 20.9; `/set`:
+  19 flushes -> 9.
+- **Shipping.** With `capture.store` set (a directory or `file:///path`, or an
+  object store URL as for `leases`: round3's `object_store`, S3 and compatibles),
+  the supervisor (jailed workers have no network), or an in-process node, ships
+  each object's versions in order, then removes them locally but the last (the
+  next one's parent). A version is put once at
+  `<app>/<object>/<seq>-<sha256>.tar`: the key names the bytes, so writers never
+  clash (a hard link from a fresh `O_EXCL` temporary file, synced, then the
+  directory synced; `PutMode::Create`). On cf/storage, before round3, this had
+  its own SigV4 client and a fence object; on cf/storage-r3 both gave way to
+  `object_store` and the lease.
+- **The head (W-90, fix/lease-r3fix).** A version counts only once the object's
+  head, `<app>/<object>/head` = `{sequence, digest, node, lease}`, names it. The
+  shipper moves the head one version at a time, to the next sequence whose parent
+  digest is the head's, by a write conditional on the head it read (`If-Match`
+  the ETag; on a directory store a rename under a lock file, compared by
+  digest), and only then marks the version shipped locally. With leases it does
+  so only under this node's live lease on the object (a grant its worker holds,
+  in the node's current session) and with the head claimed by this node at that
+  lease's epoch: before a worker gets a lease, its supervisor claims the head
+  (`ship::claim`), so no node with an earlier lease can move it, however late its
+  upload lands. The claim also makes the node's copy of the object the head's
+  (kept if it holds the head's version and no other node has claimed the object
+  since this one did, or it is exactly the head's; otherwise dropped and
+  restored), so a takeover never serves state older than the head and never ships
+  history the head has moved past. Versions (format 3) carry the lease epoch they
+  were committed under; the lease is still checked right before the journal's new
+  key, so a lapsed lease refuses the commit and recovery discards what capture
+  staged. The capture limits bound the unshipped outbox: with the store down,
+  writes are refused once it is full; nothing is dropped. See
+  `notes/multinode.md` for the argument.
+- **Acknowledgement** stays local by default on one node. `remote_ack = true`
+  holds each commit until the head names its version (2 s at most; then the
+  request fails, but the commit stands locally: ambiguous, not a rollback). With
+  `leases` a config file defaults it to true (owner's decision): a takeover
+  restores from the store, so a write answered only locally would be lost.
+- **Restore.** `nanovm::ship::restore` rebuilds an object on a fresh data root
+  from the head back, parent by parent, to the last snapshot (only those versions
+  are fetched), syncs the volume, then keeps the head's version so history goes
+  on; `shipped_versions_restore_an_object_on_a_fresh_root` serves it and ships the
+  next version from there, twice. A claim restores the same way.
+
 Tests (mutation-checked): 120 random steps of creates, overwrites, growth,
 truncation, removes, file and directory renames (over files and empty
 directories) and type changes, every version restored and compared with the
 live volume; small-change size; a directory renamed over an emptied one;
 unsafe paths; put-once for both stores against an in-process S3 fake that checks
-signatures; the shipper's order, pruning, conflict and fence; outage: no
-acknowledgement under `remote_ack`, a full outbox refusing writes.
+signatures; the shipper's order, pruning and head; outage: no
+acknowledgement under `remote_ack`, a full outbox refusing writes. The head's
+fence, authority and takeover: `review_takeover_during_upload_fences_the_old_writer`,
+`review_shipping_requires_a_live_matching_epoch_not_just_a_node_name`,
+`a_claim_keeps_only_history_no_other_node_has_moved_past`,
+`review_concurrent_directory_put_keeps_acknowledged_bytes` and
+`nodes::review_failover_with_separate_disks_preserves_remote_acknowledged_state`.
 
 ## N-600 (SQLite provider syncs)
 
@@ -196,6 +244,6 @@ replays the log and restarts nothing, but that is a guest API decision.
 ## Open (ISSUES)
 
 N-162 (2 record syncs per KV key: bulk KV tests time out under heavy load, as on
-base), N-165 (the shipper polls), N-166 (restore reads every version; needs a
-snapshot pointer and remote retention), W-80 (a `nanovm restore` command,
-commit-time fencing, the RPO decision).
+base), N-165 (the shipper polls), N-166 (restore now fetches only from the last
+snapshot before the head; remote retention remains), W-80 (a `nanovm restore`
+command).

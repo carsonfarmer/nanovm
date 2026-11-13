@@ -15,18 +15,18 @@
 //! session, every `lease_ms / 4`; they last until 7/8 of `lease_ms` after it
 //! sent the last renewal that succeeded, after which it serves none of their
 //! objects and starts a new session. Another node takes an object whose
-//! holder's session record it has seen unchanged for `lease_ms`, by its own
+//! holder's session record it has seen unchanged for the holder's `lease_ms`
+//! (which the record carries, so nodes needn't agree on it), by its own
 //! clock (clocks needn't agree, only tick at about the same rate). It first
 //! ends that session with a conditional write, so a renewal still on its way
 //! can't land after it and extend the holder's leases.
 //!
-//! Records: `nodes/<node>` is `{session, beat}` and `objects/<app>/<object>`
-//! `{node, session, epoch}`, with no node once released. Deleting a record
-//! restarts its epochs: never do.
+//! Records: `nodes/<node>` is `{session, beat, lease_ms}` and
+//! `objects/<app>/<object>` `{node, session, epoch}`, with no node once
+//! released. Deleting a record restarts its epochs: never do.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use object_store::path::Path;
@@ -67,6 +67,12 @@ pub struct Grant {
 struct NodeRecord {
     session: u64,
     beat: u64,
+    /// The node's `lease_ms`: how long another waits, seeing the record
+    /// unchanged, before it takes the node's objects. The holder's, not the
+    /// taker's, so nodes needn't agree on it (0, from an older node: the
+    /// taker's).
+    #[serde(default)]
+    lease_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,13 +109,16 @@ pub struct Leases {
     session: Mutex<Own>,
     /// Other nodes' session records: the version seen, and since when.
     seen: Mutex<HashMap<String, (Option<UpdateVersion>, Instant)>>,
+    /// The grants this node's workers hold, by key, each given out once its
+    /// object was claimed (see `serve`): what the node may ship.
+    held: Mutex<HashMap<String, Grant>>,
 }
 
 type Result<T> = object_store::Result<T>;
 
 impl Leases {
     pub fn new(store: Arc<dyn ObjectStore>, node: &str, ttl: Duration) -> Leases {
-        Leases { store, node: node.into(), ttl, session: Mutex::default(), seen: Mutex::default() }
+        Leases { store, node: node.into(), ttl, session: Mutex::default(), seen: Mutex::default(), held: Mutex::default() }
     }
 
     /// The store an object store URL names, if any.
@@ -132,7 +141,8 @@ impl Leases {
                 Err(_) => return (s.id, s.until),
             }
         }
-        match self.put(&path, &NodeRecord { session: s.id, beat: s.beat + 1 }, s.version.clone()).await {
+        let rec = NodeRecord { session: s.id, beat: s.beat + 1, lease_ms: self.ttl.as_millis() as u64 };
+        match self.put(&path, &rec, s.version.clone()).await {
             Ok(v) => {
                 (s.beat, s.version) = (s.beat + 1, Some(v));
                 s.until = sent + (self.ttl * 7 / 8).as_nanos() as u64;
@@ -154,7 +164,9 @@ impl Leases {
     }
 
     /// Takes the lease on `key` (`<app>/<object>`), at the next epoch,
-    /// unless another node's live session holds it.
+    /// unless another node's live session holds it. The grant is in the
+    /// session this began in, which can end while the store answers: it
+    /// holds only while `until` has a deadline for it.
     pub async fn acquire(&self, key: &str) -> std::result::Result<Grant, Refused> {
         let Own { id, until, .. } = self.session.lock().clone();
         if until <= mono_ns() {
@@ -172,13 +184,23 @@ impl Leases {
                 return Err(Refused::Held(r.node.clone()));
             }
             let epoch = rec.map_or(1, |r| r.epoch + 1);
-            match self.put(&path, &ObjectRecord { node: self.node.clone(), session: id, epoch }, version).await {
-                Ok(v) => return Ok(Grant { epoch, session: id, e_tag: v.e_tag, version: v.version }),
+            let grant = match self.put(&path, &ObjectRecord { node: self.node.clone(), session: id, epoch }, version).await {
+                Ok(v) => Grant { epoch, session: id, e_tag: v.e_tag, version: v.version },
                 Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. }) => continue,
                 Err(e) => return Err(unavailable(e)),
-            }
+            };
+            // Any grant this node held on it before is over.
+            self.held.lock().remove(key);
+            return Ok(grant);
         }
         Err(Refused::Unavailable(format!("{key}'s lease keeps changing")))
+    }
+
+    /// The `mono_ns` until which `grant` holds: that of the session it was
+    /// taken in, while that is this node's and live.
+    pub fn until(&self, grant: &Grant) -> Option<u64> {
+        let s = self.session.lock();
+        (s.id == grant.session && mono_ns() < s.until).then_some(s.until)
     }
 
     /// This node's name.
@@ -186,15 +208,28 @@ impl Leases {
         &self.node
     }
 
-    /// Which node's lease the store has for `key` (`<app>/<object>`), empty
-    /// once released, and its epoch; none if it was never taken.
-    pub async fn holder(&self, key: &str) -> Result<Option<(String, u64)>> {
-        let path = Path::from_iter(["objects"].into_iter().chain(key.split('/')));
-        Ok(self.get::<ObjectRecord>(&path).await?.0.map(|r| (r.node, r.epoch)))
+    /// Records that this node's worker holds `grant` on `key`.
+    pub fn hold(&self, key: &str, grant: Grant) {
+        self.held.lock().insert(key.into(), grant);
+    }
+
+    fn unhold(&self, key: &str, grant: &Grant) {
+        let mut held = self.held.lock();
+        if held.get(key).is_some_and(|g| g.epoch == grant.epoch) {
+            held.remove(key);
+        }
+    }
+
+    /// The epoch of the lease this node holds on `key`, live: held by a
+    /// worker, and in this node's session, which hasn't lapsed.
+    pub fn epoch(&self, key: &str) -> Option<u64> {
+        let grant = self.held.lock().get(key).cloned()?;
+        self.until(&grant).map(|_| grant.epoch)
     }
 
     /// Gives up the lease `grant` took on `key`, unless it has moved on.
     pub async fn release(&self, key: &str, grant: &Grant) {
+        self.unhold(key, grant);
         let path = Path::from_iter(["objects"].into_iter().chain(key.split('/')));
         let version = UpdateVersion { e_tag: grant.e_tag.clone(), version: grant.version.clone() };
         let released = ObjectRecord { node: String::new(), session: 0, epoch: grant.epoch };
@@ -206,20 +241,18 @@ impl Leases {
     async fn alive(&self, node: &str, session: u64) -> Result<bool> {
         let path = Path::from_iter(["nodes", node]);
         let (rec, version) = self.get::<NodeRecord>(&path).await?;
-        if rec.is_none_or(|r| r.session != session) {
-            return Ok(false);
-        }
+        let Some(rec) = rec.filter(|r| r.session == session) else { return Ok(false) };
         {
             let mut seen = self.seen.lock();
             let (seen_version, since) = seen.entry(node.into()).or_insert((None, Instant::now()));
             if *seen_version != version {
                 (*seen_version, *since) = (version.clone(), Instant::now());
             }
-            if since.elapsed() < self.ttl {
+            if since.elapsed() < Some(rec.lease_ms).filter(|&ms| ms > 0).map_or(self.ttl, Duration::from_millis) {
                 return Ok(true);
             }
         }
-        match self.put(&path, &NodeRecord { session: session + 1, beat: 0 }, version).await {
+        match self.put(&path, &NodeRecord { session: session + 1, beat: 0, ..rec }, version).await {
             Ok(_) => Ok(false),
             Err(object_store::Error::Precondition { .. }) => Ok(true),
             Err(e) => Err(e),
@@ -246,26 +279,27 @@ impl Leases {
     }
 }
 
-/// A worker's view of its node's session, as the supervisor last told it.
+/// A worker's view of its node's session, as the supervisor last told it:
+/// its id, and the `mono_ns` until which its leases hold.
 #[derive(Default)]
-pub struct Session {
-    id: AtomicU64,
-    until: AtomicU64,
-}
+pub struct Session(Mutex<(u64, u64)>);
 
 impl Session {
-    /// Records the node's session; whether it is a new one or has lapsed.
+    /// Records what the supervisor says of its session, unless it has said
+    /// more already (a later session, or this one renewed later): what it
+    /// says can arrive out of order. Whether the session is now a new one,
+    /// or has lapsed.
     pub fn set(&self, id: u64, until: u64) -> bool {
-        // The id first: whoever sees the new `until` sees the new id.
-        let old = self.id.swap(id, SeqCst);
-        self.until.store(until, SeqCst);
-        old != id || until <= mono_ns()
+        let mut s = self.0.lock();
+        let old = s.0;
+        *s = (*s).max((id, until));
+        old != s.0 || s.1 <= mono_ns()
     }
 
     /// Whether `grant` is in the node's session and that hasn't lapsed.
     pub fn holds(&self, grant: &Grant) -> bool {
-        let until = self.until.load(SeqCst);
-        grant.session == self.id.load(SeqCst) && mono_ns() < until
+        let (id, until) = *self.0.lock();
+        grant.session == id && mono_ns() < until
     }
 }
 
@@ -307,8 +341,15 @@ impl Worker {
 }
 
 /// The supervisor's side of `Worker::ask`, for app `app`: the grant with its
-/// session and `until` (200), or the holder (421), or why not (503).
-pub async fn serve(leases: &Leases, app: &str, req: http::Request<hyper::body::Incoming>) -> http::Response<bytes::Bytes> {
+/// session and `until` (200), or the holder (421), or why not (503). A grant
+/// goes out only once `claim` has claimed its object for it (see
+/// `ship::claim`), and is held from then on.
+pub async fn serve<B: http_body::Body<Data = bytes::Bytes>>(
+    leases: &Leases,
+    app: &str,
+    req: http::Request<B>,
+    claim: impl AsyncFnOnce(&str, &Grant) -> std::io::Result<()>,
+) -> http::Response<bytes::Bytes> {
     use http_body_util::BodyExt;
     let object = req.uri().path().strip_prefix(PATH).unwrap_or_default().to_owned();
     if !crate::table::valid_object(&object) {
@@ -323,14 +364,21 @@ pub async fn serve(leases: &Leases, app: &str, req: http::Request<hyper::body::I
         }
         return res.status(204).body(bytes::Bytes::new()).unwrap();
     }
-    match leases.acquire(&key).await {
-        Ok(grant) => {
-            let until = leases.session.lock().until;
-            res.body(serde_json::to_vec(&(&grant, grant.session, until)).expect("grants serialize").into()).unwrap()
-        }
-        Err(Refused::Held(node)) => res.status(421).header(OWNER, node).body(bytes::Bytes::new()).unwrap(),
-        Err(Refused::Unavailable(why)) => res.status(503).body(why.into()).unwrap(),
+    let grant = match leases.acquire(&key).await {
+        Ok(grant) => grant,
+        Err(Refused::Held(node)) => return res.status(421).header(OWNER, node).body(bytes::Bytes::new()).unwrap(),
+        Err(Refused::Unavailable(why)) => return res.status(503).body(why.into()).unwrap(),
+    };
+    if let Err(e) = claim(&object, &grant).await {
+        leases.release(&key, &grant).await;
+        return res.status(503).body(format!("claiming {key}: {e}").into()).unwrap();
     }
+    // The grant with the `until` of its own session, never another's: the
+    // session it was taken in may have ended while the store answered.
+    let Some(until) = leases.until(&grant) else { return res.status(503).body("this node's session ended".into()).unwrap() };
+    let body = serde_json::to_vec(&(&grant, grant.session, until)).expect("grants serialize");
+    leases.hold(&key, grant);
+    res.body(body.into()).unwrap()
 }
 
 #[cfg(test)]
@@ -407,6 +455,27 @@ mod tests {
         assert!(renewed > id && grant.session == id);
     }
 
+    /// Nodes configured with different lease durations: one with a shorter
+    /// lease takes an object over no sooner than the holder's own leases
+    /// have lapsed, by the holder's duration, not its own.
+    #[tokio::test]
+    async fn review_shorter_observer_ttl_cannot_revoke_a_live_holder() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (a, b) = (Leases::new(store.clone(), "a", TTL * 5), Leases::new(store, "b", TTL / 2));
+        let (_, until) = a.renew().await;
+        b.renew().await;
+        a.acquire("app/o").await.unwrap();
+        // A goes quiet; B keeps asking.
+        let t0 = Instant::now();
+        while b.acquire("app/o").await.is_err() {
+            assert!(t0.elapsed() < TTL * 10, "never taken over");
+            b.renew().await;
+            tokio::time::sleep(TTL / 20).await;
+        }
+        let taken = mono_ns();
+        assert!(until < taken, "B took the object {} ms before A's leases lapsed", (until - taken) / 1_000_000);
+    }
+
     /// A renewal sent before a takeover but landing after it can't extend
     /// the old session: the taker ended it first.
     #[tokio::test]
@@ -422,8 +491,110 @@ mod tests {
         n[1].renew().await;
         n[1].acquire("app/o").await.unwrap();
         let late = store.put_opts(&Path::from("nodes/n0"),
-            serde_json::to_vec(&NodeRecord { session: stale.id, beat: stale.beat + 1 }).unwrap().into(),
+            serde_json::to_vec(&NodeRecord { session: stale.id, beat: stale.beat + 1, lease_ms: TTL.as_millis() as u64 }).unwrap().into(),
             PutMode::Update(stale.version.unwrap()).into()).await;
         assert!(matches!(late, Err(object_store::Error::Precondition { .. })), "{late:?}");
+    }
+
+    /// A store that takes each write of an object's lease record, then
+    /// answers it only once `gate` has a permit (a store slow to answer).
+    #[derive(Debug)]
+    struct Slow {
+        store: Arc<object_store::memory::InMemory>,
+        landed: tokio::sync::Notify,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl std::fmt::Display for Slow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Slow")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Slow {
+        async fn put_opts(&self, l: &Path, p: object_store::PutPayload, o: object_store::PutOptions) -> Result<object_store::PutResult> {
+            let put = self.store.put_opts(l, p, o).await;
+            if l.as_ref().starts_with("objects/") {
+                self.landed.notify_one();
+                self.gate.acquire().await.unwrap().forget();
+            }
+            put
+        }
+        async fn put_multipart_opts(&self, l: &Path, o: object_store::PutMultipartOptions) -> Result<Box<dyn object_store::MultipartUpload>> {
+            self.store.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &Path, o: object_store::GetOptions) -> Result<object_store::GetResult> {
+            self.store.get_opts(l, o).await
+        }
+        fn delete_stream(&self, l: futures::stream::BoxStream<'static, Result<Path>>) -> futures::stream::BoxStream<'static, Result<Path>> {
+            self.store.delete_stream(l)
+        }
+        fn list(&self, p: Option<&Path>) -> futures::stream::BoxStream<'static, Result<object_store::ObjectMeta>> {
+            self.store.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Path>) -> Result<object_store::ListResult> {
+            self.store.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Path, t: &Path, o: object_store::CopyOptions) -> Result<()> {
+            self.store.copy_opts(f, t, o).await
+        }
+    }
+
+    /// Node A takes a lease, but the store answers late: meanwhile A's
+    /// session lapses, B takes the object over (ending A's session) and A
+    /// starts a new session. A's answer to its worker must not then make the
+    /// grant of the dead session one the worker commits under.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_delayed_acquire_does_not_revive_a_dead_session() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let slow = Arc::new(Slow { store: store.clone(), landed: Default::default(), gate: tokio::sync::Semaphore::new(0) });
+        let a = Arc::new(Leases::new(slow.clone(), "a", TTL));
+        let b = Leases::new(store, "b", TTL);
+        a.renew().await;
+        b.renew().await;
+        let asked = tokio::spawn({
+            let a = a.clone();
+            async move {
+                let req = http::Request::post(format!("http://nanovm{PATH}o")).body(http_body_util::Empty::<bytes::Bytes>::new());
+                serve(&a, "app", req.unwrap(), async |_, _| Ok(())).await
+            }
+        });
+        slow.landed.notified().await;
+        let t0 = Instant::now();
+        let taken = loop {
+            b.renew().await;
+            match b.acquire("app/o").await {
+                Ok(grant) => break grant,
+                Err(_) => assert!(t0.elapsed() < TTL * 5, "B never took the object"),
+            }
+            tokio::time::sleep(TTL / 10).await;
+        };
+        let (id, until) = a.renew().await;
+        slow.gate.add_permits(1);
+        let res = asked.await.unwrap();
+        // As a worker takes the answer (`Worker::acquire`, `Node::acquire`)
+        // and decides a commit (`ObjShared::lease_epoch`), whether or not it
+        // has heard of A's new session first.
+        for heard in [false, true] {
+            let session = Arc::new(Session::default());
+            if heard {
+                session.set(id, until);
+            }
+            let mut obj = crate::object::ObjShared::new("app".into(), "o");
+            obj.leases = Some(session.clone());
+            if res.status() == 200 {
+                let (grant, id, until): (Grant, u64, u64) = serde_json::from_slice(res.body()).unwrap();
+                session.set(id, until);
+                *obj.lease.get_mut() = Some(grant);
+            }
+            let epoch = obj.lease_epoch().ok();
+            assert!(epoch.is_none(), "A's worker (heard of its new session: {heard}) may commit at epoch {epoch:?} while B holds {}", taken.epoch);
+            // Nor does a late word on the dead session revive it.
+            if heard {
+                session.set(id - 1, u64::MAX);
+                assert!(!session.holds(&Grant { epoch: 1, session: id - 1, e_tag: None, version: None }));
+            }
+        }
     }
 }
