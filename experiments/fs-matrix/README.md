@@ -1,6 +1,9 @@
 # Filesystem matrix for durable writes (E-63)
 
 Measurement only, for operator docs: which filesystem to put `data_dir` on.
+Measured before round 3, whose journal costs a counter's `/incr` 5 device
+flushes instead of 9 (README, "Commits"): the absolute numbers below are older
+than the code, and the filesystems' order was not measured again.
 Every `POST /incr` on the counter guest is a durable write: the undo journal
 records, then the commit syncs, before the response is released.
 
