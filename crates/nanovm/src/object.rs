@@ -700,7 +700,13 @@ async fn serve(
 
                 let (resp, mut failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
-                        let mut res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
+                        // The guest learns its answer is out (the future
+                        // `response.new` gave it resolves) once the client
+                        // has read it to its end, or gone: only then can its
+                        // work after the answer fail without failing it.
+                        let (sent, out) = oneshot::channel::<()>();
+                        let out = async move { _ = out.await; req_io.await };
+                        let mut res = acc.with(|mut s| res.into_http(&mut s, out))?;
                         // Only the node refuses requests to the proxy: a guest
                         // answering as one would have the proxy run its
                         // request again and again.
@@ -710,6 +716,7 @@ async fn serve(
                                 inner: b,
                                 remaining: max_resp,
                                 abort,
+                                sent: Some(sent),
                             }
                             .boxed_unsync()
                         });
@@ -935,6 +942,8 @@ struct GuardedBody<B> {
     inner: B,
     remaining: u64,
     abort: Arc<AtomicBool>,
+    /// Dropped once the body has been read to its end or failed, or with it.
+    sent: Option<oneshot::Sender<()>>,
 }
 
 impl<B> Body for GuardedBody<B>
@@ -949,7 +958,7 @@ where
         if self.abort.load(Relaxed) {
             return Poll::Ready(Some(Err("instance terminated".into())));
         }
-        match Pin::new(&mut self.inner).poll_frame(cx) {
+        let poll = match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     let n = data.len() as u64;
@@ -963,7 +972,11 @@ where
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
+        };
+        if matches!(poll, Poll::Ready(None | Some(Err(_)))) {
+            self.sent = None;
         }
+        poll
     }
 
     fn is_end_stream(&self) -> bool {
@@ -1053,12 +1066,27 @@ mod tests {
             inner: Full::new(Bytes::from_static(b)),
             remaining,
             abort: Arc::new(AtomicBool::new(abort)),
+            sent: None,
         };
         assert_eq!(body(b"12345", 5, false).collect().await.unwrap().to_bytes(), "12345");
         let e = body(b"123456", 5, false).collect().await.unwrap_err();
         assert!(e.to_string().contains("max_response_body_kb"));
         let e = body(b"1", 5, true).collect().await.unwrap_err();
         assert_eq!(e.to_string(), "instance terminated");
+    }
+
+    /// The guest hears that its answer is out once the body has been read
+    /// to its end, though whoever read it keeps it.
+    #[tokio::test]
+    async fn guarded_body_says_when_it_has_been_read() {
+        use oneshot::error::TryRecvError::{Closed, Empty};
+        let (sent, mut out) = oneshot::channel::<()>();
+        let inner = Full::new(Bytes::from_static(b"1"));
+        let mut body = GuardedBody { inner, remaining: 5, abort: Arc::default(), sent: Some(sent) };
+        assert!(body.frame().await.unwrap().is_ok());
+        assert_eq!(out.try_recv(), Err(Empty));
+        assert!(body.frame().await.is_none());
+        assert_eq!(out.try_recv(), Err(Closed));
     }
 
     /// The task of an idle object holds little: once, moved-in futures held
