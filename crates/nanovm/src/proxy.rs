@@ -87,30 +87,45 @@ const MAX_CACHED: usize = 10_000;
 const MAX_UNKNOWN: usize = 1000;
 /// How long a failed lookup is answered again rather than retried.
 const ERROR_TTL: Duration = Duration::from_secs(5);
+/// How long past its TTL a found answer is still given while looking it up
+/// again fails, or takes over `STALE_WAIT` (a resolver or registry outage),
+/// asked again every `STALE_RETRY`: RFC 8767's serve-stale.
+const MAX_STALE: Duration = Duration::from_secs(24 * 3600);
+const STALE_WAIT: Duration = Duration::from_secs(5);
+const STALE_RETRY: Duration = Duration::from_secs(30);
 
 /// Answers kept until they expire, failures briefly. However many ask for a
 /// key at once, it is looked up once. Answers `found` accepts are kept apart
 /// from the rest, so made-up names neither push them out nor cost more than
-/// `MAX_UNKNOWN` lookups while the rest are fresh.
+/// `MAX_UNKNOWN` lookups while the rest are fresh, and stand in for
+/// failures to look them up again for `stale` (`MAX_STALE`).
 struct Cache<T> {
     found: fn(&T) -> bool,
+    stale: Duration,
     /// The keys with a found answer, and the rest.
     cells: Mutex<[HashMap<String, Cell<T>>; 2]>,
 }
 
-/// An answer or a failure, and until when it holds.
-type Cell<T> = Arc<OnceCell<(Result<T, String>, Instant)>>;
+/// A key's answer once looked up (an answer or a failure, until when it
+/// holds, and until when its last found answer held), and that last found
+/// answer, standing in for a failure.
+struct Slot<T> {
+    answer: OnceCell<(Result<T, String>, Instant, Instant)>,
+    last: Option<(T, Instant)>,
+}
+type Cell<T> = Arc<Slot<T>>;
 
 impl<T: Clone> Cache<T> {
     fn new(found: fn(&T) -> bool) -> Cache<T> {
-        Cache { found, cells: Mutex::default() }
+        Cache { found, stale: MAX_STALE, cells: Mutex::default() }
     }
 
     /// `key`'s answer, from `lookup` (an answer and how long it lasts) when
     /// there is none fresh.
     async fn get(&self, key: &str, lookup: impl Future<Output = anyhow::Result<(T, Duration)>>) -> Result<T, (StatusCode, String)> {
         let now = Instant::now();
-        let fresh = |c: &Cell<T>| c.get().is_none_or(|(_, until)| *until > now);
+        let fresh = |c: &Cell<T>| c.answer.get().is_none_or(|(_, until, _)| *until > now);
+        let slot = |last| Arc::new(Slot { answer: OnceCell::new(), last });
         let (cell, unknown) = {
             let mut cells = self.cells.lock();
             let [found, rest] = &mut *cells;
@@ -119,8 +134,9 @@ impl<T: Clone> Cache<T> {
             } else if let Some(c) = rest.get(key).filter(|c| fresh(c)) {
                 (c.clone(), true)
             } else if let Some(old) = found.get_mut(key) {
-                // Looked up again where it is.
-                *old = Cell::default();
+                // Looked up again where it is, its found answer standing in.
+                let last = old.answer.get().and_then(|(a, _, good)| Some((a.as_ref().ok().filter(|v| (self.found)(v))?.clone(), *good)));
+                *old = slot(last);
                 (old.clone(), false)
             } else {
                 if rest.len() >= MAX_UNKNOWN {
@@ -129,13 +145,23 @@ impl<T: Clone> Cache<T> {
                 if rest.len() >= MAX_UNKNOWN {
                     return Err((StatusCode::SERVICE_UNAVAILABLE, "too many names without an answer are remembered: try again soon".into()));
                 }
-                (rest.entry(key.to_string()).insert_entry(Cell::default()).get().clone(), true)
+                (rest.entry(key.to_string()).insert_entry(slot(None)).get().clone(), true)
             }
         };
-        let (answer, _) = cell
-            .get_or_init(async || match lookup.await {
-                Ok((v, ttl)) => (Ok(v), Instant::now() + ttl),
-                Err(e) => (Err(format!("{e:#}")), Instant::now() + ERROR_TTL),
+        let last = &cell.last;
+        let (answer, ..) = cell
+            .answer
+            .get_or_init(|| async move {
+                let looked = match last {
+                    Some(_) => tokio::time::timeout(STALE_WAIT, lookup).await.unwrap_or_else(|_| Err(anyhow::anyhow!("no answer in {STALE_WAIT:?}"))),
+                    None => lookup.await,
+                };
+                let now = Instant::now();
+                match (looked, last) {
+                    (Ok((v, ttl)), _) => (Ok(v), now + ttl, now + ttl),
+                    (Err(_), Some((v, good))) if now < *good + self.stale => (Ok(v.clone()), now + STALE_RETRY, *good),
+                    (Err(e), _) => (Err(format!("{e:#}")), now + ERROR_TTL, now),
+                }
             })
             .await;
         // A new key's found answer moves to the found ones.
@@ -563,18 +589,25 @@ mod tests {
         assert!(cache.cells.lock()[0].len() <= MAX_CACHED);
     }
 
+    type Down = Arc<std::sync::atomic::AtomicBool>;
+
     /// A DNS-over-HTTPS stub answering TXT queries for `_nanovm.<host>` from
-    /// `records` by host, and counting them. A record `CNAME <name>` answers
-    /// as resolvers do (the alias, then the target's records under its
-    /// name); `STATUS <n>` answers DNS status `n` and nothing else.
-    async fn resolver(records: &[(&str, &str)]) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    /// `records` by host, with TTL `ttl`, and counting them; while `Down`,
+    /// it answers 503. A record `CNAME <name>` answers as resolvers do (the
+    /// alias, then the target's records under its name); `STATUS <n>`
+    /// answers DNS status `n` and nothing else.
+    async fn resolver(records: &[(&str, &str)], ttl: u64) -> (String, Arc<std::sync::atomic::AtomicUsize>, Down) {
         use std::sync::atomic::Ordering::SeqCst;
         let records: Arc<HashMap<String, String>> = Arc::new(records.iter().map(|(h, r)| (format!("_nanovm.{h}"), r.to_string())).collect());
         let (listener, asked) = (tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(), Arc::<std::sync::atomic::AtomicUsize>::default());
         let url = format!("http://{}/dns-query", listener.local_addr().unwrap());
-        let counted = asked.clone();
+        let (counted, down) = (asked.clone(), Down::default());
+        let switch = down.clone();
         tokio::spawn(crate::server::serve_http1(listener, move |req: Request<Incoming>| {
             counted.fetch_add(1, SeqCst);
+            if down.load(SeqCst) {
+                return std::future::ready(crate::object::error_response(503, "down", "down"));
+            }
             let mut name = req.uri().query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("name=")).unwrap_or("").to_string();
             let (mut answer, mut status) = (vec![], 0);
             if let Some(target) = records.get(&name).and_then(|r| r.strip_prefix("CNAME ")) {
@@ -583,12 +616,12 @@ mod tests {
             }
             match records.get(&name) {
                 Some(r) if r.starts_with("STATUS ") => status = r[7..].parse().unwrap(),
-                Some(txt) => answer.push(serde_json::json!({ "name": format!("{name}."), "type": 16, "TTL": 3600, "data": format!("\"{txt}\"") })),
+                Some(txt) => answer.push(serde_json::json!({ "name": format!("{name}."), "type": 16, "TTL": ttl, "data": format!("\"{txt}\"") })),
                 None => {}
             }
-            async move { crate::server::ok_json(serde_json::json!({ "Status": status, "Answer": answer })) }
+            std::future::ready(crate::server::ok_json(serde_json::json!({ "Status": status, "Answer": answer })))
         }));
-        (url, asked)
+        (url, asked, switch)
     }
 
     /// A proxy asking `resolver`, serving `hosts` to apps `signers` sign.
@@ -603,7 +636,7 @@ mod tests {
     async fn unlisted_hosts_are_refused_before_any_lookup() {
         use std::sync::atomic::Ordering::SeqCst;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let (url, asked) = resolver(&[]).await;
+        let (url, asked, _) = resolver(&[], 3600).await;
         let status = async |addr: std::net::SocketAddr, host: &str| {
             let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
             c.write_all(format!("GET /a/ HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
@@ -634,7 +667,7 @@ mod tests {
     async fn records_trust_only_the_operators_signers() {
         let mixed = "app=ghcr.io/org/app:prod; trust=https://ci repo:org/a; trust=https://ci repo:other/a; \
             trust=https://evil repo:org/a; trust=https://ci repo:org; trust=https://ci.evil repo:org/a; trust=https://exact whom";
-        let (url, _) = resolver(&[("mixed.test", mixed), ("theirs.test", "app=ghcr.io/org/app:prod; trust=https://ci repo:other/a")]).await;
+        let (url, ..) = resolver(&[("mixed.test", mixed), ("theirs.test", "app=ghcr.io/org/app:prod; trust=https://ci repo:other/a")], 3600).await;
         let p = proxy(&url, &[], &["https://ci repo:org/*", "https://exact who"]);
         assert_eq!(p.route("mixed.test").await.unwrap().trust, "https://ci repo:org/a");
         let (status, why) = p.route("theirs.test").await.unwrap_err();
@@ -647,13 +680,13 @@ mod tests {
     /// serve another's app, with its data, under its own origin.
     #[tokio::test]
     async fn aliases_need_the_owners_consent() {
-        let (url, _) = resolver(&[
+        let (url, ..) = resolver(&[
             ("a.test", "app=ghcr.io/org/app:prod; trust=i s; alias=www.a.test"),
             ("www.a.test", "CNAME _nanovm.a.test"),
             ("evil.test", "CNAME _nanovm.a.test"),
             ("b.test", "app=ghcr.io/org/app:prod; trust=i s"),
             ("www.b.test", "CNAME _nanovm.b.test"),
-        ]).await;
+        ], 3600).await;
         let p = proxy(&url, &[], &["i s"]);
         assert_eq!(p.route("a.test").await.unwrap().owner, "a.test");
         assert_eq!(p.route("www.a.test").await.unwrap().owner, "a.test");
@@ -670,7 +703,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn made_up_names_cost_bounded_lookups_and_keep_live_routes() {
         use std::sync::atomic::Ordering::SeqCst;
-        let (url, asked) = resolver(&[("live.apps.test", "app=ghcr.io/org/app:prod; trust=i s")]).await;
+        let (url, asked, _) = resolver(&[("live.apps.test", "app=ghcr.io/org/app:prod; trust=i s")], 3600).await;
         let p = proxy(&url, &["*.apps.test"], &["i s"]);
         p.route("live.apps.test").await.unwrap();
         let (flood, mut refused) = (3 * MAX_CACHED, 0);
@@ -694,11 +727,57 @@ mod tests {
     /// without a record (404, remembered for 30 s).
     #[tokio::test]
     async fn a_failing_resolver_is_not_an_answer() {
-        let (url, _) = resolver(&[("down.test", "STATUS 2"), ("gone.test", "STATUS 3")]).await;
+        let (url, ..) = resolver(&[("down.test", "STATUS 2"), ("gone.test", "STATUS 3")], 3600).await;
         let p = proxy(&url, &[], &["i s"]);
         let (status, why) = p.route("down.test").await.unwrap_err();
         assert!(status == StatusCode::BAD_GATEWAY && why.contains("status 2"), "{why}");
         assert_eq!(p.route("gone.test").await.unwrap_err().0, StatusCode::NOT_FOUND);
+    }
+
+    /// While looking a found answer up again fails, or hangs past
+    /// `STALE_WAIT`, the answer is still given, for `stale` past its TTL,
+    /// and asked for again only every `STALE_RETRY`; a key with no found
+    /// answer fails as before. Before, a resolver or registry outage took
+    /// every app down within its TTL.
+    #[tokio::test]
+    async fn found_answers_outlast_an_outage_for_a_while() {
+        let (start, stale) = (Instant::now(), STALE_WAIT + Duration::from_secs(1));
+        let cache = Cache::<u32> { stale, ..Cache::new(|v| *v > 0) };
+        let ok = |v| async move { anyhow::Ok((v, Duration::ZERO)) };
+        let down = || async { Err::<(u32, Duration), _>(anyhow::anyhow!("down")) };
+        for (key, v) in [("a", 7), ("b", 0), ("c", 9), ("d", 5)] {
+            assert_eq!(cache.get(key, ok(v)).await, Ok(v));
+        }
+        assert_eq!(cache.get("a", down()).await, Ok(7));
+        let unasked = async { unreachable!("asked again before STALE_RETRY") as anyhow::Result<(u32, Duration)> };
+        assert_eq!(cache.get("a", unasked).await, Ok(7));
+        for key in ["b", "never"] {
+            assert_eq!(cache.get(key, down()).await, Err((StatusCode::BAD_GATEWAY, "down".into())), "{key}");
+        }
+        let t0 = Instant::now();
+        let hung = tokio::time::timeout(STALE_WAIT + Duration::from_secs(2), cache.get("c", std::future::pending())).await;
+        assert_eq!(hung.expect("waited on a hung lookup"), Ok(9));
+        assert!(t0.elapsed() >= STALE_WAIT, "{:?}", t0.elapsed());
+        // `d` ran out more than `stale` ago.
+        tokio::time::sleep((start + stale + Duration::from_millis(100)).saturating_duration_since(Instant::now())).await;
+        assert_eq!(cache.get("d", down()).await, Err((StatusCode::BAD_GATEWAY, "down".into())));
+    }
+
+    /// A resolver outage keeps a host's last route rather than taking its
+    /// app down within the record's TTL; a host it never routed fails.
+    #[tokio::test]
+    async fn a_resolver_outage_keeps_the_last_route() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (url, asked, down) = resolver(&[("live.test", "app=ghcr.io/org/app:prod; trust=i s")], 1).await;
+        let p = proxy(&url, &[], &["i s"]);
+        p.route("live.test").await.unwrap();
+        down.store(true, SeqCst);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(p.route("live.test").await.unwrap().trust, "i s");
+        assert_eq!(p.route("new.test").await.unwrap_err().0, StatusCode::BAD_GATEWAY);
+        let n = asked.load(SeqCst);
+        p.route("live.test").await.unwrap();
+        assert_eq!(asked.load(SeqCst), n);
     }
 
     /// With several nodes, a node that takes a request and never answers
