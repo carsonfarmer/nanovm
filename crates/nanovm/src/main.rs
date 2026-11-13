@@ -270,5 +270,5 @@ fn listener(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
 }
 
 async fn front(sup: Arc<Supervisor>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-    nanovm::server::serve_http1(listener, move |req| sup.clone().handle(req)).await
+    nanovm::gate::serve(sup.gate.clone(), listener, None, move |req| sup.clone().handle(req)).await
 }

@@ -91,6 +91,10 @@ pub struct Supervisor {
     relay: Arc<crate::telemetry::Relay>,
     telemetry: Arc<crate::telemetry::Telemetry>,
     started: Instant,
+    /// What clients that reach `listen` directly may ask of it.
+    pub gate: Arc<crate::gate::Gate>,
+    /// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`).
+    cgroup: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -157,8 +161,9 @@ impl Supervisor {
         let ttl = Duration::from_millis(cfg.lease_ms);
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
+        let cgroup = cgroup(&cfg)?;
         // Workers' cgroups that an earlier run left: the empty ones go.
-        for dir in cfg.cgroup.iter().flat_map(std::fs::read_dir).flatten().flatten() {
+        for dir in cgroup.iter().flat_map(std::fs::read_dir).flatten().flatten() {
             let _ = std::fs::remove_dir(dir.path());
         }
         let sup = Arc::new(Supervisor {
@@ -176,11 +181,13 @@ impl Supervisor {
             relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
+            gate: crate::gate::Gate::new(&cfg.clients)?,
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
             started: Instant::now(),
+            cgroup,
         });
         sup.clone().refill();
         // Renews the node's session, and tells each worker it holds.
@@ -255,6 +262,10 @@ impl Supervisor {
 
     async fn handle_request(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         let mut req = req.map(|b| b.boxed_unsync());
+        let client = self.gate.client(&req);
+        if let Err(refused) = self.gate.admit(client, None) {
+            return refused;
+        }
         let want = match AppRef::from_headers(req.headers()) {
             Ok(Some(w)) => w,
             Ok(None) => return self.admin(req).await,
@@ -267,6 +278,9 @@ impl Supervisor {
             return error_response(400, "bad-object-id", BAD_OBJECT);
         }
         let name = want.name();
+        if let Err(refused) = self.gate.admit(client, Some(&name)) {
+            return refused;
+        }
         let w = {
             let mut workers = self.workers.lock();
             if !workers.contains_key(&name) && workers.len() >= 2 * self.cfg.max_apps {
@@ -568,7 +582,7 @@ impl Supervisor {
         let (requests, worker_requests) = UnixStream::pair()?;
         let (egress, worker_egress) = UnixStream::pair()?;
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
-        let cgroup = self.cfg.cgroup.as_deref().map(Cgroup::new).transpose()?;
+        let cgroup = self.cgroup.as_deref().map(Cgroup::new).transpose()?;
         let into = cgroup.as_ref().map(|c| format!(" into {}", c.0.display())).unwrap_or_default();
         let procs = cgroup.as_ref().map(|c| std::fs::OpenOptions::new().write(true).open(c.0.join("cgroup.procs"))).transpose();
         let procs = procs.with_context(|| format!("spawning {}{into}", self.exe.display()))?;
@@ -794,6 +808,46 @@ fn restored(objects: &Path, object: &str) -> std::io::Result<()> {
         chown_tree(d, uid).map_err(std::io::Error::other)?;
     }
     Ok(())
+}
+
+/// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`).
+fn cgroup(cfg: &NodeConfig) -> anyhow::Result<Option<PathBuf>> {
+    Ok(match cfg.cgroup.as_str() {
+        "off" => None,
+        "auto" if cfg!(not(target_os = "linux")) => None,
+        "auto" => Some(delegate(&cfg.worker).context("cgroup = \"auto\": workers need a cgroup v2 subtree for their [worker] limits \
+            (under systemd, Delegate=yes); set cgroup = \"off\" to run them without")?),
+        dir => Some(PathBuf::from(dir)),
+    })
+}
+
+/// Makes the supervisor's own cgroup v2 a subtree for workers, as a
+/// container runtime does: moves the supervisor into `<own>/supervisor`
+/// (cgroup v2 keeps processes out of a group that hands controllers to its
+/// children), hands the controllers `limits` need to `<own>/workers`'
+/// children, and returns `<own>/workers`.
+fn delegate(limits: &WorkerLimits) -> anyhow::Result<PathBuf> {
+    let own = std::fs::read_to_string("/proc/self/cgroup")?;
+    let own = own.lines().find_map(|l| l.strip_prefix("0::")).context("not in a cgroup v2 hierarchy")?;
+    // Mount info: `<id> <parent> <dev> <root> <mount point> ... - cgroup2 ...`.
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let (root, mount) = mounts.lines().map(|l| l.split(' ').collect::<Vec<_>>())
+        .find_map(|f| (f.iter().skip_while(|f| **f != "-").nth(1) == Some(&"cgroup2")).then(|| (f[3].to_owned(), PathBuf::from(f[4]))))
+        .context("no cgroup v2 hierarchy is mounted")?;
+    let own = mount.join(Path::new(own).strip_prefix(&root).context("the supervisor's cgroup is outside the mounted hierarchy")?);
+    let wanted = [("memory", limits.memory_mb > 0), ("cpu", limits.cpus > 0.0), ("pids", limits.pids > 0)];
+    let available = std::fs::read_to_string(own.join("cgroup.controllers"))?;
+    if let Some((c, _)) = wanted.iter().find(|(c, on)| *on && !available.split_whitespace().any(|a| a == *c)) {
+        bail!("the {c} controller is not available in {}", own.display());
+    }
+    let enable: Vec<_> = wanted.iter().filter(|(_, on)| *on).map(|(c, _)| format!("+{c}")).collect();
+    let write = |dir: &Path, file: &str, value: &str| {
+        std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(file), value)).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
+    };
+    write(&own.join("supervisor"), "cgroup.procs", "0")?;
+    write(&own, "cgroup.subtree_control", &enable.join(" "))?;
+    write(&own.join("workers"), "cgroup.subtree_control", &enable.join(" "))?;
+    Ok(own.join("workers"))
 }
 
 /// Gives a worker's cgroup its app's worker limits.

@@ -7,3 +7,5 @@ max_live_objects = 8000
 memory_reservation_mb = 64
 epoch_tick_ms = 5
 dev = true
+# Workers run without [worker] limits where no cgroup is delegated.
+cgroup = "off"

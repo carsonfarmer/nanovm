@@ -73,6 +73,8 @@ fn node_cfg(test: &str, max_live: usize) -> NodeConfig {
         max_live_objects: max_live,
         memory_reservation_mb: 64,
         dev: true,
+        // The cgroup tests name their own; the rest run where none is delegated.
+        cgroup: "off".into(),
         ..NodeConfig::default()
     };
     cfg.validate().unwrap();
@@ -743,6 +745,104 @@ async fn data_quota_survives_restart() {
     assert!(node.metrics.fs_denied.load(Relaxed) >= 1);
 }
 
+/// A supervisor whose data is on a tmpfs of `mb` MiB, as the audit's 8 MiB
+/// root was, with `app_disk_mb` and `disk_reserve_mb`; why not, unless root.
+async fn on_a_small_disk(test: &str, mb: u64, budget: u64, reserve: u64) -> Result<(Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, SmallDisk), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("mounting a tmpfs needs root".into());
+    }
+    let mut cfg = node_cfg(test, 8);
+    let cache = std::fs::read_link(cfg.data_dir.join("cache")).unwrap();
+    let mounted = std::process::Command::new("mount").args(["-t", "tmpfs", "-o", &format!("size={mb}m"), "tmpfs"]).arg(&cfg.data_dir).status();
+    if !mounted.as_ref().is_ok_and(|s| s.success()) {
+        return Err(format!("mount -t tmpfs failed: {mounted:?}"));
+    }
+    let disk = SmallDisk(cfg.data_dir.clone());
+    std::os::unix::fs::symlink(cache, cfg.data_dir.join("cache")).unwrap();
+    (cfg.app_disk_mb, cfg.disk_reserve_mb) = (budget, reserve);
+    let (sup, addr) = supervised_with(cfg).await;
+    Ok((sup, addr, disk))
+}
+
+/// A tmpfs, unmounted when dropped.
+struct SmallDisk(PathBuf);
+
+impl Drop for SmallDisk {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount").arg("-l").arg(&self.0).status();
+    }
+}
+
+/// The `fs-denied` events the supervisor at `addr` has had from its workers.
+async fn denials(addr: std::net::SocketAddr) -> Vec<String> {
+    stats_json(addr).await;
+    let logs = captures().lock()[&addr].1.lock().logs.clone();
+    logs.iter().filter(|l| l["kind"] == "fs-denied").map(|l| l["detail"].as_str().unwrap_or_default().to_owned()).collect()
+}
+
+/// An app that fills its disk budget has its own writes refused, with a
+/// status that says so, and no other app's: on the audit's 8 MiB disk,
+/// where one app's objects stopped every write on the node.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_app_budget_refuses_only_that_apps_writes() {
+    let (_sup, addr, _disk) = match on_a_small_disk("a_full_app_budget_refuses_only_that_apps_writes", 8, 3, 1).await {
+        Ok(s) => s,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (a, b) = (publish("budget-a", &filler()).await, publish("budget-b", &filler()).await);
+    let fill = async |app: &str, object: &str, name: &str, mb: u32| {
+        let (status, body) = app_get(addr, app, &format!("/{object}/fill?mount=data&mb={mb}&name={name}")).await;
+        (status, serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default())
+    };
+    assert_eq!(fill(&a, "o1", "f", 2).await.0, 200);
+    // Another object of the same app gets what is left of its 3 MiB.
+    let (status, body) = fill(&a, "o2", "f", 2).await;
+    assert_eq!((status, body["error"].as_str(), body["written"].as_u64()), (507, Some("insufficient-space"), Some(1 << 20)), "{body}");
+    assert!(denials(addr).await.iter().any(|d| d.contains("the app's 3 MiB disk budget is full")));
+    // The other app's writes go on.
+    let (status, body) = fill(&b, "o1", "f", 2).await;
+    assert_eq!(status, 200, "{body}");
+    // Freeing an object's space lets the app write again.
+    assert_eq!(app_get(addr, &a, "/o1/clean?mount=data").await.0, 200);
+    let (status, body) = fill(&a, "o2", "g", 1).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// Below the node's free-space reserve every app's writes that need more
+/// space are refused cleanly (507 from the app, not a failed commit), while
+/// writes in place still commit; freeing space ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_disk_reserve_keeps_writes_committing() {
+    let (_sup, addr, _disk) = match on_a_small_disk("the_disk_reserve_keeps_writes_committing", 8, 100, 3).await {
+        Ok(s) => s,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (files, counter) = (publish("reserve-files", &filler()).await, publish("reserve-counter", &app("counter")).await);
+    let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(raw(addr, &format!("POST /c0/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await.0, 200);
+    // One object fills the disk down to the reserve.
+    let (status, body) = app_get(addr, &files, "/hog/fill?mount=data&mb=8&name=f").await;
+    assert_eq!(status, 507, "{body}");
+    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk is below its 3 MiB reserve")));
+    // Every app's growth is refused by the app, as on a full disk: never a
+    // failed commit, as the audit saw on every write.
+    let incr = async |object: &str| {
+        raw(addr, &format!("POST /{object}/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await
+    };
+    for i in 0..20 {
+        let (status, body) = incr(&format!("c{i}")).await;
+        assert_eq!(status, 507, "{body}");
+        assert!(body.contains("insufficient-space"), "{body}");
+    }
+    // A write in place still commits.
+    let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(app_get(addr, &files, "/hog/clean?mount=data").await.0, 200);
+    let (status, body) = incr("c1").await;
+    assert_eq!(status, 200, "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_escapes_blocked() {
     let node = node("sandbox_escapes_blocked", "hostile", 8);
@@ -1083,7 +1183,7 @@ async fn supervised_at(mut cfg: NodeConfig, listener: tokio::net::TcpListener, l
     captures().lock().retain(|_, (sup, _)| sup.strong_count() != 0);
     captures().lock().insert(addr, (Arc::downgrade(&sup), captured));
     let s = sup.clone();
-    tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
+    tokio::spawn(nanovm::gate::serve(sup.gate.clone(), listener, None, move |req| s.clone().handle(req)));
     sup
 }
 
@@ -1575,7 +1675,7 @@ async fn workers_are_placed_in_their_cgroups() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("workers_are_placed_in_their_cgroups", 8);
-    cfg.cgroup = Some(root.clone());
+    cfg.cgroup = root.to_str().unwrap().into();
     let (sup, addr) = supervised_with(cfg).await;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
     for a in [&counter, &hostile] {
@@ -1632,7 +1732,7 @@ async fn review_spare_engine_memory_is_charged_to_the_app() {
     };
     let slots = 8192;
     let mut cfg = node_cfg("review_spare_engine_memory_is_charged_to_the_app", slots);
-    cfg.cgroup = Some(root.clone());
+    cfg.cgroup = root.to_str().unwrap().into();
     cfg.worker.memory_mb = 512;
     let (sup, addr) = supervised_with(cfg).await;
     let counter = publish("counter", &app("counter")).await;
@@ -1662,7 +1762,7 @@ async fn worker_memory_max_kills_only_that_worker() {
     };
     // Each hostile object may hold 32 MiB; eight holding 30 MiB exceed 160.
     let mut cfg = node_cfg("worker_memory_max_kills_only_that_worker", 8);
-    cfg.cgroup = Some(root.clone());
+    cfg.cgroup = root.to_str().unwrap().into();
     cfg.worker.memory_mb = 160;
     let (sup, addr) = supervised_with(cfg).await;
     let mut big = app("hostile");
@@ -1698,7 +1798,7 @@ async fn worker_cpu_and_pids_limits_hold() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("worker_cpu_and_pids_limits_hold", 8);
-    cfg.cgroup = Some(root.clone());
+    cfg.cgroup = root.to_str().unwrap().into();
     cfg.worker.cpus = 0.2;
     cfg.worker.pids = 64;
     let (sup, addr) = supervised_with(cfg).await;
@@ -3421,6 +3521,133 @@ async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::Sock
     let addr = listener.local_addr().unwrap();
     tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
     addr
+}
+
+/// A proxy in front of `node` serving `counter` at `counter.test` and
+/// `hostile` at `hostile.test`, with `clients` its client limits.
+async fn gated(test: &str, clients: nanovm::config::ClientLimits) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+    let (sup, node) = supervised(test).await;
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    for (host, name) in [("counter.test", "counter"), ("hostile.test", "hostile")] {
+        let app = publish(&format!("{test}-{name}"), &app(name)).await;
+        records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", app.split_once('@').unwrap().0)]);
+    }
+    let cfg = nanovm::config::ProxyConfig { nodes: vec![node.to_string()], resolver: doh(records).await, dev: true, listen: "127.0.0.1:0".into(), clients, ..Default::default() };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+    (sup, addr)
+}
+
+/// `GET /a/` on `host` with `extra` headers: the status line and headers,
+/// lowercased.
+async fn head_of(addr: std::net::SocketAddr, host: &str, extra: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("GET /a/ HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out).await;
+    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    text.split_once("\r\n\r\n").map_or(text.clone(), |(h, _)| h.to_owned())
+}
+
+/// A client past its rate is answered 429 with a retry-after, by the
+/// proxy and by a node it reaches directly; what it says in
+/// X-Forwarded-For is heard only from a trusted peer, and then only right
+/// of what the client wrote itself, so it can't spread its requests over
+/// addresses it makes up, nor spend another client's.
+#[tokio::test(flavor = "multi_thread")]
+async fn clients_past_their_rate_are_refused_however_they_forward() {
+    use nanovm::config::ClientLimits;
+    // 127.0.0.1 is a client like any other: it may send 5 a second, 10 at once.
+    let untrusted = ClientLimits { rate: 5, trusted: vec!["192.0.2.1".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("rate_untrusted", untrusted).await;
+    for i in 0..10 {
+        let head = head_of(proxy, "counter.test", &format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
+        assert!(head.starts_with("http/1.1 200"), "{i}: {head}");
+    }
+    for i in 10..20 {
+        let head = head_of(proxy, "counter.test", &format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
+        assert!(head.starts_with("http/1.1 429") && head.contains("retry-after: 1") && head.contains("x-nanovm-error: rate-limited"), "{i}: {head}");
+    }
+    // Behind a trusted terminator, each client has its own rate.
+    let trusted = ClientLimits { rate: 5, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("rate_trusted", trusted).await;
+    let from = |client: &str| format!("X-Forwarded-For: {client}\r\n");
+    for _ in 0..10 {
+        assert!(head_of(proxy, "counter.test", &from("198.51.100.1")).await.starts_with("http/1.1 200"));
+    }
+    assert!(head_of(proxy, "counter.test", &from("198.51.100.1")).await.starts_with("http/1.1 429"));
+    // Whatever it writes before its own address.
+    for forged in ["203.0.113.66, 198.51.100.1", "198.51.100.2, 198.51.100.1", "127.0.0.1, 198.51.100.1"] {
+        assert!(head_of(proxy, "counter.test", &from(forged)).await.starts_with("http/1.1 429"), "{forged}");
+    }
+    assert!(head_of(proxy, "counter.test", &from("198.51.100.2")).await.starts_with("http/1.1 200"));
+    // The terminator's own requests aren't limited.
+    for _ in 0..30 {
+        assert!(head_of(proxy, "counter.test", "").await.starts_with("http/1.1 200"));
+    }
+    // A node reached directly limits its clients too.
+    let mut cfg = node_cfg("rate_node", 8);
+    cfg.clients = ClientLimits { rate: 5, trusted: vec![], ..ClientLimits::default() };
+    let (_sup, node) = supervised_with(cfg).await;
+    let counter = publish("rate-node", &app("counter")).await;
+    let statuses: Vec<_> = futures::future::join_all((0..12).map(|_| app_get(node, &counter, "/a/"))).await.into_iter().map(|r| r.0).collect();
+    assert_eq!(statuses.iter().filter(|s| **s == 429).count(), 2, "{statuses:?}");
+}
+
+/// Past an app's rate, its requests are refused whichever client sends
+/// them; another app's are not.
+#[tokio::test(flavor = "multi_thread")]
+async fn apps_past_their_rate_are_refused() {
+    use nanovm::config::ClientLimits;
+    let limits = ClientLimits { rate: 0, app_rate: 3, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("app_rate", limits).await;
+    let from = |i: usize| format!("X-Forwarded-For: 198.51.100.{i}\r\n");
+    for i in 0..6 {
+        assert!(head_of(proxy, "counter.test", &from(i)).await.starts_with("http/1.1 200"), "{i}");
+    }
+    assert!(head_of(proxy, "counter.test", &from(7)).await.starts_with("http/1.1 429"));
+    assert!(head_of(proxy, "hostile.test", &from(7)).await.starts_with("http/1.1 200"));
+}
+
+/// A client gets `connections_per_client` connections, past which one is
+/// answered 503 with a retry-after and closed; past `connections` in all, a
+/// new one waits until another closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_are_capped_per_client_and_in_all() {
+    use nanovm::config::ClientLimits;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = b"GET /a/ HTTP/1.1\r\nHost: counter.test\r\nConnection: close\r\n\r\n";
+    let answer = async |s: &mut tokio::net::TcpStream| {
+        s.write_all(request).await.unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+        String::from_utf8_lossy(&out).to_ascii_lowercase()
+    };
+    let limits = ClientLimits { connections_per_client: 2, trusted: vec![], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("connections_per_client", limits).await;
+    let connect = || tokio::net::TcpStream::connect(proxy);
+    let (a, mut b) = (connect().await.unwrap(), connect().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let refused = answer(&mut connect().await.unwrap()).await;
+    assert!(refused.starts_with("http/1.1 503") && refused.contains("retry-after: 1") && refused.contains("too-many-connections"), "{refused}");
+    assert!(answer(&mut b).await.starts_with("http/1.1 200"));
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(answer(&mut connect().await.unwrap()).await.starts_with("http/1.1 200"));
+
+    let limits = ClientLimits { connections: 2, connections_per_client: 0, ..ClientLimits::default() };
+    let (_sup, proxy) = gated("connections_in_all", limits).await;
+    let connect = || tokio::net::TcpStream::connect(proxy);
+    let (a, _b) = (connect().await.unwrap(), connect().await.unwrap());
+    let mut third = connect().await.unwrap();
+    let waiting = tokio::spawn(async move { answer(&mut third).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!waiting.is_finished(), "served past the cap");
+    drop(a);
+    let served = tokio::time::timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap();
+    assert!(served.starts_with("http/1.1 200"), "{served}");
 }
 
 /// The proxy serves each host the app its `_nanovm` record names, at the

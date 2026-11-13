@@ -68,10 +68,6 @@ config! {
         /// When the supervisor runs as root, app `i`'s worker runs as uid and
         /// gid `jail_uid_base + i`.
         jail_uid_base: u32 = 200_000u32,
-        /// A delegated cgroup v2 directory, with the memory, cpu and pids
-        /// controllers enabled for its children. Each worker runs in a
-        /// cgroup of its own under it, with its app's `[app.worker]` limits.
-        cgroup: Option<PathBuf> = None::<PathBuf>,
         /// The most an app gets: each of its limits is clamped to these.
         /// Egress entries are the app's own.
         limits: Limits = Limits::default(),
@@ -91,6 +87,23 @@ config! {
         /// are plain HTTP. Allowed only in a build with the `dev` feature and
         /// with a loopback `listen`.
         dev: bool = false,
+        /// Where workers run, each in a cgroup v2 of its own with the
+        /// `[worker]` limits: `"auto"` makes the supervisor's own cgroup a
+        /// subtree for them (systemd: `Delegate=yes`) and refuses to start
+        /// where it can't; a directory names a delegated one, with the cpu,
+        /// memory and pids controllers enabled for its children; `"off"` runs
+        /// workers without those limits.
+        cgroup: String = "auto",
+        /// What clients may ask of `listen` when they reach it directly.
+        clients: ClientLimits = ClientLimits::default(),
+        /// Bytes all of an app's objects' volumes may hold, in MiB: past it
+        /// that app's writes are refused. 0 is a quarter of `data_dir`'s
+        /// filesystem.
+        app_disk_mb: u64 = 0u64,
+        /// Free space kept on `data_dir`'s filesystem, in MiB: below it,
+        /// writes that need more space are refused for every app, so
+        /// commits, rollbacks and deletes always find room.
+        disk_reserve_mb: u64 = 512u64,
     }
 }
 
@@ -145,6 +158,29 @@ config! {
         /// For local development only: registries may be on private
         /// addresses, and loopback ones are plain HTTP (as for the node).
         dev: bool = false,
+        /// What clients may ask of `listen`.
+        clients: ClientLimits = ClientLimits::default(),
+    }
+}
+
+config! {
+    /// What one client, and one app, may ask of a public listener (see
+    /// `gate`). 0 turns a limit off.
+    pub struct ClientLimits {
+        /// Requests a second from one client address (an IPv6 /64), with
+        /// bursts of twice that.
+        rate: u32 = 100u32,
+        /// Requests a second to one app, with bursts of twice that.
+        app_rate: u32 = 1000u32,
+        /// Connections open at once from one client address.
+        connections_per_client: usize = 256usize,
+        /// Connections open at once in all: past it, new ones wait.
+        connections: usize = 10_000usize,
+        /// Peers that forward other clients' requests (a TLS terminator, the
+        /// proxy), as addresses or CIDR ranges. Their own requests and
+        /// connections aren't limited, and a request's client is the last
+        /// address in its `X-Forwarded-For` that isn't one of theirs.
+        trusted: Vec<String> = vec!["127.0.0.1".to_string(), "::1".to_string()],
     }
 }
 
@@ -173,10 +209,11 @@ config! {
 
 config! {
     /// Limits on an app's whole worker process, applied through its cgroup.
-    /// 0 leaves a limit unset.
+    /// The defaults leave the rest of the host room: a quarter of its memory
+    /// and all its cores but one. 0 leaves a limit unset.
     pub struct WorkerLimits {
-        memory_mb: u64 = 0u64,
-        cpus: f64 = 0.0f64,
+        memory_mb: u64 = host_memory_mb() / 4,
+        cpus: f64 = or_cores_over(0, 1).saturating_sub(1).max(1) as f64,
         pids: u64 = 0u64,
     }
 }
@@ -258,6 +295,7 @@ impl NodeConfig {
         if !self.leases.is_empty() && self.capture.as_ref().is_none_or(|c| c.store.is_none()) {
             bail!("a node with leases ships its objects' versions (capture.store): another node restores an object it takes over from there");
         }
+        crate::gate::trusted(&self.clients.trusted)?;
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
@@ -267,6 +305,7 @@ impl ProxyConfig {
         if self.nodes.is_empty() {
             bail!("the proxy has no nodes");
         }
+        crate::gate::trusted(&self.clients.trusted)?;
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
@@ -282,6 +321,13 @@ fn dev_on_loopback(dev: bool, listen: &str, built: bool) -> anyhow::Result<()> {
         bail!("dev mode needs a loopback listen address, not {addr}");
     }
     Ok(())
+}
+
+/// The host's memory, in MiB.
+fn host_memory_mb() -> u64 {
+    // SAFETY: sysconf only reads.
+    let (pages, size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    (pages.max(0) as u64 * size.max(0) as u64) >> 20
 }
 
 /// `n`, or for 0 the number of cores divided by `div` (at least 1).
@@ -363,7 +409,7 @@ mod tests {
             (cfg.max_live_objects, cfg.memory_reservation_mb, cfg.heavy_lanes, cfg.max_component_mb),
             (1000, 128, 0, 64)
         );
-        assert!(cfg.cgroup.is_none() && !cfg.dev);
+        assert!(cfg.cgroup == "auto" && !cfg.dev);
         assert_eq!(ProxyConfig::default().max_sockets_per_app, 1000);
 
         let cfg: NodeConfig = toml::from_str("[limits]\ncpu_ms = 9\n").unwrap();

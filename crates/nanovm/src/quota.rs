@@ -8,11 +8,12 @@
 //! share one budget. Hard links and symlinks are refused so the accounting
 //! stays exact.
 
+use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::task::{Context, Poll};
 
 use parking_lot::Mutex;
@@ -47,6 +48,107 @@ pub fn add_to_linker(linker: &mut Linker<ObjState>) -> wasmtime::Result<()> {
     Ok(())
 }
 
+/// What an app's objects hold on disk, against the app's budget, and the
+/// free space its node keeps (`app_disk_mb`, `disk_reserve_mb`). Each
+/// instance's [`QuotaGuard`] counts its changes here as well.
+pub struct Disk {
+    /// The bytes live instances count (`/tmp` too), and what the other
+    /// objects' volumes held when last measured.
+    used: AtomicU64,
+    max: u64,
+    /// The objects without an instance, and what each counts in `used`.
+    idle: Mutex<HashMap<Arc<str>, u64>>,
+    /// The filesystem the volumes are on, and the bytes it keeps free.
+    fs: Option<std::fs::File>,
+    reserve: u64,
+}
+
+impl Default for Disk {
+    /// No budget and no reserve.
+    fn default() -> Disk {
+        Disk { used: AtomicU64::new(0), max: u64::MAX, idle: Mutex::default(), fs: None, reserve: 0 }
+    }
+}
+
+impl Disk {
+    /// The disk of the app whose volumes are under `objects`, measured
+    /// there; a budget of 0 MiB is a quarter of their filesystem.
+    pub fn open(objects: &Path, budget_mb: u64, reserve_mb: u64) -> std::io::Result<Disk> {
+        let fs = std::fs::File::open(objects)?;
+        let st = rustix::fs::fstatvfs(&fs)?;
+        let mut idle = HashMap::new();
+        for e in std::fs::read_dir(objects)? {
+            let e = e?;
+            // Not the journals or the capture outbox.
+            if let Some(id) = e.file_name().to_str().filter(|n| !n.starts_with('~')) && e.file_type()?.is_dir() {
+                idle.insert(id.into(), usage(&e.path())?.0);
+            }
+        }
+        Ok(Disk {
+            used: AtomicU64::new(idle.values().sum()),
+            max: if budget_mb == 0 { st.f_blocks * st.f_frsize / 4 } else { budget_mb << 20 },
+            idle: Mutex::new(idle),
+            fs: Some(fs),
+            reserve: reserve_mb << 20,
+        })
+    }
+
+    /// Why nothing more may be written, if the node's disk is below its
+    /// reserve (or can't say how much it has free).
+    fn low(&self) -> Option<String> {
+        let free = rustix::fs::fstatvfs(self.fs.as_ref()?).map_or(0, |st| st.f_bavail * st.f_frsize);
+        (free < self.reserve).then(|| format!("write refused, the node's disk is below its {} MiB reserve", self.reserve >> 20))
+    }
+
+    /// Up to `want` more bytes, none while the node's disk is below its
+    /// reserve; and why not all of them.
+    fn grant(&self, want: u64) -> (u64, String) {
+        if want > 0 && let Some(why) = self.low() {
+            return (0, why);
+        }
+        let mut got = 0;
+        let _ = self.used.try_update(Relaxed, Relaxed, |u| {
+            got = want.min(self.max.saturating_sub(u));
+            Some(u + got)
+        });
+        (got, format!("write refused, the app's {} MiB disk budget is full", self.max >> 20))
+    }
+
+    fn add(&self, bytes: i128) {
+        let _ = self.used.try_update(Relaxed, Relaxed, |u| Some((u as i128 + bytes).clamp(0, u64::MAX as i128) as u64));
+    }
+
+    /// `id`'s instance starts: its volume holds `bytes`.
+    fn unpark(&self, id: &Arc<str>, bytes: u64) {
+        let was = self.idle.lock().remove(id).unwrap_or(0);
+        self.add(bytes as i128 - was as i128);
+    }
+
+    /// `id`'s instance, which counted `counted`, ends: its volume holds `bytes`.
+    fn park(&self, id: &Arc<str>, counted: u64, bytes: u64) {
+        let was = self.idle.lock().insert(id.clone(), bytes).unwrap_or(0);
+        self.add(bytes as i128 - counted as i128 - was as i128);
+    }
+}
+
+/// Bytes in the regular files under `dir`, and entries.
+fn usage(dir: &Path) -> std::io::Result<(u64, u64)> {
+    let (mut bytes, mut files) = (0, 0);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let (path, md) = entry.and_then(|e| Ok((e.path(), e.metadata()?)))?;
+            files += 1;
+            if md.is_dir() {
+                stack.push(path);
+            } else if md.is_file() {
+                bytes += md.len();
+            }
+        }
+    }
+    Ok((bytes, files))
+}
+
 /// Disk budget and usage of one instance, shared with its in-flight write
 /// streams.
 #[derive(Clone)]
@@ -57,6 +159,9 @@ struct Inner {
     max_files: u64,
     bytes: u64,
     files: u64,
+    /// Its app's, which `bytes` counts in.
+    disk: Arc<Disk>,
+    volume: PathBuf,
     /// What the current request changed in the volume, to commit or roll
     /// back. Its log and removed files may each hold as much as the volume,
     /// bounding logical content to three quotas. Filesystem block rounding
@@ -70,27 +175,18 @@ struct Inner {
 impl QuotaGuard {
     /// A budget whose starting usage is what's already under `volume`, so a
     /// persistent volume starts each instance with its real usage.
-    pub fn new(volume: &Path, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>, capture: Option<&crate::config::CaptureConfig>) -> std::io::Result<Self> {
+    pub fn new(volume: &Path, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>, capture: Option<&crate::config::CaptureConfig>, disk: Arc<Disk>) -> std::io::Result<Self> {
         // First, so a failed request or a crash is undone before it's counted.
         let journal = Journal::open(volume, limits.disk_mb << 20, obj.clone(), capture)?;
-        let (mut bytes, mut files) = (0, 0);
-        let mut stack = vec![volume.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir)? {
-                let (path, md) = entry.and_then(|e| Ok((e.path(), e.metadata()?)))?;
-                files += 1;
-                if md.is_dir() {
-                    stack.push(path);
-                } else if md.is_file() {
-                    bytes += md.len();
-                }
-            }
-        }
+        let (bytes, files) = usage(volume)?;
+        disk.unpark(&obj.id, bytes);
         Ok(QuotaGuard(Arc::new(Mutex::new(Inner {
             max_bytes: limits.disk_mb << 20,
             max_files: limits.max_files,
             bytes,
             files,
+            disk,
+            volume: volume.to_path_buf(),
             journal,
             denials: 0,
             metrics,
@@ -107,16 +203,18 @@ impl QuotaGuard {
         let end = at.checked_add(buf.len() as u64).ok_or(ErrorCode::Overflow)?;
         let mut q = self.0.lock();
         let room = before + q.max_bytes.saturating_sub(q.bytes);
-        let allowed_end = end.min(room);
+        let (got, short) = q.disk.grant(end.min(room).saturating_sub(before));
+        let allowed_end = end.min(room).min(before + got);
         if allowed_end <= at && !buf.is_empty() {
-            return Err(q.full());
+            q.disk.add(-(got as i128));
+            return Err(if end > room { q.full() } else { q.deny(ErrorCode::InsufficientSpace, short) });
         }
-        q.journaled(|j| j.writing(file, at, allowed_end))?;
-        let n = file
-            .write_at(&buf[..(allowed_end - at) as usize], at)
-            .map_err(|_| ErrorCode::Io)?;
-        q.bytes += before.max(at + n as u64) - before;
-        Ok(n)
+        let n = q.journaled(|j| j.writing(file, at, allowed_end)).and_then(|()| {
+            file.write_at(&buf[..(allowed_end - at) as usize], at).map_err(|_| ErrorCode::Io)
+        });
+        let grown = n.as_ref().map_or(0, |n| before.max(at + *n as u64) - before);
+        q.set_bytes(|b| b + grown, got);
+        n
     }
 
     fn set_size(&self, file: &std::fs::File, size: u64) -> Result<(), ErrorCode> {
@@ -126,12 +224,20 @@ impl QuotaGuard {
         if size > room {
             return Err(q.full());
         }
-        q.journaled(|j| j.writing(file, size, before))?;
-        file.set_len(size).map_err(|_| ErrorCode::Io)?;
+        let grown = size.saturating_sub(before);
+        let (got, short) = q.disk.grant(grown);
+        let done = match got < grown {
+            true => Err(q.deny(ErrorCode::InsufficientSpace, short)),
+            false => q.journaled(|j| j.writing(file, size, before)).and_then(|()| file.set_len(size).map_err(|_| ErrorCode::Io)),
+        };
+        if let Err(e) = done {
+            q.disk.add(-(got as i128));
+            return Err(e);
+        }
         // A removed file's bytes were freed when it was removed; growing it
         // still costs, but shrinking it frees nothing more.
         let freed = if q.journal.holds(file) { 0 } else { before.saturating_sub(size) };
-        q.bytes = (q.bytes + size.saturating_sub(before)).saturating_sub(freed);
+        q.set_bytes(|b| (b + grown).saturating_sub(freed), got);
         Ok(())
     }
 
@@ -141,7 +247,11 @@ impl QuotaGuard {
             let what = format!("entry limit reached ({} files)", q.max_files);
             return Err(q.deny(ErrorCode::Quota, what));
         }
-        Ok(())
+        // An entry takes space too: none below the node's reserve.
+        match q.disk.low() {
+            Some(why) => Err(q.deny(ErrorCode::InsufficientSpace, why)),
+            None => Ok(()),
+        }
     }
 
     fn refuse(&self, code: ErrorCode, what: &str) -> FilesystemError {
@@ -155,7 +265,7 @@ impl QuotaGuard {
     pub fn unlink(&self, path: &Path, bytes: u64) -> Result<(), ErrorCode> {
         let mut q = self.0.lock();
         q.journaled(|j| j.unlink(path, bytes))?;
-        q.bytes = q.bytes.saturating_sub(bytes);
+        q.set_bytes(|b| b.saturating_sub(bytes), 0);
         q.files = q.files.saturating_sub(1);
         Ok(())
     }
@@ -200,7 +310,7 @@ impl QuotaGuard {
         let mut q = self.0.lock();
         if let Some((slot, bytes)) = file {
             q.journal.restore(&slot, to, bytes).map_err(|_| ErrorCode::Io)?;
-            q.bytes += bytes;
+            q.set_bytes(|b| b + bytes, 0);
             q.files += 1;
         }
         q.journal.cancel_rename(record).map_err(|_| ErrorCode::Io)
@@ -220,19 +330,40 @@ impl QuotaGuard {
         let held = obj.storage().await;
         tokio::task::spawn_blocking(move || {
             let _held = held;
-            q.lock().journal.commit()
+            // This instance's usage is its app's once nothing holds it, so
+            // before the volume is: see `Inner`'s `drop`.
+            let committed = q.lock().journal.commit();
+            drop(q);
+            committed
         })
         .await?
     }
 
     pub fn adjust(&self, bytes: i64, files: i64) {
         let mut q = self.0.lock();
-        q.bytes = q.bytes.saturating_add_signed(bytes);
+        q.set_bytes(|b| b.saturating_add_signed(bytes), 0);
         q.files = q.files.saturating_add_signed(files);
     }
 }
 
+impl Drop for Inner {
+    /// What the volume holds is its app's while the object has no instance;
+    /// what it held in `/tmp` goes with the instance.
+    fn drop(&mut self) {
+        let held = usage(&self.volume).map_or(self.bytes, |(bytes, _)| bytes);
+        self.disk.park(&self.obj.id, self.bytes, held);
+    }
+}
+
 impl Inner {
+    /// Changes the object's bytes to `to` of them, and its app's by as
+    /// much, less the `granted` bytes already counted there.
+    fn set_bytes(&mut self, to: impl FnOnce(u64) -> u64, granted: u64) {
+        let bytes = to(self.bytes);
+        self.disk.add(bytes as i128 - self.bytes as i128 - granted as i128);
+        self.bytes = bytes;
+    }
+
     /// Runs `f` on the journal: a full journal is a full disk to the guest,
     /// and anything else an I/O error.
     fn journaled<T>(&mut self, f: impl FnOnce(&mut Journal) -> std::io::Result<T>) -> Result<T, ErrorCode> {
@@ -240,6 +371,10 @@ impl Inner {
             .check()
             .and_then(|()| f(&mut self.journal))
             .map_err(|e| match e.kind() {
+                // The node's disk, not the object's quota.
+                std::io::ErrorKind::StorageFull if e.raw_os_error().is_some() => {
+                    self.deny(ErrorCode::InsufficientSpace, "write refused, the node's disk is full".into())
+                }
                 std::io::ErrorKind::StorageFull => self.full(),
                 // A path the journal refuses (`Journal::creating`), as the syscall would.
                 std::io::ErrorKind::NotADirectory => ErrorCode::NotDirectory,
@@ -684,7 +819,7 @@ mod tests {
             ..Limits::default()
         };
         let dir = tempdir("empty");
-        let g = QuotaGuard::new(&dir, &limits, metrics.clone(), obj, None).unwrap();
+        let g = QuotaGuard::new(&dir, &limits, metrics.clone(), obj, None, Default::default()).unwrap();
         std::fs::remove_dir(dir).unwrap();
         g.0.lock().max_bytes = bytes;
         (g, metrics)
@@ -696,7 +831,7 @@ mod tests {
 
     fn volume_guard(v: &Path, max: u64) -> QuotaGuard {
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(v, &Limits::default(), Default::default(), obj.clone(), None).unwrap();
+        let g = QuotaGuard::new(v, &Limits::default(), Default::default(), obj.clone(), None, Default::default()).unwrap();
         g.0.lock().journal = Journal::open(v, max, obj, None).unwrap();
         g
     }
@@ -828,6 +963,70 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// An app's objects share its budget: a write past it is cut short, then
+    /// refused to every object of the app until one frees space. The budget
+    /// counts every volume, not the journals, from the start; an instance
+    /// counts what its volume holds, and when it ends hands back what it
+    /// held elsewhere (`/tmp`).
+    #[test]
+    fn objects_share_their_apps_budget() {
+        let objects = tempdir("app-budget");
+        std::fs::create_dir_all(objects.join("a")).unwrap();
+        std::fs::write(objects.join("a/old"), [0; 4]).unwrap();
+        std::fs::create_dir_all(objects.join("c")).unwrap();
+        std::fs::write(objects.join("c/old"), [0; 6]).unwrap();
+        std::fs::create_dir_all(objects.join("~journal/a")).unwrap();
+        std::fs::write(objects.join("~journal/a/log"), [0; 100]).unwrap();
+        let disk = Arc::new(Disk::open(&objects, 1, 0).unwrap());
+        assert_eq!((disk.used.load(Relaxed), disk.max), (10, 1 << 20));
+        let guard = |id: &str| {
+            std::fs::create_dir_all(objects.join(id)).unwrap();
+            let obj = Arc::new(ObjShared::new("app".into(), id));
+            QuotaGuard::new(&objects.join(id), &Limits::default(), Default::default(), obj, None, disk.clone()).unwrap()
+        };
+        let (a, b) = (guard("a"), guard("b"));
+        assert_eq!(disk.used.load(Relaxed), 10);
+        let scratch = tempdir("app-budget-scratch");
+        let file = |name: &str| std::fs::File::options().read(true).write(true).create(true).truncate(true).open(scratch.join(name)).unwrap();
+        let (fa, fb) = (file("a"), file("b"));
+        assert_eq!(a.write(&fa, None, &vec![1; 1 << 20]).unwrap(), (1 << 20) - 10, "cut at the app's budget");
+        assert!(matches!(b.write(&fb, None, b"x"), Err(ErrorCode::InsufficientSpace)));
+        assert!(matches!(b.set_size(&fb, 1), Err(ErrorCode::InsufficientSpace)));
+        assert_eq!(b.0.lock().denials, 2);
+        a.set_size(&fa, 100).unwrap();
+        assert_eq!(b.write(&fb, None, b"xy").unwrap(), 2);
+        assert_eq!(disk.used.load(Relaxed), 4 + 6 + 100 + 2);
+        // `a` ends: of its 104 bytes only its volume's 4 stay counted.
+        drop(a);
+        assert_eq!(disk.used.load(Relaxed), 4 + 6 + 2);
+        std::fs::write(objects.join("a/old"), [0; 40]).unwrap();
+        let a = guard("a");
+        assert_eq!((disk.used.load(Relaxed), a.usage().0), (40 + 6 + 2, 40));
+        std::fs::remove_dir_all(objects).unwrap();
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    /// Below the node's reserve nothing grows and nothing new is made, but
+    /// files are still overwritten in place and shrunk.
+    #[test]
+    fn below_the_reserve_only_growth_is_refused() {
+        let dir = tempdir("reserve");
+        let disk = Arc::new(Disk { reserve: u64::MAX, fs: Some(std::fs::File::open(&dir).unwrap()), ..Disk::default() });
+        std::fs::create_dir(dir.join("v")).unwrap();
+        let obj = Arc::new(ObjShared::new("app".into(), "v"));
+        let g = QuotaGuard::new(&dir.join("v"), &Limits::default(), Default::default(), obj, None, disk).unwrap();
+        let f = std::fs::File::options().read(true).write(true).create(true).truncate(true).open(dir.join("f")).unwrap();
+        f.set_len(10).unwrap();
+        assert_eq!(g.write(&f, Some(0), b"0123456789").unwrap(), 10, "in place");
+        assert_eq!(g.write(&f, Some(5), b"0123456789").unwrap(), 5, "the rest would grow it");
+        assert!(matches!(g.write(&f, None, b"x"), Err(ErrorCode::InsufficientSpace)));
+        assert!(matches!(g.check_new_entry(), Err(ErrorCode::InsufficientSpace)));
+        g.set_size(&f, 3).unwrap();
+        assert!(matches!(g.set_size(&f, 4), Err(ErrorCode::InsufficientSpace)));
+        assert_eq!(std::fs::read(dir.join("f")).unwrap(), b"012");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// A new instance starts from what the volume already holds: every
     /// entry counts against the file limit, and regular files' bytes.
     #[test]
@@ -841,7 +1040,7 @@ mod tests {
             ..Limits::default()
         };
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj, None).unwrap();
+        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj, None, Default::default()).unwrap();
         assert_eq!(usage(&g), (15, 4));
         assert_eq!(g.0.lock().max_bytes, 2 << 20);
         std::fs::remove_dir_all(dir).unwrap();
@@ -979,7 +1178,7 @@ mod tests {
         std::fs::write(dir.join("f"), [0; 10]).unwrap();
         std::fs::write(dir.join("g"), [0; 10]).unwrap();
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj, None).unwrap();
+        let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj, None, Default::default()).unwrap();
         let f = std::fs::File::options().write(true).open(dir.join("f")).unwrap();
         g.unlink(&dir.join("f"), 10).unwrap();
         assert_eq!(usage(&g), (10, 1));
@@ -997,7 +1196,7 @@ mod tests {
         let dir = tempdir("new-unlinked").canonicalize().unwrap();
         let limits = Limits { disk_mb: 1, ..Limits::default() };
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj, None).unwrap();
+        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj, None, Default::default()).unwrap();
         let create = |name: &str| {
             let path = dir.join(name);
             g.journal(|j| j.creating(&path)).unwrap();

@@ -7,6 +7,7 @@ pub mod committed;
 pub mod config;
 pub mod egress;
 pub mod engine;
+pub mod gate;
 pub mod jail;
 pub mod journal;
 pub mod lease;

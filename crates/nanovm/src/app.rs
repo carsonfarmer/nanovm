@@ -42,6 +42,8 @@ pub struct App {
     /// compares a volume's path with where its open files really are.
     pub objects: PathBuf,
     pub scratch: Arc<Scratch>,
+    /// What its objects hold on disk, against its budget.
+    pub disk: Arc<crate::quota::Disk>,
     /// Advisory local exclusion, retained through every App owner's lifetime.
     _ownership: std::fs::File,
 }
@@ -171,6 +173,7 @@ impl App {
             config: Arc::new(cfg.config.iter().collect()),
             objects: objects.canonicalize()?,
             scratch: Scratch::new(tmp)?,
+            disk: Arc::new(crate::quota::Disk::open(&objects, node.app_disk_mb, node.disk_reserve_mb)?),
             _ownership: ownership,
         })
     }

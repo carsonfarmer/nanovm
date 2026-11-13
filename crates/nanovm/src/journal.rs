@@ -2284,7 +2284,7 @@ mod tests {
                 let v = volume();
                 let obj = Arc::new(ObjShared::new("app".into(), "o"));
                 let limits = crate::config::Limits::default();
-                let quota = crate::quota::QuotaGuard::new(&v, &limits, Default::default(), obj, None).unwrap();
+                let quota = crate::quota::QuotaGuard::new(&v, &limits, Default::default(), obj, None, Default::default()).unwrap();
                 quota.journal(|j| j.creating(&v.join("n"))).unwrap();
                 SLOW_MS.store(100, std::sync::atomic::Ordering::Relaxed);
                 quota.commit().await.unwrap();
@@ -2341,7 +2341,7 @@ mod tests {
         rt.block_on(async {
             let v = volume();
             let obj = Arc::new(ObjShared::new("app".into(), "o"));
-            let quota = crate::quota::QuotaGuard::new(&v, &Default::default(), Default::default(), obj, None).unwrap();
+            let quota = crate::quota::QuotaGuard::new(&v, &Default::default(), Default::default(), obj, None, Default::default()).unwrap();
             let busy = tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(500)));
             let commit = tokio::time::timeout(std::time::Duration::from_millis(200), quota.commit());
             commit.await.expect("not waiting for a blocking thread").unwrap();
