@@ -311,6 +311,20 @@ async fn review2_wait_until_that_wrote_before_the_answer_commits_that_write_when
     assert!(kv.get("early").is_none(), "the rejected waitUntil work's write committed: {kv}");
 }
 
+/// review2 (D4): `answer` takes `Promise.all` of the promises registered
+/// when the handler answers. One that waitUntil work registers later is not
+/// waited for and its rejection is never seen: its write commits with the
+/// rest of the work after the answer, and the instance goes on.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_wait_until_registered_after_the_answer_commits_its_write_when_it_rejects() {
+    let node = node("js_wait_until_nested_reject", 8);
+    let r = post(&node, "n", "/later-nested").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}", r.error);
+    // Served once the waitUntil work is over.
+    let kv = get(&node, "n", "/kv").await.json();
+    assert!(kv.get("nested").is_none(), "the rejected waitUntil work's write committed: {kv}");
+}
+
 /// The component starts from a snapshot taken at build time; nothing in it
 /// may be shared by instances or stale: randomness, the clock, the id.
 #[tokio::test(flavor = "multi_thread")]
