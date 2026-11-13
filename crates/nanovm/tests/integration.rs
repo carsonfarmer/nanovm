@@ -260,6 +260,51 @@ async fn volume_survives_eviction_memory_does_not() {
     assert_eq!(r.json()["instance_hits"], 1, "fresh instance");
 }
 
+/// Every directory under `objects` (an app's), relative to it, but the
+/// empty ones waiting in its pool (`~new`).
+fn dirs_under(objects: &Path) -> Vec<String> {
+    let mut found = vec![];
+    let mut stack = vec![objects.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let rel = e.path().strip_prefix(objects).unwrap().to_string_lossy().into_owned();
+            if e.file_type().unwrap().is_dir() && rel != "~new" {
+                found.push(rel);
+                stack.push(e.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A scanner's 404s and reads of objects that don't exist leave nothing on
+/// disk, while instances are live and after they are gone: an object's
+/// directory appears with the first change it commits. The audit's 300
+/// `wp-login.php` probes left 301 volume directories.
+#[tokio::test(flavor = "multi_thread")]
+async fn objects_that_change_nothing_leave_nothing() {
+    let node = node("objects_that_change_nothing_leave_nothing", "counter", 1000);
+    let objects = node.cfg.app_dirs("counter")[0].clone();
+    for n in 0..300 {
+        let r = get(&node, &format!("scan{n}"), "/wp-login.php").await;
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+    for n in 0..20 {
+        let r = get(&node, &format!("read{n}"), "/").await;
+        assert_eq!((r.status, r.json()["count"].as_u64()), (200, Some(0)), "{}", r.body);
+    }
+    assert_eq!(dirs_under(&objects), Vec::<String>::new(), "while live");
+    assert_eq!(request(&node, "POST", "w", "/incr", "").await.status, 200);
+    let written = dirs_under(&objects);
+    assert!(!written.is_empty() && written.iter().all(|d| !d.contains("scan") && !d.contains("read")), "{written:?}");
+    node.shutdown().await;
+    assert_eq!(dirs_under(&objects), written, "once gone");
+    // The pool holds at most one empty directory per instance that was live at once.
+    let pool = std::fs::read_dir(objects.join("~new")).map_or(0, |d| d.count());
+    assert!(pool <= 321, "{pool}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn objects_do_not_share_volumes() {
     let node = node("objects_do_not_share_volumes", "counter", 8);
