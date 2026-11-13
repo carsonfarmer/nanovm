@@ -1867,7 +1867,9 @@ fn a_dropped_supervisors_worker_cgroups_go() {
 /// and it never drops its telemetry: retiring it (a switch to another
 /// version here) kills it outright, without asking it to flush first. What
 /// it recorded since its last export (up to 1 s), here an egress-denied
-/// event, never reaches the collector.
+/// event, never reaches the collector. Asked to stop, it flushes and exits
+/// by itself, well before it would be killed (2 s; it would have exported
+/// by then anyway).
 #[tokio::test(flavor = "multi_thread")]
 async fn review2_a_retired_workers_last_telemetry_reaches_the_collector() {
     let (_sup, addr) = supervised("review2_retired_worker_telemetry").await;
@@ -1878,7 +1880,7 @@ async fn review2_a_retired_workers_last_telemetry_reaches_the_collector() {
     assert!(body.contains("HttpRequestDenied"), "{body}");
     stats_json(addr).await;
     assert!(seen(worker(&live)), "a live worker's egress-denied event is exported");
-    let mut lost = vec![];
+    let (mut lost, mut slow) = (vec![], vec![]);
     for round in 0..3 {
         let repo = format!("review2-retired-{round}");
         let v1 = publish_version(&repo, &app("hostile"), guest("hostile"), "1.0.0").await;
@@ -1888,14 +1890,19 @@ async fn review2_a_retired_workers_last_telemetry_reaches_the_collector() {
         assert_ne!(v1, v2);
         let (_, body) = app_get(addr, &v1, "/s/fetch?url=http://169.254.169.254/").await;
         assert!(body.contains("HttpRequestDenied"), "{body}");
-        // v1's worker has nothing in flight: it is killed at once.
+        // v1's worker has nothing in flight: it is retired at once.
+        let t0 = Instant::now();
         assert_eq!(app_get(addr, &v2, "/x/").await.0, 200);
+        if t0.elapsed() >= Duration::from_secs(2) {
+            slow.push(t0.elapsed());
+        }
         stats_json(addr).await;
         if !seen(worker(&v1)) {
             lost.push(round);
         }
     }
     assert!(lost.is_empty(), "rounds whose egress-denied event a retired worker never exported: {lost:?}");
+    assert!(slow.is_empty(), "switches that waited for a retired worker to be killed: {slow:?}");
 }
 
 /// An upstream that answers with headers and the start of a large body,
