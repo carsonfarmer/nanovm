@@ -1,8 +1,9 @@
 #!/bin/bash
 # Replaces the nanovm binary under a running supervisor (runbooks.md,
 # "Upgrade"), then starts a new app's worker. OLD and NEW are dev build
-# directories (nanovm and examples/dev-registry) of two versions whose
-# supervisor-worker spec differs, e.g. before and after N-551:
+# directories (nanovm and examples/dev-registry) of two builds whose
+# supervisor-worker spec differs. The new app must start from the running
+# image (N-552):
 #   docs/ops/drills/binary-swap.sh OLD_DIR NEW_DIR
 set -u
 OLD=$1 NEW=$2; PORT=28580; REG=25580

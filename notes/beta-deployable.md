@@ -108,6 +108,7 @@ All with a dev build of this branch (`cargo build -p nanovm --features dev
 | `check-host.py` on `deploy/systemd/nanovm.toml` | ok; warns: data_dir not created yet, ext4 mounted with `discard`, `RUST_BACKTRACE` set in this shell. 7 unit tests pass; the new address-space test fails with `GUARD = 0` or the check disabled |
 | `docs/ops/errors-check.sh` | 20/20 checks give the documented status and reason (18 reasons) |
 | `drills/disk-full.sh` | round 3 differs from ops' text, which was rewritten: counter's own 507 x2, overwrite in place commits while its KV write fails, a new object's first write `500 commit-failed` "journal requires recovery", reads 200; freed: 3 → 4, new object 1. The first run left its tmpfs mounted (workers outlive the supervisor briefly); the drill now retries the unmount |
+| `drills/binary-swap.sh`, the new binary a shell script that exits 1 | `cp` over the running file: "Text file busy"; after `install`, the running app counts 2 and a new app's worker starts (`{"object":"h","hits":1}`): workers come from the running image (N-552) |
 | `drills/backup-restore.sh` | count 3 and KV "kept" before and after restic backup and restore into a fresh root; uids 200000/200001 kept; next write 4 |
 | Container: `deploy/container/test/local.sh` (stand-in base, local binary) | 11/11; image 92 MB; stop 183 ms with `--init`, 3,192 ms as PID 1; workers start as PID 1 |
 | Container on the real `debian:trixie-slim` with the image's own configs | node ready 204, proxy answers 502 (no network for its resolver); 200 MB with the debug binary |
@@ -130,8 +131,6 @@ All with a dev build of this branch (`cargo build -p nanovm --features dev
 - **Real ACME, real DNS, an S3 store, `otelcol-contrib`, `oha`** (so not the
   Collector-outage drill, nor `bench --quick`), `AllowedCPUs` enforcement and
   cgroup v2 controllers (cgroup v1 here), arm64, Podman.
-- **The binary-swap drill**: it compares two builds with different worker specs;
-  N-552 is in round 3 and its behaviour is covered by the units test's restart.
 - **The release and bench-history workflows** (need GitHub).
 - The fs-matrix numbers are from before round 3 and weren't measured again.
 
