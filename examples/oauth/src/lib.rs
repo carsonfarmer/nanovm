@@ -41,10 +41,8 @@ async fn handle(req: Request) -> Result {
 
 async fn auth(req: &Request, now: u64) -> Result {
     let setting = |k: &str| config::get(k).ok().flatten().unwrap_or_default();
-    // Served over https (as the callback URL says): cookies are `Secure`,
-    // and the nonce's is a `__Host-` one, which only this origin can set.
-    let secure = setting("redirect_uri").starts_with("https://");
-    let nonce_cookie = if secure { "__Host-oauth_nonce" } else { "oauth_nonce" };
+    let secure = secure();
+    let nonce_cookie = &named("oauth_nonce", secure);
     Ok(match req.path() {
         "/login" => {
             // The browser's nonce (a new one, or the one it has, so that two
@@ -101,7 +99,7 @@ async fn auth(req: &Request, now: u64) -> Result {
             let session = random_hex(32);
             let profile = json!({ "login": login, "id": me["id"], "name": me["name"] });
             kv::set(&format!("session:{session}"), json!({ "profile": profile, "until": now + SESSION_MS }).to_string()).await?;
-            let cookie = cookie("session", &format!("{login}.{session}"), SESSION_MS / 1000, secure);
+            let cookie = cookie(&named("session", secure), &format!("{login}.{session}"), SESSION_MS / 1000, secure);
             Response::new(302).header("location", format!("/u-{login}/me")).header("set-cookie", cookie)
         }
         // For user objects, about a cookie they were shown.
@@ -122,8 +120,10 @@ async fn auth(req: &Request, now: u64) -> Result {
 async fn user(req: &Request, now: u64) -> Result {
     // A cookie is `{login}.{session}`: only this user's own sessions count.
     let login = &nanovm_sdk::id()[2..];
-    let cookie = req.cookie("session").and_then(|c| c.split_once('.')).filter(|(l, s)| *l == login && s.len() == 64);
-    let session = cookie.map(|(_, s)| s.to_string());
+    let secure = secure();
+    let name = named("session", secure);
+    let shown = req.cookie(&name).and_then(|c| c.split_once('.')).filter(|(l, s)| *l == login && s.len() == 64);
+    let session = shown.map(|(_, s)| s.to_string());
     let signed_in = match &session {
         Some(id) => match kv::get_text(&format!("session:{id}")).await?.and_then(|t| t.parse::<u64>().ok()) {
             Some(until) => until > now,
@@ -147,7 +147,7 @@ async fn user(req: &Request, now: u64) -> Result {
             let id = session.unwrap_or_default();
             kv::delete(&format!("session:{id}")).await?;
             object("auth").post(&format!("/logout?session={id}"), "").send().await?;
-            Response::new(204).header("set-cookie", "session=; Path=/; Max-Age=0")
+            Response::new(204).header("set-cookie", cookie(&name, "", 0, secure))
         }
         ("GET", "/me") | ("POST", "/logout") => Response::text("sign in at /auth/login\n").status(401),
         _ => Response::not_found(),
@@ -157,6 +157,18 @@ async fn user(req: &Request, now: u64) -> Result {
 async fn session(id: Option<&str>) -> Result<Option<Value>> {
     let Some(id) = id.filter(|s| s.len() == 64) else { return Ok(None) };
     Ok(kv::get_text(&format!("session:{id}")).await?.and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// Served over https (as the callback URL says): cookies are `Secure`, and
+/// `__Host-` ones, which only this origin can set. A sibling host could
+/// otherwise plant its own (`Domain=` the parent), such as a session of its
+/// own, and sign a browser in as someone else (login CSRF).
+fn secure() -> bool {
+    config::get("redirect_uri").ok().flatten().unwrap_or_default().starts_with("https://")
+}
+
+fn named(name: &str, secure: bool) -> String {
+    if secure { format!("__Host-{name}") } else { name.into() }
 }
 
 /// A cookie for the whole site, out of scripts' reach, and sent on GitHub's

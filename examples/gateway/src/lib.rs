@@ -59,16 +59,12 @@ async fn handle(req: Request) -> Result {
             kv::set(&used_key, (used + max).to_string()).await?;
             Response::stream("text/event-stream", move |mut body| async move {
                 let mut events = Events::default();
-                loop {
-                    let piece = match upstream.next().await {
-                        Ok(Some(piece)) => piece,
-                        Ok(None) => break,
-                        // The upstream broke off: the reservation stands.
-                        Err(_) => return,
-                    };
+                // If the upstream breaks off, so does this answer, for the
+                // client to see; the reservation stands.
+                while let Some(piece) = upstream.next().await? {
                     events.read(&piece);
                     if !body.write(piece).await {
-                        return; // The client left: the reservation stands.
+                        return Ok(()); // The client left: the reservation stands.
                     }
                 }
                 // Done, and verifiably so: give back what wasn't used. This
@@ -77,6 +73,7 @@ async fn handle(req: Request) -> Result {
                 if let Some(used) = events.used() {
                     let _ = kv::increment(&used_key, used.clamp(0, max) - max).await;
                 }
+                Ok(())
             })
             .header("cache-control", "no-cache")
         }
