@@ -751,6 +751,56 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// A node taking over many objects at once (another node stopped)
+    /// claims them concurrently, each claim restoring its object and marking
+    /// it shipped up to its head. Each object's marker must name its own
+    /// head: a marker past it acknowledges (`stored`) and skips shipping
+    /// versions the store never got.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn review_concurrent_claims_mark_each_object_its_own_head() {
+        let base = tempdir("marks");
+        let store = Arc::new(Objects(Arc::new(object_store::memory::InMemory::new())));
+        const OBJECTS: u64 = 16;
+        // Object `o{i}`'s head names its version at sequence `1 + 7i`, claimed by node a.
+        let sequence = |i: u64| 1 + 7 * i;
+        for i in 0..OBJECTS {
+            let (object, n) = (format!("o{i}"), sequence(i));
+            let dir = base.join("a/~committed").join(&object);
+            let digest = version(&dir, n, 1, "", &format!("v{i}"));
+            let bytes = std::fs::read(dir.join(format!("{n:020}.tar"))).unwrap();
+            store.put(&version_key("app", &object, n, &digest), bytes).await.unwrap();
+            let head = Head { sequence: n, digest, node: "a".into(), lease: 1 };
+            store.swap(&head_key("app", &object), serde_json::to_vec(&head).unwrap(), None).await.unwrap().unwrap();
+        }
+        let mut wrong = vec![];
+        for round in 0..20u64 {
+            // Node b, on a disk of its own, takes every object at once.
+            let objects = base.join(format!("b{round}"));
+            let claims: Vec<_> = (0..OBJECTS)
+                .map(|i| {
+                    let (store, objects) = (store.clone(), objects.clone());
+                    tokio::spawn(async move { claim(&*store, "b", 2 + round, "app", &format!("o{i}"), &objects).await })
+                })
+                .collect();
+            for (i, c) in claims.into_iter().enumerate() {
+                let i = i as u64;
+                if let Err(e) = c.await.unwrap() {
+                    wrong.push(format!("round {round}: claiming o{i} failed: {e}"));
+                    continue;
+                }
+                let dir = objects.join("~committed").join(format!("o{i}"));
+                let marked = std::fs::read_to_string(marker(&dir)).unwrap_or_default();
+                if marked != sequence(i).to_string() {
+                    let acked = stored(&dir, sequence(i) + 1).is_ok();
+                    wrong.push(format!("round {round}: o{i}'s head is {} but its marker says {marked:?} (version {} acknowledged: {acked})",
+                        sequence(i), sequence(i) + 1));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} of {} claims went wrong:\n{}", wrong.len(), 20 * OBJECTS, wrong.join("\n"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// A node ships an object's versions only under its live lease on the
     /// object, at the epoch it claimed the head with: not with no lease, nor
     /// a released, lapsed, or since-replaced one, though the lease record may
