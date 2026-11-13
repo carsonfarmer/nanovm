@@ -132,6 +132,12 @@ where
             dialer: self.clone(),
         }))
     }
+
+    /// Dials no more: the accepting side's `serve` returns once it has
+    /// taken the connections already sent.
+    pub fn hang_up(&self) {
+        let _ = self.ctl.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// A response body that keeps its connection running while it is read.
