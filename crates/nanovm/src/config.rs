@@ -46,7 +46,9 @@ config! {
         /// lease holder. Every node's must differ.
         name: String = "",
         /// How long a node's leases outlive its last renewal: the longest an
-        /// object is unavailable after its node stops (see `lease`).
+        /// object is unavailable after its node stops (see `lease`). Each
+        /// node's session record carries its own, which other nodes wait
+        /// out before taking its objects, so nodes may differ.
         lease_ms: u64 = 10_000u64,
         /// OTLP/HTTP collector base URL. Only the supervisor connects to it.
         telemetry_endpoint: String = "http://127.0.0.1:4318",

@@ -15,14 +15,15 @@
 //! session, every `lease_ms / 4`; they last until 7/8 of `lease_ms` after it
 //! sent the last renewal that succeeded, after which it serves none of their
 //! objects and starts a new session. Another node takes an object whose
-//! holder's session record it has seen unchanged for `lease_ms`, by its own
+//! holder's session record it has seen unchanged for the holder's `lease_ms`
+//! (which the record carries, so nodes needn't agree on it), by its own
 //! clock (clocks needn't agree, only tick at about the same rate). It first
 //! ends that session with a conditional write, so a renewal still on its way
 //! can't land after it and extend the holder's leases.
 //!
-//! Records: `nodes/<node>` is `{session, beat}` and `objects/<app>/<object>`
-//! `{node, session, epoch}`, with no node once released. Deleting a record
-//! restarts its epochs: never do.
+//! Records: `nodes/<node>` is `{session, beat, lease_ms}` and
+//! `objects/<app>/<object>` `{node, session, epoch}`, with no node once
+//! released. Deleting a record restarts its epochs: never do.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,6 +67,12 @@ pub struct Grant {
 struct NodeRecord {
     session: u64,
     beat: u64,
+    /// The node's `lease_ms`: how long another waits, seeing the record
+    /// unchanged, before it takes the node's objects. The holder's, not the
+    /// taker's, so nodes needn't agree on it (0, from an older node: the
+    /// taker's).
+    #[serde(default)]
+    lease_ms: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -131,7 +138,8 @@ impl Leases {
                 Err(_) => return (s.id, s.until),
             }
         }
-        match self.put(&path, &NodeRecord { session: s.id, beat: s.beat + 1 }, s.version.clone()).await {
+        let rec = NodeRecord { session: s.id, beat: s.beat + 1, lease_ms: self.ttl.as_millis() as u64 };
+        match self.put(&path, &rec, s.version.clone()).await {
             Ok(v) => {
                 (s.beat, s.version) = (s.beat + 1, Some(v));
                 s.until = sent + (self.ttl * 7 / 8).as_nanos() as u64;
@@ -219,20 +227,18 @@ impl Leases {
     async fn alive(&self, node: &str, session: u64) -> Result<bool> {
         let path = Path::from_iter(["nodes", node]);
         let (rec, version) = self.get::<NodeRecord>(&path).await?;
-        if rec.is_none_or(|r| r.session != session) {
-            return Ok(false);
-        }
+        let Some(rec) = rec.filter(|r| r.session == session) else { return Ok(false) };
         {
             let mut seen = self.seen.lock();
             let (seen_version, since) = seen.entry(node.into()).or_insert((None, Instant::now()));
             if *seen_version != version {
                 (*seen_version, *since) = (version.clone(), Instant::now());
             }
-            if since.elapsed() < self.ttl {
+            if since.elapsed() < Some(rec.lease_ms).filter(|&ms| ms > 0).map_or(self.ttl, Duration::from_millis) {
                 return Ok(true);
             }
         }
-        match self.put(&path, &NodeRecord { session: session + 1, beat: 0 }, version).await {
+        match self.put(&path, &NodeRecord { session: session + 1, beat: 0, ..rec }, version).await {
             Ok(_) => Ok(false),
             Err(object_store::Error::Precondition { .. }) => Ok(true),
             Err(e) => Err(e),
@@ -420,6 +426,27 @@ mod tests {
         assert!(renewed > id && grant.session == id);
     }
 
+    /// Nodes configured with different lease durations: one with a shorter
+    /// lease takes an object over no sooner than the holder's own leases
+    /// have lapsed, by the holder's duration, not its own.
+    #[tokio::test]
+    async fn review_shorter_observer_ttl_cannot_revoke_a_live_holder() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (a, b) = (Leases::new(store.clone(), "a", TTL * 5), Leases::new(store, "b", TTL / 2));
+        let (_, until) = a.renew().await;
+        b.renew().await;
+        a.acquire("app/o").await.unwrap();
+        // A goes quiet; B keeps asking.
+        let t0 = Instant::now();
+        while b.acquire("app/o").await.is_err() {
+            assert!(t0.elapsed() < TTL * 10, "never taken over");
+            b.renew().await;
+            tokio::time::sleep(TTL / 20).await;
+        }
+        let taken = mono_ns();
+        assert!(until < taken, "B took the object {} ms before A's leases lapsed", (until - taken) / 1_000_000);
+    }
+
     /// A renewal sent before a takeover but landing after it can't extend
     /// the old session: the taker ended it first.
     #[tokio::test]
@@ -435,7 +462,7 @@ mod tests {
         n[1].renew().await;
         n[1].acquire("app/o").await.unwrap();
         let late = store.put_opts(&Path::from("nodes/n0"),
-            serde_json::to_vec(&NodeRecord { session: stale.id, beat: stale.beat + 1 }).unwrap().into(),
+            serde_json::to_vec(&NodeRecord { session: stale.id, beat: stale.beat + 1, lease_ms: TTL.as_millis() as u64 }).unwrap().into(),
             PutMode::Update(stale.version.unwrap()).into()).await;
         assert!(matches!(late, Err(object_store::Error::Precondition { .. })), "{late:?}");
     }
