@@ -63,16 +63,16 @@ impl Fetch {
         self
     }
 
-    /// Sends the request and reads the whole answer.
+    /// Sends the request and reads the whole answer. A body that doesn't
+    /// arrive whole (the connection broke, or closed before the
+    /// `content-length` or the last chunk) is an error, not a short body.
     pub async fn send(self) -> Result<Reply, ErrorCode> {
-        let response = self.open().await?;
-        let status = response.get_status_code();
-        let headers = response.get_headers().copy_all().into_iter();
-        let headers = headers.map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned())).collect();
-        let (result_tx, result_rx) = wit_future::new(|| Ok(()));
-        let (body, _trailers) = wit::Response::consume_body(response, result_rx);
+        let Streaming { status, headers, body, end, _done, .. } = self.stream().await?;
         let body = body.collect().await;
-        drop(result_tx);
+        // Whether that was all of it is the host's to say, once it has ended.
+        if let Some(end) = end {
+            end.await?;
+        }
         Ok(Reply { status, headers, body })
     }
 
@@ -85,8 +85,8 @@ impl Fetch {
         let headers = response.get_headers().copy_all().into_iter();
         let headers = headers.map(|(k, v)| (k, String::from_utf8_lossy(&v).into_owned())).collect();
         let (done, result) = wit_future::new(|| Ok(()));
-        let (body, _trailers) = wit::Response::consume_body(response, result);
-        Ok(Streaming { status, headers, body, _done: done })
+        let (body, end) = wit::Response::consume_body(response, result);
+        Ok(Streaming { status, headers, body, closed: false, end: Some(end), ended: Ok(()), _done: done })
     }
 
     /// Sends the request and returns once the answer's headers arrive. Its
@@ -115,22 +115,33 @@ pub struct Streaming {
     /// Names as the server sent them.
     pub headers: Vec<(String, String)>,
     body: wit_bindgen::rt::async_support::StreamReader<u8>,
+    /// The body's stream has ended.
+    closed: bool,
+    /// Once it has, whether all of it came: its trailers, or an error.
+    end: Option<wit_bindgen::rt::async_support::FutureReader<Result<Option<wit::Fields>, ErrorCode>>>,
+    ended: Result<(), ErrorCode>,
     _done: wit_bindgen::rt::async_support::FutureWriter<Result<(), ErrorCode>>,
 }
 
 impl Streaming {
-    /// The body's next piece, as soon as there is one; `None` at its end.
-    /// Dropping the `Streaming` stops reading and frees its connection.
-    pub async fn next(&mut self) -> Option<Vec<u8>> {
+    /// The body's next piece, as soon as there is one. `Ok(None)` once all
+    /// of it has arrived; `Err` if it can't: the connection broke or closed
+    /// early (before the `content-length`, or the last chunk), so what came
+    /// is only part of the answer. Dropping the `Streaming` stops reading
+    /// and frees its connection.
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>, ErrorCode> {
         use wit_bindgen::rt::async_support::StreamResult;
-        loop {
+        while !self.closed {
             let (result, piece) = self.body.read(Vec::with_capacity(16 << 10)).await;
-            match result {
-                StreamResult::Complete(_) if piece.is_empty() => continue,
-                StreamResult::Complete(_) => return Some(piece),
-                _ => return (!piece.is_empty()).then_some(piece),
+            self.closed = !matches!(result, StreamResult::Complete(_));
+            if !piece.is_empty() {
+                return Ok(Some(piece));
             }
         }
+        if let Some(end) = self.end.take() {
+            self.ended = end.await.map(drop);
+        }
+        self.ended.clone().map(|()| None)
     }
 }
 

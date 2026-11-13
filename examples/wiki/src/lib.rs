@@ -5,6 +5,11 @@
 //! names the revision it was edited from; if someone saved in between, it
 //! is refused with `409` rather than silently overwriting their edit.
 //!
+//! A page is anyone's input, so nothing in it may run in a reader's
+//! browser: its raw HTML is escaped, its links and images keep only http,
+//! https, mailto and relative destinations (a `javascript:` link becomes
+//! its text), and the page's Content-Security-Policy refuses script anyway.
+//!
 //! - `PUT /{wiki}/pages/{name}?author=…` (body: Markdown; `if-match: <rev>`,
 //!   `0` for a new page): `201 {"rev":n}`, or `409` with the latest revision
 //! - `GET /{wiki}/pages/{name}` (`?rev=n`, `?raw=1`): the page as HTML (or
@@ -16,7 +21,7 @@ use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nanovm_sdk::{Request, Response, Result, quote, sqlite};
-use pulldown_cmark::{Event, Parser, html};
+use pulldown_cmark::{CowStr, Event, Parser, Tag, TagEnd, html};
 
 nanovm_sdk::serve!(handle);
 
@@ -39,7 +44,9 @@ async fn handle(req: Request) -> Result {
             let body: String = row.get("body")?;
             let page = match req.query("raw") {
                 Some(_) => Response::bytes("text/markdown; charset=utf-8", body),
-                None => Response::html(render(&body)),
+                None => Response::html(render(&body))
+                    .header("content-security-policy", CSP)
+                    .header("x-content-type-options", "nosniff"),
             };
             page.header("etag", format!("\"{rev}\""))
         }
@@ -101,15 +108,43 @@ async fn latest(page: &str) -> Result<i64> {
     Ok(rows.first().map(|r| r.get("rev")).transpose()?.unwrap_or(0))
 }
 
-/// Markdown to HTML, with raw HTML in the page shown as text, not run.
+/// A rendered page loads images and nothing else: no script, styles,
+/// frames, forms or `<base>`, whatever got into it.
+const CSP: &str = "default-src 'none'; img-src 'self' http: https:; base-uri 'none'; form-action 'none'";
+
+/// Markdown to HTML, with raw HTML in the page shown as text, not run, and
+/// links and images to anything but [`safe`] destinations shown as their
+/// text.
 fn render(markdown: &str) -> String {
-    let events = Parser::new(markdown).map(|e| match e {
-        Event::Html(h) | Event::InlineHtml(h) => Event::Text(h),
-        e => e,
+    // Whether each open link or image was dropped, to drop its end too.
+    let mut open = Vec::new();
+    let events = Parser::new(markdown).filter_map(|e| match e {
+        Event::Html(h) | Event::InlineHtml(h) => Some(Event::Text(h)),
+        Event::Start(Tag::Link { ref dest_url, .. } | Tag::Image { ref dest_url, .. }) => {
+            let keep = safe(dest_url);
+            open.push(keep);
+            keep.then_some(e)
+        }
+        Event::End(TagEnd::Link | TagEnd::Image) => open.pop().unwrap_or(true).then_some(e),
+        e => Some(e),
     });
     let mut out = String::from("<!doctype html><meta charset=\"utf-8\">\n");
     html::push_html(&mut out, events);
     out
+}
+
+/// Whether a link or image may go to `url`: one with no scheme (relative),
+/// or http, https or mailto. Read as a browser reads it: controls and
+/// spaces around it and tabs and newlines in it ignored (`java\tscript:` is
+/// `javascript:`), the scheme in any case.
+fn safe(url: &CowStr) -> bool {
+    let url: String = url.trim_matches(|c: char| c <= ' ').chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+    let Some(end) = url.find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))) else { return true };
+    let scheme = &url[..end];
+    if !url[end..].starts_with(':') || !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    ["http", "https", "mailto"].iter().any(|s| scheme.eq_ignore_ascii_case(s))
 }
 
 /// A page name: 1-100 letters, digits, `_` or `-`.

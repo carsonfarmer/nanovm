@@ -2,11 +2,16 @@
 //! completion API. Each user is an object (`/{user}/`), so their quota is
 //! checked and spent one request at a time. A completion is streamed from
 //! the upstream API to the client as it is generated (Server-Sent Events,
-//! one token per event), and counted on the way through.
+//! one token per event, `[DONE]` at the end), and counted on the way
+//! through: its events are parsed as they arrive, however the reads split
+//! them.
 //!
 //! The quota is charged *before* streaming and refunded after: a request
 //! reserves `max_tokens` with its answer (that commits at once), and the
-//! stream, once done, gives back what it didn't use. A stream that is cut
+//! stream, once done, gives back what it didn't use. Done means verified:
+//! the upstream said `[DONE]` and its body arrived whole. What was used is
+//! the upstream's own count if it reports one (`usage.completion_tokens`,
+//! as OpenAI's API does), else the token events seen. A stream that is cut
 //! off (by the client, the upstream, or `post_return_timeout_ms`, which
 //! rolls back what it changed) keeps the whole reservation, so a broken
 //! stream is never free.
@@ -50,21 +55,90 @@ async fn handle(req: Request) -> Result {
             // Reserved now: this commits with the answer, before any token flows.
             kv::set(&used_key, (used + max).to_string()).await?;
             Response::stream("text/event-stream", move |mut body| async move {
-                let mut tokens = 0;
-                while let Some(piece) = upstream.next().await {
-                    tokens += String::from_utf8_lossy(&piece).matches("data: {").count() as i64;
+                let mut events = Events::default();
+                loop {
+                    let piece = match upstream.next().await {
+                        Ok(Some(piece)) => piece,
+                        Ok(None) => break,
+                        // The upstream broke off: the reservation stands.
+                        Err(_) => return,
+                    };
+                    events.read(&piece);
                     if !body.write(piece).await {
                         return; // The client left: the reservation stands.
                     }
                 }
-                // Done: give back what wasn't used. This commits when the
-                // stream ends, or never if it runs out of time.
-                let _ = kv::increment(&used_key, tokens.min(max) - max).await;
+                // Done, and verifiably so: give back what wasn't used. This
+                // commits when the stream ends, or never if it runs out of
+                // time. Without `[DONE]` the reservation stands.
+                if let Some(used) = events.used() {
+                    let _ = kv::increment(&used_key, used.clamp(0, max) - max).await;
+                }
             })
             .header("cache-control", "no-cache")
         }
         _ => Response::not_found(),
     })
+}
+
+/// The upstream's Server-Sent Events, read as its body arrives: an event
+/// ends at a blank line, wherever the reads split it, and lines end with
+/// LF, CRLF or CR (a CRLF split between reads included).
+#[derive(Default)]
+struct Events {
+    line: Vec<u8>,
+    after_cr: bool,
+    /// The `data` of the event so far.
+    data: Option<String>,
+    tokens: i64,
+    usage: Option<i64>,
+    done: bool,
+}
+
+impl Events {
+    fn read(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            let after_cr = std::mem::replace(&mut self.after_cr, b == b'\r');
+            match b {
+                b'\n' if after_cr => {}
+                b'\n' | b'\r' => {
+                    let line = std::mem::take(&mut self.line);
+                    self.line(&String::from_utf8_lossy(&line));
+                }
+                b => self.line.push(b),
+            }
+        }
+    }
+
+    fn line(&mut self, line: &str) {
+        if line.is_empty() {
+            match self.data.take().as_deref() {
+                Some("[DONE]") => self.done = true,
+                Some(data) => {
+                    self.tokens += 1;
+                    let event: serde_json::Value = serde_json::from_str(data).unwrap_or_default();
+                    if let Some(n) = event["usage"]["completion_tokens"].as_i64() {
+                        self.usage = Some(n);
+                    }
+                }
+                None => {}
+            }
+        } else if let Some(value) = line.strip_prefix("data:").or((line == "data").then_some("")) {
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match &mut self.data {
+                Some(data) => {
+                    data.push('\n');
+                    data.push_str(value);
+                }
+                None => self.data = Some(value.into()),
+            }
+        }
+    }
+
+    /// The tokens a finished stream used: none if it didn't say `[DONE]`.
+    fn used(&self) -> Option<i64> {
+        self.done.then(|| self.usage.unwrap_or(self.tokens))
+    }
 }
 
 fn setting(key: &str, default: i64) -> i64 {

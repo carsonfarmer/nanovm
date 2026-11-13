@@ -24,15 +24,15 @@ node.
 | [presence](../examples/presence) | A-12 | join/leave/typing over WebSockets; two tabs are one person; presence that lapses when a restart drops sockets silently | 4.5 |
 | [tictactoe](../examples/tictactoe) | A-1 | a lobby pairing players through calls (ten at once make five games of two); each game the authority on its moves | 3.2 |
 | [flags](../examples/flags) | A-8 | defaults in config, overrides per tenant object pushed live; stable, monotonic percentage rollouts | 3.3 |
-| [wiki](../examples/wiki) | A-10 | revisions in SQLite; lost updates refused with `if-match`; Markdown (`pulldown-cmark`) with raw HTML escaped; diffs (`similar`) | 2.2 |
+| [wiki](../examples/wiki) | A-10 | revisions in SQLite; lost updates refused with `if-match`; Markdown (`pulldown-cmark`) with raw HTML escaped, link and image destinations limited to http(s), mailto and relative, and a no-script CSP; diffs (`similar`) | 2.2 |
 | [notes](../examples/notes) | A-19 | an FTS5 index per person: ranked, highlighted prefix search; user input never query syntax | ~2 |
 | [analytics](../examples/analytics) | A-15 | batched ingest in one statement; per-day rollups kept by a trigger; CSV | ~2 |
 | [reminders](../examples/reminders) | A-26 | acting on time without alarms: an external tick or client polling, each reminder fired once | 3.3 |
 | [todos](../examples/todos) | A-23 | offline-first sync: field-level merges, reported conflicts, retries that apply nothing twice | 2.1 |
 | [webhooks](../examples/webhooks) | A-7 | HMAC-verified webhooks answered at once, relayed after the answer (`after`), retried with backoff; egress allowlist | 3.0 |
-| [gateway](../examples/gateway) | A-17 | per-user token quotas in front of a streaming API: reserve before streaming, refund after, so cut streams aren't free | 3.7 |
+| [gateway](../examples/gateway) | A-17 | per-user token quotas in front of a streaming API: reserve before streaming, refund after a verified finish (`[DONE]`, body whole), so cut streams aren't free; events parsed across reads | 3.7 |
 | [feeds](../examples/feeds) | A-18 | a feed object as a shared cache: conditional GETs, items kept once; readers fan in through calls | 1.6 |
-| [oauth](../examples/oauth) | A-14 | GitHub sign-in: one-time state, token exchange over egress, cookies only the user's object accepts, `auth` vouching for sessions (W-602) | 0.6 |
+| [oauth](../examples/oauth) | A-14 | GitHub sign-in: one-time state bound to the starting browser by a `__Host-` nonce cookie, token exchange over egress, cookies only the user's object accepts, `auth` vouching for sessions (W-602) | 0.6 |
 
 The first twenty: 72 s in one run, 59 s in the full suite
 (`RUST_TEST_THREADS=1`, load average 11-17 on 4 shared cores). Most tests
@@ -76,7 +76,9 @@ Each in its own commit, found by an example:
 - `after(work)`: work that runs once the handler has answered, committed
   when it is done (webhooks).
 - `Fetch::stream` / `Streaming::next`: read an outbound answer as it
-  arrives (gateway).
+  arrives (gateway). `next()` is `Result<Option<_>, ErrorCode>`: a body
+  cut short upstream ends in an error, as `send()` returns one, rather
+  than passing for the whole answer (review D3).
 
 An app that uses none of them is unchanged: `shortener.wasm` is 400,751
 bytes before and after the SQLite module, with no `spin:sqlite` import.
@@ -129,3 +131,24 @@ bytes before and after the SQLite module, with no `spin:sqlite` import.
 Every commit depends on `cf/onramp` (the SDK, `tools/build-app.sh`, `nanovm
 run`). Runtime lines (CI's count of `crates/nanovm/src`): +6, all in
 `main.rs` (N-602's warning). `components/sqlite/provider`: +8 (N-603).
+
+## Review fixes (PR #2)
+
+Each with a `review_*` test that failed before it and passes after.
+
+- **D1** oauth: the state is bound to the starting browser by a nonce
+  cookie (`__Host-` and `Secure` over https); a callback link opened
+  elsewhere signs no one in.
+- **D2** wiki: link and image destinations limited to http(s), mailto and
+  relative ones; a no-script CSP on rendered pages.
+- **D3** SDK: `send()` and `Streaming::next()` report a body cut short
+  upstream as an error (JavaScript's `fetch` rejects); the gateway keeps
+  the reservation of a stream its upstream breaks off.
+- **D4** JavaScript: a rejected `ctx.waitUntil` promise stops the instance
+  (as a panic in Rust's `after` work does), so the host rolls back what
+  the work wrote after the answer instead of committing it; the answer and
+  the handler's own writes, committed when it was sent, stand.
+- **D5** gateway: Server-Sent Events parsed across reads (an event split
+  between HTTP chunks was zero tokens, so a split stream was refunded in
+  full); refunds only after `[DONE]` and a whole body, by the upstream's
+  `usage` when it reports one.

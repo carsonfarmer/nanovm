@@ -951,6 +951,54 @@ async fn wiki_keeps_every_revision_and_refuses_lost_updates() {
     assert_eq!(next.json()["rev"], 3);
 }
 
+/// examples/wiki: Markdown's own links and images, not only its raw HTML,
+/// can run script: `[x](javascript:…)` is an `href` a click runs. The
+/// destinations served are read as a browser reads them (case, tabs and
+/// newlines inside, controls around), and only http, https, mailto and
+/// relative ones are kept; the page's CSP refuses script besides.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_wiki_does_not_serve_executable_markdown_links() {
+    let app = App::start("wiki", json!({})).await;
+    let hostile = "# Links\n\n\
+        [a](javascript:alert(1)) [b](JaVaScRiPt:alert(2)) [c](java&#x09;script:alert(3)) [d](&#x20;javascript:alert(4))\n\
+        <javascript:alert(5)> [e][ref] ![f](javascript:alert(6)) [g](vbscript:msgbox(7))\n\
+        [h](data:text/html;base64,PHNjcmlwdD5hbGVydCg4KTwvc2NyaXB0Pg==) [i](&#106;avascript:alert(9)) [j](java\nscript:alert(10))\n\n\
+        [ref]: javascript:alert(11)\n\n\
+        [ok](https://example.com/a?b=1&c=2) [rel](/w/pages/Other) [mail](mailto:ann@example.com) [frag](#top) [page](Other)\n\
+        ![img](https://example.com/i.png) [plain](http://example.com/) [colon](./a:b)\n";
+    let saved = app.send("PUT", "/w/pages/Links", &[("if-match", "0")], hostile).await;
+    assert_eq!(saved.status, 201, "{saved:?}");
+    let page = app.get("/w/pages/Links").await;
+    let html = page.text();
+
+    // Every href and src, as the browser will resolve its scheme: entities
+    // decoded, tabs and newlines dropped, controls and spaces trimmed.
+    let mut urls = vec![];
+    for attr in ["href=\"", "src=\""] {
+        for (i, _) in html.match_indices(attr) {
+            let value = &html[i + attr.len()..];
+            let value = &value[..value.find('"').unwrap()];
+            let value = value.replace("&quot;", "\"").replace("&#39;", "'").replace("&#x27;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+            urls.push(value);
+        }
+    }
+    let scheme = |url: &str| -> Option<String> {
+        let url: String = url.trim_matches(|c: char| c <= ' ').chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+        let end = url.find(|c: char| !(c.is_ascii_alphanumeric() || "+-.".contains(c)))?;
+        (url[end..].starts_with(':') && url.starts_with(|c: char| c.is_ascii_alphabetic())).then(|| url[..end].to_ascii_lowercase())
+    };
+    for url in &urls {
+        if let Some(s) = scheme(url) {
+            assert!(["http", "https", "mailto"].contains(&s.as_str()), "an executable destination {url:?} in {html}");
+        }
+    }
+    for kept in ["https://example.com/a?b=1&c=2", "/w/pages/Other", "mailto:ann@example.com", "#top", "Other", "https://example.com/i.png", "http://example.com/", "./a:b"] {
+        assert!(urls.iter().any(|u| u == kept), "{kept} is kept: {urls:?}");
+    }
+    let csp = page.header("content-security-policy");
+    assert!(csp.contains("default-src 'none'") && !csp.contains("script-src"), "no script, whatever the page holds: {csp:?}");
+}
+
 /// examples/notes: an FTS5 index per person, kept in step by the same
 /// statements that save notes; ranked, highlighted prefix search that
 /// treats query syntax as words; durable.
@@ -1276,8 +1324,12 @@ async fn webhooks_verify_answer_then_relay_with_retries() {
 }
 
 /// A completion API on loopback: a prompt `n N ms M` streams N tokens as
-/// Server-Sent Events, one every M ms, then `[DONE]`; `fail` is a 500. It
-/// records each request's authorization header.
+/// Server-Sent Events, one every M ms, then `[DONE]` (`… nodone`: not,
+/// `… usage K`: after an event reporting K tokens used); `cut N` streams N
+/// and then breaks the connection (a chunked body with no last chunk);
+/// `split N` streams N and `[DONE]`, each event in three HTTP chunks 20 ms
+/// apart (the first cut inside its `data: ` prefix, the second anywhere
+/// after); `fail` is a 500. It records each request's authorization header.
 async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let keys = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1291,15 +1343,52 @@ async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
             let body = http_body_util::BodyExt::collect(req.into_body()).await.unwrap().to_bytes();
             let prompt = serde_json::from_slice::<Value>(&body).unwrap()["prompt"].as_str().unwrap().to_string();
             let words: Vec<&str> = prompt.split(' ').collect();
-            let ["n", n, "ms", ms] = words[..] else { return nanovm::object::error_response(500, "scripted", "fail") };
-            let (n, ms): (u32, u64) = (n.parse().unwrap(), ms.parse().unwrap());
-            let tokens = futures::stream::unfold(0, move |i| async move {
-                if i > n {
-                    return None;
+            if let ["split", n] = words[..] {
+                let n: usize = n.parse().unwrap();
+                let events = (0..n).map(|i| format!("data: {{\"token\":\"t{i}\"}}\n\n")).chain(["data: [DONE]\n\n".to_string()]);
+                let mut pieces = vec![];
+                for (i, e) in events.enumerate() {
+                    let a = 1 + i % 6;
+                    let b = a + 1 + (i * 7) % (e.len() - a - 1);
+                    pieces.extend([e[..a].to_string(), e[a..b].to_string(), e[b..].to_string()]);
                 }
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                let event = if i == n { "data: [DONE]\n\n".to_string() } else { format!("data: {{\"token\":\"t{i}\"}}\n\n") };
-                Some((Ok::<_, nanovm::object::BoxError>(http_body::Frame::data(bytes::Bytes::from(event))), i + 1))
+                let pieces = futures::stream::iter(pieces).then(|p| async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok::<_, nanovm::object::BoxError>(http_body::Frame::data(bytes::Bytes::from(p)))
+                });
+                let body = http_body_util::BodyExt::boxed_unsync(http_body_util::StreamBody::new(pieces));
+                return http::Response::builder().header("content-type", "text/event-stream").body(body).unwrap();
+            }
+            if let ["cut", n] = words[..] {
+                let n: u32 = n.parse().unwrap();
+                let tokens = futures::stream::unfold(0, move |i| async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    match i {
+                        i if i < n => Some((Ok(http_body::Frame::data(bytes::Bytes::from(format!("data: {{\"token\":\"t{i}\"}}\n\n")))), i + 1)),
+                        i if i == n => Some((Err::<http_body::Frame<bytes::Bytes>, nanovm::object::BoxError>("cut".into()), i + 1)),
+                        _ => None,
+                    }
+                });
+                let body = http_body_util::BodyExt::boxed_unsync(http_body_util::StreamBody::new(tokens));
+                return http::Response::builder().header("content-type", "text/event-stream").body(body).unwrap();
+            }
+            let ["n", n, "ms", ms, ref then @ ..] = words[..] else { return nanovm::object::error_response(500, "scripted", "fail") };
+            let (n, ms): (u32, u64) = (n.parse().unwrap(), ms.parse().unwrap());
+            let last = match then {
+                ["nodone"] => None,
+                ["usage", k] => Some(format!("data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":{k}}}}}\n\ndata: [DONE]\n\n")),
+                _ => Some("data: [DONE]\n\n".to_string()),
+            };
+            let tokens = futures::stream::unfold(0, move |i| {
+                let last = last.clone();
+                async move {
+                    if i > n || (i == n && last.is_none()) {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    let event = if i == n { last.unwrap() } else { format!("data: {{\"token\":\"t{i}\"}}\n\n") };
+                    Some((Ok::<_, nanovm::object::BoxError>(http_body::Frame::data(bytes::Bytes::from(event))), i + 1))
+                }
             });
             let body = http_body_util::BodyExt::boxed_unsync(http_body_util::StreamBody::new(tokens));
             http::Response::builder().header("content-type", "text/event-stream").body(body).unwrap()
@@ -1311,13 +1400,14 @@ async fn llm() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
 /// examples/gateway (on an in-process node, to reach a loopback API): a
 /// streamed completion passed through as it is generated; the quota
 /// reserved before streaming and refunded after, so a stream cut off by
-/// the client or by post_return_timeout_ms keeps its reservation.
+/// the client, the upstream or post_return_timeout_ms keeps its
+/// reservation.
 #[tokio::test(flavor = "multi_thread")]
 async fn gateway_streams_completions_within_quotas() {
     let (api, keys) = llm().await;
     let patch = json!({
         "limits": {"egress": [api], "post_return_timeout_ms": 1500},
-        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "300", "max_tokens": "100"},
+        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "400", "max_tokens": "100"},
         "env": {"UPSTREAM_KEY": "test-key"},
     });
     let app = Local::start("gateway", patch);
@@ -1352,12 +1442,18 @@ async fn gateway_streams_completions_within_quotas() {
     http_body_util::BodyExt::frame(&mut body).await.unwrap().unwrap();
     drop(body);
     assert_eq!(usage(&app).await, 105);
+    // So does one the upstream breaks off: what came of it is no measure.
+    let res = complete(&app, "cut 3").await;
+    let text = http_body_util::BodyExt::collect(res.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
+    let text = String::from_utf8_lossy(&text);
+    assert!(text.matches("token").count() == 3 && !text.contains("[DONE]"), "{text}");
+    assert_eq!(usage(&app).await, 205, "not refunded as if 3 tokens were all of it");
     // So does one that outlives post_return_timeout_ms: its refund rolls back.
     let res = complete(&app, "n 50 ms 100").await;
     let text = http_body_util::BodyExt::collect(res.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
     assert!(!String::from_utf8_lossy(&text).contains("[DONE]"), "cut short");
-    assert_eq!(usage(&app).await, 205);
-    // 205 + 100 > 300: refused before anything is sent upstream.
+    assert_eq!(usage(&app).await, 305);
+    // 305 + 100 > 400: refused before anything is sent upstream.
     let calls = keys.lock().unwrap().len();
     let over = app.send("POST", "/ann/complete", &[], r#"{"prompt":"n 1 ms 0"}"#).await;
     assert_eq!((over.status, &over.json()["error"]), (429, &json!("quota")));
@@ -1365,9 +1461,35 @@ async fn gateway_streams_completions_within_quotas() {
     assert_eq!(app.send("GET", "/bob/usage", &[], "").await.json()["used"], 0, "quotas are per user");
 
     app.evicted().await;
-    assert_eq!(usage(&app).await, 205);
+    assert_eq!(usage(&app).await, 305);
     let app = app.restart().await;
-    assert_eq!(usage(&app).await, 205);
+    assert_eq!(usage(&app).await, 305);
+}
+
+/// examples/gateway: a token's event split across the upstream's HTTP
+/// chunks (as TCP may split it anywhere) is still a token. The gateway reads
+/// Server-Sent Events across reads, and refunds only what a stream that
+/// verifiably finished (`[DONE]`, and its body whole) didn't use, by the
+/// upstream's own count if it gives one.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_gateway_counts_tokens_split_across_http_chunks() {
+    let (api, _) = llm().await;
+    let patch = json!({
+        "limits": {"egress": [api], "post_return_timeout_ms": 5000},
+        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "1000", "max_tokens": "100"},
+    });
+    let app = Local::start("gateway", patch);
+    let usage = async || app.send("GET", "/ann/usage", &[], "").await.json()["used"].as_i64().unwrap();
+    let res = app.send("POST", "/ann/complete", &[], json!({"prompt": "split 5"}).to_string()).await;
+    assert_eq!(res.status, 200);
+    let text = res.text();
+    assert!(text.matches("data: {\"token\"").count() == 5 && text.ends_with("data: [DONE]\n\n"), "passed on as sent: {text:?}");
+    assert_eq!(usage().await, 5, "5 tokens used, 95 of the 100 reserved given back");
+    let complete = async |prompt: &str| app.send("POST", "/ann/complete", &[], json!({"prompt": prompt}).to_string()).await.status;
+    assert_eq!(complete("n 3 ms 0 nodone").await, 200);
+    assert_eq!(usage().await, 105, "no [DONE], not known to be finished: the reservation stands");
+    assert_eq!(complete("n 3 ms 0 usage 7").await, 200);
+    assert_eq!(usage().await, 112, "the upstream's count, not the events seen");
 }
 
 /// Feeds on loopback: `/rss` and `/atom` serve the documents in `docs`
@@ -1476,9 +1598,9 @@ async fn github() -> String {
 }
 
 /// examples/oauth (on an in-process node, with GitHub on loopback): the
-/// OAuth code flow with a one-time state, a session cookie that only the
-/// signed-in user's object accepts, logout, and sessions that survive
-/// eviction and restarts.
+/// OAuth code flow with a one-time state bound to the browser, a session
+/// cookie that only the signed-in user's object accepts, logout, and
+/// sessions that survive eviction and restarts.
 #[tokio::test(flavor = "multi_thread")]
 async fn oauth_signs_in_with_one_time_state_and_scoped_sessions() {
     let gh = github().await;
@@ -1489,15 +1611,19 @@ async fn oauth_signs_in_with_one_time_state_and_scoped_sessions() {
         "env": {"CLIENT_SECRET": "s3cret"},
     });
     let app = Local::start("oauth", patch);
-    let login = async |app: &Local| -> String {
+    // The state, and the browser's nonce cookie it is bound to.
+    let login = async |app: &Local| -> (String, String) {
         let to = app.send("GET", "/auth/login", &[], "").await;
         assert_eq!(to.status, 302);
         let location = to.header("location").to_string();
         assert!(location.starts_with("https://github.example/authorize?client_id=app-1&redirect_uri=http://app/auth/callback&state="), "{location}");
-        location.split("state=").nth(1).unwrap().split('&').next().unwrap().to_string()
+        let nonce = to.header("set-cookie");
+        assert!(nonce.starts_with("oauth_nonce=") && !nonce.contains("Secure"), "plain http: not Secure, so not __Host-: {nonce}");
+        let state = location.split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        (state, nonce.split(';').next().unwrap().to_string())
     };
-    let state = login(&app).await;
-    let back = app.send("GET", &format!("/auth/callback?code=good&state={state}"), &[], "").await;
+    let (state, nonce) = login(&app).await;
+    let back = app.send("GET", &format!("/auth/callback?code=good&state={state}"), &[("cookie", &nonce)], "").await;
     assert_eq!((back.status, back.header("location")), (302, "/u-ann/me"));
     let cookie = back.header("set-cookie").split(';').next().unwrap().to_string();
     assert!(cookie.starts_with("session=ann.") && back.header("set-cookie").contains("HttpOnly"), "{cookie}");
@@ -1509,10 +1635,11 @@ async fn oauth_signs_in_with_one_time_state_and_scoped_sessions() {
     assert_eq!(app.send("GET", "/u-ann/me", &[("cookie", &forged)], "").await.status, 401, "a made-up session");
 
     // A state is used once, and only a state we made counts.
-    assert_eq!(app.send("GET", &format!("/auth/callback?code=good&state={state}"), &[], "").await.status, 400);
-    assert_eq!(app.send("GET", "/auth/callback?code=good&state=forged", &[], "").await.status, 400);
-    let state = login(&app).await;
-    assert_eq!(app.send("GET", &format!("/auth/callback?code=bad&state={state}"), &[], "").await.status, 401);
+    let with_nonce = [("cookie", nonce.as_str())];
+    assert_eq!(app.send("GET", &format!("/auth/callback?code=good&state={state}"), &with_nonce, "").await.status, 400);
+    assert_eq!(app.send("GET", "/auth/callback?code=good&state=forged", &with_nonce, "").await.status, 400);
+    let (state, nonce) = login(&app).await;
+    assert_eq!(app.send("GET", &format!("/auth/callback?code=bad&state={state}"), &[("cookie", &nonce)], "").await.status, 401);
 
     // Sessions outlive instances and the node; logout ends them everywhere.
     app.evicted().await;
@@ -1520,4 +1647,59 @@ async fn oauth_signs_in_with_one_time_state_and_scoped_sessions() {
     assert_eq!(app.send("GET", "/u-ann/me", &me, "").await.status, 200);
     assert_eq!(app.send("POST", "/u-ann/logout", &me, "").await.status, 204);
     assert_eq!(app.send("GET", "/u-ann/me", &me, "").await.status, 401);
+}
+
+/// examples/oauth: a sign-in's `state` works only in the browser that asked
+/// for it. Without that, someone who starts a sign-in and gets another
+/// browser to open the callback link (their code, their state) signs that
+/// browser in as themselves (login CSRF). `/auth/login` sets a random nonce
+/// in a `__Host-` cookie (HttpOnly, Secure, SameSite=Lax, Path=/), bound by
+/// its hash to the state; the callback needs both, and the state is spent
+/// by any attempt.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_oauth_state_must_be_bound_to_the_starting_browser() {
+    let gh = github().await;
+    let patch = json!({
+        "limits": {"egress": [gh]},
+        "config": {"authorize_url": "https://github.example/authorize", "token_url": format!("http://{gh}/token"),
+                   "user_url": format!("http://{gh}/user"), "client_id": "app-1", "redirect_uri": "https://app.example/auth/callback"},
+        "env": {"CLIENT_SECRET": "s3cret"},
+    });
+    let app = Local::start("oauth", patch);
+    // A browser starts a sign-in; `cookies` is what it already holds.
+    let login = async |cookies: &str| -> (String, String) {
+        let to = app.send("GET", "/auth/login", &[("cookie", cookies)], "").await;
+        assert_eq!(to.status, 302);
+        let state = to.header("location").split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+        (state, to.header("set-cookie").to_string())
+    };
+    let callback = async |state: &str, cookies: &str| {
+        let back = app.send("GET", &format!("/auth/callback?code=good&state={state}"), &[("cookie", cookies)], "").await;
+        let session = back.headers.get_all("set-cookie").iter().any(|c| c.to_str().unwrap().starts_with("session="));
+        (back.status, session)
+    };
+
+    // The link opened in a browser that didn't start it signs no one in.
+    let (state, set) = login("").await;
+    assert_eq!(callback(&state, "").await, (400, false), "no nonce: whoever opens the link is signed in");
+    let attrs: Vec<&str> = set.split(';').map(str::trim).collect();
+    let nonce = attrs[0];
+    assert!(nonce.starts_with("__Host-") && nonce.split_once('=').unwrap().1.len() >= 32, "a random nonce in a __Host- cookie: {set}");
+    for attr in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
+        assert!(attrs.contains(&attr), "{attr}: {set}");
+    }
+    assert!(!set.to_ascii_lowercase().contains("domain="), "{set}");
+    let (state, _) = login(nonce).await;
+    let (_, other) = login("").await;
+    let other = other.split(';').next().unwrap().to_string();
+    assert_ne!(other, nonce);
+    assert_eq!(callback(&state, &other).await, (400, false), "another browser's nonce");
+    assert_eq!(callback(&state, nonce).await, (400, false), "the state is spent by any attempt");
+
+    // The browser that started it signs in, even with two sign-ins open.
+    let (first, _) = login(nonce).await;
+    let (second, again) = login(nonce).await;
+    assert_eq!(again.split(';').next().unwrap(), nonce, "a browser keeps its nonce");
+    assert_eq!(callback(&second, nonce).await, (302, true));
+    assert_eq!(callback(&first, nonce).await, (302, true));
 }
