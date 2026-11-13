@@ -188,7 +188,18 @@ checks `git diff` is empty (all 13 were). Run before the `beta/objects` merge.
 
 M8 was for the pre-merge design (the removal added back at measuring time); after the merge the
 journal rolls it back first, and the same test checks the count (`objects_share_their_apps_budget`,
-now on objects-backed journals in the sharded layout).
+now on objects-backed journals in the sharded layout). Two more after the merges, both caught by it
+and restored with an empty diff:
+
+| # | Mutation | Caught by |
+|---|---|---|
+| M14 | an ended instance measured before its journal rolls back (`park` before `journal`) | `objects_share_their_apps_budget` |
+| M15 | an ended instance's usage kept as counted, not measured | `objects_share_their_apps_budget` |
+
+After both merges the full suite passes: 165 unit, 9 `dev`, 27 `examples`, 118 integration (14
+ignored, as on `cf/round3`), 17 JavaScript, 2 `committed_state`; and `cargo check -p nanovm --bin
+nanovm` (no dev feature). Example and JavaScript apps were the `beta/objects` worktree's builds,
+whose sources match `cf/round3`'s (`wac` isn't installed here to build them).
 
 ### Not done or not verified
 
@@ -197,8 +208,6 @@ now on objects-backed journals in the sharded layout).
   integration tests, which the shared disk (3–8 GB free) couldn't spare.
 - **W-35 / N-182** (a global budget for what the proxy buffers): not taken; they bound memory, not
   requests or disk, and this branch is already +327 lines.
-- **Four example tests** (`gateway`, `oauth`) didn't run: their apps need `wac` to build, which isn't
-  installed here, and the other worktrees' builds of them differ.
 - **The proxy's CPU per request** wasn't measured separately: it runs the same gate code as the node's
   front end, which was.
 
