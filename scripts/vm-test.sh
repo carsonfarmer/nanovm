@@ -15,7 +15,7 @@
 set -e
 cd "$(dirname "$0")/.."
 N=$(pwd)
-TESTS=${1:-workers_are_placed,worker_memory,worker_cpu,spare_engine_memory,jail_blocks_escapes}
+TESTS=${1:-workers_are_placed,worker_memory,worker_cpu,spare_engine_memory,cgroup,jail_blocks_escapes}
 [ "$TESTS" = all ] && TESTS=
 V=$N/target/vm
 mkdir -p "$V"
@@ -33,15 +33,16 @@ accel=tcg
 R=$V/root
 rm -rf "$R"
 mkdir -p "$R/bin" "$R/proc" "$R/sys" "$R/dev" "$R/tmp" "$R$N/crates/nanovm" "$R$N/target/release/deps" \
-    "$R$N/target/tmp" "$R$N/guests/target/wasm32-wasip2/release" "$R$N/demo"
+    "$R$N/target/tmp" "$R$N/guests/target/wasm32-wasip2/release" "$R/etc/ssl/certs"
 cp "$(command -v busybox)" "$R/bin/"
-for c in sh mount ip poweroff sysctl cat cut sed tr; do ln -s busybox "$R/bin/$c"; done
+for c in sh mount ip poweroff sysctl cat cut sed tr sleep; do ln -s busybox "$R/bin/$c"; done
 cp "$T" "$R$N/target/release/deps/integration"
 cp target/release/nanovm "$R$N/target/release/"
 cp guests/target/wasm32-wasip2/release/counter.wasm guests/target/wasm32-wasip2/release/hostile.wasm \
     "$R$N/guests/target/wasm32-wasip2/release/"
-cp -r demo/static "$R$N/demo/"
-mkdir -p "$R/etc" && echo "127.0.0.1 localhost" >"$R/etc/hosts"
+# HTTP clients load the system's CA certificates when they are built.
+cp -L /etc/ssl/certs/ca-certificates.crt "$R/etc/ssl/certs/"
+echo "127.0.0.1 localhost" >"$R/etc/hosts"
 for f in $(ldd "$T" target/release/nanovm | grep -o '/lib[^ ]*' | sort -u); do
     mkdir -p "$R$(dirname "$f")"
     cp -L "$f" "$R$f"

@@ -36,6 +36,11 @@ async fn handle(req: Request) -> Result {
             mark("later").await;
             panic!("after work failed");
         }),
+        // Work that takes a while, then writes.
+        "/slow" => after(async {
+            nanovm_sdk::sleep(Duration::from_millis(500)).await;
+            mark("later").await;
+        }),
         // Work that passes on more work, which writes.
         "/nested" => after(async {
             nanovm_sdk::sleep(Duration::from_millis(20)).await;
