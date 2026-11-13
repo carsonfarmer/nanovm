@@ -131,3 +131,20 @@ bytes before and after the SQLite module, with no `spin:sqlite` import.
 Every commit depends on `cf/onramp` (the SDK, `tools/build-app.sh`, `nanovm
 run`). Runtime lines (CI's count of `crates/nanovm/src`): +6, all in
 `main.rs` (N-602's warning). `components/sqlite/provider`: +8 (N-603).
+
+## Review fixes (PR #2)
+
+Each with a `review_*` test that failed before it and passes after.
+
+- **D1** oauth: the state is bound to the starting browser by a nonce
+  cookie (`__Host-` and `Secure` over https); a callback link opened
+  elsewhere signs no one in.
+- **D2** wiki: link and image destinations limited to http(s), mailto and
+  relative ones; a no-script CSP on rendered pages.
+- **D3** SDK: `send()` and `Streaming::next()` report a body cut short
+  upstream as an error (JavaScript's `fetch` rejects); the gateway keeps
+  the reservation of a stream its upstream breaks off.
+- **D4** JavaScript: a rejected `ctx.waitUntil` promise stops the instance
+  (as a panic in Rust's `after` work does), so the host rolls back what
+  the work wrote after the answer instead of committing it; the answer and
+  the handler's own writes, committed when it was sent, stand.

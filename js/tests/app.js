@@ -67,6 +67,19 @@ const routes = {
     return new Response("answered first");
   },
   "GET /later-value": async (req, env) => Response.json({ later: (await env.kv.get("later")) ?? null }),
+  // waitUntil work that writes, then throws: its write rolls back; the
+  // answer and the handler's own write stand.
+  "POST /later-throw": async (req, env, ctx) => {
+    await env.kv.put("answered", hits);
+    ctx.waitUntil((async () => {
+      // Well after the answer: waitUntil work done while the handler's own
+      // promise was still settling would commit with the answer.
+      await new Promise((r) => setTimeout(r, 200));
+      await env.kv.put("partial", hits);
+      throw new Error("after the answer");
+    })());
+    return new Response("answered first");
+  },
   // Nothing of the build's pre-initialization may be shared by instances.
   "GET /fresh": () => Response.json({ random: Math.random(), uuid: crypto.randomUUID(), now: Date.now() }),
   "GET /web": async () => {

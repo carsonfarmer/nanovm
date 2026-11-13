@@ -280,6 +280,23 @@ async fn web_apis() {
     assert_eq!(lengths, ["2"], "one content-length, the body's");
 }
 
+/// A `waitUntil` promise that rejects fails the work done after the answer,
+/// as a panic in Rust's `after` work does: what it wrote rolls back and the
+/// instance is replaced. The answer, already sent, and what the handler
+/// wrote before answering stand.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_wait_until_exception_rolls_back_partial_work() {
+    let node = node("js_wait_until_rolls_back", 8);
+    let r = post(&node, "u", "/later-throw").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}", r.error);
+    // Served once the waitUntil work is over.
+    let kv = get(&node, "u", "/kv").await.json();
+    assert!(kv.get("partial").is_none(), "the failed work's write rolled back: {kv}");
+    assert_eq!(kv["answered"], 1, "committed with the answer: {kv}");
+    let r = get(&node, "u", "/").await;
+    assert_eq!(r.json()["hits"], 2, "a fresh instance since: {}", r.body);
+}
+
 /// The component starts from a snapshot taken at build time; nothing in it
 /// may be shared by instances or stale: randomness, the clock, the id.
 #[tokio::test(flavor = "multi_thread")]

@@ -36,12 +36,15 @@ JSON) on the composed Spin key-value provider, committed with the response;
 outbound `fetch` under the app's egress policy (it rejects if the body
 breaks off before its end); `env.objects.get(id).fetch()`
 between objects; `env.config`, `env.id`, `env.publish(channel, message)`;
-`ctx.waitUntil`; WebSocket handlers `webSocketOpen` (return `false` to
+`ctx.waitUntil` (its work runs after the answer and commits when done; if
+a promise rejects, the instance stops and that work's writes roll back,
+while the answer and the handler's own writes stand, as with Rust's
+`after`); WebSocket handlers `webSocketOpen` (return `false` to
 refuse), `webSocketMessage` and `webSocketClose`, with `ws.send`,
 `ws.close(code)` and `ws.subscribe(channel)`. An uncaught exception fails
 the request and rolls back its writes. Bodies are whole (no streams), one
 module (bundle imports first), no `performance`.
 
-Tests: `crates/nanovm/tests/js.rs` (ten, on an in-process node) and
+Tests: `crates/nanovm/tests/js.rs` (eleven, on an in-process node) and
 `javascript_apps_run_and_publish` in `crates/nanovm/tests/run.rs`.
 Measurements: notes/js.md and notes/qjs.md on branch cf/optimistic-feynman.
