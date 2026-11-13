@@ -97,12 +97,14 @@ async fn download(req: &Request, meta: Meta) -> Result {
                 Ok(piece) if !piece.is_empty() => {
                     at += piece.len() as u64;
                     if !body.write(piece).await {
-                        return;
+                        break;
                     }
                 }
-                _ => return,
+                // Short of its content-length: the client sees it break off.
+                _ => break,
             }
         }
+        Ok(())
     })
     .status(status)
     .header("accept-ranges", "bytes")
