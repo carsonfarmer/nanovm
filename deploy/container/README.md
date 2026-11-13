@@ -43,6 +43,11 @@ Mount your own config over `/etc/nanovm/nanovm.toml` (read-only) to change limit
 `telemetry_endpoint` (a Collector in the same network namespace can use the
 default `127.0.0.1:4318`), or `max_live_objects`. Do not set `RUST_BACKTRACE`.
 
+**App secrets.** Set `secrets = "/etc/nanovm/secrets"` in that config and mount
+a host directory only root may use (`chmod 700`) there, read-only: `-v
+/etc/nanovm-secrets:/etc/nanovm/secrets:ro`. What goes in it: the
+[single-node guide](../single-node/README.md#6-app-secrets), step 6.
+
 **Not in a container: per-app cgroups.** Docker mounts `/sys/fs/cgroup`
 read-only in an unprivileged container, so leave `cgroup` unset and bound the
 whole node with `--memory`, `--cpus` and `--pids-limit`. Per-app worker limits

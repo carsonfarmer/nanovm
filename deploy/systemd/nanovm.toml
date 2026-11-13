@@ -18,6 +18,9 @@ telemetry_endpoint = "http://127.0.0.1:4318"
 # App i runs as uid/gid jail_uid_base + i. Never change it on a node with
 # data: an app's uid is the owner of its objects directory.
 jail_uid_base = 200000
+# Each app's secrets, as <app>.json: a directory only root may use (install.sh
+# makes it 0700). See deploy/single-node/README.md, step 6.
+secrets = "/etc/nanovm/secrets"
 # With nanovm-cgroup.conf installed, each worker goes in <cgroup>/worker-<n>:
 # cgroup = "/sys/fs/cgroup/system.slice/nanovm.service/apps"
 

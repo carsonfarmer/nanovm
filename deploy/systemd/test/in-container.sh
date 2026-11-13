@@ -10,7 +10,7 @@ systemctl stop nanovm nanovm-proxy devreg 2>/dev/null
 systemctl reset-failed 2>/dev/null
 rm -rf /var/lib/nanovm /var/lib/private/nanovm /etc/nanovm /etc/systemd/system/nanovm.service.d /srv/nanovm-store
 install -m644 $D/nanovm.service $D/nanovm-proxy.service /etc/systemd/system/
-install -d /etc/nanovm && install -m644 $D/nanovm.toml $D/proxy.toml /etc/nanovm/
+install -d /etc/nanovm && install -m644 $D/nanovm.toml $D/proxy.toml /etc/nanovm/ && install -d -m700 /etc/nanovm/secrets
 install -m644 $D/90-nanovm.conf /etc/sysctl.d/
 # Unsigned apps from the loopback registry: dev mode (dev build, loopback).
 sed -i '1i dev = true' /etc/nanovm/nanovm.toml

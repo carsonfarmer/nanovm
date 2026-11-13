@@ -9,6 +9,9 @@ max_live_objects = 1000
 proxy = "http://127.0.0.1:8444"
 telemetry_endpoint = "http://127.0.0.1:4318"
 jail_uid_base = 200000
+# Each app's secrets, as <app>.json: mount a directory only root may use here
+# (deploy/container/README.md, "App secrets").
+# secrets = "/etc/nanovm/secrets"
 
 [limits]
 memory_mb = 64

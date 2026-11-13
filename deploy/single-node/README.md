@@ -75,7 +75,8 @@ deploy/single-node/install.sh target/release/nanovm     # add --cgroup for per-a
 
 [install.sh](install.sh) installs the binary (keeping the previous one as
 `nanovm.prev`), the [units](../systemd/README.md), the sysctl drop-in and, if
-absent, `/etc/nanovm/{nanovm,proxy}.toml`, then runs `check-host.py`. It refuses
+absent, `/etc/nanovm/{nanovm,proxy}.toml`, makes `/etc/nanovm/secrets` (step
+6), then runs `check-host.py`. It refuses
 to replace the binary while the node runs, and starts nothing. A release build
 has no `dev` feature: apps must be signed, and registries and egress must be on
 public addresses.
@@ -156,12 +157,31 @@ on public addresses.
 
 ## 6. App secrets
 
-Today an app's `env` and `config` travel in its published package: anyone who
-can pull the package can read them. Don't put secrets there.
+An app's `env` and `config` travel in its published package, which anyone can
+pull, so `nanovm publish` refuses a package that looks like it holds a secret.
+Its secrets come from you instead ([README, Secrets](../../README.md#secrets)):
 
-> **Placeholder (`beta/secrets`):** how the operator gives an app its secrets
-> without publishing them: where they are kept on the node, the config keys,
-> who can read them, and rotation. Filled in when `beta/secrets` is integrated.
+- **Where:** `secrets = "/etc/nanovm/secrets"` (the reference), a directory
+  only root may use: `install.sh` makes it `0700`; with any group or other
+  bits the node doesn't start.
+- **What:** one file per app, `<app>.json`, a JSON object of strings, with the
+  keys its `nanovm.json` declares in `"secrets"`: `{"client_secret": "…"}`.
+  `<app>` is the app's name on the node, as its `objects/<app>` directory is
+  named (README, Secrets, shows how to compute it); a request to an app whose
+  file is missing a declared key gets 502 naming the file it wants, never a
+  value. The developer tells you the keys; they read them with their config.
+- **Who reads them:** the supervisor, when it starts the app's worker, which
+  gets them on its stdin. Only that app's jailed worker has them; its uid
+  can't read the directory. The host masks the values in telemetry and in
+  error details (exact matches only, B-101).
+- **Rotation:** write the new file whole and rename it into place. The node
+  checks each running app's file every second: a change (even `touch`)
+  retires the worker, whose requests in flight finish, and the next request
+  starts one with the new values. Removing the file stops an app that
+  declares secrets.
+- **At rest** the files are plain text behind the directory's mode: keep the
+  disk encrypted, or decrypt into the directory at boot (a systemd
+  credential, `sops`/`age`). Back them up apart from the data directory.
 
 ## 7. Objects, the store and backups
 

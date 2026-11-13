@@ -2,8 +2,9 @@
 # Installs a node and proxy on this systemd host from a nanovm binary:
 #   sudo deploy/single-node/install.sh path/to/nanovm [--cgroup]
 # Copies the binary, the units, the sysctl drop-in and (only if absent) the
-# configs; with --cgroup also the cgroup drop-in. Refuses to replace the binary
-# under a running node (docs/ops/runbooks.md, Upgrade). Starts nothing.
+# configs, and makes the secrets directory; with --cgroup also the cgroup
+# drop-in. Refuses to replace the binary under a running node
+# (docs/ops/runbooks.md, Upgrade). Starts nothing.
 set -euo pipefail
 [ $# -ge 1 ] || { echo "usage: $0 <nanovm binary> [--cgroup]" >&2; exit 2; }
 bin=$1 cgroup=${2:-}
@@ -20,6 +21,8 @@ if [ -e /usr/local/bin/nanovm ]; then cp -p /usr/local/bin/nanovm /usr/local/bin
 install -m755 "$bin" /usr/local/bin/nanovm.new && mv /usr/local/bin/nanovm.new /usr/local/bin/nanovm
 install -m644 "$units/nanovm.service" "$units/nanovm-proxy.service" /etc/systemd/system/
 install -d /etc/nanovm
+# Apps' secrets (nanovm.toml's `secrets`): root's alone, or the node won't start.
+install -d -m700 /etc/nanovm/secrets
 for f in nanovm.toml proxy.toml; do
     if [ ! -e "/etc/nanovm/$f" ]; then install -m644 "$units/$f" /etc/nanovm/; else echo "kept /etc/nanovm/$f"; fi
 done
