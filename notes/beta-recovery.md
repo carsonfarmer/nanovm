@@ -60,8 +60,9 @@ Per object (`Supervisor::restore`, `ship::restore`):
    object's journal (its undo was for the old volume), swap the volume, mark the
    first staged version shipped, swap the versions directory, `syncfs`, remove
    the staging. Each step can be taken again.
-6. Release the lease, resume. The new version, if one was made, ships as any
-   other.
+6. Ship the version made, if one was (three tries), before letting the lease
+   go: with leases only a held lease lets it ship, and a failover before it
+   counts would restore the old head. Release the lease, resume.
 
 `ship::recover`, before the supervisor starts any worker, installs each staged
 restore that has `ready` and removes the others, then removes every pause.

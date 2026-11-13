@@ -483,7 +483,8 @@ directory under `objects/`). A restore:
    foreign version is refused and nothing changes), and rebuilds the volume beside
    the node's data, outside every worker's reach.
 4. replaces the object's volume, its journal (whose undo was for the old volume)
-   and its versions here, all at once, and resumes it.
+   and its versions here, all at once, ships the version it made (if any), and
+   resumes the object.
 
 **Going back makes a new version.** Restoring version 41 of an object whose head
 is 50 makes version 51, with 41's contents, after the head: the head only moves
