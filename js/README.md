@@ -35,7 +35,8 @@ and `randomUUID`; `env.kv` (`get`, `put`, `delete`, `list`; values are
 JSON) on the composed Spin key-value provider, committed with the response;
 outbound `fetch` under the app's egress policy (it rejects if the body
 breaks off before its end); `env.objects.get(id).fetch()`
-between objects; `env.config`, `env.id`, `env.publish(channel, message)`;
+between objects; `env.config` (the app's config and its
+[secrets](../README.md#secrets)), `env.id`, `env.publish(channel, message)`;
 `ctx.waitUntil` (its work runs after the answer and commits when done; if
 a promise rejects, the instance stops and that work's writes roll back,
 while the answer and the handler's own writes stand, as with Rust's

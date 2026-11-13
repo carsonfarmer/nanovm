@@ -5,7 +5,8 @@ about 140 lines of Rust ([src/lib.rs](src/lib.rs)) on
 [nanovm-sdk](../../sdk/rust).
 
 ```sh
-tools/build-app.sh examples/gateway -o examples/target/gateway.wasm --run --manifest examples/gateway/nanovm.json
+echo '{"upstream_key": "…"}' > ~/gateway-secrets.json
+tools/build-app.sh examples/gateway -o examples/target/gateway.wasm --run --manifest examples/gateway/nanovm.json --secrets ~/gateway-secrets.json
 ```
 
 ```sh
@@ -14,8 +15,9 @@ curl http://127.0.0.1:8080/ann/usage                                            
 ```
 
 Set `upstream` (a completion API that streams Server-Sent Events) in the
-manifest's config, its host in `egress`, and its key as `UPSTREAM_KEY` in
-`env`.
+manifest's config and its host in `egress`. Its key is the app's one secret
+(`upstream_key`, declared in the manifest's `secrets`): `--secrets` gives it
+locally, a node's operator on a node ([Secrets](../../README.md#secrets)).
 
 What it shows:
 
@@ -45,14 +47,16 @@ What it shows:
   other requests wait; other users are not held up. Long completions need a
   `post_return_timeout_ms` to match.
 
-The API key is in the manifest's `env`, which is published with the app;
-real secrets need a secret store (IDEAS G-78). The test runs this app on an
-in-process dev node with a mock API on loopback.
+The API key is never in the package. The tests run this app on an
+in-process dev node, and as an operator would (published without the key,
+which a supervised node gives its jailed worker), with a mock API on
+loopback.
 
 API: `POST /{user}/complete` `{"prompt"}` → `text/event-stream`, `429
 {"error":"quota","used","limit"}`, `502` if the upstream fails, `400`;
 `GET /{user}/usage` → `{"used","limit","day"}`.
 
-Tests: `gateway_streams_completions_within_quotas` and
-`review_gateway_counts_tokens_split_across_http_chunks` in
+Tests: `gateway_streams_completions_within_quotas`,
+`review_gateway_counts_tokens_split_across_http_chunks` and
+`oauth_and_gateway_get_their_keys_from_the_node` in
 [crates/nanovm/tests/examples.rs](../../crates/nanovm/tests/examples.rs).

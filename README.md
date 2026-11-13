@@ -293,7 +293,7 @@ The node trusts these headers because only the proxy can reach it, and strips th
 
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
-2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
+2. **Then the blobs.** The supervisor fetches the config blob (the app's limits, env, config and the names of the secrets it needs) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
 3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB head on the host: a header map, or a request's headers with the method, scheme, authority and path the guest set on it, which together may not pass 64 KiB; 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
@@ -308,7 +308,7 @@ What happens on the first request for a digest:
 
 **Uids.** An app's uid is the owner of its `objects/<app>` directory, or the next free one for a new app. It is stable across restarts, with no separate record.
 
-**Publishing.** `nanovm publish app.wasm <registry>/<repository>:<version> [--manifest nanovm.json]` pushes an app as nodes pull it: artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, the component as its one `application/wasm` layer, the tag as its version. It first checks the component as a node will (imports, handler export, manifest), and prints the digest, how to sign and the TXT record. Registry credentials come from `NANOVM_REGISTRY_USER`/`NANOVM_REGISTRY_TOKEN`. [.github/workflows/publish-app.yml](.github/workflows/publish-app.yml) is a manual template that builds one app, publishes it and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity; [publish-guests.yml](.github/workflows/publish-guests.yml) does the same for the test guests with `oras`. No key exists anywhere. A person can sign from a laptop with `cosign` and a browser sign-in (not yet tested end to end, W-102).
+**Publishing.** `nanovm publish app.wasm <registry>/<repository>:<version> [--manifest nanovm.json]` pushes an app as nodes pull it: artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, the component as its one `application/wasm` layer, the tag as its version. It first checks the component as a node will (imports, handler export, manifest) and that the manifest holds no [secret](#secrets), and prints the digest, how to sign and the TXT record. Registry credentials come from `NANOVM_REGISTRY_USER`/`NANOVM_REGISTRY_TOKEN`. [.github/workflows/publish-app.yml](.github/workflows/publish-app.yml) is a manual template that builds one app, publishes it and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity; [publish-guests.yml](.github/workflows/publish-guests.yml) does the same for the test guests with `oras`. No key exists anywhere. A person can sign from a laptop with `cosign` and a browser sign-in (not yet tested end to end, W-102).
 
 ## Key-value and config
 
@@ -388,7 +388,23 @@ acceptance, continued reader/writer/directory-stream use, exact entry-quota recl
 rejection and restart. Premature inode release fails it; restored code passes.
 This test-only follow-up does not change runtime LOC or the adoption gates.
 
-**`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
+**`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`, and the app's [secrets](#secrets) over it. Environment variables (`env`) still work alongside it.
+
+## Secrets
+
+A package is public (nodes pull it anonymously), so nothing in its `config` or `env` is secret. An app's secrets come from the node's operator instead, and never enter its package.
+
+- **The app declares them** in `nanovm.json`, `"secrets": ["client_secret"]`, and reads them with its config: `config::get("client_secret")` in Rust, `env.config.client_secret` in JavaScript. Config (`wasi:config/store`) rather than environment variables: JavaScript apps read only config, and programs tend to print their environment.
+- **The operator gives them** on each node: `secrets = "/etc/nanovm/secrets"` in the node's config names a directory only the user nanovm runs as may use (`chmod 700`; otherwise the node doesn't start). It holds each app's as `<app>.json`, a JSON object of strings: `{"client_secret": "…"}`. `<app>` is the app's name on the node ([Apps](#apps)), as its `data_dir/objects/<app>` directory is named: `<host>_<registry>_<repository>-` and the first 16 hex digits of the SHA-256 of `<host> <registry>/<repository>` (`printf '%s' 'example.com ghcr.io/org/app' | sha256sum | cut -c1-16`); a request to an app without a secret it declares says which file it wants. Write the file whole and rename it into place.
+- **When:** the supervisor reads an app's file when it starts the app's worker and hands the values over on the worker's stdin, never in its arguments or environment. It looks at each running app's file every second: a change (written, replaced, removed, even touched) retires the worker, whose requests in flight finish as in a version switch, and the next request starts one with the new values.
+- **Fail closed:** a secret the app declares and the file doesn't give, or a file that isn't one, can't be read or isn't a JSON object of strings, stops the app. Its requests get 502 naming the file and what is wrong with it, never what it holds, until the file is fixed.
+- **Only that app:** the values reach only its own jailed worker, whose uid can't read the directory and whose jail can't reach it. A secret overrides the package's config value of the same name.
+- **Not in what the host reports:** whatever the host passes on of what the guest wrote, it masks every secret value in first (with as many `*`): telemetry (the guest's stdout and stderr, the paths of its requests out, events) and the detail of a failed request sent to its client. The match is exact: a guest that encodes or splits its secret can still leak it, as it can over its egress.
+- **`nanovm publish` refuses** a manifest whose `config` or `env` holds a declared secret, a non-empty value under a key named like a credential (ending in `secret`, `password`, `token`, `apikey`, `credentials` and the like; not `token_url` or `max_tokens`), or a value shaped like one: a private key, a URL with a password, or a token with a well-known provider's prefix (`sk-`, `ghp_`, `AKIA`, `xoxb-` and others). It names the key, never the value.
+- **Locally,** `nanovm run app.wasm --secrets secrets.json` gives them as an operator would, and a change to the file restarts it. Keep the file out of version control.
+- **Several nodes** each read their own directory: give every node that may run the app its file.
+
+Tests: `secrets_reach_only_their_apps_worker`, `changed_or_bad_secrets_restart_or_stop_the_app` and `secrets_stay_out_of_telemetry_and_error_text` (integration, on jailed workers), `oauth_and_gateway_get_their_keys_from_the_node` (examples), `nanovm_run_takes_secrets_from_a_file`, `example_manifests_hold_no_secrets` and the publish refusals in `nanovm_publish_pushes_what_a_node_loads` (dev), and `secrets.rs`'s unit tests. Evidence: [notes/beta-secrets.md](notes/beta-secrets.md).
 
 ## Calls between objects
 
