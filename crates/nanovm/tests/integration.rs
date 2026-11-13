@@ -1725,6 +1725,38 @@ async fn worker_cpu_and_pids_limits_hold() {
     remove_cgroup(&root).await;
 }
 
+/// review2 (W1): at startup the supervisor is to remove the `worker-<n>`
+/// cgroups an earlier run left. It removes every empty directory under
+/// `cgroup` instead: a cgroup the operator made there (not yet holding a
+/// process, say one with limits of its own) goes, and with `cgroup` set by
+/// mistake to a directory that is no cgroup at all, so do its empty
+/// subdirectories.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_startup_removes_only_cgroups_it_made() {
+    let root = match test_cgroup("foreign", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let theirs = root.join("reserved");
+    std::fs::create_dir(&theirs).unwrap();
+    let plain = Path::new(env!("CARGO_TARGET_TMPDIR")).join("review2-not-a-cgroup");
+    let _ = std::fs::remove_dir_all(&plain);
+    std::fs::create_dir_all(plain.join("keep")).unwrap();
+    let mut removed = vec![];
+    for (dir, kept) in [(&root, &theirs), (&plain, &plain.join("keep"))] {
+        let mut cfg = node_cfg("review2_startup_removes_only_cgroups_it_made", 8);
+        cfg.cgroup = Some(dir.clone());
+        let (sup, _) = supervised_with(cfg).await;
+        if !kept.exists() {
+            removed.push(kept.clone());
+        }
+        drop(sup);
+    }
+    remove_cgroup(&root).await;
+    let _ = std::fs::remove_dir_all(&plain);
+    assert!(removed.is_empty(), "startup removed directories it did not make: {removed:?}");
+}
+
 /// An upstream that answers with headers and the start of a large body,
 /// then stalls, so each response body stays open. Returns its port.
 async fn stalling_upstream() -> u16 {
