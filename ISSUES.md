@@ -511,6 +511,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** from source (the arithmetic in `preflight`); the host here has 1,048,576 and is shared, so the default was not tried.
 - **Status:** fixed on `ideas/systemd-units` (README line and `deploy/systemd/90-nanovm.conf`); on round 3 with `beta/deployable`
 
+### B-601: round 3's workers show as `/proc/self/exe worker`, not `nanovm worker`
+- **Where:** `supervisor.rs` (`spawn`: `Command::new(&self.exe).arg("worker")`)
+- **Scenario:** found by `beta/deployable` merging `ideas/ops`. N-552 (37dd88e) spawned workers from `/proc/self/exe` with `arg0("nanovm")`, so `ps` and `pgrep -f "nanovm worker"` kept showing them as before. The spare-worker port (091c810, N-224/N-225) rewrote the spawn without the `arg0`: on round 3 a worker's command line is `/proc/self/exe worker`, so ops' own checks (`deploy/systemd/test/in-container.sh`, `deploy/container/test/local.sh`) and an operator's `pgrep -f "nanovm worker"` find no worker.
+- **Reproduced:** yes: `supervised_workers_contain_attacks` now reads each worker's `/proc/<pid>/cmdline`; without the fix it is the binary's path and `worker`, not `nanovm\0worker`.
+- **Fix:** `arg0("nanovm")` again (the same line; 0 runtime lines).
+- **Status:** fixed on `beta/deployable`
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

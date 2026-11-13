@@ -574,7 +574,7 @@ impl Supervisor {
         let procs = procs.with_context(|| format!("spawning {}{into}", self.exe.display()))?;
         let c = procs.as_ref().map_or(-1, |f| f.as_raw_fd());
         let mut cmd = Command::new(&self.exe);
-        cmd.arg("worker")
+        cmd.arg0("nanovm").arg("worker")
             .env_clear()
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())

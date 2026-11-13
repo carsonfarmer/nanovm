@@ -1201,6 +1201,8 @@ async fn supervised_workers_contain_attacks() {
         };
         assert_eq!(field("Seccomp:"), "2", "{app}");
         assert_eq!(field("NoNewPrivs:"), "1", "{app}");
+        // Shown as `nanovm worker`, though spawned from /proc/self/exe (N-552).
+        assert_eq!(std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap(), "nanovm\0worker\0", "{app}");
         if unsafe { libc::geteuid() } == 0 {
             let uid: u32 = field("Uid:").parse().unwrap();
             assert!(uid >= 200_000, "{app} runs as uid {uid}");
