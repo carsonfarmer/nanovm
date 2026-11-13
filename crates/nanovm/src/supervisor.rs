@@ -51,6 +51,10 @@ pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// A worker that failed to start is not retried for this long.
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
+/// How long a worker asked to stop has to flush its telemetry and exit,
+/// past the time its objects may take to finish their work after their
+/// answers (`post_return_timeout_ms`), before it is killed (see `drain`).
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Compiling a large component on first start can take a while.
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// The longest line of a worker's stderr passed on whole.
@@ -97,6 +101,9 @@ pub struct Supervisor {
     pub gate: Arc<crate::gate::Gate>,
     /// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`).
     cgroup: Option<PathBuf>,
+    /// Held open: the cgroup its workers run under is its alone (see
+    /// [`Cgroup::take`]).
+    _cgroup_held: Option<std::fs::File>,
 }
 
 #[derive(Default)]
@@ -137,8 +144,9 @@ struct Live {
     drain: Duration,
     /// Its slot among `max_apps`, passed on to the worker that replaces it.
     slot: Mutex<Option<OwnedSemaphorePermit>>,
-    /// Sending true or dropping this kills the worker. Closure acknowledges
-    /// actual process exit, not just receipt of the kill request.
+    /// Sending true gives the worker time to exit before it is killed (see
+    /// `drain`); dropping this kills it at once. Closure acknowledges
+    /// actual process exit, not just receipt of the request.
     kill: watch::Sender<bool>,
 }
 
@@ -166,10 +174,6 @@ impl Supervisor {
         let cgroup = cgroup(&cfg)?;
         // What deletes an earlier run cut short left.
         let _ = std::fs::remove_dir_all(cfg.data_dir.join("deleted"));
-        // Workers' cgroups that an earlier run left: the empty ones go.
-        for dir in cgroup.iter().flat_map(std::fs::read_dir).flatten().flatten() {
-            let _ = std::fs::remove_dir(dir.path());
-        }
         let sup = Arc::new(Supervisor {
             runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
@@ -188,6 +192,7 @@ impl Supervisor {
             gate: crate::gate::Gate::new(&cfg.clients)?,
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
             shipping: Arc::default(),
+            _cgroup_held: cgroup.as_deref().map(Cgroup::take).transpose()?,
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
@@ -501,11 +506,15 @@ impl Supervisor {
         // after it, also when this start fails.
         let (kill, mut killed) = watch::channel(false);
         let (name, dir) = (w.name.clone(), cgroup.as_ref().map(|c| c.0.clone()));
+        let stop = Duration::from_millis(app.limits.post_return_timeout_ms) + STOP_TIMEOUT;
         tokio::spawn(async move {
             tokio::select! {
                 status = child.wait() => eprintln!("nanovm: worker for app {name:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
-                _ = killed.changed() => {
-                    let _ = child.kill().await;
+                asked = killed.changed() => {
+                    // Asked to stop, it exits by itself; dropped, it is killed at once.
+                    if asked.is_err() || tokio::time::timeout(stop, child.wait()).await.is_err() {
+                        let _ = child.kill().await;
+                    }
                 }
             }
             drop(cgroup);
@@ -628,8 +637,8 @@ impl Supervisor {
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
         let cgroup = self.cgroup.as_deref().map(Cgroup::new).transpose()?;
         let into = cgroup.as_ref().map(|c| format!(" into {}", c.0.display())).unwrap_or_default();
-        let procs = cgroup.as_ref().map(|c| std::fs::OpenOptions::new().write(true).open(c.0.join("cgroup.procs"))).transpose();
-        let procs = procs.with_context(|| format!("spawning {}{into}", self.exe.display()))?;
+        let procs = cgroup.as_ref().map(|c| c.0.join("cgroup.procs"));
+        let procs = procs.map(|p| std::fs::OpenOptions::new().write(true).open(&p).with_context(|| format!("opening {}", p.display()))).transpose()?;
         let c = procs.as_ref().map_or(-1, |f| f.as_raw_fd());
         let mut cmd = Command::new(&self.exe);
         cmd.arg("worker")
@@ -700,6 +709,21 @@ struct Spawned {
 struct Cgroup(PathBuf);
 
 impl Cgroup {
+    /// Takes `root` (a cgroup v2 directory no other supervisor holds) for
+    /// this one's workers while the returned file is open, and removes
+    /// the `worker-<n>` cgroups an earlier run left there, with whatever
+    /// of that run still runs in them.
+    fn take(root: &Path) -> anyhow::Result<std::fs::File> {
+        let held = std::fs::File::open(root).with_context(|| format!("cgroup {}", root.display()))?;
+        let v2 = rustix::fs::fstatfs(&held)?.f_type as i64 == libc::CGROUP2_SUPER_MAGIC as i64;
+        anyhow::ensure!(v2, "cgroup {} is not a cgroup v2 directory", root.display());
+        held.try_lock().with_context(|| format!("another node runs its workers in cgroup {}", root.display()))?;
+        let ours = |n: &str| n.strip_prefix("worker-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let left = std::fs::read_dir(root)?.flatten().filter(|e| e.file_name().to_str().is_some_and(ours));
+        left.for_each(|e| drop(Cgroup(e.path())));
+        Ok(held)
+    }
+
     fn new(root: &Path) -> anyhow::Result<Cgroup> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
@@ -715,7 +739,19 @@ impl Cgroup {
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.0);
+        // Its worker has been reaped, unless it was dropped without (its
+        // supervisor gone, a failed spawn) or is an earlier run's: then
+        // what is left in it is killed, and the cgroup goes once empty.
+        let busy = |dir: &Path| std::fs::remove_dir(dir).is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+        if busy(&self.0) {
+            let _ = std::fs::write(self.0.join("cgroup.kill"), "1");
+            let (dir, since) = (std::mem::take(&mut self.0), Instant::now());
+            std::thread::spawn(move || {
+                while busy(&dir) && since.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }
     }
 }
 
@@ -739,13 +775,17 @@ async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<Re
 
 /// Waits until nothing holds `old` but this (its requests have finished and
 /// their bodies have been read), or its longest request has had its time,
-/// then kills the process and waits for it to be gone: what still holds it
-/// can't keep it running beside the next version.
+/// then asks the worker to stop and waits for it to be gone: what still
+/// holds it can't keep it running beside the next version. Hung up on, a
+/// worker lets its objects finish their work after their answers, flushes
+/// its telemetry and exits (see `worker_main`); one that takes longer than
+/// that work may, and `STOP_TIMEOUT` more, is killed.
 async fn drain(old: Arc<Live>) {
     let deadline = Instant::now() + old.drain;
     while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    old.link.hang_up();
     old.kill.send_replace(true);
     old.kill.closed().await;
 }
@@ -926,6 +966,10 @@ fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
         std::fs::write(dir.join(file), &value).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
     };
     if w.memory_mb > 0 {
+        // A limit below what the worker holds already (its engine) would OOM-kill it.
+        let held = std::fs::read_to_string(dir.join("memory.current")).ok().and_then(|m| m.trim().parse::<u64>().ok());
+        let held = held.unwrap_or_default().div_ceil(1 << 20);
+        anyhow::ensure!(held < w.memory_mb, "[worker] memory_mb = {} is below the {held} MiB a worker holds before it has an app", w.memory_mb);
         set("memory.max", (w.memory_mb << 20).to_string())?;
     }
     if w.cpus > 0.0 {
@@ -938,7 +982,9 @@ fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
 }
 
 /// `nanovm worker`: reads its spec and component from stdin, jails itself,
-/// then serves its app to the supervisor until the supervisor hangs up.
+/// then serves its app to the supervisor until the supervisor hangs up, and
+/// lets its objects finish their work and flushes its telemetry before it
+/// exits.
 pub fn worker_main() -> anyhow::Result<()> {
     use std::io::BufRead;
     let mut input = std::io::stdin().lock();
@@ -976,8 +1022,10 @@ pub fn worker_main() -> anyhow::Result<()> {
         // Pool 0 for the runtime's threads, 1 for the telemetry export thread.
         let upstream = Dialer::new(upstream, 2);
         let node = Node::with_engine(engine, &linker, cfg, &app, Wasm::File(wasm, &digest), Some(upstream))?;
-        let requests = tokio::net::UnixStream::from_std(requests)?;
-        link::serve(requests, vec![], move |req| crate::server::handle(node.clone(), req)).await
+        let (requests, serving) = (tokio::net::UnixStream::from_std(requests)?, node.clone());
+        link::serve(requests, vec![], move |req| crate::server::handle(serving.clone(), req)).await?;
+        node.shutdown().await;
+        tokio::task::spawn_blocking(move || node.telemetry.flush()).await?
     })
 }
 

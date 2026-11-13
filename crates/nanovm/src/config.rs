@@ -96,9 +96,9 @@ config! {
         /// Where workers run, each in a cgroup v2 of its own with the
         /// `[worker]` limits: `"auto"` makes the supervisor's own cgroup a
         /// subtree for them (systemd: `Delegate=yes`) and refuses to start
-        /// where it can't; a directory names a delegated one, with the cpu,
-        /// memory and pids controllers enabled for its children; `"off"` runs
-        /// workers without those limits.
+        /// where it can't; a directory names a delegated one, used by this
+        /// node alone, with the cpu, memory and pids controllers enabled for
+        /// its children; `"off"` runs workers without those limits.
         cgroup: String = "auto",
         /// What clients may ask of `listen` when they reach it directly.
         clients: ClientLimits = ClientLimits::default(),
