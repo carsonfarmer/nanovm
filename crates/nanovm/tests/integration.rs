@@ -1725,6 +1725,73 @@ async fn worker_cpu_and_pids_limits_hold() {
     remove_cgroup(&root).await;
 }
 
+/// review2 (W1): at startup the supervisor is to remove the `worker-<n>`
+/// cgroups an earlier run left. It removes every empty directory under
+/// `cgroup` instead: a cgroup the operator made there (not yet holding a
+/// process, say one with limits of its own) goes, and with `cgroup` set by
+/// mistake to a directory that is no cgroup at all, so do its empty
+/// subdirectories.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_startup_removes_only_cgroups_it_made() {
+    let root = match test_cgroup("foreign", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let theirs = root.join("reserved");
+    std::fs::create_dir(&theirs).unwrap();
+    let plain = Path::new(env!("CARGO_TARGET_TMPDIR")).join("review2-not-a-cgroup");
+    let _ = std::fs::remove_dir_all(&plain);
+    std::fs::create_dir_all(plain.join("keep")).unwrap();
+    let mut removed = vec![];
+    for (dir, kept) in [(&root, &theirs), (&plain, &plain.join("keep"))] {
+        let mut cfg = node_cfg("review2_startup_removes_only_cgroups_it_made", 8);
+        cfg.cgroup = Some(dir.clone());
+        let (sup, _) = supervised_with(cfg).await;
+        if !kept.exists() {
+            removed.push(kept.clone());
+        }
+        drop(sup);
+    }
+    remove_cgroup(&root).await;
+    let _ = std::fs::remove_dir_all(&plain);
+    assert!(removed.is_empty(), "startup removed directories it did not make: {removed:?}");
+}
+
+/// review2 (W2): a jailed worker is the only owner of an export runtime,
+/// and it never drops its telemetry: retiring it (a switch to another
+/// version here) kills it outright, without asking it to flush first. What
+/// it recorded since its last export (up to 1 s), here an egress-denied
+/// event, never reaches the collector.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_a_retired_workers_last_telemetry_reaches_the_collector() {
+    let (_sup, addr) = supervised("review2_retired_worker_telemetry").await;
+    let seen = |name: String| captures().lock()[&addr].1.lock().logs.iter().any(|log| log["app"] == name.as_str() && log["kind"] == "egress-denied");
+    // Control: a live worker's event arrives.
+    let live = publish("hostile", &app("hostile")).await;
+    let (_, body) = app_get(addr, &live, "/s/fetch?url=http://169.254.169.254/").await;
+    assert!(body.contains("HttpRequestDenied"), "{body}");
+    stats_json(addr).await;
+    assert!(seen(worker(&live)), "a live worker's egress-denied event is exported");
+    let mut lost = vec![];
+    for round in 0..3 {
+        let repo = format!("review2-retired-{round}");
+        let v1 = publish_version(&repo, &app("hostile"), guest("hostile"), "1.0.0").await;
+        let mut next = app("hostile");
+        next.env.insert("NEXT".into(), "1".into());
+        let v2 = publish_version(&repo, &next, guest("hostile"), "1.0.1").await;
+        assert_ne!(v1, v2);
+        let (_, body) = app_get(addr, &v1, "/s/fetch?url=http://169.254.169.254/").await;
+        assert!(body.contains("HttpRequestDenied"), "{body}");
+        // v1's worker has nothing in flight: it is killed at once.
+        assert_eq!(app_get(addr, &v2, "/x/").await.0, 200);
+        stats_json(addr).await;
+        if !seen(worker(&v1)) {
+            lost.push(round);
+        }
+    }
+    assert!(lost.is_empty(), "rounds whose egress-denied event a retired worker never exported: {lost:?}");
+}
+
 /// An upstream that answers with headers and the start of a large body,
 /// then stalls, so each response body stays open. Returns its port.
 async fn stalling_upstream() -> u16 {
