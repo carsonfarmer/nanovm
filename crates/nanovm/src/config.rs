@@ -67,8 +67,8 @@ config! {
         /// gid `jail_uid_base + i`.
         jail_uid_base: u32 = 200_000u32,
         /// A delegated cgroup v2 directory, with the memory, cpu and pids
-        /// controllers enabled for its children. Each worker is placed in
-        /// `<cgroup>/<app>` with that app's `[app.worker]` limits.
+        /// controllers enabled for its children. Each worker runs in a
+        /// cgroup of its own under it, with its app's `[app.worker]` limits.
         cgroup: Option<PathBuf> = None::<PathBuf>,
         /// The most an app gets: each of its limits is clamped to these.
         /// Egress entries are the app's own.

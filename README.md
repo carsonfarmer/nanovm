@@ -229,7 +229,7 @@ A worker reads its config and component from stdin, then jails itself while it s
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
-- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker goes into `<cgroup>/<app>` with the node's `[worker]` memory, CPU and pids limits, before it is given anything.
+- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker runs in a cgroup of its own, `<cgroup>/worker-<n>`, which it enters before it runs and which is removed once it has exited. Its app's `[worker]` memory, CPU and pids limits are set on it before the worker is given the app, and they cover the whole process: also the engine a worker builds before it has an app (about 2 KiB a slot of `max_live_objects`, half of it kernel memory for the stacks' mappings: 19 MiB in all at 8,192 slots), since memory stays charged to the cgroup a process was in when it allocated it.
 
 Mount and network namespaces were left out on purpose: Landlock already confines the filesystem, and with no `socket()` there is no network to remove.
 
