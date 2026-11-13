@@ -63,7 +63,8 @@ fn publish(wasm: &str, target: &str, flags: &[String]) -> anyhow::Result<()> {
         [] => std::fs::read("nanovm.json").unwrap_or_else(|_| b"{}".into()),
         _ => bail!("usage: {PUBLISH}"),
     };
-    serde_json::from_slice::<nanovm::registry::AppSpec>(&spec).context("the manifest")?;
+    let manifest: nanovm::registry::AppSpec = serde_json::from_slice(&spec).context("the manifest")?;
+    nanovm::secrets::check_package(&manifest).context("the manifest")?;
     let r: oci_spec::distribution::Reference =
         target.parse().with_context(|| format!("{target} is not <registry>/<repository>:<version>"))?;
     let version = r.tag().and_then(|t| semver::Version::parse(t).ok());
@@ -94,17 +95,19 @@ fn publish(wasm: &str, target: &str, flags: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-const RUN: &str = "nanovm run <app.wasm> [--manifest ./nanovm.json] [--listen 127.0.0.1:8080] [--data nanovm-data]";
+const RUN: &str = "nanovm run <app.wasm> [--manifest ./nanovm.json] [--secrets <secrets.json>] [--listen 127.0.0.1:8080] [--data nanovm-data]";
 
 /// `nanovm run`: one app in this process, for local development. With no
 /// registry, signatures or jail, it listens on loopback only. It serves
 /// `/{object}/…` as a node does, holds WebSockets as the proxy does, prints
-/// a line per request, and restarts when the component changes.
+/// a line per request, and restarts when the component or its secrets
+/// (a file as a node's operator gives them) change.
 fn run(wasm: &str, flags: &[String]) -> anyhow::Result<()> {
-    let (mut cfg, mut manifest) = (NodeConfig::default(), std::fs::read("nanovm.json").ok());
+    let (mut cfg, mut manifest, mut secrets) = (NodeConfig::default(), std::fs::read("nanovm.json").ok(), None);
     for flag in flags.chunks(2) {
         match flag {
             [k, v] if k == "--manifest" => manifest = Some(std::fs::read(v).with_context(|| format!("reading {v}"))?),
+            [k, v] if k == "--secrets" => secrets = Some(PathBuf::from(v)),
             [k, v] if k == "--listen" => cfg.listen = v.clone(),
             [k, v] if k == "--data" => cfg.data_dir = v.into(),
             _ => bail!("usage: {RUN}"),
@@ -122,7 +125,9 @@ fn run(wasm: &str, flags: &[String]) -> anyhow::Result<()> {
             eprintln!("nanovm: the manifest's {k} is {a}; nanovm run allows at most {m}, so it is {m} here");
         }
     }
-    let app = AppConfig { name: name.into(), digest: "run".into(), env: spec.env, config: spec.config, limits, worker: Default::default() };
+    let watched = secrets.clone();
+    let secrets = nanovm::secrets::load(secrets.as_deref(), &spec.secrets).context("--secrets <secrets.json>")?;
+    let app = AppConfig { name: name.into(), digest: "run".into(), env: spec.env, config: spec.config, secrets, limits, worker: Default::default() };
     let bytes = std::fs::read(wasm).with_context(|| format!("reading {wasm}"))?;
     nanovm::engine::preflight(&cfg)?;
     tokio::runtime::Runtime::new()?.block_on(async {
@@ -132,7 +137,7 @@ fn run(wasm: &str, flags: &[String]) -> anyhow::Result<()> {
         let node = Node::new(cfg, &app, &bytes, None).map_err(compose_hint)?;
         let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("binding {addr}"))?;
         eprintln!("nanovm: {name} on http://{}/<object>/ with data in {}", listener.local_addr()?, node.cfg.data_dir.display());
-        tokio::spawn(restart_on_change(PathBuf::from(wasm)));
+        tokio::spawn(restart_on_change([Some(PathBuf::from(wasm)), watched].into_iter().flatten().collect()));
         nanovm::server::serve_http1(listener, move |req| local(node.clone(), req)).await
     })
 }
@@ -199,17 +204,18 @@ async fn print(req: http::Request<hyper::body::Incoming>) -> http::Response<Resp
     http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync())
 }
 
-/// Runs this command afresh once `wasm` has changed and settled. Requests in
-/// flight end as in a crash, so their changes roll back; sockets close.
-async fn restart_on_change(wasm: PathBuf) {
+/// Runs this command afresh once one of `files` has changed and settled.
+/// Requests in flight end as in a crash, so their changes roll back; sockets
+/// close.
+async fn restart_on_change(files: Vec<PathBuf>) {
     use std::os::unix::process::CommandExt;
-    let stamp = || std::fs::metadata(&wasm).and_then(|m| m.modified()).ok();
+    let stamp = || files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect::<Vec<_>>();
     let (first, mut last) = (stamp(), stamp());
     loop {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let now = stamp();
-        if now.is_some() && now != first && now == last {
-            eprintln!("nanovm: {} changed; restarting", wasm.display());
+        if let Some(i) = (0..files.len()).find(|&i| now[i].is_some() && now[i] != first[i] && now == last) {
+            eprintln!("nanovm: {} changed; restarting", files[i].display());
             let exe = std::env::current_exe().unwrap_or_else(|_| "nanovm".into());
             let e = std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec();
             eprintln!("nanovm: restarting: {e}");

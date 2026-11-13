@@ -893,7 +893,7 @@ mod tests {
                 crate::server::ok_json(serde_json::json!({}))
             }
         }));
-        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&endpoint, "app", "digest", None).unwrap());
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&endpoint, "app", "digest", None, &Default::default()).unwrap());
         let (g, metrics) = guard(0, 0);
         metrics.telemetry.set(Arc::downgrade(&telemetry)).unwrap();
         for _ in 0..2000 {

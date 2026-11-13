@@ -105,7 +105,7 @@ impl Node {
         upstream: Option<Upstream>,
     ) -> anyhow::Result<Arc<Node>> {
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
-        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone(), &app.secrets)?);
         let leases = upstream.clone().filter(|_| !cfg.leases.is_empty()).map(crate::lease::Worker::new);
         anyhow::ensure!(leases.is_some() == !cfg.leases.is_empty(), "leases are taken through a supervisor");
         // Without a supervisor, which ships for its workers, a node ships its own.

@@ -53,6 +53,7 @@ fn app(name: &str) -> AppConfig {
         digest: "test".into(),
         env: Default::default(),
         config: Default::default(),
+        secrets: Default::default(),
         limits: serde_json::from_value(limits).unwrap(),
         worker: Default::default(),
     }
@@ -1108,6 +1109,11 @@ async fn publish_wasm(repo: &str, app: &AppConfig, wasm: Vec<u8>) -> String {
 
 async fn publish_version(repo: &str, app: &AppConfig, wasm: Vec<u8>, version: &str) -> String {
     let spec = serde_json::json!({ "limits": app.limits, "env": app.env, "config": app.config });
+    publish_spec(repo, spec, wasm, version).await
+}
+
+/// Publishes `wasm` with the manifest `spec` (its config blob).
+async fn publish_spec(repo: &str, spec: serde_json::Value, wasm: Vec<u8>, version: &str) -> String {
     let r = format!("{}/nanovm/{repo}:latest", registry()).parse().unwrap();
     let oci = nanovm::registry::Oci::new(true).unwrap();
     let version = version.parse().unwrap();
@@ -3032,6 +3038,184 @@ async fn only_well_formed_publishes_are_held() {
         let r = get(&node, "p", &format!("/fetch?method=POST&url={url}")).await;
         assert_eq!(r.json()["status"], status, "{url}: {}", r.body);
     }
+}
+
+// ---- Secrets ---------------------------------------------------------------
+
+/// A secrets directory for `test` that only this user can use, outside the
+/// node's data directory, as an operator keeps one.
+fn secrets_dir(test: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("secrets").join(test);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
+/// Gives the app named `name` on the node `secrets`, as an operator should:
+/// a new file renamed into place.
+fn give(dir: &Path, name: &str, secrets: &str) {
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, secrets).unwrap();
+    std::fs::rename(tmp, dir.join(format!("{name}.json"))).unwrap();
+}
+
+/// The counter guest's manifest, needing the secrets `needs`.
+fn needing(needs: &[&str]) -> serde_json::Value {
+    serde_json::json!({ "limits": app("counter").limits, "secrets": needs })
+}
+
+/// Polls `GET path` on `app` until `done` holds of its answer, for up to 10 s.
+async fn until(addr: std::net::SocketAddr, app: &str, path: &str, done: impl Fn(u16, &str) -> bool) -> (u16, String) {
+    let t0 = Instant::now();
+    loop {
+        let (status, body) = app_get(addr, app, path).await;
+        if done(status, &body) {
+            return (status, body);
+        }
+        assert!(t0.elapsed() < Duration::from_secs(10), "still {status} {body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// An app's secrets reach its own jailed worker, which reads them with its
+/// config (`wasi:config`), and no other app: not through its config, not
+/// through the file (the directory is root's alone, and a worker runs as a
+/// uid of its own), and not through the worker's arguments or environment,
+/// which other processes may read.
+#[tokio::test(flavor = "multi_thread")]
+async fn secrets_reach_only_their_apps_worker() {
+    let test = "secrets_reach_only_their_apps_worker";
+    let (mut cfg, dir) = (node_cfg(test, 8), secrets_dir(test));
+    cfg.secrets = Some(dir.clone());
+    let (_sup, addr) = supervised_with(cfg).await;
+    let a = publish_spec("secret-a", needing(&["api_key"]), guest("counter"), "1.0.0").await;
+    let b = publish_spec("secret-b", needing(&[]), guest("counter"), "1.0.0").await;
+    let key = "sk-a-0123456789abcdef";
+    give(&dir, &worker(&a), &format!(r#"{{"api_key": "{key}", "greeting": "from the operator"}}"#));
+    assert_eq!(app_get(addr, &a, "/x/config/api_key").await, (200, key.into()));
+    assert_eq!(app_get(addr, &b, "/x/config/api_key").await.0, 404, "another app's secret");
+    // b's own, once it has one: b's worker restarts with it, and a's keeps its.
+    give(&dir, &worker(&b), r#"{"api_key": "b's own"}"#);
+    until(addr, &b, "/x/config/api_key", |s, body| (s, body) == (200, "b's own")).await;
+    assert_eq!(app_get(addr, &a, "/x/config/api_key").await, (200, key.into()));
+
+    let pid = stats_json(addr).await["workers"][worker(&a).as_str()]["pid"].as_u64().unwrap();
+    for file in ["cmdline", "environ"] {
+        let seen = std::fs::read(format!("/proc/{pid}/{file}")).unwrap();
+        assert!(!seen.windows(key.len()).any(|w| w == key.as_bytes()), "the worker's {file} holds the secret");
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::{fs::MetadataExt, process::CommandExt};
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let uid: u32 = status.lines().find_map(|l| l.strip_prefix("Uid:")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        assert!(uid >= 200_000, "the worker runs as uid {uid}");
+        // Its uid can't read the file (nor can its jail reach the directory).
+        let read = std::process::Command::new("cat").arg(dir.join(format!("{}.json", worker(&a)))).uid(uid).gid(uid).output().unwrap();
+        assert!(!read.status.success() && read.stdout.is_empty(), "uid {uid} read the secrets file");
+        // It is not dumpable: no core dump holds its secrets, and no
+        // process of its uid may trace it or read its memory.
+        for file in ["environ", "mem"] {
+            assert_eq!(std::fs::metadata(format!("/proc/{pid}/{file}")).unwrap().uid(), 0, "{file}: the worker is dumpable");
+        }
+    }
+}
+
+/// A change to an app's secrets restarts its worker with them. A file the
+/// node can't use stops the app (fail closed): its requests get 502 naming
+/// the file and what is wrong, never what the file holds. So does a
+/// missing secret the app needs. A secrets directory others can use stops
+/// the node from starting.
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_or_bad_secrets_restart_or_stop_the_app() {
+    use std::os::unix::fs::PermissionsExt;
+    let test = "changed_or_bad_secrets_restart_or_stop_the_app";
+    let (mut cfg, dir) = (node_cfg(test, 8), secrets_dir(test));
+    cfg.secrets = Some(dir.clone());
+    let (_sup, addr) = supervised_with(cfg.clone()).await;
+    let a = publish_spec("secret-change", needing(&["api_key"]), guest("counter"), "1.0.0").await;
+    let name = worker(&a);
+    let (status, body) = app_get(addr, &a, "/x/config/api_key").await;
+    assert_eq!(status, 502, "{body}");
+    assert!(body.contains(&format!("the app's secrets, from the node's secrets directory: the app needs secrets api_key; {name}.json doesn't give them")), "{body}");
+
+    give(&dir, &name, r#"{"api_key": "one"}"#);
+    until(addr, &a, "/x/config/api_key", |s, body| (s, body) == (200, "one")).await;
+    let pid = |v: serde_json::Value| v["workers"][name.as_str()]["pid"].as_u64().unwrap();
+    let first = pid(stats_json(addr).await);
+    give(&dir, &name, r#"{"api_key": "two"}"#);
+    until(addr, &a, "/x/config/api_key", |s, body| (s, body) == (200, "two")).await;
+    assert_ne!(pid(stats_json(addr).await), first, "a new worker");
+
+    // serde_json alone would say `invalid type: integer `4242…``.
+    give(&dir, &name, r#"{"api_key": 4242424242424242}"#);
+    let (_, body) = until(addr, &a, "/x/config/api_key", |s, _| s == 502).await;
+    assert!(body.contains(&format!("{name}.json is not a JSON object of strings (line 1, column")) && !body.contains("4242"), "{body}");
+    std::fs::remove_file(dir.join(format!("{name}.json"))).unwrap();
+    std::fs::create_dir(dir.join(format!("{name}.json"))).unwrap();
+    until(addr, &a, "/x/config/api_key", |s, body| s == 502 && body.contains(&format!("{name}.json is not a file"))).await;
+    std::fs::remove_dir(dir.join(format!("{name}.json"))).unwrap();
+    give(&dir, &name, r#"{"api_key": "three"}"#);
+    until(addr, &a, "/x/config/api_key", |s, body| (s, body) == (200, "three")).await;
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
+    let e = nanovm::supervisor::Supervisor::new(cfg, exe, 1, None).err().expect("a directory others can read");
+    assert!(e.to_string().contains("only its owner, the user nanovm runs as, may use it"), "{e:#}");
+}
+
+/// A guest that writes its secret to stdout and stderr, puts it in the path
+/// of a request out, and then fails with it in its error or its panic. The
+/// host reports all of that (the failure, with the guest's last output, to
+/// the client; the output, the request out and its refusal to telemetry),
+/// but masked: nothing the collector receives, and no answer, holds the
+/// secret.
+#[tokio::test(flavor = "multi_thread")]
+async fn secrets_stay_out_of_telemetry_and_error_text() {
+    use http_body_util::BodyExt;
+    let test = "secrets_stay_out_of_telemetry_and_error_text";
+    let (mut cfg, dir) = (node_cfg(test, 8), secrets_dir(test));
+    cfg.secrets = Some(dir.clone());
+    // Every batch the collector is sent, as sent.
+    let received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+    let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cfg.telemetry_endpoint = format!("http://{}", collector.local_addr().unwrap());
+    let r = received.clone();
+    tokio::spawn(nanovm::server::serve_http1(collector, move |req: http::Request<hyper::body::Incoming>| {
+        let r = r.clone();
+        async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            r.lock().extend(body);
+            http::Response::new(http_body_util::Full::new(bytes::Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+        }
+    }));
+    let (sup, addr) = supervised_with(cfg).await;
+    let leaky = serde_json::json!({ "limits": app("hostile").limits, "secrets": ["api_key"] });
+    let leaky = publish_spec("secret-leak", leaky, probe(), "1.0.0").await;
+    let key = "sk-leak-0123456789abcdef";
+    give(&dir, &worker(&leaky), &format!(r#"{{"api_key": "{key}"}}"#));
+    let masked = "*".repeat(key.len());
+
+    let (status, body) = app_get(addr, &leaky, "/x/leak?key=api_key").await;
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains(r#""error":"trap""#) && body.contains(&format!("panic {masked}")) && body.contains(&format!("stderr {masked}")), "{body}");
+    assert!(!body.contains(key), "{body}");
+    let (status, body) = app_get(addr, &leaky, "/y/leak?key=api_key&then=error").await;
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains(r#""error":"guest-error""#) && body.contains(&format!("error {masked}")) && !body.contains(key), "{body}");
+
+    let t0 = Instant::now();
+    while let Err(e) = sup.flush_telemetry().await {
+        assert!(t0.elapsed() < Duration::from_secs(2), "telemetry flush failed: {e:#}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let received = received.lock().clone();
+    let holds = |s: &str| received.windows(s.len()).any(|w| w == s.as_bytes());
+    for reported in [format!("/leak/{masked}"), format!("stdout {masked}"), format!("stderr {masked}"), format!("panic {masked}")] {
+        assert!(holds(&reported), "telemetry should report {reported:?}");
+    }
+    assert!(!holds(key), "telemetry holds the secret");
 }
 
 // ---- WebSockets ----------------------------------------------------------

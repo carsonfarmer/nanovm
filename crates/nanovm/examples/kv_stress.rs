@@ -238,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
         digest: "local-hostile".into(),
         env: Default::default(),
         config: Default::default(),
+        secrets: Default::default(),
         worker: Default::default(),
         limits: serde_json::from_value(json!({"memory_mb":64,"cpu_ms":60000,
             "request_timeout_ms":120000,"disk_mb":16,"max_files":12010,"max_resources":256}))?,

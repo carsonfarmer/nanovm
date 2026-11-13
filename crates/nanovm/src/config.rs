@@ -91,6 +91,9 @@ config! {
         /// are plain HTTP. Allowed only in a build with the `dev` feature and
         /// with a loopback `listen`.
         dev: bool = false,
+        /// A directory only this user can use, holding each app's secrets
+        /// as `<app>.json` (see `secrets`). None: apps get none.
+        secrets: Option<PathBuf> = None::<PathBuf>,
     }
 }
 
@@ -109,6 +112,9 @@ pub struct AppConfig {
     /// Values the guest reads through `wasi:config/store`.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// The operator's secrets for the app, read with (and over) `config`.
+    #[serde(default)]
+    pub secrets: crate::secrets::Secrets,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -241,9 +247,11 @@ impl NodeConfig {
         if let Some(capture) = cfg.capture.as_mut().filter(|_| leased && !said) {
             capture.remote_ack = true;
         }
-        // A relative data_dir is relative to the config file (joining keeps
-        // an absolute one as it is).
-        cfg.data_dir = path.parent().unwrap_or(Path::new(".")).join(&cfg.data_dir);
+        // A relative data_dir or secrets is relative to the config file
+        // (joining keeps an absolute one as it is).
+        let dir = path.parent().unwrap_or(Path::new("."));
+        cfg.data_dir = dir.join(&cfg.data_dir);
+        cfg.secrets = cfg.secrets.map(|s| dir.join(s));
         cfg.validate()?;
         Ok(cfg)
     }

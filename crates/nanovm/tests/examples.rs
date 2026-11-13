@@ -1205,6 +1205,7 @@ impl Local {
             digest: "local".into(),
             env: spec.env,
             config: spec.config,
+            secrets: Default::default(),
             limits: spec.limits,
             worker: Default::default(),
         };

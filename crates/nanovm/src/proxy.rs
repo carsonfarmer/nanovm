@@ -124,7 +124,7 @@ impl Proxy {
         connector.set_connect_timeout(Some(Duration::from_secs(1)));
         let node = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
         Ok(Arc::new(Proxy {
-            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_proxy", env!("CARGO_PKG_VERSION"), None)?),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_proxy", env!("CARGO_PKG_VERSION"), None, &Default::default())?),
             registry: Oci::new(cfg.dev)?,
             cfg: Arc::new(cfg),
             http: reqwest::Client::new(),

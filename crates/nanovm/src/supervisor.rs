@@ -125,6 +125,8 @@ struct Live {
     /// The app version it runs.
     digest: String,
     version: semver::Version,
+    /// Its secrets file as it was when they were read.
+    secrets: crate::secrets::Stamp,
     /// The policies that have accepted it.
     policies: Mutex<HashSet<Policy>>,
     /// How long its longest request may take, to bound a drain.
@@ -157,6 +159,7 @@ impl Supervisor {
         let ttl = Duration::from_millis(cfg.lease_ms);
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
+        cfg.secrets.as_deref().map(crate::secrets::check_dir).transpose()?;
         // Workers' cgroups that an earlier run left: the empty ones go.
         for dir in cfg.cgroup.iter().flat_map(std::fs::read_dir).flatten().flatten() {
             let _ = std::fs::remove_dir(dir.path());
@@ -174,7 +177,7 @@ impl Supervisor {
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
             uids: Arc::default(),
             relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
-            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None, &Default::default())?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
             cfg,
@@ -201,6 +204,21 @@ impl Supervisor {
                     }
                     drop(sup);
                     tokio::time::sleep(ttl / 4).await;
+                }
+            });
+        }
+        // A change to an app's secrets retires its worker: it drains, and
+        // the next request starts one with them.
+        if let Some(dir) = sup.cfg.secrets.clone() {
+            let weak = Arc::downgrade(&sup);
+            tokio::spawn(async move {
+                while let Some(sup) = weak.upgrade() {
+                    let live: Vec<_> = sup.workers.lock().values().filter_map(|w| Some((w.clone(), w.live()?))).collect();
+                    drop(sup);
+                    for (w, l) in live.into_iter().filter(|(w, l)| l.secrets != crate::secrets::stamp(&secrets_file(&dir, &w.name))) {
+                        tokio::spawn(retire(w, l));
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             });
         }
@@ -402,11 +420,15 @@ impl Supervisor {
     /// limits, hands it its app and component, and waits until it answers.
     async fn start(&self, w: &Worker, want: &AppRef) -> anyhow::Result<Arc<Live>> {
         let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
+        let file = self.cfg.secrets.as_ref().map(|dir| secrets_file(dir, &w.name));
+        let stamp = file.as_deref().and_then(crate::secrets::stamp);
+        let secrets = crate::secrets::load(file.as_deref(), &p.spec.secrets).context("the app's secrets, from the node's secrets directory")?;
         let app = AppConfig {
             name: w.name.clone(),
             digest: want.digest.clone(),
             env: p.spec.env,
             config: p.spec.config,
+            secrets,
             limits: p.spec.limits.clamped(&self.cfg.limits),
             worker: self.cfg.worker.clone(),
         };
@@ -535,6 +557,7 @@ impl Supervisor {
             pid,
             digest: want.digest.clone(),
             version: p.version,
+            secrets: stamp,
             policies: Mutex::new(HashSet::from([want.policy.clone()])),
             drain,
             slot: Mutex::new(Some(slot)),
@@ -690,6 +713,21 @@ async fn drain(old: Arc<Live>) {
     }
     old.kill.send_replace(true);
     old.kill.closed().await;
+}
+
+/// Drains `w`'s worker `l`, unless it has already gone; the next request
+/// starts another.
+async fn retire(w: Arc<Worker>, l: Arc<Live>) {
+    let _switching = w.starting.lock().await;
+    let old = w.live.lock().take_if(|live| Arc::ptr_eq(live, &l));
+    drop(l);
+    if let Some(old) = old {
+        drain(old).await;
+    }
+}
+
+fn secrets_file(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.json"))
 }
 
 /// Sends a worker's call to another object of its app on to the proxy, which

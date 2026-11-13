@@ -708,7 +708,7 @@ async fn serve(
                         });
                         (res, false)
                     }
-                    Err(code) => (error_response(500, "guest-error", &format!("{code:?}")), true),
+                    Err(code) => (error_response(500, "guest-error", &app.cfg.secrets.masked(format!("{code:?}"))), true),
                 };
                 pending.lock().as_mut().unwrap().phase("nanovm.commit.duration_ms");
                 shared.set_phase(Phase::PostReturn);
@@ -814,7 +814,7 @@ async fn serve(
         pending.span.set_status(opentelemetry::trace::Status::error(p.as_str()));
         if let Some(tx) = pending.reply.take() {
             let status = if *p == Poison::Timeout { 504 } else { 500 };
-            let response = error_response(status, p.as_str(), detail);
+            let response = error_response(status, p.as_str(), &app.cfg.secrets.masked(detail.clone()));
             crate::telemetry::response(&mut pending.span, &response);
             let _ = tx.send(response);
         } else {

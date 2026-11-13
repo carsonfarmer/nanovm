@@ -409,6 +409,7 @@ async fn nanovm_publish_pushes_what_a_node_loads() {
         digest: digest.into(),
         env: spec.env,
         config: spec.config,
+        secrets: Default::default(),
         limits: spec.limits,
         worker: Default::default(),
     };
