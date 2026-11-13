@@ -718,6 +718,48 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** a client whose request starts an app that fails to start gets the full error as its 502 detail, for example a registry error or a missing secret's name and file name. Secret values are never in it (B-100), but it tells the public about the node's setup. Pre-existing; found while choosing what the secrets errors say (they name the file, not the directory).
 - **Status:** open (owner: log the detail, answer clients with its first line)
 
+### B-400: anyone who points DNS at the proxy deploys (beta blocker, deploy)
+- **Where:** `proxy.rs` (`forward`, `lookup`), `config.rs` (`ProxyConfig`)
+- **Scenario:** the proxy served any host whose `_nanovm` TXT record parsed, and told the node to accept whatever identities that record trusted. The domain owner, not the operator, decided what ran on the node.
+- **Status:** fixed in d287d22: `hosts` (names and `*.name`) and `signers` (`<issuer> <subject>`, the subject exact or up to a final `*`) in `proxy.toml`, both empty by default. An unlisted host is 403 before any lookup; a record's `trust=` entries are cut to the signers before the node hears them; a record left with none is 403. Tests: `unlisted_hosts_are_refused_before_any_lookup`, `records_trust_only_the_operators_signers`, `the_proxy_routes_hosts_by_dns`. The empty default is an owner question (notes/beta-deploy.md).
+
+### B-401: the app alone chooses its egress; the operator can't cap it (beta blocker, deploy)
+- **Where:** `egress.rs` (`EgressPolicy`), `config.rs` (`Limits::clamped` kept the app's list), `supervisor.rs`, `app.rs`
+- **Scenario:** a signed manifest asking for `*.com` reached every `.com` host from the operator's IP: the node was an HTTP relay for any app.
+- **Status:** fixed in d287d22: the node's `limits.egress` is the operator's list, and a request must match both it and the app's (default empty: no egress). Private addresses stay refused in both. Tests: `the_operators_list_caps_the_apps`, `egress_is_capped_by_the_operator` (in process and through the supervisor). `nanovm run` takes the manifest's list as its cap.
+
+### B-402: made-up Host headers each cost a DNS-over-HTTPS lookup, and 10,000 wiped the route cache (beta blocker, deploy)
+- **Where:** `proxy.rs` (`Cache`)
+- **Scenario:** every new host cost a lookup; past 10,000 cached hosts the cache dropped every entry, live routes included, so a flood of random hosts both cost unbounded lookups and made every app look itself up again.
+- **Status:** fixed in d287d22: unlisted hosts never reach the cache (B-400); under a `*.name` entry, hosts with an app are kept apart (10,000) from the rest (no record, refused, failed, in flight: 1,000), and while 1,000 of the rest are fresh a new host is 503 rather than looked up. Test: `made_up_names_cost_bounded_lookups_and_keep_live_routes` (30,000 made-up names: at most 1,001 lookups; the live route isn't looked up again).
+
+### B-403: any domain could serve another's app, with its data, under its own origin (beta blocker, deploy)
+- **Where:** `proxy.rs` (`lookup`); W-15
+- **Scenario:** apps belong to the name their record is found at after CNAMEs (W-15), so `_nanovm.evil.com CNAME _nanovm.victim.com` served victim.com's app and data at evil.com: its users' sessions and cookies at an origin evil.com controls, which it can point elsewhere at any time.
+- **Status:** fixed in d287d22: an alias is served only if the owner's record lists it (`alias=<host>`); W-15's shared app stays for aliases that consent. Test: `aliases_need_the_owners_consent`, and `the_proxy_routes_hosts_by_dns` end to end.
+
+### B-404: a resolver failure read as "no record"
+- **Where:** `proxy.rs` (`lookup`)
+- **Scenario:** a DNS-over-HTTPS answer with status SERVFAIL (or any status) and no records was a 404, remembered 30 s: a resolver outage looked like every app being removed.
+- **Status:** fixed in d287d22: only NOERROR and NXDOMAIN answer; anything else is a failure (502, then B-405). Test: `a_failing_resolver_is_not_an_answer`.
+
+### B-405: a registry or DNS-over-HTTPS outage takes every app down within 30 s (deploy)
+- **Where:** `proxy.rs` (`Cache`)
+- **Scenario:** routes last their TTL and digests `tag_ttl_s` (30 s); once one ran out, a failed lookup was the answer (502) for every request.
+- **Status:** fixed in 185f832: a found route or digest stands in for failures to look it up again (or a lookup taking over 5 s) for up to a day past its TTL, asked again every 30 s (RFC 8767's serve-stale). A host or tag never found fails as before. Tests: `found_answers_outlast_an_outage_for_a_while`, `a_resolver_outage_keeps_the_last_route`. Not covered: a proxy restarted during an outage has nothing to serve (the cache is in memory); B-406.
+
+### B-406: a worker start fetches the manifest and signatures again, so a registry outage stops any app whose worker restarts (deploy)
+- **Where:** `registry.rs` (`load`, `verify`), `supervisor.rs` (`start`)
+- **Scenario:** a worker retired as idle or least recently used, or one that crashed, starts again through `Registry::load`, which fetches the manifest and the signatures from the registry every time, by design ("whether a signature exists is the registry's current answer"). During a registry outage that app is down until the registry is back, whatever the proxy serves.
+- **Proposal:** keep the manifest and each accepted `(digest, policy)` on disk next to the blob cache once verified, and fall back to them when the registry fails (not when it answers "no signatures"), for as long as the proxy serves stale (B-405). It changes the registry's trust rule, so it is the owner's call.
+- **Status:** open
+
+### B-407: the TLS terminator lists the hosts again
+- **Where:** `deploy/single-node/Caddyfile` (on `ideas/single-node`)
+- **Scenario:** Caddy issues certificates only for the hosts listed in its Caddyfile, so an operator keeps the same list twice (Caddyfile and `hosts`); Caddy's on-demand TLS needs an `ask` endpoint, which nanovm doesn't provide.
+- **Proposal:** the proxy's private listener answers `GET /ask?domain=<host>` with 200 when `hosts` matches it, so Caddy's `on_demand_tls { ask … }` can use one list.
+- **Status:** open
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -833,7 +875,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-15: key apps by the DNS name that owns their record (owner decided 2026-10-30)
 - **What:** today an app is keyed by the request's host and repository, so `example.com` and `www.example.com` are two apps with separate data. Key it instead by the name whose `_nanovm` TXT record was found, after CNAMEs: the `name` of the TXT answer in the DNS-over-HTTPS JSON, lowercased, without a trailing dot or the `_nanovm.` prefix. The proxy sends that as `nanovm-host`. Then `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app. Still safe: a CNAME to someone else's record only serves their app as their record configures it, which anyone could already reach through their own domain; no name can choose another name's version or data. Test with the DoH stub answering a CNAME chain (two hosts, one app; a third host with its own record, its own app). Update README's "The proxy" and "Apps", and Q52 in HANDOFF.
-- **Status:** fixed in 54054c0
+- **Status:** fixed in 54054c0; amended by B-403 (d287d22): "a CNAME to someone else's record only serves their app" also served their data under the alias's origin, so the owner's record must now list each alias (`alias=<host>`).
 
 ### W-16: build and test CI
 - **What:** run a production-feature build check and the unit/integration suite on pushes and pull requests; build guests locally without publishing packages. Read-only token, Ubuntu 24.04, locked dependencies, serial test scheduling to reduce N-32 contention.

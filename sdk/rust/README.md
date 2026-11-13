@@ -91,7 +91,7 @@ no need for write-to-temp-then-rename.
 - `config::get(key)`: the manifest's `config` table, and the secrets a node's
   operator gives the app ([Secrets](../../README.md#secrets)).
 - `fetch(url).method(..).header(..).body(..).send()`: outbound HTTP to hosts
-  in the manifest's `egress` list; `.stream()` instead reads the answer's
+  in the manifest's `egress` list that the node's operator also allows; `.stream()` instead reads the answer's
   body as it arrives (`next()`: `Ok(Some(piece))`, then `Ok(None)` once
   all of it has come). A body that breaks off (the connection closes before
   its `content-length` or last chunk) is an error from `send()`, and from

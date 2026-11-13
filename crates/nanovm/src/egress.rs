@@ -36,48 +36,57 @@ struct Rule {
 #[derive(Debug, Default)]
 pub struct EgressPolicy {
     rules: Vec<Rule>,
+    /// The operator's list (the node's `limits.egress`): a request must
+    /// match it too.
+    cap: Vec<Rule>,
 }
 
 impl EgressPolicy {
-    /// An app's list. Its author is the tenant, so it may name no private
-    /// address, unless `dev`.
-    pub fn parse(entries: &[String], dev: bool) -> anyhow::Result<Self> {
-        let mut rules = Vec::new();
-        for e in entries {
-            let e = e.trim().to_ascii_lowercase();
-            let (wild, rest) = e.strip_prefix("*.").map_or((false, e.as_str()), |r| (true, r));
-            // `host`, `host:port` or `[v6]:port`.
-            let a: http::uri::Authority = rest.parse().map_err(|_| anyhow::anyhow!("bad egress entry {e:?}"))?;
-            // A port that isn't a u16 would otherwise read as "any port".
-            let named = a.as_str().rsplit_once(']').map_or(a.as_str(), |(_, p)| p).contains(':');
-            anyhow::ensure!(!named || a.port_u16().is_some(), "bad port in egress entry {e:?}");
-            let host = a.host().trim_start_matches('[').trim_end_matches(']');
-            let host = match host.parse::<IpAddr>() {
-                _ if wild => HostPat::Suffix(format!(".{host}")),
-                Ok(ip) if dev || is_global(ip) => HostPat::Ip(ip),
-                Ok(_) => anyhow::bail!("egress entry {e:?} is a private address"),
-                Err(_) => HostPat::Exact(host.to_string()),
-            };
-            rules.push(Rule {
-                host,
-                port: a.port_u16(),
-            });
-        }
-        Ok(EgressPolicy { rules })
+    /// An app's list, within the operator's `cap`. Neither may name a
+    /// private address, unless `dev`: the app's author is the tenant.
+    pub fn parse(entries: &[String], cap: &[String], dev: bool) -> anyhow::Result<Self> {
+        Ok(EgressPolicy { rules: rules(entries, dev)?, cap: rules(cap, dev)? })
     }
 
     fn matches(&self, host: &str, port: u16) -> Option<&Rule> {
         let host = host.to_ascii_lowercase();
         let ip = host.parse::<IpAddr>().ok();
-        self.rules.iter().find(|r| {
+        let hit = |rules: &[Rule]| rules.iter().position(|r| {
             r.port.is_none_or(|p| p == port)
                 && match &r.host {
                     HostPat::Exact(h) => *h == host,
                     HostPat::Suffix(s) => host.ends_with(s.as_str()),
                     HostPat::Ip(a) => ip == Some(*a),
                 }
-        })
+        });
+        hit(&self.cap).and(hit(&self.rules)).map(|i| &self.rules[i])
     }
+}
+
+/// `entries` as rules: `host`, `host:port` or `*.suffix[:port]`.
+fn rules(entries: &[String], dev: bool) -> anyhow::Result<Vec<Rule>> {
+    let mut rules = Vec::new();
+    for e in entries {
+        let e = e.trim().to_ascii_lowercase();
+        let (wild, rest) = e.strip_prefix("*.").map_or((false, e.as_str()), |r| (true, r));
+        // `host`, `host:port` or `[v6]:port`.
+        let a: http::uri::Authority = rest.parse().map_err(|_| anyhow::anyhow!("bad egress entry {e:?}"))?;
+        // A port that isn't a u16 would otherwise read as "any port".
+        let named = a.as_str().rsplit_once(']').map_or(a.as_str(), |(_, p)| p).contains(':');
+        anyhow::ensure!(!named || a.port_u16().is_some(), "bad port in egress entry {e:?}");
+        let host = a.host().trim_start_matches('[').trim_end_matches(']');
+        let host = match host.parse::<IpAddr>() {
+            _ if wild => HostPat::Suffix(format!(".{host}")),
+            Ok(ip) if dev || is_global(ip) => HostPat::Ip(ip),
+            Ok(_) => anyhow::bail!("egress entry {e:?} is a private address"),
+            Err(_) => HostPat::Exact(host.to_string()),
+        };
+        rules.push(Rule {
+            host,
+            port: a.port_u16(),
+        });
+    }
+    Ok(rules)
 }
 
 /// True for addresses reachable on the public internet.
@@ -538,12 +547,7 @@ mod tests {
 
     #[test]
     fn allowlist_matching() {
-        let p = EgressPolicy::parse(&[
-            "api.example.com".into(),
-            "*.cdn.example.net:443".into(),
-            "127.0.0.1:9000".into(),
-        ], true)
-        .unwrap();
+        let p = policy(&["api.example.com", "*.cdn.example.net:443", "127.0.0.1:9000"]);
         assert!(p.matches("api.example.com", 443).is_some());
         assert!(p.matches("API.EXAMPLE.COM", 80).is_some());
         assert!(p.matches("evil.com", 443).is_none());
@@ -578,8 +582,32 @@ mod tests {
         }
     }
 
+    /// `entries`, as both the app's list and the operator's.
     fn policy(entries: &[&str]) -> EgressPolicy {
-        EgressPolicy::parse(&entries.iter().map(|e| e.to_string()).collect::<Vec<_>>(), true).unwrap()
+        let entries: Vec<_> = entries.iter().map(|e| e.to_string()).collect();
+        EgressPolicy::parse(&entries, &entries, true).unwrap()
+    }
+
+    /// An app reaches only what both its list and the operator's allow: one
+    /// asking for `*.com` gets what the operator lists, and with no operator
+    /// list nothing. The operator's list names no private address either.
+    #[tokio::test]
+    async fn the_operators_list_caps_the_apps() {
+        let capped = |app: &[&str], cap: &[&str]| {
+            let list = |l: &[&str]| l.iter().map(|e| e.to_string()).collect::<Vec<_>>();
+            EgressPolicy::parse(&list(app), &list(cap), false).unwrap()
+        };
+        let p = capped(&["*.com", "1.1.1.1"], &["api.example.com:443", "*.cdn.com", "8.8.8.8"]);
+        assert!(p.matches("api.example.com", 443).is_some());
+        assert!(p.matches("a.cdn.com", 80).is_some());
+        for (host, port) in [("evil.com", 443), ("api.example.com", 80), ("example.com", 443), ("cdn.com", 443), ("1.1.1.1", 443), ("8.8.8.8", 443)] {
+            assert!(p.matches(host, port).is_none(), "{host}:{port}");
+        }
+        assert!(capped(&["*.com"], &[]).matches("a.com", 443).is_none(), "no operator list allows nothing");
+        // Refused before any lookup or connection.
+        assert!(matches!(send(get("https://evil.com/"), None, &p).await.err(), Some(Error::HttpRequestDenied)));
+        let e = EgressPolicy::parse(&[], &["10.0.0.1".into()], false).unwrap_err().to_string();
+        assert!(e.contains("private address"), "{e}");
     }
 
     /// Entries that aren't `host`, `host:port` or `*.suffix[:port]` are
@@ -599,10 +627,10 @@ mod tests {
             "[::1",
             "::1]",
         ] {
-            let e = EgressPolicy::parse(&[bad.to_string()], true).unwrap_err().to_string();
+            let e = rules(&[bad.to_string()], true).unwrap_err().to_string();
             assert!(e.starts_with("bad egress entry"), "{bad:?}: {e}");
         }
-        assert!(EgressPolicy::parse(&[], false).unwrap().rules.is_empty());
+        assert!(rules(&[], false).unwrap().is_empty());
         assert!(policy(&[]).matches("a.com", 443).is_none(), "an empty list denies all");
     }
 
@@ -625,7 +653,7 @@ mod tests {
     #[test]
     fn parse_refuses_bad_ports() {
         for bad in ["a.com:99999", "a.com:8o", "*.a.com:-1", "a.com:"] {
-            assert!(EgressPolicy::parse(&[bad.to_string()], true).is_err(), "{bad:?}");
+            assert!(rules(&[bad.to_string()], true).is_err(), "{bad:?}");
         }
     }
 
@@ -634,12 +662,12 @@ mod tests {
     #[test]
     fn parse_refuses_private_addresses_unless_dev() {
         for private in ["127.0.0.1:9000", "169.254.169.254", "[::1]", "10.0.0.1", "[::ffff:127.0.0.1]:80"] {
-            let e = EgressPolicy::parse(&[private.to_string()], false).unwrap_err().to_string();
+            let e = rules(&[private.to_string()], false).unwrap_err().to_string();
             assert!(e.contains("private address"), "{private}: {e}");
-            EgressPolicy::parse(&[private.to_string()], true).unwrap();
+            rules(&[private.to_string()], true).unwrap();
         }
         let public = ["1.1.1.1:443", "[2606:4700:4700::1111]", "localhost", "*.0.0.1"].map(String::from);
-        EgressPolicy::parse(&public, false).unwrap();
+        rules(&public, false).unwrap();
     }
 
     /// IPv6 literals are bracketed, with or without a port, and match the

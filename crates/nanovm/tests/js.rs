@@ -45,7 +45,9 @@ fn node_cfg(test: &str, max_live: usize) -> NodeConfig {
     let cache = root.join("cwasm-cache");
     std::fs::create_dir_all(&cache).unwrap();
     std::os::unix::fs::symlink(&cache, dir.join("cache")).unwrap();
-    let cfg = NodeConfig { data_dir: dir, max_live_objects: max_live, memory_reservation_mb: 64, dev: true, ..NodeConfig::default() };
+    let mut cfg = NodeConfig { data_dir: dir, max_live_objects: max_live, memory_reservation_mb: 64, dev: true, ..NodeConfig::default() };
+    // The operator allows the egress the tests ask for.
+    cfg.limits.egress = ["localhost", "127.0.0.1"].map(String::from).into();
     cfg.validate().unwrap();
     cfg
 }

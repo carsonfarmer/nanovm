@@ -5,7 +5,7 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 - Each `(app, object-id)` has exactly one live instance, which serves one request at a time.
 - Each object has its own memory cap, CPU budget, deadlines and handle cap.
 - Each object has its own quota'd filesystem: scratch `/tmp` and a persistent `/data` volume.
-- Each app has an egress allowlist.
+- Each app has an egress allowlist, within the operator's.
 - Each object has a composed Spin KV store in its volume, and each app its host-injected `wasi:config` values.
 - Objects accept WebSockets and publish to their own sockets.
 - Memory is lost on eviction; `/data` survives eviction and restarts.
@@ -291,24 +291,43 @@ The in-process benchmark below measures the node inside a worker, and is unchang
 `nanovm proxy --config proxy.toml` is the public front door. It finds the app a request's host serves in a TXT record at `_nanovm.<host>`:
 
 ```
-app=ghcr.io/org/app:prod; trust=<issuer> <subject>; trust=…; min=1.2.0
+app=ghcr.io/org/app:prod; trust=<issuer> <subject>; trust=…; alias=www.example.com; min=1.2.0
 ```
 
-That is the repository and the tag deployed, each identity whose signature is accepted, and an optional version floor. Whoever controls the domain controls its routing; deploying moves the tag, and rolling back moves it back. The proxy:
-- asks a DNS-over-HTTPS resolver (`resolver`, Cloudflare's by default) and keeps the answer for its TTL;
+That is the repository and the tag deployed, each identity whose signature is accepted, the other names that may serve the app (below), and an optional version floor. Whoever controls the domain controls its routing; deploying moves the tag, and rolling back moves it back.
+
+**The operator decides which hosts are served and who may deploy.** Two lists in `proxy.toml`, both empty by default, so a new proxy serves nothing:
+
+```toml
+hosts = ["example.com", "*.apps.example.com"]
+signers = [
+  "https://token.actions.githubusercontent.com https://github.com/acme/*",
+  "https://accounts.google.com alice@example.com",
+]
+```
+
+- `hosts`: a name, or `*.name` for any name under it at any depth (`a.apps.example.com`, not `apps.example.com`). Any other host gets 403 before its record is looked up.
+- `signers`: `<issuer> <subject>`, the subject exact or ending in `*` for any subject that starts with what comes before it (end the prefix with `/`: `https://github.com/acme` would also match `https://github.com/acme-evil/…`). A record's `trust=` entries are cut to the ones a signer matches, and only those go to the node, so an app signed by any other identity is refused even if its record trusts it. A record left with none gets 403.
+
+**Aliases.** An app belongs to the name its record is found at, after CNAMEs (W-15), so `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app with one set of data, if example.com's record says `alias=www.example.com`. A name the record doesn't list gets 403: otherwise any domain could CNAME onto another's record and serve that app, with its data, under its own origin, and keep its users' cookies. To run someone else's repository under your own name, write your own record; that is a separate app with its own data.
+
+The proxy:
+- asks a DNS-over-HTTPS resolver (`resolver`, Cloudflare's by default) and keeps the answer for its TTL; an answer other than NOERROR or NXDOMAIN (SERVFAIL, say) is a failure, not "no record";
 - asks the registry which digest the tag names, and keeps that for `tag_ttl_s` (30 s);
-- looks each host or tag up once however many requests ask at once, keeps a failed lookup's answer for 5 s rather than asking again, and remembers at most 10,000 of each;
+- looks each host or tag up once however many requests ask at once, and keeps a failed lookup's answer for 5 s rather than asking again;
+- remembers up to 10,000 hosts and tags with an answer (an app, a digest), and apart from them up to 1,000 without one: no record (kept 30 s), refused, failed, or being looked up. While 1,000 of those are fresh, a host it doesn't know gets 503 rather than a lookup. So names made up under a `*.` entry cost at most 1,000 lookups at a time, however many come, and never push out a host that has an app (`made_up_names_cost_bounded_lookups_and_keep_live_routes`);
+- keeps serving a host's last route, and a tag's last digest, while looking it up again fails or takes over 5 s (a resolver or registry outage), for up to a day past its TTL, asking again every 30 s (RFC 8767's serve-stale). A host or tag it never found fails as before (502). The node still fetches a manifest and its signatures whenever an app's worker starts, so an app whose worker restarts during a registry outage is down until the registry is back (B-406);
 - drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards HTTP requests; it holds WebSockets itself and forwards their events;
 - speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
 - gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too);
 - makes a client keep sending a request's body: it may keep the proxy waiting 10 s in all, plus a second for every 4 KiB it sends, or gets a 408 (`body-timeout`) and its connection is closed. A body trickled a byte at a time is cut after about 10 s; an upload at 4 KiB/s or faster never is. The node applies the same rule as it reads a body, so a client that reaches it directly is held to it too;
 - refuses a request head over 64 KiB (431), as every hop does (node, worker links, egress responses).
 
-A host with no record is a 404; a malformed record, or more than one, is a 502.
+A host with no record is a 404; a host the proxy doesn't serve, an alias its record doesn't list, or a record trusting no allowed signer, a 403; a malformed record, or more than one, a 502.
 
 **Many nodes.** The proxy may place objects on several nodes: list them in `nodes` (each `host:port`, as that node's `name`). An object's home is chosen by rendezvous hashing, and the nodes keep leases on their objects in an object store (`leases = "s3://bucket/prefix"` on every node, with `name`; credentials from `AWS_*`), so an object has one live instance across nodes and a node that lost its lease can't commit. A node that doesn't hold an object answers 421 and the proxy tries the one that does (or the next), for up to `failover_ms`. When a node stops, its objects move after its `lease_ms` (10 s; each node's session record carries its own, which the others wait out). With leases a node ships its objects' committed versions to `capture.store` (required), and answers a write once it counts there; the node taking an object over restores it from there before serving it, so a failover loses no answered write and serves no older state (a write answered an error because it didn't count in time, 500 or 504, isn't served until it does). `failover_ms` must exceed every node's `lease_ms` (the proxy can't check it) and the proxy's 1 s connect timeout. A node that took a request but hasn't answered within `failover_ms` gets the client a 504 (the request may have run there); the proxy never sends it again. Calls between objects then go through the proxy's private endpoint (the node's `proxy`). See `notes/multinode.md`.
 
-DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs); the table is public; and a cold lookup adds a round trip.
+DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs its record lists); the table is public; and a cold lookup adds a round trip.
 
 ## Apps
 
@@ -322,16 +341,16 @@ nanovm-min-version: 1.4.0                    # optional floor
 
 The node trusts these headers because only the proxy can reach it, and strips them before the guest sees the request. A request without them reaches only the node's own `/_nanovm/` routes.
 
-**An app is a DNS name's deployment of a repository.** Its name on the node (`example.com_ghcr.io_org_app-<hash>`), its volumes and its uid come from the name that owns its `_nanovm` record (`nanovm-host`) and `registry/repository`, so every version that name runs, whoever signed it, sees the same data. The owner is the name the record was found at after CNAMEs, so `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app. Whoever controls that name chooses the version it runs, so no domain can name another's repository and switch its app to an old version on its data (a review finding); a CNAME to someone else's record only serves their app as their record configures it. Only those who can push to a repository can put a signed artifact in it, so naming another identity never reaches a different app's data. The registry is written one way only: lower case, without `:443`. A team signs from CI, or lists each member's identity.
+**An app is a DNS name's deployment of a repository.** Its name on the node (`example.com_ghcr.io_org_app-<hash>`), its volumes and its uid come from the name that owns its `_nanovm` record (`nanovm-host`) and `registry/repository`, so every version that name runs, whoever signed it, sees the same data. The owner is the name the record was found at after CNAMEs, so `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app, if the owner's record lists the alias (`alias=www.example.com`; see "The proxy"). Whoever controls that name chooses the version it runs, so no domain can name another's repository and switch its app to an old version on its data (a review finding), and no domain can serve another's app and data under its own name without that name's record listing it. Only those who can push to a repository can put a signed artifact in it, so naming another identity never reaches a different app's data. The registry is written one way only: lower case, without `:443`. A team signs from CI, or lists each member's identity.
 
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
 2. **Then the blobs.** The supervisor fetches the config blob (the app's limits, env, config and the names of the secrets it needs) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
-3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB head on the host: a header map, or a request's headers with the method, scheme, authority and path the guest set on it, which together may not pass 64 KiB; 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
+3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB head on the host: a header map, or a request's headers with the method, scheme, authority and path the guest set on it, which together may not pass 64 KiB; 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. Its egress reaches only what both its `egress` and the operator's `limits.egress` allow: an app asking for `*.com` gets only the hosts the operator lists, and with no operator list (the default) none; private addresses stay refused in both. The component goes to a fresh jailed worker, which compiles it.
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
 
-**How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight, whose worker is retired (its next request starts it again). Open proxy sockets do not pin workers. With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since anyone's DNS can name an app, this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
+**How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight, whose worker is retired (its next request starts it again). Open proxy sockets do not pin workers. With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since the DNS of any host the proxy serves can name an app (any name under a `*.` entry in its `hosts`), this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
 
 **Bounds.** Every registry read is bounded: a manifest, config, token or signature at 4 MiB, a component at `max_component_mb` (64), and 16 signatures per load. At most four registry fetches run at once across the node, each within `load_timeout_ms` (60 s) in all, so a registry that answers a byte at a time holds nothing for long. Digests are checked before they name anything. Registries, and their redirects and token servers, must be on public addresses: a deploy names the registry, so it must not reach the node's own network.
 
@@ -696,7 +715,7 @@ The tests cover:
   - unit tests roll back every kind of change, commit them, survive a crash at each step of recovery, ignore a torn record, journal writes to a file removed while open and to one opened write-only, and record nothing for a failed `rmdir` or a refused change
 - calls between objects: the callee's volume and commit, and cycles (an object calling itself, or back through another) refused at once
 - an allowed outbound request through the full egress path
-- the egress allowlist, including DNS rebinding to loopback
+- the egress allowlist, including DNS rebinding to loopback, within the operator's (an app asking for `*.com` reaches only what the node's `limits.egress` lists, in-process and through the supervisor)
 - LRU and idle eviction, and capacity limits
 - churn past capacity
 - the HTTP front end
@@ -716,6 +735,7 @@ The tests cover:
 - apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, a switch that finishes when its request goes away, at most `max_apps` workers (taking only idle apps' slots), and slow registries held to four fetches at once and a deadline
 - the proxy hanging up on clients that stall their headers, and surviving running out of file descriptors
 - the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and proxy-owned WebSockets send events with the current digest
+- the operator's admission: an unlisted host refused before any DNS lookup, a record's identities cut to the operator's signers (end to end: the CI-signed counter refused when only another identity is listed), an alias its owner's record doesn't list refused, 30,000 made-up hosts costing at most 1,001 lookups and never pushing out a live route, a SERVFAIL not taken for "no record", and a route or digest served stale through a resolver outage
 - key-value: persistence, shared filesystem byte/file quotas, bad names, 1 MiB read/write bounds, streamed keys/backpressure and completion lifetimes, cancellation-safe replacement, raw-file visibility and jailed execution. Optional probes cover mutation recovery cuts, 1,000 same-request replacements and 10,000-key scale.
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`
 - WebSockets through the proxy: echo, binary, committed fan-out scoped by app and object, a guest-initiated close, the object told how a socket ended, refusals by an object that doesn't answer `OPEN`; per-object, per-app and total caps, bounded messages and slow clients, publish deadlines, worker restart and version switches without reconnecting

@@ -7,3 +7,8 @@ max_live_objects = 8000
 memory_reservation_mb = 64
 epoch_tick_ms = 5
 dev = true
+
+# The operator's egress cap: an app reaches only what its own list and this
+# one both allow.
+[limits]
+egress = ["example.com"]

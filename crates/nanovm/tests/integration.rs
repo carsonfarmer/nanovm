@@ -59,8 +59,9 @@ fn app(name: &str) -> AppConfig {
     }
 }
 
-/// A dev-mode node config with its own data directory; the compile cache is
-/// shared between tests.
+/// A dev-mode node config with its own data directory, whose operator allows
+/// the egress the test apps ask for; the compile cache is shared between
+/// tests.
 fn node_cfg(test: &str, max_live: usize) -> NodeConfig {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let dir = root.join("nodes").join(test);
@@ -69,13 +70,14 @@ fn node_cfg(test: &str, max_live: usize) -> NodeConfig {
     let cache = root.join("cwasm-cache");
     std::fs::create_dir_all(&cache).unwrap();
     std::os::unix::fs::symlink(&cache, dir.join("cache")).unwrap();
-    let cfg = NodeConfig {
+    let mut cfg = NodeConfig {
         data_dir: dir,
         max_live_objects: max_live,
         memory_reservation_mb: 64,
         dev: true,
         ..NodeConfig::default()
     };
+    cfg.limits.egress = ["example.com", "localhost", "127.0.0.1"].map(String::from).into();
     cfg.validate().unwrap();
     cfg
 }
@@ -922,6 +924,40 @@ async fn egress_listed_host_allowed() {
     let r = get(&node, "n", "/fetch?url=https://example.com/").await;
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.json()["status"], 200);
+}
+
+/// An app reaches only what both its list and the operator's allow, in
+/// process and through the supervisor: one asking for every port of a host
+/// gets the one port the operator lists.
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_is_capped_by_the_operator() {
+    let mut ports = vec![];
+    for _ in 0..2 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        ports.push(listener.local_addr().unwrap().port());
+        tokio::spawn(nanovm::server::serve_http1(listener, |_| async { nanovm::server::ok_json(serde_json::json!({})) }));
+    }
+    let mut hostile = app("hostile");
+    hostile.limits.egress = vec!["127.0.0.1".into()];
+    let capped = |test: &str| {
+        let mut cfg = node_cfg(test, 8);
+        cfg.limits.egress = vec![format!("127.0.0.1:{}", ports[0])];
+        cfg
+    };
+    let node = node_with(capped("egress_capped_in_process"), hostile.clone());
+    let (_sup, addr) = supervised_with(capped("egress_capped_supervised")).await;
+    let published = publish("egress_capped", &hostile).await;
+    for (port, allowed) in [(ports[0], true), (ports[1], false)] {
+        let path = format!("/fetch?url=http://127.0.0.1:{port}/");
+        let r = get(&node, "n", &path).await;
+        let (status, body) = app_get(addr, &published, &format!("/n{path}")).await;
+        for (status, body) in [(r.status, r.body), (status, body)] {
+            match allowed {
+                true => assert_eq!(status, 200, "{body}"),
+                false => assert!(status == 502 && body.contains("HttpRequestDenied"), "{status} {body}"),
+            }
+        }
+    }
 }
 
 // ---- eviction and capacity --------------------------------------------
@@ -2086,7 +2122,8 @@ async fn published(name: &str) -> Result<Vec<(semver::Version, String)>, String>
 /// A supervisor that checks signatures.
 async fn signed(test: &str) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
     let mut cfg = node_cfg(test, 8);
-    cfg.dev = false;
+    // Outside dev mode the operator's egress list names no private address.
+    (cfg.dev, cfg.limits.egress) = (false, vec![]);
     supervised_with(cfg).await
 }
 
@@ -2137,6 +2174,36 @@ async fn registry_apps_need_a_trusted_signature() {
     let (_sup, addr) = signed("registry_trust_header").await;
     let head = format!("GET /a/ HTTP/1.1\r\nHost: x\r\nnanovm-app: {app}\r\nConnection: close\r\n\r\n");
     assert_eq!(raw(addr, &head, b"").await.0, 400);
+}
+
+/// An app signed by an identity the proxy's operator doesn't list is
+/// refused even though its record trusts that identity: the node hears only
+/// the identities the operator lets deploy. One the operator lists, here by
+/// a prefix, deploys.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_operators_signers_deploy() {
+    let (version, app) = published("counter").await.expect("published signed counter is reachable").pop().unwrap();
+    let (_sup, node) = signed("only_the_operators_signers_deploy").await;
+    let other = "https://accounts.example.com someone@example.com";
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let txt = format!("app={}:{version}; trust={SIGNER}; trust={other}", app.split_once('@').unwrap().0);
+    records.lock().insert("_nanovm.counter.test".to_string(), vec![txt]);
+    let resolver = doh(records).await;
+    let github = "https://token.actions.githubusercontent.com https://github.com/carsonfarmer/*";
+    for (signer, allowed) in [(other, false), (github, true)] {
+        let cfg = nanovm::config::ProxyConfig {
+            nodes: vec![node.to_string()], resolver: resolver.clone(), listen: "127.0.0.1:0".into(),
+            hosts: vec!["counter.test".into()], signers: vec![signer.into()], ..Default::default()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+        let (status, body) = raw(addr, "GET /a/ HTTP/1.1\r\nHost: counter.test\r\nConnection: close\r\n\r\n", b"").await;
+        match allowed {
+            true => assert_eq!(status, 200, "{body}"),
+            false => assert!(status == 502 && body.contains("not signed by a trusted identity"), "{status} {body}"),
+        }
+    }
 }
 
 /// Naming a new version switches the app: requests in flight on the old
@@ -3477,6 +3544,8 @@ mod sockets {
         }
         cfg.listen = "127.0.0.1:0".into();
         cfg.nodes = vec![node.to_string()];
+        cfg.hosts.extend(apps.iter().map(|(host, _)| host.to_string()));
+        cfg.signers = vec!["dev dev".into()];
         cfg.resolver = doh(records.clone()).await;
         cfg.tag_ttl_s = 0;
         cfg.dev = true;
@@ -3573,11 +3642,13 @@ mod sockets {
     /// Owners, not request hosts or repositories, scope channels and caps.
     #[tokio::test(flavor = "multi_thread")]
     async fn sockets_stay_with_their_record_owner_and_repository() {
-        let cfg = nanovm::config::ProxyConfig { max_sockets_per_app: 2, ..Default::default() };
+        let hosts = ["other", "alias", "alias2"].map(String::from).into();
+        let cfg = nanovm::config::ProxyConfig { max_sockets_per_app: 2, hosts, ..Default::default() };
         let (_sup, _node, addr, records) = front("socket_owners", cfg, &[("counter", app("counter")), ("replacement", app("counter"))]).await;
         {
             let mut r = records.lock();
-            let same = r["_nanovm.counter"].clone();
+            let same = vec![format!("{}; alias=alias; alias=alias2", r["_nanovm.counter"][0])];
+            r.insert("_nanovm.counter".into(), same.clone());
             r.insert("_nanovm.other".into(), same);
             for alias in ["alias", "alias2"] {
                 r.insert(format!("_nanovm.{alias}"), vec!["CNAME _nanovm.counter".into()]);
@@ -3827,11 +3898,14 @@ async fn doh(records: Arc<parking_lot::Mutex<std::collections::HashMap<String, V
     format!("http://{addr}/dns-query")
 }
 
-/// A dev-mode proxy in front of `node`, asking `resolver`, and asking the
-/// registry for a tag's digest every time.
+/// A dev-mode proxy in front of `node`, serving `*.test` to apps the dev
+/// identity signs, asking `resolver`, and asking the registry for a tag's
+/// digest every time.
 async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::SocketAddr {
     let cfg = nanovm::config::ProxyConfig {
         nodes: vec![node.to_string()],
+        hosts: vec!["*.test".into()],
+        signers: vec!["dev dev".into()],
         resolver,
         tag_ttl_s: 0,
         dev: true,
@@ -3859,7 +3933,7 @@ async fn the_proxy_routes_hosts_by_dns() {
     let record = |host: &str, txt: &[&str]| {
         records.lock().insert(format!("_nanovm.{host}"), txt.iter().map(|t| t.to_string()).collect());
     };
-    record("counter.test", &[&format!("app={tagged}; trust=dev dev")]);
+    record("counter.test", &[&format!("app={tagged}; trust=dev dev; alias=www.counter.test")]);
     let at = |host: &str, app: &str| nanovm::registry::app_name(host, &app.parse().unwrap());
     let get = async |host: &str, path: &str, extra: &str| {
         raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n"), b"").await
@@ -3886,10 +3960,20 @@ async fn the_proxy_routes_hosts_by_dns() {
     record("other.test", &[&format!("app={tagged}; trust=dev dev")]);
     let (status, body) = get("other.test", "/a/", "").await;
     assert!(status == 200 && body.contains(&at("other.test", &counter)), "{body}");
-    // An alias (its record a CNAME of counter.test's) is counter.test's app.
+    // An alias (its record a CNAME of counter.test's, which lists it) is
+    // counter.test's app; a name counter.test's record doesn't list serves
+    // nothing, nor does a host the proxy doesn't serve, or a record trusting
+    // only identities the proxy doesn't let deploy.
     record("www.counter.test", &["CNAME _nanovm.counter.test"]);
     let (status, body) = get("WWW.counter.test", "/a/", "").await;
     assert!(status == 200 && body.contains(&at("counter.test", &counter)), "{body}");
+    record("evil.test", &["CNAME _nanovm.counter.test"]);
+    record("counter.example", &[&format!("app={tagged}; trust=dev dev")]);
+    record("unsigned.test", &[&format!("app={tagged}; trust=other signer")]);
+    for (host, why) in [("evil.test", "doesn't list it"), ("counter.example", "doesn't serve"), ("unsigned.test", "trusts no identity")] {
+        let (status, body) = get(host, "/a/", "").await;
+        assert!(status == 403 && body.contains(why), "{host}: {status} {body}");
+    }
 
     // No record is no app; a bad record, or two, is the proxy's error.
     assert_eq!(get("nowhere.test", "/a/", "").await.0, 404);
@@ -4231,7 +4315,7 @@ async fn the_proxy_outlasts_idle_and_excess_connections() {
     let start = |name: &str| {
         let addr = port();
         let cfg = dir.join(format!("{name}.toml"));
-        let toml = format!("listen = \"{addr}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\n");
+        let toml = format!("listen = \"{addr}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\nhosts = [\"x\"]\n");
         std::fs::write(&cfg, toml).unwrap();
         let cmd = format!("ulimit -n 64 && exec {} proxy --config {}", env!("CARGO_BIN_EXE_nanovm"), cfg.display());
         let child = tokio::process::Command::new("sh").args(["-c", &cmd]).kill_on_drop(true).spawn().unwrap();
@@ -4419,7 +4503,7 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     records.lock().insert("_nanovm.good.test".into(), vec![format!("app={}:latest; trust=dev dev", counter.split_once('@').unwrap().0)]);
     let cfg = nanovm::config::ProxyConfig {
         nodes: vec![node.to_string()], resolver: doh(records).await, telemetry_endpoint: endpoint,
-        listen: "127.0.0.1:0".into(), dev: true, ..Default::default()
+        listen: "127.0.0.1:0".into(), dev: true, hosts: vec!["*.test".into()], signers: vec!["dev dev".into()], ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = listener.local_addr().unwrap();
@@ -5149,7 +5233,7 @@ mod nodes {
         records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={tagged}; trust=dev dev")]);
         let cfg = nanovm::config::ProxyConfig {
             nodes: nodes.to_vec(), resolver: doh(records).await, tag_ttl_s: 0, dev: true, listen: "127.0.0.1:0".into(),
-            failover_ms: 20_000, ..Default::default()
+            failover_ms: 20_000, hosts: vec![host.into()], signers: vec!["dev dev".into()], ..Default::default()
         };
         let proxy = nanovm::proxy::Proxy::new(cfg).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

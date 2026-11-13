@@ -89,7 +89,8 @@ fn publish(wasm: &str, target: &str, flags: &[String]) -> anyhow::Result<()> {
          Then route a host to it with a DNS TXT record naming the signer's OIDC issuer and identity:\n\
          _nanovm.example.com. TXT \"app={repo}:{version}; trust=<issuer> <identity>\"\n\
          such as trust=https://token.actions.githubusercontent.com \
-         https://github.com/<owner>/<repo>/.github/workflows/publish-app.yml@refs/heads/main"
+         https://github.com/<owner>/<repo>/.github/workflows/publish-app.yml@refs/heads/main\n\
+         The proxy serves it once its operator lists the host in `hosts` and the identity in `signers`."
     );
     Ok(())
 }
@@ -118,6 +119,8 @@ fn run(wasm: &str, flags: &[String]) -> anyhow::Result<()> {
     let name = Path::new(wasm).file_stem().and_then(|s| s.to_str()).filter(|s| nanovm::table::valid_name(s));
     let name = name.context("the component's file name must be <app>.wasm, with <app> of [A-Za-z0-9_.-]")?;
     let limits = spec.limits.clamped(&cfg.limits);
+    // Its developer is its operator: the manifest's egress is all it gets.
+    cfg.limits.egress = spec.limits.egress.clone();
     let (asked, max) = (serde_json::json!(spec.limits), serde_json::json!(cfg.limits));
     for (k, v) in asked.as_object().into_iter().flatten() {
         if let (Some(a), Some(m)) = (v.as_u64(), max[k].as_u64()) && a > m {
