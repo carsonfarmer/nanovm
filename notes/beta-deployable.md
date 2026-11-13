@@ -59,6 +59,9 @@ none (B-601, fixed).
 | 8b17f8a | CI runs the ops tooling; the release workflow ships disabled | 0 |
 | 946f3e8 | the store drop-in (B-604) and a store mode in the units test | 0 |
 | 2f639fa | the single-node beta operator guide | 0 |
+| 3c6fba4 | README "Deploy and operate"; these notes | 0 |
+| 2a0ca13 | binary-swap drill takes any two builds; run on round 3 | 0 |
+| 5b629ab | B-604's `ship.rs` half moves to the round-3 lease fix | 0 |
 
 Runtime: 7,410 → 7,415 lines (CI's count).
 
@@ -112,22 +115,29 @@ All with a dev build of this branch (`cargo build -p nanovm --features dev
 | `drills/backup-restore.sh` | count 3 and KV "kept" before and after restic backup and restore into a fresh root; uids 200000/200001 kept; next write 4 |
 | Container: `deploy/container/test/local.sh` (stand-in base, local binary) | 11/11; image 92 MB; stop 183 ms with `--init`, 3,192 ms as PID 1; workers start as PID 1 |
 | Container on the real `debian:trixie-slim` with the image's own configs | node ready 204, proxy answers 502 (no network for its resolver); 200 MB with the debug binary |
+| `nanovm publish` of `examples/hello` (built with `tools/build-app.sh`) to the loopback dev registry, served by a node on `deploy/systemd/nanovm.toml` (plus `dev = true`, a scratch `data_dir`) | pushed `127.0.0.1:25890/nanovm/hello:1.0.0@sha256:2ef881d6…`; the node serves it by digest: "world has had 1 visits", 200. `nanovm run` on the same component: the same answer |
 | promtool `check config`, `check rules`, `test rules` | pass (14 rules, 5 test groups) |
 | `package.sh` | identical archives twice, checksum OK, `deploy/` included, a non-nanovm binary and tag `latest` refused |
 | Python tests (check-host, bench history, changelog) | 7 + 6 + 4 pass |
 | shellcheck `-S warning` on every ops script | clean |
 | `bench-history`: the JSON keys `history.py` reads | all present in `bench.rs`/`support/load.rs` (static check; the bench was not run) |
 
-**Rust tests:** see the end of this file.
+**Rust tests** (`env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked
+-p nanovm`, by target): lib 154 passed; `configs` 1 passed; `integration` 94
+passed, 14 ignored; `dev` 8 passed, 1 failed: `javascript_apps_run_and_publish`
+needs `js/target/test-app.wasm`, which needs the WASI SDK (not on this host).
+`examples` wasn't run (it needs every example built; `hello` and `chat` were).
+The SQLite `--ignored` suite wasn't run.
 
 ## Not run, and why
 
 - **A full image build**: the build stage's release build needs several GB of
   disk this shared host didn't have; the build context resolves offline and its
   base tag exists.
-- **`nanovm publish` to a registry, signed apps**: no registry credentials or
-  signing identity here; apps came from the dev registry in dev mode. The
-  end-to-end test is dev mode for that reason.
+- **Publishing to a public registry, signed apps**: no registry credentials or
+  signing identity here; `nanovm publish` went to the loopback dev registry
+  and the node ran apps unsigned in dev mode. The end-to-end test is dev mode
+  for that reason.
 - **Real ACME, real DNS, an S3 store, `otelcol-contrib`, `oha`** (so not the
   Collector-outage drill, nor `bench --quick`), `AllowedCPUs` enforcement and
   cgroup v2 controllers (cgroup v1 here), arm64, Podman.
