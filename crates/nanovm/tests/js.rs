@@ -297,6 +297,86 @@ async fn review_wait_until_exception_rolls_back_partial_work() {
     assert_eq!(r.json()["hits"], 2, "a fresh instance since: {}", r.body);
 }
 
+/// review2 (D4): `waitUntil` work starts when the promise is made, not after
+/// the answer. What it writes while the handler is still running commits
+/// with the answer, as documented, and stands when the work later rejects;
+/// what it writes after the answer rolls back, and the instance is replaced.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_wait_until_that_wrote_before_the_answer_commits_that_write_when_it_rejects() {
+    let node = node("js_wait_until_straddle_reject", 8);
+    let r = post(&node, "s", "/later-throw-straddle").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}", r.error);
+    // Served once the waitUntil work is over.
+    let kv = get(&node, "s", "/kv").await.json();
+    assert_eq!(kv["early"], 1, "written before the answer: committed with it: {kv}");
+    assert!(kv.get("late").is_none(), "written after the answer by work that failed: rolled back: {kv}");
+    assert_eq!(get(&node, "s", "/").await.json()["hits"], 2, "a fresh instance since");
+}
+
+/// review2 (D4): a waitUntil promise that has already rejected when the
+/// handler answers fails only the work after the answer: the answer and the
+/// handler's own write stand, whenever the rejection lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_wait_until_rejected_before_the_answer_fails_the_answered_request() {
+    let node = node("js_wait_until_early_reject", 8);
+    let r = post(&node, "e", "/later-throw-early").await;
+    let kv = get(&node, "e", "/kv").await.json();
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}; storage after: {kv}", r.error);
+    assert_eq!(kv["answered"], 1, "the handler's own write stands: {kv}");
+    assert_eq!(get(&node, "e", "/").await.json()["hits"], 2, "a fresh instance since");
+}
+
+/// review2 (D4): a promise waitUntil work registers after the answer is
+/// waited for and checked like the rest: its rejection rolls back its write.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_wait_until_registered_after_the_answer_commits_its_write_when_it_rejects() {
+    let node = node("js_wait_until_nested_reject", 8);
+    let r = post(&node, "n", "/later-nested").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}", r.error);
+    // Served once the waitUntil work is over.
+    let kv = get(&node, "n", "/kv").await.json();
+    assert!(kv.get("nested").is_none(), "the rejected waitUntil work's write committed: {kv}");
+}
+
+/// A promise waitUntil work registers after the answer is waited for though
+/// the work that registered it has ended: what it writes commits before the
+/// object's next request.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_until_registered_after_the_answer_is_waited_for() {
+    let node = node("js_wait_until_nested_ok", 8);
+    let r = post(&node, "n", "/later-nested-ok").await;
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}", r.error);
+    let kv = get(&node, "n", "/kv").await.json();
+    assert_eq!(kv["nested"], 1, "{kv}");
+}
+
+/// review2 (D4): a `waitUntil` promise that can never settle fails the work
+/// after the answer, not the answer: it and the handler's own write stand.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_wait_until_that_never_settles_fails_the_answered_request() {
+    let node = node("js_wait_until_never", 8);
+    let r = post(&node, "v", "/later-never").await;
+    let kv = get(&node, "v", "/kv").await.json();
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}; storage after: {kv}", r.error);
+    assert_eq!(kv["answered"], 1, "the handler's own write stands: {kv}");
+}
+
+/// The work after the answer fails only once the client has all of it: a
+/// client slow to read a long answer still gets it whole, though the
+/// waitUntil work had failed before the handler answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn wait_until_that_fails_lets_a_slow_client_read_the_whole_answer() {
+    use http_body_util::BodyExt;
+    let node = node("js_wait_until_big", 8);
+    let req = http::Request::post("http://localhost/later-big").body(bytes::Bytes::new()).unwrap();
+    let res = node.dispatch("b", req).await;
+    assert_eq!(res.status(), 200);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let body = res.into_body().collect().await.expect("the answer arrives whole").to_bytes();
+    assert_eq!(body.len(), 1 << 20);
+    assert_eq!(get(&node, "b", "/").await.json()["hits"], 1, "a fresh instance since");
+}
+
 /// The component starts from a snapshot taken at build time; nothing in it
 /// may be shared by instances or stale: randomness, the clock, the id.
 #[tokio::test(flavor = "multi_thread")]

@@ -70,9 +70,11 @@ no need for write-to-temp-then-rename.
   `query_or("n", 0)`, `header("h")`, `cookie("c")`, `body()`, `text()`,
   `json()` (feature `json`). `Response::text/html/json/bytes/new/not_found` with
   `.status()`, `.header()`, `.body()`.
-- `Response::stream(content_type, |mut body| async move { body.write(..).await; })`
+- `Response::stream(content_type, |mut body| async move { body.write(..).await; Ok(()) })`
   streams a body after the handler returns; the object serves nothing else
-  meanwhile, for at most the app's `post_return_timeout_ms`. `sse(id, event,
+  meanwhile, for at most the app's `post_return_timeout_ms`. A writer that
+  returns an error breaks the body off for the client (it doesn't end as if
+  whole) and rolls back what it changed, as a panic does. `sse(id, event,
   data)` formats a Server-Sent Event ([examples/events](../../examples/events)).
 - `data()` and `tmp()`: `read` (an `Option`), `read_text`, `write`, `append`,
   `remove`, `rename`, `open`; `fs::read_at(&fd, offset, len)` and
@@ -97,8 +99,11 @@ no need for write-to-temp-then-rename.
   app, through its queue; it commits before it answers.
 - `ws::events(&req)`, `ws::Answer` (`accept`, `subscribe`, `text`, `binary`,
   `close`) and `ws::publish(channel, msg)` for WebSockets.
-- `after(async { … })`: work that runs once the handler has answered (its
-  changes commit when it is done).
+- `after(async { … })`: work that runs once the client has the whole answer
+  (or has gone), before the object's next request; work it passes to
+  `after` runs too. What it changes commits when all of it is done, and
+  rolls back if any of it panics or runs out of time; the answer stands.
+  The main README's "Commits" has the model, which `ctx.waitUntil` shares.
 - `id()`, `app()`, `env(key)`, `sleep(d)`, `quote(s)`; `wasip3` for the rest.
 
 The [chat example](../../examples/chat) uses most of it.
