@@ -4855,8 +4855,10 @@ mod nodes {
         let away = shipped.with_extension("away");
         std::fs::rename(&shipped, &away).unwrap();
         std::fs::write(&shipped, "").unwrap();
+        // Answered 500, or 504 when the request's deadline (here 1 s) ends
+        // the wait first; the commit stands either way.
         let written = get(proxy, "unacked.test", &format!("/{object}/commit?v=two")).await;
-        assert_eq!(written.0, 500, "{written:?}");
+        assert!(matches!(written.0, 500 | 504), "{written:?}");
         let read = {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
