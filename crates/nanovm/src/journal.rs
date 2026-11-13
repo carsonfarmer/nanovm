@@ -33,9 +33,10 @@
 //! An object has a directory only from its first change on: until then its
 //! volume is an empty directory from the app's pool, moved into its place
 //! by that change (`place`), if the app has room for another object. When
-//! its instance ends, what it didn't commit is rolled back, and an object
-//! whose volume is then empty, with no captured history, is removed
-//! (`Objects::settle`): one that never committed a change leaves nothing.
+//! its instance ends, an object whose volume is empty, with no captured
+//! history, is removed (`Objects::settle`); one the instance made that never
+//! committed is rolled back first. So one that never committed a change
+//! leaves nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -88,6 +89,8 @@ pub struct Journal {
     objects: Option<Arc<Objects>>,
     /// The volume, while it is still the pool's (see `place`).
     fresh: Option<TmpDir>,
+    /// This instance placed the volume, and nothing in it is committed yet.
+    made: bool,
     /// The volume's device and inode: it never moves, so a descriptor for it
     /// needs no asking where it is.
     root: (u64, u64),
@@ -152,6 +155,7 @@ impl Journal {
             volume: fresh.as_ref().map_or(volume, |t| &t.0).to_path_buf(),
             objects: objects.cloned(),
             fresh,
+            made: false,
             root: (md.dev(), md.ino()),
             dir,
             log: None,
@@ -228,7 +232,7 @@ impl Journal {
             return Err(e);
         }
         *path = volume.join(path.strip_prefix(std::mem::take(&mut tmp.0)).expect("in the volume"));
-        self.fresh = None;
+        (self.fresh, self.made) = (None, true);
         // Its name in the object's directory is made durable at commit.
         self.touched.insert(PathBuf::new());
         self.volume = volume;
@@ -658,18 +662,22 @@ impl Journal {
         self.sized.clear();
         self.created.clear();
         self.held = (0, self.unlinked.iter().map(|(_, bytes)| bytes).sum());
-        self.poisoned = false;
+        (self.poisoned, self.made) = (false, false);
         Ok(())
     }
 }
 
 /// When the instance ends (with the last handle on its quota, so after any
-/// commit in flight): what it didn't commit is rolled back now, not when the
-/// object next starts, and an object left empty goes (`Objects::settle`).
+/// commit in flight), an object left empty goes (`Objects::settle`). One
+/// this instance made, which never committed, is rolled back first, so it
+/// leaves nothing; any other is rolled back when it next starts.
 impl Drop for Journal {
     fn drop(&mut self) {
         let Some(objects) = self.objects.clone().filter(|_| self.fresh.is_none()) else { return };
         let undo = self.log.is_some() || self.poisoned;
+        if undo && !self.made {
+            return;
+        }
         let settled = (|| {
             if undo {
                 recover(&self.base, &self.dir, &self.obj)?;
