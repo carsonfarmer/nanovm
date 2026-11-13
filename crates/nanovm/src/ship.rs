@@ -956,6 +956,41 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// What an operator holds still for a delete or a restore (`Held`: an
+    /// object, or a whole app) isn't shipped meanwhile; the rest is, and it
+    /// is once let go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shipper_passes_what_is_held_over() {
+        let base = tempdir("held");
+        let (objects, store) = (base.join("objects"), Arc::new(Dir(base.join("store"))));
+        let dir = |o: &str| versions(&objects.join("app"), o);
+        let held: Arc<Held> = Default::default();
+        held.write().await.insert("app/o".into());
+        let one = [version(&dir("o"), 1, 0, "", "o1"), version(&dir("p"), 1, 0, "", "p1")];
+        let shipper = tokio::spawn(run(objects.clone(), store.clone(), None, held.clone()));
+        let at = async |o: &str| head(&*store, "app", o).await.unwrap().0.sequence;
+        let until = async |o: &str, n: u64| {
+            let t0 = std::time::Instant::now();
+            while at(o).await < n {
+                assert!(t0.elapsed() < Duration::from_secs(5), "{o} never reached {n}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        until("p", 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(at("o").await, 0, "a held object shipped");
+        // The whole app held: neither ships.
+        held.write().await.insert("app".into());
+        version(&dir("p"), 2, 0, &one[1], "p2");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!((at("o").await, at("p").await), (0, 1), "a held app shipped");
+        held.write().await.clear();
+        until("o", 1).await;
+        until("p", 2).await;
+        shipper.abort();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// A version that names another app or object is never shipped as this
     /// one's, wherever it is found (a worker can put anything in its own
     /// directory).
