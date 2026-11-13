@@ -836,6 +836,60 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// A store each of whose calls takes `delay` (an object store's round
+    /// trip).
+    struct Latent {
+        store: Objects,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Store for Latent {
+        async fn put(&self, key: &str, bytes: Vec<u8>) -> io::Result<Put> {
+            tokio::time::sleep(self.delay).await;
+            self.store.put(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+            tokio::time::sleep(self.delay).await;
+            self.store.get(key).await
+        }
+        async fn read(&self, key: &str) -> io::Result<Option<(Vec<u8>, Tag)>> {
+            tokio::time::sleep(self.delay).await;
+            self.store.read(key).await
+        }
+        async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>> {
+            tokio::time::sleep(self.delay).await;
+            self.store.swap(key, bytes, tag).await
+        }
+    }
+
+    /// With remote acknowledgement (the default with leases), each commit
+    /// waits up to two seconds (`stored`) for the shipper to make its
+    /// version count. Objects committing at once on one node, with a store
+    /// answering in 25 ms, must each be acknowledged in that time: else
+    /// the write is answered 500 (commit-failed) though it stands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn review_remote_acks_keep_up_with_objects_committing_at_once() {
+        let base = tempdir("acks");
+        let objects = base.join("objects");
+        const OBJECTS: usize = 40;
+        let dirs: Vec<_> = (0..OBJECTS).map(|i| objects.join(format!("app/~committed/o{i}"))).collect();
+        for dir in &dirs {
+            version(dir, 1, 0, "", "v");
+        }
+        let store = Arc::new(Latent { store: Objects(Arc::new(object_store::memory::InMemory::new())), delay: Duration::from_millis(25) });
+        let shipper = tokio::spawn(run(objects, store, None));
+        // Each commit's wait, as `Journal::commit` makes it, all at once.
+        let waits: Vec<_> = dirs.iter().cloned().map(|dir| tokio::task::spawn_blocking(move || stored(&dir, 1))).collect();
+        let mut late = 0;
+        for w in waits {
+            late += w.await.unwrap().is_err() as usize;
+        }
+        shipper.abort();
+        assert_eq!(late, 0, "{late} of {OBJECTS} commits at once were not acknowledged within the 2 s wait");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// A node ships an object's versions only under its live lease on the
     /// object, at the epoch it claimed the head with: not with no lease, nor
     /// a released, lapsed, or since-replaced one, though the lease record may
