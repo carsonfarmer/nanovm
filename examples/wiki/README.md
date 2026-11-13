@@ -1,7 +1,7 @@
 # Wiki with history
 
 A wiki that keeps every revision, refuses lost updates and diffs any two
-revisions, in about 130 lines of Rust ([src/lib.rs](src/lib.rs)) on
+revisions, in about 170 lines of Rust ([src/lib.rs](src/lib.rs)) on
 [nanovm-sdk](../../sdk/rust), `pulldown-cmark` and `similar`.
 
 ```sh
@@ -27,8 +27,14 @@ What it shows:
   insert are one statement, and the wiki serves one request at a time, so
   two editors of the same revision can't both win.
 - **Libraries work.** `pulldown-cmark` renders Markdown and `similar` makes
-  unified diffs, both plain crates built for `wasm32-wasip2`. Raw HTML in a
-  page is escaped, so a page can't run script in its readers' browsers.
+  unified diffs, both plain crates built for `wasm32-wasip2`.
+- **A page can't run script in its readers' browsers.** Raw HTML in it is
+  escaped, and Markdown's own links and images keep only http, https,
+  mailto and relative destinations, read as a browser reads them (any
+  case; tabs and newlines inside and controls around ignored): a
+  `[click](javascript:…)` is shown as its text. The rendered page's
+  `Content-Security-Policy` (`default-src 'none'`, images only) refuses
+  script besides.
 
 API: `PUT /{wiki}/pages/{name}?author=…` (a name is 1-100 letters, digits,
 `_` or `-`; `if-match: <rev>`, `0` for a new page; body: Markdown) → `201
@@ -37,5 +43,6 @@ API: `PUT /{wiki}/pages/{name}?author=…` (a name is 1-100 letters, digits,
 /{wiki}/pages/{name}/history` → `[{"rev","author","at","bytes"}]`; `GET
 /{wiki}/pages/{name}/diff?from=&to=`; `GET /{wiki}/` → `[{"page","rev"}]`.
 
-Test: `wiki_keeps_every_revision_and_refuses_lost_updates` in
+Tests: `wiki_keeps_every_revision_and_refuses_lost_updates` and
+`review_wiki_does_not_serve_executable_markdown_links` in
 [crates/nanovm/tests/examples.rs](../../crates/nanovm/tests/examples.rs).

@@ -24,7 +24,7 @@ node.
 | [presence](../examples/presence) | A-12 | join/leave/typing over WebSockets; two tabs are one person; presence that lapses when a restart drops sockets silently | 4.5 |
 | [tictactoe](../examples/tictactoe) | A-1 | a lobby pairing players through calls (ten at once make five games of two); each game the authority on its moves | 3.2 |
 | [flags](../examples/flags) | A-8 | defaults in config, overrides per tenant object pushed live; stable, monotonic percentage rollouts | 3.3 |
-| [wiki](../examples/wiki) | A-10 | revisions in SQLite; lost updates refused with `if-match`; Markdown (`pulldown-cmark`) with raw HTML escaped; diffs (`similar`) | 2.2 |
+| [wiki](../examples/wiki) | A-10 | revisions in SQLite; lost updates refused with `if-match`; Markdown (`pulldown-cmark`) with raw HTML escaped, link and image destinations limited to http(s), mailto and relative, and a no-script CSP; diffs (`similar`) | 2.2 |
 | [notes](../examples/notes) | A-19 | an FTS5 index per person: ranked, highlighted prefix search; user input never query syntax | ~2 |
 | [analytics](../examples/analytics) | A-15 | batched ingest in one statement; per-day rollups kept by a trigger; CSV | ~2 |
 | [reminders](../examples/reminders) | A-26 | acting on time without alarms: an external tick or client polling, each reminder fired once | 3.3 |

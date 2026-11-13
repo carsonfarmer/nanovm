@@ -951,6 +951,54 @@ async fn wiki_keeps_every_revision_and_refuses_lost_updates() {
     assert_eq!(next.json()["rev"], 3);
 }
 
+/// examples/wiki: Markdown's own links and images, not only its raw HTML,
+/// can run script: `[x](javascript:…)` is an `href` a click runs. The
+/// destinations served are read as a browser reads them (case, tabs and
+/// newlines inside, controls around), and only http, https, mailto and
+/// relative ones are kept; the page's CSP refuses script besides.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_wiki_does_not_serve_executable_markdown_links() {
+    let app = App::start("wiki", json!({})).await;
+    let hostile = "# Links\n\n\
+        [a](javascript:alert(1)) [b](JaVaScRiPt:alert(2)) [c](java&#x09;script:alert(3)) [d](&#x20;javascript:alert(4))\n\
+        <javascript:alert(5)> [e][ref] ![f](javascript:alert(6)) [g](vbscript:msgbox(7))\n\
+        [h](data:text/html;base64,PHNjcmlwdD5hbGVydCg4KTwvc2NyaXB0Pg==) [i](&#106;avascript:alert(9)) [j](java\nscript:alert(10))\n\n\
+        [ref]: javascript:alert(11)\n\n\
+        [ok](https://example.com/a?b=1&c=2) [rel](/w/pages/Other) [mail](mailto:ann@example.com) [frag](#top) [page](Other)\n\
+        ![img](https://example.com/i.png) [plain](http://example.com/) [colon](./a:b)\n";
+    let saved = app.send("PUT", "/w/pages/Links", &[("if-match", "0")], hostile).await;
+    assert_eq!(saved.status, 201, "{saved:?}");
+    let page = app.get("/w/pages/Links").await;
+    let html = page.text();
+
+    // Every href and src, as the browser will resolve its scheme: entities
+    // decoded, tabs and newlines dropped, controls and spaces trimmed.
+    let mut urls = vec![];
+    for attr in ["href=\"", "src=\""] {
+        for (i, _) in html.match_indices(attr) {
+            let value = &html[i + attr.len()..];
+            let value = &value[..value.find('"').unwrap()];
+            let value = value.replace("&quot;", "\"").replace("&#39;", "'").replace("&#x27;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+            urls.push(value);
+        }
+    }
+    let scheme = |url: &str| -> Option<String> {
+        let url: String = url.trim_matches(|c: char| c <= ' ').chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+        let end = url.find(|c: char| !(c.is_ascii_alphanumeric() || "+-.".contains(c)))?;
+        (url[end..].starts_with(':') && url.starts_with(|c: char| c.is_ascii_alphabetic())).then(|| url[..end].to_ascii_lowercase())
+    };
+    for url in &urls {
+        if let Some(s) = scheme(url) {
+            assert!(["http", "https", "mailto"].contains(&s.as_str()), "an executable destination {url:?} in {html}");
+        }
+    }
+    for kept in ["https://example.com/a?b=1&c=2", "/w/pages/Other", "mailto:ann@example.com", "#top", "Other", "https://example.com/i.png", "http://example.com/", "./a:b"] {
+        assert!(urls.iter().any(|u| u == kept), "{kept} is kept: {urls:?}");
+    }
+    let csp = page.header("content-security-policy");
+    assert!(csp.contains("default-src 'none'") && !csp.contains("script-src"), "no script, whatever the page holds: {csp:?}");
+}
+
 /// examples/notes: an FTS5 index per person, kept in step by the same
 /// statements that save notes; ranked, highlighted prefix search that
 /// treats query syntax as words; durable.
