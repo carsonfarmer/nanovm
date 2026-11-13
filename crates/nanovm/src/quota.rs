@@ -188,7 +188,7 @@ impl QuotaGuard {
             max_files: limits.max_files,
             bytes,
             files,
-            park: Park { disk: disk.clone(), id: obj.id.clone(), counted: bytes, volume: journal.volume().into() },
+            park: Park { disk: disk.clone(), id: obj.id.clone(), counted: bytes, volume: journal.volume().into(), removed: 0 },
             disk,
             journal,
             denials: 0,
@@ -351,25 +351,30 @@ impl QuotaGuard {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        (self.park.counted, self.park.volume) = (self.bytes, self.journal.volume().to_path_buf());
+        let p = &mut self.park;
+        (p.counted, p.volume, p.removed) = (self.bytes, self.journal.volume().to_path_buf(), self.journal.removed());
     }
 }
 
 /// An instance's usage, handed to its app when the instance ends: then
 /// what the object's volume holds is the app's while it has no instance,
-/// measured once the journal has rolled back what the instance left
-/// uncommitted (its own `Drop`); what it held in `/tmp` goes with it.
+/// measured once the journal's own `Drop` has settled it (and rolled back
+/// an object the instance made but never committed); what it held in
+/// `/tmp` goes with it.
 struct Park {
     disk: Arc<Disk>,
     id: Arc<str>,
     counted: u64,
     volume: std::path::PathBuf,
+    /// What the instance removed and didn't commit.
+    removed: u64,
 }
 
 impl Drop for Park {
     fn drop(&mut self) {
         let held = match usage(&self.volume) {
-            Ok((bytes, _)) => bytes,
+            // What it removed comes back when the object next starts.
+            Ok((bytes, _)) => bytes + self.removed,
             // The object, emptied, is gone.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(_) => self.counted,
@@ -1036,7 +1041,8 @@ mod tests {
         std::fs::write(volume("a").join("old"), [0; 40]).unwrap();
         let a = guard("a");
         assert_eq!((disk.used.load(Relaxed), a.usage().0), (40 + 6 + 2, 40));
-        // A removal it leaves uncommitted is rolled back as it ends.
+        // A removal it leaves uncommitted counts until the object next
+        // starts, which rolls it back.
         a.unlink(&volume("a").join("old"), 40).unwrap();
         assert_eq!(disk.used.load(Relaxed), 6 + 2);
         drop(a);
