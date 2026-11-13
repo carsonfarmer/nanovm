@@ -583,7 +583,7 @@ impl Supervisor {
         let procs = procs.map(|p| std::fs::OpenOptions::new().write(true).open(&p).with_context(|| format!("opening {}", p.display()))).transpose()?;
         let c = procs.as_ref().map_or(-1, |f| f.as_raw_fd());
         let mut cmd = Command::new(&self.exe);
-        cmd.arg("worker")
+        cmd.arg0("nanovm").arg("worker")
             .env_clear()
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())

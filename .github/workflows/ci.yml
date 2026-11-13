@@ -44,6 +44,14 @@ jobs:
           sudo apt-get install -y restic
           python3 -m unittest discover -s scripts -p test_backup.py -v
           sudo python3 -m unittest discover -s scripts -p test_backup.py -v
+      - name: Check the ops tooling (deploy, docs/ops, tools)
+        run: |
+          for d in deploy/single-node tools/bench-history tools/release; do
+            python3 -m unittest discover -s "$d" -v
+          done
+          shellcheck -S warning deploy/single-node/install.sh deploy/single-node/test/e2e.sh \
+            deploy/systemd/test/*.sh deploy/container/test/local.sh docs/ops/drills/*.sh \
+            docs/ops/errors-check.sh tools/release/package.sh experiments/fs-matrix/run.sh
       - name: Report runtime line count
         run: |
           python3 - <<'PY'

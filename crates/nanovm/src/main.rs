@@ -20,8 +20,7 @@ fn main() -> anyhow::Result<()> {
     match args.as_slice() {
         [cmd, flag, path] if cmd == "serve" && flag == "--config" => serve(NodeConfig::load(&PathBuf::from(path))?),
         [cmd, flag, path] if cmd == "proxy" && flag == "--config" => {
-            let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
-            let cfg: nanovm::config::ProxyConfig = toml::from_str(&text).with_context(|| format!("parsing {path}"))?;
+            let cfg = nanovm::config::ProxyConfig::load(Path::new(path))?;
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let listener = tokio::net::TcpListener::bind(&cfg.listen).await.with_context(|| format!("binding {}", cfg.listen))?;

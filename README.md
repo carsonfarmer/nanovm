@@ -219,6 +219,31 @@ Every attack in the storm, and how it ended:
 | fetch cloud metadata (169.254.169.254) | denied (not on the allowlist) |
 | allowlisted name that resolves to 127.0.0.1 | denied by the resolved-IP check (in this sandbox, which has no DNS, it fails to resolve instead; the `localhost` integration test covers the IP check) |
 
+## Deploy and operate
+
+To run a single-node beta for a few trusted developers, follow
+[deploy/single-node](deploy/single-node/README.md), the operator guide: TLS
+(Caddy), the proxy, the node, the capture store and backups, limits and
+observability, with links to the runbooks for everything after.
+
+| Path | What it is |
+|---|---|
+| [deploy/single-node](deploy/single-node/README.md) | the operator guide, `install.sh`, `check-host.py`, the Caddyfile, sizing, an end-to-end test |
+| [deploy/systemd](deploy/systemd/README.md) | hardened units, the sysctl, cgroup and store drop-ins, reference configs, a test in systemd-nspawn |
+| [deploy/container](deploy/container/README.md) | a Dockerfile for the node and the proxy, run flags, reference configs, a local test |
+| [deploy/monitoring](deploy/monitoring/README.md) | Prometheus alerts and recording rules, with promtool tests |
+| [docs/ops/runbooks.md](docs/ops/runbooks.md) | upgrade, rollback, backup and restore, disk full, crash loops, Collector outage; [drills](docs/ops/drills) reproduce them |
+| [docs/ops/errors.md](docs/ops/errors.md) | every `x-nanovm-error` reason; `errors-check.sh` triggers them |
+| [tools/release](tools/release/README.md) | release packaging and notes; the release workflow ships disabled until the owner approves it |
+| [tools/bench-history](tools/bench-history/README.md) | `bench --quick` per commit, compared and charted by a nightly workflow |
+| [experiments/fs-matrix](experiments/fs-matrix/README.md) | durable writes on ext4, XFS and btrfs, with and without `discard` (measured before round 3) |
+
+`crates/nanovm/tests/configs.rs` loads every config shipped here (and every
+app's `nanovm.json`) with the loaders the binary uses, so a renamed key fails a
+test instead of an operator's start. Evidence: [notes/ops.md](notes/ops.md)
+(the ops branches) and [notes/beta-deployable.md](notes/beta-deployable.md)
+(the same on round 3).
+
 ## The jail
 
 ```
@@ -619,10 +644,12 @@ Every scenario completed with 0 failed requests.
 The supervisor and each worker check these at startup and refuse to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
 
 - **File descriptors:** each live object holds 2 (`/data` and `/tmp`). The check needs about `2 × max_live_objects + 1024`. The worker raises its soft limit to the hard limit itself, before it jails itself; the demo's 8,000 objects per app need `ulimit -n` of at least 17,088.
-- **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 8,000 needs `sysctl -w vm.max_map_count=68352` or more.
+- **Memory mappings:** about 24 per pool slot (`engine::MAPS_PER_OBJECT`) plus 4,096. The default `vm.max_map_count` of 65,530 fits about 2,500 objects per app; 8,000 needs `sysctl -w vm.max_map_count=196864` or more.
 - **Address space:** the engine reserves each pool slot's 4 memories (`memory_reservation_mb` + 64 KiB each), stacks and tables up front, about 522 GiB at the defaults. Under `ulimit -v` or `LimitAS=` below that, `nanovm serve` refuses to start with the number; remove the limit or lower `max_live_objects` or `memory_reservation_mb`.
 - **The jail** needs Landlock (Linux 5.13+) and seccomp. A separate uid per app needs the supervisor to run as root.
 - **Don't run with `RUST_BACKTRACE` set.** wasmtime then captures a stack backtrace for every guest-visible error. That includes routine ones, like reading a file that doesn't exist yet. With it set, warm throughput across 1,000 objects fell from 63K/s to 23K/s.
+
+[deploy/single-node/check-host.py](deploy/single-node/check-host.py) checks each of these against a node's config before it starts; [deploy/systemd](deploy/systemd/README.md) has hardened units for the node and the proxy, with a sysctl drop-in for the mappings.
 
 ## Tests
 
@@ -767,6 +794,9 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 | `crates/nanovm/src/ws.rs` | WebSockets: the proxy's sockets, WebSocket-over-HTTP events and per-object channels |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
 | `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |
+| `deploy/` | Single-node operator guide, systemd units, container image, alerts ([Deploy and operate](#deploy-and-operate)) |
+| `docs/ops/` | Runbooks, drills and the error guide |
+| `tools/release/`, `tools/bench-history/` | Release packaging and notes; benchmark history |
 
 ## Known limits of this phase
 
