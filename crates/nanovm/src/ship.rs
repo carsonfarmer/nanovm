@@ -249,12 +249,12 @@ pub(crate) fn marker(dir: &Path) -> PathBuf {
     objects.join("~shipped").join(dir.file_name().expect("an object's"))
 }
 
-/// Records `sequence` in `marker`, whole.
+/// Records `sequence` in `marker`, whole: through a file of its own, as
+/// claims and the shipper mark objects at once.
 fn mark(marker: &Path, sequence: u64) -> io::Result<()> {
-    let new = marker.with_file_name("~new");
-    std::fs::create_dir_all(marker.parent().expect("in ~shipped"))?;
-    std::fs::write(&new, sequence.to_string())?;
-    std::fs::rename(new, marker)
+    let dir = marker.parent().expect("in ~shipped");
+    std::fs::create_dir_all(dir)?;
+    std::fs::rename(written(dir, sequence.to_string().as_bytes())?, marker)
 }
 
 /// Waits, two seconds at most (within an instance's post-return deadline),
