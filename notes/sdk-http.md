@@ -187,6 +187,12 @@ response's headers back into `Fields`. Earlier runs, under heavier load
   (`wait_until_*` included), and integration.rs's 4 `after`/stream tests.
   The first four mutations ran before the merge (echo rebuilt each time),
   the last four after it.
+- The full suite at the end (`env -u RUST_BACKTRACE RUST_TEST_THREADS=1
+  cargo test --locked -p nanovm`): 155 unit, 98 integration (14 ignored),
+  28 examples, 9 dev, 17 js, 2 `committed_state`, all passing; the
+  production check (`cargo check --locked -p nanovm --bin nanovm`) and the
+  SDK's CI step (`cargo test --locked --manifest-path examples/Cargo.toml -p
+  nanovm-sdk`) pass too.
 
 ## JavaScript
 
