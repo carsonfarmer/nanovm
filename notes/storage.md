@@ -7,7 +7,8 @@ Branch `cf/storage` (from `cf/main-next`). ISSUES N-160..166, W-80.
 A counter `POST /incr` creates `count.tmp`, writes it and renames it over
 `count`. Before this work it made 6 fsync + 3 fdatasync calls (strace -c), and
 on a private nojournal ext4 loop device 23 writes, 2 discards and 9 flushes
-(journaled ext4: 16.9 writes, 12.7 flushes):
+(journaled ext4: 16.9 writes, 12.7 flushes; the device counts are the authors',
+see Numbers):
 
 - the request's first undo record created the log and synced three directories;
 - every record was synced on its own (the created file; the replaced file moved
@@ -42,9 +43,10 @@ own `sync` reached the disk (SQLite syncs ~1.7 times per statement).
   first and hung a post-return test: don't use it inside wasmtime's event loop.
 - **A guest's `sync`/`sync-data` do nothing**: durability is the commit's.
 
-`/incr` now: 5 flushes (the created file; the rename with the replaced file;
-`count`; the directory; the key), 15 writes, 1 discard (the replaced file, removed
-after commit). Journaled ext4: 9.5 writes, 5.5 flushes.
+`/incr` now: 5 sync calls (the created file; the rename with the replaced file;
+`count`; the directory; the key). On the authors' loop device, 15 writes, 5 flushes
+and 1 discard (the replaced file, removed after commit); journaled ext4: 9.5 writes,
+5.5 flushes.
 
 The crash protocol changed, so: the existing crash-cut tests pass (unit sync
 failures at every point of record/commit/recover, recovery interrupted at every
@@ -90,8 +92,13 @@ refusal keeps main's log and capture.
 
 ## Numbers
 
-Device I/O per request, bench `--writes --quick`, private loop devices (only the
-bench uses them, so the counters are exact):
+Sync calls per write (fsync and fdatasync, strace -c): `/incr` 9 -> 5, with
+capture 17 -> 7. An independent audit reproduced these exactly. They are
+syscalls, not device flushes: the audit could not reproduce the flush counts
+below on virtual storage, where a sync need not reach the device as one flush.
+
+Device I/O per request as the authors measured it, bench `--writes --quick`,
+private loop devices (only the bench used them); not reproduced by the audit:
 
 | per request | nojournal ext4 (discard) | journaled ext4 |
 |---|---|---|
@@ -100,12 +107,17 @@ bench uses them, so the counters are exact):
 | `/set` (SQL+file+KV) before | 27 writes, 1 discard, 11 flushes | |
 | `/set` after | 18.7 writes, 7 flushes | |
 
-Real disk (this VM's nojournal ext4, load average 10-25 from other agents), 3
-alternating rounds, dev profile, medians (ranges): `POST /incr` 256-concurrent
-over 100 objects 388/s (350-625) -> 1,057/s (1,023-1,229), p99 2.6 s -> 0.98 s;
-serial 40/s (34-87) -> 75/s (72-80); process CPU per write 1,069 µs -> 848 µs
-concurrent, 1,718 -> 1,346 µs serial. Wall-clock numbers here swing several-fold
-with other agents' I/O; trust the device counts.
+Throughput and CPU, from the audit: an idle 4-vCPU machine, 3 alternating
+pairs, medians [ranges]. Concurrent writes (`POST /incr`) 784/s [763-797] ->
+3,074/s [3,031-3,094], p99 1,407 ms -> 302 ms, process CPU per write
+932 µs -> 749.5 µs (-19.6%); serial 323/s -> 530/s, CPU per write 810 µs -> 820 µs
+(+1.2%, ranges overlap). These replace the authors' figures where they conflict:
+round3's notes had serial writes flat (385 -> 394/s) at about 12% more CPU, and
+this note had serial CPU falling (1,718 -> 1,346 µs); neither reproduced. The
+authors' run on a loaded VM (load average 10-25 from other agents) had concurrent
+388/s -> 1,057/s, p99 2.6 s -> 0.98 s and serial 40/s -> 75/s; wall-clock numbers
+there swung several-fold with other agents' I/O. Trust the sync call counts and
+the audit's numbers.
 
 Reproduce: `cargo build --example bench`; for exact counts make a loop device
 (`truncate -s 2G x.img; mkfs.ext4 -O ^has_journal x.img; losetup --direct-io=on
@@ -132,8 +144,9 @@ On top of Amp's W-9 local capture (b7bf806):
   the same directory after the key's sync. Recovery publishes a staged version
   whose key is gone (after syncing the log, since a key it sees may not be
   durable) and discards, durably before any undo, one staged under the current
-  key. With capture, `/incr`: 17 flushes and 39.8 writes -> 7 and 20.9; `/set`:
-  19 flushes -> 9.
+  key. With capture, `/incr`: 17 sync calls -> 7 (reproduced by the audit); on the
+  authors' loop device 39.8 writes -> 20.9, and `/set` 19 flushes -> 9 (not
+  reproduced).
 - **Shipping.** With `capture.store` set (a directory, or an object store URL as
   for `leases`: round3's `object_store`, S3 and compatibles), the supervisor
   (jailed workers have no network), or an in-process node, ships each object's

@@ -92,12 +92,14 @@ spare), and `tests/dev.rs` reads the pulled component from its cache file (C5).
 - **Fewer syncs per write.** The undo log is kept and a commit writes a new key that voids every
   record at once; records made back to back share one sync; commits run off the worker thread;
   a guest's own `sync` is a no-op because the commit already makes the request durable. A counter
-  write costs 5 device flushes instead of 9 (with capture, 7 instead of 17).
-- **Evidence on round3** (quiet machine, dev profile, 3 alternating rounds, medians): concurrent
-  `POST /incr` 1,058/s → 1,978/s (1.87×), p99 1.06–1.28 s → 0.46–0.48 s, CPU per concurrent write
-  1,121 → 870 µs (−22%). Serial writes are flat on a quiet disk (385 → 394/s) and cost about 12% more
-  CPU, because each writing commit is handed to a blocking thread; under disk contention serial
-  writes went 40 → 75/s.
+  write makes 5 sync calls instead of 9 (with capture, 7 instead of 17). These are syscalls
+  (fsync/fdatasync), reproduced exactly by an independent audit; that they are as many device
+  flushes was not reproduced on virtual storage.
+- **Evidence** (the audit's: idle 4-vCPU machine, 3 alternating pairs, medians [ranges]):
+  concurrent `POST /incr` 784 [763–797] → 3,074 [3,031–3,094]/s, p99 1,407 → 302 ms, CPU per
+  write 932 → 749.5 µs (−19.6%). Serial writes are not flat: 323 → 530/s, at the same CPU per
+  write (810 → 820 µs, +1.2%, ranges overlap). These replace the figures first given here, which
+  they contradict: serial writes flat (385 → 394/s) at about 12% more CPU did not reproduce.
 - **Committed versions as changes (format 3).** A snapshot every 16 versions, changes in between
   (a 1-byte change to a 1 MiB file is a version under 8 KiB), each carrying the lease epoch.
 - **Shipping and restore.** Versions are shipped in order to a put-once store (a directory, or S3,
@@ -107,6 +109,12 @@ spare), and `tests/dev.rs` reads the pulled component from its cache file (C5).
 - **Limits.** A short window between reading the lease record and the put remains (W-90, needs a
   head pointer written with `If-Match`); the shipper polls every 20 ms (N-165); restore reads every
   version (N-166); a log left uncommitted by an older binary is refused, so drain before upgrading.
+- **Review fixes** (`fix/storage-r3fix`). A commit that outlives a request killed at its deadline
+  owns the volume until it ends: the next instance's recovery, and retirement, wait for it (S1).
+  Upgrading from main publishes a capture main decided but hadn't published, and reads main's
+  whole-volume history as snapshots the new changes apply to (S2, `notes/storage.md`). Restore
+  takes files and directories only and reaches everything from the root's descriptor without
+  following a symlink (S4). +125 runtime lines.
 - +494 runtime lines, no new dependencies. All tests pass, including 114 SQLite recovery cuts and
   the new lease-fenced shipping tests.
 
