@@ -1697,7 +1697,7 @@ async fn review_oauth_state_must_be_bound_to_the_starting_browser() {
     };
     let callback = async |state: &str, cookies: &str| {
         let back = app.send("GET", &format!("/auth/callback?code=good&state={state}"), &[("cookie", cookies)], "").await;
-        let session = back.headers.get_all("set-cookie").iter().any(|c| c.to_str().unwrap().starts_with("session="));
+        let session = back.headers.get_all("set-cookie").iter().any(|c| c.to_str().unwrap().starts_with("__Host-session="));
         (back.status, session)
     };
 
@@ -1724,4 +1724,39 @@ async fn review_oauth_state_must_be_bound_to_the_starting_browser() {
     assert_eq!(again.split(';').next().unwrap(), nonce, "a browser keeps its nonce");
     assert_eq!(callback(&second, nonce).await, (302, true));
     assert_eq!(callback(&first, nonce).await, (302, true));
+}
+
+/// review2 (D1): over https the session cookie is a `__Host-` one too, which
+/// only this origin can set. A sibling host could plant a plain `session`
+/// cookie (`Domain=` the parent, `Path=/u-{its login}`) holding its own
+/// valid session, and a browser would be signed in as it on its pages:
+/// login CSRF without the callback. A plain `session` cookie signs no one in.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_oauth_session_cookie_is_a_host_cookie_over_https() {
+    let gh = github().await;
+    let patch = json!({
+        "limits": {"egress": [gh]},
+        "config": {"authorize_url": "https://github.example/authorize", "token_url": format!("http://{gh}/token"),
+                   "user_url": format!("http://{gh}/user"), "client_id": "app-1", "redirect_uri": "https://app.example/auth/callback"},
+        "env": {"CLIENT_SECRET": "s3cret"},
+    });
+    let app = Local::start("oauth", patch);
+    let to = app.send("GET", "/auth/login", &[], "").await;
+    let state = to.header("location").split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+    let nonce = to.header("set-cookie").split(';').next().unwrap().to_string();
+    let back = app.send("GET", &format!("/auth/callback?code=good&state={state}"), &[("cookie", &nonce)], "").await;
+    assert_eq!(back.status, 302);
+    let set = back.header("set-cookie").to_string();
+    let attrs: Vec<&str> = set.split(';').map(str::trim).collect();
+    assert!(attrs[0].starts_with("__Host-session=ann."), "{set}");
+    for attr in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
+        assert!(attrs.contains(&attr), "{attr}: {set}");
+    }
+    assert!(!set.to_ascii_lowercase().contains("domain="), "{set}");
+    let planted = format!("session={}", attrs[0].split_once('=').unwrap().1);
+    assert_eq!(app.send("GET", "/u-ann/me", &[("cookie", &planted)], "").await.status, 401, "a plain session cookie: {planted}");
+    assert_eq!(app.send("GET", "/u-ann/me", &[("cookie", attrs[0])], "").await.status, 200);
+    let out = app.send("POST", "/u-ann/logout", &[("cookie", attrs[0])], "").await;
+    let cleared = out.header("set-cookie");
+    assert!(out.status == 204 && cleared.starts_with("__Host-session=;") && cleared.contains("Secure") && cleared.contains("Max-Age=0"), "{cleared}");
 }
