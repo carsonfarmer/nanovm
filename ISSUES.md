@@ -712,6 +712,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** a version up to the head's is the head's history when this copy has the head's version (a claim made it so; versions here are a chain): it is marked, not shipped again.
 - **Status:** fixed on `fix/r3-lease` (73dbc48)
 
+### B-210: after a claim restores an object, the supervisor's chown follows the path the worker can change
+- **Where:** `supervisor.rs` (`restored`, `chown_tree`)
+- **Scenario:** found while moving B-502's descriptor paths onto the per-object layout. `restored` gives what a claim restored to the app's uid by walking `objects/<app>/<shard>/<object>` by path as root: `lchown` doesn't follow the last name, but a shard (or, before, `~committed`) the worker replaced with a symlink is followed. `claim`'s `discard` refuses such a symlink first, but a claim that keeps the copy (`current`) doesn't discard. Same exposure as on `cf/round3`; only with leases.
+- **Suggestion:** chown through `dir_at` (`fchownat` with `AT_SYMLINK_NOFOLLOW` from the object's directory, opened a name at a time), as `mark` and `discard` do.
+- **Status:** open (from source)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
