@@ -60,10 +60,11 @@ object's own quota as before, and now `the node's disk is full` for an ENOSPC th
 (before, that was reported as the object's quota).
 
 With `beta/objects` merged, an app's objects are `objects/<app>/<shard>/<id>/data`, an object has
-a directory only from its first change, and its journal rolls back what an instance left uncommitted
-when the instance ends: the budget walks each `<shard>/<id>/data` at load, and an ended instance's
-volume is measured after that rollback (a `Park` field dropped after the journal), so the app counts
-exactly what stays; a volume the journal removed because it emptied counts 0.
+a directory only from its first change, and when an instance ends its journal removes an object it
+made and never committed (any other's uncommitted changes are rolled back when it next starts): the
+budget walks each `<shard>/<id>/data` at load, and an ended instance's volume is measured after the
+journal's own `Drop` (a `Park` field dropped after the journal), so a removed object counts 0, and
+what an instance removed without committing counts until the rollback brings it back.
 
 Both limits count logical bytes, as the object quota does. Journals (68 KiB per object between
 requests), the capture outbox and block rounding are on top (B-304); the objects cap on
@@ -94,9 +95,9 @@ does. `scripts/vm-test.sh` now includes the test, which checks the placement and
 All on this sandbox (4 vCPU, 16 GiB, ext4), as root, shared with several other agents' builds and
 tests: load average 5–30 most of the time, near 0 for one short window. Runtime lines (CI's count):
 this branch merges `beta/objects` (its object layout, `objects/<app>/<shard>/<id>/data`, and per-app
-object cap), as the coordinator asked, and `cf/round3` at b12ffba (the worker fixes), so its delta is
-counted against the two merged: 7,717 → 8,044 (+327: `gate.rs` 145, `quota.rs` +112, `supervisor.rs`
-+43, `config.rs` +19, `proxy.rs` +7, the rest +1).
+object cap), as the coordinator asked, and `cf/round3` (6940893), so its delta is counted against the
+two merged: 7,826 → 8,161 (+335: `gate.rs` 145, `quota.rs` +114, `supervisor.rs` +43, `config.rs`
++19, `proxy.rs` +7, `journal.rs` +3 (`Journal::removed`), `app.rs` +2, the rest +2).
 Before that merge, against `cf/round3`: 7,410 → 7,728 (+318).
 
 The measurements below were taken before the merge (the hot path they cover, the gate and the
@@ -196,10 +197,19 @@ and restored with an empty diff:
 | M14 | an ended instance measured before its journal rolls back (`park` before `journal`) | `objects_share_their_apps_budget` |
 | M15 | an ended instance's usage kept as counted, not measured | `objects_share_their_apps_budget` |
 
-After both merges the full suite passes: 165 unit, 9 `dev`, 27 `examples`, 118 integration (14
-ignored, as on `cf/round3`), 17 JavaScript, 2 `committed_state`; and `cargo check -p nanovm --bin
-nanovm` (no dev feature). Example and JavaScript apps were the `beta/objects` worktree's builds,
-whose sources match `cf/round3`'s (`wac` isn't installed here to build them).
+After `beta/objects` narrowed its rollback rule (only an object the instance made and never
+committed is rolled back at its end), M14 was no longer caught; the test now also ends an instance of
+a new, never-committed object and checks it counts 0 once gone, which catches it again, and M8
+(forget an uncommitted removal) is caught again with `Journal::removed` back.
+
+On the final merge (`cf/round3` 6940893 and `beta/objects` 37bb607) the full serial suite passes:
+177 unit (1 ignored), 9 `dev`, 27 `examples`, 120 integration (14 ignored), 17 JavaScript, 2
+`committed_state`; and `cargo check -p nanovm --bin nanovm` (no dev feature). One integration test,
+`the_proxy_outlasts_idle_and_excess_connections`, failed once in the full run: its proxy left its
+private listener on the default port 8444, which something else on this shared machine held
+("Address already in use"); with 8444 taken it fails every time, and with its own free port it passes
+(B-309, fixed here). Example and JavaScript apps were the `beta/objects` worktree's builds, whose
+sources match `cf/round3`'s (`wac` isn't installed here to build them).
 
 ### Not done or not verified
 
