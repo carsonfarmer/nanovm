@@ -43,6 +43,8 @@ pub struct App {
     pub config: Arc<WasiConfigVariables>,
     pub objects: Arc<Objects>,
     pub scratch: Arc<Scratch>,
+    /// What its objects hold on disk, against its budget.
+    pub disk: Arc<crate::quota::Disk>,
     /// Advisory local exclusion, retained through every App owner's lifetime.
     _ownership: std::fs::File,
 }
@@ -172,6 +174,7 @@ impl App {
             config: Arc::new(cfg.config.iter().chain(&cfg.secrets.0).collect()),
             objects: Arc::new(Objects::load(objects.canonicalize()?, node.max_objects_per_app, &cfg.limits)?),
             scratch: Scratch::new(tmp)?,
+            disk: Arc::new(crate::quota::Disk::open(&objects, node.app_disk_mb, node.disk_reserve_mb)?),
             _ownership: ownership,
         })
     }
@@ -203,7 +206,7 @@ pub struct Objects {
 }
 
 impl Objects {
-    fn load(dir: PathBuf, max: u64, limits: &crate::config::Limits) -> std::io::Result<Objects> {
+    pub(crate) fn load(dir: PathBuf, max: u64, limits: &crate::config::Limits) -> std::io::Result<Objects> {
         let mut count = 0;
         for shard in std::fs::read_dir(&dir)? {
             let shard = shard?;

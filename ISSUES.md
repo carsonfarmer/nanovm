@@ -646,6 +646,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** the script copied the deleted `demo/static` (`set -e` stopped it), and the VM had no CA certificates, so every test failed building its HTTP client. Worker limits are the node's `[worker]`, not an app's `[app.worker]`.
 - **Fix:** the script copies the host's CA bundle and no longer `demo/static`, links `sleep`, and its default set includes the `cgroup` tests. Docs corrected.
 - **Status:** fixed on `fix/r3-worker`
+
 ### B-201: any request to an unknown object made a permanent volume (beta audit)
 - **Where:** `object.rs` (`new_store` made `<objects>/<app>/<id>` before instantiating), `table.rs` (any valid first path segment is an object)
 - **Scenario:** the production audit sent 300 `GET /scanN/wp-login.php`: all 404, and 301 volume directories stayed on disk. Nothing removed a volume, ever. The journal log and the capture directory already appeared only with a change; the volume was the one thing made up front.
@@ -892,6 +893,56 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix (docs, done):** README, PLAN and the runbook say a delete removes the backup too, and that only a store keeping its own old versions (S3 bucket versioning, object lock) can bring it back.
 - **Recommendation (owner):** keep delete removing the store's copy (it is what an erasure request needs, and an object that keeps its head in the store can't start a new history), and say in the operator guide to turn on bucket versioning with a lifecycle rule if deletes must be undoable for a while. Alternative: a two-step delete that renames the store's prefix aside for a grace period, then purges; more code, and a second retention policy to run.
 - **Status:** open (owner decision); documented
+
+### B-301: no rate limits or connection caps (beta audit)
+- **Where:** `proxy.rs` (`serve`), the node's front end (`main.rs`, `server::serve_http1`)
+- **Scenario:** a client could send any number of requests a second, to any app, and hold any number of connections, at the proxy and at a node reached directly; one client or one app could take all of either.
+- **Fix:** `gate` (both listeners, `[clients]`): requests a second per client address (an IPv6 /64) and per app (`governor`, GCRA; 429 with `Retry-After`), connections per client address (503 with `Retry-After`) and in all (the listener stops accepting). The client behind a trusted forwarder is the last untrusted address in `X-Forwarded-For`; trusted peers (default loopback) aren't limited. Hostile tests: `clients_past_their_rate_are_refused_however_they_forward` (spoofed and prepended `X-Forwarded-For`), `apps_past_their_rate_are_refused`, `connections_are_capped_per_client_and_in_all`. Evidence: notes/beta-limits.md.
+- **Status:** fixed on `beta/limits`
+
+### B-302: one app could fill a node's disk and stop every app's writes (beta audit)
+- **Where:** `quota.rs`
+- **Scenario:** objects had a quota each but an app had none, and nothing kept the node's disk from filling: on an 8 MiB root, about 560 counter objects filled it and every write on the node then failed `500 commit-failed`, reported as the object's own quota being full.
+- **Fix:** a per-app budget (`app_disk_mb`, default a quarter of `data_dir`'s filesystem) over the same logical bytes each object's quota counts, shared by the app's instances (`quota::Disk`), and a free-space reserve (`disk_reserve_mb`, default a twentieth of the filesystem, at most 1 GiB): below it, growth and new entries are refused for every app while writes in place, deletes, rollbacks and commits go on. ENOSPC from the journal now says the node's disk is full. Tests on an 8 MiB tmpfs: `a_full_app_budget_refuses_only_that_apps_writes`, `the_disk_reserve_keeps_writes_committing`; unit: `objects_share_their_apps_budget`, `below_the_reserve_only_growth_is_refused`.
+- **Status:** fixed on `beta/limits`
+
+### B-303: workers ran without cgroup limits by default (beta audit)
+- **Where:** `config.rs` (`cgroup`, `[worker]`), `supervisor.rs`
+- **Scenario:** `cgroup` was unset and `[worker]` limits 0 by default (and in the ops reference config), so one app could touch `memory_mb × max_live_objects` (64 GiB) and use every core.
+- **Fix:** `[worker]` defaults to a quarter of the host's memory and all its cores but one; `cgroup = "auto"` (default) makes the supervisor's own cgroup v2 the workers' subtree (it moves itself into `<own>/supervisor`, workers go in `<own>/workers`) and refuses to start where it can't, naming `cgroup = "off"`. Owner question: fail closed (built) or warn and run.
+- **Reproduced:** this sandbox's controllers are on cgroup v1, so only the refusal is tested here (`workers_run_under_host_sized_limits_or_the_node_refuses_to_start`); its delegated branch runs in `scripts/vm-test.sh`.
+- **Status:** fixed on `beta/limits` (for `deployable`: the ops configs should drop their `[worker] = 0` lines and the `cgroup` path, and keep `Delegate=yes`)
+
+### B-304: an app's disk budget counts logical bytes, not blocks or its journals
+- **Where:** `quota.rs`
+- **Scenario:** the budget counts what each object's quota counts. An object's journal (up to 68 KiB between requests, more during one), its capture outbox, directories and block rounding are on top, so many tiny objects cost far more disk than their budget says (the audit's ~14 KiB a counter object on tmpfs). The objects cap (`beta/objects`) bounds how many there are; the reserve keeps a full disk from failing commits.
+- **Status:** open (by design for now)
+
+### B-305: the reserve counts bytes, not inodes
+- **Where:** `quota.rs` (`Disk::low`)
+- **Scenario:** a filesystem out of inodes (ext4's are fixed at mkfs) refuses new files with free bytes left; the reserve doesn't look at `f_favail`. `max_files` per object and the objects cap bound it.
+- **Status:** open
+
+### B-306: deleting an object must tell its app's disk budget
+- **Where:** `quota::Disk` (`idle`)
+- **Scenario:** a worker counts an object without an instance at what its volume held when last measured, so a volume removed under a running worker would stay counted until the worker restarts.
+- **Status:** not an issue with `beta/objects`' delete, merged here: `nanovm admin delete` drains and stops the app's worker first, and the next one measures the app afresh. A volume a lease takeover restores is measured when its object next starts.
+
+### B-307: a worker measures all its app's volumes when it starts
+- **Where:** `quota::Disk::open` (from `App::load`)
+- **Scenario:** the app budget starts from a walk of every object's volume, on each worker start (first request, version switch, restart): measured about 3–4 µs a file, warm, so 10,000 objects of 5 files add 150–250 ms. The objects cap bounds it. Alternatives: walk in the background with a short window in which only the objects' own quotas hold, or keep each object's usage in a small file its commits update.
+- **Status:** open
+
+### B-308: rate limits are per listener, and WebSocket messages aren't requests
+- **Where:** `gate.rs`
+- **Scenario:** each proxy (and each node a client reaches directly) keeps its own counts, so with several proxies a client or an app gets the rate at each; a socket's messages count only as the request that opened it (their own bounds are the socket backlog and caps).
+- **Status:** open (by design for one node)
+
+### B-309 (tests): `the_proxy_outlasts_idle_and_excess_connections` bound the default private port
+- **Where:** `tests/integration.rs`
+- **Scenario:** the test's proxy listened on a free port but left `publish_listen` at its default, 127.0.0.1:8444; on a machine where anything else held 8444 (another agent's proxy) the proxy exited at once ("Address already in use") and the test failed with "the proxy never listened". Seen once in a full run on `beta/limits`.
+- **Fix:** the test gives the private listener a free port too.
+- **Status:** fixed on `beta/limits`
 
 ## Planned work
 

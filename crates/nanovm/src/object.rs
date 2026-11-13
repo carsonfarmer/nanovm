@@ -426,7 +426,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     http.set_field_size_limit(crate::server::MAX_HEAD);
 
     // `/tmp` starts empty, so only the persistent volume holds usage.
-    let quota = QuotaGuard::new(journal, limits, node.metrics.clone(), shared.clone())?;
+    let quota = QuotaGuard::new(journal, limits, node.metrics.clone(), shared.clone(), app.disk.clone())?;
 
     let state = ObjState {
         wasi: b.build(),

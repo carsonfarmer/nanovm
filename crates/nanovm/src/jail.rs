@@ -141,6 +141,8 @@ fn seccomp_filter() -> anyhow::Result<seccompiler::SeccompFilter> {
         libc::SYS_fstat,
         libc::SYS_newfstatat,
         libc::SYS_statx,
+        // Free space on the volumes' filesystem, for the node's reserve.
+        libc::SYS_fstatfs,
         libc::SYS_faccessat2,
         libc::SYS_getdents64,
         libc::SYS_mkdirat,

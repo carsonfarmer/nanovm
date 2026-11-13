@@ -75,6 +75,8 @@ fn node_cfg(test: &str, max_live: usize) -> NodeConfig {
         max_live_objects: max_live,
         memory_reservation_mb: 64,
         dev: true,
+        // The cgroup tests name their own; the rest run where none is delegated.
+        cgroup: "off".into(),
         ..NodeConfig::default()
     };
     cfg.limits.egress = ["example.com", "localhost", "127.0.0.1"].map(String::from).into();
@@ -1028,6 +1030,123 @@ async fn data_quota_survives_restart() {
     assert!(node.metrics.fs_denied.load(Relaxed) >= 1);
 }
 
+/// `hostile` with room for file work (see `filler`) and a 2 MiB quota: a
+/// new object needs that much free on the small disk below.
+fn small_filler() -> AppConfig {
+    let mut f = filler();
+    f.limits.disk_mb = 2;
+    f
+}
+
+/// A supervisor whose data is on a tmpfs of `mb` MiB, as the audit's 8 MiB
+/// root was, with `app_disk_mb` and `disk_reserve_mb`; why not, unless root.
+async fn on_a_small_disk(test: &str, mb: u64, budget: u64, reserve: u64) -> Result<(Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, SmallDisk), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("mounting a tmpfs needs root".into());
+    }
+    let mut cfg = node_cfg(test, 8);
+    let cache = std::fs::read_link(cfg.data_dir.join("cache")).unwrap();
+    let mounted = std::process::Command::new("mount").args(["-t", "tmpfs", "-o", &format!("size={mb}m"), "tmpfs"]).arg(&cfg.data_dir).status();
+    if !mounted.as_ref().is_ok_and(|s| s.success()) {
+        return Err(format!("mount -t tmpfs failed: {mounted:?}"));
+    }
+    let disk = SmallDisk(cfg.data_dir.clone());
+    std::os::unix::fs::symlink(cache, cfg.data_dir.join("cache")).unwrap();
+    (cfg.app_disk_mb, cfg.disk_reserve_mb) = (budget, reserve);
+    let (sup, addr) = supervised_with(cfg).await;
+    Ok((sup, addr, disk))
+}
+
+/// A tmpfs, unmounted when dropped.
+struct SmallDisk(PathBuf);
+
+impl Drop for SmallDisk {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount").arg("-l").arg(&self.0).status();
+    }
+}
+
+/// The `fs-denied` events the supervisor at `addr` has had from its workers.
+async fn denials(addr: std::net::SocketAddr) -> Vec<String> {
+    stats_json(addr).await;
+    let logs = captures().lock()[&addr].1.lock().logs.clone();
+    logs.iter().filter(|l| l["kind"] == "fs-denied").map(|l| l["detail"].as_str().unwrap_or_default().to_owned()).collect()
+}
+
+/// An app that fills its disk budget has its own writes refused, with a
+/// status that says so, and no other app's: on the audit's 8 MiB disk,
+/// where one app's objects stopped every write on the node.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_app_budget_refuses_only_that_apps_writes() {
+    let (_sup, addr, _disk) = match on_a_small_disk("a_full_app_budget_refuses_only_that_apps_writes", 8, 3, 1).await {
+        Ok(s) => s,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (a, b) = (publish("budget-a", &small_filler()).await, publish("budget-b", &small_filler()).await);
+    let fill = async |app: &str, object: &str, name: &str, mb: u32| {
+        let (status, body) = app_get(addr, app, &format!("/{object}/fill?mount=data&mb={mb}&name={name}")).await;
+        (status, serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default())
+    };
+    assert_eq!(fill(&a, "o1", "fill.bin", 2).await.0, 200);
+    // Another object of the same app gets what is left of its 3 MiB.
+    let (status, body) = fill(&a, "o2", "f", 2).await;
+    assert_eq!((status, body["error"].as_str(), body["written"].as_u64()), (507, Some("insufficient-space"), Some(1 << 20)), "{body}");
+    assert!(denials(addr).await.iter().any(|d| d.contains("the app's 3 MiB disk budget is full")));
+    // The other app's writes go on.
+    let (status, body) = fill(&b, "o1", "f", 2).await;
+    assert_eq!(status, 200, "{body}");
+    // Freeing an object's space lets the app write again.
+    assert_eq!(app_get(addr, &a, "/o1/clean?mount=data").await.0, 200);
+    let (status, body) = fill(&a, "o2", "g", 1).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// Below the node's free-space reserve every app's writes that need more
+/// space are refused cleanly (507 from the app, not a failed commit), while
+/// writes in place still commit; freeing space ends it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_disk_reserve_keeps_writes_committing() {
+    let (_sup, addr, _disk) = match on_a_small_disk("the_disk_reserve_keeps_writes_committing", 8, 100, 3).await {
+        Ok(s) => s,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (files, counter) = (publish("reserve-files", &small_filler()).await, publish("reserve-counter", &app("counter")).await);
+    let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(raw(addr, &format!("POST /c0/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await.0, 200);
+    // Objects of 2 MiB fill the disk down to the reserve: the first refused
+    // is refused by it (a new object needs only its 2 MiB free).
+    let mut hogs = 0;
+    let body = loop {
+        let (status, body) = app_get(addr, &files, &format!("/hog{hogs}/fill?mount=data&mb=2")).await;
+        hogs += 1;
+        if status != 200 {
+            assert_eq!(status, 507, "{body}");
+            break body;
+        }
+    };
+    assert!(body.contains("insufficient-space"), "{body}");
+    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk is below its 3.0 MiB reserve")));
+    // Every app's growth is refused by the app, as on a full disk: never a
+    // failed commit, as the audit saw on every write.
+    let incr = async |object: &str| {
+        raw(addr, &format!("POST /{object}/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await
+    };
+    for i in 0..20 {
+        let (status, body) = incr(&format!("c{i}")).await;
+        assert_eq!(status, 507, "{body}");
+        assert!(body.contains("insufficient-space"), "{body}");
+    }
+    // A write in place still commits.
+    let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
+    assert_eq!(status, 200, "{body}");
+    for hog in 0..hogs {
+        assert_eq!(app_get(addr, &files, &format!("/hog{hog}/clean?mount=data")).await.0, 200);
+    }
+    let (status, body) = incr("c1").await;
+    assert_eq!(status, 200, "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_escapes_blocked() {
     let node = node("sandbox_escapes_blocked", "hostile", 8);
@@ -1402,7 +1521,7 @@ async fn supervised_at(mut cfg: NodeConfig, listener: tokio::net::TcpListener, l
     captures().lock().retain(|_, (sup, _)| sup.strong_count() != 0);
     captures().lock().insert(addr, (Arc::downgrade(&sup), captured));
     let s = sup.clone();
-    tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
+    tokio::spawn(nanovm::gate::serve(sup.gate.clone(), listener, None, move |req| s.clone().handle(req)));
     sup
 }
 
@@ -2139,6 +2258,13 @@ fn test_cgroup(name: &str, controllers: &[&str]) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// Runs `cfg`'s workers in the test cgroup `root`, under no limits but those
+/// a test sets: the defaults need controllers a test cgroup may lack.
+fn in_cgroup(cfg: &mut NodeConfig, root: &Path) {
+    cfg.cgroup = root.to_str().unwrap().into();
+    cfg.worker = nanovm::config::WorkerLimits { memory_mb: 0, cpus: 0.0, pids: 0 };
+}
+
 /// Kills what is left in a test cgroup and removes it.
 async fn remove_cgroup(root: &Path) {
     for _ in 0..200 {
@@ -2175,7 +2301,7 @@ async fn workers_are_placed_in_their_cgroups() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("workers_are_placed_in_their_cgroups", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     let (sup, addr) = supervised_with(cfg).await;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
     for a in [&counter, &hostile] {
@@ -2196,6 +2322,38 @@ async fn workers_are_placed_in_their_cgroups() {
     eventually("the exited worker's cgroup to go", || !group.exists()).await;
     drop(sup);
     remove_cgroup(&root).await;
+}
+
+/// By default a node runs its workers under the `[worker]` limits, sized
+/// from the host: in a cgroup subtree it makes of its own where cgroup v2
+/// lets it, and otherwise it refuses to start, saying how to run without.
+#[tokio::test(flavor = "multi_thread")]
+async fn workers_run_under_host_sized_limits_or_the_node_refuses_to_start() {
+    let mut cfg = node_cfg("workers_run_under_host_sized_limits", 8);
+    cfg.cgroup = "auto".into();
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
+    if let Err(e) = nanovm::supervisor::Supervisor::new(cfg.clone(), exe, 1, None) {
+        let e = format!("{e:#}");
+        assert!(e.contains("cgroup = \"auto\"") && e.contains("cgroup = \"off\""), "{e}");
+        return eprintln!("refused, as it should be where no cgroup v2 subtree can be made: {e}");
+    }
+    {
+        // Where it can, the supervisor moves itself into `<own>/supervisor`
+        // and puts workers in `<own>/workers`, under the default limits.
+        let (sup, addr) = supervised_with(cfg).await;
+        let counter = publish("counter", &app("counter")).await;
+        assert_eq!(app_get(addr, &counter, "/x/").await.0, 200);
+        let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
+        let mine = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        assert!(mine.trim_end().ends_with("/supervisor"), "{mine}");
+        let theirs = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        let group = PathBuf::from("/sys/fs/cgroup").join(theirs.lines().find_map(|l| l.strip_prefix("0::/")).unwrap());
+        assert!(group.parent().unwrap().ends_with("workers"), "{}", group.display());
+        let w = nanovm::config::WorkerLimits::default();
+        assert_eq!(std::fs::read_to_string(group.join("memory.max")).unwrap().trim(), (w.memory_mb << 20).to_string());
+        assert_eq!(std::fs::read_to_string(group.join("cpu.max")).unwrap().trim(), format!("{} 100000", w.cpus as u64 * 100_000));
+        drop(sup);
+    }
 }
 
 /// Waits until a worker spawned ahead has built its engine (its stacks and
@@ -2232,7 +2390,7 @@ async fn review_spare_engine_memory_is_charged_to_the_app() {
     };
     let slots = 8192;
     let mut cfg = node_cfg("review_spare_engine_memory_is_charged_to_the_app", slots);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     cfg.worker.memory_mb = 512;
     let (sup, addr) = supervised_with(cfg).await;
     let counter = publish("counter", &app("counter")).await;
@@ -2262,7 +2420,7 @@ async fn worker_memory_max_kills_only_that_worker() {
     };
     // Each hostile object may hold 32 MiB; eight holding 30 MiB exceed 160.
     let mut cfg = node_cfg("worker_memory_max_kills_only_that_worker", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     cfg.worker.memory_mb = 160;
     let (sup, addr) = supervised_with(cfg).await;
     let mut big = app("hostile");
@@ -2298,7 +2456,7 @@ async fn worker_cpu_and_pids_limits_hold() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("worker_cpu_and_pids_limits_hold", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     cfg.worker.cpus = 0.2;
     cfg.worker.pids = 64;
     let (sup, addr) = supervised_with(cfg).await;
@@ -2345,7 +2503,7 @@ async fn review2_startup_removes_only_cgroups_it_made() {
     let (mut removed, mut started) = (vec![], vec![]);
     for (dir, kept) in [(&root, &theirs), (&plain, &plain.join("keep"))] {
         let mut cfg = node_cfg("review2_startup_removes_only_cgroups_it_made", 8);
-        cfg.cgroup = Some(dir.clone());
+        in_cgroup(&mut cfg, &dir);
         let sup = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None);
         if !kept.exists() {
             removed.push(kept.clone());
@@ -2385,7 +2543,7 @@ async fn startup_removes_an_earlier_runs_worker_cgroups() {
     let mut left = std::process::Command::new("sleep").arg("60").spawn().unwrap();
     std::fs::write(busy.join("cgroup.procs"), left.id().to_string()).unwrap();
     let mut cfg = node_cfg("startup_removes_an_earlier_runs_worker_cgroups", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     let (sup, _) = supervised_with(cfg).await;
     gone(&[&idle, &busy]).await;
     let kept: Vec<_> = [&idle, &busy].into_iter().filter(|d| d.exists()).cloned().collect();
@@ -2407,7 +2565,7 @@ async fn two_nodes_cannot_share_a_cgroup() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("two_nodes_cannot_share_a_cgroup", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     let (first, addr) = supervised_with(cfg).await;
     let counter = publish("counter", &app("counter")).await;
     let (status, body) = app_get(addr, &counter, "/x/").await;
@@ -2417,7 +2575,7 @@ async fn two_nodes_cannot_share_a_cgroup() {
     let fresh = root.join("worker-999999");
     std::fs::create_dir(&fresh).unwrap();
     let mut cfg = node_cfg("two_nodes_cannot_share_a_cgroup-second", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     let second = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None);
     let second = second.map(drop).map_err(|e| format!("{e:#}"));
     let kept = fresh.exists();
@@ -2445,7 +2603,7 @@ fn a_dropped_supervisors_worker_cgroups_go() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let made = rt.block_on(async {
         let mut cfg = node_cfg("a_dropped_supervisors_worker_cgroups_go", 8);
-        cfg.cgroup = Some(root.clone());
+        in_cgroup(&mut cfg, &root);
         let (_sup, addr) = supervised_with(cfg).await;
         let counter = publish("counter", &app("counter")).await;
         let (status, body) = app_get(addr, &counter, "/x/").await;
@@ -2476,7 +2634,7 @@ async fn a_worker_memory_limit_below_a_spares_use_is_refused_clearly() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("a_worker_memory_limit_below_a_spares_use_is_refused_clearly", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     cfg.worker.memory_mb = 1;
     let (sup, addr) = supervised_with(cfg).await;
     let counter = publish("counter", &app("counter")).await;
@@ -4438,6 +4596,132 @@ async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::Sock
     addr
 }
 
+/// A proxy in front of `node` serving `counter` at `counter.test` and
+/// `hostile` at `hostile.test`, with `clients` its client limits.
+async fn gated(test: &str, clients: nanovm::config::ClientLimits) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+    let (sup, node) = supervised(test).await;
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    for (host, name) in [("counter.test", "counter"), ("hostile.test", "hostile")] {
+        let app = publish(&format!("{test}-{name}"), &app(name)).await;
+        records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", app.split_once('@').unwrap().0)]);
+    }
+    let cfg = nanovm::config::ProxyConfig { nodes: vec![node.to_string()], resolver: doh(records).await, dev: true, listen: "127.0.0.1:0".into(), clients, ..Default::default() };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+    (sup, addr)
+}
+
+/// `GET /a/` on `host` with `extra` headers: the status line and headers,
+/// lowercased.
+async fn head_of(addr: std::net::SocketAddr, host: &str, extra: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("GET /a/ HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out).await;
+    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    text.split_once("\r\n\r\n").map_or(text.clone(), |(h, _)| h.to_owned())
+}
+
+/// `n` requests at once to `host`, the `i`th with `extra(i)` headers: how
+/// many were answered 200, and how many 429 with a retry-after.
+async fn at_once(addr: std::net::SocketAddr, host: &str, n: usize, extra: impl Fn(usize) -> String) -> (usize, usize) {
+    let heads = futures::future::join_all((0..n).map(|i| {
+        let extra = extra(i);
+        async move { head_of(addr, host, &extra).await }
+    }));
+    let heads = heads.await;
+    let refused = |h: &String| h.starts_with("http/1.1 429") && h.contains("retry-after: ") && h.contains("x-nanovm-error: rate-limited");
+    (heads.iter().filter(|h| h.starts_with("http/1.1 200")).count(), heads.iter().filter(|h| refused(h)).count())
+}
+
+/// A client past its rate (here 1 a second, 2 at once) is answered 429
+/// with a retry-after, by the proxy and by a node it reaches directly. What
+/// it says in X-Forwarded-For is heard only from a trusted peer, and then
+/// only right of what the client wrote itself, so it can't spread its
+/// requests over addresses it makes up, nor spend another client's.
+#[tokio::test(flavor = "multi_thread")]
+async fn clients_past_their_rate_are_refused_however_they_forward() {
+    use nanovm::config::ClientLimits;
+    // 127.0.0.1 is a client like any other.
+    let untrusted = ClientLimits { rate: 1, trusted: vec!["192.0.2.1".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("rate_untrusted", untrusted).await;
+    let (ok, refused) = at_once(proxy, "counter.test", 10, |i| format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
+    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
+    // Behind a trusted terminator, each client has its own rate.
+    let trusted = ClientLimits { rate: 1, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("rate_trusted", trusted).await;
+    let from = |client: &str| format!("X-Forwarded-For: {client}\r\n");
+    // The terminator's own requests aren't limited (and start the app).
+    let (ok, _) = at_once(proxy, "counter.test", 10, |_| String::new()).await;
+    assert_eq!(ok, 10);
+    let (ok, refused) = at_once(proxy, "counter.test", 10, |_| from("198.51.100.1")).await;
+    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
+    // Whatever it writes before its own address.
+    let forged = ["203.0.113.66, 198.51.100.1", "198.51.100.2, 198.51.100.1", "127.0.0.1, 198.51.100.1", "junk, 198.51.100.1"];
+    assert_eq!(at_once(proxy, "counter.test", forged.len(), |i| from(forged[i])).await, (0, forged.len()));
+    assert_eq!(at_once(proxy, "counter.test", 1, |_| from("198.51.100.2")).await, (1, 0));
+    // A node reached directly limits its clients too.
+    let mut cfg = node_cfg("rate_node", 8);
+    cfg.clients = ClientLimits { rate: 1, trusted: vec![], ..ClientLimits::default() };
+    let (_sup, node) = supervised_with(cfg).await;
+    let counter = publish("rate-node", &app("counter")).await;
+    let statuses: Vec<_> = futures::future::join_all((0..10).map(|_| app_get(node, &counter, "/a/"))).await.into_iter().map(|r| r.0).collect();
+    assert!(statuses.iter().filter(|s| **s == 429).count() >= 7, "{statuses:?}");
+}
+
+/// Past an app's rate (here 1 a second, 2 at once), its requests are
+/// refused whichever client sends them; another app's are not.
+#[tokio::test(flavor = "multi_thread")]
+async fn apps_past_their_rate_are_refused() {
+    use nanovm::config::ClientLimits;
+    let limits = ClientLimits { rate: 0, app_rate: 1, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("app_rate", limits).await;
+    let (ok, refused) = at_once(proxy, "counter.test", 10, |i| format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
+    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
+    assert_eq!(at_once(proxy, "hostile.test", 1, |_| "X-Forwarded-For: 198.51.100.1\r\n".into()).await, (1, 0));
+}
+
+/// A client gets `connections_per_client` connections, past which one is
+/// answered 503 with a retry-after and closed; past `connections` in all, a
+/// new one waits until another closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_are_capped_per_client_and_in_all() {
+    use nanovm::config::ClientLimits;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = b"GET /a/ HTTP/1.1\r\nHost: counter.test\r\nConnection: close\r\n\r\n";
+    let answer = async |s: &mut tokio::net::TcpStream| {
+        s.write_all(request).await.unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+        String::from_utf8_lossy(&out).to_ascii_lowercase()
+    };
+    let limits = ClientLimits { connections_per_client: 2, trusted: vec![], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("connections_per_client", limits).await;
+    let connect = || tokio::net::TcpStream::connect(proxy);
+    let (a, mut b) = (connect().await.unwrap(), connect().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let refused = answer(&mut connect().await.unwrap()).await;
+    assert!(refused.starts_with("http/1.1 503") && refused.contains("retry-after: 1") && refused.contains("too-many-connections"), "{refused}");
+    assert!(answer(&mut b).await.starts_with("http/1.1 200"));
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(answer(&mut connect().await.unwrap()).await.starts_with("http/1.1 200"));
+
+    let limits = ClientLimits { connections: 2, connections_per_client: 0, ..ClientLimits::default() };
+    let (_sup, proxy) = gated("connections_in_all", limits).await;
+    let connect = || tokio::net::TcpStream::connect(proxy);
+    let (a, _b) = (connect().await.unwrap(), connect().await.unwrap());
+    let mut third = connect().await.unwrap();
+    let waiting = tokio::spawn(async move { answer(&mut third).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!waiting.is_finished(), "served past the cap");
+    drop(a);
+    let served = tokio::time::timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap();
+    assert!(served.starts_with("http/1.1 200"), "{served}");
+}
+
 /// The proxy serves each host the app its `_nanovm` record names, at the
 /// version its tag names now; a client can name no app itself, nor reach
 /// the node's own routes; WebSockets pass through.
@@ -4835,7 +5119,8 @@ async fn the_proxy_outlasts_idle_and_excess_connections() {
     let start = |name: &str| {
         let addr = port();
         let cfg = dir.join(format!("{name}.toml"));
-        let toml = format!("listen = \"{addr}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\nhosts = [\"x\"]\n");
+        // Its own private port too: the default, 8444, may be another's.
+        let toml = format!("listen = \"{addr}\"\npublish_listen = \"{}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\nhosts = [\"x\"]\n", port());
         std::fs::write(&cfg, toml).unwrap();
         let cmd = format!("ulimit -n 64 && exec {} proxy --config {}", env!("CARGO_BIN_EXE_nanovm"), cfg.display());
         let child = tokio::process::Command::new("sh").args(["-c", &cmd]).kill_on_drop(true).spawn().unwrap();

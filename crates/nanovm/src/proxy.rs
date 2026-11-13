@@ -77,6 +77,7 @@ pub struct Proxy {
     digests: Cache<String>,
     sockets: Mutex<HashMap<String, Arc<Sockets>>>,
     total: Arc<std::sync::atomic::AtomicUsize>,
+    gate: Arc<crate::gate::Gate>,
 }
 
 /// Hosts or tags with an answer (an app, a digest) remembered at most.
@@ -195,7 +196,9 @@ impl Proxy {
         // A node that doesn't answer is passed over like one that refuses.
         connector.set_connect_timeout(Some(CONNECT));
         let node = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+        let gate = crate::gate::Gate::new(&cfg.clients)?;
         Ok(Arc::new(Proxy {
+            gate,
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_proxy", env!("CARGO_PKG_VERSION"), None, &Default::default())?),
             registry: Oci::new(cfg.dev)?,
             cfg: Arc::new(cfg),
@@ -235,12 +238,19 @@ impl Proxy {
         if ws::is_event(&req) {
             return Err((StatusCode::BAD_REQUEST, "socket events come from the proxy".into()));
         }
+        let client = self.gate.client(&req);
+        if let Err(refused) = self.gate.admit(client, None) {
+            return Ok(refused);
+        }
         let host = req.headers().get(http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
         let host = host.rsplit_once(':').map_or(host, |(h, _)| h).to_ascii_lowercase();
         if !self.cfg.hosts.iter().any(|h| h.strip_prefix('*').map_or(*h == host, |under| host.ends_with(under))) {
             return Err((StatusCode::FORBIDDEN, format!("this proxy doesn't serve {host}")));
         }
         let (name, headers) = self.resolve(&host).await?;
+        if let Err(refused) = self.gate.admit(client, Some(&name)) {
+            return Ok(refused);
+        }
         let upgrading = ws::wants(&req);
         let (mut parts, body) = req.into_parts();
         // Only the proxy names apps to the node.
@@ -511,10 +521,7 @@ fn parse(txt: &str) -> anyhow::Result<Route> {
 /// Serves the proxy on `listener`, over plain HTTP: TLS is left to a
 /// terminator in front.
 pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-    loop {
-        let p = proxy.clone();
-        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| p.clone().handle(req));
-    }
+    crate::gate::serve(proxy.gate.clone(), listener, Some(CLIENT_TIMEOUT), move |req| proxy.clone().handle(req)).await
 }
 
 /// Private control port: network policy must restrict it to nodes.
