@@ -131,7 +131,7 @@ empty of them afterwards. Every one fails at least one test:
 | M7 the operator's egress list ignored | `the_operators_list_caps_the_apps` |
 | M8 `hosts` entries unchecked | `proxy_lists_are_empty_by_default_and_checked` |
 | M9 no stale answer | `a_resolver_outage_keeps_the_last_route`, `found_answers_outlast_an_outage_for_a_while` |
-| M10 no wait bound on a refresh | M10RESULT |
+| M10 no wait bound on a refresh | `found_answers_outlast_an_outage_for_a_while` (times out on the hung lookup) |
 | M11 stale forever | `found_answers_outlast_an_outage_for_a_while` |
 | M12 exact signers matched as prefixes | `records_trust_only_the_operators_signers` |
 
@@ -141,15 +141,13 @@ record trusts it), and `egress_is_capped_by_the_operator` relies on M7's
 check (its in-process and supervised policies are built by the same
 `EgressPolicy::parse`).
 
-**Suite** (`RUST_TEST_THREADS=1 cargo test --locked -p nanovm --no-fail-fast`,
-at d287d22 plus the `signed` fix, then the proxy and integration subsets again
-after the stale-on-error commit): lib 161 (163 with stale-on-error) pass;
-integration 95 pass, 14 ignored (opt-in), including the signed-app tests
-against ghcr.io; js 11; dev 9 and examples 25 pass with the example
-components built (`tools/build-app.sh`; gateway and oauth built here, the
-rest copied from another worktree whose sources for them match `cf/round3`).
-Without those builds, dev's 4 and examples' 25 fail on the missing files, as
-on the base.
+**Suite** (`RUST_TEST_THREADS=1 cargo test --locked -p nanovm --no-fail-fast`)
+on the branch merged with `cf/round3` 7b3f9c6 (3b0c4c5): lib 164, dev 9,
+examples 27, integration 100 (14 ignored, opt-in), js 17, committed_state 2:
+all pass, including the signed-app tests against ghcr.io. The example and
+JavaScript components were built from the merged sources with
+`tools/build-app.sh`. `cargo check --locked -p nanovm --bin nanovm` (no dev
+feature) is clean.
 
 ## CPU per request
 
@@ -187,7 +185,8 @@ proxy (the DoH stub answers NXDOMAIN for every name but the live host):
 
 CI's count: 7,410 at the base; 7,470 after d287d22 (+60: proxy +42, config
 +12, egress +5, main +1); 7,490 after 185f832 (+20, proxy; its commit
-message says +15, miscounted). In all +80.
+message says +15, miscounted); 7,491 after 14c97f9 (+1, the publish hint).
+In all +81: 7,499 merged, against 7,418 on `cf/round3` 7b3f9c6.
 
 ## Not done
 
