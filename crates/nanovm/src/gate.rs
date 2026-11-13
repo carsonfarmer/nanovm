@@ -93,8 +93,8 @@ impl Gate {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 let Some(gate) = weak.upgrade() else { return };
-                for l in &gate.clients { l.retain_recent(); l.shrink_to_fit() }
-                for l in &gate.apps { l.retain_recent(); l.shrink_to_fit() }
+                if let Some(l) = &gate.clients { l.retain_recent(); l.shrink_to_fit() }
+                if let Some(l) = &gate.apps { l.retain_recent(); l.shrink_to_fit() }
             }
         });
         Ok(gate)
