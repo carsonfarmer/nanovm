@@ -410,7 +410,7 @@ impl Supervisor {
             limits: p.spec.limits.clamped(&self.cfg.limits),
             worker: self.cfg.worker.clone(),
         };
-        let policy = EgressPolicy::parse(&app.limits.egress, self.cfg.dev).context("egress")?;
+        let policy = EgressPolicy::parse(&app.limits.egress, &self.cfg.limits.egress, self.cfg.dev).context("egress")?;
         let old = w.live.lock().take();
         let slot = match old {
             Some(old) => {

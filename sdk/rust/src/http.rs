@@ -1,5 +1,6 @@
-//! Outbound HTTP: [`fetch`] reaches the internet (hosts the app's `egress`
-//! list allows), and [`object`] another object of this app.
+//! Outbound HTTP: [`fetch`] reaches the internet (hosts both the app's
+//! `egress` list and the node's operator allow), and [`object`] another
+//! object of this app.
 
 use wasip3::http::types::{self as wit, ErrorCode, Method, Scheme};
 use wasip3::wit_future;

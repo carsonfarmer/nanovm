@@ -1199,7 +1199,9 @@ impl Local {
             }
         }
         let spec: nanovm::registry::AppSpec = serde_json::from_value(manifest).unwrap();
-        let cfg = nanovm::config::NodeConfig { data_dir: data, max_live_objects: 16, memory_reservation_mb: 64, dev: true, ..Default::default() };
+        let mut cfg = nanovm::config::NodeConfig { data_dir: data, max_live_objects: 16, memory_reservation_mb: 64, dev: true, ..Default::default() };
+        // The operator allows what the app asks for.
+        cfg.limits.egress = spec.limits.egress.clone();
         let app = nanovm::config::AppConfig {
             name: name.into(),
             digest: "local".into(),

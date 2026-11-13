@@ -160,7 +160,7 @@ impl App {
         let egress = match upstream {
             Some(u) => Route::Supervisor(u),
             None => Route::Direct(Arc::new(
-                EgressPolicy::parse(&cfg.limits.egress, node.dev).with_context(|| format!("app {:?} egress", cfg.name))?,
+                EgressPolicy::parse(&cfg.limits.egress, &node.limits.egress, node.dev).with_context(|| format!("app {:?} egress", cfg.name))?,
             )),
         };
         Ok(App {

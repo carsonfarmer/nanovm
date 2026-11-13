@@ -88,7 +88,7 @@ no need for write-to-temp-then-rename.
   [examples/leaderboard](../../examples/leaderboard) uses it.
 - `config::get(key)`: the manifest's `config` table.
 - `fetch(url).method(..).header(..).body(..).send()`: outbound HTTP to hosts
-  in the manifest's `egress` list; `.stream()` instead reads the answer's
+  in the manifest's `egress` list that the node's operator also allows; `.stream()` instead reads the answer's
   body as it arrives (`next()`: `Ok(Some(piece))`, then `Ok(None)` once
   all of it has come). A body that breaks off (the connection closes before
   its `content-length` or last chunk) is an error from `send()`, and from

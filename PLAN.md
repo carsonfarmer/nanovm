@@ -166,14 +166,14 @@ nanovm/
 ## Egress (src/egress.rs)
 
 `WasiHttpHooks::send_request` is the single choke point for outbound requests, and we override it.
-1. **Allowlist:** checked against `uri.host()` and `port_u16()` (never the raw authority). Entries are `host`, `host:port`, `*.suffix[:port]` or an IP literal. Scheme and method are not matched yet. No match returns `HttpRequestDenied`.
+1. **Allowlist:** checked against `uri.host()` and `port_u16()` (never the raw authority). Entries are `host`, `host:port`, `*.suffix[:port]` or an IP literal. A request must match both the app's list and the operator's (the node's `limits.egress`). Scheme and method are not matched yet. No match returns `HttpRequestDenied`.
 2. **Concurrency:** a per-object semaphore. The permit is held inside the returned I/O future. When exhausted, the request fails with `ConnectionLimitReached`.
 3. **DNS:** `lookup_host` under a timeout. Every non-public address is dropped; if none remain, the request fails with `DestinationIpProhibited`. Dropped ranges:
    - loopback, RFC1918, CGNAT, link-local (including 169.254.169.254)
    - ULA, multicast, unspecified, documentation and benchmark ranges
    - IPv4-mapped and NAT64 forms of all of these
 
-   An IP-literal allowlist entry bypasses the filter, since the operator named the address explicitly. Every resolved address must be public; a name that mixes in a private address is treated as rebinding.
+   An IP-literal entry must be public outside dev mode, in the app's list and the operator's alike. Every resolved address must be public; a name that mixes in a private address is treated as rebinding.
 4. **Connect** to the resolved `SocketAddr`, which defeats DNS rebinding. TLS uses rustls with webpki roots (the config is currently rebuilt per request). The client is hyper http1. Guest-set connect and first-byte timeouts are capped at 10 s and 30 s.
 5. **Not yet done:** a timeout on the TLS handshake itself, a between-bytes timeout and a size cap on the upstream response body. Today these are bounded only by the request's wall-clock deadline.
 6. **Sockets:** wasi sockets stay denied by default, and `inherit_network()` is never called.
@@ -190,7 +190,7 @@ nanovm/
 | `max_queue` | 64 | bounded mailbox |
 | `max_outbound_concurrency` | 4 | egress semaphore |
 | `max_resources` | 10000 | ResourceTable + component handles; at most `memory_mb × 16` (256 at 16 MiB) |
-| `egress` | `[]` (deny all) | allowlist |
+| `egress` | `[]` (deny all) | allowlist; the node's own `egress` is the operator's, and a request must match both |
 
 Node-level settings: `max_live_objects` (1000), `memory_reservation_mb` (128), `listen` (127.0.0.1:8080), `data_dir` (nanovm-data), `epoch_tick_ms` (5), `heavy_lanes` (cores that requests past 10 ms of CPU may occupy at once; 0 means half the cores).
 
@@ -263,15 +263,16 @@ All nine steps are done. [README.md](README.md) has the results and the bugs the
 
 ## Target design (agreed)
 
-The goal: one node, as fast and secure as we can make it, that runs untrusted WebAssembly apps as durable objects, deployable by anyone without handing out a long-lived secret. It is a solid single-node baseline to measure against before any clustering.
+The goal: one node, as fast and secure as we can make it, that runs untrusted WebAssembly apps as durable objects, deployable by the identities its operator lists, at the hosts its operator lists, without handing out a long-lived secret. It is a solid single-node baseline to measure against before any clustering.
 
 - **Placement:** the node sits behind a trusted proxy on a private network. The proxy is the public HTTP entry point (route → digest), behind a TLS terminator; only the proxy-to-node hop is private. The node has no TLS and no auth of its own.
-- **Tenancy:** tenant = app, keyed by the DNS name that owns its record (after CNAMEs) and its repository (phase 7, W-15). Routes are `/{object}/{path}`, with the app named by the proxy's headers. The node exposes only data APIs.
+- **Admission:** the operator lists the hosts the proxy serves (`hosts`: names and `*.name`) and the identities that may deploy (`signers`: `<issuer> <subject>`, the subject exact or up to a final `*`). Both are empty by default: a new proxy serves nothing. A host not listed is refused before any DNS lookup; a record's identities are cut to the listed ones before the node hears them. The operator also caps every app's egress (the node's `limits.egress`): a request must match both lists.
+- **Tenancy:** tenant = app, keyed by the DNS name that owns its record (after CNAMEs, which that record must list as `alias=`) and its repository (phase 7, W-15). Routes are `/{object}/{path}`, with the app named by the proxy's headers. The node exposes only data APIs.
 - **Isolation, in layers:** Wasm with the per-object limits; one jailed worker process per app; a supervisor that holds no untrusted code and owns the network. A Wasm escape reaches one app's jail and nothing else.
 - **Deploy, stateless and keyless:**
   - Apps are OCI artifacts (an `application/wasm` layer plus a config blob with limits and env), pulled anonymously and by digest only.
   - They are signed with Sigstore keyless signing: GitHub artifact attestations from CI, or `cosign` with a browser OIDC sign-in on a laptop. No long-lived keys exist anywhere.
-  - The proxy sends, with every request, the manifest digest, the app's trust policy (a list of exact `{issuer, subject}` identities) and its minimum version.
+  - The proxy sends, with every request, the manifest digest, the app's trust policy (a list of exact `{issuer, subject}` identities, cut to the operator's `signers`) and its minimum version.
   - The node fetches on first use (single-flight per digest), verifies offline with `sigstore-verify` against the embedded trusted root, compiles inside the app's jail and caches by digest. It keeps no deploy state and has no deploy API.
   - New requests go to the new version; objects on the old version drain and are evicted.
   - Manifest limits are clamped to operator maximums.

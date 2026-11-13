@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 
 /// Declares a config struct in which every field has a default, so the
@@ -72,8 +72,9 @@ config! {
         /// controllers enabled for its children. Each worker runs in a
         /// cgroup of its own under it, with its app's `[app.worker]` limits.
         cgroup: Option<PathBuf> = None::<PathBuf>,
-        /// The most an app gets: each of its limits is clamped to these.
-        /// Egress entries are the app's own.
+        /// The most an app gets: each of its limits is clamped to these, and
+        /// its egress reaches only what both its list and this `egress`
+        /// allow (by default nothing).
         limits: Limits = Limits::default(),
         /// Every app's worker limits.
         worker: WorkerLimits = WorkerLimits::default(),
@@ -145,6 +146,14 @@ config! {
         /// For local development only: registries may be on private
         /// addresses, and loopback ones are plain HTTP (as for the node).
         dev: bool = false,
+        /// The hosts served: `name`, or `*.name` for any name under it. Any
+        /// other host is refused (403) before its record is looked up.
+        hosts: Vec<String> = Vec::new(),
+        /// The identities that may deploy, `<issuer> <subject>`, the subject
+        /// exact or ending in `*` (then any subject that starts with what
+        /// comes before it). A record's `trust=` entries are cut to these,
+        /// and a record left with none is refused (403).
+        signers: Vec<String> = Vec::new(),
     }
 }
 
@@ -258,6 +267,7 @@ impl NodeConfig {
         if !self.leases.is_empty() && self.capture.as_ref().is_none_or(|c| c.store.is_none()) {
             bail!("a node with leases ships its objects' versions (capture.store): another node restores an object it takes over from there");
         }
+        crate::egress::EgressPolicy::parse(&[], &self.limits.egress, self.dev).context("limits.egress")?;
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
@@ -266,6 +276,15 @@ impl ProxyConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.nodes.is_empty() {
             bail!("the proxy has no nodes");
+        }
+        for h in &self.hosts {
+            let name = h.strip_prefix("*.").unwrap_or(h);
+            ensure!(!name.is_empty() && !name.contains(['*', ':', '/']) && *h == h.to_ascii_lowercase(), "hosts entry {h:?} is not `name` or `*.name` in lower case");
+        }
+        for s in &self.signers {
+            let star = s.find('*').is_none_or(|i| i == s.len() - 1);
+            let words: Vec<_> = s.split_whitespace().collect();
+            ensure!(words.len() == 2 && words.join(" ") == *s && star && !s.contains(','), "signers entry {s:?} is not `<issuer> <subject>`, the subject maybe ending in `*`");
         }
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
@@ -326,8 +345,8 @@ mod tests {
         assert_eq!(serde_json::json!(d.clamped(&d)), serde_json::json!(d));
     }
 
-    /// Validation refuses a listen address that isn't one, and dev mode off
-    /// loopback.
+    /// Validation refuses a listen address that isn't one, dev mode off
+    /// loopback, and an egress cap naming a private address outside it.
     #[test]
     fn validate_checks_listen_and_dev() {
         let mut cfg = NodeConfig::default();
@@ -343,7 +362,12 @@ mod tests {
             cfg.listen = public.into();
             assert!(cfg.validate().unwrap_err().to_string().contains("dev mode"), "{public}");
         }
+        cfg.limits.egress = vec!["10.0.0.1".into()];
+        cfg.listen = "127.0.0.1:1".into();
+        cfg.validate().unwrap();
         cfg.dev = false;
+        assert!(cfg.validate().unwrap_err().to_string().contains("limits.egress"));
+        cfg.limits.egress.clear();
         cfg.validate().unwrap();
         let proxy = ProxyConfig { dev: true, ..ProxyConfig::default() };
         assert!(proxy.validate().unwrap_err().to_string().contains("dev mode"), "the default listen is public");
@@ -368,6 +392,27 @@ mod tests {
 
         let cfg: NodeConfig = toml::from_str("[limits]\ncpu_ms = 9\n").unwrap();
         assert_eq!((cfg.limits.cpu_ms, cfg.limits.memory_mb), (9, 64));
+    }
+
+    /// The proxy serves no host and lets no identity deploy until its
+    /// operator lists them; its lists hold only what they can match: names
+    /// or `*.name`, in lower case, and `<issuer> <subject>` pairs whose only
+    /// `*` ends the subject.
+    #[test]
+    fn proxy_lists_are_empty_by_default_and_checked() {
+        let cfg: ProxyConfig = toml::from_str("").unwrap();
+        assert!(cfg.hosts.is_empty() && cfg.signers.is_empty());
+        let check = |hosts: &[&str], signers: &[&str]| {
+            let list = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+            ProxyConfig { hosts: list(hosts), signers: list(signers), ..ProxyConfig::default() }.validate().map_err(|e| e.to_string())
+        };
+        check(&["a.com", "*.a.com", "localhost"], &["https://i s", "https://i repo:org/*", "https://i *"]).unwrap();
+        for bad in ["", "*", "*.", "A.com", "a.com:443", "*a.com", "a.*.com", "http://a.com"] {
+            assert!(check(&[bad], &[]).unwrap_err().contains("hosts entry"), "{bad:?}");
+        }
+        for bad in ["https://i", "https://i  s", "https://i s t", " https://i s", "https://i\ts", "https://* s", "https://i s*x", "https://i a,b"] {
+            assert!(check(&[], &[bad]).unwrap_err().contains("signers entry"), "{bad:?}");
+        }
     }
 
     /// A misspelt key anywhere is an error rather than silently a default,
