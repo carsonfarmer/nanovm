@@ -166,15 +166,16 @@ impl App {
                 EgressPolicy::parse(&cfg.limits.egress, &node.limits.egress, node.dev).with_context(|| format!("app {:?} egress", cfg.name))?,
             )),
         };
+        let disk = Arc::new(crate::quota::Disk::open(&objects, node.app_disk_mb, node.disk_reserve_mb)?);
         Ok(App {
             name: cfg.name.as_str().into(),
             cfg: cfg.clone(),
             pre,
             egress,
             config: Arc::new(cfg.config.iter().chain(&cfg.secrets.0).collect()),
-            objects: Arc::new(Objects::load(objects.canonicalize()?, node.max_objects_per_app, &cfg.limits)?),
+            objects: Arc::new(Objects::load(objects.canonicalize()?, node.max_objects_per_app, &cfg.limits, disk.reserve)?),
             scratch: Scratch::new(tmp)?,
-            disk: Arc::new(crate::quota::Disk::open(&objects, node.app_disk_mb, node.disk_reserve_mb)?),
+            disk,
             _ownership: ownership,
         })
     }
@@ -203,10 +204,13 @@ pub struct Objects {
     max: u64,
     /// The bytes and entries a new object may use: its quota.
     need: (u64, u64),
+    /// The bytes the node keeps free (`quota::Disk`), which a new object's
+    /// room is on top of.
+    reserve: u64,
 }
 
 impl Objects {
-    pub(crate) fn load(dir: PathBuf, max: u64, limits: &crate::config::Limits) -> std::io::Result<Objects> {
+    pub(crate) fn load(dir: PathBuf, max: u64, limits: &crate::config::Limits, reserve: u64) -> std::io::Result<Objects> {
         let mut count = 0;
         for shard in std::fs::read_dir(&dir)? {
             let shard = shard?;
@@ -215,12 +219,13 @@ impl Objects {
             }
         }
         let pool = Scratch::new(dir.join("~new"))?;
-        Ok(Objects { dir, pool, count: count.into(), max, need: (limits.disk_mb << 20, limits.max_files) })
+        Ok(Objects { dir, pool, count: count.into(), max, need: (limits.disk_mb << 20, limits.max_files), reserve })
     }
 
     /// Whether a new object may be made: refused while the app has its
     /// most (`QuotaExceeded`, answered `507 object-limit`), or the disk has
-    /// less free than the object's quota (`StorageFull`, `507 disk-full`).
+    /// less free than the object's quota above the node's reserve
+    /// (`StorageFull`, `507 disk-full`).
     pub fn room(&self) -> std::io::Result<()> {
         if self.count.load(Relaxed) >= self.max {
             return Err(self.most());
@@ -238,9 +243,9 @@ impl Objects {
 
     fn disk(&self) -> std::io::Result<()> {
         let fs = rustix::fs::statvfs(&self.dir)?;
-        if fs.f_bavail * fs.f_frsize < self.need.0 || (fs.f_files > 0 && fs.f_favail < self.need.1) {
-            let (mb, files) = (self.need.0 >> 20, self.need.1);
-            let detail = format!("the disk has less free than a new object may use ({mb} MiB, {files} files)");
+        if fs.f_bavail * fs.f_frsize < self.reserve + self.need.0 || (fs.f_files > 0 && fs.f_favail < self.need.1) {
+            let (mb, files, reserve) = (self.need.0 >> 20, self.need.1, self.reserve as f64 / 1048576.0);
+            let detail = format!("the disk has less free than a new object may use ({mb} MiB, {files} files) above the node's {reserve:.1} MiB reserve");
             return Err(std::io::Error::new(ErrorKind::StorageFull, detail));
         }
         Ok(())
@@ -286,7 +291,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let limits = crate::config::Limits { disk_mb: need.0, max_files: need.1, ..Default::default() };
-        Objects::load(dir, max, &limits).unwrap()
+        Objects::load(dir, max, &limits, 0).unwrap()
     }
 
     fn reason(e: std::io::Error) -> &'static str {
@@ -300,7 +305,7 @@ mod tests {
     /// Objects are counted from their directories; a place is taken only
     /// while there is room, however many threads ask at once; one given
     /// back makes room again; and a disk with less free than a new object's
-    /// quota has none.
+    /// quota above the node's reserve has none.
     #[test]
     fn room_for_objects() {
         let o = objects("room", 0, (1, 1));
@@ -308,7 +313,7 @@ mod tests {
             std::fs::create_dir_all(object_dir(&o.dir, id).join("data")).unwrap();
         }
         let dir = o.dir.clone();
-        let o = Objects::load(dir.clone(), 8, &crate::config::Limits { disk_mb: 1, max_files: 1, ..Default::default() }).unwrap();
+        let o = Objects::load(dir.clone(), 8, &crate::config::Limits { disk_mb: 1, max_files: 1, ..Default::default() }, 0).unwrap();
         assert_eq!(o.count.load(Relaxed), 3, "counted, but not the pool");
         let admitted: usize = std::thread::scope(|s| {
             let threads: Vec<_> = (0..16).map(|_| s.spawn(|| o.admit().is_ok() as usize)).collect();
@@ -318,7 +323,10 @@ mod tests {
         assert_eq!(reason(o.room().unwrap_err()), "object-limit");
         o.release();
         o.room().unwrap();
-        let full = Objects { need: (u64::MAX, 1), ..o };
+        // The quota above the node's reserve (`quota::Disk`).
+        let o = Objects { reserve: u64::MAX / 2, ..o };
+        assert_eq!(reason(o.room().unwrap_err()), "disk-full", "room within the node's reserve");
+        let full = Objects { reserve: 0, need: (u64::MAX, 1), ..o };
         assert_eq!(reason(full.room().unwrap_err()), "disk-full");
         assert_eq!(reason(full.admit().unwrap_err()), "disk-full");
         assert_eq!(full.count.load(Relaxed), 7, "a refusal takes no place");

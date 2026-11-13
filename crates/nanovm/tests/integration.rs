@@ -1103,7 +1103,9 @@ async fn a_full_app_budget_refuses_only_that_apps_writes() {
 
 /// Below the node's free-space reserve every app's writes that need more
 /// space are refused cleanly (507 from the app, not a failed commit), while
-/// writes in place still commit; freeing space ends it.
+/// writes in place still commit; freeing space ends it. A new object isn't
+/// started once the disk has less free than its quota above the reserve
+/// (objects' room check, with limits' reserve).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_disk_reserve_keeps_writes_committing() {
     let (_sup, addr, _disk) = match on_a_small_disk("the_disk_reserve_keeps_writes_committing", 8, 100, 3).await {
@@ -1114,8 +1116,12 @@ async fn the_disk_reserve_keeps_writes_committing() {
     let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(raw(addr, &format!("POST /c0/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await.0, 200);
-    // Objects of 2 MiB fill the disk down to the reserve: the first refused
-    // is refused by it (a new object needs only its 2 MiB free).
+    // Objects that exist, each with room under its 2 MiB quota to grow by 1 MiB.
+    for g in 0..4 {
+        assert_eq!(app_get(addr, &files, &format!("/g{g}/fill?mount=data&mb=0")).await.0, 200);
+    }
+    // New objects of 2 MiB fill the disk until one hasn't its quota free
+    // above the reserve: it is refused before it runs.
     let mut hogs = 0;
     let body = loop {
         let (status, body) = app_get(addr, &files, &format!("/hog{hogs}/fill?mount=data&mb=2")).await;
@@ -1125,23 +1131,38 @@ async fn the_disk_reserve_keeps_writes_committing() {
             break body;
         }
     };
-    assert!(body.contains("insufficient-space"), "{body}");
+    assert!(body.contains("disk-full") && body.contains("above the node's 3.0 MiB reserve"), "{body}");
+    // Objects that exist grow down to the reserve, then are refused by it:
+    // with less than the reserve and 2 MiB free, at most two grow.
+    let refused = 'grow: {
+        for g in 0..4 {
+            let (status, body) = app_get(addr, &files, &format!("/g{g}/fill?mount=data&mb=1")).await;
+            if status != 200 {
+                break 'grow (status, body);
+            }
+        }
+        panic!("four objects grew by 1 MiB with less than the reserve and 2 MiB free");
+    };
+    assert!(refused.0 == 507 && refused.1.contains("insufficient-space"), "{refused:?}");
     assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk is below its 3.0 MiB reserve")));
-    // Every app's growth is refused by the app, as on a full disk: never a
-    // failed commit, as the audit saw on every write.
+    // Every app's growth is refused by the app, as on a full disk, and a new
+    // object before it runs: never a failed commit, as the audit saw on
+    // every write.
     let incr = async |object: &str| {
         raw(addr, &format!("POST /{object}/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await
     };
-    for i in 0..20 {
+    let (status, body) = incr("c0").await;
+    assert!(status == 507 && body.contains("insufficient-space"), "{status} {body}");
+    for i in 1..20 {
         let (status, body) = incr(&format!("c{i}")).await;
-        assert_eq!(status, 507, "{body}");
-        assert!(body.contains("insufficient-space"), "{body}");
+        assert!(status == 507 && body.contains("disk-full"), "{status} {body}");
     }
     // A write in place still commits.
     let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
     assert_eq!(status, 200, "{body}");
-    for hog in 0..hogs {
-        assert_eq!(app_get(addr, &files, &format!("/hog{hog}/clean?mount=data")).await.0, 200);
+    // The hogs made (the last was refused, so never made), and what grew.
+    for object in (0..hogs - 1).map(|h| format!("hog{h}")).chain((0..4).map(|g| format!("g{g}"))) {
+        assert_eq!(app_get(addr, &files, &format!("/{object}/clean?mount=data")).await.0, 200);
     }
     let (status, body) = incr("c1").await;
     assert_eq!(status, 200, "{body}");

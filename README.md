@@ -669,9 +669,10 @@ something; nothing else creates or deletes an object's data.
   its create, as from a full disk.
 - **A full disk makes no new objects:** a request to an object without storage
   gets `507 disk-full` when the filesystem has less free than the object's quota
-  (`disk_mb` and `max_files`), and so does a first create then. Objects that exist
-  are served and keep their quotas; reserving room for them, and refusing the
-  node's own writes near full, is the disk budget's job (the `limits` work).
+  (`disk_mb` and `max_files`) above the node's reserve (`disk_reserve_mb`, see
+  "Disk" above), and so does a first create then. Objects that exist are served
+  and keep their quotas; below the reserve their growth is refused
+  (`insufficient-space`), while writes in place and commits go on.
 - **Never automatic for data:** nothing deletes an object that holds data, however
   old or idle; that is the app's, or an operator's (`nanovm admin delete`).
 

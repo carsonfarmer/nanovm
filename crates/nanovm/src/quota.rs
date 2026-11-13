@@ -60,7 +60,7 @@ pub struct Disk {
     idle: Mutex<HashMap<Arc<str>, u64>>,
     /// The filesystem the volumes are on, and the bytes it keeps free.
     fs: Option<std::fs::File>,
-    reserve: u64,
+    pub reserve: u64,
 }
 
 impl Default for Disk {
@@ -1014,7 +1014,7 @@ mod tests {
         }
         std::fs::create_dir_all(object_dir(&dir, "a").join("shipped")).unwrap();
         std::fs::write(object_dir(&dir, "a").join("shipped/x"), [0; 100]).unwrap();
-        let objects = Arc::new(Objects::load(dir.clone(), 100, &Limits::default()).unwrap());
+        let objects = Arc::new(Objects::load(dir.clone(), 100, &Limits::default(), 0).unwrap());
         std::fs::write(dir.join("~new").join("x"), [0; 100]).unwrap();
         let disk = Arc::new(Disk::open(&dir, 1, 0).unwrap());
         assert_eq!((disk.used.load(Relaxed), disk.max), (10, 1 << 20));
