@@ -1,5 +1,7 @@
 # Handoff
 
+**Read [AGENTS.md](AGENTS.md) first.** Rule 1 there: never write compatibility code; there is one version, v1.
+
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
 ## Current state (2026-11-08)
