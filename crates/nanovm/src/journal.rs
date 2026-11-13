@@ -1318,7 +1318,7 @@ mod tests {
         let second = out.join(format!("{:020}.tar", 2));
         assert_eq!(std::fs::read(&second).expect("main's decided version is published"), staged);
         assert!(!v.parent().unwrap().join("~journal/o/capture").exists());
-        assert_eq!(committed::epoch(&second).unwrap(), 0, "main had no leases");
+        assert_eq!(committed::identity(std::fs::File::open(&second).unwrap()).unwrap().epoch, 0, "main had no leases");
         assert_eq!(archive_tree(&v, 2), tree(&v));
         // Changes to main's last version, then a snapshot (5), then changes.
         for n in 3..=7 {
