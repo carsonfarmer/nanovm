@@ -38,23 +38,31 @@ directory, under `committed/`; recovery discards a rejected one or completes
 an accepted one before new work. A commit with capture costs 2 more syncs. With
 `store` set (a directory, `file:///path`, or an object store URL as for `leases`,
 e.g. `s3://bucket/prefix`, credentials and region from `AWS_*`), the supervisor (or
-an in-process node) ships each object's versions in order. Each is put once at
+an in-process node) ships up to 32 objects at once, each object's versions in order;
+a failure is that object's (logged, tried again a second later). Each is put once at
 `<app>/<object>/<sequence>-<sha256>.tar`, a key naming its bytes, and counts only
 once the object's head, `<app>/<object>/head`, names it; the head moves one version
 at a time, each following the last, by a write conditional on the head read
-(`If-Match`; a lock and a rename on a directory store). Shipped versions are removed
+(`If-Match`; a lock and a rename on a directory store), read once and then moved from
+what the node last wrote: a version costs a put and a head move. Shipped versions are removed
 here but the last. `max_versions` and `max_mb` bound what waits here: with the store
 down, writes are refused once they are reached; nothing is silently dropped. A
 commit is acknowledged once durable here unless `remote_ack = true`, which also
-waits (2 s at most, then fails the request: the commit still stands locally) for the
-head to name its version; with `leases` a `store` is required, and a config file's
-`remote_ack` defaults to true. Versions carry the lease epoch they were committed under. With leases,
+waits (2 s at most, whatever the app's deadlines, then fails the request with 500: the
+commit still stands locally) for the head to name its version, and then serves the object nothing (503 `not-stored`,
+`Retry-After: 1`) until every version here counts, so no client sees state the store
+doesn't have. With `leases` a `store` is required (in a config file, `leases` and
+`store` must be object stores every node shares, not memory, `file:` or a directory),
+and a config file's `remote_ack` defaults to true. Versions carry the lease epoch they were committed under. With leases,
 a node claims an object's head at its lease's epoch before serving the object, and
 ships only under its live lease, once it has claimed the head with it, versions that
 follow the head: a node that lost the object can't make a version count, however
 late its upload lands (W-90). The claim also makes the node's copy of the object the
 head's, restoring it from the store if need be, so a takeover never serves state
-older than the head. `nanovm::ship::restore` rebuilds an object from the store on a
+older than the head; a discard the claim makes is synced before the claim counts and
+is never taken for a current copy if cut short. A claim that finds the object's
+history broken in the store (a version missing) refuses the object on that node for a
+minute without asking the store again. `nanovm::ship::restore` rebuilds an object from the store on a
 fresh root, from the last snapshot before the head, and keeps its last version, so
 history goes on. Capture defaults off. Not yet: remote retention (every version
 stays in the store). Do not manually prune history or
@@ -273,7 +281,7 @@ That is the repository and the tag deployed, each identity whose signature is ac
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
-**Many nodes.** The proxy may place objects on several nodes: list them in `nodes` (each `host:port`, as that node's `name`). An object's home is chosen by rendezvous hashing, and the nodes keep leases on their objects in an object store (`leases = "s3://bucket/prefix"` on every node, with `name`; credentials from `AWS_*`), so an object has one live instance across nodes and a node that lost its lease can't commit. A node that doesn't hold an object answers 421 and the proxy tries the one that does (or the next), for up to `failover_ms`. When a node stops, its objects move after its `lease_ms` (10 s; each node's session record carries its own, which the others wait out). With leases a node ships its objects' committed versions to `capture.store` (required), and answers a write once it counts there; the node taking an object over restores it from there before serving it, so a failover loses no answered write and serves no older state. A node that took a request but hasn't answered within `failover_ms` gets the client a 504 (the request may have run there); the proxy never sends it again. Calls between objects then go through the proxy's private endpoint (the node's `proxy`). See `notes/multinode.md`.
+**Many nodes.** The proxy may place objects on several nodes: list them in `nodes` (each `host:port`, as that node's `name`). An object's home is chosen by rendezvous hashing, and the nodes keep leases on their objects in an object store (`leases = "s3://bucket/prefix"` on every node, with `name`; credentials from `AWS_*`), so an object has one live instance across nodes and a node that lost its lease can't commit. A node that doesn't hold an object answers 421 and the proxy tries the one that does (or the next), for up to `failover_ms`. When a node stops, its objects move after its `lease_ms` (10 s; each node's session record carries its own, which the others wait out). With leases a node ships its objects' committed versions to `capture.store` (required), and answers a write once it counts there; the node taking an object over restores it from there before serving it, so a failover loses no answered write and serves no older state (a write answered an error because it didn't count in time, 500 or 504, isn't served until it does). `failover_ms` must exceed every node's `lease_ms` (the proxy can't check it) and the proxy's 1 s connect timeout. A node that took a request but hasn't answered within `failover_ms` gets the client a 504 (the request may have run there); the proxy never sends it again. Calls between objects then go through the proxy's private endpoint (the node's `proxy`). See `notes/multinode.md`.
 
 DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs); the table is public; and a cold lookup adds a round trip.
 

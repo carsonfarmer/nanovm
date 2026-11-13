@@ -132,7 +132,9 @@ config! {
         nodes: Vec<String> = vec!["127.0.0.1:8080".to_string()],
         /// How long a request may wait for its object's node: for a node that
         /// stopped to lose its leases (its `lease_ms`) and another to take
-        /// over.
+        /// over. It must exceed every node's `lease_ms`, with the time a
+        /// takeover takes to restore an object; the proxy can't check that,
+        /// as each node has its own. More than the connect timeout (1 s).
         failover_ms: u64 = 30_000u64,
         /// Private control listener; only nodes may reach it.
         publish_listen: String = "127.0.0.1:8444",
@@ -248,6 +250,17 @@ impl NodeConfig {
         if let Some(capture) = cfg.capture.as_mut().filter(|_| leased && !said) {
             capture.remote_ack = true;
         }
+        // Every node must see the same leases and heads, written
+        // conditionally: memory and directories are each node's own, and
+        // `object_store`'s local files can't update a record conditionally.
+        // (A programmatic config's caller brings stores its nodes share, as
+        // tests do.)
+        let store = cfg.capture.as_ref().and_then(|c| c.store.as_deref()).unwrap_or_default();
+        for (key, url) in [("leases", cfg.leases.as_str()), ("capture.store", store)].iter().filter(|_| leased) {
+            if ["memory:", "file:", "/"].iter().any(|own| url.starts_with(own)) {
+                bail!("with leases, {key} is an object store every node shares, such as s3://bucket/prefix, not {url:?}");
+            }
+        }
         // A relative data_dir is relative to the config file (joining keeps
         // an absolute one as it is).
         cfg.data_dir = path.parent().unwrap_or(Path::new(".")).join(&cfg.data_dir);
@@ -258,6 +271,9 @@ impl NodeConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.leases.is_empty() && self.name.is_empty() {
             bail!("a node with leases has a name");
+        }
+        if self.lease_ms == 0 {
+            bail!("lease_ms is 0: a node renews its leases every lease_ms / 4");
         }
         if self.capture.as_ref().is_some_and(|c| c.remote_ack && c.store.is_none()) {
             bail!("capture.remote_ack needs a capture.store");
@@ -273,6 +289,11 @@ impl ProxyConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.nodes.is_empty() {
             bail!("the proxy has no nodes");
+        }
+        // Else a node that doesn't accept a connection in time would be taken
+        // for one that took the request and may have run it (504).
+        if self.failover_ms <= crate::proxy::CONNECT.as_millis() as u64 {
+            bail!("failover_ms must be more than the proxy's connect timeout, {:?}", crate::proxy::CONNECT);
         }
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
@@ -403,11 +424,37 @@ mod tests {
             std::fs::write(&path, text).unwrap();
             NodeConfig::load(&path).map(|c| c.capture.unwrap().remote_ack).map_err(|e| e.to_string())
         };
-        let leased = "leases = \"memory:\"\nname = \"10.0.0.1:8080\"\n";
+        let leased = "leases = \"s3://b/leases\"\nname = \"10.0.0.1:8080\"\n";
         assert!(ack(leased).unwrap_err().contains("capture.store"));
-        assert_eq!(ack(&format!("{leased}[capture]\nstore = \"/s\"")), Ok(true));
-        assert_eq!(ack(&format!("{leased}[capture]\nstore = \"/s\"\nremote_ack = false")), Ok(false));
+        assert_eq!(ack(&format!("{leased}[capture]\nstore = \"s3://b/s\"")), Ok(true));
+        assert_eq!(ack(&format!("{leased}[capture]\nstore = \"s3://b/s\"\nremote_ack = false")), Ok(false));
         assert_eq!(ack("[capture]\nstore = \"/s\""), Ok(false));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Hostile configs a node or proxy refuses: leases renewed in a busy
+    /// loop; with leases, stores each node would have its own of (memory, a
+    /// directory) or couldn't update conditionally (`object_store`'s local
+    /// files: sessions would lapse at their first renewal); a proxy that
+    /// would give up on a node before a connect to it can time out.
+    #[test]
+    fn configs_that_cannot_hold_leases_are_refused() {
+        let dir = std::env::temp_dir().join(format!("nanovm-config-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("n.toml");
+        let load = |leases: &str, store: &str, more: &str| {
+            let text = format!("leases = {leases:?}\nname = \"10.0.0.1:8080\"\n{more}\n[capture]\nstore = {store:?}\n");
+            std::fs::write(&path, text).unwrap();
+            NodeConfig::load(&path).map(drop).map_err(|e| e.to_string())
+        };
+        assert_eq!(load("s3://b/leases", "s3://b/versions", ""), Ok(()));
+        assert!(load("s3://b/leases", "s3://b/versions", "lease_ms = 0").unwrap_err().contains("lease_ms"));
+        for (leases, store) in [("memory:", "s3://b/v"), ("file:///l", "s3://b/v"), ("s3://b/l", "/v"), ("s3://b/l", "file:///v"), ("s3://b/l", "memory:")] {
+            assert!(load(leases, store, "").unwrap_err().contains("every node shares"), "{leases} {store}");
+        }
+        let proxy = |failover_ms| ProxyConfig { failover_ms, ..Default::default() }.validate().map_err(|e| e.to_string());
+        assert!(proxy(1000).unwrap_err().contains("connect timeout"));
+        assert_eq!(proxy(1001).map_err(drop), Ok(()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

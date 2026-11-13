@@ -54,19 +54,22 @@ pub enum Phase {
     Handling,
     PostReturn,
     Cold,
+    /// The node commits what a request changed: its work, not the guest's.
+    Committing,
 }
 
 impl Phase {
-    pub(crate) const ALL: [Phase; 5] = [
+    pub(crate) const ALL: [Phase; 6] = [
         Phase::Starting,
         Phase::Idle,
         Phase::Handling,
         Phase::PostReturn,
         Phase::Cold,
+        Phase::Committing,
     ];
 
     pub fn as_str(self) -> &'static str {
-        ["starting", "idle", "handling", "post-return", "cold"][self as usize]
+        ["starting", "idle", "handling", "post-return", "cold", "committing"][self as usize]
     }
 }
 
@@ -504,14 +507,20 @@ enum Exit {
 /// changes stand whether or not a publish gets through). Only while the node
 /// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route, node, id) = acc.with(|mut s| {
+    let (quota, held, route, node, shared) = acc.with(|mut s| {
         let s = s.data_mut();
         let held = std::mem::take(&mut *s.hooks.held.lock());
-        (s.quota.clone(), held, s.hooks.route.clone(), s.hooks.node.clone(), s.shared.id.clone())
+        (s.quota.clone(), held, s.hooks.route.clone(), s.hooks.node.clone(), s.shared.clone())
     });
     // Only while the node holds the object's lease (see `Journal::commit`):
-    // otherwise neither its changes nor its publishes go out.
-    quota.commit().await?;
+    // otherwise neither its changes nor its publishes go out. Its time is
+    // the node's (a store acknowledging remotely may take `ship::ACK`), not
+    // counted against the guest's post-return deadline.
+    shared.set_phase(Phase::Committing);
+    let committed = quota.commit().await;
+    shared.set_phase(Phase::PostReturn);
+    committed?;
+    let id = shared.id.clone();
     if !held.is_empty() {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {
@@ -597,18 +606,24 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         });
         let started = async {
             let mut store = new_store(&node, &app, &shared)?;
+            // Acknowledging remotely, it serves only what counts in the store
+            // (see `ship::caught_up`); recovery may just have settled a commit.
+            let versions = crate::ship::versions(&app.objects.dir, &shared.id);
+            if node.cfg.capture.as_ref().is_some_and(|c| c.remote_ack) && !crate::ship::caught_up(&versions).await? {
+                return Ok(None);
+            }
             *counted = true;
             let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
             node.metrics.stores_peak.fetch_max(live, Relaxed);
             let svc = shared
                 .charged(&node.metrics, pin!(app.pre.instantiate_async(&mut store)))
                 .await?;
-            anyhow::Ok((store, svc))
+            anyhow::Ok(Some((store, svc)))
         }
         .await;
         crate::telemetry::duration(&mut job.span, "nanovm.instantiate.duration_ms", t0);
         match started {
-            Ok((store, svc)) => {
+            Ok(Some((store, svc))) => {
                 let exit = serve(&node, &app, &shared, store, svc, job, &mut rx).await;
                 // A commit its request's deadline cut short still owns the
                 // volume. Recovering it for the next instance (or another
@@ -625,6 +640,12 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                         node.metrics.event(p.as_str(), &shared.id, detail, &shared.context.lock());
                     }
                 }
+            }
+            Ok(None) => {
+                let mut response = error_response(503, "not-stored", "its last commit doesn't count in the store yet");
+                response.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+                crate::telemetry::response(&mut job.span, &response);
+                let _ = job.reply.send(response);
             }
             Err(e) => {
                 // A new object the app has no room for (`Objects::room`).
@@ -801,6 +822,7 @@ async fn serve(
                 let ms = match phase {
                     Phase::Idle => limits.idle_timeout_ms,
                     Phase::PostReturn => limits.post_return_timeout_ms,
+                    Phase::Committing => limits.post_return_timeout_ms + crate::ship::ACK.as_millis() as u64,
                     Phase::Handling | Phase::Starting | Phase::Cold => limits.request_timeout_ms,
                 };
                 let elapsed = Duration::from_nanos(t1.saturating_sub(since));
@@ -1153,6 +1175,6 @@ mod tests {
         shared.begin_start();
         assert!(shared.cpu_used_ns() < 5_000_000);
         let names = Phase::ALL.map(Phase::as_str);
-        assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold"]);
+        assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold", "committing"]);
     }
 }

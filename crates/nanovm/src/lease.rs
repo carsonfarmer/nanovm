@@ -110,13 +110,21 @@ pub struct Leases {
     /// The grants this node's workers hold, by key, each given out once its
     /// object was claimed (see `serve`): what the node may ship.
     held: Mutex<HashMap<String, Grant>>,
+    /// Objects whose history the store can't give back, by key: until when
+    /// they are refused here, and why (see `serve`).
+    broken: Mutex<HashMap<String, (Instant, String)>>,
 }
+
+/// How long a node refuses an object whose claim found its history broken
+/// in the store, without asking the store again.
+const BROKEN: Duration = Duration::from_secs(60);
 
 type Result<T> = object_store::Result<T>;
 
 impl Leases {
     pub fn new(store: Arc<dyn ObjectStore>, node: &str, ttl: Duration) -> Leases {
-        Leases { store, node: node.into(), ttl, session: Mutex::default(), seen: Mutex::default(), held: Mutex::default() }
+        let (session, seen, held, broken) = Default::default();
+        Leases { store, node: node.into(), ttl, session, seen, held, broken }
     }
 
     /// The store an object store URL names, if any.
@@ -341,7 +349,11 @@ impl Worker {
 /// The supervisor's side of `Worker::ask`, for app `app`: the grant with its
 /// session and `until` (200), or the holder (421), or why not (503). A grant
 /// goes out only once `claim` has claimed its object for it (see
-/// `ship::claim`), and is held from then on.
+/// `ship::claim`), and is held from then on. A claim that finds the object's
+/// history broken in the store (a version missing, or not what its key
+/// names: `NotFound`, `InvalidData`) won't succeed by asking again: the
+/// object is refused here for `BROKEN`, without taking its lease at a new
+/// epoch, claiming its head and fetching its history for every request.
 pub async fn serve<B: http_body::Body<Data = bytes::Bytes>>(
     leases: &Leases,
     app: &str,
@@ -362,6 +374,9 @@ pub async fn serve<B: http_body::Body<Data = bytes::Bytes>>(
         }
         return res.status(204).body(bytes::Bytes::new()).unwrap();
     }
+    if let Some((_, why)) = leases.broken.lock().get(&key).filter(|(until, _)| Instant::now() < *until) {
+        return res.status(503).body(why.clone().into()).unwrap();
+    }
     let grant = match leases.acquire(&key).await {
         Ok(grant) => grant,
         Err(Refused::Held(node)) => return res.status(421).header(OWNER, node).body(bytes::Bytes::new()).unwrap(),
@@ -369,7 +384,12 @@ pub async fn serve<B: http_body::Body<Data = bytes::Bytes>>(
     };
     if let Err(e) = claim(&object, &grant).await {
         leases.release(&key, &grant).await;
-        return res.status(503).body(format!("claiming {key}: {e}").into()).unwrap();
+        let why = format!("claiming {key}: {e}");
+        if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData) {
+            eprintln!("nanovm: {why}; refusing it for {}s", BROKEN.as_secs());
+            leases.broken.lock().insert(key, (Instant::now() + BROKEN, why.clone()));
+        }
+        return res.status(503).body(why.into()).unwrap();
     }
     // The grant with the `until` of its own session, never another's: the
     // session it was taken in may have ended while the store answered.
@@ -594,5 +614,40 @@ mod tests {
                 assert!(!session.holds(&Grant { epoch: 1, session: id - 1, e_tag: None, version: None }));
             }
         }
+    }
+
+    /// A claim that fails because the store can't give back the object's
+    /// history (a version its head names is missing) refuses the object for
+    /// a while, without asking the store again: a request for it no longer
+    /// takes its lease at a new epoch, claims its head and fetches its
+    /// history (and the proxy tries every node in turn, for `failover_ms`).
+    /// A claim that fails for another reason (the store unreachable) is
+    /// tried again by the next request.
+    #[tokio::test]
+    async fn an_object_whose_history_is_broken_is_refused_without_asking_the_store_again() {
+        let (store, n) = nodes(1);
+        n[0].renew().await;
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let ask = async |object: &str, kind: std::io::ErrorKind| {
+            let req = http::Request::post(format!("http://nanovm{PATH}{object}")).body(http_body_util::Empty::<bytes::Bytes>::new()).unwrap();
+            let failing = async |_: &str, _: &Grant| {
+                tries.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(std::io::Error::new(kind, "app/o version 3 is not in the store"))
+            };
+            let res = serve(&n[0], "app", req, failing).await;
+            (res.status().as_u16(), String::from_utf8_lossy(res.body()).contains("version 3 is not in the store"))
+        };
+        let epoch = async |object: &str| {
+            let rec = store.get(&Path::from_iter(["objects", "app", object])).await.unwrap().bytes().await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&rec).unwrap()["epoch"].as_u64().unwrap()
+        };
+        for _ in 0..5 {
+            assert_eq!(ask("o", std::io::ErrorKind::NotFound).await, (503, true));
+        }
+        assert_eq!((tries.swap(0, std::sync::atomic::Ordering::SeqCst), epoch("o").await), (1, 1), "claimed again");
+        for _ in 0..3 {
+            assert_eq!(ask("p", std::io::ErrorKind::Other).await, (503, true));
+        }
+        assert_eq!((tries.load(std::sync::atomic::Ordering::SeqCst), epoch("p").await), (3, 3));
     }
 }

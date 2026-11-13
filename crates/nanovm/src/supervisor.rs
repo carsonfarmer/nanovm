@@ -90,8 +90,9 @@ pub struct Supervisor {
     leases: Option<Arc<crate::lease::Leases>>,
     /// Where objects' committed versions are shipped (`capture.store`).
     capture: Option<Arc<dyn crate::ship::Store>>,
-    /// Held while shipping an object, or deleting (see `ship::run`).
-    shipping: Arc<tokio::sync::Mutex<()>>,
+    /// Held to read while shipping an object, to write while deleting (see
+    /// `ship::run`).
+    shipping: Arc<tokio::sync::RwLock<()>>,
     /// A worker spawned ahead of need: see [`Spawned`].
     spare: tokio::sync::Mutex<Option<Spawned>>,
     relay: Arc<crate::telemetry::Relay>,
@@ -324,7 +325,7 @@ impl Supervisor {
         if let Some(old) = live {
             drain(old).await;
         }
-        let _turn = self.shipping.lock().await;
+        let _turn = self.shipping.write().await;
         let prefix = object.map_or(app.to_string(), |o| format!("{app}/{o}"));
         if let Some(store) = &self.capture {
             store.remove(&prefix).await.context("removing it from the store")?;

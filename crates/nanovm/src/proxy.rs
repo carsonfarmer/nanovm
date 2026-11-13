@@ -116,12 +116,15 @@ impl<T: Clone> Cache<T> {
 
 pub(crate) type Body = UnsyncBoxBody<bytes::Bytes, crate::object::BoxError>;
 
+/// How long the proxy waits for a node to accept a connection.
+pub const CONNECT: Duration = Duration::from_secs(1);
+
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> anyhow::Result<Arc<Proxy>> {
         cfg.validate()?;
         let mut connector = hyper_util::client::legacy::connect::HttpConnector::new();
         // A node that doesn't answer is passed over like one that refuses.
-        connector.set_connect_timeout(Some(Duration::from_secs(1)));
+        connector.set_connect_timeout(Some(CONNECT));
         let node = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
         Ok(Arc::new(Proxy {
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_proxy", env!("CARGO_PKG_VERSION"), None)?),
@@ -528,14 +531,14 @@ mod tests {
                 r.fetch_add(1, SeqCst);
             }
         });
-        let proxy = Proxy::new(ProxyConfig { nodes: nodes.clone(), failover_ms: 500, ..Default::default() }).unwrap();
+        let proxy = Proxy::new(ProxyConfig { nodes: nodes.clone(), failover_ms: 1500, ..Default::default() }).unwrap();
         let object = (0..).map(|i| format!("o{i}")).find(|o| rank(&nodes, "app", o)[0] == nodes[0]).unwrap();
         let req = Request::post(format!("/{object}/charge")).body(Full::new(bytes::Bytes::from("once")).map_err(|e| match e {}).boxed_unsync());
         let t0 = Instant::now();
         let sent = tokio::time::timeout(Duration::from_secs(5), proxy.send("app", &object, req.unwrap())).await;
         let (status, why) = sent.expect("still waiting long past failover_ms").unwrap_err();
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{why}");
-        assert!(t0.elapsed() < Duration::from_millis(1500), "{:?}", t0.elapsed());
+        assert!(t0.elapsed() < Duration::from_millis(2500), "{:?}", t0.elapsed());
         assert_eq!(reached.load(SeqCst), 0, "sent again to another node");
     }
 
