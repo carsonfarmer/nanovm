@@ -1863,6 +1863,30 @@ fn a_dropped_supervisors_worker_cgroups_go() {
     assert!(left.is_empty(), "worker cgroups left 10 s after their supervisor was dropped: {left:?}");
 }
 
+/// A `[worker] memory_mb` below what a spare worker uses before it has
+/// its app (its engine, mostly) is set when the spare is given its app, so
+/// it would OOM-kill the spare, and the start fail with an unrelated error
+/// (a broken pipe, say). The start is refused instead, saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_memory_limit_below_a_spares_use_is_refused_clearly() {
+    let root = match test_cgroup("small", &["memory"]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let mut cfg = node_cfg("a_worker_memory_limit_below_a_spares_use_is_refused_clearly", 8);
+    cfg.cgroup = Some(root.clone());
+    cfg.worker.memory_mb = 1;
+    let (sup, addr) = supervised_with(cfg).await;
+    let counter = publish("counter", &app("counter")).await;
+    spare_built(8).await;
+    let (status, body) = app_get(addr, &counter, "/x/").await;
+    let killed = cgroup_stat(&root, "memory.events", "oom_kill ");
+    drop(sup);
+    remove_cgroup(&root).await;
+    assert_eq!((status, killed), (502, 0), "{body}");
+    assert!(body.contains("[worker] memory_mb = 1 is below the"), "{body}");
+}
+
 /// review2 (W2): a jailed worker is the only owner of an export runtime,
 /// and it never drops its telemetry: retiring it (a switch to another
 /// version here) kills it outright, without asking it to flush first. What

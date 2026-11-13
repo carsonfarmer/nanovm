@@ -839,6 +839,10 @@ fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
         std::fs::write(dir.join(file), &value).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
     };
     if w.memory_mb > 0 {
+        // A limit below what the worker holds already (its engine) would OOM-kill it.
+        let held = std::fs::read_to_string(dir.join("memory.current")).ok().and_then(|m| m.trim().parse::<u64>().ok());
+        let held = held.unwrap_or_default().div_ceil(1 << 20);
+        anyhow::ensure!(held < w.memory_mb, "[worker] memory_mb = {} is below the {held} MiB a worker holds before it has an app", w.memory_mb);
         set("memory.max", (w.memory_mb << 20).to_string())?;
     }
     if w.cpus > 0.0 {
