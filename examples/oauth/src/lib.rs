@@ -18,7 +18,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, LOCATION, SET_COOKIE, USER_AGENT};
 use nanovm_sdk::http::{Request, Response};
 use nanovm_sdk::{Body, RequestExt, Result, config, fetch, kv, object, serde_json};
 use serde_json::{Value, json};
@@ -60,7 +60,8 @@ async fn auth(req: &Request<Body>, now: u64) -> Result {
                 setting("client_id"),
                 setting("redirect_uri")
             );
-            Response::new(302).header("location", to).header("set-cookie", cookie(nonce_cookie, &nonce, STATE_MS / 1000, secure))
+            let nonce = cookie(nonce_cookie, &nonce, STATE_MS / 1000, secure);
+            Response::builder().status(302).header(LOCATION, to).header(SET_COOKIE, nonce).body(Body::empty())?
         }
         "/callback" => {
             // The state proves the flow started here, once; the nonce whose
@@ -75,10 +76,9 @@ async fn auth(req: &Request<Body>, now: u64) -> Result {
             if !ok {
                 return text(400, "this sign-in link is used, expired, or not from this browser\n");
             }
-            let token = fetch(setting("token_url"))
-                .method("POST")
-                .header("accept", "application/json")
-                .header("content-type", "application/json")
+            let token = Request::post(setting("token_url"))
+                .header(ACCEPT, "application/json")
+                .header(CONTENT_TYPE, "application/json")
                 .body(
                     json!({
                         "client_id": setting("client_id"),
@@ -86,14 +86,14 @@ async fn auth(req: &Request<Body>, now: u64) -> Result {
                         "code": req.query("code").unwrap_or_default(),
                     })
                     .to_string(),
-                )
-                .send()
-                .await?;
+                )?;
+            let token = fetch(token).await?;
             let token: Value = serde_json::from_slice(token.body()).unwrap_or_default();
             let Some(token) = token["access_token"].as_str() else {
                 return text(401, "GitHub refused the code\n");
             };
-            let me = fetch(setting("user_url")).header("authorization", format!("Bearer {token}")).header("user-agent", "nanovm").send().await?;
+            let me = Request::get(setting("user_url")).header(AUTHORIZATION, format!("Bearer {token}")).header(USER_AGENT, "nanovm");
+            let me = fetch(me.body(())?).await?;
             let me: Value = serde_json::from_slice(me.body()).unwrap_or_default();
             let login = me["login"].as_str().filter(|l| (1..=39).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
             let Some(login) = login else { return text(502, "no GitHub user\n") };
@@ -101,10 +101,10 @@ async fn auth(req: &Request<Body>, now: u64) -> Result {
             let profile = json!({ "login": login, "id": me["id"], "name": me["name"] });
             kv::set(&format!("session:{session}"), json!({ "profile": profile, "until": now + SESSION_MS }).to_string()).await?;
             let cookie = cookie("session", &format!("{login}.{session}"), SESSION_MS / 1000, secure);
-            Response::new(302).header("location", format!("/u-{login}/me")).header("set-cookie", cookie)
+            Response::builder().status(302).header(LOCATION, format!("/u-{login}/me")).header(SET_COOKIE, cookie).body(Body::empty())?
         }
         // For user objects, about a cookie they were shown.
-        "/verify" => match session(req.query("session")).await? {
+        "/verify" => match session(req.query("session").as_deref()).await? {
             Some(s) if s["until"].as_u64().is_some_and(|t| t > now) => json(200, s.to_string())?,
             _ => text(404, "not found")?,
         },
@@ -146,7 +146,7 @@ async fn user(req: &Request<Body>, now: u64) -> Result {
             let id = session.unwrap_or_default();
             kv::delete(&format!("session:{id}")).await?;
             object("auth").post(&format!("/logout?session={id}"), "").await?;
-            Response::new(204).header("set-cookie", "session=; Path=/; Max-Age=0")
+            Response::builder().status(204).header(SET_COOKIE, "session=; Path=/; Max-Age=0").body(Body::empty())?
         }
         ("GET", "/me") | ("POST", "/logout") => text(401, "sign in at /auth/login\n")?,
         _ => text(404, "not found")?,

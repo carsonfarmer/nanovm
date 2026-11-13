@@ -17,7 +17,8 @@ use std::task::Poll;
 
 use nanovm_sdk::wasip3::clocks::{monotonic_clock, system_clock};
 use nanovm_sdk::wasip3::random::random;
-use nanovm_sdk::{Error, Request, Response, kv};
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, Error, kv};
 use rquickjs::context::intrinsic::{
     Date, Eval, Json, MapSet, Promise as Promises, Proxy, RegExp, RegExpCompiler, TypedArrays, WeakRef,
 };
@@ -49,7 +50,7 @@ mod init {
 const APP: &str = include_str!(concat!(env!("OUT_DIR"), "/app.js"));
 const PRELUDE: &str = include_str!("prelude.js");
 
-async fn handle(request: Request) -> nanovm_sdk::Result {
+async fn handle(request: Request<Body>) -> nanovm_sdk::Result {
     let js = engine().map_err(uncaught)?;
     let (status, headers, body, after) = js.serve(request).await.map_err(uncaught)?;
     // `ctx.waitUntil` work goes on after the answer, before the next
@@ -68,7 +69,8 @@ async fn handle(request: Request) -> nanovm_sdk::Result {
         }),
         None => drop(TASKS.take()),
     }
-    Ok(headers.chunks_exact(2).fold(Response::new(status).body(body), |r, kv| r.header(&kv[0], &kv[1])))
+    let response = headers.chunks_exact(2).fold(Response::builder().status(status), |r, kv| r.header(&kv[0], &kv[1]));
+    Ok(response.body(body.into())?)
 }
 
 /// An uncaught exception fails the request, which rolls back its changes.
@@ -169,16 +171,21 @@ impl Engine {
 
     async fn serve(
         &'static self,
-        request: Request,
+        request: Request<Body>,
     ) -> Result<(u16, Vec<String>, Vec<u8>, Option<Persistent<Value<'static>>>), String> {
         let (response, js_ctx) = self.ctx.with(|ctx| {
             let call = || {
-                let headers: Vec<&str> = request.headers().iter().flat_map(|(k, v)| [k.as_str(), v.as_str()]).collect();
-                let body = match request.body() {
+                let headers = flat(request.headers());
+                let body = match request.body().as_bytes() {
                     [] => Value::new_null(ctx.clone()),
-                    _ => TypedArray::<u8>::new(ctx.clone(), request.body())?.into_value(),
+                    body => TypedArray::<u8>::new(ctx.clone(), body)?.into_value(),
                 };
-                let args = (nanovm_sdk::id(), request.method(), request.url(), headers, body);
+                // The whole URL, as received (`/{object}` already gone).
+                let uri = request.uri();
+                let scheme = uri.scheme_str().unwrap_or("http");
+                let authority = uri.authority().map_or("localhost", |a| a.as_str());
+                let url = format!("{scheme}://{authority}{}", uri.path_and_query().map_or("/", |p| p.as_str()));
+                let args = (nanovm_sdk::id(), request.method().as_str(), url, headers, body);
                 let List((response, js_ctx)): List<(Value, Value)> = self.serve.clone().restore(&ctx)?.call(args)?;
                 Ok((Persistent::save(&ctx, response), Persistent::save(&ctx, js_ctx)))
             };
@@ -487,30 +494,35 @@ fn send<'js>(
     headers: Vec<String>,
     body: Option<TypedArray<'js, u8>>,
 ) -> rquickjs::Result<Promise<'js>> {
-    let mut request = nanovm_sdk::fetch(url.clone()).method(&method);
-    for kv in headers.chunks_exact(2) {
-        request = request.header(&kv[0], &kv[1]);
-    }
-    if let Some(body) = body {
-        request = request.body(bytes(&body));
-    }
+    let request = headers.chunks_exact(2).fold(Request::builder().method(method.as_str()).uri(&url), |r, kv| r.header(&kv[0], &kv[1]));
+    let request = request.body(body.map_or_else(Vec::new, |b| bytes(&b)));
     let (promise, resolve, _) = Promise::new(&ctx)?;
     let resolve = Persistent::save(&ctx, resolve);
     spawn(async move {
-        let reply = request.send().await;
+        let reply = match request {
+            Ok(request) => nanovm_sdk::fetch(request).await.map_err(|e| format!("{e:?}")),
+            Err(e) => Err(e.to_string()),
+        };
         let settle: Settle = Box::new(move |ctx| {
             let resolve = resolve.restore(&ctx)?;
             match reply {
                 Ok(r) => {
-                    let headers: Vec<String> = r.headers.into_iter().flat_map(|(k, v)| [k, v]).collect();
-                    resolve.call((List((r.status, headers, TypedArray::new(ctx.clone(), r.body)?)),))
+                    let (status, headers) = (r.status().as_u16(), flat(r.headers()));
+                    resolve.call((List((status, headers, TypedArray::new(ctx.clone(), r.into_body().into_bytes())?)),))
                 }
-                Err(e) => resolve.call((format!("fetch {url}: {e:?}"),)),
+                Err(e) => resolve.call((format!("fetch {url}: {e}"),)),
             }
         });
         settle
     });
     Ok(promise)
+}
+
+/// `headers` as JavaScript gets them: name, value, name, value, …; a value
+/// that isn't UTF-8 has its other bytes replaced.
+fn flat(headers: &nanovm_sdk::http::HeaderMap) -> Vec<String> {
+    let text = |v: &nanovm_sdk::http::HeaderValue| String::from_utf8_lossy(v.as_bytes()).into_owned();
+    headers.iter().flat_map(|(k, v)| [k.as_str().to_owned(), text(v)]).collect()
 }
 
 /// `sleep(ms, then)`: calls `then` after `ms` milliseconds (timers).

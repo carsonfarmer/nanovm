@@ -23,7 +23,7 @@
 //! ```
 //!
 //! A request arrives read in full: its [`Body`] is the bytes, with
-//! [`text`](Body::text) and [`json`](Body::json). [`RequestExt`] adds what
+//! [`text`](Body::text) and `json` (feature `json`). [`RequestExt`] adds what
 //! `http` leaves out: query parameters and cookies. The path is the one
 //! within the object: `/{object}/a/b` arrives as `/a/b`.
 //!

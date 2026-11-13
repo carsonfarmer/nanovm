@@ -199,6 +199,40 @@ async fn say(ws: &mut Ws, text: &str) {
     ws.send(Message::text(text)).await.unwrap();
 }
 
+/// examples/echo: what the SDK hands an app (`http::Request`) and what it
+/// sends for the app's `http::Response`, through the node: the status both
+/// ways, every value of a repeated header in order, header bytes that
+/// aren't UTF-8, the method, the URI within the object, and the body's
+/// bytes. The relay passes the same through a call between objects too
+/// (the SDK's outgoing request and the answer it reads back).
+#[tokio::test(flavor = "multi_thread")]
+async fn echo_maps_requests_and_responses_both_ways() {
+    let app = App::start("echo", json!({})).await;
+    let raw = reqwest::header::HeaderValue::from_bytes(b"caf\xe9 \xff\x80").unwrap();
+    let body = b"\x00\xff\r\nnot UTF-8".to_vec();
+    let direct = format!("http://{}", app.addr);
+    for (path, host) in [("/a/x/y?status=418&q=%20", direct.as_str()), ("/a/relay/b/x/y?status=418&q=%20", "http://nanovm")] {
+        let req = app.http.request(Method::PATCH, app.url(path)).body(body.clone());
+        let req = req.header("x-echo-twice", "1").header("x-echo-twice", "2").header("x-echo-raw", raw.clone());
+        let res = req.header("content-type", "application/x-test").header("x-other", "kept out").send().await.unwrap();
+        assert_eq!(res.status().as_u16(), 418, "{path}: the app's status");
+        let headers = res.headers().clone();
+        let twice: Vec<_> = headers.get_all("x-echo-twice").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(twice, ["1", "2"], "{path}: each value of a repeated header, in order");
+        assert_eq!(headers["x-echo-raw"].as_bytes(), raw.as_bytes(), "{path}: bytes that aren't UTF-8, as sent");
+        assert_eq!((headers["content-type"].to_str().unwrap(), headers.get("x-other")), ("application/x-test", None), "{path}");
+        let seen = format!("PATCH {host}/x/y?status=418&q=%20");
+        assert_eq!(headers["x-seen"].to_str().unwrap(), seen, "{path}: the method and URI, within the object");
+        assert_eq!(res.bytes().await.unwrap().to_vec(), body, "{path}: the body's bytes");
+    }
+    for status in [200, 201, 299, 404, 500, 599] {
+        let res = app.get(format!("/a/?status={status}")).await;
+        assert_eq!((res.status, res.headers.get("x-nanovm-error")), (status, None), "a status the app chose, not a failure");
+        let relayed = app.get(format!("/a/relay/b/?status={status}")).await;
+        assert_eq!(relayed.status, status, "through a call between objects");
+    }
+}
+
 /// examples/shortener: a link per object, a redirect that counts clicks per
 /// day, codes minted by one object asking another to take a link.
 #[tokio::test(flavor = "multi_thread")]
@@ -1443,10 +1477,19 @@ async fn gateway_streams_completions_within_quotas() {
     drop(body);
     assert_eq!(usage(&app).await, 105);
     // So does one the upstream breaks off: what came of it is no measure.
+    // The client's stream breaks off too, so it can tell (B-703): before,
+    // it ended cleanly after the third token, as if that were all of it.
     let res = complete(&app, "cut 3").await;
-    let text = http_body_util::BodyExt::collect(res.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
-    let text = String::from_utf8_lossy(&text);
+    let (mut body, mut text, mut broke) = (res.into_body(), String::new(), false);
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        match frame.map(|f| f.into_data()) {
+            Ok(Ok(data)) => text.push_str(&String::from_utf8_lossy(&data)),
+            Ok(Err(_)) => {}
+            Err(_) => broke = true,
+        }
+    }
     assert!(text.matches("token").count() == 3 && !text.contains("[DONE]"), "{text}");
+    assert!(broke, "the answer ends in an error, not a clean end");
     assert_eq!(usage(&app).await, 205, "not refunded as if 3 tokens were all of it");
     // So does one that outlives post_return_timeout_ms: its refund rolls back.
     let res = complete(&app, "n 50 ms 100").await;

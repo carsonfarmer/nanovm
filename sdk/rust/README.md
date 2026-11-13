@@ -1,8 +1,10 @@
 # nanovm-sdk
 
-Write a [nanovm](../../README.md) app in Rust: one async function from a
-request to a response. Each `/{object}/…` URL is its own durable object, with
-its own files and key-value store, served one request at a time.
+Write a [nanovm](../../README.md) app in Rust: one async function from an
+`http::Request` to an `http::Response`, the [`http`](https://docs.rs/http)
+crate's types (re-exported as `nanovm_sdk::http`). Each `/{object}/…` URL is
+its own durable object, with its own files and key-value store, served one
+request at a time.
 
 ## Five minutes
 
@@ -27,13 +29,13 @@ printf '\n[lib]\ncrate-type = ["cdylib"]\n' >> Cargo.toml
 `src/lib.rs`:
 
 ```rust
-use nanovm_sdk::{Request, Response, Result, kv};
+use nanovm_sdk::{Body, Result, http, kv};
 
 nanovm_sdk::serve!(handle);
 
-async fn handle(_req: Request) -> Result {
+async fn handle(_req: http::Request<Body>) -> Result {
     let visits = kv::increment("visits", 1).await?;
-    Ok(Response::text(format!("{} has had {visits} visits\n", nanovm_sdk::id())))
+    Ok(http::Response::new(format!("{} has had {visits} visits\n", nanovm_sdk::id()).into()))
 }
 ```
 
@@ -66,14 +68,28 @@ no need for write-to-temp-then-rename.
 
 ## What's in it
 
-- `Request`: `method()`, `path()` (within the object), `query("q")`,
-  `query_or("n", 0)`, `header("h")`, `cookie("c")`, `body()`, `text()`,
-  `json()` (feature `json`). `Response::text/html/json/bytes/new/not_found` with
-  `.status()`, `.header()`, `.body()`.
-- `Response::stream(content_type, |mut body| async move { body.write(..).await; })`
+- Requests and responses are `http`'s: `req.method()`, `req.uri().path()`
+  (the path within the object: `/{object}/a` arrives as `/a`),
+  `req.headers()` (every value of a repeated header, bytes that aren't UTF-8
+  kept), `Response::builder().status(201).header(k, v).body(body)?`,
+  `StatusCode`, `header::CONTENT_TYPE`, …. A builder error converts into a
+  failed request with `?`. Set `content-type` yourself; the
+  [examples](../../examples) keep two-line `json(status, body)` and
+  `text(status, body)` helpers for it.
+- `Body`, both ways. A request's is read in full (the node bounds it by
+  `max_request_body_kb`): `body()` derefs to its bytes, with `text()` and
+  `json()` (feature `json`). Make one with `.into()` from a `String`, `&str`,
+  `Vec<u8>`, `&[u8]` or `()`, or `Body::empty()`. A byte body gets its
+  `content-length`.
+- `RequestExt` (`use nanovm_sdk::RequestExt`) adds what `http` leaves out:
+  `req.query("q")` (percent-decoded), `req.query_or("n", 0)`,
+  `req.cookie("c")`.
+- `Body::stream(|mut body| async move { body.write(..).await; Ok(()) })`
   streams a body after the handler returns; the object serves nothing else
-  meanwhile, for at most the app's `post_return_timeout_ms`. `sse(id, event,
-  data)` formats a Server-Sent Event ([examples/events](../../examples/events)).
+  meanwhile, for at most the app's `post_return_timeout_ms`. Returning an
+  error from it breaks the body off, so the client sees it end early rather
+  than a short body that looks whole. `sse(id, event, data)` formats a
+  Server-Sent Event ([examples/events](../../examples/events)).
 - `data()` and `tmp()`: `read` (an `Option`), `read_text`, `write`, `append`,
   `remove`, `rename`, `open`; `fs::read_at(&fd, offset, len)` and
   `fs::write_at` for pieces of a file.
@@ -87,21 +103,26 @@ no need for write-to-temp-then-rename.
   Building it needs `WASI_SDK_PATH` (SQLite is C);
   [examples/leaderboard](../../examples/leaderboard) uses it.
 - `config::get(key)`: the manifest's `config` table.
-- `fetch(url).method(..).header(..).body(..).send()`: outbound HTTP to hosts
-  in the manifest's `egress` list; `.stream()` instead reads the answer's
-  body as it arrives (`next()`: `Ok(Some(piece))`, then `Ok(None)` once
+- `fetch(Request::post(url).header(..).body(..)?)`: outbound HTTP to hosts
+  in the manifest's `egress` list, answered with an `http::Response<Body>`;
+  `fetch_streaming(request)` instead returns once the headers arrive, its
+  body read as it comes (`next()`: `Ok(Some(piece))`, then `Ok(None)` once
   all of it has come). A body that breaks off (the connection closes before
-  its `content-length` or last chunk) is an error from `send()`, and from
+  its `content-length` or last chunk) is an error from `fetch`, and from
   `next()` where it ends, never a short body that looks whole.
-- `object("lobby").post(path, body).send()`: calls another object of the
-  app, through its queue; it commits before it answers.
+- `object("lobby").post(path, body)`, `.get(path)`, `.fetch(request)`:
+  calls another object of the app, through its queue; it commits before it
+  answers.
 - `ws::events(&req)`, `ws::Answer` (`accept`, `subscribe`, `text`, `binary`,
-  `close`) and `ws::publish(channel, msg)` for WebSockets.
+  `close`; `.into()` the response) and `ws::publish(channel, msg)` for
+  WebSockets.
 - `after(async { … })`: work that runs once the handler has answered (its
   changes commit when it is done).
 - `id()`, `app()`, `env(key)`, `sleep(d)`, `quote(s)`; `wasip3` for the rest.
 
-The [chat example](../../examples/chat) uses most of it.
+The [chat example](../../examples/chat) uses most of it;
+[examples/echo](../../examples/echo) answers with what it was sent, to see
+what reaches an app.
 
 ## Publish
 

@@ -66,7 +66,8 @@ not certify physical power loss or remote hosts.
 ## Build an app
 
 One command builds and runs an app on your machine, one publishes it. Rust apps use
-[nanovm-sdk](sdk/rust/README.md) (one async function from a request to a response);
+[nanovm-sdk](sdk/rust/README.md) (one async function from an `http::Request` to an
+`http::Response`, the `http` crate's types);
 JavaScript apps are a Workers-style module ([js/](js/README.md)). Once:
 
 ```bash
@@ -94,7 +95,7 @@ machine: loopback only, no registry, signature or jail. `nanovm publish hello.wa
 ghcr.io/you/hello:1.0.0` checks the app as a node will, pushes it as nodes pull it ([Apps](#apps)),
 and prints how to sign it and the TXT record that routes a host to it.
 [examples/chat](examples/chat) is a live multi-room chat on the same SDK. A recorded run and the
-reasons for each choice: [notes/onramp.md](notes/onramp.md). Twenty-two more examples, from a URL
+reasons for each choice: [notes/onramp.md](notes/onramp.md). Twenty-three more examples, from a URL
 shortener to a job queue, each with an end-to-end test: [notes/examples.md](notes/examples.md).
 
 ## SQLite beta

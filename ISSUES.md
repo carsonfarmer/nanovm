@@ -505,6 +505,28 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** round-3 review S2 asked that a node keep what main's build left in its data directory: a capture main had decided but not published, and main's whole-volume versions without an epoch. 7d03ade built that: recovery adopted main's staged capture, and versions were read in main's format as well as this one. Separately, M4 (3acd297) judged a session record without `lease_ms` by the taker's own.
 - **Status:** not supported, see AGENTS.md rule 1: there is exactly one version of nanovm, v1. All three were removed on `fix/no-compat`. A version says `"format": 1` and is read only so; a log is refused unless its first block is the `nanovmj1` tag and a key; a session record without `lease_ms` doesn't parse and is refused. Operators start from a fresh data directory.
 
+### B-701: the Rust SDK has its own `Request` and `Response` (owner decision: use the `http` crate's)
+- **Where:** `sdk/rust/src/lib.rs`, `fetch.rs` (was `http.rs`), `ws.rs`; every Rust app (`examples/`, `js/runtime`)
+- **Scenario:** the SDK's `Request`, `Response`, `Reply` and `Fetch` builder (about 300 lines) duplicated `http::Request`/`Response`, unfamiliar to Rust developers who know `http` from hyper, axum or Spin.
+- **Fix:** handlers take `http::Request<Body>` and return `http::Response<Body>`; `fetch` and object calls take and return them too. Conversions are `wasip3`'s `http-compat`. `Body` is bytes or a response's stream; `RequestExt` adds `query` and `cookie`. The old types are deleted, no aliases. examples/echo and `echo_maps_requests_and_responses_both_ways` check the mapping both ways through a node. Evidence: notes/sdk-http.md.
+- **Status:** done on `sdk/http-types` (sdk-http agent)
+
+### B-702: the `http` crate adds 56–77 KB to every Rust app
+- **Where:** guest components
+- **Scenario:** composed components grow +56 KB (hello, +17%) to +77 KB (oauth); +3.4–4% for apps with SQLite or the JS runtime. A linker map puts it in `http` itself: `HeaderName::from_bytes`' table of standard names (16.9 KB), URI and `HeaderMap` code (about 13 KB), `bytes` (about 4 KB).
+- **Status:** accepted with B-701 (the cost of the crate; notes/sdk-http.md has the numbers)
+
+### B-703: a streamed body can't say it failed
+- **Where:** `sdk/rust/src/lib.rs` (`Body::stream`)
+- **Scenario:** found by the round-3 review: a `Response::stream` writer ended its body with a clean end whatever happened, so examples/gateway passed on an upstream that broke off as a complete answer.
+- **Fix:** a `Body::stream` writer returns `Result<()>`; an `Err` resolves the body's trailers future to an error, so the host ends the body without its last chunk. The gateway returns the upstream's error; `gateway_streams_completions_within_quotas` checks the client sees the cut. The `r3-dev` fix brings an error path to round 3's SDK too; merging it here keeps this one.
+- **Status:** done on `sdk/http-types`
+
+### B-704: `fetch` of a request with a `host` header fails
+- **Where:** `sdk/rust/src/fetch.rs`
+- **Scenario:** from source: `wasi:http` forbids a `host` header on an outgoing request, so an app that forwards an incoming request's headers (they include `host`) gets an error. `wasip3`'s `http_into_wasi_request` moves `host` into the URI's authority; the SDK builds its request itself (it sets `content-length` and sends no body for an empty one) and doesn't.
+- **Status:** open (low)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

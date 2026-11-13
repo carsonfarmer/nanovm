@@ -10,7 +10,7 @@
 //! - `PUT /{reader}/follows` `["f-…", …]`; `GET /{reader}/timeline`: newest
 //!   first, after pulling what is new
 
-use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::header::{ACCEPT, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use nanovm_sdk::http::{Request, Response};
 use nanovm_sdk::{Body, RequestExt, Result, fetch, kv, object, serde_json};
 use serde::{Deserialize, Serialize};
@@ -47,16 +47,16 @@ async fn feed(req: &Request<Body>) -> Result {
         }
         ("POST", "/refresh") => {
             let Some(url) = kv::get_text("url").await? else { return text(404, "not found") };
-            let mut get = fetch(url.as_str()).header("accept", "application/rss+xml, application/atom+xml");
+            let mut get = Request::get(url.as_str()).header(ACCEPT, "application/rss+xml, application/atom+xml");
             if let Some(etag) = kv::get_text("etag").await? {
-                get = get.header("if-none-match", etag);
+                get = get.header(IF_NONE_MATCH, etag);
             }
-            let reply = get.send().await?;
+            let reply = fetch(get.body(())?).await?;
             if reply.status() == 304 {
                 return json(200, r#"{"new":0,"unchanged":true}"#);
             }
             if reply.status() != 200 {
-                return text(502, format!("the feed answered {}\n", reply.status()));
+                return text(502, format!("the feed answered {}\n", reply.status().as_u16()));
             }
             let Ok(found) = items(&String::from_utf8_lossy(reply.body())) else {
                 return text(502, "not RSS or Atom\n");
@@ -74,8 +74,8 @@ async fn feed(req: &Request<Body>) -> Result {
                 kv::set(&format!("item:{seq:010}"), serde_json::to_vec(&item)?).await?;
                 new += 1;
             }
-            if let Some((_, etag)) = reply.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("etag")) {
-                kv::set("etag", etag.as_str()).await?;
+            if let Some(etag) = reply.headers().get(ETAG).and_then(|v| v.to_str().ok()) {
+                kv::set("etag", etag).await?;
             }
             json(200, format!(r#"{{"new":{new}}}"#))?
         }

@@ -10,9 +10,9 @@
 use std::hash::{Hash, Hasher};
 
 use nanovm_sdk::fs::{self, DescriptorFlags, OpenFlags};
-use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG};
 use nanovm_sdk::http::{Request, Response};
-use nanovm_sdk::{Body, Result, data, kv, serde_json};
+use nanovm_sdk::{Body, Error, Result, data, kv, serde_json};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -54,8 +54,8 @@ async fn handle(req: Request<Body>) -> Result {
 }
 
 async fn upload(name: &str, req: Request<Body>) -> Result {
-    let content_type = req.header("content-type").unwrap_or("application/octet-stream").to_string();
-    let body = req.into_body();
+    let content_type = header(&req, CONTENT_TYPE).unwrap_or("application/octet-stream").to_string();
+    let body = req.into_body().into_bytes();
     let mut hasher = std::hash::DefaultHasher::new();
     body.hash(&mut hasher);
     let meta = Meta { name: name.into(), size: body.len() as u64, etag: format!("\"{:016x}\"", hasher.finish()), content_type };
@@ -73,47 +73,52 @@ async fn upload(name: &str, req: Request<Body>) -> Result {
     data().rename(UPLOAD, &format!("f-{name}")).await?;
     let json = serde_json::to_string(&meta)?;
     kv::set(name, json.as_str()).await?;
-    Ok(Response::json(json).status(201).header("etag", &meta.etag))
+    let created = Response::builder().status(201).header(CONTENT_TYPE, "application/json");
+    Ok(created.header(ETAG, &meta.etag).body(json.into())?)
 }
 
 async fn download(req: &Request<Body>, meta: Meta) -> Result {
-    if req.header("if-none-match") == Some(&meta.etag) {
-        return Ok(Response::new(304).header("etag", &meta.etag));
+    if header(req, "if-none-match") == Some(&meta.etag) {
+        return Ok(Response::builder().status(304).header(ETAG, &meta.etag).body(Body::empty())?);
     }
     let size = meta.size;
-    let ((start, end), status) = match req.header("range").map(|r| range(r, size)) {
+    let ((start, end), status) = match header(req, "range").map(|r| range(r, size)) {
         Some(Some(Ok(r))) => (r, 206),
         Some(Some(Err(()))) => {
-            return Ok(Response::new(416).header("content-range", format!("bytes */{size}")));
+            return Ok(Response::builder().status(416).header(CONTENT_RANGE, format!("bytes */{size}")).body(Body::empty())?);
         }
         // No range, or one we don't serve (several): the whole file.
         _ => ((0, size), 200),
     };
     let fd = data().open(&format!("f-{}", meta.name), OpenFlags::empty(), DescriptorFlags::READ).await?;
     let head = req.method() == "HEAD";
-    // Streamed a piece at a time, so a large file never sits in memory.
-    let mut res = Response::stream(&meta.content_type, move |mut body| async move {
+    // Streamed a piece at a time, so a large file never sits in memory. A
+    // read that fails breaks the body off: the client sees it cut short.
+    let body = Body::stream(move |mut body| async move {
         let mut at = start;
         while at < end && !head {
-            match fs::read_at(&fd, at, (end - at).min(PIECE) as usize).await {
-                Ok(piece) if !piece.is_empty() => {
-                    at += piece.len() as u64;
-                    if !body.write(piece).await {
-                        return;
-                    }
-                }
-                _ => return,
+            let piece = fs::read_at(&fd, at, (end - at).min(PIECE) as usize).await?;
+            if piece.is_empty() {
+                return Err(Error::new("the file is shorter than its size"));
+            }
+            at += piece.len() as u64;
+            if !body.write(piece).await {
+                break; // The client left.
             }
         }
-    })
-    .status(status)
-    .header("accept-ranges", "bytes")
-    .header("etag", &meta.etag)
-    .header("content-length", (end - start).to_string());
+        Ok(())
+    });
+    let mut res = Response::builder().status(status).header(CONTENT_TYPE, &meta.content_type);
+    res = res.header(ACCEPT_RANGES, "bytes").header(ETAG, &meta.etag).header(CONTENT_LENGTH, end - start);
     if status == 206 {
-        res = res.header("content-range", format!("bytes {start}-{}/{size}", end - 1));
+        res = res.header(CONTENT_RANGE, format!("bytes {start}-{}/{size}", end - 1));
     }
-    Ok(res)
+    Ok(res.body(body)?)
+}
+
+/// Header `name`, if it is text.
+fn header(req: &Request<Body>, name: impl nanovm_sdk::http::header::AsHeaderName) -> Option<&str> {
+    req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
 /// One range of `Range: bytes=…` as `[start, end)`: `None` if it isn't one

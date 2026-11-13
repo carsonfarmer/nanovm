@@ -610,6 +610,7 @@ Several agents work on this repo at once, each in its own checkout.
 - `crates/nanovm/tests/integration.rs`: the integration tests. Helpers: `node_cfg`, `supervised_with`, `http_get`, `test_cgroup`, `stalling_upstream`. `jail_probe` runs in a child process.
 - `crates/nanovm/support/load.rs`: the in-process load generator, used by the tests and the benchmark.
 - `crates/nanovm/examples/bench.rs`: the in-process benchmark. `examples/dev-registry.rs`: a loopback registry with the guests published, for the demo and local development.
+- `sdk/rust`: the Rust SDK. Handlers take and return the `http` crate's `Request`/`Response` with the SDK's `Body` (owner decision, B-701; `wasip3`'s `http-compat` converts; notes/sdk-http.md). `examples/echo` answers with what it was sent.
 - `guests/`: `counter`, `hostile` and `util`; build them with `scripts/build-guests.sh`.
   - Hostile endpoints include `/hold` (keeps response bodies open), `/big` (a large body) and `/commit` (writes, then ends as `then=` says).
   - The counter guest has a chat room on `/ws` and `POST /publish`.

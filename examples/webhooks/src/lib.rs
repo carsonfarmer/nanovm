@@ -56,14 +56,14 @@ async fn handle(req: Request<Body>) -> Result {
         ("POST", "/in") => {
             let Some(config) = kv::get("config").await? else { return text(404, "not found") };
             let config: Config = serde_json::from_slice(&config)?;
-            if !signed(&config.secret, req.header("x-hub-signature-256").unwrap_or_default(), req.body()) {
+            if !signed(&config.secret, header(&req, "x-hub-signature-256").unwrap_or_default(), req.body()) {
                 return text(401, "bad signature\n");
             }
             let id = kv::increment("next", 1).await?;
             let delivery = Delivery {
                 id,
                 body: req.body().text()?.into(),
-                content_type: req.header("content-type").unwrap_or("application/json").into(),
+                content_type: header(&req, "content-type").unwrap_or("application/json").into(),
                 pending: config.targets,
                 done: vec![],
                 tries: 0,
@@ -98,21 +98,19 @@ async fn handle(req: Request<Body>) -> Result {
 async fn deliver(mut d: Delivery) -> Result<()> {
     let mut failed = vec![];
     for target in std::mem::take(&mut d.pending) {
-        let sent = fetch(target.as_str())
-            .method("POST")
-            .header("content-type", &d.content_type)
-            .header("x-relay-delivery", d.id.to_string())
-            .body(d.body.as_str())
-            .send()
-            .await;
+        let request = Request::post(target.as_str()).header(CONTENT_TYPE, d.content_type.as_str());
+        let sent = match request.header("x-relay-delivery", d.id).body(d.body.as_str()) {
+            Ok(request) => fetch(request).await.map_err(|e| format!("{e:?}")),
+            Err(e) => Err(e.to_string()),
+        };
         match sent {
-            Ok(r) if (200..300).contains(&r.status()) => d.done.push(target),
+            Ok(r) if r.status().is_success() => d.done.push(target),
             Ok(r) => {
-                d.error = Some(format!("{target}: {}", r.status()));
+                d.error = Some(format!("{target}: {}", r.status().as_u16()));
                 failed.push(target);
             }
             Err(e) => {
-                d.error = Some(format!("{target}: {e:?}"));
+                d.error = Some(format!("{target}: {e}"));
                 failed.push(target);
             }
         }
@@ -124,6 +122,11 @@ async fn deliver(mut d: Delivery) -> Result<()> {
         d.next_at = now()? + (1000u64 << (d.tries - 1).min(10));
     }
     save(&d).await
+}
+
+/// Header `name`, if it is text.
+fn header<'a>(req: &'a Request<Body>, name: &str) -> Option<&'a str> {
+    req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
 /// `signature` is `sha256=` and the hex HMAC-SHA256 of `body` under `secret`;

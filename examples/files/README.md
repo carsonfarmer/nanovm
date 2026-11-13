@@ -30,7 +30,7 @@ What it shows:
   file needs room for both copies while it is written (W-600 would remove
   the need).
 - **Streamed downloads.** A download is read and sent 64 KiB at a time
-  (`Response::stream`, `fs::read_at`), so a large file never sits in the
+  (`Body::stream`, `fs::read_at`), so a large file never sits in the
   object's memory; it has `content-length`, `accept-ranges` and an `ETag`
   (`If-None-Match` gives `304`). The object serves nothing else while it
   streams, for at most `post_return_timeout_ms`.

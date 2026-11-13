@@ -22,9 +22,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
 use nanovm_sdk::http::{Request, Response};
-use nanovm_sdk::{Body, Result, config, fetch, kv, serde_json};
+use nanovm_sdk::{Body, Result, config, fetch_streaming, kv, serde_json};
 use serde_json::json;
 
 nanovm_sdk::serve!(handle);
@@ -44,30 +44,24 @@ async fn handle(req: Request<Body>) -> Result {
                 return json(429, json!({ "error": "quota", "used": used, "limit": limit }).to_string());
             }
             let url = config::get("upstream").ok().flatten().unwrap_or_default();
-            let mut upstream = fetch(url)
-                .method("POST")
-                .header("content-type", "application/json")
-                .header("authorization", format!("Bearer {}", nanovm_sdk::env("UPSTREAM_KEY")))
-                .body(json!({ "prompt": prompt, "max_tokens": max, "stream": true }).to_string())
-                .stream()
-                .await?;
-            if upstream.status() != 200 {
-                return text(502, format!("upstream answered {}\n", upstream.status()));
+            let request = Request::post(url)
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, format!("Bearer {}", nanovm_sdk::env("UPSTREAM_KEY")))
+                .body(json!({ "prompt": prompt, "max_tokens": max, "stream": true }).to_string())?;
+            let (upstream, mut tokens) = fetch_streaming(request).await?.into_parts();
+            if upstream.status != 200 {
+                return text(502, format!("upstream answered {}\n", upstream.status.as_u16()));
             }
             // Reserved now: this commits with the answer, before any token flows.
             kv::set(&used_key, (used + max).to_string()).await?;
-            Response::stream("text/event-stream", move |mut body| async move {
+            let stream = Body::stream(move |mut body| async move {
                 let mut events = Events::default();
-                loop {
-                    let piece = match upstream.next().await {
-                        Ok(Some(piece)) => piece,
-                        Ok(None) => break,
-                        // The upstream broke off: the reservation stands.
-                        Err(_) => return,
-                    };
+                // The upstream breaking off breaks the answer off too, so the
+                // client can tell; the reservation stands.
+                while let Some(piece) = tokens.next().await? {
                     events.read(&piece);
                     if !body.write(piece).await {
-                        return; // The client left: the reservation stands.
+                        return Ok(()); // The client left: the reservation stands.
                     }
                 }
                 // Done, and verifiably so: give back what wasn't used. This
@@ -76,8 +70,9 @@ async fn handle(req: Request<Body>) -> Result {
                 if let Some(used) = events.used() {
                     let _ = kv::increment(&used_key, used.clamp(0, max) - max).await;
                 }
-            })
-            .header("cache-control", "no-cache")
+                Ok(())
+            });
+            Response::builder().header(CONTENT_TYPE, "text/event-stream").header(CACHE_CONTROL, "no-cache").body(stream)?
         }
         _ => text(404, "not found")?,
     })

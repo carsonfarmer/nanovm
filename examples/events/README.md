@@ -21,7 +21,7 @@ reconnects a second after each response with the last id it saw.
 What it shows, and what a stream costs:
 
 - **A streamed body is written after the handler returns**
-  (`Response::stream`). The countdown's ticks arrive as they are written,
+  (`Body::stream`). The countdown's ticks arrive as they are written,
   and what it changes after answering (it counts finished countdowns)
   commits when the stream ends.
 - **Meanwhile the object serves nothing else.** An object is one request at
