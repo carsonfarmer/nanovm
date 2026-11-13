@@ -1354,8 +1354,8 @@ async fn restores_an_object_and_an_app_into_a_running_node() {
     let done = admin_json(&cfg, &["restore", &wa, "o", "3"]).await.unwrap();
     assert_eq!((&done[0]["object"], &done[0]["version"], &done[0]["head"]), (&"o".into(), &3.into(), &6.into()), "{done}");
     assert!(done[0]["said"].as_str().unwrap().contains("versions 4 to 5 stay in the store"), "{done}");
+    assert_eq!(head(&wa, "o"), 6, "the restore shipped its version");
     assert_eq!(count(app_get(addr, &a, "/o/").await), 3);
-    eventually("version 6 shipped", || head(&wa, "o") == 6).await;
     assert_eq!(count(app_post(addr, &a, "/o/incr").await), 4);
     eventually("version 7 shipped", || head(&wa, "o") == 7).await;
     let versions = admin_json(&cfg, &["versions", &wa, "o"]).await.unwrap();
@@ -5112,12 +5112,17 @@ mod nodes {
         let shipped = PathBuf::from(cfg_a.capture.as_ref().unwrap().store.clone().unwrap());
         let a = serve(cfg_a, la, store.clone()).await;
         let b = serve(cfg_b, lb, store.clone()).await;
-        let published = publish("nodes-restore", &app("hostile")).await;
+        // A write waits for its version to count in the store (remote ack)
+        // in its post-return phase: hostile's 500 ms is short for a busy disk.
+        let mut hostile = app("hostile");
+        hostile.limits.post_return_timeout_ms = 5_000;
+        let published = publish("nodes-restore", &hostile).await;
         let (proxy, app) = proxy(&names, private, "restore.test", &published).await;
         let object = homed(&names, &app, &names[0]);
         let head = || serde_json::from_slice::<nanovm::ship::Head>(&std::fs::read(shipped.join(&app).join(&object).join("head")).unwrap()).unwrap();
         for v in ["one", "two", "three"] {
-            assert_eq!(get(proxy, "restore.test", &format!("/{object}/commit?v={v}")).await.0, 200);
+            let written = get(proxy, "restore.test", &format!("/{object}/commit?v={v}")).await;
+            assert_eq!(written.0, 200, "{written:?}");
         }
         let before = head();
         assert_eq!(before.node, names[0]);
@@ -5126,8 +5131,10 @@ mod nodes {
         assert!(format!("{e:#}").contains(&format!("Held(\"{}\")", names[0])), "{e:#}");
         let done = a.command(&args(&["restore", &app, &object, "1"])).await.unwrap();
         assert_eq!((&done[0]["version"], &done[0]["head"]), (&1.into(), &(before.sequence + 1).into()), "{done}");
+        assert_eq!(head().sequence, before.sequence + 1, "shipped under the restore's lease");
         assert_eq!(get(proxy, "restore.test", &format!("/{object}/commit")).await, (200, r#"{"file":"one","key":"one"}"#.into()));
-        assert_eq!(get(proxy, "restore.test", &format!("/{object}/commit?v=four")).await.0, 200);
+        let written = get(proxy, "restore.test", &format!("/{object}/commit?v=four")).await;
+        assert_eq!(written.0, 200, "{written:?}");
         let after = head();
         assert_eq!((after.sequence, after.node.as_str()), (before.sequence + 2, names[0].as_str()));
         assert!(after.lease > before.lease, "taken again after the restore: {after:?}");

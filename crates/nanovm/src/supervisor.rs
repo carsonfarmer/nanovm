@@ -325,23 +325,31 @@ impl Supervisor {
             }
         };
         let restored = async {
-            // What it committed here goes to the store first (the shipper may
-            // be at it too, which moves the head under a try).
+            // What it committed here goes to the store first, and a version made
+            // to restore an older one goes after (the shipper may be at it too,
+            // which moves the head under a try): with leases, before the lease
+            // is let go, as only it lets the version ship.
             let dir = objects.join("~committed").join(id);
-            let mut shipped = Ok(());
-            for _ in 0..3 {
-                shipped = crate::ship::ship_object(store, self.leases.as_deref(), app, id, &dir).await;
-                if shipped.is_ok() {
-                    break;
+            let ship = async || {
+                let mut shipped = Ok(());
+                for _ in 0..3 {
+                    shipped = crate::ship::ship_object(store, self.leases.as_deref(), app, id, &dir).await;
+                    if shipped.is_ok() {
+                        break;
+                    }
                 }
-            }
-            if let Err(e) = shipped
+                shipped
+            };
+            if let Err(e) = ship().await
                 && !discard
             {
                 anyhow::bail!("it has versions the store doesn't, which a restore would drop ({e}); to drop them, discard them");
             }
-            // A version made to restore an older one ships as any other.
-            Ok(crate::ship::restore(store, app, id, objects, to, grant.as_ref().map_or(0, |g| g.epoch)).await?)
+            let restored = crate::ship::restore(store, app, id, objects, to, grant.as_ref().map_or(0, |g| g.epoch)).await?;
+            if let Err(e) = ship().await {
+                eprintln!("nanovm: shipping restored {app}/{id}: {e}");
+            }
+            Ok(restored)
         }
         .await;
         if let (Some(leases), Some(grant)) = (&self.leases, &grant) {
