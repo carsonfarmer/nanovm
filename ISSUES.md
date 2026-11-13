@@ -1,6 +1,6 @@
 # Issues
 
-One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done twice or missed. Before starting one, set its status to `fixing` (or `in progress`), with who has it, and push; when it is on `main`, set `fixed in <commit>` (or `done in <commit>`) in the same push. New problems get the next `N-` number, new work the next `W-` number.
+One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done twice or missed. Before starting one, set its status to `fixing` (or `in progress`), with who has it, and push; when it is on `main`, set `fixed in <commit>` (or `done in <commit>`) in the same push. New problems get the next `N-` number, new work the next `W-` number. Agents working in parallel each take a range of their own so their entries can't collide when their branches merge (the beta branches: `B-1xx` secrets, `B-2xx` objects, `B-3xx` limits, `B-4xx` deploy, `B-5xx` recovery, `B-6xx` deployable, `B-7xx` the SDK; round 3's reviews `N-7xx`); a merge that still brings two entries with one ID renumbers one and keeps both.
 
 - **Reproduced**: shown against the real code or the OS. **From source**: traced through the code, not run.
 - Status: `open`, `fixing`, `fixed in <commit>`, or `deferred: <why>`.

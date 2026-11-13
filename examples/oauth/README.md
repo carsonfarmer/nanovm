@@ -19,7 +19,9 @@ What it shows:
   random `state`, kept for ten minutes and usable once (so a link can't be
   replayed or forged); on the way back it trades the code for a token
   (`fetch` to `github.com`) and the token for the user's login
-  (`api.github.com`), both in the manifest's `egress` list.
+  (`api.github.com`), both in the manifest's `egress` list. On a node its
+  operator must allow them too (the node's `[limits] egress`, which caps
+  every app's); `nanovm run` takes the manifest's list as given.
 - **A sign-in finishes in the browser that started it.** `/auth/login`
   also sets a random nonce in a cookie (`HttpOnly`, `SameSite=Lax`,
   `Path=/`; `__Host-oauth_nonce` and `Secure` when `redirect_uri` is

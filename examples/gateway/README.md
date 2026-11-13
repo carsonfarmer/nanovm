@@ -15,7 +15,8 @@ curl http://127.0.0.1:8080/ann/usage                                            
 ```
 
 Set `upstream` (a completion API that streams Server-Sent Events) in the
-manifest's config and its host in `egress`. Its key is the app's one secret
+manifest's config and its host in `egress` (on a node, the operator's
+`[limits] egress` must allow it too). Its key is the app's one secret
 (`upstream_key`, declared in the manifest's `secrets`): `--secrets` gives it
 locally, a node's operator on a node ([Secrets](../../README.md#secrets)).
 

@@ -309,15 +309,19 @@ Docker instead.
 ## How this was checked
 
 On `beta/deployable` (round 3), with a dev build of that branch; method and
-output in [notes/beta-deployable.md](../../notes/beta-deployable.md).
+output in [notes/beta-deployable.md](../../notes/beta-deployable.md). Again on
+`beta/integration` with secrets and deploy merged (the reference configs with
+their `hosts`, `signers`, `egress` and secrets directory): the e2e test 9/9
+and the units test in plain mode 16/16.
 
 - [test/e2e.sh](test/e2e.sh), run by `SCRIPT=$PWD/deploy/single-node/test/e2e.sh
   MODES=plain deploy/systemd/test/nspawn.sh` (this host's Ubuntu 24.04 booted in
   systemd-nspawn): `install.sh` and its host check, Caddy 2.6.2 with its
   internal CA, the proxy asking a DNS-over-HTTPS stand-in, the dev registry, and
-  a counting sink on the Collector's port. 8/8 checks pass: three writes and a
+  a counting sink on the Collector's port. 9/9 checks pass: three writes and a
   read through verified TLS → proxy → node → jailed worker; a client-sent
-  `nanovm-app` header is ignored; a host with no record gets 404; 8080 and 8444
+  `nanovm-app` header is ignored; a host with no record gets 404, and one the
+  proxy doesn't serve 403; 8080 and 8444
   listen on 127.0.0.1 only; `proxy.request`, `supervisor.request` and `request`
   spans arrive; the count survives a node restart.
 - The units in four modes (plain, cgroup, capture, and capture shipped to a
