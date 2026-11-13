@@ -283,6 +283,7 @@ The proxy:
 - asks the registry which digest the tag names, and keeps that for `tag_ttl_s` (30 s);
 - looks each host or tag up once however many requests ask at once, and keeps a failed lookup's answer for 5 s rather than asking again;
 - remembers up to 10,000 hosts and tags with an answer (an app, a digest), and apart from them up to 1,000 without one: no record (kept 30 s), refused, failed, or being looked up. While 1,000 of those are fresh, a host it doesn't know gets 503 rather than a lookup. So names made up under a `*.` entry cost at most 1,000 lookups at a time, however many come, and never push out a host that has an app (`made_up_names_cost_bounded_lookups_and_keep_live_routes`);
+- keeps serving a host's last route, and a tag's last digest, while looking it up again fails or takes over 5 s (a resolver or registry outage), for up to a day past its TTL, asking again every 30 s (RFC 8767's serve-stale). A host or tag it never found fails as before (502). The node still fetches a manifest and its signatures whenever an app's worker starts, so an app whose worker restarts during a registry outage is down until the registry is back (B-406);
 - drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards HTTP requests; it holds WebSockets itself and forwards their events;
 - speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
 - gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too);
@@ -656,7 +657,7 @@ The tests cover:
   - unit tests roll back every kind of change, commit them, survive a crash at each step of recovery, ignore a torn record, journal writes to a file removed while open and to one opened write-only, and record nothing for a failed `rmdir` or a refused change
 - calls between objects: the callee's volume and commit, and cycles (an object calling itself, or back through another) refused at once
 - an allowed outbound request through the full egress path
-- the egress allowlist, including DNS rebinding to loopback
+- the egress allowlist, including DNS rebinding to loopback, within the operator's (an app asking for `*.com` reaches only what the node's `limits.egress` lists, in-process and through the supervisor)
 - LRU and idle eviction, and capacity limits
 - churn past capacity
 - the HTTP front end
@@ -676,6 +677,7 @@ The tests cover:
 - apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, a switch that finishes when its request goes away, at most `max_apps` workers (taking only idle apps' slots), and slow registries held to four fetches at once and a deadline
 - the proxy hanging up on clients that stall their headers, and surviving running out of file descriptors
 - the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and proxy-owned WebSockets send events with the current digest
+- the operator's admission: an unlisted host refused before any DNS lookup, a record's identities cut to the operator's signers (end to end: the CI-signed counter refused when only another identity is listed), an alias its owner's record doesn't list refused, 30,000 made-up hosts costing at most 1,001 lookups and never pushing out a live route, a SERVFAIL not taken for "no record", and a route or digest served stale through a resolver outage
 - key-value: persistence, shared filesystem byte/file quotas, bad names, 1 MiB read/write bounds, streamed keys/backpressure and completion lifetimes, cancellation-safe replacement, raw-file visibility and jailed execution. Optional probes cover mutation recovery cuts, 1,000 same-request replacements and 10,000-key scale.
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`
 - WebSockets through the proxy: echo, binary, committed fan-out scoped by app and object, a guest-initiated close, the object told how a socket ended, refusals by an object that doesn't answer `OPEN`; per-object, per-app and total caps, bounded messages and slow clients, publish deadlines, worker restart and version switches without reconnecting

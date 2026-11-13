@@ -89,7 +89,8 @@ fn publish(wasm: &str, target: &str, flags: &[String]) -> anyhow::Result<()> {
          Then route a host to it with a DNS TXT record naming the signer's OIDC issuer and identity:\n\
          _nanovm.example.com. TXT \"app={repo}:{version}; trust=<issuer> <identity>\"\n\
          such as trust=https://token.actions.githubusercontent.com \
-         https://github.com/<owner>/<repo>/.github/workflows/publish-app.yml@refs/heads/main"
+         https://github.com/<owner>/<repo>/.github/workflows/publish-app.yml@refs/heads/main\n\
+         The proxy serves it once its operator lists the host in `hosts` and the identity in `signers`."
     );
     Ok(())
 }

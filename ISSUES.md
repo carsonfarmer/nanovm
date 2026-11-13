@@ -533,7 +533,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### B-405: a registry or DNS-over-HTTPS outage takes every app down within 30 s (deploy)
 - **Where:** `proxy.rs` (`Cache`)
 - **Scenario:** routes last their TTL and digests `tag_ttl_s` (30 s); once one ran out, a failed lookup was the answer (502) for every request.
-- **Status:** fixed in the stale-on-error commit (see notes/beta-deploy.md): a found route or digest stands in for failures to look it up again (or a lookup taking over 5 s) for up to a day past its TTL, asked again every 30 s (RFC 8767's serve-stale). A host or tag never found fails as before. Tests: `found_answers_outlast_an_outage_for_a_while`, `a_resolver_outage_keeps_the_last_route`. Not covered: a proxy restarted during an outage has nothing to serve (the cache is in memory); B-406.
+- **Status:** fixed in 185f832: a found route or digest stands in for failures to look it up again (or a lookup taking over 5 s) for up to a day past its TTL, asked again every 30 s (RFC 8767's serve-stale). A host or tag never found fails as before. Tests: `found_answers_outlast_an_outage_for_a_while`, `a_resolver_outage_keeps_the_last_route`. Not covered: a proxy restarted during an outage has nothing to serve (the cache is in memory); B-406.
 
 ### B-406: a worker start fetches the manifest and signatures again, so a registry outage stops any app whose worker restarts (deploy)
 - **Where:** `registry.rs` (`load`, `verify`), `supervisor.rs` (`start`)
@@ -662,7 +662,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-15: key apps by the DNS name that owns their record (owner decided 2026-10-30)
 - **What:** today an app is keyed by the request's host and repository, so `example.com` and `www.example.com` are two apps with separate data. Key it instead by the name whose `_nanovm` TXT record was found, after CNAMEs: the `name` of the TXT answer in the DNS-over-HTTPS JSON, lowercased, without a trailing dot or the `_nanovm.` prefix. The proxy sends that as `nanovm-host`. Then `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app. Still safe: a CNAME to someone else's record only serves their app as their record configures it, which anyone could already reach through their own domain; no name can choose another name's version or data. Test with the DoH stub answering a CNAME chain (two hosts, one app; a third host with its own record, its own app). Update README's "The proxy" and "Apps", and Q52 in HANDOFF.
-- **Status:** fixed in 54054c0
+- **Status:** fixed in 54054c0; amended by B-403 (d287d22): "a CNAME to someone else's record only serves their app" also served their data under the alias's origin, so the owner's record must now list each alias (`alias=<host>`).
 
 ### W-16: build and test CI
 - **What:** run a production-feature build check and the unit/integration suite on pushes and pull requests; build guests locally without publishing packages. Read-only token, Ubuntu 24.04, locked dependencies, serial test scheduling to reduce N-32 contention.
