@@ -311,6 +311,20 @@ async fn review2_wait_until_that_wrote_before_the_answer_commits_that_write_when
     assert!(kv.get("early").is_none(), "the rejected waitUntil work's write committed: {kv}");
 }
 
+/// review2 (D4): the documented contract is that a rejected waitUntil
+/// promise leaves the answer and the handler's own writes standing. When it
+/// has already rejected by the time the handler answers, the abort lands
+/// before the host takes the answer: the request fails as a trap instead,
+/// and the handler's own write rolls back with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_wait_until_rejected_before_the_answer_fails_the_answered_request() {
+    let node = node("js_wait_until_early_reject", 8);
+    let r = post(&node, "e", "/later-throw-early").await;
+    let kv = get(&node, "e", "/kv").await.json();
+    assert_eq!((r.status, r.body.as_str()), (200, "answered first"), "{:?}; storage after: {kv}", r.error);
+    assert_eq!(kv["answered"], 1, "the handler's own write stands: {kv}");
+}
+
 /// review2 (D4): `answer` takes `Promise.all` of the promises registered
 /// when the handler answers. One that waitUntil work registers later is not
 /// waited for and its rejection is never seen: its write commits with the

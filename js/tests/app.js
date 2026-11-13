@@ -80,6 +80,17 @@ const routes = {
     })());
     return new Response("answered first");
   },
+  // review2: waitUntil work that writes and rejects before the handler
+  // has answered; the answer itself is fine.
+  "POST /later-throw-early": async (req, env, ctx) => {
+    ctx.waitUntil((async () => {
+      await env.kv.put("early", hits);
+      throw new Error("waitUntil work failed");
+    })());
+    await new Promise((r) => setTimeout(r, 50));
+    await env.kv.put("answered", hits);
+    return new Response("answered first");
+  },
   // review2: waitUntil work that writes while the handler is running and
   // rejects after it has answered.
   "POST /later-throw-straddle": async (req, env, ctx) => {
