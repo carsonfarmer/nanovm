@@ -570,24 +570,31 @@ mod tests {
             }
             tokio::time::sleep(TTL / 10).await;
         };
-        // A's worker hears of A's new session, then the late answer.
         let (id, until) = a.renew().await;
-        let session = Arc::new(Session::default());
-        session.set(id, until);
         slow.gate.add_permits(1);
         let res = asked.await.unwrap();
-        // As the worker takes an answer (`Worker::acquire`, `Node::acquire`),
-        // and decides a commit (`ObjShared::lease_epoch`).
-        let mut obj = crate::object::ObjShared::new("app".into(), "o");
-        obj.leases = Some(session.clone());
-        if res.status() == 200 {
-            let (grant, id, until): (Grant, u64, u64) = serde_json::from_slice(res.body()).unwrap();
-            session.set(id, until);
-            *obj.lease.get_mut() = Some(grant);
+        // As a worker takes the answer (`Worker::acquire`, `Node::acquire`)
+        // and decides a commit (`ObjShared::lease_epoch`), whether or not it
+        // has heard of A's new session first.
+        for heard in [false, true] {
+            let session = Arc::new(Session::default());
+            if heard {
+                session.set(id, until);
+            }
+            let mut obj = crate::object::ObjShared::new("app".into(), "o");
+            obj.leases = Some(session.clone());
+            if res.status() == 200 {
+                let (grant, id, until): (Grant, u64, u64) = serde_json::from_slice(res.body()).unwrap();
+                session.set(id, until);
+                *obj.lease.get_mut() = Some(grant);
+            }
+            let epoch = obj.lease_epoch().ok();
+            assert!(epoch.is_none(), "A's worker (heard of its new session: {heard}) may commit at epoch {epoch:?} while B holds {}", taken.epoch);
+            // Nor does a late word on the dead session revive it.
+            if heard {
+                session.set(id - 1, u64::MAX);
+                assert!(!session.holds(&Grant { epoch: 1, session: id - 1, e_tag: None, version: None }));
+            }
         }
-        assert!(obj.lease_epoch().is_err(), "A may commit at epoch {:?} while B holds epoch {}", obj.lease_epoch().ok(), taken.epoch);
-        // Nor does any late word on the dead session revive it.
-        session.set(id - 1, u64::MAX);
-        assert!(!session.holds(&Grant { epoch: 1, session: id - 1, e_tag: None, version: None }));
     }
 }
