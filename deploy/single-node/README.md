@@ -24,8 +24,6 @@ capture store or is in a backup (step 7). There is one version of nanovm, v1
 data directory ([runbooks, Upgrade](../../docs/ops/runbooks.md#upgrade-nanovm)),
 so tell your developers their objects don't survive a nanovm upgrade.
 
-Sections marked **Placeholder** are filled in as the other beta branches land.
-
 ## 0. Before you start
 
 - A VM with Ubuntu 24.04 (systemd 255, cgroup v2, Linux ≥ 5.13 with Landlock),
@@ -70,7 +68,7 @@ As root, from a checkout of the release you run:
 
 ```sh
 cargo build --release --locked -p nanovm --bin nanovm   # or a release archive (tools/release)
-deploy/single-node/install.sh target/release/nanovm     # add --cgroup for per-app worker limits
+deploy/single-node/install.sh target/release/nanovm
 ```
 
 [install.sh](install.sh) installs the binary (keeping the previous one as
@@ -108,9 +106,13 @@ to the node's:
   `max_response_body_kb`, `max_queue`, `max_outbound_concurrency`,
   `max_resources`. `egress` is different: not a ceiling to clamp to but
   your list of the hosts any app may reach (step 5).
-- `[worker]` with `cgroup`: memory, CPUs and pids for each app's whole worker.
-  Install with `install.sh --cgroup` (the [cgroup drop-in](../systemd/nanovm-cgroup.conf));
-  without `cgroup` these aren't applied, and check-host warns.
+- `[worker]`: memory, CPUs and pids for each app's whole worker, in a cgroup v2
+  of its own. By default a quarter of the host's memory and all its cores but
+  one (no pids limit); 0 unsets one. The unit delegates its cgroup to the
+  supervisor (`Delegate=`), which makes it the workers' subtree (`cgroup =
+  "auto"`, the default); without cgroup v2 and the memory and cpu controllers
+  the node refuses to start, and check-host says so. `cgroup = "off"` runs
+  workers without these limits.
 - Node-wide: `max_apps`, `max_live_objects`, `max_objects_per_app` (10,000;
   step 7), `max_component_mb` (64),
   `load_timeout_ms` (60 s for a registry fetch).
@@ -118,9 +120,31 @@ to the node's:
   `max_sockets_per_app` (1,000), `max_sockets_per_object` (256),
   `max_request_body_kb`, `max_response_body_kb`, `socket_backlog_kb`.
 
-> **Placeholder (`beta/limits`):** rate limits, connection caps and disk
-> budgets, and cgroup caps on by default: their keys, reference values and
-> what a client sees past each. Filled in when `beta/limits` is integrated.
+**Clients** (README, ["Limits"](../../README.md#limits); `[clients]`, the same
+keys in `nanovm.toml` and `proxy.toml`, 0 turns one off):
+
+| Key | Default | Past it, a client gets |
+|---|---|---|
+| `rate` | 100 requests/s per client address (an IPv6 /64), bursts of 200 | `429 rate-limited`, `Retry-After` |
+| `app_rate` | 1,000 requests/s per app, bursts of 2,000 | `429 rate-limited`, `Retry-After` |
+| `connections_per_client` | 256 | `503 too-many-connections`, `Retry-After: 1`, closed |
+| `connections` | 10,000 in all | new connections wait in the listen backlog |
+| `trusted` | loopback | forwarders: their own traffic isn't limited, and their `X-Forwarded-For` names the client |
+
+Caddy on loopback is trusted by default and sets `X-Forwarded-For`, so each
+client gets its own limits. A terminator elsewhere: list it in the proxy's
+`[clients] trusted`, or all its clients share one limit. A node whose proxy is on
+another host: list the proxy in the node's `trusted`.
+
+**Disk** (node config): `app_disk_mb`, what all of an app's objects' volumes may
+hold (default a quarter of `data_dir`'s filesystem): past it that app's writes
+are refused, no other app's. `disk_reserve_mb`, free space kept on that
+filesystem (default a twentieth, at most 1 GiB): below it every app's growth is
+refused while writes in place, deletes, rollbacks and commits go on, and no new
+object starts (step 7). Both refusals are the guest's `insufficient-space`
+(`507` from most apps), with an `fs-denied` event naming the limit. Set both
+explicitly once you know the disk. Journals, the capture outbox and block
+rounding are on top of what the budget counts; the reserve is real free space.
 
 ## 4. TLS and the proxy
 
@@ -350,9 +374,13 @@ Docker instead.
 
 On `beta/deployable` (round 3), with a dev build of that branch; method and
 output in [notes/beta-deployable.md](../../notes/beta-deployable.md). Again on
-`beta/integration` with secrets and deploy merged (the reference configs with
-their `hosts`, `signers`, `egress` and secrets directory): the e2e test 9/9
-and the units test in plain mode 16/16.
+`beta/integration` with every beta branch merged (the reference configs with
+their `hosts`, `signers`, `egress` and secrets directory, the unit delegating
+its cgroup for `cgroup = "auto"`): the e2e test 9/9 and the units test in its
+four modes 70/70, the cgroup mode with the supervisor in
+`nanovm.service/supervisor` and each worker in `workers/worker-<n>` (this host's
+cgroup v2 has no controllers, so no `[worker]` limits were enforced; the other
+modes, and the e2e test, run with `cgroup = "off"` for the same reason).
 
 - [test/e2e.sh](test/e2e.sh), run by `SCRIPT=$PWD/deploy/single-node/test/e2e.sh
   MODES=plain deploy/systemd/test/nspawn.sh` (this host's Ubuntu 24.04 booted in
@@ -368,8 +396,9 @@ and the units test in plain mode 16/16.
   directory store through the store drop-in): `deploy/systemd/test/nspawn.sh`,
   70 checks.
 - `caddy validate` passes on the Caddyfile; `systemd-analyze verify` on the
-  units with the cgroup and CPU drop-ins.
-- `check-host.py`: 7 unit tests (`python3 -m unittest discover -s
+  units with the cgroup and CPU drop-ins (on `beta/deployable`, before the unit
+  took the cgroup drop-in's `Delegate=`; not rerun).
+- `check-host.py`: 8 unit tests (`python3 -m unittest discover -s
   deploy/single-node`), and run on this host.
 - Not run: `otelcol-contrib` (no binary here), real ACME, real DNS, signed apps
   from a public registry, an S3 store, `AllowedCPUs` enforcement (cgroup v1

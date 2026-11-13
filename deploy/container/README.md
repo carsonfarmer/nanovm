@@ -49,7 +49,8 @@ a host directory only root may use (`chmod 700`) there, read-only: `-v
 [single-node guide](../single-node/README.md#6-app-secrets), step 6.
 
 **Not in a container: per-app cgroups.** Docker mounts `/sys/fs/cgroup`
-read-only in an unprivileged container, so leave `cgroup` unset and bound the
+read-only in an unprivileged container, so the image's config sets `cgroup =
+"off"` (the default, `"auto"`, would refuse to start) and you bound the
 whole node with `--memory`, `--cpus` and `--pids-limit`. Per-app worker limits
 need the host units ([deploy/systemd](../systemd/README.md)) or a privileged
 container. Don't use `--privileged` for anything else.

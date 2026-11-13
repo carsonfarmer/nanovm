@@ -14,7 +14,7 @@ $OLD/examples/dev-registry 127.0.0.1:$REG > $W/apps 2>/dev/null & pids+=($!)
 sleep 2
 for a in counter hostile; do printf 'nanovm-app: %s\nnanovm-trust: dev dev\n' "$(awk -v a=$a '$1==a{print $2}' $W/apps)" > $W/$a.h; done
 install -m755 $OLD/nanovm $W/nanovm
-printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\ndev = true\ntelemetry_endpoint = "http://127.0.0.1:9"\n' $PORT $W > $W/n.toml
+printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\ndev = true\ncgroup = "off"\ntelemetry_endpoint = "http://127.0.0.1:9"\n' $PORT $W > $W/n.toml
 env -u RUST_BACKTRACE $W/nanovm serve --config $W/n.toml > $W/n.log 2>&1 & pids+=($!)
 sleep 1
 echo "before: $(curl -s -XPOST -H @$W/counter.h http://127.0.0.1:$PORT/a/incr)"

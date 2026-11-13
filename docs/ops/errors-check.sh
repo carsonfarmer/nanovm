@@ -20,7 +20,7 @@ hdr counter; hdr hostile
 
 node() { # NAME [extra config lines...]
     local name=$1; shift
-    { echo 'dev = true'; echo "listen = \"127.0.0.1:$PORT\""; echo "data_dir = \"$W/$name\""
+    { echo 'dev = true'; echo 'cgroup = "off"'; echo "listen = \"127.0.0.1:$PORT\""; echo "data_dir = \"$W/$name\""
       echo 'telemetry_endpoint = "http://127.0.0.1:9"'; printf '%s\n' "$@"; } >"$W/$name.toml"
     env -u RUST_BACKTRACE "$BIN/nanovm" serve --config "$W/$name.toml" >"$W/$name.log" 2>&1 & pids+=($!)
     for _ in $(seq 100); do curl -sf "$U/_nanovm/ready" >/dev/null && return; sleep 0.1; done

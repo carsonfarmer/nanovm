@@ -16,9 +16,13 @@ install -m644 $D/90-nanovm.conf /etc/sysctl.d/
 sed -i '1i dev = true' /etc/nanovm/nanovm.toml
 sed -i '1i dev = true' /etc/nanovm/proxy.toml
 if [ -n "${CGROUP:-}" ]; then
-  install -d /etc/systemd/system/nanovm.service.d
-  cp $D/nanovm-cgroup.conf /etc/systemd/system/nanovm.service.d/cgroup.conf
-  sed -i '1i cgroup = "/sys/fs/cgroup/system.slice/nanovm.service/apps"' /etc/nanovm/nanovm.toml
+  # cgroup = "auto" in the unit's delegated cgroup. This host's cgroup v2 has
+  # no controllers to hand down (they are on v1), so no [worker] limits: the
+  # placement is what is checked.
+  printf '\n[worker]\nmemory_mb = 0\ncpus = 0.0\n' >>/etc/nanovm/nanovm.toml
+else
+  # Not a cgroup v2 hierarchy here: workers without [worker] limits.
+  sed -i '1i cgroup = "off"' /etc/nanovm/nanovm.toml
 fi
 # Local capture publishes versions with link(2): the unit's filter must allow it.
 [ -n "${CAPTURE:-}" ] && printf '\n[capture]\nmax_mb = 64\n' >>/etc/nanovm/nanovm.toml
@@ -68,7 +72,7 @@ if [ -n "${CGROUP:-}" ]; then
   G=/sys/fs/cgroup/system.slice/nanovm.service
   echo "cgroups: $(cd $G && find . -name cgroup.procs | sort | while read f; do echo "$(dirname $f)=[$(tr '\n' ' ' < $f)]"; done | tr '\n' ' ')"
   check "supervisor in supervisor/" 'grep -qx "$(systemctl show -p MainPID --value nanovm)" $G/supervisor/cgroup.procs'
-  check "each worker in apps/worker-<n>" '[ "$(cat $G/apps/*/cgroup.procs | sort | tr "\n" " ")" = "$(pgrep -f "nanovm worker" | sort | tr "\n" " ")" ]'
+  check "each worker in workers/worker-<n>" '[ "$(cat $G/workers/*/cgroup.procs | sort | tr "\n" " ")" = "$(pgrep -f "nanovm worker" | sort | tr "\n" " ")" ]'
   check "service group itself empty" '[ ! -s $G/cgroup.procs ]'
 fi
 W=$(pgrep -f "nanovm worker" | head -1)

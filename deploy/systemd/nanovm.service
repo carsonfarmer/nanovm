@@ -1,6 +1,5 @@
 # nanovm node: the supervisor (`nanovm serve`) and one jailed worker per app.
-# Install: see deploy/systemd/README.md. Optional cgroup v2 limits per app:
-# add nanovm-cgroup.conf as a drop-in.
+# Install: see deploy/systemd/README.md.
 [Unit]
 Description=nanovm node (supervisor and jailed app workers)
 Documentation=https://github.com/carsonfarmer/nanovm/tree/main/deploy/systemd
@@ -53,7 +52,12 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
-ProtectControlGroups=yes
+# Each app's worker runs in a cgroup v2 of its own with the [worker] limits
+# (nanovm.toml's cgroup = "auto", the default): the supervisor moves itself
+# into <unit>/supervisor and makes <unit>/workers/worker-<n>, so it needs the
+# unit's cgroup delegated, and writable. Without it the node refuses to start.
+Delegate=cpu memory pids
+ProtectControlGroups=no
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible

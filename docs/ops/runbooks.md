@@ -99,16 +99,19 @@ own old versions, such as an S3 bucket's versioning (B-800).
 
 ## Disk full
 
-What happens ([drills/disk-full.sh](drills/disk-full.sh), `data_dir` on a full
-32 MiB tmpfs, on `beta/integration` with objects merged): a write that needs
-new space fails in the guest, which answers as it chooses (the counter's own
-`507`, its count unchanged); a request to an object that has no storage yet
-gets `507 disk-full` before any guest code runs, and makes nothing; what a
-request wrote without needing space commits (each object keeps its journal's
-log, so an overwrite in place still did, while its KV write in the same
-request failed). Reads keep working and return the last committed state. Once
-space is freed, writes resume with no step on your part: the counter went 3,
-(two refused increments), 4, and the new object started at 1.
+What happens ([drills/disk-full.sh](drills/disk-full.sh), `data_dir` on a
+32 MiB tmpfs filled to 0 by a file outside nanovm, on `beta/integration` with
+objects and limits merged): below the node's `disk_reserve_mb` (here the
+default, 1.6 MiB) every write that needs more space is refused before the disk
+is, and the guest sees `insufficient-space` (the counter answers its own `507`,
+its count unchanged); a request to an object that has no storage yet gets `507
+disk-full` before any guest code runs, and makes nothing; what a request did
+without needing space commits: the hostile guest's rewrite of a file (truncate,
+then write) committed the truncation, as its write was refused and it answered
+200 anyway, while its KV write failed. Reads keep working and return the last
+committed state. The node's own commits go on: no `commit-failed`. Once space
+is freed, writes resume with no step on your part: the counter went 3, (two
+refused increments), 4, and the new object started at 1.
 
 1. Confirm: `df -h /var/lib/nanovm`; `du -xh --max-depth=2 /var/lib/nanovm | sort -h | tail`.
 2. Free space outside nanovm first (`journalctl --vacuum-size=…`, old backups,

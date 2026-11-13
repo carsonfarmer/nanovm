@@ -20,10 +20,15 @@ class CheckHost(unittest.TestCase):
     def tearDown(self):
         self.dir.cleanup()
 
-    def run_check(self, toml, nofile=1 << 20, address_space="infinity"):
+    def run_check(self, toml, nofile=1 << 20, address_space="infinity", controllers="cpu memory pids"):
         path = self.root / "nanovm.toml"
         path.write_text(toml)
-        return check_host.check(path, nofile, address_space)
+        root = self.root / "cgroup2"
+        root.mkdir(exist_ok=True)
+        (root / "cgroup.controllers").unlink(missing_ok=True)
+        if controllers is not None:
+            (root / "cgroup.controllers").write_text(controllers + "\n")
+        return check_host.check(path, nofile, address_space, root)
 
     def test_needs_match_engine_preflight(self):
         # engine::preflight: n = max_live_objects + 32; fds 2n + 1024; maps 24n + 4096.
@@ -56,10 +61,20 @@ class CheckHost(unittest.TestCase):
         self.assertFalse(any("searchable" in p for p in problems), problems)
 
     def test_worker_limits_without_cgroup_warn_and_missing_cgroup_fails(self):
-        _, warnings, _ = self.run_check('data_dir = "d"\n[worker]\nmemory_mb = 64\n')
-        self.assertTrue(any("not applied" in w for w in warnings), warnings)
+        _, warnings, _ = self.run_check('data_dir = "d"\ncgroup = "off"\n')
+        self.assertTrue(any("without their [worker] limits" in w for w in warnings), warnings)
+        _, warnings, _ = self.run_check('data_dir = "d"\ncgroup = "off"\n[worker]\nmemory_mb = 0\ncpus = 0.0\n')
+        self.assertFalse(any("cgroup" in w for w in warnings), warnings)
         _, _, problems = self.run_check(f'data_dir = "d"\ncgroup = "{self.root}/nope/apps"\n[worker]\npids = 10\n')
         self.assertTrue(any("doesn't exist" in p for p in problems), problems)
+
+    def test_auto_cgroup_needs_v2_with_the_controllers(self):
+        cgroup = lambda problems: [p for p in problems if "cgroup" in p]
+        self.assertEqual(cgroup(self.run_check('data_dir = "d"\n')[2]), [])
+        self.assertTrue(cgroup(self.run_check('data_dir = "d"\n', controllers=None)[2]), "no cgroup v2")
+        self.assertEqual(cgroup(self.run_check('data_dir = "d"\n', controllers="cpu pids")[2]),
+                         ["cgroup v2 here lacks memory, needed by [worker] limits: the node won't start"])
+        self.assertEqual(cgroup(self.run_check('data_dir = "d"\n[worker]\nmemory_mb = 0\n', controllers="cpu")[2]), [])
 
     def test_cgroup_missing_controller_fails(self):
         g = self.root / "apps"

@@ -48,6 +48,10 @@ systemd-run -q --unit=collector python3 -I $W/sink.py
 systemd-run -q --unit=devreg /usr/local/bin/dev-registry
 
 # The reference install, in dev mode, with the resolver pointed at the stand-in.
+# This test's container has no cgroup v2 hierarchy: its node config, the
+# reference with workers without [worker] limits, is in place first, and
+# install.sh (and its host check) keeps it.
+install -d /etc/nanovm && sed '1i cgroup = "off"' "$HERE/../systemd/nanovm.toml" >/etc/nanovm/nanovm.toml
 check "install.sh (and its host check)" '"$HERE/install.sh" /usr/local/bin/nanovm >$W/install.log 2>&1'
 sed -n '/^  /p;/^WARN\|^FAIL/p' $W/install.log
 sed -i '1i dev = true' /etc/nanovm/nanovm.toml

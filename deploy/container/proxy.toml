@@ -13,3 +13,8 @@ hosts = ["app.example.com", "www.app.example.com"]
 # (end the prefix with `/`). A record's trust= entries are cut to these.
 # Empty (the default): no app deploys. Replace with your developers' CI.
 signers = ["https://token.actions.githubusercontent.com https://github.com/org/*"]
+# Rate and connection limits per client ([clients]). Behind a TLS terminator
+# on another host or container, list its address so its X-Forwarded-For names
+# the client; otherwise every client shares the terminator's limit:
+# [clients]
+# trusted = ["127.0.0.1", "::1", "172.17.0.1"]

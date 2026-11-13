@@ -10,7 +10,7 @@ fd and address-space limits (the unit's `LimitNOFILE` and `LimitAS` if systemd
 has a nanovm unit, else this shell's, or `--nofile`), `vm.max_map_count`,
 Landlock, root, the data directory
 (searchable by app uids, filesystem, mount options), local capture history
-against `[capture]`, the cgroup directory if set, CA certificates and
+against `[capture]`, the cgroup workers would run in, CA certificates and
 RUST_BACKTRACE. Exit 1 if anything would stop the
 node or its workers; warnings exit 0.
 """
@@ -80,8 +80,9 @@ def mount_of(path):
     return best
 
 
-def check(cfg_path, nofile=None, address_space=None):
-    """`address_space` is the RLIMIT_AS nanovm runs with in bytes, "infinity" for none."""
+def check(cfg_path, nofile=None, address_space=None, cgroup_root=Path("/sys/fs/cgroup")):
+    """`address_space` is the RLIMIT_AS nanovm runs with in bytes, "infinity" for none;
+    `cgroup_root` where cgroup v2 is mounted."""
     raw = tomllib.loads(Path(cfg_path).read_text())
     cfg = {**DEFAULTS, **raw}
     cfg["limits"] = {**LIMIT_DEFAULTS, **raw.get("limits", {})}
@@ -160,21 +161,30 @@ def check(cfg_path, nofile=None, address_space=None):
     elif history:
         problems.append("objects have capture history (objects/<app>/<shard>/<object>/committed) but [capture] is off: they will refuse to start")
 
-    if cfg.get("cgroup"):
-        g = Path(cfg["cgroup"])
-        wanted = [c for c, k in (("memory", "memory_mb"), ("cpu", "cpus"), ("pids", "pids")) if cfg["worker"].get(k)]
+    # cgroup = "auto" (the default), a delegated directory, or "off"; [worker]
+    # limits default to a quarter of the memory and all cores but one
+    # (config.rs), and 0 unsets one.
+    cgroup = cfg.get("cgroup", "auto")
+    worker = {"memory_mb": 1, "cpus": 1, "pids": 0, **cfg["worker"]}
+    wanted = [c for c, k in (("memory", "memory_mb"), ("cpu", "cpus"), ("pids", "pids")) if worker[k]]
+    if cgroup == "off":
+        if wanted:
+            warnings.append('cgroup = "off": workers run without their [worker] limits (memory, CPUs)')
+    elif cgroup == "auto":
+        # The supervisor makes the cgroup nanovm.service delegates to it the
+        # workers' subtree; the controllers must be on cgroup v2.
+        controllers = cgroup_root / "cgroup.controllers"
+        if not controllers.exists():
+            problems.append(f'cgroup = "auto" needs cgroup v2 at {cgroup_root}: the node won\'t start '
+                            '(set cgroup = "off" to run workers without [worker] limits)')
+        elif missing := [c for c in wanted if c not in controllers.read_text().split()]:
+            problems.append(f"cgroup v2 here lacks {' '.join(missing)}, needed by [worker] limits: the node won't start")
+    else:
+        g = Path(cgroup)
         if not g.is_dir():
-            if g.parent.is_dir() and (g.parent / "cgroup.subtree_control").exists():
-                warnings.append(f"{g} doesn't exist yet (nanovm-cgroup.conf's ExecStartPre makes it)")
-            else:
-                problems.append(f"cgroup {g} doesn't exist")
-        else:
-            have = (g / "cgroup.subtree_control").read_text().split()
-            missing = [c for c in wanted if c not in have]
-            if missing:
-                problems.append(f"{g}/cgroup.subtree_control lacks {' '.join(missing)}, needed by [worker] limits")
-    elif any(cfg["worker"].get(k) for k in ("memory_mb", "cpus", "pids")):
-        warnings.append("[worker] limits are set but cgroup is not: they are not applied")
+            problems.append(f"cgroup {g} doesn't exist")
+        elif missing := [c for c in wanted if c not in (g / "cgroup.subtree_control").read_text().split()]:
+            problems.append(f"{g}/cgroup.subtree_control lacks {' '.join(missing)}, needed by [worker] limits")
 
     if not any(Path(p).exists() for p in ("/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt")):
         problems.append("no CA bundle found: the node refuses to start without CA certificates")

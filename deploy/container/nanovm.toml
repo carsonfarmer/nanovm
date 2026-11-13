@@ -9,6 +9,9 @@ max_live_objects = 1000
 proxy = "http://127.0.0.1:8444"
 telemetry_endpoint = "http://127.0.0.1:4318"
 jail_uid_base = 200000
+# Docker mounts /sys/fs/cgroup read-only: workers run without [worker]
+# limits; bound the container with --memory, --cpus, --pids-limit.
+cgroup = "off"
 # Each app's secrets, as <app>.json: mount a directory only root may use here
 # (deploy/container/README.md, "App secrets").
 # secrets = "/etc/nanovm/secrets"

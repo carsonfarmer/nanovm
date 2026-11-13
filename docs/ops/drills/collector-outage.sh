@@ -34,7 +34,7 @@ for round in 1 2; do
   for v in up refused blackhole; do
     case $v in up) ep=http://127.0.0.1:$SINK;; refused) ep=http://127.0.0.1:9;; blackhole) ep=http://10.255.255.1:4318;; esac
     rm -rf $W/data
-    printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\ndev = true\ntelemetry_endpoint = "%s"\n' $PORT $W $ep > $W/n.toml
+    printf 'listen = "127.0.0.1:%s"\ndata_dir = "%s/data"\ndev = true\ncgroup = "off"\ntelemetry_endpoint = "%s"\n' $PORT $W $ep > $W/n.toml
     env -u RUST_BACKTRACE $BIN/nanovm serve --config $W/n.toml > $W/n-$v.log 2>&1 & np=$!
     sleep 1
     "$OHA" --no-tui -n 2000 -c 16 -H "nanovm-app: $APP" -H 'nanovm-trust: dev dev' --rand-regex-url "http://127.0.0.1:$PORT/o[0-9]{2}/" >/dev/null

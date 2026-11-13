@@ -1,13 +1,12 @@
 #!/bin/bash
 # Installs a node and proxy on this systemd host from a nanovm binary:
-#   sudo deploy/single-node/install.sh path/to/nanovm [--cgroup]
+#   sudo deploy/single-node/install.sh path/to/nanovm
 # Copies the binary, the units, the sysctl drop-in and (only if absent) the
-# configs, and makes the secrets directory; with --cgroup also the cgroup
-# drop-in. Refuses to replace the binary under a running node
-# (docs/ops/runbooks.md, Upgrade). Starts nothing.
+# configs, and makes the secrets directory. Refuses to replace the binary
+# under a running node (docs/ops/runbooks.md, Upgrade). Starts nothing.
 set -euo pipefail
-[ $# -ge 1 ] || { echo "usage: $0 <nanovm binary> [--cgroup]" >&2; exit 2; }
-bin=$1 cgroup=${2:-}
+[ $# -eq 1 ] || { echo "usage: $0 <nanovm binary>" >&2; exit 2; }
+bin=$1
 here=$(cd "$(dirname "$0")" && pwd)
 units=$here/../systemd
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
@@ -28,12 +27,6 @@ for f in nanovm.toml proxy.toml; do
 done
 install -m644 "$units/90-nanovm.conf" /etc/sysctl.d/
 sysctl -q -p /etc/sysctl.d/90-nanovm.conf || echo "could not apply vm.max_map_count now (read-only /proc/sys?)"
-if [ "$cgroup" = --cgroup ]; then
-    install -d /etc/systemd/system/nanovm.service.d
-    install -m644 "$units/nanovm-cgroup.conf" /etc/systemd/system/nanovm.service.d/cgroup.conf
-    grep -q '^cgroup *=' /etc/nanovm/nanovm.toml ||
-        sed -i '1i cgroup = "/sys/fs/cgroup/system.slice/nanovm.service/apps"' /etc/nanovm/nanovm.toml
-fi
 systemctl daemon-reload
 python3 "$here/check-host.py" /etc/nanovm/nanovm.toml --nofile "$(systemctl show -p LimitNOFILE --value nanovm)"
 echo "next: systemctl enable --now nanovm nanovm-proxy"
