@@ -518,6 +518,20 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** `arg0("nanovm")` again (the same line; 0 runtime lines).
 - **Status:** fixed on `beta/deployable`
 
+### B-602: the ops reference configs don't parse on round 3, and nothing tested them
+- **Where:** `deploy/systemd/{nanovm,proxy}.toml`, `deploy/container/{nanovm,proxy}.toml`, `docs/ops/errors-check.sh`
+- **Scenario:** found by the production audit. `ideas/ops` wrote its configs on `3dafe33`, before round 3 renamed the node's `publish_to` to `proxy` and the proxy's `node` to `nodes`. On round 3 `nanovm serve` and `nanovm proxy` refuse them (`unknown field`), so `install.sh`, the units and the image start nothing. No test loaded a shipped config.
+- **Reproduced:** yes, `tests/configs.rs` fails on all four files before the fix.
+- **Fix:** the configs use today's keys (no aliases, AGENTS.md rule 1). `tests/configs.rs` loads every shipped config with the real loader (`NodeConfig::load`, the new `ProxyConfig::load` that `nanovm proxy` now calls, `AppSpec` for each `nanovm.json`). +5 runtime lines.
+- **Status:** fixed on `beta/deployable` (4ea16e6)
+
+### B-603: check-host doesn't know round 3's address-space preflight or capture
+- **Where:** `deploy/single-node/check-host.py`
+- **Scenario:** found by `beta/deployable`. Round 3's `engine::preflight` refuses to start under an address-space limit below `n × (4 × (memory_reservation_mb + 64 KiB) + 4 MiB) + 1 GiB` (N-671; about 522 GiB at the defaults), which `check-host.py` didn't check, and it described capture history as full copies kept here, not round 3's changes between snapshots, shipped to `store`.
+- **Reproduced:** from source (the arithmetic in `preflight`).
+- **Fix:** check-host checks the unit's `LimitAS` (or the shell's `ulimit -v`) against the same formula, and describes capture as round 3 keeps it. A unit test pins the formula; mutating `GUARD` or dropping the check fails it.
+- **Status:** fixed on `beta/deployable`
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

@@ -4,10 +4,11 @@
     deploy/single-node/check-host.py /etc/nanovm/nanovm.toml [--nofile N]
 
 For the config's `max_live_objects` it prints what each app's worker needs
-(file descriptors and memory mappings, as `engine::preflight` computes them),
-the disk an object can use at worst, and checks this host: the fd limit (the
-unit's `LimitNOFILE` if systemd has one for nanovm, else this shell's hard
-limit, or `--nofile`), `vm.max_map_count`, Landlock, root, the data directory
+(file descriptors, memory mappings and address space, as `engine::preflight`
+computes them), the disk an object can use at worst, and checks this host: the
+fd and address-space limits (the unit's `LimitNOFILE` and `LimitAS` if systemd
+has a nanovm unit, else this shell's, or `--nofile`), `vm.max_map_count`,
+Landlock, root, the data directory
 (searchable by app uids, filesystem, mount options), local capture history
 against `[capture]`, the cgroup directory if set, CA certificates and
 RUST_BACKTRACE. Exit 1 if anything would stop the
@@ -28,6 +29,7 @@ from pathlib import Path
 
 # crates/nanovm/src/engine.rs
 FDS_PER_OBJECT, MAPS_PER_OBJECT, SPARE_SLOTS = 2, 24, 32
+MEMORIES_PER_OBJECT, GUARD = 4, 64 << 10
 DEFAULTS = {"max_live_objects": 1000, "data_dir": "nanovm-data", "memory_reservation_mb": 128, "max_apps": 100}
 LIMIT_DEFAULTS = {"disk_mb": 64, "memory_mb": 64, "max_files": 1000}
 
@@ -38,6 +40,9 @@ def needs(cfg):
     return {
         "fds": n * FDS_PER_OBJECT + 1024,
         "maps": n * MAPS_PER_OBJECT + 4096,
+        # The engine reserves every slot's memories, stacks and tables at once.
+        "address_space": n * (MEMORIES_PER_OBJECT * ((cfg.get("memory_reservation_mb", 128) << 20) + GUARD) + (4 << 20))
+        + (1 << 30),
         # Per object: its logical quota, and while a request runs the journal
         # and the files it replaced may each hold as much again (README).
         "disk_per_object_mb": disk,
@@ -45,13 +50,14 @@ def needs(cfg):
     }
 
 
-def unit_nofile():
+def unit_limit(name):
+    """nanovm.service's Limit<name>: a number, "infinity", or None without one."""
     if not shutil.which("systemctl"):
         return None
-    out = subprocess.run(["systemctl", "show", "-p", "LimitNOFILE", "--value", "nanovm.service"],
+    out = subprocess.run(["systemctl", "show", "-p", f"Limit{name}", "--value", "nanovm.service"],
                          capture_output=True, text=True)
     value = out.stdout.strip()
-    return int(value) if out.returncode == 0 and value.isdigit() else None
+    return value if out.returncode == 0 and (value.isdigit() or value == "infinity") else None
 
 
 def landlock_abi():
@@ -74,7 +80,8 @@ def mount_of(path):
     return best
 
 
-def check(cfg_path, nofile=None):
+def check(cfg_path, nofile=None, address_space=None):
+    """`address_space` is the RLIMIT_AS nanovm runs with in bytes, "infinity" for none."""
     raw = tomllib.loads(Path(cfg_path).read_text())
     cfg = {**DEFAULTS, **raw}
     cfg["limits"] = {**LIMIT_DEFAULTS, **raw.get("limits", {})}
@@ -86,7 +93,8 @@ def check(cfg_path, nofile=None):
 
     source = "--nofile"
     if nofile is None:
-        nofile, source = unit_nofile(), "nanovm.service LimitNOFILE"
+        nofile, source = unit_limit("NOFILE"), "nanovm.service LimitNOFILE"
+        nofile = int(nofile) if nofile and nofile.isdigit() else None
     if nofile is None:
         nofile, source = resource.getrlimit(resource.RLIMIT_NOFILE)[1], "this shell's hard limit"
     facts.append(f"file descriptors: each worker needs {need['fds']}; {source} is {nofile}")
@@ -100,6 +108,18 @@ def check(cfg_path, nofile=None):
             problems.append(f"sysctl -w vm.max_map_count={need['maps']} (and persist it in /etc/sysctl.d)")
     except OSError:
         warnings.append("cannot read vm.max_map_count")
+
+    source = "given"
+    if address_space is None:
+        address_space, source = unit_limit("AS"), "nanovm.service LimitAS"
+    if address_space is None:
+        soft = resource.getrlimit(resource.RLIMIT_AS)[0]
+        address_space, source = "infinity" if soft == resource.RLIM_INFINITY else soft, "this shell's ulimit -v"
+    shown = address_space if address_space == "infinity" else f"{int(address_space) >> 20} MiB"
+    facts.append(f"address space: each worker reserves about {-(-need['address_space'] >> 30)} GiB; {source} is {shown}")
+    if address_space != "infinity" and int(address_space) < need["address_space"]:
+        problems.append("remove the address-space limit (LimitAS=infinity, ulimit -v unlimited) "
+                        "or lower max_live_objects or memory_reservation_mb")
 
     abi = landlock_abi()
     facts.append(f"Landlock ABI: {abi}")
@@ -132,9 +152,11 @@ def check(cfg_path, nofile=None):
     capture = raw.get("capture")
     history = data.is_dir() and any((data / "objects").glob("*/~committed/*"))
     if capture is not None:
-        mb = {"max_mb": 256, "max_versions": 16, **capture}
-        facts.append(f"local capture on: each object's history holds up to {mb['max_mb']} MiB "
-                     f"and {mb['max_versions']} versions (full copies); a full one refuses writes")
+        mb = {"max_mb": 256, "max_versions": 16, "snapshot_every": 16, **capture}
+        shipped = f"shipped to {mb['store']} and then removed here but the last" if mb.get("store") else "kept here (no store)"
+        facts.append(f"capture on: each object's history holds up to {mb['max_mb']} MiB "
+                     f"and {mb['max_versions']} versions here (the whole volume every {mb['snapshot_every']}, "
+                     f"changes otherwise), {shipped}; a full one refuses writes")
     elif history:
         problems.append("objects have capture history (~committed) but [capture] is off: they will refuse to start")
 

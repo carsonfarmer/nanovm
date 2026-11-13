@@ -20,10 +20,10 @@ class CheckHost(unittest.TestCase):
     def tearDown(self):
         self.dir.cleanup()
 
-    def run_check(self, toml, nofile=1 << 20):
+    def run_check(self, toml, nofile=1 << 20, address_space="infinity"):
         path = self.root / "nanovm.toml"
         path.write_text(toml)
-        return check_host.check(path, nofile)
+        return check_host.check(path, nofile, address_space)
 
     def test_needs_match_engine_preflight(self):
         # engine::preflight: n = max_live_objects + 32; fds 2n + 1024; maps 24n + 4096.
@@ -31,6 +31,16 @@ class CheckHost(unittest.TestCase):
         self.assertEqual(check_host.needs({"max_live_objects": 8000, "limits": {"disk_mb": 64}})["maps"], 196864)
         n = check_host.needs({"max_live_objects": 1000, "limits": {"disk_mb": 8}})
         self.assertEqual((n["fds"], n["maps"], n["disk_per_busy_object_mb"]), (3088, 28864, 24))
+
+    def test_address_space_matches_engine_preflight(self):
+        # engine::preflight: n x (4 x (memory_reservation_mb MiB + 64 KiB) + 4 MiB) + 1 GiB.
+        n = check_host.needs({"max_live_objects": 1000, "limits": {"disk_mb": 64}})
+        self.assertEqual(n["address_space"], 1032 * (4 * ((128 << 20) + (64 << 10)) + (4 << 20)) + (1 << 30))
+        _, _, problems = self.run_check('data_dir = "data"\n', address_space=64 << 30)
+        self.assertTrue(any("address-space limit" in p for p in problems), problems)
+        facts, _, problems = self.run_check('data_dir = "data"\nmax_live_objects = 10\n', address_space=64 << 30)
+        self.assertFalse(any("address-space" in p for p in problems), problems)
+        self.assertTrue(any("reserves about 23 GiB" in f for f in facts), facts)
 
     def test_fd_limit_too_low_fails(self):
         _, _, problems = self.run_check('data_dir = "data"\n', nofile=1024)
