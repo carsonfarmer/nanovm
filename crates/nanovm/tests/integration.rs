@@ -4235,6 +4235,93 @@ fn probe() -> Vec<u8> {
     std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap()
 }
 
+/// `crates/nanovm/tests/sdk-after`: an app on nanovm-sdk whose routes do
+/// work after the answer and fail in it, served on a node of its own.
+fn sdk_after(test: &str) -> Arc<Node> {
+    let build = std::process::Command::new("cargo").args([
+        "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
+        "crates/nanovm/tests/sdk-after/Cargo.toml", "--target-dir", "target/test-guest",
+    ]).current_dir(repo()).status().unwrap();
+    assert!(build.success());
+    let wasm = std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/sdk_after_probe.wasm")).unwrap();
+    let mut app = app("counter");
+    (app.name, app.limits.memory_mb, app.limits.post_return_timeout_ms) = ("sdk".into(), 32, 2000);
+    Node::new(node_cfg(test, 8), &app, &wasm, None).unwrap()
+}
+
+/// What `/files` says: requests the instance has served, and which files the
+/// object holds.
+fn files(served: u32, written: &[&str]) -> serde_json::Value {
+    let mut v = serde_json::json!({"served": served});
+    for name in ["answered", "later", "nested", "streamed"] {
+        v[name] = written.contains(&name).into();
+    }
+    v
+}
+
+/// `after` work starts once the client has the whole answer, so nothing it
+/// does can fail the answer. Work that panics, at once or after writing,
+/// rolls back what it wrote and replaces the instance; the answer and what
+/// the handler wrote stand.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_work_that_panics_leaves_the_answer_standing() {
+    let node = sdk_after("sdk_after_panics");
+    for (id, path) in [("a", "/panic-at-once"), ("b", "/panic-later")] {
+        let r = request(&node, "POST", id, path, "").await;
+        assert_eq!((r.status, r.body.as_str()), (200, "answered"), "{path}: {:?}", r.error);
+        assert_eq!(get(&node, id, "/files").await.json(), files(1, &["answered"]), "{path}");
+    }
+}
+
+/// Work that `after` work passes to `after` runs before the object's next
+/// request, and commits or rolls back with the rest of the work after the
+/// answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_work_passed_on_by_after_work_runs_before_the_next_request() {
+    let node = sdk_after("sdk_after_nested");
+    let r = request(&node, "POST", "a", "/nested", "").await;
+    assert_eq!(r.status, 200, "{:?}", r.error);
+    assert_eq!(get(&node, "a", "/files").await.json(), files(2, &["answered", "nested"]));
+    let r = request(&node, "POST", "b", "/nested-panic", "").await;
+    assert_eq!(r.status, 200, "{:?}", r.error);
+    assert_eq!(get(&node, "b", "/files").await.json(), files(1, &["answered"]));
+}
+
+/// A client slow to read a long answer still gets it whole, though the work
+/// after it fails at once: that work waits until the answer is out.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_work_that_panics_lets_a_slow_client_read_the_whole_answer() {
+    use http_body_util::BodyExt;
+    let node = sdk_after("sdk_after_big");
+    let res = node.dispatch("a", http::Request::post("http://localhost/big-panic").body(bytes::Bytes::new()).unwrap()).await;
+    assert_eq!(res.status(), 200);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let body = res.into_body().collect().await.expect("the answer arrives whole").to_bytes();
+    assert_eq!(body.len(), 1 << 20);
+    assert_eq!(get(&node, "a", "/files").await.json(), files(1, &["answered"]));
+}
+
+/// A streamed body whose writer returns an error breaks off for the client,
+/// rather than ending as if whole, and what the writer wrote rolls back, as
+/// on a panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_body_whose_writer_fails_breaks_off_and_rolls_back() {
+    use http_body_util::BodyExt;
+    let node = sdk_after("sdk_after_cut");
+    let res = node.dispatch("a", http::Request::get("http://localhost/cut").body(bytes::Bytes::new()).unwrap()).await;
+    assert_eq!(res.status(), 200);
+    let (mut body, mut data) = (res.into_body(), Vec::new());
+    let end = loop {
+        match body.frame().await {
+            Some(Ok(frame)) => data.extend_from_slice(&frame.into_data().unwrap_or_default()),
+            end => break end.map(|e| e.map(drop)),
+        }
+    };
+    assert_eq!(data, b"partial");
+    assert!(matches!(end, Some(Err(_))), "the body ended as if whole: {end:?}");
+    assert_eq!(get(&node, "a", "/files").await.json(), files(1, &["answered"]));
+}
+
 /// What the host holds for a guest's header maps stays within its memory
 /// limit: a map holds at most 64 KiB (its own, or a copy of one it was sent;
 /// bigger heads are refused before it), and an instance holds no more

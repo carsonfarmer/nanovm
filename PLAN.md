@@ -103,13 +103,14 @@ nanovm/
     recv request
     → p3::Request::from_http(hooks, req)
     → svc.handle(acc, req)
-    → res.into_http(..)
-    → wrap body
+    → res.into_http(.., out)                   // `out`: the guest's "transmitted" future
+    → wrap body                                // resolves `out` when dropped: read whole, or the client gone
     → reply
     → poll_fn(poll_no_interesting_tasks)        // strict serial
   })
   ```
   `from_http` takes scheme and authority from the URI only, so `server.rs` rebuilds the URI as `http://{Host}{path}` before dispatch. The request body is collected (capped at `max_request_body_kb`) before it reaches the actor.
+- **Work after the answer:** a guest trap ends the store's run, so one before the node has the answer fails the request, and one while the client still reads the body cuts it. So the future `response.new` gives the guest resolves only once the wrapped body is dropped (read whole, or the client gone), and the SDKs start `after` work, and fail work after the answer, only after it (README "Commits").
 - **Deadlines:** the run_concurrent future is wrapped in an outer `poll_fn` that reads a shared `(phase, since)`. On expiry it drops the future and the Store. Upstream documents timeouts inside run_concurrent as unreliable.
 
   | Phase | Deadline | On expiry |

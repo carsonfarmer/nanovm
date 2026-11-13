@@ -52,7 +52,7 @@ async fn handle(req: Request) -> Result {
             Response::stream("text/event-stream", move |mut body| async move {
                 for n in (1..=from).rev() {
                     if !body.write(sse(None, Some("tick"), &n.to_string())).await {
-                        return;
+                        return Ok(());
                     }
                     nanovm_sdk::sleep(every).await;
                 }
@@ -60,6 +60,7 @@ async fn handle(req: Request) -> Result {
                 // Changed after answering: this commits when the stream ends,
                 // or rolls back if the stream outlives post_return_timeout_ms.
                 let _ = kv::increment("countdowns", 1).await;
+                Ok(())
             })
             .header("cache-control", "no-cache")
         }
