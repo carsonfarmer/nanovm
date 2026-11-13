@@ -1879,7 +1879,8 @@ async fn published(name: &str) -> Result<Vec<(semver::Version, String)>, String>
 /// A supervisor that checks signatures.
 async fn signed(test: &str) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
     let mut cfg = node_cfg(test, 8);
-    cfg.dev = false;
+    // Outside dev mode the operator's egress list names no private address.
+    (cfg.dev, cfg.limits.egress) = (false, vec![]);
     supervised_with(cfg).await
 }
 
@@ -1930,6 +1931,36 @@ async fn registry_apps_need_a_trusted_signature() {
     let (_sup, addr) = signed("registry_trust_header").await;
     let head = format!("GET /a/ HTTP/1.1\r\nHost: x\r\nnanovm-app: {app}\r\nConnection: close\r\n\r\n");
     assert_eq!(raw(addr, &head, b"").await.0, 400);
+}
+
+/// An app signed by an identity the proxy's operator doesn't list is
+/// refused even though its record trusts that identity: the node hears only
+/// the identities the operator lets deploy. One the operator lists, here by
+/// a prefix, deploys.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_operators_signers_deploy() {
+    let (version, app) = published("counter").await.expect("published signed counter is reachable").pop().unwrap();
+    let (_sup, node) = signed("only_the_operators_signers_deploy").await;
+    let other = "https://accounts.example.com someone@example.com";
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let txt = format!("app={}:{version}; trust={SIGNER}; trust={other}", app.split_once('@').unwrap().0);
+    records.lock().insert("_nanovm.counter.test".to_string(), vec![txt]);
+    let resolver = doh(records).await;
+    let github = "https://token.actions.githubusercontent.com https://github.com/carsonfarmer/*";
+    for (signer, allowed) in [(other, false), (github, true)] {
+        let cfg = nanovm::config::ProxyConfig {
+            nodes: vec![node.to_string()], resolver: resolver.clone(), listen: "127.0.0.1:0".into(),
+            hosts: vec!["counter.test".into()], signers: vec![signer.into()], ..Default::default()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+        let (status, body) = raw(addr, "GET /a/ HTTP/1.1\r\nHost: counter.test\r\nConnection: close\r\n\r\n", b"").await;
+        match allowed {
+            true => assert_eq!(status, 200, "{body}"),
+            false => assert!(status == 502 && body.contains("not signed by a trusted identity"), "{status} {body}"),
+        }
+    }
 }
 
 /// Naming a new version switches the app: requests in flight on the old
