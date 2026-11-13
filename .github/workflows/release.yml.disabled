@@ -1,3 +1,6 @@
+# DISABLED until the owner approves publishing releases (AGENTS.md: outward-facing
+# actions need the owner's OK). GitHub reads only .yml/.yaml files here, so this
+# never runs. To enable: git mv .github/workflows/release.yml.disabled .github/workflows/release.yml
 name: Release
 
 # Only a pushed version tag runs this: pushing a branch never does.

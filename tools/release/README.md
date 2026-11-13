@@ -1,16 +1,22 @@
 # Releasing nanovm
 
 A version tag `vX.Y.Z` (or `vX.Y.Z-rc.N`, published as a prerelease) runs
-[.github/workflows/release.yml](../../.github/workflows/release.yml). Nothing else
-does: pushing a branch runs no release job.
+the release workflow. Nothing else does: pushing a branch runs no release job.
+
+**The workflow ships disabled**, as
+[.github/workflows/release.yml.disabled](../../.github/workflows/release.yml.disabled)
+(GitHub reads only `.yml`/`.yaml`), until the owner approves publishing
+releases. Enabling it is renaming it to `release.yml`.
 
 1. Land the version bump on `main` like any change, with CI green: `version` in
    `crates/nanovm/Cargo.toml` (and the `nanovm` entry in `Cargo.lock`, which
    `cargo check` updates). The workflow refuses a tag that doesn't match it.
 2. Preview the notes: `tools/release/changelog.py HEAD` (commits since the last
-   `v*` tag). Call out by hand anything an operator must act on: config keys,
-   journal format (a newer journal tag cannot be recovered by an older binary;
-   see README "Commits", Downgrades), host requirements.
+   `v*` tag). Call out by hand anything an operator must act on: config keys
+   (`tests/configs.rs` keeps the shipped ones current) and host requirements.
+   There is one version, v1 (AGENTS.md rule 1): data an earlier build wrote is
+   not supported, so every upgrade starts on a fresh data directory (the
+   upgrade runbook).
 3. Tag the commit CI passed on and push the tag:
    ```sh
    git tag -a v0.2.0 -m "nanovm v0.2.0" <commit> && git push origin v0.2.0
@@ -42,8 +48,11 @@ row otherwise.
 - `package.sh` run locally on a nanovm binary: archive and `.sha256` verify, two
   runs give identical archives, a non-nanovm binary and a non-version tag are
   refused. The release job's checksum and prerelease steps were run by hand.
-- The workflow itself has not run: it needs a pushed tag. Its YAML parses; there
-  was no `actionlint` here.
+- The workflow itself has not run: it needs a pushed tag and the owner's OK.
+  Its YAML parses; there was no `actionlint` here.
+- Re-run on round 3 (`beta/deployable`): the 4 tests pass; `package.sh` on a
+  dev build gives identical archives twice, `sha256sum -c` passes, the archive
+  holds `deploy/`, and `/bin/ls` and the tag `latest` are refused.
 
 The nice-to-haves branch's `review_tools.py changelog` produces JSON review
 candidates for an explicit SHA range; this script writes the Markdown notes a
