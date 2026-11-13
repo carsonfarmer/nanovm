@@ -31,8 +31,10 @@ create in it (`open_at` with `CREATE`, `create_directory_at`) moves it into the 
 place (`Journal::place`), after taking a place under the app's cap. Nothing else can be the
 first change of an empty volume. When the instance ends (the journal's `Drop`, which runs
 after any commit in flight: the commit thread now drops its handle before it gives the
-volume back), what it didn't commit is rolled back at once, and an object whose volume is
-then empty with no captured history is removed (`Objects::settle`).
+volume back), an object the instance made that never committed is rolled back at once (any
+other object's uncommitted work still rolls back when it next starts, as the SQLite recovery
+tests expect), and an object whose volume is then empty with no captured history is removed
+(`Objects::settle`).
 
 | Test | Before | After |
 |---|---|---|
@@ -120,8 +122,9 @@ empty `git diff`:
 | Mutation | Caught by |
 |---|---|
 | volume made up front again (`Journal::open`) | `objects_that_change_nothing_leave_nothing` ("while live") |
-| no rollback when an instance ends | `failed_and_emptied_objects_leave_nothing` (failed objects stay) |
+| no rollback of a new, never-committed object when its instance ends | `failed_and_emptied_objects_leave_nothing` (failed objects stay) |
 | no `settle` when an instance ends | `failed_and_emptied_objects_leave_nothing` |
+| every failed instance rolled back as it ends, not just a new object's | `nodes::a_node_that_lost_an_objects_lease_cannot_commit_it` (its uncommitted write is gone before the next start) |
 | `settle` ignores captured history | `only_empty_objects_go` |
 | cap taken without the atomic check | `room_for_objects` (16 of 16 admitted) |
 | no disk check | `a_full_disk_makes_no_new_objects` (500 `commit-failed`), `room_for_objects` |

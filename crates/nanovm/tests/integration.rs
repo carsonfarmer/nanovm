@@ -2798,7 +2798,7 @@ async fn sqlite_composed_provider() {
             // Simulate an unwriteable database during host recovery. Neither
             // a failed startup nor its retry may discard the remaining undo.
             let base = node.cfg.app_dirs(&app.name)[0].clone();
-            let db = base.join("a/composed.db");
+            let db = object_dir(&base, "a").join("data/composed.db");
             let parked = base.join("parked.db");
             std::fs::rename(&db, &parked).unwrap();
             std::fs::create_dir(&db).unwrap();
@@ -5728,10 +5728,8 @@ mod nodes {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert!(refused["detail"].as_str().unwrap().contains("no longer holds the object's lease"), "{refused}");
-        // What it wrote after answering is rolled back as its instance ends.
-        let volume = object_dir(&objects_a.join(&app), &object).join("data");
-        eventually("A to roll back its uncommitted write", || !volume.join("after.txt").exists()).await;
-        assert!(volume.join("before.txt").exists());
+        assert!(object_dir(&objects_a.join(&app), &object).join("data/after.txt").exists(), "A wrote after answering");
+        assert!(object_dir(&objects_a.join(&app), &object).join("journal/log").exists(), "the write is uncommitted");
     }
 
     /// A guest answering as a node that doesn't hold its object (421, naming

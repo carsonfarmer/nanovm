@@ -560,12 +560,12 @@ something; nothing else creates or deletes an object's data.
   once, reused, like `/tmp`'s scratch). The first create in it moves it into the
   object's place. So a scanner's 404s and reads of objects that don't exist leave
   nothing: the audit's 300 `GET /scanN/wp-login.php` left 301 directories, now 0.
-- **Rolled back, then removed, when the instance ends.** What an instance did not
-  commit (its request failed, trapped or ran out of time) is rolled back as the
-  instance ends, not when the object next starts; then an object whose volume is
-  empty, with no captured history, goes. So a new object whose first request
-  fails leaves nothing, and an object deletes its own storage by removing its
-  files: no new API. With capture, an emptied object keeps its history (its last
+- **Removed when the instance ends, if empty.** An object whose volume is empty,
+  with no captured history, goes when its instance ends. A new object that never
+  committed (its first request failed, trapped or ran out of time) is rolled back
+  first, so it leaves nothing; any other object's uncommitted work is rolled back
+  when it next starts, as always. And an object deletes its own storage by
+  removing its files: no new API. With capture, an emptied object keeps its history (its last
   version records the empty volume) and so its directory and its place under the
   cap; an operator deletes it.
 - **At most `max_objects_per_app` per app** (node config, default 10,000): an app
