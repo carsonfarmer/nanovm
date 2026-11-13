@@ -6,7 +6,7 @@
 listen = "127.0.0.1:8080"
 data_dir = "/var/lib/nanovm"
 max_live_objects = 1000
-publish_to = "http://127.0.0.1:8444/publish"
+proxy = "http://127.0.0.1:8444"
 telemetry_endpoint = "http://127.0.0.1:4318"
 jail_uid_base = 200000
 

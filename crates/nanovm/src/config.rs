@@ -263,6 +263,14 @@ impl NodeConfig {
 }
 
 impl ProxyConfig {
+    /// What `nanovm proxy --config` reads.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: ProxyConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.nodes.is_empty() {
             bail!("the proxy has no nodes");

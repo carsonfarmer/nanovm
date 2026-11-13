@@ -11,8 +11,9 @@ data_dir = "/var/lib/nanovm"
 # + 4096 mappings per worker.
 max_live_objects = 1000
 max_apps = 100
-# The proxy's private publish listener and the Collector's OTLP/HTTP base URL.
-publish_to = "http://127.0.0.1:8444/publish"
+# The proxy's private endpoint (committed WebSocket publishes go to its
+# /publish) and the Collector's OTLP/HTTP base URL.
+proxy = "http://127.0.0.1:8444"
 telemetry_endpoint = "http://127.0.0.1:4318"
 # App i runs as uid/gid jail_uid_base + i. Never change it on a node with
 # data: an app's uid is the owner of its objects directory.

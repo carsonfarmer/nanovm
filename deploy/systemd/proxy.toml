@@ -4,7 +4,8 @@
 # Plain HTTP. TLS terminates in front (Caddy, a load balancer); keep this on
 # loopback when the terminator is on the same host.
 listen = "127.0.0.1:8443"
-node = "127.0.0.1:8080"
+# The node, as its `listen` address.
+nodes = ["127.0.0.1:8080"]
 # Committed WebSocket publishes from the node. Never expose it publicly.
 publish_listen = "127.0.0.1:8444"
 telemetry_endpoint = "http://127.0.0.1:4318"
