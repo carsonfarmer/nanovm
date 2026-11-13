@@ -1531,6 +1531,25 @@ mod tests {
         }
     }
 
+    /// The shipper removes shipped versions but the last while commits list
+    /// them, in any order: a commit that sees some below the last and not
+    /// others goes on from the last (B-503).
+    #[test]
+    fn a_commit_goes_on_past_versions_pruned_out_of_order() {
+        let (v, cap) = (volume(), CaptureConfig::default());
+        let out = v.parent().unwrap().join("~committed/o");
+        let mut j = captured(&v, &cap).unwrap();
+        for n in 1..=3 {
+            write(&mut j, &v, "a", 0, &[b'0' + n]);
+            j.commit().unwrap();
+        }
+        std::fs::remove_file(out.join(format!("{:020}.tar", 2))).unwrap();
+        write(&mut j, &v, "a", 0, b"4");
+        j.commit().unwrap();
+        assert!(out.join(format!("{:020}.tar", 4)).exists());
+        std::fs::remove_dir_all(v.parent().unwrap()).unwrap();
+    }
+
     /// Writes as the filesystem host does: journal first, then the write.
     fn write(j: &mut Journal, v: &Path, name: &str, at: u64, data: &[u8]) {
         let file = File::options().read(true).write(true).open(v.join(name)).unwrap();

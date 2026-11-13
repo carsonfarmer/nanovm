@@ -937,6 +937,23 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// A version that names another app or object is never shipped as this
+    /// one's, wherever it is found (a worker can put anything in its own
+    /// directory).
+    #[tokio::test]
+    async fn a_version_naming_another_object_is_not_shipped() {
+        let base = tempdir("identity");
+        let store = Dir(base.join("store"));
+        let (theirs, dir) = (base.join("objects/app/~committed/x"), base.join("objects/app/~committed/o"));
+        version(&theirs, 1, 0, "", "x's");
+        assert!(ship_object(&store, None, "other", "x", &theirs).await.is_err(), "another app's");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::rename(theirs.join(format!("{:020}.tar", 1)), dir.join(format!("{:020}.tar", 1))).unwrap();
+        assert!(ship_object(&store, None, "app", "o", &dir).await.is_err(), "another object's");
+        assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// A store whose next put waits, once `started` has been told, for a
     /// permit from `gate`.
     struct Gated {
