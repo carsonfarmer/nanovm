@@ -57,6 +57,8 @@ pub trait Store: Send + Sync {
     /// Writes the record at `key` if it is still at `tag` (none: absent):
     /// its new version, or none if it has moved.
     async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>>;
+    /// Removes everything under `prefix` (`<app>` or `<app>/<object>`).
+    async fn remove(&self, prefix: &str) -> io::Result<()>;
 }
 
 /// The store `cap` names, if any: a directory (`/path` or `file:///path`),
@@ -169,6 +171,13 @@ impl Store for Dir {
         })
         .await?
     }
+
+    async fn remove(&self, prefix: &str) -> io::Result<()> {
+        match tokio::fs::remove_dir_all(self.0.join(prefix)).await {
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            removed => removed,
+        }
+    }
 }
 
 /// An object store (S3 and the like): a put is conditional on nothing
@@ -208,6 +217,12 @@ impl Store for Objects {
             Err(e) => Err(io::Error::other(e)),
         }
     }
+
+    async fn remove(&self, prefix: &str) -> io::Result<()> {
+        use futures::{StreamExt, TryStreamExt};
+        let keys = self.0.list(Some(&prefix.into())).map_ok(|m| m.location).boxed();
+        self.0.delete_stream(keys).try_collect::<Vec<_>>().await.map(drop).map_err(io::Error::other)
+    }
 }
 
 /// What an object's head says.
@@ -242,17 +257,15 @@ pub async fn head(store: &dyn Store, app: &str, object: &str) -> io::Result<(Hea
 }
 
 /// Where the shipper records the last version the head has named of the
-/// object whose versions are in `dir` (`<objects>/~committed/<object>`):
-/// `<objects>/~shipped/<object>`.
+/// object whose versions are in `dir` (its directory's `committed`): its
+/// directory's `shipped`.
 pub(crate) fn marker(dir: &Path) -> PathBuf {
-    let objects = dir.parent().and_then(Path::parent).expect("in ~committed");
-    objects.join("~shipped").join(dir.file_name().expect("an object's"))
+    dir.with_file_name("shipped")
 }
 
 /// Records `sequence` in `marker`, whole.
 fn mark(marker: &Path, sequence: u64) -> io::Result<()> {
-    let new = marker.with_file_name("~new");
-    std::fs::create_dir_all(marker.parent().expect("in ~shipped"))?;
+    let new = marker.with_file_name("shipped.new");
     std::fs::write(&new, sequence.to_string())?;
     std::fs::rename(new, marker)
 }
@@ -345,27 +358,30 @@ pub(crate) async fn ship_object(store: &dyn Store, leases: Option<&Leases>, app:
 /// Ships, until the runtime stops, the versions published under `objects`
 /// (`<data_dir>/objects`): every app's, every object's, retrying failures
 /// a second later. An object this node holds no live lease on waits, quietly,
-/// until it does.
-pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Leases>>) {
+/// until it does. It ships an object while it holds `turn`, which an
+/// operator's delete takes, so neither sees the other half done.
+pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Leases>>, turn: Arc<tokio::sync::Mutex<()>>) {
     let mut seen = std::collections::HashMap::new();
     loop {
-        let dirs = std::fs::read_dir(&objects).into_iter().flatten().flatten().flat_map(|app| {
-            let committed = app.path().join("~committed");
-            let objects = std::fs::read_dir(committed).into_iter().flatten().flatten();
-            objects.filter(|o| o.file_type().is_ok_and(|t| t.is_dir())).map(move |o| (app.file_name(), o))
+        let entries = |dir: PathBuf| std::fs::read_dir(dir).into_iter().flatten().flatten();
+        let dirs = entries(objects.clone()).flat_map(|app| {
+            let shards = entries(app.path()).filter(|s| s.file_name().len() == 2);
+            shards.flat_map(move |s| entries(s.path())).map(move |o| (app.file_name(), o))
         });
         let mut failed = false;
         for (app, object) in dirs.collect::<Vec<_>>() {
             // Skip an object nothing was published for since its last round:
             // its directory's time is the same, and older than the clock's tick.
-            let changed = object.metadata().and_then(|m| m.modified()).ok();
-            let old = changed.is_some_and(|t| t.elapsed().is_ok_and(|e| e > Duration::from_millis(100)));
-            if old && seen.get(&object.path()) == Some(&changed) {
+            let versions = object.path().join("committed");
+            let Ok(changed) = versions.metadata().and_then(|m| m.modified()) else { continue };
+            let old = changed.elapsed().is_ok_and(|e| e > Duration::from_millis(100));
+            if old && seen.get(&versions) == Some(&changed) {
                 continue;
             }
             let (app, id) = (app.to_string_lossy(), object.file_name().to_string_lossy().into_owned());
-            match ship_object(&*store, leases.as_deref(), &app, &id, &object.path()).await {
-                Ok(()) => _ = seen.insert(object.path(), changed),
+            let _turn = turn.lock().await;
+            match ship_object(&*store, leases.as_deref(), &app, &id, &versions).await {
+                Ok(()) => _ = seen.insert(versions, changed),
                 Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
                 Err(e) => {
                     eprintln!("nanovm: shipping {app}/{id}: {e}");
@@ -385,7 +401,7 @@ pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Lea
 /// restored from the store. So a node never serves state older than the
 /// head, nor ships history the head has moved past.
 pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object: &str, objects: &Path) -> io::Result<()> {
-    let dir = objects.join("~committed").join(object);
+    let dir = crate::committed::directory(&crate::app::object_dir(objects, object));
     for _ in 0..4 {
         let (head, tag) = head(store, app, object).await?;
         if head.lease > lease || (head.lease == lease && head.node != node) {
@@ -424,18 +440,17 @@ fn current(dir: &Path, head: &Head, node: &str) -> io::Result<bool> {
 /// journal and marker, then its versions, which say whether a copy is
 /// current, so a discard cut short is never taken for one.
 fn discard(objects: &Path, object: &str) -> io::Result<()> {
-    let [journal, staging, marker, versions] = ["~journal", "~restore", "~shipped", "~committed"].map(|d| objects.join(d).join(object));
-    for path in [objects.join(object), journal, staging, versions] {
-        if let Err(e) = std::fs::remove_dir_all(&path)
+    let base = crate::app::object_dir(objects, object);
+    for name in [crate::journal::VOLUME, "journal", "restore", "shipped", "committed"] {
+        let path = base.join(name);
+        let removed = if name == "shipped" { std::fs::remove_file(path) } else { std::fs::remove_dir_all(path) };
+        if let Err(e) = removed
             && e.kind() != ErrorKind::NotFound
         {
             return Err(e);
         }
     }
-    match std::fs::remove_file(marker) {
-        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 /// Rebuilds object `object` of app `app` from what `store` holds, as the
@@ -447,7 +462,8 @@ pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path)
     if head.sequence == 0 {
         return Err(io::Error::new(ErrorKind::NotFound, format!("nothing of {app}/{object} counts in the store")));
     }
-    let staging = objects.join("~restore").join(object);
+    let base = crate::app::object_dir(objects, object);
+    let staging = base.join("restore");
     // What a restore cut short left.
     if let Err(e) = std::fs::remove_dir_all(&staging)
         && e.kind() != ErrorKind::NotFound
@@ -471,10 +487,10 @@ pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path)
         }
         (n, digest) = (n - 1, version.parent);
     }
-    let last = crate::committed::restore(&staging, &objects.join(object))?;
+    let last = crate::committed::restore(&staging, &base.join(crate::journal::VOLUME))?;
     // The volume first, then the version that says it is there.
     sync_fs(objects)?;
-    let out = objects.join("~committed").join(object);
+    let out = crate::committed::directory(&base);
     std::fs::create_dir_all(&out)?;
     std::fs::rename(staging.join(format!("{last:020}.tar")), out.join(format!("{last:020}.tar")))?;
     mark(&marker(&out), last)?;
@@ -556,7 +572,7 @@ mod tests {
     /// at `epoch` after the version with digest `parent`: a snapshot whose
     /// volume holds `v`, saying `text`. Returns its digest.
     fn version(dir: &Path, n: u64, epoch: u64, parent: &str, text: &str) -> String {
-        let object = dir.file_name().unwrap().to_str().unwrap();
+        let object = dir.parent().unwrap().file_name().unwrap().to_str().unwrap();
         let id = serde_json::json!({
             "format": 1, "app": "app", "object": object, "sequence": n, "epoch": epoch, "parent": parent, "snapshot": true,
         });
@@ -579,7 +595,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
         std::fs::create_dir_all(root).unwrap();
         restore(store, "app", object, root).await.map_err(|e| e.to_string())?;
-        Ok(std::fs::read_to_string(root.join(object).join("v")).unwrap())
+        Ok(std::fs::read_to_string(crate::app::object_dir(root, object).join("data/v")).unwrap())
     }
 
     /// Takes `object`'s lease for `leases`' node, claims the head for it with
@@ -621,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn the_shipper_follows_the_head_and_keeps_the_last() {
         let base = tempdir("shipper");
-        let (store, dir) = (Dir(base.join("store")), base.join("objects/app/~committed/o"));
+        let (store, dir) = (Dir(base.join("store")), crate::app::object_dir(&base.join("objects/app"), "o").join("committed"));
         let local = || published(&dir).unwrap().0;
         let mut parent = String::new();
         for n in 1..=3 {
@@ -670,6 +686,9 @@ mod tests {
         async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>> {
             self.store.swap(key, bytes, tag).await
         }
+        async fn remove(&self, prefix: &str) -> io::Result<()> {
+            self.store.remove(prefix).await
+        }
     }
 
     /// Node A uploads a version; before the upload lands, A's lease runs out
@@ -687,7 +706,7 @@ mod tests {
         };
         let (a, b) = (Leases::new(records.clone(), "a", Duration::from_millis(200)), Leases::new(records, "b", Duration::from_secs(5)));
         let (a_objects, b_objects) = (base.join("a"), base.join("b"));
-        let (a_dir, b_dir) = (a_objects.join("~committed/o"), b_objects.join("~committed/o"));
+        let (a_dir, b_dir) = (crate::app::object_dir(&a_objects, "o").join("committed"), crate::app::object_dir(&b_objects, "o").join("committed"));
         let ga = take(&store, &a, "o", &a_objects).await;
         version(&a_dir, 1, ga.epoch, "", "A's");
         let (shipped, gb) = tokio::join!(ship_object(&store, Some(&a), "app", "o", &a_dir), async {
@@ -718,12 +737,12 @@ mod tests {
         let store = Objects(Arc::new(object_store::memory::InMemory::new()));
         let (a, b) = (Leases::new(records.clone(), "a", Duration::from_millis(200)), Leases::new(records, "b", Duration::from_secs(5)));
         let (a_objects, b_objects) = (base.join("a"), base.join("b"));
-        let dir = a_objects.join("~committed/o");
-        let text = |objects: &Path| std::fs::read_to_string(objects.join("o/v")).ok();
+        let dir = crate::app::object_dir(&a_objects, "o").join("committed");
+        let text = |objects: &Path| std::fs::read_to_string(crate::app::object_dir(objects, "o").join("data/v")).ok();
         // A version and the volume as it leaves it.
         let commit = |n: u64, epoch: u64, parent: &str, v: &str| {
-            std::fs::create_dir_all(a_objects.join("o")).unwrap();
-            std::fs::write(a_objects.join("o/v"), v).unwrap();
+            std::fs::create_dir_all(dir.with_file_name("data")).unwrap();
+            std::fs::write(dir.with_file_name("data/v"), v).unwrap();
             version(&dir, n, epoch, parent, v)
         };
         // A ships version 1, commits 2, and lets the object go.
@@ -766,7 +785,7 @@ mod tests {
         // A has a version of `object`, committed at `epoch`; it must not count.
         let mut shipped = vec![];
         let mut refused = async |object: &str, epoch: u64| {
-            let dir = objects.join("~committed").join(object);
+            let dir = crate::app::object_dir(&objects, object).join("committed");
             version(&dir, 1, epoch, "", "late");
             if ship_object(&store, Some(&a), "app", object, &dir).await.is_ok() || head(&store, "app", object).await.unwrap().0.sequence > 0 {
                 shipped.push(object.to_owned());
