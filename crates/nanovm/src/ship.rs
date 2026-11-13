@@ -287,17 +287,23 @@ fn shipped(dir: &Path) -> u64 {
     std::fs::read_to_string(marker(dir)).ok().and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
-/// Waits, two seconds at most (within an instance's post-return deadline),
-/// for the shipper to make the version `sequence` of the object whose
-/// versions are in `dir` count: for its head to name it, or a later one.
+/// How long a commit acknowledged remotely waits for its version to count.
+/// The node's time, not the guest's: its deadlines don't cut it short
+/// (`object::Phase::Committing`).
+pub(crate) const ACK: Duration = Duration::from_secs(2);
+
+/// Waits, `ACK` at most, for the shipper to make the version `sequence` of
+/// the object whose versions are in `dir` count: for its head to name it,
+/// or a later one.
 pub(crate) fn stored(dir: &Path, sequence: u64) -> io::Result<()> {
-    for _ in 0..1000 {
-        if shipped(dir) >= sequence {
-            return Ok(());
+    let t0 = std::time::Instant::now();
+    while shipped(dir) < sequence {
+        if t0.elapsed() > ACK {
+            return Err(io::Error::new(ErrorKind::TimedOut, format!("version {sequence} is not in the store")));
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    Err(io::Error::new(ErrorKind::TimedOut, format!("version {sequence} is not in the store")))
+    Ok(())
 }
 
 /// Whether every version published in `dir` counts in the store, waiting

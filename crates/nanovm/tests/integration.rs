@@ -175,8 +175,9 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
 }
 
 /// With remote acknowledgement, a commit whose version can't be stored is
-/// not acknowledged, though it stands here; and with the store down, once
-/// the capture limits are reached writes are refused, never versions dropped.
+/// not acknowledged, though it stands here, and the object serves nothing
+/// until it counts (N-725); and with the store down, once the capture
+/// limits are reached writes are refused, never versions dropped.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() {
     for remote_ack in [true, false] {
@@ -190,9 +191,11 @@ async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() 
         });
         let node = node_with(cfg.clone(), app("counter"));
         let r = request(&node, "POST", "o", "/incr", "").await;
+        let local = cfg.app_dirs("counter")[0].join("~committed/o");
         if remote_ack {
             assert_eq!(r.error.as_deref(), Some("commit-failed"), "{}", r.body);
-            assert_eq!(get(&node, "o", "/").await.json()["count"], 1, "the commit stands here");
+            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 1, "the commit stands here");
+            assert_eq!(get(&node, "o", "/").await.error.as_deref(), Some("not-stored"), "served before it counts");
         } else {
             assert_eq!(r.json()["count"], 1);
             for n in 2..=3 {
@@ -201,11 +204,37 @@ async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() 
             let r = request(&node, "POST", "o", "/incr", "").await;
             assert_eq!(r.error.as_deref(), Some("commit-failed"), "a full outbox refuses: {}", r.body);
             assert_eq!(get(&node, "o", "/").await.json()["count"], 3);
-            let local = cfg.app_dirs("counter")[0].join("~committed/o");
-            assert_eq!(std::fs::read_dir(local).unwrap().count(), 3, "every unshipped version kept");
+            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 3, "every unshipped version kept");
         }
         node.shutdown().await;
     }
+}
+
+/// Acknowledging remotely, a commit waits for the store (`ship::ACK`, 2 s)
+/// whatever the app's own deadlines: committing is the node's work, not the
+/// guest's (B-507). Here the store acknowledges after about a second, twice
+/// the hostile app's post-return deadline: the write is answered 200
+/// (before: 504, "deadline exceeded while post-return").
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_acknowledgement_is_not_cut_short_by_the_apps_deadline() {
+    let mut cfg = node_cfg("slow_ack", 8);
+    let store = cfg.data_dir.join("store");
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), remote_ack: true, ..Default::default() });
+    let node = node_with(cfg, app("hostile"));
+    assert_eq!(get(&node, "o", "/commit?v=one").await.status, 200);
+    // The store's next move of the head waits a second for its lock.
+    let lock = std::fs::File::options().append(true).open(store.join("hostile/o/head.lock")).unwrap();
+    lock.lock().unwrap();
+    let held = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1000));
+        drop(lock);
+    });
+    let t0 = Instant::now();
+    let r = get(&node, "o", "/commit?v=two").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(t0.elapsed() >= Duration::from_millis(900), "answered before the store acknowledged: {:?}", t0.elapsed());
+    held.join().unwrap();
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4855,10 +4884,15 @@ mod nodes {
         let away = shipped.with_extension("away");
         std::fs::rename(&shipped, &away).unwrap();
         std::fs::write(&shipped, "").unwrap();
-        // Answered 500, or 504 when the request's deadline (here 1 s) ends
-        // the wait first; the commit stands either way.
-        let written = get(proxy, "unacked.test", &format!("/{object}/commit?v=two")).await;
-        assert!(matches!(written.0, 500 | 504), "{written:?}");
+        // Answered 500 once the wait for the store (2 s) is over, whatever
+        // the app's deadlines (B-507); the commit stands. A read queued
+        // behind it finds the object's instance reset, and its next one
+        // waits for the store, in vain. (Once the object's actor has
+        // retired, a request needs a new claim, which the store being down
+        // refuses too: A serves nothing either way.)
+        let path = format!("/{object}/commit?v=two");
+        let write = tokio::spawn(async move { get(proxy, "unacked.test", &path).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let read = {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
@@ -4868,6 +4902,8 @@ mod nodes {
             s.read_to_string(&mut out).await.unwrap();
             out.to_lowercase()
         };
+        let written = write.await.unwrap();
+        assert_eq!(written.0, 500, "{written:?}");
         assert!(read.starts_with("http/1.1 503") && read.contains("retry-after: 1") && read.contains("not-stored"), "A serves what it answered 500 for: {read}");
         // A stops, then the store is back; B takes the object over.
         stop.send(()).unwrap();

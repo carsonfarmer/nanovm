@@ -54,19 +54,22 @@ pub enum Phase {
     Handling,
     PostReturn,
     Cold,
+    /// The node commits what a request changed: its work, not the guest's.
+    Committing,
 }
 
 impl Phase {
-    pub(crate) const ALL: [Phase; 5] = [
+    pub(crate) const ALL: [Phase; 6] = [
         Phase::Starting,
         Phase::Idle,
         Phase::Handling,
         Phase::PostReturn,
         Phase::Cold,
+        Phase::Committing,
     ];
 
     pub fn as_str(self) -> &'static str {
-        ["starting", "idle", "handling", "post-return", "cold"][self as usize]
+        ["starting", "idle", "handling", "post-return", "cold", "committing"][self as usize]
     }
 }
 
@@ -502,14 +505,20 @@ enum Exit {
 /// changes stand whether or not a publish gets through). Only while the node
 /// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route, node, id) = acc.with(|mut s| {
+    let (quota, held, route, node, shared) = acc.with(|mut s| {
         let s = s.data_mut();
         let held = std::mem::take(&mut *s.hooks.held.lock());
-        (s.quota.clone(), held, s.hooks.route.clone(), s.hooks.node.clone(), s.shared.id.clone())
+        (s.quota.clone(), held, s.hooks.route.clone(), s.hooks.node.clone(), s.shared.clone())
     });
     // Only while the node holds the object's lease (see `Journal::commit`):
-    // otherwise neither its changes nor its publishes go out.
-    quota.commit().await?;
+    // otherwise neither its changes nor its publishes go out. Its time is
+    // the node's (a store acknowledging remotely may take `ship::ACK`), not
+    // counted against the guest's post-return deadline.
+    shared.set_phase(Phase::Committing);
+    let committed = quota.commit().await;
+    shared.set_phase(Phase::PostReturn);
+    committed?;
+    let id = shared.id.clone();
     if !held.is_empty() {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {
@@ -803,6 +812,7 @@ async fn serve(
                 let ms = match phase {
                     Phase::Idle => limits.idle_timeout_ms,
                     Phase::PostReturn => limits.post_return_timeout_ms,
+                    Phase::Committing => limits.post_return_timeout_ms + crate::ship::ACK.as_millis() as u64,
                     Phase::Handling | Phase::Starting | Phase::Cold => limits.request_timeout_ms,
                 };
                 let elapsed = Duration::from_nanos(t1.saturating_sub(since));
@@ -1155,6 +1165,6 @@ mod tests {
         shared.begin_start();
         assert!(shared.cpu_used_ns() < 5_000_000);
         let names = Phase::ALL.map(Phase::as_str);
-        assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold"]);
+        assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold", "committing"]);
     }
 }
