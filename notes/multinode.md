@@ -166,22 +166,38 @@ compared by digest):
   epoch, and only a version that follows the head (the next sequence, whose
   parent digest is the head's). Upload, then move the head; then mark it
   shipped locally. A move that fails its condition stops shipping: the node
-  lost the object.
+  lost the object. Up to 32 objects ship at once, each its versions in
+  order; the head is read once and then moved from what this node last
+  wrote (a stale one fails the move and is read again), so a version costs
+  a put and a head move. A failure is its object's own (logged, tried
+  again a second later); holding no lease is a state, not a failure.
+  A version up to the head's is marked, not refused, when this copy has
+  the head's version: a marker is unsynced, and one a power loss takes
+  back is caught up from the head.
 - **Restore** (`ship::restore`) follows the head back, parent by parent, to
   the last snapshot: only versions from there are fetched (N-166's
   pointer).
 - **Acknowledgement** (`remote_ack`) waits for the local marker, which is
-  written only after the head names the version.
+  written only after the head names the version. An instance then starts
+  only once every version here counts (`ship::caught_up`): a commit whose
+  wait ran out is answered 500 but stands here, and serving it would show
+  state a takeover can lose. The object answers 503 `not-stored`
+  (`Retry-After: 1`) meanwhile, holding its lease so its shipper can ship.
 
 **Takeover restores before serving.** The claim decides whether this node's
 copy of the object is the head's: it must hold the head's version, and
 anything after it counts only if no other node has claimed the object since
 this node did (the head's `node` is this node), or, if another has, the copy
-must be exactly the head's (no later or staged versions). Otherwise the copy
-goes (the volume, the journal, the versions and the marker; the versions
-last, so a discard cut short is never taken for a current copy), the head is
-claimed, and the object is rebuilt from the head; the supervisor gives what
-it restored to the app's uid. Only then does the worker instantiate. So a
+must be exactly the head's (no later or staged versions), and a copy with
+versions must have its volume. Otherwise the copy goes (the volume first,
+then the journal and the marker, the versions last, so a discard cut short
+leaves a copy judged as before, or an empty one: never a current one), the
+drop is synced, the head is claimed, and the object is rebuilt from the
+head; the supervisor gives what it restored to the app's uid. The claim
+lists this copy before it reads the head: the shipper, which may still be
+shipping under the grant before this one, removes a version only after
+moving the head past it, so the head read after names a listed version if
+this copy has it (`a_claim_racing_the_shippers_old_grant_keeps_later_versions`). Only then does the worker instantiate. So a
 node never serves state older than the head, and history a node committed
 but never shipped before another took the object is dropped there, never
 shipped.
@@ -205,8 +221,8 @@ proposed: the capture store is already shared and written conditionally, the
 head carries the claiming epoch itself (so it doesn't depend on the lease
 record's version, which every acquisition and release changes), and one node
 uses the same head at epoch 0. It costs a claim (a read and a conditional
-write) per acquisition, and per shipped version a head read per round and a
-conditional write; S3 needs its default `ETagMatch` conditional puts, as the
+write) per acquisition, and per shipped version a put and a conditional
+write (the head is read again only after a claim or a failed move); S3 needs its default `ETagMatch` conditional puts, as the
 leases do.
 
 **Never delete lease records or heads**: an object's epochs would restart,
@@ -362,6 +378,99 @@ ignored (opt-in); the SQLite suite (`sqlite_ -- --ignored`) 12 pass; `dev`
 7,068 (cf/round3 9f878a9) -> 7,301 (+233: ship.rs +175, lease.rs +25,
 supervisor.rs +20, config.rs +8, proxy.rs +5).
 
+### Second lease review (`fix/r3-lease`, N-720..N-729)
+
+`review2/lease` added four failing tests; each passes now, its root cause
+fixed and the test kept. The review's two suspicions were proven by tests
+that failed, then fixed; the deployable agent's B-604 too. Each test below
+failed before its fix (the runs are in the commits) and is mutation-checked.
+
+- **N-720** `mark` wrote every marker through one fixed temporary file; now
+  a file of its own (`written`), unsynced (a marker behind is caught up,
+  N-729). `review_concurrent_claims_mark_each_object_its_own_head`: 66 and
+  41 of 320 claims wrong before.
+- **N-721** a copy with versions is current only with its volume, which a
+  discard removes first; the marker goes before the versions, which go last.
+  `review_a_discard_cut_short_is_not_taken_for_a_current_copy`.
+- **N-722** a claim syncs what it dropped before its head write.
+  `a_claim_syncs_what_it_dropped_before_claiming` (a failing sync must stop
+  the claim; a test-only hook in `sync_fs`).
+- **N-723** (suspicion) the claim lists this copy before reading the head.
+  `a_claim_racing_the_shippers_old_grant_keeps_later_versions`: a store
+  holds the shipper's put and the claim's head read; before, version 5
+  (committed after the shipper listed its own) was dropped.
+- **N-724** up to 32 objects ship at once, each in order; a head is read
+  once, then moved from what this node wrote; failures are per object.
+  `review_remote_acks_keep_up_with_objects_committing_at_once` (14 of 40
+  late before), `the_shipper_reads_a_head_once_then_moves_it_from_what_it_wrote`.
+- **N-725** with `remote_ack`, an instance starts only once every version
+  here counts (`ship::caught_up`), else 503 `not-stored`, `Retry-After: 1`.
+  `review_a_takeover_never_serves_older_state_than_was_served` (its "next
+  instance" now starts as the node starts one) and
+  `nodes::a_write_answered_500_is_served_only_once_it_counts` (the write
+  is answered 500, or 504 when the request's deadline ends the wait first).
+- **N-726** (suspicion) a claim that finds the history broken in the store
+  (`NotFound`, `InvalidData`) refuses the object on that node for 60 s
+  without asking the store.
+  `an_object_whose_history_is_broken_is_refused_without_asking_the_store_again`
+  (before: 5 requests, 5 claims, epoch 5).
+- **N-727** `lease_ms = 0`, non-shared lease or capture stores in a config
+  file with leases, and `failover_ms` at or below the proxy's connect
+  timeout are refused. `configs_that_cannot_hold_leases_are_refused`.
+- **N-728** (B-604) no lease is `Ok(false)`, never an error; every error is
+  logged and its object retried a second later.
+  `a_failure_shipping_one_object_is_its_own_and_not_taken_for_no_lease`
+  (before: 24 quiet tries in 500 ms).
+- **N-729** a version up to the head's is marked when this copy has the
+  head's version. `the_shipper_catches_up_a_marker_left_behind`.
+
+Mutation checks (`fix/r3-lease`; each removes one mechanism, the named test
+then fails; restored with `git checkout`, empty diff after):
+
+| # | removed | caught by |
+|---|---|---|
+| L1 | a marker file of its own (the fixed `~new` again) | `review_concurrent_claims_mark_each_object_its_own_head` (the runs before the fix) |
+| L2 | a current copy has its volume (`whole` always true) | `review_a_discard_cut_short_is_not_taken_for_a_current_copy` |
+| L3 | the sync after a discard | `a_claim_syncs_what_it_dropped_before_claiming` |
+| L4 | listing the copy before reading the head | `a_claim_racing_the_shippers_old_grant_keeps_later_versions` |
+| L5 | objects shipped at once (32 -> 1) | `review_remote_acks_keep_up_with_objects_committing_at_once` |
+| L6 | the head kept from the last move | `the_shipper_reads_a_head_once_then_moves_it_from_what_it_wrote` |
+| L7 | errors as errors (PermissionDenied taken for no lease again) | `a_failure_shipping_one_object_is_its_own_and_not_taken_for_no_lease` |
+| L8 | marking versions up to the head | `the_shipper_catches_up_a_marker_left_behind` |
+| L9 | `caught_up` (always caught up) | `review_a_takeover_never_serves_older_state_than_was_served` |
+| L10 | the instance start's call to `caught_up` | `nodes::a_write_answered_500_is_served_only_once_it_counts` |
+| L11 | the remembered broken history | `an_object_whose_history_is_broken_is_refused_without_asking_the_store_again` |
+| L12 | refusing `lease_ms = 0`; refusing stores nodes can't share; refusing `failover_ms` at the connect timeout (three mutations) | `configs_that_cannot_hold_leases_are_refused`, each time |
+
+L2–L9, L11 and L12 ran as three builds of independent mutations; in each
+only the named tests failed (`ship::`, `lease::`, `config::`, `proxy::`:
+37 tests).
+
+**Shipper throughput** (`ship::tests::measure_remote_acks`, ignored; N
+objects each commit a version and wait for it, as a `remote_ack` commit
+does, again and again for 10 s; the store answers every call in 25 ms;
+CPU is the shipper runtime's threads, from `/proc/self/task/*/stat`). The
+baseline is the reviewer's tree (0ea78cd) with the same test; the two test
+binaries alternated, 3 rounds each, on the shared VM (load 21–25).
+Medians [ranges]:
+
+| objects | baseline acks/s | late | CPU µs/ack | fix acks/s | late | CPU µs/ack |
+|---|---|---|---|---|---|---|
+| 1 | 9.1 [7.6–9.7] | 0 | 439 [259–510] | 14.6 [12.9–15.4] | 0 | 620 [544–645] |
+| 40 | 5.9 [5.9–6.1] | 165 [163–169] | 1,200 [845–1,408] | 548 [512–565] | 0 | 244 [194–261] |
+| 200 | 5.4 [5.3–5.7] | 978 [968–980] | 923 [857–1,363] | 559 [393–583] | 0 [0–221] | 295 [275–301] |
+
+"Late": commits not acknowledged within the 2 s wait in 10 s (answered 500
+though they stand). The baseline costs three round trips a version, one
+object at a time; the fix two, 32 objects at once (a ceiling of 640/s at
+25 ms), and one object's acknowledgement takes the scan's 20 ms plus two
+round trips. CPU per acknowledgement fell 4–5x with many objects; with one
+it rose (the per-scan cost, now a task per changed object, spread over fewer
+acknowledgements: about 9 ms of CPU a second in all). The one 200-object
+round with late commits ran at load 24, with the test's 200 threads each
+polling its marker every 2 ms, as a `remote_ack` commit does (N-165).
+
+
 ## Measurements
 
 Single node, A/B on the HTTP path, method from the shared bench harness (CPU
@@ -406,6 +515,15 @@ merge.
 - Cold starts with leases wait on the store (N-183; W-91 proposes keeping
   released leases for a while). Renewals have object_store's own timeouts
   (30 s), so one slower than the lease just lets the session lapse (safe).
+- From the second review (`fix/r3-lease`): an object refused for a broken
+  history answers the worker 503, which the worker turns into 421, so the
+  client gets the proxy's 503 after `failover_ms`, not the reason (N-726).
+  An instance waiting for its versions to count holds a pool slot for up to
+  2 s. The shipper holds up to 32 versions in memory at once (a snapshot is
+  the whole volume). It still finds new versions by polling (N-165), and a
+  `remote_ack` commit polls its marker every 2 ms. The permissions behind
+  B-604 (a supervisor without `CAP_DAC_OVERRIDE` writing in app-owned
+  directories) are the deployable agent's; failures now show in the log.
 
 ## Decisions for the owner (numbered, with a recommendation)
 
@@ -446,3 +564,21 @@ merge.
    S3); an explicit `false` keeps local acknowledgement, which a failover may
    lose (the claim drops versions the head never named). Programmatic configs
    (tests, embedding) set it themselves. One node stays local by default.
+   Since `fix/r3-lease` a write is answered once the head names its version
+   (a put and a head move, two round trips, plus up to 20 ms of polling), and
+   an object with a version that doesn't count yet serves nothing (503
+   `not-stored`) until it does: with the store down, reads of an object whose
+   last write failed fail too, as remote acknowledgement means.
+9. **A head written without leases (`lease` 0).** A claim treats such a head
+   as this node's own (`current`: `head.lease == 0`), so it keeps any versions
+   after it. That matters only when a cluster with leases takes over a store a
+   single node wrote, and then only for whichever node claims first: if that
+   is the former single node, its unshipped versions survive (and ship); if
+   another node claims first, they are dropped. *Recommend treating a lease-0
+   head like any other node's* (remove `|| head.lease == 0`, one line): the
+   switch to leases then never keeps unshipped single-node history, whichever
+   node claims first, and the operator drains the single node (lets its
+   shipper catch up) before turning leases on. Refusing such heads with an
+   error instead (about three lines) would cost every single-node deployment
+   its store when it grows to several nodes (a fresh store, history lost),
+   for no safety the one-line change doesn't give.

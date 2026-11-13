@@ -449,7 +449,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `ship.rs` (`run`)
 - **Scenario:** every 20 ms the shipper lists `~committed/` of every app and stats each object's directory, skipping unchanged ones: ~0.1 core at 10k objects, and up to 20 ms added to a `remote_ack` commit. A worker can't notify the supervisor's shipper except through the filesystem.
 - **Fix (proposed):** a notification over the worker's supervisor link when a version is published.
-- **Status:** open
+- **Status:** open (since N-724 the shipper ships 32 objects at once and reads each head once, but still finds new versions by polling)
 
 ### N-166 (efficiency): restoring an object downloads every version it ever had
 - **Where:** `ship.rs` (`restore`)
@@ -544,6 +544,75 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** from source; not run.
 - **Suggestion:** treat it as the existing ambiguous-outcome case ("Do not interpret every error as a rollback", README "Commits"), or have the node finish the answer's commit before reporting the trap.
 - **Status:** open
+
+### N-720: concurrent claims overwrote each other's shipped markers
+- **Where:** `ship.rs` (`mark`)
+- **Scenario:** found by the second lease review (`review2/lease`, finding 1). `mark` wrote every object's marker through one fixed temporary file, `<objects>/~shipped/~new`. Every lease grant claims (and may restore and mark) its object, grants run concurrently, and the shipper marks too. A marker could then hold another object's sequence, or a mix: `stored` acknowledged versions the store never got, and `ship_object` skipped them; the losing rename failed with ENOENT, so that claim answered 503.
+- **Reproduced:** yes: `review_concurrent_claims_mark_each_object_its_own_head`, 66 and 41 of 320 claims wrong in two runs.
+- **Fix:** `mark` writes through `written` (a random name, created exclusively, synced), as `Dir::put` does, then renames.
+- **Status:** fixed on `fix/r3-lease` (dbb3cea)
+
+### N-721: a claim's discard cut short was taken for a current copy, served with no volume
+- **Where:** `ship.rs` (`current`, `discard`)
+- **Scenario:** review finding 2 (crash). `current` judged a copy only by its versions; `discard` removed the volume, then the versions with `remove_dir_all` (directory order), then the marker. A crash after the volume and the later versions were gone, but before the head's version, left a copy the next claim kept: the object was served with no volume. A crash after the versions but before the marker left a marker that acknowledged (and skipped shipping) the next versions.
+- **Reproduced:** yes: `review_a_discard_cut_short_is_not_taken_for_a_current_copy` (the copy was kept; the volume read failed with ENOENT).
+- **Fix:** a copy with versions is current only with its volume, which `discard` removes first; the marker goes before the versions, which go last. Wherever a discard stops, the next claim judges the copy as the first did, or (no versions left) as an empty copy.
+- **Status:** fixed on `fix/r3-lease` (b3cd8a3)
+
+### N-722: a claim's discard wasn't durable before the claim made the copy count
+- **Where:** `ship.rs` (`claim`)
+- **Scenario:** review finding 5 (power loss, traced). `discard` unlinks without syncing, then the claim's conditional write of the head makes what is here count for this node. `syncfs` ran only inside `restore`, and only when the head names a version. A power loss could bring back a version the claim dropped, now under this node's claim, and it would ship.
+- **Reproduced:** yes, the order: `a_claim_syncs_what_it_dropped_before_claiming` (a sync that fails must stop the claim; before, the head was claimed with no sync at all).
+- **Fix:** the claim syncs the filesystem after a discard, before writing the head.
+- **Status:** fixed on `fix/r3-lease` (b3cd8a3)
+
+### N-723: a claim racing the shipper's old grant dropped versions committed after the shipper listed them
+- **Where:** `ship.rs` (`claim`)
+- **Scenario:** the review's unproven suspicion, now proven. The shipper ships under the grant it found when it began. An object's actor can give its lease up and take it again meanwhile (idle eviction, LRU), and the new grant's claim runs while the shipper still ships under the old one. The claim read the head, then listed this node's versions; in between, the shipper moved the head on and removed the version the claim's head named. The claim took its own copy for a stale one, dropped it, and restored the head: a version committed after the shipper listed its own (and, with `remote_ack = false`, answered) was lost.
+- **Reproduced:** yes: `a_claim_racing_the_shippers_old_grant_keeps_later_versions` (before: the copy held `v4`, version 5 gone).
+- **Fix:** the claim lists this copy before it reads the head. The shipper removes a version only after moving the head past it, and the head only moves forward, so the head read after names a version listed here if this copy has it; one removed after the listing makes the claim read again (NotFound), never drop the copy.
+- **Status:** fixed on `fix/r3-lease` (b3cd8a3)
+
+### N-724: remote acknowledgement couldn't keep up with objects committing at once
+- **Where:** `ship.rs` (`run`, `ship_object`)
+- **Scenario:** review finding 3. With `remote_ack` (the default with leases) each commit waits at most 2 s for its version to count. The shipper shipped one object at a time, three store round trips a version (head read, put, head swap), and any failure made the whole loop sleep a second. At 25 ms a store call, 14 of 40 simultaneous commits were answered 500 though they stood.
+- **Reproduced:** yes: `review_remote_acks_keep_up_with_objects_committing_at_once`; `measure_remote_acks` (numbers in `notes/multinode.md`).
+- **Fix:** up to 32 objects ship at once (a fair semaphore), each its versions in order; the head is read once and then moved from what this node last wrote (a stale one fails the conditional move and is read again); a failure is its object's own (logged, that object tried again a second later).
+- **Status:** fixed on `fix/r3-lease` (73dbc48)
+
+### N-725: a takeover served older state than the old node had served
+- **Where:** `journal.rs` (the commit decision comes before `stored`), `object.rs` (`run`)
+- **Scenario:** review finding 4. A write whose acknowledgement times out is answered 500 but stands on its node, which served it to later requests. If that node stopped before shipping it, the node taking over restored the head without it: clients read "one!" from A, then "zero" from B.
+- **Reproduced:** yes: `review_a_takeover_never_serves_older_state_than_was_served` (unit), `nodes::a_write_answered_500_is_served_only_once_it_counts` (integration: A served, 200, the write it had answered 504 for; the app's 1 s deadline ends the 2 s wait first, so such a write is answered 500 or 504).
+- **Fix:** with `remote_ack`, an instance starts only once every version published here counts in the store (`ship::caught_up`, waiting as a commit does, up to 2 s); otherwise the request gets 503 `not-stored` with `Retry-After: 1`. Instance start is the one place: a failed commit always ends its instance, and every instance (after a crash too, once recovery has settled a staged commit) passes there before the guest can read the volume. The wait holds the object's lease, so its shipper can ship meanwhile.
+- **Status:** fixed on `fix/r3-lease` (fb9f2e9)
+
+### N-726: a claim whose restore could never succeed was retried for every request, on every node
+- **Where:** `lease.rs` (`serve`)
+- **Scenario:** the review's second unproven suspicion, now proven. A version the head names missing from the store (or not what its key names) fails every restore. Each request took the object's lease at a new epoch, rewrote its head, fetched its history down to the missing version, and released the lease; the worker answered 421, so the proxy tried every node in turn for `failover_ms`.
+- **Reproduced:** yes: `an_object_whose_history_is_broken_is_refused_without_asking_the_store_again` (before: 5 requests, 5 claims, epoch 5).
+- **Fix:** a claim failing with `NotFound` or `InvalidData` (the store's history is broken; a store that can't be reached is `Other`) is logged and remembered: the node refuses the object (503, the reason) for 60 s without asking the store. So each node tries at most once a minute.
+- **Status:** fixed on `fix/r3-lease` (5f08d93). Open: the worker turns the supervisor's 503 into a 421, so the client gets the proxy's 503 after `failover_ms`, not the reason.
+
+### N-727: configs that can't hold leases were accepted
+- **Where:** `config.rs`, `proxy.rs`
+- **Scenario:** review finding 6. `lease_ms = 0` renewed every `0 / 4` ms, hammering the store. With leases, a `memory:` or directory store is each node's own (a directory store gives each node its own heads: a takeover restores nothing), and `object_store`'s local files can't update a record conditionally (this build doesn't compile them in, so a `file:` lease store failed at startup with "feature not enabled"). A proxy `failover_ms` at or below its 1 s connect timeout answered a hung connect 504 "may have run there" though nothing was sent.
+- **Fix:** `lease_ms = 0` is refused; a config file with `leases` must name object stores for `leases` and `capture.store` (not `memory:`, `file:` or a directory; programmatic configs, as in tests, bring stores their nodes share); the proxy refuses `failover_ms` at or below `proxy::CONNECT`. `failover_ms` against the nodes' `lease_ms` can't be checked in one process: the config docs say it must exceed every node's. Test: `configs_that_cannot_hold_leases_are_refused`.
+- **Status:** fixed on `fix/r3-lease` (3f853b7)
+
+### N-728: the shipper took a filesystem PermissionDenied for "no lease" (B-604)
+- **Where:** `ship.rs` (`run`, `authority`)
+- **Scenario:** found by the deployable agent (B-604). `run` treated every `PermissionDenied` from `ship_object` as "this node holds no live lease on the object" and waited quietly. Under the hardened systemd unit (no `CAP_DAC_OVERRIDE`) the supervisor can't write in an app's directories, so a node shipped one version per object (put and head move succeed, marking fails with EACCES) and then stopped silently.
+- **Reproduced:** yes: `a_failure_shipping_one_object_is_its_own_and_not_taken_for_no_lease` (a store refusing puts with PermissionDenied: before, tried again every 20 ms, quietly).
+- **Fix:** having no lease isn't an error: `ship_object` answers `Ok(false)`; every error is logged and its object tried again a second later. The permissions themselves are B-604's.
+- **Status:** fixed on `fix/r3-lease` (73dbc48)
+
+### N-729: a shipped marker a power loss took back stopped shipping for good
+- **Where:** `ship.rs` (`ship_object`)
+- **Scenario:** found while fixing N-725 (traced). The marker is renamed into place without a directory sync, and versions are removed after it. A power loss can leave a marker behind the head with versions up to the head still here; the shipper then refused the first of them ("doesn't follow its head") on every round, and with N-725's fix the object would serve nothing.
+- **Reproduced:** yes: `the_shipper_catches_up_a_marker_left_behind` (before: refused).
+- **Fix:** a version up to the head's is the head's history when this copy has the head's version (a claim made it so; versions here are a chain): it is marked, not shipped again.
+- **Status:** fixed on `fix/r3-lease` (73dbc48)
 
 ## Planned work
 
