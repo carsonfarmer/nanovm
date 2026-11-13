@@ -2382,7 +2382,7 @@ mod tests {
         };
         let ship = async |node: &Leases, v: &Path| {
             let dir = v.parent().unwrap().join("~committed/o");
-            crate::ship::ship_object(&store, Some(node), "app", "o", &dir).await
+            crate::ship::ship_object(&store, Some(node), "app", "o", &dir, &mut None).await
         };
         let va = volume();
         let (a, a_obj) = take("a", std::time::Duration::from_secs(1), va.parent().unwrap()).await;
@@ -2400,13 +2400,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(vb.parent().unwrap());
         std::fs::create_dir_all(vb.parent().unwrap()).unwrap();
         let (b, b_obj) = take("b", std::time::Duration::from_secs(10), vb.parent().unwrap()).await;
-        assert_eq!(ship(&a, &va).await.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!ship(&a, &va).await.unwrap(), "shipped without the lease");
         let vb = vb.canonicalize().unwrap();
         let mut j = Journal::open(&vb, 1 << 30, b_obj, Some(&cap)).unwrap();
         write(&mut j, &vb, "a", 0, b"B's");
         j.commit().unwrap();
         ship(&b, &vb).await.unwrap();
-        assert!(ship(&a, &va).await.is_err(), "still refused");
+        assert!(!ship(&a, &va).await.unwrap(), "still refused");
         let (head, _) = crate::ship::head(&store, "app", "o").await.unwrap();
         assert_eq!((head.sequence, head.node.as_str()), (2, "b"));
         let version = store.get(&format!("app/o/{:020}-{}.tar", 2, head.digest)).await.unwrap().unwrap();

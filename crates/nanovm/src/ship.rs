@@ -80,9 +80,10 @@ fn hex(bytes: &[u8]) -> String {
 /// replaces a name; a swap renames over a record under its lock file's lock.
 pub struct Dir(pub PathBuf);
 
-/// Writes `bytes`, synced, to a new file in `dir` that no other write can
-/// open: its name is random and it is created exclusively. Returns its path.
-fn written(dir: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+/// Writes `bytes` (synced if `synced`) to a new file in `dir` that no other
+/// write can open: its name is random and it is created exclusively.
+/// Returns its path.
+fn written(dir: &Path, bytes: &[u8], synced: bool) -> io::Result<PathBuf> {
     use std::io::Write;
     let mut name = [0u8; 8];
     // SAFETY: getentropy writes at most `name.len()` bytes into `name`.
@@ -91,7 +92,7 @@ fn written(dir: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     }
     let path = dir.join(format!("~new.{:016x}", u64::from_ne_bytes(name)));
     let mut file = std::fs::File::options().write(true).create_new(true).open(&path)?;
-    match file.write_all(bytes).and_then(|()| file.sync_all()) {
+    match file.write_all(bytes).and_then(|()| if synced { file.sync_all() } else { Ok(()) }) {
         Ok(()) => Ok(path),
         Err(e) => Err(std::fs::remove_file(&path).err().unwrap_or(e)),
     }
@@ -117,7 +118,7 @@ impl Store for Dir {
             let dir = path.parent().expect("keys have a directory");
             let fresh = !dir.exists();
             std::fs::create_dir_all(dir)?;
-            let new = written(dir, &bytes)?;
+            let new = written(dir, &bytes, true)?;
             // A link never replaces a name: of puts racing at a key, one
             // stores its bytes, and the others find them.
             let linked = std::fs::hard_link(&new, &path);
@@ -162,7 +163,7 @@ impl Store for Dir {
             if now != at {
                 return Ok(None);
             }
-            let new = written(dir, &bytes)?;
+            let new = written(dir, &bytes, true)?;
             std::fs::rename(&new, &path)?;
             sync_names(&root, dir, fresh)?;
             Ok(Some(tag(&bytes)))
@@ -250,11 +251,18 @@ pub(crate) fn marker(dir: &Path) -> PathBuf {
 }
 
 /// Records `sequence` in `marker`, whole: through a file of its own, as
-/// claims and the shipper mark objects at once.
+/// claims and the shipper mark objects at once. Unsynced: a marker a crash
+/// takes back is caught up from the head (see `ship_object`).
 fn mark(marker: &Path, sequence: u64) -> io::Result<()> {
     let dir = marker.parent().expect("in ~shipped");
     std::fs::create_dir_all(dir)?;
-    std::fs::rename(written(dir, sequence.to_string().as_bytes())?, marker)
+    std::fs::rename(written(dir, sequence.to_string().as_bytes(), false)?, marker)
+}
+
+/// The last version of the object whose versions are in `dir` that the
+/// shipper has seen its head name (0: none).
+fn shipped(dir: &Path) -> u64 {
+    std::fs::read_to_string(marker(dir)).ok().and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
 /// Waits, two seconds at most (within an instance's post-return deadline),
@@ -262,7 +270,7 @@ fn mark(marker: &Path, sequence: u64) -> io::Result<()> {
 /// versions are in `dir` count: for its head to name it, or a later one.
 pub(crate) fn stored(dir: &Path, sequence: u64) -> io::Result<()> {
     for _ in 0..1000 {
-        if std::fs::read_to_string(marker(dir)).ok().and_then(|s| s.parse::<u64>().ok()) >= Some(sequence) {
+        if shipped(dir) >= sequence {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -290,37 +298,49 @@ fn published(dir: &Path) -> io::Result<(Vec<u64>, bool)> {
 
 /// The node, and its lease's epoch, under which this node may move the head
 /// of object `object` of app `app`: its live lease on the object (with one
-/// node, there are no leases: "" and 0).
-fn authority<'a>(leases: Option<&'a Leases>, app: &str, object: &str) -> io::Result<(&'a str, u64)> {
-    let Some(leases) = leases else { return Ok(("", 0)) };
-    let held = leases.epoch(&format!("{app}/{object}")).map(|epoch| (leases.node(), epoch));
-    held.ok_or_else(|| io::Error::new(ErrorKind::PermissionDenied, format!("this node holds no live lease on {app}/{object}")))
+/// node, there are no leases: "" and 0); none without one.
+fn authority<'a>(leases: Option<&'a Leases>, app: &str, object: &str) -> Option<(&'a str, u64)> {
+    let Some(leases) = leases else { return Some(("", 0)) };
+    leases.epoch(&format!("{app}/{object}")).map(|epoch| (leases.node(), epoch))
 }
 
 /// Ships what the object whose versions are in `dir` hasn't yet, in order,
 /// moving its head to each, then removes the shipped ones here but the
 /// last. Only under this node's live lease on the object (`authority`), once
 /// it has claimed the head with it; and only versions that follow the head,
-/// so a node never ships history the head has moved past.
-pub(crate) async fn ship_object(store: &dyn Store, leases: Option<&Leases>, app: &str, object: &str, dir: &Path) -> io::Result<()> {
-    let marker = marker(dir);
-    let shipped: u64 = std::fs::read_to_string(&marker).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+/// so a node never ships history the head has moved past. `known` is the
+/// head as this node last moved it, if it still may be (a move from it
+/// fails if it has moved since): no need to read it again. Whether it
+/// shipped what it had: not when this node holds no live lease on the
+/// object, which isn't a failure (its versions wait until it does).
+pub(crate) async fn ship_object(
+    store: &dyn Store,
+    leases: Option<&Leases>,
+    app: &str,
+    object: &str,
+    dir: &Path,
+    known: &mut Option<(Head, Tag)>,
+) -> io::Result<bool> {
+    let (marker, shipped) = (marker(dir), shipped(dir));
     let (versions, _) = published(dir)?;
     let unshipped: Vec<_> = versions.iter().copied().filter(|&n| n > shipped).collect();
     if !unshipped.is_empty() {
-        let (node, lease) = authority(leases, app, object)?;
-        let (mut head, mut tag) = head(store, app, object).await?;
+        let Some((node, lease)) = authority(leases, app, object) else { return Ok(false) };
+        let (mut head, mut tag) = match known.take().filter(|(head, _)| (head.node.as_str(), head.lease) == (node, lease)) {
+            Some((head, tag)) => (head, Some(tag)),
+            None => head(store, app, object).await?,
+        };
         if (head.node.as_str(), head.lease) != (node, lease) {
             return Err(io::Error::other(format!("{app}/{object}'s head is claimed by {:?} at epoch {}", head.node, head.lease)));
         }
+        let at = |n: u64| dir.join(format!("{n:020}.tar"));
         for n in unshipped {
-            let bytes = tokio::fs::read(dir.join(format!("{n:020}.tar"))).await?;
-            let digest = hex(&bytes);
-            // Unless the head names it already (it was shipped, not marked).
-            if (n, &digest) != (head.sequence, &head.digest) {
-                let version = crate::committed::identity(&bytes[..])?;
+            let astray = || io::Error::other(format!("{app}/{object} version {n} doesn't follow its head, {}", head.sequence));
+            if n > head.sequence {
+                let bytes = tokio::fs::read(at(n)).await?;
+                let (digest, version) = (hex(&bytes), crate::committed::identity(&bytes[..])?);
                 if n != head.sequence + 1 || version.parent != head.digest || version.epoch > lease {
-                    return Err(io::Error::other(format!("{app}/{object} version {n} doesn't follow its head, {}", head.sequence)));
+                    return Err(astray());
                 }
                 if let Put::Conflict = store.put(&version_key(app, object, n, &digest), bytes).await? {
                     return Err(io::Error::other(format!("{app}/{object} version {n} isn't what its key names")));
@@ -329,9 +349,15 @@ pub(crate) async fn ship_object(store: &dyn Store, leases: Option<&Leases>, app:
                 let swapped = store.swap(&head_key(app, object), serde_json::to_vec(&next)?, tag.as_ref()).await?;
                 tag = Some(swapped.ok_or_else(|| io::Error::other(format!("{app}/{object}'s head moved")))?);
                 head = next;
+            // One the head has reached was shipped, not marked (a crash, or a
+            // power loss taking the marker back): it is the head's history if
+            // this copy has the head's version (versions here are a chain).
+            } else if crate::committed::digest(&at(head.sequence))? != head.digest {
+                return Err(astray());
             }
             mark(&marker, n)?;
         }
+        *known = tag.map(|tag| (head, tag));
     }
     for &n in versions.iter().rev().skip(1) {
         match std::fs::remove_file(dir.join(format!("{n:020}.tar"))) {
@@ -339,41 +365,72 @@ pub(crate) async fn ship_object(store: &dyn Store, leases: Option<&Leases>, app:
             _ => {}
         }
     }
-    Ok(())
+    Ok(true)
+}
+
+/// How many objects the shipper ships at once, each its versions in order:
+/// a version costs a put and a move of its head, a store's round trip each,
+/// while many objects commit at once. Each holds one version in memory.
+const SHIPPING: usize = 32;
+
+/// What the shipper knows of an object.
+#[derive(Default)]
+struct Shipping {
+    /// Its directory's time when all of it was last shipped.
+    seen: Option<std::time::SystemTime>,
+    /// Its head as this node last moved it (see `ship_object`).
+    head: Option<(Head, Tag)>,
+    /// When to try it again, after a failure.
+    retry: Option<std::time::Instant>,
 }
 
 /// Ships, until the runtime stops, the versions published under `objects`
-/// (`<data_dir>/objects`): every app's, every object's, retrying failures
-/// a second later. An object this node holds no live lease on waits, quietly,
-/// until it does.
+/// (`<data_dir>/objects`): every app's, every object's, `SHIPPING` objects
+/// at once, each in order. A failure is the object's own: logged, and tried
+/// again a second later. An object this node holds no live lease on waits,
+/// quietly, until it does.
 pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Leases>>) {
-    let mut seen = std::collections::HashMap::new();
+    // None while being shipped: it comes back on `done`.
+    let mut known: std::collections::HashMap<PathBuf, Option<Shipping>> = Default::default();
+    let (back, mut done) = tokio::sync::mpsc::unbounded_channel();
+    let slots = Arc::new(tokio::sync::Semaphore::new(SHIPPING));
     loop {
+        while let Ok((dir, state)) = done.try_recv() {
+            known.insert(dir, Some(state));
+        }
         let dirs = std::fs::read_dir(&objects).into_iter().flatten().flatten().flat_map(|app| {
             let committed = app.path().join("~committed");
             let objects = std::fs::read_dir(committed).into_iter().flatten().flatten();
             objects.filter(|o| o.file_type().is_ok_and(|t| t.is_dir())).map(move |o| (app.file_name(), o))
         });
-        let mut failed = false;
         for (app, object) in dirs.collect::<Vec<_>>() {
+            let entry = known.entry(object.path()).or_insert_with(|| Some(Shipping::default()));
+            let Some(state) = entry else { continue };
             // Skip an object nothing was published for since its last round:
             // its directory's time is the same, and older than the clock's tick.
             let changed = object.metadata().and_then(|m| m.modified()).ok();
             let old = changed.is_some_and(|t| t.elapsed().is_ok_and(|e| e > Duration::from_millis(100)));
-            if old && seen.get(&object.path()) == Some(&changed) {
+            if (old && state.seen == changed) || state.retry.is_some_and(|t| t > std::time::Instant::now()) {
                 continue;
             }
-            let (app, id) = (app.to_string_lossy(), object.file_name().to_string_lossy().into_owned());
-            match ship_object(&*store, leases.as_deref(), &app, &id, &object.path()).await {
-                Ok(()) => _ = seen.insert(object.path(), changed),
-                Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
-                Err(e) => {
-                    eprintln!("nanovm: shipping {app}/{id}: {e}");
-                    failed = true;
+            let mut state = entry.take().expect("not being shipped");
+            let (app, id, dir) = (app.to_string_lossy().into_owned(), object.file_name().to_string_lossy().into_owned(), object.path());
+            let (store, leases, slots, back) = (store.clone(), leases.clone(), slots.clone(), back.clone());
+            tokio::spawn(async move {
+                let _slot = slots.acquire().await;
+                state.retry = None;
+                match ship_object(&*store, leases.as_deref(), &app, &id, &dir, &mut state.head).await {
+                    Ok(true) => state.seen = changed,
+                    Ok(false) => {}
+                    Err(e) => {
+                        eprintln!("nanovm: shipping {app}/{id}: {e}");
+                        state.retry = Some(std::time::Instant::now() + Duration::from_secs(1));
+                    }
                 }
-            }
+                let _ = back.send((dir, state));
+            });
         }
-        tokio::time::sleep(Duration::from_millis(if failed { 1000 } else { 20 })).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -604,14 +661,14 @@ mod tests {
         for n in 1..=3 {
             parent = commit(n, &parent, &format!("v{n}"));
         }
-        ship_object(&*store, Some(&a), "app", "o", &dir).await.unwrap();
+        ship_object(&*store, Some(&a), "app", "o", &dir, &mut None).await.unwrap();
         let four = commit(4, &parent, "v4");
         // The shipper lists version 4, reads the head (at 3) and waits to
         // put it.
         store.put.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         let shipper = tokio::spawn({
             let (store, a, dir) = (store.clone(), a.clone(), dir.clone());
-            async move { ship_object(&*store, Some(&a), "app", "o", &dir).await }
+            async move { ship_object(&*store, Some(&a), "app", "o", &dir, &mut None).await }
         });
         store.put.started.notified().await;
         commit(5, &four, "v5");
@@ -726,7 +783,9 @@ mod tests {
         }
         let bytes = tar.into_inner().unwrap();
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join(format!("{n:020}.tar")), &bytes).unwrap();
+        // Whole, as a commit publishes it: a shipper may be listing.
+        std::fs::write(dir.join("new"), &bytes).unwrap();
+        std::fs::rename(dir.join("new"), dir.join(format!("{n:020}.tar"))).unwrap();
         hex(&bytes)
     }
 
@@ -784,7 +843,7 @@ mod tests {
         for n in 1..=3 {
             parent = version(&dir, n, 0, &parent, &format!("v{n}"));
         }
-        ship_object(&store, None, "app", "o", &dir).await.unwrap();
+        ship_object(&store, None, "app", "o", &dir, &mut None).await.unwrap();
         let shipped = Head { sequence: 3, digest: parent.clone(), node: "".into(), lease: 0 };
         assert_eq!(head(&store, "app", "o").await.unwrap().0, shipped);
         assert_eq!((local(), std::fs::read_to_string(marker(&dir)).unwrap()), (vec![3], "3".into()));
@@ -794,7 +853,7 @@ mod tests {
         let theirs = Head { sequence: 4, digest: "0".repeat(64), ..shipped };
         store.swap("app/o/head", serde_json::to_vec(&theirs).unwrap(), tag.as_ref()).await.unwrap().unwrap();
         version(&dir, 4, 0, &parent, "v4");
-        assert!(ship_object(&store, None, "app", "o", &dir).await.is_err());
+        assert!(ship_object(&store, None, "app", "o", &dir, &mut None).await.is_err());
         assert_eq!((local(), std::fs::read_to_string(marker(&dir)).unwrap()), (vec![3, 4], "3".into()));
         assert_eq!(head(&store, "app", "o").await.unwrap().0, theirs);
         std::fs::remove_dir_all(base).unwrap();
@@ -847,7 +906,8 @@ mod tests {
         let (a_dir, b_dir) = (a_objects.join("~committed/o"), b_objects.join("~committed/o"));
         let ga = take(&store, &a, "o", &a_objects).await;
         version(&a_dir, 1, ga.epoch, "", "A's");
-        let (shipped, gb) = tokio::join!(ship_object(&store, Some(&a), "app", "o", &a_dir), async {
+        let mut known = None;
+        let (shipped, gb) = tokio::join!(ship_object(&store, Some(&a), "app", "o", &a_dir, &mut known), async {
             store.started.notified().await;
             let gb = take(&store, &b, "o", &b_objects).await;
             store.gate.add_permits(1);
@@ -857,7 +917,7 @@ mod tests {
         assert!(!marker(&a_dir).exists(), "A marked its version shipped");
         // B serves the object, and its history is the object's.
         let digest = version(&b_dir, 1, gb.epoch, "", "B's");
-        ship_object(&store, Some(&b), "app", "o", &b_dir).await.unwrap();
+        ship_object(&store, Some(&b), "app", "o", &b_dir, &mut None).await.unwrap();
         let ours = Head { sequence: 1, digest, node: "b".into(), lease: gb.epoch };
         assert_eq!(head(&store, "app", "o").await.unwrap().0, ours);
         assert_eq!(restored(&store, "o", &base.join("fresh")).await.unwrap(), "B's");
@@ -886,14 +946,14 @@ mod tests {
         // A ships version 1, commits 2, and lets the object go.
         let first = take(&store, &a, "o", &a_objects).await;
         let one = commit(1, first.epoch, "", "one");
-        ship_object(&store, Some(&a), "app", "o", &dir).await.unwrap();
+        ship_object(&store, Some(&a), "app", "o", &dir, &mut None).await.unwrap();
         let two = commit(2, first.epoch, &one, "two");
         a.release("app/o", &first).await;
         // Taken again with no other node between: its copy stays, and
         // version 2 ships under the new lease.
         let again = take(&store, &a, "o", &a_objects).await;
         assert_eq!(text(&a_objects).as_deref(), Some("two"));
-        ship_object(&store, Some(&a), "app", "o", &dir).await.unwrap();
+        ship_object(&store, Some(&a), "app", "o", &dir, &mut None).await.unwrap();
         assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 2);
         // A commits 3, but B takes the object before A ships it: B restores 2.
         commit(3, again.epoch, &two, "three");
@@ -903,7 +963,7 @@ mod tests {
         // A takes it back: its version 3 never was the object's, and goes.
         take(&store, &a, "o", &a_objects).await;
         assert_eq!((text(&a_objects).as_deref(), published(&dir).unwrap().0), (Some("two"), vec![2]));
-        ship_object(&store, Some(&a), "app", "o", &dir).await.unwrap();
+        ship_object(&store, Some(&a), "app", "o", &dir, &mut None).await.unwrap();
         assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 2);
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -998,6 +1058,8 @@ mod tests {
     struct Latent {
         store: Objects,
         delay: Duration,
+        /// Records read so far.
+        reads: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -1011,6 +1073,7 @@ mod tests {
             self.store.get(key).await
         }
         async fn read(&self, key: &str) -> io::Result<Option<(Vec<u8>, Tag)>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             self.store.read(key).await
         }
@@ -1034,7 +1097,7 @@ mod tests {
         for dir in &dirs {
             version(dir, 1, 0, "", "v");
         }
-        let store = Arc::new(Latent { store: Objects(Arc::new(object_store::memory::InMemory::new())), delay: Duration::from_millis(25) });
+        let store = Arc::new(Latent { store: Objects(Arc::new(object_store::memory::InMemory::new())), delay: Duration::from_millis(25), reads: Default::default() });
         let shipper = tokio::spawn(run(objects, store, None));
         // Each commit's wait, as `Journal::commit` makes it, all at once.
         let waits: Vec<_> = dirs.iter().cloned().map(|dir| tokio::task::spawn_blocking(move || stored(&dir, 1))).collect();
@@ -1044,6 +1107,158 @@ mod tests {
         }
         shipper.abort();
         assert_eq!(late, 0, "{late} of {OBJECTS} commits at once were not acknowledged within the 2 s wait");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A failure shipping one object (here the store refuses its puts with
+    /// PermissionDenied, as a directory store does on EACCES) is that
+    /// object's: logged and tried again a second later, never taken for
+    /// "this node holds no live lease" (waited out quietly, tried again at
+    /// once); and the other objects ship meanwhile.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failure_shipping_one_object_is_its_own_and_not_taken_for_no_lease() {
+        struct Denying(Objects, std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl Store for Denying {
+            async fn put(&self, key: &str, bytes: Vec<u8>) -> io::Result<Put> {
+                if key.starts_with("app/bad/") {
+                    self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    return Err(ErrorKind::PermissionDenied.into());
+                }
+                self.0.put(key, bytes).await
+            }
+            async fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+                self.0.get(key).await
+            }
+            async fn read(&self, key: &str) -> io::Result<Option<(Vec<u8>, Tag)>> {
+                self.0.read(key).await
+            }
+            async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>> {
+                self.0.swap(key, bytes, tag).await
+            }
+        }
+        let base = tempdir("denied");
+        let objects = base.join("objects");
+        let dir = |o: &str| objects.join("app/~committed").join(o);
+        version(&dir("bad"), 1, 0, "", "v");
+        let store = Arc::new(Denying(Objects(Arc::new(object_store::memory::InMemory::new())), Default::default()));
+        let shipper = tokio::spawn(run(objects.clone(), store.clone(), None));
+        let tries = || store.1.load(std::sync::atomic::Ordering::SeqCst);
+        let t0 = std::time::Instant::now();
+        while tries() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Another object commits meanwhile, and ships.
+        version(&dir("good"), 1, 0, "", "v");
+        let good = dir("good");
+        tokio::task::spawn_blocking(move || stored(&good, 1)).await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(500).saturating_sub(t0.elapsed())).await;
+        assert_eq!(tries(), 1, "tried again at once, as an object with no lease");
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(tries() >= 2, "never tried again");
+        shipper.abort();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A marker that a power loss took back (the head names version 3, the
+    /// marker 1, and versions 2 and 3 are still here, their removal lost
+    /// too) is caught up: versions up to the head's are in its history (a
+    /// claim made this copy the head's), so the shipper marks them and goes
+    /// on, rather than stopping at a version that "doesn't follow its head"
+    /// for good (and, acknowledging remotely, serving the object nothing).
+    #[tokio::test]
+    async fn the_shipper_catches_up_a_marker_left_behind() {
+        let base = tempdir("behind");
+        let (store, dir) = (Objects(Arc::new(object_store::memory::InMemory::new())), base.join("objects/app/~committed/o"));
+        let mut parents = vec![String::new()];
+        for n in 1..=3 {
+            parents.push(version(&dir, n, 0, &parents[n as usize - 1], &format!("v{n}")));
+        }
+        ship_object(&store, None, "app", "o", &dir, &mut None).await.unwrap();
+        for n in 2..=3 {
+            version(&dir, n, 0, &parents[n as usize - 1], &format!("v{n}"));
+        }
+        mark(&marker(&dir), 1).unwrap();
+        version(&dir, 4, 0, &parents[3], "v4");
+        ship_object(&store, None, "app", "o", &dir, &mut None).await.unwrap();
+        assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 4);
+        assert_eq!((published(&dir).unwrap().0, std::fs::read_to_string(marker(&dir)).unwrap()), (vec![4], "4".into()));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// Acknowledged commits per second, and the shipper's CPU per
+    /// acknowledgement, with a store answering each call in 25 ms: each of
+    /// `n` objects commits a version and waits (`stored`, as a commit with
+    /// `remote_ack` does) for it to count, then commits the next, for 10 s.
+    /// `cargo test --lib measure_remote_acks -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn measure_remote_acks() {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        // CPU time of this process's threads named `shipper`, in µs.
+        let cpu = || -> u64 {
+            let ticks: u64 = std::fs::read_dir("/proc/self/task").unwrap().flatten().filter_map(|t| {
+                let stat = std::fs::read_to_string(t.path().join("stat")).ok()?;
+                let (name, rest) = stat.split_once(" (")?.1.rsplit_once(") ")?;
+                let fields: Vec<&str> = rest.split(' ').collect();
+                (name == "shipper").then(|| fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap())
+            }).sum();
+            ticks * 1_000_000 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64
+        };
+        for n in [1, 40, 200] {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).thread_name("shipper").enable_all().build().unwrap();
+            let base = tempdir(&format!("measure-{n}"));
+            let store = Arc::new(Latent { store: Objects(Arc::new(object_store::memory::InMemory::new())), delay: Duration::from_millis(25), reads: Default::default() });
+            rt.spawn(run(base.join("objects"), store, None));
+            let (acked, late, cpu0, t0) = (AtomicU64::new(0), AtomicU64::new(0), cpu(), std::time::Instant::now());
+            std::thread::scope(|s| {
+                for i in 0..n {
+                    let (dir, acked, late) = (base.join(format!("objects/app/~committed/o{i}")), &acked, &late);
+                    s.spawn(move || {
+                        let (mut parent, mut seq) = (String::new(), 0);
+                        while t0.elapsed() < Duration::from_secs(10) {
+                            seq += 1;
+                            parent = version(&dir, seq, 0, &parent, "v");
+                            match stored(&dir, seq) {
+                                Ok(()) => acked.fetch_add(1, Relaxed),
+                                Err(_) => late.fetch_add(1, Relaxed),
+                            };
+                        }
+                    });
+                }
+            });
+            let (secs, used) = (t0.elapsed().as_secs_f64(), cpu() - cpu0);
+            let (acked, late) = (acked.load(Relaxed), late.load(Relaxed));
+            println!("objects {n}: {:.1} acknowledged commits/s, {late} not acknowledged within 2 s, shipper CPU {} µs per acknowledgement",
+                acked as f64 / secs, used / acked.max(1));
+            drop(rt);
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    /// The shipper reads an object's head once, then moves it on from what
+    /// it last wrote: a version costs a put and a move of the head, two round
+    /// trips, not three. A head moved meanwhile (here written again, as a
+    /// claim would) fails the move from the stale one, and is read again.
+    #[tokio::test]
+    async fn the_shipper_reads_a_head_once_then_moves_it_from_what_it_wrote() {
+        let base = tempdir("known");
+        let store = Latent { store: Objects(Arc::new(object_store::memory::InMemory::new())), delay: Duration::ZERO, reads: Default::default() };
+        let dir = base.join("objects/app/~committed/o");
+        let reads = || store.reads.load(std::sync::atomic::Ordering::SeqCst);
+        let (mut known, mut parent) = (None, String::new());
+        for n in 1..=5 {
+            parent = version(&dir, n, 0, &parent, "v");
+            assert!(ship_object(&store, None, "app", "o", &dir, &mut known).await.unwrap());
+        }
+        assert_eq!(reads(), 1, "the head was read for every version");
+        let (now, tag) = head(&store, "app", "o").await.unwrap();
+        store.swap(&head_key("app", "o"), serde_json::to_vec(&now).unwrap(), tag.as_ref()).await.unwrap().unwrap();
+        version(&dir, 6, 0, &parent, "v");
+        assert!(ship_object(&store, None, "app", "o", &dir, &mut known).await.is_err(), "moved from a stale head");
+        assert!(ship_object(&store, None, "app", "o", &dir, &mut known).await.unwrap());
+        assert_eq!(reads(), 3, "the head wasn't read again");
+        assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 6);
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -1083,7 +1298,7 @@ mod tests {
         };
         // "zero" counts in the store.
         commit(false, "zero").unwrap();
-        ship_object(&store, Some(&a), "app", "o", &a_objects.join("~committed/o")).await.unwrap();
+        ship_object(&store, Some(&a), "app", "o", &a_objects.join("~committed/o"), &mut None).await.unwrap();
         // "one!" is committed, but the store is slow: answered 500.
         assert!(commit(true, "one!").is_err());
         // A's next instance recovers the journal and serves the object.
@@ -1115,7 +1330,7 @@ mod tests {
         let mut refused = async |object: &str, epoch: u64| {
             let dir = objects.join("~committed").join(object);
             version(&dir, 1, epoch, "", "late");
-            if ship_object(&store, Some(&a), "app", object, &dir).await.is_ok() || head(&store, "app", object).await.unwrap().0.sequence > 0 {
+            if ship_object(&store, Some(&a), "app", object, &dir, &mut None).await.is_ok_and(|shipped| shipped) || head(&store, "app", object).await.unwrap().0.sequence > 0 {
                 shipped.push(object.to_owned());
             }
         };
