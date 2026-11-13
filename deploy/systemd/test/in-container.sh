@@ -8,7 +8,7 @@ fail=0
 check() { if eval "$2"; then echo "PASS $1"; else echo "FAIL $1"; fail=1; fi; }
 systemctl stop nanovm nanovm-proxy devreg 2>/dev/null
 systemctl reset-failed 2>/dev/null
-rm -rf /var/lib/nanovm /var/lib/private/nanovm /etc/nanovm /etc/systemd/system/nanovm.service.d
+rm -rf /var/lib/nanovm /var/lib/private/nanovm /etc/nanovm /etc/systemd/system/nanovm.service.d /srv/nanovm-store
 install -m644 $D/nanovm.service $D/nanovm-proxy.service /etc/systemd/system/
 install -d /etc/nanovm && install -m644 $D/nanovm.toml $D/proxy.toml /etc/nanovm/
 install -m644 $D/90-nanovm.conf /etc/sysctl.d/
@@ -22,6 +22,12 @@ if [ -n "${CGROUP:-}" ]; then
 fi
 # Local capture publishes versions with link(2): the unit's filter must allow it.
 [ -n "${CAPTURE:-}" ] && printf '\n[capture]\nmax_mb = 64\nmax_versions = 100\n' >>/etc/nanovm/nanovm.toml
+# Capture shipped to a directory store, through the store drop-in.
+if [ -n "${STORE:-}" ]; then
+  install -d /etc/systemd/system/nanovm.service.d /srv/nanovm-store
+  cp $D/nanovm-store.conf /etc/systemd/system/nanovm.service.d/store.conf
+  printf '\n[capture]\nstore = "/srv/nanovm-store"\n' >>/etc/nanovm/nanovm.toml
+fi
 systemctl daemon-reload
 rm -f /run/devreg.out
 systemd-run -q --unit=devreg -p StandardOutput=file:/run/devreg.out /usr/local/bin/dev-registry
@@ -38,6 +44,12 @@ check "counter at 3" 'curl -s -H @/run/counter.h http://127.0.0.1:8080/alice/ | 
 if [ -n "${CAPTURE:-}" ]; then
   echo "captured versions of alice: $(find /var/lib/nanovm/objects/*/~committed/alice -type f | wc -l)"
   check "three captured versions" '[ "$(find /var/lib/nanovm/objects/*/~committed/alice -type f -name "*.tar" | wc -l)" = 3 ]'
+fi
+if [ -n "${STORE:-}" ]; then
+  for _ in $(seq 50); do grep -qs '"sequence":3' /srv/nanovm-store/*/alice/head && break; sleep 0.2; done
+  echo "store: $(cd /srv/nanovm-store && find . -path '*alice*' -type f | sort | tr '\n' ' ')"
+  check "three versions shipped, the head names the third" '[ "$(find /srv/nanovm-store/*/alice -name "*.tar" | wc -l)" = 3 ] && grep -q "\"sequence\":3" /srv/nanovm-store/*/alice/head'
+  check "shipped versions removed here but the last" '[ "$(find /var/lib/nanovm/objects/*/~committed/alice -name "*.tar" | wc -l)" = 1 ]'
 fi
 W=$(pgrep -f "nanovm worker" | head -1)
 echo "worker pid $W uid $(ps -o uid= -p $W) caps $(grep CapEff /proc/$W/status)"

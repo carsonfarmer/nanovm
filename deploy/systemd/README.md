@@ -10,6 +10,7 @@ Linux host, with a sysctl drop-in and an optional cgroup v2 drop-in.
 | [nanovm.toml](nanovm.toml), [proxy.toml](proxy.toml) | `/etc/nanovm/` |
 | [90-nanovm.conf](90-nanovm.conf) | `/etc/sysctl.d/90-nanovm.conf` |
 | [nanovm-cgroup.conf](nanovm-cgroup.conf) (optional) | `/etc/systemd/system/nanovm.service.d/cgroup.conf` |
+| [nanovm-store.conf](nanovm-store.conf) (with a capture `store`) | `/etc/systemd/system/nanovm.service.d/store.conf` |
 
 ```sh
 cargo build --release --locked -p nanovm --bin nanovm
@@ -36,6 +37,16 @@ set keeps four capabilities, each shown necessary in a container test by removin
 | `CAP_SETUID` | the worker's `setresuid` before its jail | `entering the jail: setresuid(200000) failed` |
 | `CAP_SETGID` | the worker's `setgroups`/`setresgid` | `entering the jail: setgroups failed` |
 | `CAP_KILL` | SIGKILL of a worker at its drain deadline (other uid) | `kill(2)` across uids fails; workers still exit when the supervisor hangs up, but a stuck one outlives its drain |
+
+With a capture `store`, the [store drop-in](nanovm-store.conf) adds a fifth,
+`CAP_DAC_OVERRIDE`: the supervisor records what it shipped in
+`objects/<app>/~shipped/` and removes shipped versions from
+`objects/<app>/~committed/`, directories the app's uid owns. Without it the
+supervisor ships each object's first version and then nothing, silently
+(B-604). It adds little: `CAP_SETUID` already lets the supervisor act as any
+app uid. The drop-in also makes `/srv/nanovm-store` writable for a directory
+store and reads an object store's `AWS_*` credentials from
+`/etc/nanovm/store.env`.
 
 Deliberately **not** set on the node, each for a reason seen in testing:
 
@@ -74,14 +85,17 @@ fails that worker's start with `writing "…" to …/memory.max: Permission deni
 ## How these were tested
 
 `test/nspawn.sh` boots this host's own Ubuntu 24.04 (systemd 255) in
-`systemd-nspawn` and runs `test/in-container.sh` there three times: plain, with
-the cgroup drop-in on a cgroup v2 hierarchy, and with local capture on (its
-version publication uses `link`, which `@system-service` allows): install,
+`systemd-nspawn` and runs `test/in-container.sh` there four times: plain, with
+the cgroup drop-in on a cgroup v2 hierarchy, with local capture on (its
+version publication uses `link`, which `@system-service` allows), and with
+capture shipped to a directory store through the store drop-in: install,
 start, drive the counter and hostile apps from a loopback registry in dev mode,
-check worker uid, seccomp and `no_new_privs`, restart (data and uids survive),
-start the proxy, stop both, and check nothing is left. All three pass (52
-checks, on a dev build of `3dafe33`). `systemd-analyze verify` passes on all
-three files.
+check worker uid, seccomp and `no_new_privs`, the workers (one per app and the
+spare the supervisor keeps ready), restart (data and uids survive), start the
+proxy, stop both, and check nothing is left. On round 3 (`beta/deployable`, a
+dev build) all four pass, 70 checks; the store mode fails without
+`CAP_DAC_OVERRIDE` (one version shipped of three). `systemd-analyze verify`
+passes on both units with the cgroup and CPU drop-ins.
 
 Not tested here: controllers actually enforced under the drop-in (this host
 gives memory, cpu and pids to cgroup v1, so the v2 hierarchy had none to hand

@@ -532,6 +532,14 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** check-host checks the unit's `LimitAS` (or the shell's `ulimit -v`) against the same formula, and describes capture as round 3 keeps it. A unit test pins the formula; mutating `GUARD` or dropping the check fails it.
 - **Status:** fixed on `beta/deployable`
 
+### B-604: with a capture store, a node under the hardened unit ships one version per object, then nothing, silently
+- **Where:** `deploy/systemd/nanovm.service` (`CapabilityBoundingSet`); `ship.rs` (`run`, `authority`, `mark`)
+- **Scenario:** found by `beta/deployable` testing the units with `[capture] store` set. The supervisor ships a version, moves the head, then records it in `objects/<app>/~shipped/<object>` and removes shipped versions from `objects/<app>/~committed/<object>/`: directories the app's uid owns. The unit keeps only `CAP_CHOWN CAP_SETUID CAP_SETGID CAP_KILL`, so as root without `CAP_DAC_OVERRIDE` both fail with EACCES. `ship::run` takes every `PermissionDenied` as "this node holds no lease on the object" and waits quietly, so it logs nothing, never marks version 1, and retries the same step forever: later versions pile up here until `max_versions`, then writes are refused; with `remote_ack` every write fails after 2 s.
+- **Reproduced:** yes, `deploy/systemd/test/nspawn.sh`, store mode: one version of three in the store, three left here, nothing in the node's journal. Outside the unit (root with every capability) the same config ships all three.
+- **Fix (deploy):** `deploy/systemd/nanovm-store.conf`, a drop-in for any store, adds `CAP_DAC_OVERRIDE` (and the directory store's `ReadWritePaths`, an object store's `EnvironmentFile`). After: 3 of 3 shipped, 1 left here, 70/70 checks in four modes.
+- **Open (runtime, for whoever owns `ship.rs`; not changed here because `beta/recovery` works there):** `authority` signals "no lease" with `ErrorKind::PermissionDenied`, the same kind a filesystem EACCES has, so `run` swallows real I/O failures. Suggested: `authority` returns `Ok(None)` for no lease (or a dedicated error type), and `run` logs and retries every other error.
+- **Status:** fixed on `beta/deployable` for the units; the silent swallowing is open
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
