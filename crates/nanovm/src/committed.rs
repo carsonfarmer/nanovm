@@ -313,9 +313,9 @@ pub(super) fn settle(
     sync(out)
 }
 
-/// The lease epoch the version in `path` was committed under.
-pub fn epoch(path: &Path) -> io::Result<u64> {
-    Ok(read_version(&mut tar::Archive::new(File::open(path)?).entries()?)?.epoch)
+/// What the version `archive` reads says of itself.
+pub fn identity(archive: impl Read) -> io::Result<Version> {
+    read_version(&mut tar::Archive::new(archive).entries()?)
 }
 
 fn read_version<R: Read>(entries: &mut tar::Entries<R>) -> io::Result<Version> {

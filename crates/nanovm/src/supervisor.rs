@@ -84,6 +84,8 @@ pub struct Supervisor {
     /// To the proxy's private endpoint: publishes, and calls to objects.
     proxy: reqwest::Client,
     leases: Option<Arc<crate::lease::Leases>>,
+    /// Where objects' committed versions are shipped (`capture.store`).
+    capture: Option<Arc<dyn crate::ship::Store>>,
     /// A worker spawned ahead of need: see [`Spawned`].
     spare: tokio::sync::Mutex<Option<Spawned>>,
     relay: Arc<crate::telemetry::Relay>,
@@ -170,6 +172,7 @@ impl Supervisor {
             relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
+            capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
@@ -178,7 +181,7 @@ impl Supervisor {
         sup.clone().refill();
         // Renews the node's session, and tells each worker it holds.
         // Jailed workers can't reach a store: their versions ship from here.
-        if let Some(store) = sup.cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten() {
+        if let Some(store) = sup.capture.clone() {
             tokio::spawn(crate::ship::run(sup.cfg.data_dir.join("objects"), store, sup.leases.clone()));
         }
         if let Some(leases) = sup.leases.clone() {
@@ -475,7 +478,7 @@ impl Supervisor {
 
         let policy = Arc::new(policy);
         let (http, proxy, app, host) = (self.proxy.clone(), self.cfg.proxy.clone(), w.name.clone(), w.host.clone());
-        let leases = self.leases.clone();
+        let (leases, capture) = (self.leases.clone(), self.capture.clone());
         let (telemetry, digest) = (self.relay.clone(), want.digest.clone());
         let telemetry_slots = Arc::new(tokio::sync::Semaphore::new(3));
         egress.set_nonblocking(true)?;
@@ -483,13 +486,19 @@ impl Supervisor {
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, link_caps, move |req| {
             let (policy, http, proxy, app, host) = (policy.clone(), http.clone(), proxy.clone(), app.clone(), host.clone());
             let (telemetry, digest, slots, leases) = (telemetry.clone(), digest.clone(), telemetry_slots.clone(), leases.clone());
+            let capture = capture.clone();
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
                     return serve_forwarded(req, &policy).await;
                 }
                 if let Some(leases) = &leases {
                     if req.uri().path().starts_with(crate::lease::PATH) {
-                        return crate::lease::serve(leases, &app, req).await.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync());
+                        // Before its worker serves an object, the object's head is this lease's.
+                        let claim = async |object: &str, grant: &crate::lease::Grant| match &capture {
+                            Some(store) => crate::ship::claim(&**store, leases.node(), grant.epoch, &app, object).await,
+                            None => Ok(()),
+                        };
+                        return crate::lease::serve(leases, &app, req, claim).await.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync());
                     }
                     if req.uri().path().starts_with(crate::egress::CALLS) {
                         return call(&http, &proxy, &app, &host, req).await;

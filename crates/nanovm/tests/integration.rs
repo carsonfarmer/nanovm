@@ -127,10 +127,14 @@ fn captured_files(objects: &Path, id: &str, sequence: u64) -> std::collections::
 /// and its history goes on in the store from there.
 #[tokio::test(flavor = "multi_thread")]
 async fn shipped_versions_restore_an_object_on_a_fresh_root() {
-    use nanovm::ship::{Dir, Store};
+    use nanovm::ship::Dir;
     let store = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ship-store");
     let _ = std::fs::remove_dir_all(&store);
-    let shipped = |n: u64| store.join(format!("counter/o/{n:020}.tar")).exists();
+    // Shipped: the object's head names the version, or a later one.
+    let shipped = |n: u64| {
+        let head = std::fs::read(store.join("counter/o/head")).ok();
+        head.and_then(|h| serde_json::from_slice::<nanovm::ship::Head>(&h).ok()).is_some_and(|h| h.sequence >= n)
+    };
     let shipping = |name| {
         let mut cfg = node_cfg(name, 8);
         cfg.capture = Some(nanovm::config::CaptureConfig {
@@ -166,8 +170,8 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
             std::fs::remove_dir_all(&fresh.data_dir).unwrap();
         }
     }
-    let theirs = Dir(store.clone()).get("counter/o/00000000000000000005.tar").await.unwrap().unwrap();
-    assert!(!theirs.is_empty());
+    let (head, _) = nanovm::ship::head(&Dir(store.clone()), "counter", "o").await.unwrap();
+    assert_eq!((head.sequence, head.node.as_str(), head.lease), (5, "", 0));
 }
 
 /// With remote acknowledgement, a commit whose version can't be stored is

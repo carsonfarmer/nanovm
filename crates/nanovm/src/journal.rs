@@ -2254,20 +2254,26 @@ mod tests {
     async fn a_node_that_lost_the_lease_cannot_ship() {
         use crate::lease::{Leases, Session, mono_ns};
         use crate::ship::{Objects, Store};
-        let ttl = std::time::Duration::from_millis(100);
         let leases: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
         let store = Objects(Arc::new(object_store::memory::InMemory::new()));
         let cap = CaptureConfig::default();
-        // A node: its lease on the object, and its object's view of it.
-        let take = async |name: &str| {
+        // A node (its leases lasting `ttl`) takes the object for its copy
+        // under `objects` as its supervisor does, restoring what the store
+        // has; and its object's view of the lease.
+        let take = async |name: &str, ttl: std::time::Duration, objects: &Path| {
             let node = Leases::new(leases.clone(), name, ttl);
             let (grant, (id, until)) = loop {
                 let session = node.renew().await;
                 match node.acquire("app/o").await {
                     Ok(grant) => break (grant, session),
-                    Err(_) => tokio::time::sleep(ttl / 4).await,
+                    Err(_) => tokio::time::sleep(ttl / 8).await,
                 }
             };
+            if crate::ship::head(&store, "app", "o").await.unwrap().0.sequence > 0 {
+                crate::ship::restore(&store, "app", "o", objects).await.unwrap();
+            }
+            crate::ship::claim(&store, name, grant.epoch, "app", "o").await.unwrap();
+            node.hold("app/o", grant.clone());
             let session = Arc::new(Session::default());
             session.set(id, until.max(mono_ns() + 60_000_000_000));
             let mut obj = ObjShared::new("app".into(), "o");
@@ -2278,35 +2284,33 @@ mod tests {
             let dir = v.parent().unwrap().join("~committed/o");
             crate::ship::ship_object(&store, Some(node), "app", "o", &dir).await
         };
-        let (a, a_obj) = take("a").await;
         let va = volume();
+        let (a, a_obj) = take("a", std::time::Duration::from_secs(1), va.parent().unwrap()).await;
         let mut j = Journal::open(&va, 1 << 30, a_obj.clone(), Some(&cap)).unwrap();
         write(&mut j, &va, "a", 0, b"first");
         j.commit().unwrap();
+        a.renew().await;
         ship(&a, &va).await.unwrap();
         // Committed under A's lease, but not shipped before B takes it.
         write(&mut j, &va, "a", 0, b"late!");
         j.commit().unwrap();
         drop(j);
-        let (b, b_obj) = take("b").await;
-        assert!(ship(&a, &va).await.unwrap_err().to_string().contains("lease moved"));
         let root = |name: &str| std::env::temp_dir().join(format!("nanovm-w90-{name}-{}", std::process::id()));
         let vb = root("b").join("o");
         let _ = std::fs::remove_dir_all(vb.parent().unwrap());
         std::fs::create_dir_all(vb.parent().unwrap()).unwrap();
-        assert_eq!(crate::ship::restore(&store, "app", "o", vb.parent().unwrap()).await.unwrap(), 1);
+        let (b, b_obj) = take("b", std::time::Duration::from_secs(10), vb.parent().unwrap()).await;
+        assert_eq!(ship(&a, &va).await.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
         let vb = vb.canonicalize().unwrap();
         let mut j = Journal::open(&vb, 1 << 30, b_obj, Some(&cap)).unwrap();
         write(&mut j, &vb, "a", 0, b"B's");
         j.commit().unwrap();
         ship(&b, &vb).await.unwrap();
         assert!(ship(&a, &va).await.is_err(), "still refused");
-        let version: serde_json::Value = serde_json::from_reader(
-            tar::Archive::new(&store.get("app/o/00000000000000000002.tar").await.unwrap().unwrap()[..])
-                .entries().unwrap().next().unwrap().unwrap(),
-        )
-        .unwrap();
-        assert_eq!(version["epoch"], 2, "the store's second version is B's");
+        let (head, _) = crate::ship::head(&store, "app", "o").await.unwrap();
+        assert_eq!((head.sequence, head.node.as_str()), (2, "b"));
+        let version = store.get(&format!("app/o/{:020}-{}.tar", 2, head.digest)).await.unwrap().unwrap();
+        assert_eq!(crate::committed::identity(&version[..]).unwrap().epoch, 2, "the store's second version is B's");
         let third = root("c");
         let _ = std::fs::remove_dir_all(&third);
         std::fs::create_dir_all(&third).unwrap();
