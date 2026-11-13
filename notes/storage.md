@@ -61,6 +61,33 @@ parallel commit syncs are faster and fail if any path fails.
 Upgrade note: a log left uncommitted by a binary before this format is refused
 (InvalidData); drain cleanly before upgrading.
 
+### Upgrading from main's capture (format 1, S2)
+
+Main staged each version as `~journal/<object>/capture` (the whole volume), deleted
+the undo log (the decision), then hard-linked the capture to
+`~committed/<object>/<seq>.tar` and removed it. The first open under this format:
+
+- **Main's log still there** (its commit undecided): refused, InvalidData, with the
+  log and the staged capture kept. Drain main (or let it recover) before upgrading.
+- **A staged capture without main's log**: main decided that commit. It is published
+  as main's `finish` would have (sync the journal directory, check the identity,
+  sequence and parent, hard link, sync, remove) before anything in the journal
+  directory is cleared. Before, recovery cleared it as a leftover: the volume kept
+  a commit no version held, and the next version's parent skipped it.
+- **Main's published history** is migrated by reading it, not rewriting it: a
+  format-1 version is a whole volume with no epoch, so it reads as a snapshot at
+  epoch 0 (a single node's epoch; main had no leases). The next version is format 3,
+  a change to main's last (its parent that file's digest) unless its sequence falls
+  on a snapshot; `restore` starts from the last snapshot of either format. Main's
+  files and digests stay valid, and a shipper ships them with the rest; with leases,
+  epoch 0 matches no lease record, so they ship only while the record names this
+  node. Before, the first format-3 change made the history unrestorable (`restore`
+  refused main's versions: "missing field `epoch`").
+
+`review_upgrade_preserves_decided_legacy_capture` builds main's layout byte for byte
+(its `prepare`'s tar, its `finish`'s link) and checks both; a second test checks the
+refusal keeps main's log and capture.
+
 ## Numbers
 
 Device I/O per request, bench `--writes --quick`, private loop devices (only the

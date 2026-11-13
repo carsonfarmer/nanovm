@@ -8,6 +8,12 @@
 //! staged is `<sequence>.<decision>.staged` beside them, where `<decision>`
 //! names the journal key its commit replaces: recovery discards it while
 //! that is still the journal's key, and publishes it once it isn't.
+//!
+//! Main's format (1) is read too: whole volumes, without an epoch, so a
+//! node upgraded from it keeps its history. Each is a snapshot, and the
+//! changes this format adds apply to the last. Main staged a version as
+//! `~journal/<object>/capture`, decided once main deleted the undo log:
+//! [`adopt`] publishes one left there.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -60,6 +66,17 @@ struct Manifest {
     listed: BTreeMap<String, BTreeSet<(String, bool)>>,
     whole: BTreeSet<String>,
     patched: BTreeMap<String, (u64, Vec<(u64, u64)>)>,
+}
+
+/// How main's format (1) names its version.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Legacy {
+    format: u32,
+    app: String,
+    object: String,
+    sequence: u64,
+    parent: String,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -261,6 +278,39 @@ pub(super) fn publish(out: &Path, key: &[u8; 8]) -> io::Result<u64> {
     Ok(next)
 }
 
+/// Publishes the version main's format left staged in the journal at
+/// `journal`, if any, as main would have: its log is gone (or is this
+/// format's, made after), which decided its commit.
+pub(super) fn adopt(journal: &Path, out: &Path, obj: &ObjShared) -> io::Result<()> {
+    let staged = journal.join("capture");
+    let file = match File::open(&staged) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        file => file?,
+    };
+    // The log's deletion may not be durable yet: make it so first.
+    sync(journal)?;
+    let version = read_version(&mut tar::Archive::new(file).entries()?)?;
+    if version.format != 1 || version.app != *obj.app || version.object != *obj.id {
+        return Err(invalid("wrong capture identity"));
+    }
+    let (last, ..) = head(out)?;
+    let target = out.join(filename(version.sequence));
+    if version.sequence == last {
+        if digest(&staged)? != digest(&target)? {
+            return Err(invalid("conflicting committed version"));
+        }
+    } else {
+        let parent = if last == 0 { String::new() } else { digest(&out.join(filename(last)))? };
+        if last + 1 != version.sequence || version.parent != parent {
+            return Err(invalid("out-of-order committed version"));
+        }
+        fs::hard_link(&staged, &target)?;
+    }
+    sync(out)?;
+    fs::remove_file(&staged)?;
+    sync(journal)
+}
+
 /// Settles what commits left staged when their instance stopped, given the
 /// journal's key `key`: a version staged under it never decided and is
 /// discarded. When the journal has records to roll back (`undecided`), the
@@ -325,8 +375,14 @@ fn read_version<R: Read>(entries: &mut tar::Entries<R>) -> io::Result<Version> {
     }
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes)?;
-    let version: Version = serde_json::from_slice(&bytes)?;
-    if version.format != FORMAT || version.sequence == 0 {
+    let version = match serde_json::from_slice::<serde_json::Value>(&bytes)?["format"].as_u64() {
+        Some(1) => {
+            let Legacy { format, app, object, sequence, parent } = serde_json::from_slice(&bytes)?;
+            Version { format, app, object, sequence, epoch: 0, parent, snapshot: true }
+        }
+        _ => serde_json::from_slice::<Version>(&bytes)?,
+    };
+    if ![1, FORMAT].contains(&version.format) || version.sequence == 0 {
         return Err(invalid("wrong capture identity"));
     }
     Ok(version)

@@ -617,13 +617,19 @@ impl Journal {
 /// operations may be skipped.
 fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[u8; 8]>> {
     let log = match std::fs::read(dir.join(LOG)) {
-        Ok(log) => log,
-        Err(e) if e.kind() == ErrorKind::NotFound => return clear(dir).map(|()| None),
+        Ok(log) => Some(log),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
-    let Some(key) = log.strip_prefix(MAGIC).and_then(|k| k.get(..8)?.try_into().ok()) else {
+    // A log in another format, as main's left undecided, is refused, with
+    // what main staged under it. Without one, what main staged is decided:
+    // it is published before anything here is cleared (S2).
+    let key = log.as_ref().map(|log| log.strip_prefix(MAGIC).and_then(|k| k.get(..8)?.try_into().ok()));
+    if key == Some(None) {
         return Err(std::io::Error::new(ErrorKind::InvalidData, "not a journal log"));
-    };
+    }
+    committed::adopt(dir, &committed::directory(base, dir), obj)?;
+    let (Some(log), Some(Some(key))) = (log, key) else { return clear(dir).map(|()| None) };
     let file = File::options().write(true).open(dir.join(LOG))?;
     let undos = decode(&log, &key);
     // What commits staged settles first; a key seen here may not be durable yet.
@@ -1172,6 +1178,97 @@ mod tests {
             assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
             assert_eq!(std::fs::read(base.join("victim")).unwrap(), b"kept");
         }
+    }
+
+    /// What main's format (1) left for a commit of `v` as version
+    /// `sequence`: the whole volume, staged in the journal as `capture`, the
+    /// tar its `committed::prepare` wrote, byte for byte; then, if
+    /// `finished`, published as its `committed::finish` did. Main deleted
+    /// the undo log before either: that decided the commit.
+    fn legacy(v: &Path, sequence: u64, finished: bool) -> PathBuf {
+        let base = v.parent().unwrap();
+        let (journal, out) = (base.join("~journal/o"), base.join("~committed/o"));
+        std::fs::create_dir_all(&journal).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let parent = match sequence {
+            1 => String::new(),
+            n => committed::digest(&out.join(format!("{:020}.tar", n - 1))).unwrap(),
+        };
+        let id = format!(r#"{{"format":1,"app":"app","object":"o","sequence":{sequence},"parent":"{parent}"}}"#);
+        let staged = journal.join("capture");
+        let mut archive = tar::Builder::new(File::options().write(true).create_new(true).open(&staged).unwrap());
+        archive.follow_symlinks(false);
+        archive.sparse(false);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(id.len() as u64);
+        header.set_mode(0o600);
+        archive.append_data(&mut header, "nanovm.json", id.as_bytes()).unwrap();
+        archive.append_dir("data", v).unwrap();
+        let mut pending = vec![v.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                archive.append_path_with_name(&path, Path::new("data").join(path.strip_prefix(v).unwrap())).unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        archive.into_inner().unwrap();
+        if finished {
+            std::fs::hard_link(&staged, out.join(format!("{sequence:020}.tar"))).unwrap();
+            std::fs::remove_file(&staged).unwrap();
+        }
+        staged
+    }
+
+    /// A node upgraded from main keeps what main committed: a version
+    /// staged under a commit main decided but hadn't published is published
+    /// as main would have, not cleared with the journal's leftovers, which
+    /// lost the only copy of a commit the volume holds (S2). Main's history
+    /// goes on in this format: its whole volumes are snapshots, so the last
+    /// is what the changes after it apply to.
+    #[test]
+    fn review_upgrade_preserves_decided_legacy_capture() {
+        let cap = CaptureConfig { snapshot_every: 4, ..Default::default() };
+        let v = volume();
+        let out = v.parent().unwrap().join("~committed/o");
+        legacy(&v, 1, true);
+        std::fs::write(v.join("a"), "main's second commit").unwrap();
+        std::fs::write(v.join("n"), "new in it").unwrap();
+        let staged = std::fs::read(legacy(&v, 2, false)).unwrap();
+        let mut j = captured(&v, &cap).unwrap();
+        let second = out.join(format!("{:020}.tar", 2));
+        assert_eq!(std::fs::read(&second).expect("main's decided version is published"), staged);
+        assert!(!v.parent().unwrap().join("~journal/o/capture").exists());
+        assert_eq!(committed::epoch(&second).unwrap(), 0, "main had no leases");
+        assert_eq!(archive_tree(&v, 2), tree(&v));
+        // Changes to main's last version, then a snapshot (5), then changes.
+        for n in 3..=7 {
+            write(&mut j, &v, "a", 0, format!("v{n}").as_bytes());
+            j.creating(&v.join(format!("n{n}"))).unwrap();
+            std::fs::write(v.join(format!("n{n}")), "new").unwrap();
+            j.commit().unwrap();
+            assert_eq!(archive_tree(&v, n), tree(&v), "version {n}");
+        }
+    }
+
+    /// What main left undecided (its undo log is there) can't be rolled
+    /// back in this format: the volume is refused, and the log and what
+    /// main staged are kept for main to settle.
+    #[test]
+    fn an_older_binarys_undecided_commit_is_refused_and_kept() {
+        let v = volume();
+        let journal = v.parent().unwrap().join("~journal/o");
+        legacy(&v, 1, false);
+        // A record as main wrote one: "remove o/n", unsigned.
+        let log: Vec<u8> = [&[2u8][..], b"o/n"].iter().flat_map(|f| [&(f.len() as u64).to_le_bytes()[..], f].concat()).collect();
+        std::fs::write(journal.join(LOG), &log).unwrap();
+        let e = captured(&v, &CaptureConfig::default()).err().expect("refused");
+        assert_eq!(e.kind(), ErrorKind::InvalidData, "{e}");
+        assert_eq!(std::fs::read(journal.join(LOG)).unwrap(), log);
+        assert!(journal.join("capture").exists());
     }
 
     /// A small change to a big file is captured as the bytes that changed.
