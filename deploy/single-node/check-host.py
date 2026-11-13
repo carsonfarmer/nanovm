@@ -150,7 +150,7 @@ def check(cfg_path, nofile=None, address_space=None):
             warnings.append("online discard lowered concurrent durable writes in 5 of 6 measured rounds (experiments/fs-matrix); prefer fstrim.timer")
 
     capture = raw.get("capture")
-    history = data.is_dir() and any((data / "objects").glob("*/~committed/*"))
+    history = data.is_dir() and any((data / "objects").glob("*/*/*/committed/*"))
     if capture is not None:
         mb = {"max_mb": 256, "max_versions": 16, "snapshot_every": 16, **capture}
         shipped = f"shipped to {mb['store']} and then removed here but the last" if mb.get("store") else "kept here (no store)"
@@ -158,7 +158,7 @@ def check(cfg_path, nofile=None, address_space=None):
                      f"and {mb['max_versions']} versions here (the whole volume every {mb['snapshot_every']}, "
                      f"changes otherwise), {shipped}; a full one refuses writes")
     elif history:
-        problems.append("objects have capture history (~committed) but [capture] is off: they will refuse to start")
+        problems.append("objects have capture history (objects/<app>/<shard>/<object>/committed) but [capture] is off: they will refuse to start")
 
     if cfg.get("cgroup"):
         g = Path(cfg["cgroup"])

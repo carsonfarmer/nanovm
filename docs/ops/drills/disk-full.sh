@@ -29,7 +29,7 @@ r -XPOST -H @$W/counter.h $U/a/incr
 r -H @$W/hostile.h "$U/h/commit?v=during"
 r -XPOST -H @$W/counter.h $U/newobj/incr
 r -H @$W/counter.h $U/a/
-echo "journal files (each object keeps its log): $(find $W/data/objects -path '*~journal*' -type f | sed "s|$W/data/||" | head -5 | tr '\n' ' ')"
+echo "journal files (each object keeps its log): $(find $W/data/objects -path '*/journal/*' -type f | sed "s|$W/data/||" | head -5 | tr '\n' ' ')"
 grep -v 'OTLP\|opentelemetry\|Batch' $W/n.log | tail -5
 rm $W/data/filler
 echo "== freed"
@@ -37,5 +37,5 @@ r -H @$W/counter.h $U/a/
 r -XPOST -H @$W/counter.h $U/a/incr
 r -H @$W/hostile.h "$U/h/commit"
 r -XPOST -H @$W/counter.h $U/newobj/incr
-echo "journal files: $(find $W/data/objects -path '*~journal*' -type f | wc -l)"
+echo "journal files: $(find $W/data/objects -path '*/journal/*' -type f | wc -l)"
 ls -la $W/data/objects/*/ | head -20

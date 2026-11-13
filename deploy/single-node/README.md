@@ -111,7 +111,8 @@ to the node's:
 - `[worker]` with `cgroup`: memory, CPUs and pids for each app's whole worker.
   Install with `install.sh --cgroup` (the [cgroup drop-in](../systemd/nanovm-cgroup.conf));
   without `cgroup` these aren't applied, and check-host warns.
-- Node-wide: `max_apps`, `max_live_objects`, `max_component_mb` (64),
+- Node-wide: `max_apps`, `max_live_objects`, `max_objects_per_app` (10,000;
+  step 7), `max_component_mb` (64),
   `load_timeout_ms` (60 s for a registry fetch).
 - The proxy (`/etc/nanovm/proxy.toml`): `max_sockets` (10,000),
   `max_sockets_per_app` (1,000), `max_sockets_per_object` (256),
@@ -220,15 +221,35 @@ Its secrets come from you instead ([README, Secrets](../../README.md#secrets)):
 
 ## 7. Objects, the store and backups
 
-Each object has its own `/data` volume under
-`/var/lib/nanovm/objects/<app>/<object>`, created by its first request. Never
-edit or delete anything under `objects/*/~journal/`, `~committed/` or
-`~shipped/` ([runbooks](../../docs/ops/runbooks.md), the three facts).
+Each object is a directory, `/var/lib/nanovm/objects/<app>/<shard>/<object>/`:
+its volume (`data`), its undo journal and, with capture, its history
+(`committed`, `shipped`). Never edit or delete anything in it by hand
+([runbooks](../../docs/ops/runbooks.md), the three facts). README, ["Data
+lifecycle"](../../README.md#data-lifecycle), has the details.
 
-> **Placeholder (`beta/objects`):** the cap on how many objects an app may
-> create, how idle ones are cleaned up, and deleting an object or an app's
-> objects with `nanovm admin` (the node's root-only control socket). Filled in
-> when `beta/objects` is integrated.
+- **An object has storage only once it has written something**, and loses it
+  when it is empty again: a scanner's requests to made-up objects leave
+  nothing. Nothing deletes an object that holds data, however old or idle.
+- **At most `max_objects_per_app`** per app (node config, 10,000 by default):
+  past it, a request to a new object gets `507 object-limit` before any guest
+  code runs; existing objects are served. 256 shards keep each directory well
+  under the 65,000 subdirectories some filesystems allow; keep the cap under
+  that on a filesystem without `dir_nlink`.
+- **A full disk makes no new objects:** `507 disk-full` while the filesystem
+  has less free than a new object's quota.
+- **Deleting, as root on the node** ([README, Operator
+  commands](../../README.md#operator-commands)):
+  ```sh
+  nanovm admin --config /etc/nanovm/nanovm.toml apps                    # names and versions
+  nanovm admin --config /etc/nanovm/nanovm.toml delete <app> <object>
+  nanovm admin --config /etc/nanovm/nanovm.toml delete-app <app>
+  ```
+  `<app>` is the app's directory name under `objects/`. A delete drains the
+  app's worker as a version switch does, removes what the node shipped of it
+  from the `store`, then the node's copy; the app serves again with its next
+  request, the object from nothing. The socket is `data_dir/admin/socket`,
+  root's alone; no HTTP route reaches it. A delete is not a backup and
+  doesn't touch backups. Refused with `leases` (several nodes).
 
 **Capture store (continuous).** With `[capture]` and a `store`, the supervisor
 ships each object's committed versions off the VM as they happen (README,

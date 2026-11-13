@@ -42,14 +42,14 @@ check "ready 204" '[ "$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:
 for _ in 1 2 3; do curl -s -XPOST -H @/run/counter.h http://127.0.0.1:8080/alice/incr; echo; done
 check "counter at 3" 'curl -s -H @/run/counter.h http://127.0.0.1:8080/alice/ | grep -q "\"count\":3"'
 if [ -n "${CAPTURE:-}" ]; then
-  echo "captured versions of alice: $(find /var/lib/nanovm/objects/*/~committed/alice -type f | wc -l)"
-  check "three captured versions" '[ "$(find /var/lib/nanovm/objects/*/~committed/alice -type f -name "*.tar" | wc -l)" = 3 ]'
+  echo "captured versions of alice: $(find /var/lib/nanovm/objects/*/*/alice/committed -type f | wc -l)"
+  check "three captured versions" '[ "$(find /var/lib/nanovm/objects/*/*/alice/committed -type f -name "*.tar" | wc -l)" = 3 ]'
 fi
 if [ -n "${STORE:-}" ]; then
   for _ in $(seq 50); do grep -qs '"sequence":3' /srv/nanovm-store/*/alice/head && break; sleep 0.2; done
   echo "store: $(cd /srv/nanovm-store && find . -path '*alice*' -type f | sort | tr '\n' ' ')"
   check "three versions shipped, the head names the third" '[ "$(find /srv/nanovm-store/*/alice -name "*.tar" | wc -l)" = 3 ] && grep -q "\"sequence\":3" /srv/nanovm-store/*/alice/head'
-  check "shipped versions removed here but the last" '[ "$(find /var/lib/nanovm/objects/*/~committed/alice -name "*.tar" | wc -l)" = 1 ]'
+  check "shipped versions removed here but the last" '[ "$(find /var/lib/nanovm/objects/*/*/alice/committed -name "*.tar" | wc -l)" = 1 ]'
 fi
 W=$(pgrep -f "nanovm worker" | head -1)
 echo "worker pid $W uid $(ps -o uid= -p $W) caps $(grep CapEff /proc/$W/status)"

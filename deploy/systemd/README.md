@@ -39,9 +39,9 @@ set keeps four capabilities, each shown necessary in a container test by removin
 | `CAP_KILL` | SIGKILL of a worker at its drain deadline (other uid) | `kill(2)` across uids fails; workers still exit when the supervisor hangs up, but a stuck one outlives its drain |
 
 With a capture `store`, the [store drop-in](nanovm-store.conf) adds a fifth,
-`CAP_DAC_OVERRIDE`: the supervisor records what it shipped in
-`objects/<app>/~shipped/` and removes shipped versions from
-`objects/<app>/~committed/`, directories the app's uid owns. Without it the
+`CAP_DAC_OVERRIDE`: the supervisor records what it shipped in each object's
+directory (`objects/<app>/<shard>/<object>/shipped`) and removes shipped
+versions from its `committed/`, directories the app's uid owns. Without it the
 supervisor ships each object's first version and then nothing, silently
 (B-604). It adds little: `CAP_SETUID` already lets the supervisor act as any
 app uid. The drop-in also makes `/srv/nanovm-store` writable for a directory

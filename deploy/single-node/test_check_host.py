@@ -69,7 +69,7 @@ class CheckHost(unittest.TestCase):
         self.assertEqual([p for p in problems if "cgroup" in p], [f"{g}/cgroup.subtree_control lacks memory, needed by [worker] limits"])
 
     def test_capture_history_needs_capture(self):
-        hist = self.root / "data/objects/app/~committed/o"
+        hist = self.root / "data/objects/app/3c/o/committed"
         hist.mkdir(parents=True)
         (hist / "00000000000000000001.tar").write_bytes(b"")
         _, _, problems = self.run_check('data_dir = "data"\n')

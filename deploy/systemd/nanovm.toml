@@ -11,6 +11,8 @@ data_dir = "/var/lib/nanovm"
 # + 4096 mappings per worker.
 max_live_objects = 1000
 max_apps = 100
+# Objects with storage per app; past it a new object gets 507 object-limit.
+max_objects_per_app = 10000
 # The proxy's private endpoint (committed WebSocket publishes go to its
 # /publish) and the Collector's OTLP/HTTP base URL.
 proxy = "http://127.0.0.1:8444"

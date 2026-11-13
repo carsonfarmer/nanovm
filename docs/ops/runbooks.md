@@ -14,14 +14,17 @@ Three facts every runbook leans on:
 - **Stopping is not graceful.** SIGTERM ends the supervisor; workers die with it
   and in-flight requests roll back, their clients unsure whether they committed.
   Close ingress at the TLS terminator first.
-- **Never delete anything under `objects/*/~journal/`, `~committed/` or
-  `~shipped/`.** A log in `~journal` is a request's undo record: the object
-  recovers it on its next start, and deleting it can leave half a request's
-  writes in place. `~committed` is capture's version history (`[capture]`, off
-  by default): with a `store`, nanovm removes what it has shipped itself (all
-  but the last version) and records it in `~shipped`. Don't prune either, and
-  don't remove `[capture]` from a node that has history (its objects then
-  refuse to start: `committed history requires capture to remain enabled`).
+- **Never edit or delete anything in an object's directory by hand.** Each
+  object is `objects/<app>/<shard>/<object>/` (README, "Data lifecycle"):
+  `data` is its volume, `journal` a request's undo record (the object recovers
+  it on its next start; deleting it can leave half a request's writes in
+  place), and with capture (`[capture]`, off by default) `committed` is its
+  version history and `shipped` what has reached the `store` (nanovm removes
+  shipped versions itself, all but the last). Delete an object or an app with
+  `nanovm admin delete` / `delete-app` on the running node, which also
+  removes what it shipped. Don't remove `[capture]` from a node that has
+  history (its objects then refuse to start: `committed history requires
+  capture to remain enabled`).
 - **Uids are data.** An app's uid is the owner of its `objects/<app>` directory.
   Keep `jail_uid_base`, run as root, and preserve numeric owners.
 
@@ -112,15 +115,15 @@ uids 200000/200001 preserved, and the next write gives 4. Run `restic check
 ## Disk full
 
 What happens ([drills/disk-full.sh](drills/disk-full.sh), `data_dir` on a full
-32 MiB tmpfs, on round 3): a write that needs new space fails in the guest,
-which answers as it chooses (the counter's own `507`, its count unchanged); a
-request whose object has no journal yet (its first write) answers
-`500 commit-failed` (`journal requires recovery`) and rolls back; what a request
-wrote without needing space commits (each object keeps its journal's log, so
-an overwrite in place still did, while its KV write in the same request
-failed). Reads keep working and return the last committed state. Once space is
-freed, writes resume with no step on your part: the counter went 3, (two
-refused increments), 4, and the new object started at 1.
+32 MiB tmpfs, on `beta/integration` with objects merged): a write that needs
+new space fails in the guest, which answers as it chooses (the counter's own
+`507`, its count unchanged); a request to an object that has no storage yet
+gets `507 disk-full` before any guest code runs, and makes nothing; what a
+request wrote without needing space commits (each object keeps its journal's
+log, so an overwrite in place still did, while its KV write in the same
+request failed). Reads keep working and return the last committed state. Once
+space is freed, writes resume with no step on your part: the counter went 3,
+(two refused increments), 4, and the new object started at 1.
 
 1. Confirm: `df -h /var/lib/nanovm`; `du -xh --max-depth=2 /var/lib/nanovm | sort -h | tail`.
 2. Free space outside nanovm first (`journalctl --vacuum-size=…`, old backups,
@@ -128,7 +131,9 @@ refused increments), 4, and the new object started at 1.
 3. If that isn't enough: with the node stopped, `cache/` (compiled code) and
    `registry/` (downloaded apps) are caches: delete their contents and the node
    recompiles and refetches (and re-verifies) on demand. `tmp/` is per-instance
-   scratch. Never touch `objects/*/~journal/` or `objects/*/~committed/`.
+   scratch. Never touch an object's `journal` or `committed`; to drop an
+   object or an app's data, use `nanovm admin delete` / `delete-app` (the
+   three facts, above).
 4. Start; writes recover object by object. Read back an object that failed.
 5. Size for it: an object's quota counts logical bytes, and while a request runs
    its journal and replaced files can hold as much again (up to 3 × `disk_mb`
