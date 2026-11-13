@@ -147,5 +147,5 @@ All with a dev build of this branch (`cargo build -p nanovm --features dev
 3. **Nightly bench-history workflow.** It publishes nothing (a 90-day workflow
    artifact, `contents: read`) and was left enabled. Recommended: keep it.
 4. **`CAP_DAC_OVERRIDE` with a capture store** (B-604). Recommended: keep it in
-   the store drop-in only; separately, fix `ship::run` so a filesystem EACCES is
-   logged rather than taken for "no lease".
+   the store drop-in only. The `ship::run` side (a filesystem EACCES taken for
+   "no lease") is being fixed on `cf/round3` by the lease fix agent.
