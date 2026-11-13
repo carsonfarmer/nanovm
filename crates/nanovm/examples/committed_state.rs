@@ -207,6 +207,7 @@ fn journal(root: &Path) -> Result<Journal> {
         MAX_BYTES as u64,
         Arc::new(ObjShared::new("app".into(), "o")),
         None,
+        None,
     )?)
 }
 

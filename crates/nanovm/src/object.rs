@@ -317,7 +317,7 @@ impl Scratch {
         Ok(Arc::new(Scratch { dir, free: Mutex::new(free) }))
     }
 
-    fn take(self: &Arc<Self>) -> std::io::Result<TmpDir> {
+    pub(crate) fn take(self: &Arc<Self>) -> std::io::Result<TmpDir> {
         let path = match self.free.lock().pop() {
             Some(path) => path,
             None => {
@@ -331,11 +331,15 @@ impl Scratch {
 }
 
 /// An instance's scratch directory: back to its [`Scratch`] when the
-/// instance goes away if the instance left it empty, else removed.
-struct TmpDir(PathBuf, Arc<Scratch>);
+/// instance goes away if the instance left it empty, else removed; nothing,
+/// once its path is taken (moved elsewhere).
+pub(crate) struct TmpDir(pub(crate) PathBuf, Arc<Scratch>);
 
 impl Drop for TmpDir {
     fn drop(&mut self) {
+        if self.0.as_os_str().is_empty() {
+            return;
+        }
         if empty(&self.0) {
             self.1.free.lock().push(std::mem::take(&mut self.0));
         } else {
@@ -386,16 +390,14 @@ impl WasiHttpView for ObjState {
 
 fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Result<Store<ObjState>> {
     let limits = &app.cfg.limits;
-    // A volume made here, in a directory without symlinks, has none; one
-    // that was already there must not be one either.
-    let data_dir = app.objects.join(&*shared.id);
-    if let Err(e) = std::fs::create_dir(&data_dir) {
-        anyhow::ensure!(
-            e.kind() == std::io::ErrorKind::AlreadyExists && std::fs::symlink_metadata(&data_dir)?.is_dir(),
-            "volume {}: {e}",
-            data_dir.display()
-        );
-    }
+    // First, so a failed request or a crash is undone before it's counted.
+    // A volume made here, or by the journal, in a directory without
+    // symlinks, has none; one that was already there must not be one either.
+    let volume = crate::app::object_dir(&app.objects.dir, &shared.id).join(crate::journal::VOLUME);
+    let capture = node.cfg.capture.as_ref();
+    let journal = crate::journal::Journal::open(&volume, limits.disk_mb << 20, shared.clone(), capture, Some(&app.objects))?;
+    let data_dir = journal.volume().to_path_buf();
+    anyhow::ensure!(std::fs::symlink_metadata(&data_dir)?.is_dir(), "volume {} is not a directory", data_dir.display());
     let tmp = app.scratch.take()?;
 
     let stderr = LogTail::default();
@@ -424,7 +426,7 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
     http.set_field_size_limit(crate::server::MAX_HEAD);
 
     // `/tmp` starts empty, so only the persistent volume holds usage.
-    let quota = QuotaGuard::new(&data_dir, limits, node.metrics.clone(), shared.clone(), node.cfg.capture.as_ref())?;
+    let quota = QuotaGuard::new(journal, limits, node.metrics.clone(), shared.clone())?;
 
     let state = ObjState {
         wasi: b.build(),
@@ -606,7 +608,7 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
             let mut store = new_store(&node, &app, &shared)?;
             // Acknowledging remotely, it serves only what counts in the store
             // (see `ship::caught_up`); recovery may just have settled a commit.
-            let versions = app.objects.join("~committed").join(&*shared.id);
+            let versions = crate::ship::versions(&app.objects.dir, &shared.id);
             if node.cfg.capture.as_ref().is_some_and(|c| c.remote_ack) && !crate::ship::caught_up(&versions).await? {
                 return Ok(None);
             }
@@ -646,10 +648,18 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
                 let _ = job.reply.send(response);
             }
             Err(e) => {
+                // A new object the app has no room for (`Objects::room`).
+                let (status, reason) = match e.downcast_ref::<std::io::Error>().map(std::io::Error::kind) {
+                    Some(std::io::ErrorKind::QuotaExceeded) => (507, "object-limit"),
+                    Some(std::io::ErrorKind::StorageFull) => (507, "disk-full"),
+                    _ => (503, "instantiate-failed"),
+                };
+                if status == 503 {
+                    node.metrics.instantiate_failures.fetch_add(1, Relaxed);
+                }
                 let e = format!("{e:#}");
-                node.metrics.instantiate_failures.fetch_add(1, Relaxed);
-                node.metrics.event("instantiate-failed", &shared.id, &*e, &shared.context.lock());
-                let response = error_response(503, "instantiate-failed", &e);
+                node.metrics.event(reason, &shared.id, &*e, &shared.context.lock());
+                let response = error_response(status, reason, &e);
                 crate::telemetry::response(&mut job.span, &response);
                 let _ = job.reply.send(response);
             }

@@ -2,6 +2,7 @@
 //! objects (one live instance per object id, one request at a time) with
 //! per-object memory, CPU, disk and egress limits.
 
+pub mod admin;
 pub mod app;
 pub mod committed;
 pub mod config;

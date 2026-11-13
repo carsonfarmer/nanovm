@@ -237,7 +237,7 @@ async fn nanovm_run_restarts_when_the_component_changes() {
     run.line("changed; restarting").await;
     let addr = run.addr().await;
     assert_eq!(get(addr, "/x/").await, (200, r#"{"object":"x","hits":1}"#.into()));
-    assert_eq!(std::fs::read_to_string(data.join("objects/app/x/count")).unwrap(), "1");
+    assert_eq!(std::fs::read_to_string(nanovm::app::object_dir(&data.join("objects/app"), "x").join("data/count")).unwrap(), "1");
 }
 
 /// `nanovm run --secrets <file>` gives an app its secrets as a node's

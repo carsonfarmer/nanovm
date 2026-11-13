@@ -71,11 +71,11 @@ fn disk(path: &Path) -> anyhow::Result<Disk> {
 }
 
 fn volume(root: &Path, id: &str) -> PathBuf {
-    root.join("objects/stress").join(id)
+    nanovm::app::object_dir(&root.join("objects/stress"), id).join("data")
 }
 
 async fn request(node: &Arc<Node>, root: &Path, id: &str, path: &str) -> anyhow::Result<load::Reply> {
-    let journal = root.join("objects/stress/~journal").join(id);
+    let journal = nanovm::app::object_dir(&root.join("objects/stress"), id).join("journal");
     let mut peak = Disk::default();
     let mut samples = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(10));

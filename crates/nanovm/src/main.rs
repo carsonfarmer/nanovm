@@ -35,11 +35,15 @@ fn main() -> anyhow::Result<()> {
             eprintln!("{e:#}");
             std::process::exit(1)
         }),
+        [cmd, flag, path, args @ ..] if cmd == "admin" && flag == "--config" => nanovm::admin::client(&NodeConfig::load(&PathBuf::from(path))?, args),
         [cmd, wasm, flags @ ..] if cmd == "run" => run(wasm, flags),
         [cmd, wasm, target, flags @ ..] if cmd == "publish" => publish(wasm, target, flags),
-        _ => bail!("usage: nanovm serve --config <nanovm.toml> | nanovm proxy --config <proxy.toml> | {RUN} | {PUBLISH}"),
+        _ => bail!("usage: nanovm serve --config <nanovm.toml> | nanovm proxy --config <proxy.toml> | {ADMIN} | {RUN} | {PUBLISH}"),
     }
 }
+
+/// Run as root (as the node is) on the node's host; see `admin`.
+const ADMIN: &str = "nanovm admin --config <nanovm.toml> <command> [<argument>…]";
 
 /// Says how to give a node a key-value store when it refused one's import.
 fn compose_hint(e: anyhow::Error) -> anyhow::Error {

@@ -33,8 +33,8 @@ gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 version at both dirty commit gates: the whole volume every `snapshot_every` (16)
 versions, otherwise what the commit changed (listings of changed directories, new
 or moved files whole, files changed in place as their changed byte ranges). Versions
-are staged before the journal's commit decision and published under
-`objects/<app>/~committed/<object>/`; recovery discards a rejected one or completes
+are staged before the journal's commit decision and published in the object's
+directory, under `committed/`; recovery discards a rejected one or completes
 an accepted one before new work. A commit with capture costs 2 more syncs. With
 `store` set (a directory, `file:///path`, or an object store URL as for `leases`,
 e.g. `s3://bucket/prefix`, credentials and region from `AWS_*`), the supervisor (or
@@ -509,8 +509,8 @@ repository support; nanovm supplies the app-lock boundary and restore drill.
    it makes the encrypted backup unrecoverable. No credentials go into git.
 3. Run `python3 scripts/backup.py backup /srv/nanovm --stopped`. Save its full
    snapshot ID and the deployment record. The wrapper locks all app directories
-   before invoking restic and reads **all of `objects/`**, including `~journal`
-   logs and retained files. Never exclude or manually clear journals: tentative
+   before invoking restic and reads **all of `objects/`**, including each object's
+   `journal` log and retained files. Never exclude or manually clear journals: tentative
    data can remain after a crash. Scratch, compilation caches and registry caches
    are deliberately omitted. Only exit-zero backups receive the wrapper's
    completion tag; an incomplete restic snapshot is not an approved recovery point.
@@ -568,6 +568,75 @@ requests instead of assuming short guest sleeps survive cold startup.
 CI runs both privilege variants of the CLI tests and the SQL restore drill;
 orb setup installs restic idempotently. Runtime size remains 5,085 lines, with
 89 additional operator-tool lines counted separately.
+
+## Operator commands
+
+`nanovm admin --config <nanovm.toml> <command> [<argument>…]` runs a command in a
+running node, through the node's one control path: a Unix socket at
+`<data_dir>/admin/socket`, owned by the supervisor. Its directory has mode 0700,
+so only the supervisor's own user (root in production) can connect. Workers run
+as other users, and the jail lets no worker make a socket; no HTTP route, public
+or private, leads to it. A command is one line of JSON (an array of strings)
+and its answer one line, `{"ok": …}` or `{"error": "…"}`, which the CLI prints.
+
+| Command | What it does |
+|---|---|
+| `apps` | The apps this node knows, with the version and pid of each running worker. |
+| `delete <app> <object>` | Deletes one object's data on this node, and what the node shipped of it (see below). |
+| `delete-app <app>` | Deletes all of an app's data on this node (its objects, scratch and compile cache), and what it shipped. |
+
+`<app>` is the app's name on the node: its directory's name under `objects/`, and
+how `apps` lists it once it has run since the node started. A delete first drains and stops the app's worker, as a
+version switch does: requests in flight finish, new ones wait, and nothing of the
+app is live, mid-commit or being shipped. Then what the node shipped to
+`capture.store` goes (every key under `<app>/<object>/`, or `<app>/`: the head and
+all versions), then the node's copy: moved at once into `<data_dir>/deleted`, then
+removed, so a delete cut short leaves the data whole or gone (the rest is removed
+when the node next starts). The worker starts again with the app's next request,
+and a deleted object starts from nothing, with a new history. A delete is not a
+backup: what offline backups hold is untouched. Not with `leases` (several nodes):
+another node may hold the object, so the node refuses.
+
+## Data lifecycle
+
+An object has storage only once it has committed a change, and only while it holds
+something; nothing else creates or deletes an object's data.
+
+- **Where:** `objects/<app>/<shard>/<object>/`, where `<shard>` is the first byte of
+  the object id's SHA-256 in hex: 256 shards, so no directory holds more than a
+  share of an app's objects (65,000 subdirectories is a limit on some filesystems,
+  [N-35](ISSUES.md)). In it: `data` (the volume, the guest's `/data`), `journal`
+  (its undo log and the files a request removed), and with capture `committed`
+  and `shipped`.
+- **Made by the first change.** Until then an instance's `/data` is an empty
+  directory from the app's pool (`objects/<app>/~new`, one per instance live at
+  once, reused, like `/tmp`'s scratch). The first create in it moves it into the
+  object's place. So a scanner's 404s and reads of objects that don't exist leave
+  nothing: the audit's 300 `GET /scanN/wp-login.php` left 301 directories, now 0.
+- **Removed when the instance ends, if empty.** An object whose volume is empty,
+  with no captured history, goes when its instance ends. A new object that never
+  committed (its first request failed, trapped or ran out of time) is rolled back
+  first, so it leaves nothing; any other object's uncommitted work is rolled back
+  when it next starts, as always. And an object deletes its own storage by
+  removing its files: no new API. With capture, an emptied object keeps its history (its last
+  version records the empty volume) and so its directory and its place under the
+  cap; an operator deletes it.
+- **At most `max_objects_per_app` per app** (node config, default 10,000): an app
+  past it gets `507 object-limit` for a request to an object without storage,
+  before any guest code runs; existing objects are served. The count is the
+  objects' directories, kept in memory by the app's worker (counted when it
+  starts), and taken exactly at the first change, so clients making new objects
+  at once can't pass it: one that loses that race gets `insufficient-space` from
+  its create, as from a full disk.
+- **A full disk makes no new objects:** a request to an object without storage
+  gets `507 disk-full` when the filesystem has less free than the object's quota
+  (`disk_mb` and `max_files`), and so does a first create then. Objects that exist
+  are served and keep their quotas; reserving room for them, and refusing the
+  node's own writes near full, is the disk budget's job (the `limits` work).
+- **Never automatic for data:** nothing deletes an object that holds data, however
+  old or idle; that is the app's, or an operator's (`nanovm admin delete`).
+
+## Commits
 
 ## Commits
 
@@ -814,7 +883,8 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 | Path | What it is |
 |---|---|
 | `crates/nanovm/src/engine.rs` | Engine config, pooling allocator, epoch ticker, `.cwasm` cache |
-| `crates/nanovm/src/app.rs` | Component loading and the linker |
+| `crates/nanovm/src/app.rs` | Component loading and the linker; an app's objects: where each is, how many, and whether there is room for another |
+| `crates/nanovm/src/admin.rs` | The operator's control path: the supervisor's admin socket and `nanovm admin` |
 | `crates/nanovm/src/object.rs` | The per-object actor: instance lifecycle, limits, CPU accounting, heavy lanes, poisoning |
 | `crates/nanovm/src/table.rs` | The node: one app, object id → actor, LRU and idle eviction |
 | `crates/nanovm/src/quota.rs` | Per-mount byte and file quotas over WASIp3 filesystem calls |
@@ -841,3 +911,5 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 - **The CPU budget is the CPU time of the thread polling the guest** (user and kernel, so the guest's own file calls count; waiting for a core or the disk doesn't). An overloaded node slows a request down to its wall-clock deadline (504) rather than failing it for CPU ([N-640](ISSUES.md)).
 - **Without root, apps share the supervisor's uid.** Landlock and seccomp still separate them.
 - **A worker's stderr lines are passed on whole up to 4 KiB**; longer ones are split.
+- **Only an empty volume is removed.** A volume holding only empty directories is kept: the KV provider leaves `.kv/<store>/` when its last key goes ([B-203](ISSUES.md)).
+- **The object count is per worker,** from the directories when it starts: an object a lease takeover restores (`ship::claim`) isn't counted until the app's worker next starts.

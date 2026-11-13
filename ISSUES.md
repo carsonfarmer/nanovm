@@ -229,7 +229,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `object.rs`, `new_store`; `demo/demo.sh` creates a fresh set of 5,000 object IDs each run
 - **Scenario:** every persistent object volume is a direct child of the app directory. Repeated demos reached 65,000 directory links on this orb; new objects fail with `instantiate-failed` while existing objects work, despite free disk/inodes and live-store capacity. Eviction does not delete persistent volumes.
 - **Reproduced:** yes: `stat` reports 65,000 links on the counter app directory and a direct `mkdir` fails with `Too many links`. The first affected demo had seven cold-start failures; the next had 65,000 instantiation failures. Existing solo/canary objects still answered. This predates the telemetry response changes.
-- **Status:** open; plan directory sharding/data lifecycle without deleting existing volumes. W-2 validation uses a fresh disposable data root and preserves the exhausted directory.
+- **Status:** fixed on `beta/objects` (B-202): objects are sharded 256 ways and capped per app (`max_objects_per_app`, default 10,000). An existing data directory in the old layout is not read: not supported, see AGENTS.md rule 1; start from a fresh data directory.
 
 ### N-36: jailed-worker telemetry drops spans under sustained HTTP load
 - **Where:** worker SDK export queue and supervisor relay; fixed by W-2, delivered on main in `49d0ae4`.
@@ -592,6 +592,56 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** the script copied the deleted `demo/static` (`set -e` stopped it), and the VM had no CA certificates, so every test failed building its HTTP client. Worker limits are the node's `[worker]`, not an app's `[app.worker]`.
 - **Fix:** the script copies the host's CA bundle and no longer `demo/static`, links `sleep`, and its default set includes the `cgroup` tests. Docs corrected.
 - **Status:** fixed on `fix/r3-worker`
+### B-201: any request to an unknown object made a permanent volume (beta audit)
+- **Where:** `object.rs` (`new_store` made `<objects>/<app>/<id>` before instantiating), `table.rs` (any valid first path segment is an object)
+- **Scenario:** the production audit sent 300 `GET /scanN/wp-login.php`: all 404, and 301 volume directories stayed on disk. Nothing removed a volume, ever. The journal log and the capture directory already appeared only with a change; the volume was the one thing made up front.
+- **Reproduced:** yes: `objects_that_change_nothing_leave_nothing` (300 such GETs and 20 reads of unknown objects) failed with 320 directories under `objects/counter` before the fix.
+- **Fix:** an object has a directory only from its first change: until then an instance's `/data` is an empty directory from the app's pool (`~new`, one per live instance, reused), moved into the object's place by the first create (`Journal::place`). When an instance ends (`Journal`'s `Drop`), an object it made that never committed is rolled back at once (others still roll back when they next start), and an object whose volume is then empty, with no captured history, is removed (`Objects::settle`). After: 0 directories; a new object whose first request fails leaves nothing (`failed_and_emptied_objects_leave_nothing`).
+- **Status:** fixed on `beta/objects`
+
+### B-202: no per-app object cap, and about 65k objects broke an app's new objects (N-35)
+- **Where:** `app.rs` (`Objects`), `config.rs` (`max_objects_per_app`)
+- **Scenario:** nothing bounded how many objects an app kept on a node; every volume, journal and capture directory was a direct child of one directory per app, so 65,000 subdirectories (a limit on some filesystems) failed every new object of the app (N-35).
+- **Fix:** objects live at `<objects>/<app>/<shard>/<id>/` (`data`, `journal`, `committed`, `shipped`), the shard the first byte of the id's SHA-256: 65,000 objects put under 400 in any directory (`objects_are_sharded`). A node config `max_objects_per_app` (default 10,000) caps an app's objects: a request to an object without storage gets `507 object-limit` before any guest code runs, and a first create past it gets `insufficient-space`; the place is taken atomically at the first change, so 40 clients making objects at once against a cap of 5 make exactly 5 (`an_app_has_at_most_its_objects`). The count is per worker, from the shards when it starts. A client that crafts ids for one shard can still fill that shard, and the cap only stops it at the cap: raise the cap past 65,000 on such a filesystem only with that in mind.
+- **Status:** fixed on `beta/objects`
+
+### B-203: the KV provider leaves `.kv/<store>/` when its last key goes, so such an object is never empty
+- **Where:** `components/keyvalue/provider` (`delete`)
+- **Scenario:** an object that deletes all its keys keeps two empty directories, so its volume isn't empty and the object isn't removed (B-201's rule is conservative: only an empty volume goes).
+- **Suggestion:** after a delete, remove the store's directory (and `.kv`) when a listing shows it empty; only then, so a delete costs no extra journal record.
+- **Status:** open
+
+### B-204: a full disk still made new object directories (beta audit)
+- **Where:** `object.rs` (`new_store`), `app.rs` (`Objects::room`)
+- **Scenario:** on an 8 MiB root, about 700 one-counter objects filled the disk; every write then failed with `500 commit-failed`, yet requests went on making object directories (9,003).
+- **Fix:** a request to an object without storage gets `507 disk-full` when the filesystem has less free than the object's quota (`disk_mb`, and `max_files` entries where the filesystem counts them), checked with `statfs` (added to the worker's seccomp list) before anything is made, and again at the first create. Existing objects are served. `a_full_disk_makes_no_new_objects` (root: a 4 MiB tmpfs) fills it with counters until the first `disk-full`, then checks that 200 more requests to new objects are refused and make nothing. Reserving room for existing objects' writes is the disk budget's (`beta/limits`).
+- **Status:** fixed on `beta/objects`
+
+### B-205: no way to delete an object's or an app's data (W-5)
+- **Where:** `supervisor.rs` (`delete`, `remove`), `ship.rs` (`Store::remove`), `admin.rs`
+- **Fix:** an object deletes its own storage by removing its files (B-201; no new WIT). An operator runs `nanovm admin delete <app> <object>` or `delete-app <app>` on a running node: the app's worker drains and stops (as for a version switch), the shipper is held off, what the node shipped goes from `capture.store` (`<app>/<object>/` or `<app>/`), then the node's copy is moved into `<data_dir>/deleted` at once and removed; the app starts again with its next request (`an_operator_deletes_an_object_and_an_app`). Nothing deletes an object that holds data on its own.
+- **Status:** fixed on `beta/objects`; with `leases` (several nodes) deletes are refused (B-206).
+
+### B-206: operator deletes are refused on nodes with leases
+- **Where:** `supervisor.rs` (`delete`)
+- **Scenario:** with several nodes another node may hold the object, serve it and ship its versions; deleting its store keys under it would break its shipping, and deleting this node's copy wouldn't delete the object.
+- **Suggestion:** delete through the object's lease: take it (as a failover does), delete the store's head and versions, release. Needs W-90's head fencing to cover a delete.
+- **Status:** open (owner question)
+
+### B-207: an object a lease takeover restores is not in its app's count until the worker restarts
+- **Where:** `supervisor.rs` (`restored`), `app.rs` (`Objects`)
+- **Scenario:** `ship::claim` restores an object's directory from the supervisor, outside the worker that counts. The count is low by such objects until the worker next starts (it saturates at 0 when they go). Only with leases.
+- **Status:** open (minor)
+
+### B-208: one operator control path into a running node
+- **Where:** `admin.rs`, `supervisor.rs` (`command`), `main.rs` (`nanovm admin`)
+- **Fix:** a Unix socket at `<data_dir>/admin/socket` in a 0700 directory of the supervisor's own user; a line of JSON (an array of strings) in, a line out. Bound and reached through `/proc/self/fd`, so a long `data_dir` fits a socket's 107-byte path. `admin_socket_is_the_supervisors_own`: uid 65534 gets EACCES; no HTTP route reaches it; `jail_blocks_escapes`: a jailed worker can't connect to it. `recovery` adds its restore commands here.
+- **Status:** done on `beta/objects` (1b11455)
+
+### B-209 (tests): `a_node_that_lost_an_objects_lease_cannot_commit_it` once got a 200 with an empty body
+- **Where:** `tests/integration.rs` (`nodes::`), the end of a streamed body whose instance resets
+- **Scenario:** in one full serial run on `beta/objects` (after merging 7b3f9c6), under load average about 26 from other agents, the first request's answer came back `200` with an empty body instead of `finished`. The guest writes `finished` from work after its answer; that work's commit is then refused (the node lost the lease) and the instance resets. Not reproduced in 10 runs since (two full runs and 8 targeted ones, 6 under added CPU load). Suspected: the client reads the body's end while the reset instance's store is being dropped, the race N-710 narrowed.
+- **Status:** open (not reproduced)
 
 ### N-720: concurrent claims overwrote each other's shipped markers
 - **Where:** `ship.rs` (`mark`)
@@ -776,6 +826,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** from source: `wasi:http` forbids a `host` header on an outgoing request, so an app that forwards an incoming request's headers (they include `host`) gets an error. `wasip3`'s `http_into_wasi_request` moves `host` into the URI's authority; the SDK builds its request itself (it sets `content-length` and sends no body for an empty one) and doesn't.
 - **Status:** open (low)
 
+### B-210: after a claim restores an object, the supervisor's chown follows the path the worker can change
+- **Where:** `supervisor.rs` (`restored`, `chown_tree`)
+- **Scenario:** found while moving B-502's descriptor paths onto the per-object layout. `restored` gives what a claim restored to the app's uid by walking `objects/<app>/<shard>/<object>` by path as root: `lchown` doesn't follow the last name, but a shard (or, before, `~committed`) the worker replaced with a symlink is followed. `claim`'s `discard` refuses such a symlink first, but a claim that keeps the copy (`current`) doesn't discard. Same exposure as on `cf/round3`; only with leases.
+- **Suggestion:** chown through `dir_at` (`fchownat` with `AT_SYMLINK_NOFOLLOW` from the object's directory, opened a name at a time), as `mark` and `discard` do.
+- **Status:** open (from source)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
@@ -848,7 +904,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-5: data lifecycle (planning)
 - **What:** a plan for deleting an app's or an object's data, exporting a volume, backups and retention, and how each is authorized (likely through the proxy).
-- **Status:** offline backup/restore done in `fab908c` with validated main follow-through. Restic snapshots retain journals under app admission locks; only complete snapshots are tagged, and restore requires an exact ID and new destination. Real jailed SQL/file/KV crash recovery into a fresh root passes unprivileged and as root, including another write/restart. Six mutations caught; full suite, ten SQL tests, Python CLI tests, demo, benchmark and adversarial review pass. Host runtime unchanged at 5,085; tooling adds 89 lines. README defines offline authorization, ownership/deployment records, retention guidance and old-writer fencing. Deletion API, live snapshots, automated retention and actual off-node deployment remain open; no active file ownership after main integration.
+- **Status:** deletion done on `beta/objects` (B-201, B-205): an object's storage exists only from its first committed change and goes when its volume is empty (no captured history); `nanovm admin delete <app> <object>` and `delete-app <app>` delete on a running node, the store's copy included; refused with leases (B-206). No automatic deletion of data, so no retention policy for volumes is needed; idle-object eviction of data is an owner question. Offline backup/restore done in `fab908c` with validated main follow-through. Restic snapshots retain journals under app admission locks; only complete snapshots are tagged, and restore requires an exact ID and new destination. Real jailed SQL/file/KV crash recovery into a fresh root passes unprivileged and as root, including another write/restart. Six mutations caught; full suite, ten SQL tests, Python CLI tests, demo, benchmark and adversarial review pass. Host runtime unchanged at 5,085; tooling adds 89 lines. README defines offline authorization, ownership/deployment records, retention guidance and old-writer fencing. Live snapshots, exporting a volume, automated backup retention and actual off-node deployment remain open.
 
 ### W-6: JS and Python guests
 - **What:** guests built with componentize-js and componentize-py, running the same endpoints as `counter`, to prove the host for other languages.

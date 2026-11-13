@@ -110,7 +110,7 @@ impl Node {
         anyhow::ensure!(leases.is_some() == !cfg.leases.is_empty(), "leases are taken through a supervisor");
         // Without a supervisor, which ships for its workers, a node ships its own.
         let ship = cfg.capture.as_ref().filter(|_| upstream.is_none()).map(crate::ship::store).transpose()?.flatten();
-        let ship = ship.map(|store| tokio::spawn(crate::ship::run(cfg.data_dir.join("objects"), store, None)).abort_handle());
+        let ship = ship.map(|store| tokio::spawn(crate::ship::run(cfg.data_dir.join("objects"), store, None, Default::default())).abort_handle());
         let app = Arc::new(App::load(&engine, linker, &cfg, app, wasm, upstream)?);
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
