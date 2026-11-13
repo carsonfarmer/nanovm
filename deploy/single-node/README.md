@@ -33,7 +33,7 @@ Sections marked **Placeholder** are filled in as the other beta branches land.
 - A DNS zone for the app hosts.
 - An OCI registry the apps are published to, readable anonymously, and each
   app's signing identity (CI, keyless: README, "Publishing").
-- Off the VM: a restic repository for backups and, for the capture store, an
+- Off the VM: for the capture store, which is the backup (step 7), an
   S3-compatible bucket or a disk of its own.
 
 ## 1. Size it
@@ -249,19 +249,23 @@ lifecycle"](../../README.md#data-lifecycle), has the details.
   from the `store`, then the node's copy; the app serves again with its next
   request, the object from nothing. The socket is `data_dir/admin/socket`,
   root's alone; no HTTP route reaches it. A delete is not a backup and
-  doesn't touch backups. Refused with `leases` (several nodes).
+  removes the object's backup too: what the store held of it can't be restored
+  afterwards, unless the store keeps its own old versions (B-800). Refused
+  with `leases` (several nodes).
 
-**Capture store (continuous).** With `[capture]` and a `store`, the supervisor
-ships each object's committed versions off the VM as they happen (README,
-"Capture and shipping"): the whole volume every `snapshot_every` (16)
-versions, the changes otherwise, and an object's `head` naming the last one
-that counts. Shipped versions are removed here but the last.
+**The backup is the capture store.** With `[capture]` and a `store`, the
+supervisor ships each object's committed versions off the VM as they happen,
+while it serves (README, ["Backup and restore"](../../README.md#backup-and-restore)):
+the whole volume every `snapshot_every` (16) versions, the changes otherwise,
+and an object's `head` naming the last one that counts. Shipped versions are
+removed here but the last. Turn it on before the node takes its first write:
+an object is in the store from its first commit with capture on.
 
 ```toml
 [capture]
 store = "s3://bucket/nanovm"     # or "/srv/nanovm-store", a disk of its own mounted there
-# max_mb = 256 and max_versions = 16 bound what waits here while the store is
-# down; past them writes are refused, never dropped.
+# max_mb = 256 bounds what may wait here per object while the store is down;
+# past it that object's writes are refused, never versions dropped.
 ```
 
 - Install the [store drop-in](../systemd/nanovm-store.conf) for either kind:
@@ -274,18 +278,33 @@ store = "s3://bucket/nanovm"     # or "/srv/nanovm-store", a disk of its own mou
   write answered just before the disk is lost may not have shipped.
   `remote_ack = true` waits (2 s at most) for the store to name it, and fails
   the request otherwise (the commit stands here).
-- The store keeps every version: there is no remote retention yet. Watch its
-  size.
+- **Is it current?** `nanovm admin --config /etc/nanovm/nanovm.toml backlog`
+  says what waits to ship (versions, bytes, objects); the supervisor reports
+  it as `nanovm.capture.waiting.*` and logs when versions start to wait. What a
+  lost VM loses is that backlog: with the store up, the last few tens of
+  milliseconds of writes.
+- **A store outage isn't a write outage:** each object's unshipped versions
+  may take up to `max_mb` here before its writes are refused; when the store
+  is back, everything ships in order. Size the disk for it.
+- The store keeps every version (only a delete removes an object's): there is
+  no remote retention yet. Watch its size. Turn on the bucket's versioning if
+  the store must survive its credentials being misused, or deletes must be
+  undoable for a while.
 
-**Offline backups.** `scripts/backup.py` (restic) backs up the whole data
-directory with the node stopped, so schedule a window:
-[runbooks, Back up and restore](../../docs/ops/runbooks.md#back-up-and-restore).
-Keep the restic repository and its password off the VM, and restore one
-regularly: a backup you haven't restored is a hope.
+**Restoring, on the running node** ([README](../../README.md#backup-and-restore),
+[the recovery runbook](../../notes/recovery-runbook.md)):
 
-> **Placeholder (`beta/recovery`):** live backup, and restoring one app or one
-> object (from the store or a backup) on a running node with `nanovm admin`,
-> with the runbook it adds. Filled in when `beta/recovery` is integrated.
+```sh
+nanovm admin --config /etc/nanovm/nanovm.toml versions <app> <object>     # head, versions, when stored
+nanovm admin --config /etc/nanovm/nanovm.toml restore <app> <object> 41   # to version 41
+nanovm admin --config /etc/nanovm/nanovm.toml restore <app>               # each object to its head
+```
+
+The object answers `503 object-restoring` for the seconds it takes; the app's
+other objects and other apps keep serving. Going back to version 41 of 50 makes
+version 51 with 41's contents (restore 50 to undo it). A lost VM: start a fresh
+node with the same config and an empty `data_dir`, ingress off, `restore` each
+app (`versions` lists them), then open ingress; fence the old node first.
 
 ## 8. Observability
 

@@ -21,7 +21,7 @@ if [ -n "${CGROUP:-}" ]; then
   sed -i '1i cgroup = "/sys/fs/cgroup/system.slice/nanovm.service/apps"' /etc/nanovm/nanovm.toml
 fi
 # Local capture publishes versions with link(2): the unit's filter must allow it.
-[ -n "${CAPTURE:-}" ] && printf '\n[capture]\nmax_mb = 64\nmax_versions = 100\n' >>/etc/nanovm/nanovm.toml
+[ -n "${CAPTURE:-}" ] && printf '\n[capture]\nmax_mb = 64\n' >>/etc/nanovm/nanovm.toml
 # Capture shipped to a directory store, through the store drop-in.
 if [ -n "${STORE:-}" ]; then
   install -d /etc/systemd/system/nanovm.service.d /srv/nanovm-store

@@ -152,11 +152,11 @@ def check(cfg_path, nofile=None, address_space=None):
     capture = raw.get("capture")
     history = data.is_dir() and any((data / "objects").glob("*/*/*/committed/*"))
     if capture is not None:
-        mb = {"max_mb": 256, "max_versions": 16, "snapshot_every": 16, **capture}
+        mb = {"max_mb": 256, "snapshot_every": 16, **capture}
         shipped = f"shipped to {mb['store']} and then removed here but the last" if mb.get("store") else "kept here (no store)"
-        facts.append(f"capture on: each object's history holds up to {mb['max_mb']} MiB "
-                     f"and {mb['max_versions']} versions here (the whole volume every {mb['snapshot_every']}, "
-                     f"changes otherwise), {shipped}; a full one refuses writes")
+        facts.append(f"capture on: each object's history holds up to {mb['max_mb']} MiB here "
+                     f"(the whole volume every {mb['snapshot_every']} versions, changes otherwise), "
+                     f"{shipped}; a full one refuses writes")
     elif history:
         problems.append("objects have capture history (objects/<app>/<shard>/<object>/committed) but [capture] is off: they will refuse to start")
 

@@ -76,7 +76,7 @@ class CheckHost(unittest.TestCase):
         self.assertTrue(any("refuse to start" in p for p in problems), problems)
         facts, _, problems = self.run_check('data_dir = "data"\n[capture]\nmax_mb = 64\n')
         self.assertFalse(any("refuse to start" in p for p in problems), problems)
-        self.assertTrue(any("up to 64 MiB and 16 versions" in f for f in facts), facts)
+        self.assertTrue(any("up to 64 MiB here" in f for f in facts), facts)
 
 
 if __name__ == "__main__":

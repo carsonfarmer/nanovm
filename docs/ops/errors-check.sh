@@ -68,9 +68,12 @@ show "memory_mb below the guest's start" -H @"$W/counter.h" "$U/x/"
 stop
 
 # Local capture: history full, then capture turned off on a root with history.
-node cap '[capture]' 'max_versions = 2'
-for _ in 1 2; do curl -s -o /dev/null -XPOST -H @"$W/counter.h" "$U/c/incr"; done
-show "capture history full (max_versions = 2)" -XPOST -H @"$W/counter.h" "$U/c/incr"
+node cap '[capture]' 'max_mb = 1'
+# 60 KiB values, one version each, until 1 MiB of them wait here.
+for _ in $(seq 40); do
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -XPUT -H @"$W/counter.h" --data-binary @<(head -c 61440 /dev/zero) "$U/c/kv/k")" = 500 ] && break
+done
+show "capture history full (max_mb = 1)" -XPUT -H @"$W/counter.h" --data-binary @<(head -c 61440 /dev/zero) "$U/c/kv/k"
 stop
 node cap
 show "capture turned off, history kept" -H @"$W/counter.h" "$U/c/"

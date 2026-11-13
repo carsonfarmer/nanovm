@@ -35,7 +35,7 @@ docker run -d --name nanovm-proxy --init --network container:nanovm-node \
 | `--cap-drop ALL --cap-add CHOWN SETUID SETGID KILL` | the supervisor runs as root to give each app its own uid (see [deploy/systemd](../systemd/README.md) for what each is for). Docker's defaults include more; these four are enough |
 | `--security-opt no-new-privileges` | works here, unlike systemd's `NoNewPrivileges=yes` (which drops `CAP_SETUID`): Docker keeps the bounding set's capabilities |
 | `--init` | without it the supervisor is PID 1 and ignores SIGTERM, so `docker stop` waits out its timeout and SIGKILLs. Stopping is never graceful: drain at the TLS terminator first |
-| `-v …:/var/lib/nanovm` | volumes, undo journals, registry and compile caches. Back it up with `scripts/backup.py` while the node is stopped |
+| `-v …:/var/lib/nanovm` | volumes, undo journals, registry and compile caches. Its backup is the capture store (README, "Backup and restore"), shipped as the node runs |
 | `--network container:nanovm-node` | the proxy shares the node's loopback: the node (8080) and publish (8444) listeners stay unreachable from anywhere else. Publish only 8443, on the node container, behind TLS |
 | proxy `--user 65534 --read-only --cap-drop ALL` | the proxy needs no privilege and writes nothing |
 

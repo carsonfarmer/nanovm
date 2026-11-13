@@ -13,7 +13,9 @@ config: `nanovm admin --config /etc/nanovm/nanovm.toml <command>`, below
 1. Choose a store off the node: an S3 bucket (`s3://bucket/prefix`, credentials
    and region from `AWS_*` in the supervisor's environment), or a directory on
    another disk. Turn on bucket versioning or object lock if you want the store to
-   survive its own credentials being misused; nanovm never deletes from it.
+   survive its own credentials being misused. nanovm deletes from it only on an
+   operator's `admin delete` / `delete-app`, which can't be undone without the
+   store's own old versions (B-800).
 2. In the node's config:
 
    ```toml

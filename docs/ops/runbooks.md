@@ -71,46 +71,31 @@ owners first: their objects start empty.
 **Rolling back an app** is not this: move its tag back in the registry. The
 proxy sees it within `tag_ttl_s` (30 s) plus the DNS TTL, and the next request
 switches the worker (the old one drains). A `min=` floor in the TXT record
-refuses versions below it. Restoring data from a backup is the last resort: it
-loses every write after the snapshot.
+refuses versions below it. Restoring an object to an older version (Back up and
+restore) is for bad data, not for a bad deploy.
 
 ## Back up and restore
 
-[`scripts/backup.py`](../../scripts/backup.py) wraps restic; README "Backup and
-restore" has the full contract. With the node stopped it locks every app
-directory, backs up `objects/` (journals and capture history included; caches
-left out), and tags only a complete snapshot.
+**The backup is the capture store** (README, ["Backup and
+restore"](../../README.md#backup-and-restore)): with `[capture] store` set, the
+node ships every committed version of every object off the VM as it commits,
+while it serves. There is nothing to schedule and nothing to stop; turn it on
+before the first write (single-node guide, step 7). What a lost node loses is
+what it hadn't shipped yet: `nanovm admin --config /etc/nanovm/nanovm.toml
+backlog` says how much waits now.
 
-```sh
-export RESTIC_REPOSITORY=/srv/backups/nanovm RESTIC_PASSWORD_FILE=/root/restic-pass   # off-node in practice
-restic init                                   # once
-systemctl stop nanovm-proxy nanovm            # and keep them stopped
-python3 scripts/backup.py backup /var/lib/nanovm --stopped     # prints the full snapshot id: record it
-systemctl start nanovm nanovm-proxy
-```
+Restoring runs on the running node, one object or one app, through `nanovm
+admin` (as root on the host): `versions` to find a version, `restore <app>
+<object> [<version>]` or `restore <app>`. A restored object answers 503 for the
+seconds it takes; everything else keeps serving. Going back to an older version
+makes a new version after the head, so nothing is lost. The steps for each case
+(is the backup current, the store is down, an object's data is bad, a restore
+refused, a crash during a restore, a lost node) are in [the recovery
+runbook](../../notes/recovery-runbook.md).
 
-Restore into a root that doesn't exist, then swap it in:
-
-```sh
-systemctl stop nanovm-proxy nanovm
-python3 scripts/backup.py restore <full snapshot id> /var/lib/nanovm.restored
-mv /var/lib/nanovm /var/lib/nanovm.old && mv /var/lib/nanovm.restored /var/lib/nanovm
-systemctl start nanovm      # same nanovm build, same jail_uid_base, same app identities
-```
-
-Read and write an object before opening ingress; keep `/var/lib/nanovm.old`
-until you are sure.
-
-With a capture `store` (single-node guide, step 7), committed versions also
-ship off the VM as they happen; `nanovm::ship::restore` rebuilds an object from
-the store on a fresh root.
-
-> **Placeholder (`beta/recovery`):** restoring one app or one object on a
-> running node, from the store or a backup, with `nanovm admin`. Filled in when
-> `beta/recovery` is integrated. [drills/backup-restore.sh](drills/backup-restore.sh): count 3
-and a KV value before; after restoring into a fresh root, the same values, app
-uids 200000/200001 preserved, and the next write gives 4. Run `restic check
---read-data` on a schedule; a backup you haven't restored is a hope.
+A delete (`nanovm admin delete` / `delete-app`) removes the object's versions
+from the store too: it can't be restored afterwards unless the store keeps its
+own old versions, such as an S3 bucket's versioning (B-800).
 
 ## Disk full
 
@@ -144,7 +129,7 @@ space is freed, writes resume with no step on your part: the counter went 3,
    filesystem usage and on `error.type = commit-failed`.
 
 A single object answering `commit-failed` with `no storage space` while the
-disk has room is a full capture history (`max_versions` or `max_mb`), not a
+disk has room is a full capture history (`max_mb`), not a
 full disk. With a `store`, versions wait here until they ship: check the store
 is reachable (its credentials, its host) first. Otherwise raise the limits in
 `[capture]` and restart; nanovm never drops versions to make room.
