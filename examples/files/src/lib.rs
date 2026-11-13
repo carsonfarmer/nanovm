@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use nanovm_sdk::fs::{self, DescriptorFlags, OpenFlags};
 use nanovm_sdk::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG};
 use nanovm_sdk::http::{Request, Response};
-use nanovm_sdk::{Body, Error, Result, data, kv, serde_json};
+use nanovm_sdk::{Body, Result, data, kv, serde_json};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -92,18 +92,19 @@ async fn download(req: &Request<Body>, meta: Meta) -> Result {
     };
     let fd = data().open(&format!("f-{}", meta.name), OpenFlags::empty(), DescriptorFlags::READ).await?;
     let head = req.method() == "HEAD";
-    // Streamed a piece at a time, so a large file never sits in memory. A
-    // read that fails breaks the body off: the client sees it cut short.
+    // Streamed a piece at a time, so a large file never sits in memory.
     let body = Body::stream(move |mut body| async move {
         let mut at = start;
         while at < end && !head {
-            let piece = fs::read_at(&fd, at, (end - at).min(PIECE) as usize).await?;
-            if piece.is_empty() {
-                return Err(Error::new("the file is shorter than its size"));
-            }
-            at += piece.len() as u64;
-            if !body.write(piece).await {
-                break; // The client left.
+            match fs::read_at(&fd, at, (end - at).min(PIECE) as usize).await {
+                Ok(piece) if !piece.is_empty() => {
+                    at += piece.len() as u64;
+                    if !body.write(piece).await {
+                        break;
+                    }
+                }
+                // Short of its content-length: the client sees it break off.
+                _ => break,
             }
         }
         Ok(())

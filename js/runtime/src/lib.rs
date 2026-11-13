@@ -53,14 +53,16 @@ const PRELUDE: &str = include_str!("prelude.js");
 async fn handle(request: Request<Body>) -> nanovm_sdk::Result {
     let js = engine().map_err(uncaught)?;
     let (status, headers, body, after) = js.serve(request).await.map_err(uncaught)?;
-    // `ctx.waitUntil` work goes on after the answer, before the next
-    // request; anything else still pending is dropped. What it changes
-    // commits when it is done. If it fails (a promise rejects, or can never
-    // settle), so does the work after the answer, as when Rust's `after`
-    // work panics: the instance stops, what the work changed rolls back,
-    // and the answer, already sent, stands with what was changed before it.
+    // `ctx.waitUntil` work goes on as Rust's `after` work, once the answer
+    // is out, until every promise has settled (those registered meanwhile
+    // too), before the next request; anything else still pending is
+    // dropped. What it changes from then on commits when it is done. If it
+    // fails (a promise rejects, whenever it did, or they can never settle),
+    // so does that work, as when `after` work panics: the instance stops,
+    // what it changed after the answer rolls back, and the answer stands
+    // with what was changed before it.
     match after {
-        Some(after) => nanovm_sdk::wasip3::spawn_local(async move {
+        Some(after) => nanovm_sdk::after(async move {
             if let Err(e) = js.settle(after).await {
                 eprintln!("Uncaught (in waitUntil) {e}");
                 std::process::abort();

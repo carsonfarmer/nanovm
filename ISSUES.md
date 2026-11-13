@@ -505,10 +505,50 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** round-3 review S2 asked that a node keep what main's build left in its data directory: a capture main had decided but not published, and main's whole-volume versions without an epoch. 7d03ade built that: recovery adopted main's staged capture, and versions were read in main's format as well as this one. Separately, M4 (3acd297) judged a session record without `lease_ms` by the taker's own.
 - **Status:** not supported, see AGENTS.md rule 1: there is exactly one version of nanovm, v1. All three were removed on `fix/no-compat`. A version says `"format": 1` and is read only so; a log is refused unless its first block is the `nanovmj1` tag and a key; a session record without `lease_ms` doesn't parse and is refused. Operators start from a fresh data directory.
 
+### N-710: work after the answer could fail the answer (round-3 review 2, D4 findings 1 and 4)
+- **Where:** `js/runtime/src/lib.rs` (`handle`), `sdk/rust/src/lib.rs` (`__serve`, `after`), `object.rs` (the future `response.new` gives the guest)
+- **Scenario:** D4 made a failed `ctx.waitUntil` abort the instance so that its writes after the answer roll back. But the work ran from the moment the handler returned, so the abort could land before the node had taken the answer: a promise that can never settle (found on the first poll) or one that had already rejected failed every such request with `500 trap`, and the handler's own writes rolled back. Rust's `after` work had the same flaw (a panic before its first wait), and a failure after the node took the answer could still cut the body of a client slow to read it (the node aborts a body when the instance dies).
+- **Reproduced:** yes: `review2_wait_until_that_never_settles_fails_the_answered_request` and `review2_wait_until_rejected_before_the_answer_fails_the_answered_request` (js.rs) got `500 trap` with storage `{}`; `after_work_that_panics_leaves_the_answer_standing` (integration.rs) got `500 trap` for `/panic-at-once`.
+- **Fix:** the node resolves the future `response.new` returns (WASI's "result of transmission") once the client has read the answer whole or gone, not when the request body was consumed. The SDK starts `after` work only then, and the JavaScript runtime runs its waitUntil settling as `after` work, so its abort comes only then. One model for both, in README "Commits".
+- **Status:** fixed in 2031f79 and c65cfb3 (`fix/r3-dev`)
+
+### N-711: waitUntil work's writes before the answer commit with it, even if it later rejects (round-3 review 2, D4 finding 2)
+- **Where:** `js/runtime` (waitUntil semantics)
+- **Scenario:** a waitUntil promise's work starts when it is made, so what it writes while the handler runs is in the journal when the answer commits, and stays committed when the work rejects afterwards. The same holds for a Rust streamed body's writer, which starts as the handler returns: what it writes before the node has taken the answer commits with it.
+- **Status:** by design, documented in 2031f79 (README "Commits", js/README.md): the answer commits everything written up to it. The node has one journal per request, not one per task, so the only alternatives were holding back the answer until all waitUntil work ends (which defeats waitUntil) or failing the answer after it was sent. `review2_wait_until_that_wrote_before_the_answer_commits_that_write_when_it_rejects` now asserts this (and that the work's write after the answer rolls back).
+
+### N-712: a waitUntil promise registered after the answer was never awaited or checked (round-3 review 2, D4 finding 3)
+- **Where:** `js/runtime/src/prelude.js` (`answer`)
+- **Scenario:** `answer` took `Promise.all` of the promises registered by then; one that waitUntil work registered later was neither awaited (dropped if it outlived the rest) nor checked (its rejection ignored, its write committed). Rust's `after` called from `after` work was queued for the next request instead of running in this one.
+- **Reproduced:** yes: `review2_wait_until_registered_after_the_answer_commits_its_write_when_it_rejects` (`{"nested":1}` committed), `wait_until_registered_after_the_answer_is_waited_for`, `after_work_passed_on_by_after_work_runs_before_the_next_request`.
+- **Fix:** the runtime waits until the set is empty (`settled`: `Promise.all`, again while more were registered); `after` from work after the answer starts it at once, so it is part of the same post-return stretch.
+- **Status:** fixed in 2031f79 (`fix/r3-dev`)
+
+### N-713: a broken upstream stream reached the gateway's client looking whole (round-3 review 2, D3)
+- **Where:** `sdk/rust/src/lib.rs` (`Response::stream`), `examples/gateway`
+- **Scenario:** `Streaming::next` reports an upstream cut, but a streamed response's writer returned `()` and its trailers were always `Ok(None)`, so the gateway's client got 3 tokens and a clean end.
+- **Reproduced:** yes: `review2_gateway_tells_its_client_when_the_upstream_breaks_off` (examples.rs).
+- **Fix:** the writer returns `Result<()>`; on `Err` the SDK ends the body with an error in its trailers (the node then fails the body, so the client sees it break off), and once the answer is out panics as `after` work, so what the writer changed rolls back, as on a panic. The gateway's writer uses `?` on `next()`; `events`, `files` and `site` return `Ok(())`. This changes `Response::stream`'s signature (no compatibility path, AGENTS.md rule 1).
+- **Status:** fixed in 551d13d (`fix/r3-dev`)
+
+### N-714: the oauth example's session cookie was a plain cookie over https (round-3 review 2, D1)
+- **Where:** `examples/oauth/src/lib.rs`
+- **Scenario:** a sibling host could set `session=<its own valid session>; Domain=<parent>; Path=/u-<its login>`, and a victim's browser was signed in as the attacker on the attacker's pages: login CSRF without the callback.
+- **Reproduced:** yes: `review2_oauth_session_cookie_is_a_host_cookie_over_https` (a planted plain `session` cookie got `200`).
+- **Fix:** over https the session cookie is `__Host-session` (Secure, Path=/, no Domain), as the nonce cookie already was; logout clears it with the same attributes.
+- **Status:** fixed in a50b695 (`fix/r3-dev`)
+
+### N-715: a guest that traps while its answer commits gets a 500, though the commit may land
+- **Where:** `object.rs` (`serve`: `commit(acc).await` runs while the store's event loop goes on)
+- **Scenario:** found while fixing N-710. After the guest returns its answer, the node commits it on a blocking thread and the guest's other tasks keep running. If one traps before the commit ends, the store's run ends, the reply still pending gets `500 trap`, and the commit thread (which owns the volume until it ends, S1) still lands the writes. The SDKs no longer fail work after the answer before it is out (N-710), so this needs a guest that traps on its own (a raw `spawn_local` task that panics at once). The same holds for a request deadline that passes during the commit (S1).
+- **Reproduced:** from source; not run.
+- **Suggestion:** treat it as the existing ambiguous-outcome case ("Do not interpret every error as a rollback", README "Commits"), or have the node finish the answer's commit before reporting the trap.
+- **Status:** open
+
 ### B-701: the Rust SDK has its own `Request` and `Response` (owner decision: use the `http` crate's)
 - **Where:** `sdk/rust/src/lib.rs`, `fetch.rs` (was `http.rs`), `ws.rs`; every Rust app (`examples/`, `js/runtime`)
 - **Scenario:** the SDK's `Request`, `Response`, `Reply` and `Fetch` builder (about 300 lines) duplicated `http::Request`/`Response`, unfamiliar to Rust developers who know `http` from hyper, axum or Spin.
-- **Fix:** handlers take `http::Request<Body>` and return `http::Response<Body>`; `fetch` and object calls take and return them too. Conversions are `wasip3`'s `http-compat`. `Body` is bytes or a response's stream; `RequestExt` adds `query` and `cookie`. The old types are deleted, no aliases. examples/echo and `echo_maps_requests_and_responses_both_ways` check the mapping both ways through a node. Evidence: notes/sdk-http.md.
+- **Fix:** handlers take `http::Request<Body>` and return `http::Response<Body>`; `fetch` and object calls take and return them too. Conversions are `wasip3`'s `http-compat`. `Body` is bytes or a response's stream; `RequestExt` adds `query` and `cookie`. The old types are deleted, no aliases. N-710's and N-713's fixes (work after the answer waits for it to be out; a streamed body's writer can fail) are carried over: `Body::stream`'s writer returns `Result<()>`. examples/echo and `echo_maps_requests_and_responses_both_ways` check the mapping both ways through a node. Evidence: notes/sdk-http.md.
 - **Status:** done on `sdk/http-types` (sdk-http agent)
 
 ### B-702: the `http` crate adds 56–77 KB to every Rust app
@@ -516,13 +556,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** composed components grow +56 KB (hello, +17%) to +77 KB (oauth); +3.4–4% for apps with SQLite or the JS runtime. A linker map puts it in `http` itself: `HeaderName::from_bytes`' table of standard names (16.9 KB), URI and `HeaderMap` code (about 13 KB), `bytes` (about 4 KB).
 - **Status:** accepted with B-701 (the cost of the crate; notes/sdk-http.md has the numbers)
 
-### B-703: a streamed body can't say it failed
-- **Where:** `sdk/rust/src/lib.rs` (`Body::stream`)
-- **Scenario:** found by the round-3 review: a `Response::stream` writer ended its body with a clean end whatever happened, so examples/gateway passed on an upstream that broke off as a complete answer.
-- **Fix:** a `Body::stream` writer returns `Result<()>`; an `Err` resolves the body's trailers future to an error, so the host ends the body without its last chunk. The gateway returns the upstream's error; `gateway_streams_completions_within_quotas` checks the client sees the cut. The `r3-dev` fix brings an error path to round 3's SDK too; merging it here keeps this one.
-- **Status:** done on `sdk/http-types`
-
-### B-704: `fetch` of a request with a `host` header fails
+### B-703: `fetch` of a request with a `host` header fails
 - **Where:** `sdk/rust/src/fetch.rs`
 - **Scenario:** from source: `wasi:http` forbids a `host` header on an outgoing request, so an app that forwards an incoming request's headers (they include `host`) gets an error. `wasip3`'s `http_into_wasi_request` moves `host` into the URI's authority; the SDK builds its request itself (it sets `content-length` and sends no body for an empty one) and doesn't.
 - **Status:** open (low)

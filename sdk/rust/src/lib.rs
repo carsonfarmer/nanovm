@@ -85,22 +85,34 @@ pub async fn __serve<F: Future<Output = Result>>(
     request: wit::Request,
     handler: impl FnOnce(http::Request<Body>) -> F,
 ) -> core::result::Result<wit::Response, wit::ErrorCode> {
-    let result = handler(read(request).await?).await;
-    let later = AFTER.with(|a| a.take());
-    match result {
-        Ok(response) => {
-            for work in later {
-                wasip3::spawn_local(work);
-            }
-            let (mut parts, body) = response.into_parts();
-            let (body, trailers) = body.into_wit(&mut parts.headers);
-            let (response, _) = wit::Response::new(fields(parts.headers)?, Some(body), trailers);
-            let _ = response.set_status_code(parts.status.as_u16());
-            Ok(response)
-        }
-        // A failed request's instance is discarded: nothing runs after it.
-        Err(Error(why)) => Err(wit::ErrorCode::InternalError(Some(why))),
+    let request = read(request).await?;
+    AFTER.set(Some(Vec::new()));
+    // A failed request's instance is discarded: nothing runs after it.
+    let response = handler(request).await.map_err(|Error(why)| wit::ErrorCode::InternalError(Some(why)))?;
+    let streamed = response.body().is_stream();
+    let (response, out) = answer(response)?;
+    match streamed || AFTER.with_borrow(|a| a.as_ref().is_some_and(|a| !a.is_empty())) {
+        // Started only once the answer is out, so that no panic in it can
+        // fail the answer (one before the node has taken it would).
+        true => wasip3::spawn_local(async move {
+            let _ = out.await;
+            AFTER.take().into_iter().flatten().for_each(wasip3::spawn_local);
+        }),
+        false => AFTER.set(None),
     }
+    Ok(response)
+}
+
+/// `response` as `wasip3`'s, and the future that resolves once it is out.
+/// A streamed body whose writer fails breaks off for the client, and what
+/// was changed since answering rolls back, as when it panics.
+fn answer(response: http::Response<Body>) -> core::result::Result<(wit::Response, FutureReader<core::result::Result<(), wit::ErrorCode>>), wit::ErrorCode> {
+    let (mut parts, body) = response.into_parts();
+    let failed = |why: String| after(async move { panic!("the response body failed: {why}") });
+    let (body, trailers) = body.into_wit(&mut parts.headers, failed);
+    let (response, out) = wit::Response::new(fields(parts.headers)?, Some(body), trailers);
+    let _ = response.set_status_code(parts.status.as_u16());
+    Ok((response, out))
 }
 
 /// The request as `http`'s, its body read in full (the node bounds it by
@@ -129,17 +141,25 @@ async fn read(request: wit::Request) -> core::result::Result<http::Request<Body>
 }
 
 thread_local! {
-    static AFTER: std::cell::RefCell<Vec<Pin<Box<dyn Future<Output = ()>>>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Work for after the answer, waiting until it is out; `None` once it is.
+    static AFTER: std::cell::RefCell<Option<Vec<Pin<Box<dyn Future<Output = ()>>>>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `work` once the handler has answered: the client gets its response
-/// without waiting for it (a webhook's sender, say), and the object takes no
-/// other request until `work` is done, within the app's
-/// `post_return_timeout_ms`. What `work` changes commits when it finishes,
-/// and rolls back if it panics or runs out of time (the answer already sent
-/// stands). Nothing runs if the handler returns an error.
+/// Runs `work` after the answer, once the client has all of it (or has
+/// gone): the client doesn't wait for it (a webhook's sender, say), and
+/// nothing `work` does can change or fail the answer. The object takes no
+/// other request until `work`, and any work it passes to `after` in turn,
+/// is done, within the app's `post_return_timeout_ms`. What all of it
+/// changes commits together when it is done; if any of it panics or time
+/// runs out, all of that rolls back and the instance is replaced, while the
+/// answer and what the handler changed stand. Nothing runs if the handler
+/// returns an error.
 pub fn after(work: impl Future<Output = ()> + 'static) {
-    AFTER.with(|a| a.borrow_mut().push(Box::pin(work)));
+    let work = Box::pin(work);
+    AFTER.with_borrow_mut(|a| match a {
+        Some(waiting) => waiting.push(work),
+        None => wasip3::spawn_local(work),
+    });
 }
 
 /// Why a request failed. A handler that returns one rolls back everything the
@@ -263,13 +283,16 @@ impl Body {
     /// has returned. Meanwhile the object serves nothing else: its other
     /// requests wait until `write` is done, and it has the app's
     /// `post_return_timeout_ms` for it, after which the object is stopped
-    /// and what it changed since answering rolls back. What it changed
-    /// before answering has already committed. Set `content-length` if you
-    /// know it; without one the body is chunked.
+    /// and what it changed since answering rolls back. `write` starts as
+    /// the handler returns: what it changes before the node has taken the
+    /// answer (as it takes the first piece) commits with the answer, the
+    /// rest once it ends. Set `content-length` if you know it; without one
+    /// the body is chunked.
     ///
     /// `write` returning an error breaks the body off: the client sees it
     /// end early (a chunked body without its last chunk), never a short
-    /// body that looks whole.
+    /// body that looks whole. In an answer, what it changed since answering
+    /// rolls back too, as when it panics.
     pub fn stream<F: Future<Output = Result<()>> + 'static>(write: impl FnOnce(BodyWriter) -> F + 'static) -> Body {
         Body(Inner::Stream(Box::new(|w| Box::pin(write(w)))))
     }
@@ -305,8 +328,9 @@ impl Body {
     }
 
     /// The body as `wasi:http` streams it, and the future that says whether
-    /// all of it came; bytes get their `content-length`.
-    fn into_wit(self, headers: &mut http::HeaderMap) -> (StreamReader<u8>, FutureReader<Trailers>) {
+    /// all of it came; bytes get their `content-length`. If a stream's
+    /// writer fails, the future says so, and `failed` gets why.
+    fn into_wit(self, headers: &mut http::HeaderMap, failed: impl FnOnce(String) + 'static) -> (StreamReader<u8>, FutureReader<Trailers>) {
         // Dropped unwritten, `end` says all of it came.
         let (end, ended) = wit_future::new(|| Ok(None));
         let (mut tx, rx) = wit_stream::new();
@@ -323,7 +347,8 @@ impl Body {
                 // The body ends when `write` drops its writer; then `end`
                 // says whether that was all of it.
                 if let Err(Error(why)) = write(BodyWriter(tx)).await {
-                    let _ = end.write(Err(wit::ErrorCode::InternalError(Some(why)))).await;
+                    let _ = end.write(Err(wit::ErrorCode::InternalError(Some(why.clone())))).await;
+                    failed(why);
                 }
             }),
         }

@@ -88,8 +88,9 @@ no need for write-to-temp-then-rename.
   streams a body after the handler returns; the object serves nothing else
   meanwhile, for at most the app's `post_return_timeout_ms`. Returning an
   error from it breaks the body off, so the client sees it end early rather
-  than a short body that looks whole. `sse(id, event, data)` formats a
-  Server-Sent Event ([examples/events](../../examples/events)).
+  than a short body that looks whole, and rolls back what it changed, as a
+  panic does. `sse(id, event, data)` formats a Server-Sent Event
+  ([examples/events](../../examples/events)).
 - `data()` and `tmp()`: `read` (an `Option`), `read_text`, `write`, `append`,
   `remove`, `rename`, `open`; `fs::read_at(&fd, offset, len)` and
   `fs::write_at` for pieces of a file.
@@ -116,8 +117,11 @@ no need for write-to-temp-then-rename.
 - `ws::events(&req)`, `ws::Answer` (`accept`, `subscribe`, `text`, `binary`,
   `close`; `.into()` the response) and `ws::publish(channel, msg)` for
   WebSockets.
-- `after(async { … })`: work that runs once the handler has answered (its
-  changes commit when it is done).
+- `after(async { … })`: work that runs once the client has the whole answer
+  (or has gone), before the object's next request; work it passes to
+  `after` runs too. What it changes commits when all of it is done, and
+  rolls back if any of it panics or runs out of time; the answer stands.
+  The main README's "Commits" has the model, which `ctx.waitUntil` shares.
 - `id()`, `app()`, `env(key)`, `sleep(d)`, `quote(s)`; `wasip3` for the rest.
 
 The [chat example](../../examples/chat) uses most of it;

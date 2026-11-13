@@ -25,7 +25,9 @@ pub async fn fetch(request: Request<impl Into<Body>>) -> Result<Response<Body>, 
 pub async fn fetch_streaming(request: Request<impl Into<Body>>) -> Result<Response<Streaming>, ErrorCode> {
     let (mut parts, body) = request.map(Into::into).into_parts();
     // A request without a body has none, rather than `content-length: 0`.
-    let body = (!body.is_empty() || body.is_stream()).then(|| body.into_wit(&mut parts.headers));
+    // A streamed body that fails ends the request's body early: the host
+    // fails the request, so the caller hears of it.
+    let body = (!body.is_empty() || body.is_stream()).then(|| body.into_wit(&mut parts.headers, drop));
     let (contents, trailers) = match body {
         Some((contents, trailers)) => (Some(contents), trailers),
         None => (None, wit_future::new(|| Ok(None)).1),
