@@ -14,7 +14,9 @@
 //! object's lease, live, and has claimed the head at that lease's epoch
 //! (`claim`, before the object is served there). A claim is a conditional
 //! write too, so a node that lost the object may still put a version, but
-//! the head it read has moved, and the version never counts. Shipped versions
+//! the head it read has moved, and the version never counts. A claim also
+//! makes the node's copy of the object the head's, restoring it from the
+//! store when it isn't: a node never serves state older than the head. Shipped versions
 //! are removed here but the last, which the next names as its parent; what
 //! isn't shipped yet stays, within the capture limits, which refuse writes
 //! once they are reached (the store down, say), never dropping a version.
@@ -377,19 +379,63 @@ pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Lea
 
 /// Claims the head of object `object` of app `app` for this node's lease on
 /// it, at epoch `lease`, before the object is served here: by a conditional
-/// write, after which no node with an earlier lease can move the head.
-pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object: &str) -> io::Result<()> {
+/// write, after which no node with an earlier lease can move the head. This
+/// node's copy of the object (under `objects`, `<data_dir>/objects/<app>`)
+/// is then the head's: kept if it is (see `current`), else dropped and
+/// restored from the store. So a node never serves state older than the
+/// head, nor ships history the head has moved past.
+pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object: &str, objects: &Path) -> io::Result<()> {
+    let dir = objects.join("~committed").join(object);
     for _ in 0..4 {
         let (head, tag) = head(store, app, object).await?;
         if head.lease > lease || (head.lease == lease && head.node != node) {
             return Err(io::Error::other(format!("{app}/{object} is claimed at a later epoch, {}", head.lease)));
         }
-        let claimed = Head { node: node.into(), lease, ..head };
-        if store.swap(&head_key(app, object), serde_json::to_vec(&claimed)?, tag.as_ref()).await?.is_some() {
-            return Ok(());
+        // Dropped before the claim, which makes what is here count.
+        let current = current(&dir, &head, node)?;
+        if !current {
+            discard(objects, object)?;
         }
+        let claimed = Head { node: node.into(), lease, ..head.clone() };
+        if store.swap(&head_key(app, object), serde_json::to_vec(&claimed)?, tag.as_ref()).await?.is_none() {
+            continue;
+        }
+        if !current && head.sequence > 0 {
+            restore(store, app, object, objects).await?;
+        }
+        return Ok(());
     }
     Err(io::Error::other(format!("{app}/{object}'s head keeps moving")))
+}
+
+/// Whether this node's copy of an object, its versions in `dir`, is the
+/// head's: it has the head's version, and versions after it count only if
+/// no other node has claimed the object since this one (`node`) did, which
+/// another node can't have served.
+fn current(dir: &Path, head: &Head, node: &str) -> io::Result<bool> {
+    let (versions, staged) = published(dir)?;
+    let at = |n: u64| dir.join(format!("{n:020}.tar"));
+    let has = head.sequence == 0 || (versions.contains(&head.sequence) && crate::committed::digest(&at(head.sequence))? == head.digest);
+    let ours = head.node == node || head.lease == 0;
+    Ok(has && (ours || (!staged && versions.last().is_none_or(|&n| n == head.sequence))))
+}
+
+/// Drops this node's copy of `object` (under `objects`): its volume,
+/// journal and marker, then its versions, which say whether a copy is
+/// current, so a discard cut short is never taken for one.
+fn discard(objects: &Path, object: &str) -> io::Result<()> {
+    let [journal, staging, marker, versions] = ["~journal", "~restore", "~shipped", "~committed"].map(|d| objects.join(d).join(object));
+    for path in [objects.join(object), journal, staging, versions] {
+        if let Err(e) = std::fs::remove_dir_all(&path)
+            && e.kind() != ErrorKind::NotFound
+        {
+            return Err(e);
+        }
+    }
+    match std::fs::remove_file(marker) {
+        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Rebuilds object `object` of app `app` from what `store` holds, as the
@@ -536,15 +582,16 @@ mod tests {
         Ok(std::fs::read_to_string(root.join(object).join("v")).unwrap())
     }
 
-    /// Takes `object`'s lease for `leases`' node, claims the head for it, and
-    /// holds it, as the supervisor does before a worker serves the object.
-    async fn take(store: &dyn Store, leases: &Leases, object: &str) -> crate::lease::Grant {
+    /// Takes `object`'s lease for `leases`' node, claims the head for it with
+    /// its copy of the object under `objects`, and holds it, as the
+    /// supervisor does before a worker serves the object.
+    async fn take(store: &dyn Store, leases: &Leases, object: &str, objects: &Path) -> crate::lease::Grant {
         let key = format!("app/{object}");
         let t0 = std::time::Instant::now();
         loop {
             leases.renew().await;
             if let Ok(grant) = leases.acquire(&key).await {
-                claim(store, leases.node(), grant.epoch, "app", object).await.unwrap();
+                claim(store, leases.node(), grant.epoch, "app", object, objects).await.unwrap();
                 leases.hold(&key, grant.clone());
                 return grant;
             }
@@ -641,11 +688,11 @@ mod tests {
         let (a, b) = (Leases::new(records.clone(), "a", Duration::from_millis(200)), Leases::new(records, "b", Duration::from_secs(5)));
         let (a_objects, b_objects) = (base.join("a"), base.join("b"));
         let (a_dir, b_dir) = (a_objects.join("~committed/o"), b_objects.join("~committed/o"));
-        let ga = take(&store, &a, "o").await;
+        let ga = take(&store, &a, "o", &a_objects).await;
         version(&a_dir, 1, ga.epoch, "", "A's");
         let (shipped, gb) = tokio::join!(ship_object(&store, Some(&a), "app", "o", &a_dir), async {
             store.started.notified().await;
-            let gb = take(&store, &b, "o").await;
+            let gb = take(&store, &b, "o", &b_objects).await;
             store.gate.add_permits(1);
             gb
         });
@@ -657,6 +704,50 @@ mod tests {
         let ours = Head { sequence: 1, digest, node: "b".into(), lease: gb.epoch };
         assert_eq!(head(&store, "app", "o").await.unwrap().0, ours);
         assert_eq!(restored(&store, "o", &base.join("fresh")).await.unwrap(), "B's");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// A claim keeps a node's copy of an object while no other node has
+    /// claimed the object since this one did (its versions after the head
+    /// then ship); once another has, the copy goes, with any versions after
+    /// the head, and the head's is restored.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_claim_keeps_only_history_no_other_node_has_moved_past() {
+        let base = tempdir("claims");
+        let records: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let store = Objects(Arc::new(object_store::memory::InMemory::new()));
+        let (a, b) = (Leases::new(records.clone(), "a", Duration::from_millis(200)), Leases::new(records, "b", Duration::from_secs(5)));
+        let (a_objects, b_objects) = (base.join("a"), base.join("b"));
+        let dir = a_objects.join("~committed/o");
+        let text = |objects: &Path| std::fs::read_to_string(objects.join("o/v")).ok();
+        // A version and the volume as it leaves it.
+        let commit = |n: u64, epoch: u64, parent: &str, v: &str| {
+            std::fs::create_dir_all(a_objects.join("o")).unwrap();
+            std::fs::write(a_objects.join("o/v"), v).unwrap();
+            version(&dir, n, epoch, parent, v)
+        };
+        // A ships version 1, commits 2, and lets the object go.
+        let first = take(&store, &a, "o", &a_objects).await;
+        let one = commit(1, first.epoch, "", "one");
+        ship_object(&store, Some(&a), "app", "o", &dir).await.unwrap();
+        let two = commit(2, first.epoch, &one, "two");
+        a.release("app/o", &first).await;
+        // Taken again with no other node between: its copy stays, and
+        // version 2 ships under the new lease.
+        let again = take(&store, &a, "o", &a_objects).await;
+        assert_eq!(text(&a_objects).as_deref(), Some("two"));
+        ship_object(&store, Some(&a), "app", "o", &dir).await.unwrap();
+        assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 2);
+        // A commits 3, but B takes the object before A ships it: B restores 2.
+        commit(3, again.epoch, &two, "three");
+        let theirs = take(&store, &b, "o", &b_objects).await;
+        assert_eq!(text(&b_objects).as_deref(), Some("two"));
+        b.release("app/o", &theirs).await;
+        // A takes it back: its version 3 never was the object's, and goes.
+        take(&store, &a, "o", &a_objects).await;
+        assert_eq!((text(&a_objects).as_deref(), published(&dir).unwrap().0), (Some("two"), vec![2]));
+        ship_object(&store, Some(&a), "app", "o", &dir).await.unwrap();
+        assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 2);
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -685,17 +776,17 @@ mod tests {
         a.renew().await;
         refused("missing", 1).await;
         // A released lease (the record names no node, at the version's epoch).
-        let grant = take(&store, &a, "released").await;
+        let grant = take(&store, &a, "released", &objects).await;
         a.release("app/released", &grant).await;
         refused("released", grant.epoch).await;
         // A lapsed lease (the record still names A, at the version's epoch).
-        let grant = take(&store, &a, "lapsed").await;
+        let grant = take(&store, &a, "lapsed", &objects).await;
         tokio::time::sleep(ttl).await;
         refused("lapsed", grant.epoch).await;
         // A lease taken again, after B held the object: the record names A,
         // at a later epoch than the version's.
-        let first = take(&store, &a, "moved").await;
-        let theirs = take(&store, &b, "moved").await;
+        let first = take(&store, &a, "moved", &objects).await;
+        let theirs = take(&store, &b, "moved", &base.join("b")).await;
         b.release("app/moved", &theirs).await;
         a.renew().await;
         let again = loop {

@@ -4479,12 +4479,19 @@ mod nodes {
     }
 
     /// A node's config: named for `listener`, taking leases, calling through
-    /// the proxy's private endpoint `private`.
+    /// the proxy's private endpoint `private`, shipping to a store the nodes
+    /// of a test share (`<test>_a` and `<test>_b` share `<test>`'s) and
+    /// answering writes once shipped, as a config file's default is.
     fn leased(test: &str, listener: &std::net::TcpListener, private: std::net::SocketAddr) -> NodeConfig {
         let mut cfg = node_cfg(test, 8);
         (cfg.name, cfg.leases, cfg.lease_ms) = (listener.local_addr().unwrap().to_string(), "memory:".into(), LEASE_MS);
         cfg.proxy = format!("http://{private}");
         cfg.limits.post_return_timeout_ms = 20_000;
+        let shared = test.strip_suffix("_a").or(test.strip_suffix("_b")).unwrap_or(test);
+        let store = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes-store").join(shared);
+        let _ = std::fs::remove_dir_all(&store);
+        cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), remote_ack: true, ..Default::default() });
+        cfg.validate().unwrap();
         cfg
     }
 
@@ -4565,6 +4572,56 @@ mod nodes {
         assert_eq!(read, (200, r#"{"file":"one","key":"one"}"#.into()));
         assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
         assert!(t0.elapsed() >= Duration::from_millis(LEASE_MS), "taken over before A's lease ran out: {:?}", t0.elapsed());
+    }
+
+    /// Nodes on disks of their own, sharing only the stores: A answers a
+    /// write once its version counts in the store; A stops; B takes the
+    /// object over and serves what A wrote, restored from the store, never
+    /// the empty object its own disk has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_failover_with_separate_disks_preserves_remote_acknowledged_state() {
+        let store = Arc::new(InMemory::new());
+        let shipped = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes-store/separate_disks");
+        let _ = std::fs::remove_dir_all(&shipped);
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let capture = nanovm::config::CaptureConfig { store: Some(shipped.to_str().unwrap().into()), remote_ack: true, ..Default::default() };
+        let mut cfg_a = leased("separate_disks_a", &la, private.local_addr().unwrap());
+        let mut cfg_b = leased("separate_disks_b", &lb, private.local_addr().unwrap());
+        (cfg_a.capture, cfg_b.capture) = (Some(capture.clone()), Some(capture));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let leases: Arc<dyn ObjectStore> = store.clone();
+        let a = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let _a = serve(cfg_a, la, leases).await;
+                let _ = stopped.await;
+            })
+        });
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-separate-disks", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "disks.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let written = get(proxy, "disks.test", &format!("/{object}/commit?v=one")).await;
+        assert_eq!(written, (200, r#"{"file":"one","key":"one"}"#.into()));
+        let head = || std::fs::read(shipped.join(&app).join(&object).join("head")).ok().map(|h| serde_json::from_slice::<serde_json::Value>(&h).unwrap());
+        assert_eq!(head().unwrap()["sequence"], 1, "answered once it counts in the store");
+        stop.send(()).unwrap();
+        a.join().unwrap();
+        let t0 = Instant::now();
+        let read = loop {
+            let read = get(proxy, "disks.test", &format!("/{object}/commit")).await;
+            if read.0 == 200 || t0.elapsed() > Duration::from_secs(15) {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(read, (200, r#"{"file":"one","key":"one"}"#.into()), "B serves the object from its own disk");
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+        // B's history goes on from A's.
+        assert_eq!(get(proxy, "disks.test", &format!("/{object}/commit?v=two")).await.0, 200);
+        let head = head().unwrap();
+        assert_eq!((head["sequence"].as_u64(), head["node"].as_str()), (Some(2), Some(names[1].as_str())));
     }
 
     /// Node A answers a request and works on after answering; meanwhile it

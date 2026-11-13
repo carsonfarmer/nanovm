@@ -2258,8 +2258,8 @@ mod tests {
         let store = Objects(Arc::new(object_store::memory::InMemory::new()));
         let cap = CaptureConfig::default();
         // A node (its leases lasting `ttl`) takes the object for its copy
-        // under `objects` as its supervisor does, restoring what the store
-        // has; and its object's view of the lease.
+        // under `objects` as its supervisor does (the claim restores what
+        // the store has); and its object's view of the lease.
         let take = async |name: &str, ttl: std::time::Duration, objects: &Path| {
             let node = Leases::new(leases.clone(), name, ttl);
             let (grant, (id, until)) = loop {
@@ -2269,10 +2269,7 @@ mod tests {
                     Err(_) => tokio::time::sleep(ttl / 8).await,
                 }
             };
-            if crate::ship::head(&store, "app", "o").await.unwrap().0.sequence > 0 {
-                crate::ship::restore(&store, "app", "o", objects).await.unwrap();
-            }
-            crate::ship::claim(&store, name, grant.epoch, "app", "o").await.unwrap();
+            crate::ship::claim(&store, name, grant.epoch, "app", "o", objects).await.unwrap();
             node.hold("app/o", grant.clone());
             let session = Arc::new(Session::default());
             session.set(id, until.max(mono_ns() + 60_000_000_000));

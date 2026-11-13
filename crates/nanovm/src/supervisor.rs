@@ -478,7 +478,7 @@ impl Supervisor {
 
         let policy = Arc::new(policy);
         let (http, proxy, app, host) = (self.proxy.clone(), self.cfg.proxy.clone(), w.name.clone(), w.host.clone());
-        let (leases, capture) = (self.leases.clone(), self.capture.clone());
+        let (leases, capture, objects) = (self.leases.clone(), self.capture.clone(), self.cfg.app_dirs(&w.name)[0].clone());
         let (telemetry, digest) = (self.relay.clone(), want.digest.clone());
         let telemetry_slots = Arc::new(tokio::sync::Semaphore::new(3));
         egress.set_nonblocking(true)?;
@@ -486,17 +486,19 @@ impl Supervisor {
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, link_caps, move |req| {
             let (policy, http, proxy, app, host) = (policy.clone(), http.clone(), proxy.clone(), app.clone(), host.clone());
             let (telemetry, digest, slots, leases) = (telemetry.clone(), digest.clone(), telemetry_slots.clone(), leases.clone());
-            let capture = capture.clone();
+            let (capture, objects) = (capture.clone(), objects.clone());
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
                     return serve_forwarded(req, &policy).await;
                 }
                 if let Some(leases) = &leases {
                     if req.uri().path().starts_with(crate::lease::PATH) {
-                        // Before its worker serves an object, the object's head is this lease's.
-                        let claim = async |object: &str, grant: &crate::lease::Grant| match &capture {
-                            Some(store) => crate::ship::claim(&**store, leases.node(), grant.epoch, &app, object).await,
-                            None => Ok(()),
+                        // Before its worker serves an object, the object's head is
+                        // this lease's, and the object here is the head's.
+                        let claim = async |object: &str, grant: &crate::lease::Grant| {
+                            let Some(store) = &capture else { return Ok(()) };
+                            crate::ship::claim(&**store, leases.node(), grant.epoch, &app, object, &objects).await?;
+                            restored(&objects, object)
                         };
                         return crate::lease::serve(leases, &app, req, claim).await.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync());
                     }
@@ -728,6 +730,21 @@ fn chown_tree(dir: &Path, uid: u32) -> anyhow::Result<()> {
         if std::fs::symlink_metadata(&d)?.is_dir() {
             stack.extend(std::fs::read_dir(&d)?.map(|e| e.map(|e| e.path())).collect::<Result<Vec<_>, _>>()?);
         }
+    }
+    Ok(())
+}
+
+/// Gives what a claim restored of `object` (under `objects`, an app's) to
+/// the app's uid, the owner of `objects`, when the supervisor is root.
+fn restored(objects: &Path, object: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let uid = std::fs::metadata(objects)?.uid();
+    let committed = objects.join("~committed");
+    for d in [committed.join(object), committed, objects.join(object)].iter().filter(|d| d.exists()) {
+        chown_tree(d, uid).map_err(std::io::Error::other)?;
     }
     Ok(())
 }
