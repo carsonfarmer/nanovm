@@ -8,7 +8,8 @@ BIN=$1; PORT=28380; REG=25380
 W=$(mktemp -d /var/tmp/nanovm-diskfull.XXXXXX); chmod 755 $W
 mkdir $W/data && mount -t tmpfs -o size=32m,mode=755 tmpfs $W/data
 pids=()
-trap 'kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null; umount $W/data; rm -rf $W' EXIT
+# Workers die with the supervisor, but not at once: retry the unmount.
+trap 'kill "${pids[@]}" 2>/dev/null; wait 2>/dev/null; for _ in $(seq 50); do umount $W/data 2>/dev/null && break; sleep 0.1; done; rm -rf $W' EXIT
 $BIN/examples/dev-registry 127.0.0.1:$REG > $W/apps 2>/dev/null & pids+=($!)
 sleep 2
 for a in counter hostile; do printf 'nanovm-app: %s\nnanovm-trust: dev dev\n' "$(awk -v a=$a '$1==a{print $2}' $W/apps)" > $W/$a.h; done
@@ -28,7 +29,7 @@ r -XPOST -H @$W/counter.h $U/a/incr
 r -H @$W/hostile.h "$U/h/commit?v=during"
 r -XPOST -H @$W/counter.h $U/newobj/incr
 r -H @$W/counter.h $U/a/
-echo "pending journals: $(find $W/data/objects -path '*~journal*' -type f | wc -l): $(find $W/data/objects -path '*~journal*' -type f | sed "s|$W/data/||" | head -5 | tr '\n' ' ')"
+echo "journal files (each object keeps its log): $(find $W/data/objects -path '*~journal*' -type f | sed "s|$W/data/||" | head -5 | tr '\n' ' ')"
 grep -v 'OTLP\|opentelemetry\|Batch' $W/n.log | tail -5
 rm $W/data/filler
 echo "== freed"
@@ -36,5 +37,5 @@ r -H @$W/counter.h $U/a/
 r -XPOST -H @$W/counter.h $U/a/incr
 r -H @$W/hostile.h "$U/h/commit"
 r -XPOST -H @$W/counter.h $U/newobj/incr
-echo "pending journals: $(find $W/data/objects -path '*~journal*' -type f | wc -l)"
+echo "journal files: $(find $W/data/objects -path '*~journal*' -type f | wc -l)"
 ls -la $W/data/objects/*/ | head -20

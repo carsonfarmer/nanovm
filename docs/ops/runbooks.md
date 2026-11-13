@@ -2,10 +2,12 @@
 
 For one node with the [systemd units](../../deploy/systemd/README.md):
 `nanovm.service` (node, `data_dir = /var/lib/nanovm`, listening on
-127.0.0.1:8080), `nanovm-proxy.service` (8443) behind a TLS terminator. In a
+127.0.0.1:8080), `nanovm-proxy.service` (8443) behind a TLS terminator; the
+[single-node guide](../../deploy/single-node/README.md) sets this up. In a
 container, read `docker stop`/`docker start` for `systemctl`. Each step was
 checked against the code; the drills in [drills/](drills) reproduce the
-behaviour quoted.
+behaviour quoted, and were run again on round 3
+([notes/beta-deployable.md](../../notes/beta-deployable.md)).
 
 Three facts every runbook leans on:
 
@@ -15,53 +17,53 @@ Three facts every runbook leans on:
 - **Never delete anything under `objects/*/~journal/` or `objects/*/~committed/`.**
   A log in `~journal` is a request's undo record: the object recovers it on its
   next start, and deleting it can leave half a request's writes in place.
-  `~committed` is local capture's version history (`[capture]`, off by default):
-  don't prune it, and don't remove `[capture]` from a node that has history
-  (its objects then refuse to start: `committed history requires capture to
-  remain enabled`).
+  `~committed` is capture's version history (`[capture]`, off by default):
+  with a `store`, nanovm removes what it has shipped itself (all but the last
+  version); don't prune it, and don't remove `[capture]` from a node that has
+  history (its objects then refuse to start: `committed history requires
+  capture to remain enabled`).
 - **Uids are data.** An app's uid is the owner of its `objects/<app>` directory.
   Keep `jail_uid_base`, run as root, and preserve numeric owners.
 
 ## Upgrade nanovm
 
-1. Read the release notes for config keys (unknown keys stop the node from
-   starting), journal format and host requirements. Take a backup (below) or
-   confirm a recent one.
+There is one version of nanovm, v1 ([AGENTS.md](../../AGENTS.md), rule 1): a
+new build may change its on-disk formats in place, and data an earlier build
+wrote is not supported. An upgrade therefore starts the node on a fresh data
+directory, and keeps the old one, with the old binary, for a rollback. Tell app
+owners first: their objects start empty.
+
+1. Read the release notes for config keys (an unknown key stops the node from
+   starting; `tests/configs.rs` keeps the shipped configs current) and host
+   requirements. Run `deploy/single-node/check-host.py` against the new config.
 2. Close ingress at the terminator. `systemctl stop nanovm-proxy nanovm`.
-3. Install the new binary **only now**, keeping the old one:
+3. Set the old data directory aside, and install the new binary **only now**,
+   keeping the old one:
    ```sh
+   mv /var/lib/nanovm /var/lib/nanovm.prev
    cp -p /usr/local/bin/nanovm /usr/local/bin/nanovm.prev
    install -m755 nanovm /usr/local/bin/nanovm.new && mv /usr/local/bin/nanovm.new /usr/local/bin/nanovm
    ```
-   Before N-552's fix, a running supervisor started every new worker from the
-   path it started with, so a binary replaced under it gave new apps workers of
-   the new version ([drills/binary-swap.sh](drills/binary-swap.sh): `worker
-   spec: invalid length 3, expected a tuple of size 4`, a 502 for every new
-   app). With the fix, workers come from the running image, and the new version
-   runs only once the node restarts. `cp` over the running file fails with "Text
-   file busy"; `install`/`mv` succeed.
+   A running supervisor starts its workers from its own image (N-552), so a
+   binary replaced under it takes effect only when the node restarts; `cp` over
+   the running file fails with "Text file busy", `install`/`mv` succeed.
 4. `systemctl start nanovm nanovm-proxy`, then
    `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/_nanovm/ready` (204).
    Startup errors are in `journalctl -u nanovm`.
 5. Through the proxy, read and write one object of a canary app; check the
-   `supervisor.request` error rate. Objects with journals left by the stop
-   recover on their first request. Open ingress.
+   `supervisor.request` error rate. Open ingress.
 
 ## Roll back nanovm
 
 1. Close ingress; `systemctl stop nanovm-proxy nanovm`.
-2. Look for unfinished journals: `find /var/lib/nanovm/objects -path '*/~journal/*/log'`.
-   If the newer version introduced a journal record (the release notes say so;
-   e.g. tag 5 for cancelled renames), an older binary cannot recover a log
-   holding it. Start the newer version with ingress closed and send any request
-   to each listed object through the proxy (`curl -H 'Host: <app host>'
-   http://127.0.0.1:8443/<object>/`): instantiating it recovers the log. Stop
-   again; the `find` must print nothing.
-3. Remove config keys the old version doesn't know. A build from before local
-   capture can't read `[capture]` and doesn't know `~committed/`: on a root with
-   capture history, don't roll back past it. Restore the binary
-   (`mv /usr/local/bin/nanovm.prev /usr/local/bin/nanovm`), start, check as in
-   Upgrade step 4–5.
+2. Put back the old binary and the data directory it wrote. Writes made since
+   the upgrade stay in the new build's directory; the old build doesn't read it.
+   ```sh
+   mv /var/lib/nanovm /var/lib/nanovm.rolled-back && mv /var/lib/nanovm.prev /var/lib/nanovm
+   mv /usr/local/bin/nanovm.prev /usr/local/bin/nanovm
+   ```
+3. Put back the old config if the upgrade changed it, start, and check as in
+   Upgrade steps 4 and 5.
 
 **Rolling back an app** is not this: move its tag back in the registry. The
 proxy sees it within `tag_ttl_s` (30 s) plus the DNS TTL, and the next request
@@ -102,12 +104,15 @@ uids 200000/200001 preserved, and the next write gives 4. Run `restic check
 ## Disk full
 
 What happens ([drills/disk-full.sh](drills/disk-full.sh), `data_dir` on a full
-32 MiB tmpfs): every request that writes, to any object, answers
-`500 commit-failed` (`journal requires recovery`) and its writes roll back;
-reads keep working and return the last committed state; logs are left in
-`objects/*/~journal/`. Once space is freed, each object recovers on its next
-request and writes resume: the counter went 3, (two failed increments), 4, and
-the failed KV write was gone.
+32 MiB tmpfs, on round 3): a write that needs new space fails in the guest,
+which answers as it chooses (the counter's own `507`, its count unchanged); a
+request whose object has no journal yet (its first write) answers
+`500 commit-failed` (`journal requires recovery`) and rolls back; what a request
+wrote without needing space commits (each object keeps its journal's log, so
+an overwrite in place still did, while its KV write in the same request
+failed). Reads keep working and return the last committed state. Once space is
+freed, writes resume with no step on your part: the counter went 3, (two
+refused increments), 4, and the new object started at 1.
 
 1. Confirm: `df -h /var/lib/nanovm`; `du -xh --max-depth=2 /var/lib/nanovm | sort -h | tail`.
 2. Free space outside nanovm first (`journalctl --vacuum-size=…`, old backups,
@@ -120,13 +125,16 @@ the failed KV write was gone.
 5. Size for it: an object's quota counts logical bytes, and while a request runs
    its journal and replaced files can hold as much again (up to 3 × `disk_mb`
    per busy object, plus metadata); quotas don't cap the total. With `[capture]`,
-   each object's history adds up to `max_mb` (256 MiB by default) of full-volume
-   copies. Alert on filesystem usage and on `error.type = commit-failed`.
+   each object's history here adds up to `max_mb` (256 MiB by default): the
+   whole volume every `snapshot_every` versions, what changed otherwise; with a
+   `store`, what has shipped is removed here but the last version. Alert on
+   filesystem usage and on `error.type = commit-failed`.
 
 A single object answering `commit-failed` with `no storage space` while the
 disk has room is a full capture history (`max_versions` or `max_mb`), not a
-full disk: raise the limits in `[capture]` and restart; nanovm never drops old
-versions to make room.
+full disk. With a `store`, versions wait here until they ship: check the store
+is reachable (its credentials, its host) first. Otherwise raise the limits in
+`[capture]` and restart; nanovm never drops versions to make room.
 
 ## Worker crash loop
 
@@ -143,15 +151,16 @@ next request, so a broken app costs one spawn a second, not one per request.
      searchable by the app uid (keep it 0755, `UMask=0022`).
      `this kernel does not enforce Landlock`: Linux ≥ 5.13 with Landlock enabled,
      and the unit's `SystemCallFilter` must allow `landlock_*` and `seccomp`.
-     `supervisor exited`: N-551 (supervisor as pid 1 without the fix).
-   - `max_live_objects = … needs about … file descriptors` or `… memory
-     mappings`: raise `LimitNOFILE` or `vm.max_map_count`
-     (`deploy/systemd/90-nanovm.conf`), or lower `max_live_objects`.
+     `supervisor exited`: the supervisor died while the worker started.
+   - `max_live_objects = … needs about … file descriptors`, `… memory
+     mappings` or `… of address space`: raise `LimitNOFILE` or
+     `vm.max_map_count` (`deploy/systemd/90-nanovm.conf`), remove `LimitAS`, or
+     lower `max_live_objects` (`deploy/single-node/check-host.py` checks all
+     three).
    - `exited: signal: 9 (SIGKILL)` with a `[worker] memory_mb` set: the cgroup's
      OOM killer; raise it or lower `max_live_objects`/`limits.memory_mb`.
    - `loading <ref>: not signed by a trusted identity`, `version … is below the
      minimum`, registry errors: a deployment problem; move the tag back.
-   - `worker spec: …`: binary replaced under a running supervisor; restart it.
 2. Fix and send a request; the next start happens within a second.
 3. Requests in flight when a worker died got `502 worker-down`; their writes
    rolled back unless they had committed. Clients retry with operation ids.
