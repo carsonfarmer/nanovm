@@ -277,12 +277,12 @@ impl Supervisor {
         }
         let ids = match object {
             Some(o) => vec![o.to_owned()],
-            None => store.list(app).await?,
+            None => store.list(app).await?.into_iter().map(|(name, _)| name).collect(),
         };
         let mut done = vec![];
         for id in ids.iter().filter(|o| object.is_some() || crate::table::valid_object(o)) {
             anyhow::ensure!(crate::table::valid_object(id), "{id:?} is not an object id");
-            crate::ship::pause(&objects, id)?;
+            self.pause(app, id, &objects).await?;
             let restored = self.restore_object(&*store, app, id, &objects, to, discard).await;
             crate::ship::resume(&objects, id)?;
             let before = done.iter().map(|r: &crate::ship::Restored| r.object.as_str()).collect::<Vec<_>>().join(", ");
@@ -291,17 +291,26 @@ impl Supervisor {
         Ok(done)
     }
 
-    /// `restore` of one object, paused.
-    async fn restore_object(&self, store: &dyn crate::ship::Store, app: &str, id: &str, objects: &Path, to: Option<u64>, discard: bool) -> anyhow::Result<crate::ship::Restored> {
-        // Its instance, if it has one, stops; being paused, it starts no
-        // other, on this worker or the next.
+    /// Pauses object `id` of app `app` (under `objects`): its instance, if it
+    /// has one, stops, and it starts no other, on this worker or the next,
+    /// until `ship::resume` (see `ship::pause`).
+    pub async fn pause(&self, app: &str, id: &str, objects: &Path) -> anyhow::Result<()> {
+        crate::ship::pause(objects, id)?;
         let live = self.workers.lock().get(app).and_then(|w| w.live());
         if let Some(live) = live {
             let mut evict = get(&format!("/_nanovm/evict/{id}"));
             *evict.method_mut() = http::Method::POST;
-            let res = live.link.send(evict).await?;
-            anyhow::ensure!(res.status() == 204, "the app's worker answered {} to stopping the object", res.status());
+            let res = live.link.send(evict).await;
+            if !res.as_ref().is_ok_and(|r| r.status() == 204) {
+                crate::ship::resume(objects, id)?;
+                anyhow::bail!("the app's worker didn't stop the object: {:?}", res.map(|r| r.status()));
+            }
         }
+        Ok(())
+    }
+
+    /// `restore` of one object, paused.
+    async fn restore_object(&self, store: &dyn crate::ship::Store, app: &str, id: &str, objects: &Path, to: Option<u64>, discard: bool) -> anyhow::Result<crate::ship::Restored> {
         let key = format!("{app}/{id}");
         let grant = match &self.leases {
             None => None,
@@ -388,7 +397,37 @@ impl Supervisor {
                 let live = w.live();
                 serde_json::json!({ "app": w.name, "running": live.as_ref().map(|l| &l.digest), "pid": live.map(|l| l.pid) })
             }).collect()),
-            _ => bail!("unknown command {args:?}; the commands are: apps"),
+            // Recovery: see `restore` and `ship`.
+            ["restore", app, rest @ ..] => {
+                let discard = rest.contains(&"--discard-unshipped");
+                let (object, to) = match rest.iter().filter(|a| **a != "--discard-unshipped").collect::<Vec<_>>()[..] {
+                    [] => (None, None),
+                    [object] => (Some(*object), None),
+                    [object, version] => (Some(*object), Some(version.parse().context("a version is a number")?)),
+                    _ => bail!("restore <app> [<object> [<version>]] [--discard-unshipped]"),
+                };
+                let said = |r: &crate::ship::Restored| match r.head > r.version {
+                    true => format!("restored version {} as version {}, after the head; versions {} to {} stay in the store", r.version, r.head, r.version + 1, r.head - 1),
+                    false => format!("restored version {}, the head", r.version),
+                };
+                let done = self.restore(app, object, to, discard).await?;
+                Ok(done.iter().map(|r| serde_json::json!({ "object": r.object, "version": r.version, "head": r.head, "said": said(r) })).collect())
+            }
+            ["versions", at @ ..] => {
+                let store = self.capture.as_ref().context("this node has no store (capture.store)")?;
+                anyhow::ensure!(at.len() <= 2 && at.iter().all(|n| crate::table::valid_name(n)), "versions [<app> [<object>]]");
+                let listed = store.list(&at.join("/")).await?;
+                let [app, object] = at else { return Ok(listed.into_iter().map(|(name, _)| name).collect()) };
+                let mut versions: Vec<_> = listed.iter().filter_map(|(name, at)| Some((name.split_once('-')?.0.parse::<u64>().ok()?, at))).collect();
+                versions.sort();
+                let versions: Vec<_> = versions.into_iter().map(|(n, at)| serde_json::json!({ "version": n, "stored": at })).collect();
+                Ok(serde_json::json!({ "head": crate::ship::head(&**store, app, object).await?.0.sequence, "versions": versions }))
+            }
+            ["backlog"] => {
+                let objects = self.cfg.data_dir.join("objects");
+                Ok(serde_json::json!(tokio::task::spawn_blocking(move || crate::ship::backlog(&objects)).await?))
+            }
+            _ => bail!("unknown command {args:?}; the commands are: apps, restore, versions, backlog"),
         }
     }
 

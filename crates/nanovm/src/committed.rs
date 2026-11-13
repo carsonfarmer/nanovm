@@ -93,14 +93,15 @@ pub fn digest(path: &Path) -> io::Result<String> {
 
 // No independent mutable cursor: the contiguous immutable filenames are the
 // head. Returns the last sequence, and how many versions and bytes are here:
-// a shipper removes those it shipped but the last, maybe meanwhile.
+// a shipper removes those it shipped but the last, maybe meanwhile, in any
+// order, so this may see some of them and not others (B-503).
 fn head(dir: &Path) -> io::Result<(u64, u64, u64)> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0, 0)),
         Err(e) => return Err(e),
     };
-    let (mut count, mut first, mut last, mut bytes) = (0u64, u64::MAX, 0u64, 0u64);
+    let (mut count, mut last, mut bytes) = (0u64, 0u64, 0u64);
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
@@ -119,12 +120,8 @@ fn head(dir: &Path) -> io::Result<(u64, u64, u64)> {
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             len => len?.len(),
         };
-        count += 1;
-        (first, last) = (first.min(sequence), last.max(sequence));
+        (count, last) = (count + 1, last.max(sequence));
         bytes = bytes.checked_add(len).ok_or_else(|| invalid("capture size overflow"))?;
-    }
-    if count > 0 && count != last - first + 1 {
-        return Err(invalid("gap in committed versions"));
     }
     Ok((last, count, bytes))
 }

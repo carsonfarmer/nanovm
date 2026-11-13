@@ -70,8 +70,9 @@ pub trait Store: Send + Sync {
     /// Writes the record at `key` if it is still at `tag` (none: absent):
     /// its new version, or none if it has moved.
     async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>>;
-    /// The names one level under `prefix`.
-    async fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
+    /// The names one level under `prefix`, each with when it was stored
+    /// (seconds since 1970), for what has a time.
+    async fn list(&self, prefix: &str) -> io::Result<Vec<(String, Option<u64>)>>;
 }
 
 /// The store `cap` names, if any: a directory (`/path` or `file:///path`),
@@ -185,9 +186,9 @@ impl Store for Dir {
         .await?
     }
 
-    async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
-        let entries = entries(&self.0.join(prefix))?;
-        Ok(entries.into_iter().filter_map(|e| e.file_name().into_string().ok()).collect())
+    async fn list(&self, prefix: &str) -> io::Result<Vec<(String, Option<u64>)>> {
+        let time = |e: &std::fs::DirEntry| e.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs());
+        Ok(entries(&self.0.join(prefix))?.into_iter().filter_map(|e| Some((e.file_name().into_string().ok()?, time(&e)))).collect())
     }
 }
 
@@ -229,10 +230,11 @@ impl Store for Objects {
         }
     }
 
-    async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+    async fn list(&self, prefix: &str) -> io::Result<Vec<(String, Option<u64>)>> {
         let found = self.0.list_with_delimiter(Some(&prefix.into())).await.map_err(io::Error::other)?;
-        let paths = found.common_prefixes.into_iter().chain(found.objects.into_iter().map(|o| o.location));
-        Ok(paths.filter_map(|p| p.filename().map(str::to_owned)).collect())
+        let dirs = found.common_prefixes.into_iter().map(|p| (p, None));
+        let objects = found.objects.into_iter().map(|o| (o.location, Some(o.last_modified.timestamp() as u64)));
+        Ok(dirs.chain(objects).filter_map(|(p, time)| Some((p.filename()?.to_owned(), time))).collect())
     }
 }
 
@@ -613,6 +615,8 @@ pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path,
         }
         (n, digest) = (n - 1, version.parent);
     }
+    #[cfg(test)]
+    tests::cut()?;
     let volume = stage.join("volume");
     crate::committed::restore(&versions, &volume)?;
     if to == head.sequence {
@@ -630,6 +634,8 @@ pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path,
     }
     // Decided once all of it is durable.
     sync_fs(&stage)?;
+    #[cfg(test)]
+    tests::cut()?;
     std::fs::File::create(stage.join("ready"))?;
     crate::journal::sync(&stage)?;
     install(objects, object)?;
@@ -644,19 +650,30 @@ fn install(objects: &Path, object: &str) -> io::Result<()> {
     let (app, stage) = (open_dir(objects)?, staging(objects, object));
     let at = open_dir(&stage)?;
     let staged = |name: &str| statat(&at, name, AtFlags::SYMLINK_NOFOLLOW).is_ok();
+    #[cfg(test)]
+    let cut = tests::cut;
+    #[cfg(not(test))]
+    let cut = || io::Result::Ok(());
+    cut()?;
     remove_in(&app, "~journal", object)?;
+    cut()?;
     if staged("volume") {
         remove_at(&app, object.as_ref())?;
+        cut()?;
         renameat(&at, "volume", &app, object)?;
     }
+    cut()?;
     if staged("history") {
         let first = published(&stage.join("history"))?.0.first().copied();
         let first = first.ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "a restore without versions"))?;
         mark(&marker(&objects.join("~committed").join(object)), first)?;
+        cut()?;
         let committed = sub(&app, "~committed", owner(objects)?)?;
         remove_at(&committed, object.as_ref())?;
+        cut()?;
         renameat(&at, "history", &committed, object)?;
     }
+    cut()?;
     sync_fs(objects)?;
     std::fs::remove_dir_all(stage)
 }
@@ -713,6 +730,66 @@ fn sync_fs(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Cut points (see `cut`) to pass before one fails, as a crash there.
+        static CUT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// A point where a restore may be cut short, as by a crash: the
+    /// `CUT`-th one fails.
+    pub(super) fn cut() -> io::Result<()> {
+        CUT.with(|c| match c.get() {
+            Some(0) => Err(io::Error::other("cut")),
+            n => Ok(c.set(n.map(|n| n - 1))),
+        })
+    }
+
+    /// A restore cut short at each point, then the node restarted
+    /// (`recover`): before it was decided, the object is as it was, journal
+    /// and all; after, it is restored, as the version after the head, which
+    /// then ships. Either way nothing is left staged and nothing paused.
+    #[tokio::test]
+    async fn a_restore_cut_short_is_finished_or_undone() {
+        let base = tempdir("cut");
+        let store = Dir(base.join("store"));
+        let (data, objects) = (base.join("node"), base.join("node/objects/app"));
+        let dir = objects.join("~committed/o");
+        let text = || std::fs::read_to_string(objects.join("o/v")).unwrap();
+        for cut in 0.. {
+            let _ = std::fs::remove_dir_all(&base);
+            let mut parent = String::new();
+            for n in 1..=3 {
+                parent = version(&dir, n, 0, &parent, &format!("v{n}"));
+                ship_object(&store, None, "app", "o", &dir).await.unwrap();
+            }
+            std::fs::create_dir_all(objects.join("o")).unwrap();
+            std::fs::write(objects.join("o/v"), "v3").unwrap();
+            std::fs::create_dir_all(objects.join("~journal/o")).unwrap();
+            std::fs::write(objects.join("~journal/o/log"), "the old volume's").unwrap();
+            pause(&objects, "o").unwrap();
+            CUT.set(Some(cut));
+            let restored = restore(&store, "app", "o", &objects, Some(2), 0).await;
+            CUT.set(None);
+            recover(&data).unwrap();
+            assert!(!paused(&objects, "o") && !base.join("node/restore/app/o").exists(), "cut {cut}");
+            let decided = restored.is_ok() || cut >= 2;
+            let journal = objects.join("~journal/o/log").exists();
+            let history = published(&dir).unwrap().0;
+            match decided {
+                false => assert_eq!((text(), journal, history), ("v3".into(), true, vec![3]), "cut {cut}"),
+                true => assert_eq!((text(), journal, history), ("v2".into(), false, vec![3, 4]), "cut {cut}"),
+            }
+            ship_object(&store, None, "app", "o", &dir).await.unwrap();
+            assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 3 + u64::from(decided), "cut {cut}");
+            if let Ok(restored) = restored {
+                assert_eq!(restored, Restored { object: "o".into(), version: 2, head: 4 });
+                assert_eq!(cut, 9, "cut points");
+                break;
+            }
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     fn tempdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("nanovm-ship-{name}-{}", std::process::id()));
@@ -887,7 +964,7 @@ mod tests {
         async fn swap(&self, key: &str, bytes: Vec<u8>, tag: Option<&Tag>) -> io::Result<Option<Tag>> {
             self.store.swap(key, bytes, tag).await
         }
-        async fn list(&self, prefix: &str) -> io::Result<Vec<String>> {
+        async fn list(&self, prefix: &str) -> io::Result<Vec<(String, Option<u64>)>> {
             self.store.list(prefix).await
         }
     }
