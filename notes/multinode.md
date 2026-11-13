@@ -423,6 +423,18 @@ failed before its fix (the runs are in the commits) and is mutation-checked.
   (before: 24 quiet tries in 500 ms).
 - **N-729** a version up to the head's is marked when this copy has the
   head's version. `the_shipper_catches_up_a_marker_left_behind`.
+- **B-502** (recovery agent's) the supervisor, as root, marks, drops and
+  prunes in the app's directory, which the app's worker writes, by name from
+  descriptors opened with `O_NOFOLLOW` (`committed::dir_at`, `remove_at`):
+  a planted symlink is refused, never followed.
+  `the_supervisor_never_follows_a_symlink_the_app_planted` (before: the
+  discard deleted outside through `~journal`).
+- **B-507** (recovery agent's) the wait for the store's acknowledgement is
+  bounded by its own `ship::ACK` (2 s), never by the app's deadlines: a
+  commit runs in a `committing` phase whose deadline is the app's
+  post-return deadline plus `ACK`, and the guest's post-return clock starts
+  after it. `a_slow_acknowledgement_is_not_cut_short_by_the_apps_deadline`
+  (before: 504 "deadline exceeded while post-return").
 
 Mutation checks (`fix/r3-lease`; each removes one mechanism, the named test
 then fails; restored with `git checkout`, empty diff after):
@@ -441,10 +453,12 @@ then fails; restored with `git checkout`, empty diff after):
 | L10 | the instance start's call to `caught_up` | `nodes::a_write_answered_500_is_served_only_once_it_counts` |
 | L11 | the remembered broken history | `an_object_whose_history_is_broken_is_refused_without_asking_the_store_again` |
 | L12 | refusing `lease_ms = 0`; refusing stores nodes can't share; refusing `failover_ms` at the connect timeout (three mutations) | `configs_that_cannot_hold_leases_are_refused`, each time |
+| L13 | descriptors for `mark`, `discard` and the prune (paths again) | `the_supervisor_never_follows_a_symlink_the_app_planted` |
+| L14 | the `committing` phase (the commit under the post-return deadline again) | `a_slow_acknowledgement_is_not_cut_short_by_the_apps_deadline` (504) |
 
 L2–L9, L11 and L12 ran as three builds of independent mutations; in each
 only the named tests failed (`ship::`, `lease::`, `config::`, `proxy::`:
-37 tests).
+37 tests). L10 also fails `an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox`.
 
 **Shipper throughput** (`ship::tests::measure_remote_acks`, ignored; N
 objects each commit a version and wait for it, as a `remote_ack` commit
@@ -524,6 +538,13 @@ merge.
   `remote_ack` commit polls its marker every 2 ms. The permissions behind
   B-604 (a supervisor without `CAP_DAC_OVERRIDE` writing in app-owned
   directories) are the deployable agent's; failures now show in the log.
+  The shipper still reads versions by path (a planted symlink can make it
+  read another directory's); beta/recovery's identity check (a version must
+  name its own app and object) refuses what it reads that way. With the
+  capture store down, a node can't claim an object (as with the lease
+  store, N-181): an object whose actor has retired is refused (421) until
+  the store is back, and the proxy, retrying until `failover_ms`, answers
+  504 if its deadline lands during a try, 503 otherwise.
 
 ## Decisions for the owner (numbered, with a recommendation)
 

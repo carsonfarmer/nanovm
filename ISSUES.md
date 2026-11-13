@@ -550,13 +550,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** found by the second lease review (`review2/lease`, finding 1). `mark` wrote every object's marker through one fixed temporary file, `<objects>/~shipped/~new`. Every lease grant claims (and may restore and mark) its object, grants run concurrently, and the shipper marks too. A marker could then hold another object's sequence, or a mix: `stored` acknowledged versions the store never got, and `ship_object` skipped them; the losing rename failed with ENOENT, so that claim answered 503.
 - **Reproduced:** yes: `review_concurrent_claims_mark_each_object_its_own_head`, 66 and 41 of 320 claims wrong in two runs.
 - **Fix:** `mark` writes through `written` (a random name, created exclusively, synced), as `Dir::put` does, then renames.
-- **Status:** fixed on `fix/r3-lease` (dbb3cea)
+- **Status:** fixed on `fix/r3-lease` (dbb3cea). The marker is now written by descriptor, never through a symlink the app's worker could plant (B-502, the recovery agent's; c882871).
 
 ### N-721: a claim's discard cut short was taken for a current copy, served with no volume
 - **Where:** `ship.rs` (`current`, `discard`)
 - **Scenario:** review finding 2 (crash). `current` judged a copy only by its versions; `discard` removed the volume, then the versions with `remove_dir_all` (directory order), then the marker. A crash after the volume and the later versions were gone, but before the head's version, left a copy the next claim kept: the object was served with no volume. A crash after the versions but before the marker left a marker that acknowledged (and skipped shipping) the next versions.
 - **Reproduced:** yes: `review_a_discard_cut_short_is_not_taken_for_a_current_copy` (the copy was kept; the volume read failed with ENOENT).
-- **Fix:** a copy with versions is current only with its volume, which `discard` removes first; the marker goes before the versions, which go last. Wherever a discard stops, the next claim judges the copy as the first did, or (no versions left) as an empty copy.
+- **Fix:** a copy with versions is current only with its volume, which `discard` removes first; the marker goes before the versions, which go last. Wherever a discard stops, the next claim judges the copy as the first did, or (no versions left) as an empty copy. `discard` (and the shipper's prune) work by descriptor, never through a symlink the app's worker could plant (B-502; c882871).
 - **Status:** fixed on `fix/r3-lease` (b3cd8a3)
 
 ### N-722: a claim's discard wasn't durable before the claim made the copy count
@@ -585,7 +585,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** review finding 4. A write whose acknowledgement times out is answered 500 but stands on its node, which served it to later requests. If that node stopped before shipping it, the node taking over restored the head without it: clients read "one!" from A, then "zero" from B.
 - **Reproduced:** yes: `review_a_takeover_never_serves_older_state_than_was_served` (unit), `nodes::a_write_answered_500_is_served_only_once_it_counts` (integration: A served, 200, the write it had answered 504 for; the app's 1 s deadline ends the 2 s wait first, so such a write is answered 500 or 504).
 - **Fix:** with `remote_ack`, an instance starts only once every version published here counts in the store (`ship::caught_up`, waiting as a commit does, up to 2 s); otherwise the request gets 503 `not-stored` with `Retry-After: 1`. Instance start is the one place: a failed commit always ends its instance, and every instance (after a crash too, once recovery has settled a staged commit) passes there before the guest can read the volume. The wait holds the object's lease, so its shipper can ship meanwhile.
-- **Status:** fixed on `fix/r3-lease` (fb9f2e9)
+- **Status:** fixed on `fix/r3-lease` (fb9f2e9). The commit's wait for the store is bounded by its own 2 s (`ship::ACK`), never by the app's deadlines: a commit runs in a `committing` phase (B-507, the recovery agent's; 96d69dc), so such a write is answered 500 commit-failed, whatever the app's post-return deadline.
 
 ### N-726: a claim whose restore could never succeed was retried for every request, on every node
 - **Where:** `lease.rs` (`serve`)

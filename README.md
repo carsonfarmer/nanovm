@@ -48,8 +48,8 @@ what the node last wrote: a version costs a put and a head move. Shipped version
 here but the last. `max_versions` and `max_mb` bound what waits here: with the store
 down, writes are refused once they are reached; nothing is silently dropped. A
 commit is acknowledged once durable here unless `remote_ack = true`, which also
-waits (2 s at most, then fails the request: the commit still stands locally) for the
-head to name its version, and then serves the object nothing (503 `not-stored`,
+waits (2 s at most, whatever the app's deadlines, then fails the request with 500: the
+commit still stands locally) for the head to name its version, and then serves the object nothing (503 `not-stored`,
 `Retry-After: 1`) until every version here counts, so no client sees state the store
 doesn't have. With `leases` a `store` is required (in a config file, `leases` and
 `store` must be object stores every node shares, not memory, `file:` or a directory),
