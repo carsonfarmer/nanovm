@@ -4121,6 +4121,27 @@ async fn after_work_that_panics_lets_a_slow_client_read_the_whole_answer() {
     assert_eq!(get(&node, "a", "/files").await.json(), files(1, &["answered"]));
 }
 
+/// A streamed body whose writer returns an error breaks off for the client,
+/// rather than ending as if whole, and what the writer wrote rolls back, as
+/// on a panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_body_whose_writer_fails_breaks_off_and_rolls_back() {
+    use http_body_util::BodyExt;
+    let node = sdk_after("sdk_after_cut");
+    let res = node.dispatch("a", http::Request::get("http://localhost/cut").body(bytes::Bytes::new()).unwrap()).await;
+    assert_eq!(res.status(), 200);
+    let (mut body, mut data) = (res.into_body(), Vec::new());
+    let end = loop {
+        match body.frame().await {
+            Some(Ok(frame)) => data.extend_from_slice(&frame.into_data().unwrap_or_default()),
+            end => break end.map(|e| e.map(drop)),
+        }
+    };
+    assert_eq!(data, b"partial");
+    assert!(matches!(end, Some(Err(_))), "the body ended as if whole: {end:?}");
+    assert_eq!(get(&node, "a", "/files").await.json(), files(1, &["answered"]));
+}
+
 /// What the host holds for a guest's header maps stays within its memory
 /// limit: a map holds at most 64 KiB (its own, or a copy of one it was sent;
 /// bigger heads are refused before it), and an instance holds no more

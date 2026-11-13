@@ -327,7 +327,7 @@ pub struct Response {
 /// What writes a streamed body ([`Response::stream`]); taken once.
 #[derive(Clone)]
 #[allow(clippy::type_complexity)]
-struct Writer(std::rc::Rc<std::cell::Cell<Option<Box<dyn FnOnce(Body) -> std::pin::Pin<Box<dyn Future<Output = ()>>>>>>>);
+struct Writer(std::rc::Rc<std::cell::Cell<Option<Box<dyn FnOnce(Body) -> std::pin::Pin<Box<dyn Future<Output = Result<()>>>>>>>>);
 
 impl fmt::Debug for Writer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -374,10 +374,12 @@ impl Response {
     /// stopped and what it changed since answering rolls back. `body` starts
     /// as the handler returns: what it changes before the node has taken the
     /// answer (as it takes the first piece) commits with the answer, the
-    /// rest once it ends. Set `content-length` if you know it; without one
-    /// the body is chunked.
-    pub fn stream<F: Future<Output = ()> + 'static>(content_type: &str, body: impl FnOnce(Body) -> F + 'static) -> Response {
-        let writer: Box<dyn FnOnce(Body) -> std::pin::Pin<Box<dyn Future<Output = ()>>>> = Box::new(|b| Box::pin(body(b)));
+    /// rest once it ends. If `body` returns an error, the client sees the
+    /// body break off, not end, and what was changed since answering rolls
+    /// back, as when it panics. Set `content-length` if you know it; without
+    /// one the body is chunked.
+    pub fn stream<F: Future<Output = Result<()>> + 'static>(content_type: &str, body: impl FnOnce(Body) -> F + 'static) -> Response {
+        let writer: Box<dyn FnOnce(Body) -> std::pin::Pin<Box<dyn Future<Output = Result<()>>>>> = Box::new(|b| Box::pin(body(b)));
         let mut response = Response::new(200).header("content-type", content_type);
         response.writer = Some(Writer(std::rc::Rc::new(std::cell::Cell::new(Some(writer)))));
         response
@@ -431,10 +433,18 @@ impl Response {
 
     /// The response as `wasip3`'s, and the future that resolves once it is out.
     fn answer(mut self) -> core::result::Result<(wit::Response, FutureReader<core::result::Result<(), wit::ErrorCode>>), wit::ErrorCode> {
+        let (trailers, end) = wit_future::new(|| Ok(None));
         let body = match self.writer.and_then(|w| w.0.take()) {
             Some(writer) => {
                 let (tx, rx) = wit_stream::new();
-                wasip3::spawn_local(writer(Body(tx)));
+                wasip3::spawn_local(async move {
+                    // Its body is closed by now; then come its trailers, or
+                    // (on `Ok`, dropped) its end.
+                    if let Err(Error(why)) = writer(Body(tx)).await {
+                        let _ = trailers.write(Err(wit::ErrorCode::InternalError(Some(why.clone())))).await;
+                        after(async move { panic!("the response body failed: {why}") });
+                    }
+                });
                 rx
             }
             None => {
@@ -444,7 +454,7 @@ impl Response {
             }
         };
         let headers = fields(&self.headers)?;
-        let (response, out) = wit::Response::new(headers, Some(body), no_trailers());
+        let (response, out) = wit::Response::new(headers, Some(body), end);
         let _ = response.set_status_code(self.status);
         Ok((response, out))
     }

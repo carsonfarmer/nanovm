@@ -1442,10 +1442,13 @@ async fn gateway_streams_completions_within_quotas() {
     http_body_util::BodyExt::frame(&mut body).await.unwrap().unwrap();
     drop(body);
     assert_eq!(usage(&app).await, 105);
-    // So does one the upstream breaks off: what came of it is no measure.
+    // So does one the upstream breaks off (which breaks off this answer
+    // too): what came of it is no measure.
     let res = complete(&app, "cut 3").await;
-    let text = http_body_util::BodyExt::collect(res.into_body()).await.map(|b| b.to_bytes()).unwrap_or_default();
-    let text = String::from_utf8_lossy(&text);
+    let (mut body, mut text) = (res.into_body(), String::new());
+    while let Some(Ok(frame)) = http_body_util::BodyExt::frame(&mut body).await {
+        text += &String::from_utf8_lossy(&frame.into_data().unwrap_or_default());
+    }
     assert!(text.matches("token").count() == 3 && !text.contains("[DONE]"), "{text}");
     assert_eq!(usage(&app).await, 205, "not refunded as if 3 tokens were all of it");
     // So does one that outlives post_return_timeout_ms: its refund rolls back.

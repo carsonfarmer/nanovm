@@ -1,9 +1,9 @@
-//! Test-only app on nanovm-sdk: work after the answer (`after`) and how it
-//! fails. Never published.
+//! Test-only app on nanovm-sdk: work after the answer (`after`, a streamed
+//! body) and how it fails. Never published.
 use std::cell::Cell;
 use std::time::Duration;
 
-use nanovm_sdk::{Request, Response, Result, after, data};
+use nanovm_sdk::{Error, Request, Response, Result, after, data};
 
 nanovm_sdk::serve!(handle);
 
@@ -52,6 +52,18 @@ async fn handle(req: Request) -> Result {
         "/big-panic" => {
             after(async { panic!("after work failed at once") });
             return Ok(Response::text("x".repeat(1 << 20)));
+        }
+        // A streamed body that changes something after the answer, then
+        // fails. The node takes a first piece as it takes the answer, a
+        // second only once the client has read the first: after the
+        // answer's commit.
+        "/cut" => {
+            return Ok(Response::stream("text/plain", |mut body| async move {
+                body.write("part").await;
+                body.write("ial").await;
+                mark("streamed").await;
+                Err(Error::new("the stream broke off"))
+            }));
         }
         _ => return Ok(Response::not_found()),
     }
