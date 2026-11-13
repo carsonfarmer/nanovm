@@ -41,11 +41,12 @@ writes before the handler answers commits with the answer. The object
 then waits for every waitUntil promise, those registered meanwhile
 included, before its next request; what they write after the answer
 commits once all have settled. If one rejects, whenever it does, or they
-can never settle or outlive `post_return_timeout_ms`, that is logged
-(`Uncaught (in waitUntil) …`), the writes after the answer roll back and
-the instance is replaced; the answer and what was written before it
-stand. This is Rust's `after`, in the main README's "Commits"); WebSocket handlers `webSocketOpen` (return `false` to
-refuse), `webSocketMessage` and `webSocketClose`, with `ws.send`,
+can never settle, that is logged (`Uncaught (in waitUntil) …`); if they
+outlive `post_return_timeout_ms`, the node logs the deadline. Either way
+the writes after the answer roll back and the instance is replaced; the
+answer and what was written before it stand. This is Rust's `after`, in
+the main README's "Commits"); WebSocket handlers `webSocketOpen` (return
+`false` to refuse), `webSocketMessage` and `webSocketClose`, with `ws.send`,
 `ws.close(code)` and `ws.subscribe(channel)`. An uncaught exception fails
 the request and rolls back its writes. Bodies are whole (no streams), one
 module (bundle imports first), no `performance`.
