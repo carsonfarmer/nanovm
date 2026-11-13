@@ -214,18 +214,19 @@ impl Supervisor {
         let weak = Arc::downgrade(&sup);
         sup.telemetry.snapshots(move || {
             let Some(sup) = weak.upgrade() else { return };
-            sup.telemetry.snapshot(vec![
+            let mut fields = vec![
                 ("process.memory.usage".into(), (rss_bytes() as i64).into()),
                 ("process.uptime".into(), sup.started.elapsed().as_secs_f64().into()),
-            ]);
+            ];
             if sup.capture.is_some() {
                 let b = sup.backlog.lock();
-                sup.telemetry.snapshot(vec![
+                fields.extend([
                     ("nanovm.capture.waiting.versions".into(), (b.versions as i64).into()),
                     ("nanovm.capture.waiting.bytes".into(), (b.bytes as i64).into()),
                     ("nanovm.capture.waiting.objects".into(), (b.objects as i64).into()),
                 ]);
             }
+            sup.telemetry.snapshot(fields);
             let workers: Vec<_> = sup.workers.lock().values().cloned().collect();
             for w in workers {
                 let live = w.live();

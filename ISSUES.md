@@ -505,6 +505,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix (proposed):** say in the README that `post_return_timeout_ms` bounds the remote-ack wait, or run the wait outside the instance's deadline. Multi-node behaviour, left as it is here.
 - **Status:** open
 
+### B-508: the admin socket can't be bound under a long `data_dir` (for `beta/objects`)
+- **Where:** `admin.rs` (`listen` binds `<data_dir>/admin/socket` by path)
+- **Scenario:** reproduced in this worktree: `a_cached_compile_is_used_without_reading_the_component` and `jailed_workers_export_otel_without_guest_network_access` fail at `Supervisor::new` (`binding …/admin/socket`): their socket paths are 109 and 110 bytes, past `sun_path`'s 108. A node whose `data_dir` is long doesn't start. Not this branch's code; recorded for the objects agent.
+- **Fix (proposed):** bind relative to the admin directory (or through `/proc/self/fd/<dir>/socket`), and have the client do the same.
+- **Status:** open (`beta/objects`)
+
 ### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
 - **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
 - **Scenario:** found by the quality agent while writing D-52. The node's linker defines every WASIp2 interface, including `wasi:filesystem@0.2` and `wasi:sockets@0.2`, and the WASIp2 filesystem shares the `WasiCtx`'s read-write preopens. A guest using `std::fs` links (`instantiate_pre` succeeds). Today `ALLOWED_IMPORTS` refuses it at load, by name, so nothing is exploitable; but that check is the single layer between a guest and writes to `/data` that bypass the quota and the journal (no rollback). Sockets have a second layer (wasmtime's default address check denies every address).

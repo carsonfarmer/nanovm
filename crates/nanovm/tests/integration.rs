@@ -236,7 +236,9 @@ async fn writes_go_on_through_a_store_outage_and_ship_in_order_after() {
     // A big file in the volume, which a snapshot would copy whole.
     assert_eq!(request(&node, "PUT", "o", "/kv/big", &"b".repeat(200 << 10)).await.status, 204);
     assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], 1);
-    eventually("shipped", || head("o") == 2).await;
+    // Shipped, and marked so (just after the head moves).
+    let objects = cfg.data_dir.join("objects");
+    eventually("shipped", || head("o") == 2 && nanovm::ship::backlog(&objects).versions == 0).await;
     // The store goes away: a file where its directory was.
     std::fs::rename(&store, &down).unwrap();
     std::fs::write(&store, "down").unwrap();
@@ -248,7 +250,6 @@ async fn writes_go_on_through_a_store_outage_and_ship_in_order_after() {
             assert_eq!(request(&node, "POST", "p", "/incr", "").await.json()["count"], 1);
         }
     }
-    let objects = cfg.data_dir.join("objects");
     let backlog = nanovm::ship::backlog(&objects);
     assert_eq!((backlog.versions, backlog.objects), (60, 2));
     println!("{} bytes wait to be shipped", backlog.bytes);
