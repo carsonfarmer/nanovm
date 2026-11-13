@@ -505,6 +505,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** round-3 review S2 asked that a node keep what main's build left in its data directory: a capture main had decided but not published, and main's whole-volume versions without an epoch. 7d03ade built that: recovery adopted main's staged capture, and versions were read in main's format as well as this one. Separately, M4 (3acd297) judged a session record without `lease_ms` by the taker's own.
 - **Status:** not supported, see AGENTS.md rule 1: there is exactly one version of nanovm, v1. All three were removed on `fix/no-compat`. A version says `"format": 1` and is read only so; a log is refused unless its first block is the `nanovmj1` tag and a key; a session record without `lease_ms` doesn't parse and is refused. Operators start from a fresh data directory.
 
+### N-550 (docs): README understated the memory mappings a worker needs threefold
+- **Where:** README "Host requirements on Linux"; `engine.rs` (`MAPS_PER_OBJECT`, `preflight`)
+- **Scenario:** found by the ops agent. README said about 8 mappings per pool slot (65,530 fits roughly 7,600 objects; 8,000 need 68,352). `preflight` has required `24 × (max_live_objects + 32) + 4096` since `c504f29`: the default 65,530 fits about 2,500 objects, and the demo's 8,000 need 196,864. An operator sizing from README got a worker that refuses to start.
+- **Reproduced:** from source (the arithmetic in `preflight`); the host here has 1,048,576 and is shared, so the default was not tried.
+- **Status:** fixed on `ideas/systemd-units` (README line and `deploy/systemd/90-nanovm.conf`); on round 3 with `beta/deployable`
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

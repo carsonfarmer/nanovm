@@ -604,10 +604,12 @@ Every scenario completed with 0 failed requests.
 The supervisor and each worker check these at startup and refuse to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
 
 - **File descriptors:** each live object holds 2 (`/data` and `/tmp`). The check needs about `2 × max_live_objects + 1024`. The worker raises its soft limit to the hard limit itself, before it jails itself; the demo's 8,000 objects per app need `ulimit -n` of at least 17,088.
-- **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 8,000 needs `sysctl -w vm.max_map_count=68352` or more.
+- **Memory mappings:** about 24 per pool slot (`engine::MAPS_PER_OBJECT`) plus 4,096. The default `vm.max_map_count` of 65,530 fits about 2,500 objects per app; 8,000 needs `sysctl -w vm.max_map_count=196864` or more.
 - **Address space:** the engine reserves each pool slot's 4 memories (`memory_reservation_mb` + 64 KiB each), stacks and tables up front, about 522 GiB at the defaults. Under `ulimit -v` or `LimitAS=` below that, `nanovm serve` refuses to start with the number; remove the limit or lower `max_live_objects` or `memory_reservation_mb`.
 - **The jail** needs Landlock (Linux 5.13+) and seccomp. A separate uid per app needs the supervisor to run as root.
 - **Don't run with `RUST_BACKTRACE` set.** wasmtime then captures a stack backtrace for every guest-visible error. That includes routine ones, like reading a file that doesn't exist yet. With it set, warm throughput across 1,000 objects fell from 63K/s to 23K/s.
+
+[deploy/systemd](deploy/systemd) has hardened units for the node and the proxy, a sysctl drop-in and an optional cgroup v2 drop-in, tested under systemd 255.
 
 ## Tests
 
