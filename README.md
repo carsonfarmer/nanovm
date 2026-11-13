@@ -532,8 +532,8 @@ and its answer one line, `{"ok": …}` or `{"error": "…"}`, which the CLI prin
 | `delete <app> <object>` | Deletes one object's data on this node, and what the node shipped of it (see below). |
 | `delete-app <app>` | Deletes all of an app's data on this node (its objects, scratch and compile cache), and what it shipped. |
 
-`<app>` is the app's name on the node, as `apps` lists it and as its directory
-under `objects/` is named. A delete first drains and stops the app's worker, as a
+`<app>` is the app's name on the node: its directory's name under `objects/`, and
+how `apps` lists it once it has run since the node started. A delete first drains and stops the app's worker, as a
 version switch does: requests in flight finish, new ones wait, and nothing of the
 app is live, mid-commit or being shipped. Then what the node shipped to
 `capture.store` goes (every key under `<app>/<object>/`, or `<app>/`: the head and
@@ -830,7 +830,8 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 | Path | What it is |
 |---|---|
 | `crates/nanovm/src/engine.rs` | Engine config, pooling allocator, epoch ticker, `.cwasm` cache |
-| `crates/nanovm/src/app.rs` | Component loading and the linker |
+| `crates/nanovm/src/app.rs` | Component loading and the linker; an app's objects: where each is, how many, and whether there is room for another |
+| `crates/nanovm/src/admin.rs` | The operator's control path: the supervisor's admin socket and `nanovm admin` |
 | `crates/nanovm/src/object.rs` | The per-object actor: instance lifecycle, limits, CPU accounting, heavy lanes, poisoning |
 | `crates/nanovm/src/table.rs` | The node: one app, object id → actor, LRU and idle eviction |
 | `crates/nanovm/src/quota.rs` | Per-mount byte and file quotas over WASIp3 filesystem calls |
