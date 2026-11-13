@@ -760,6 +760,22 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Proposal:** the proxy's private listener answers `GET /ask?domain=<host>` with 200 when `hosts` matches it, so Caddy's `on_demand_tls { ask … }` can use one list.
 - **Status:** open
 
+### B-701: the Rust SDK has its own `Request` and `Response` (owner decision: use the `http` crate's)
+- **Where:** `sdk/rust/src/lib.rs`, `fetch.rs` (was `http.rs`), `ws.rs`; every Rust app (`examples/`, `js/runtime`)
+- **Scenario:** the SDK's `Request`, `Response`, `Reply` and `Fetch` builder (about 300 lines) duplicated `http::Request`/`Response`, unfamiliar to Rust developers who know `http` from hyper, axum or Spin.
+- **Fix:** handlers take `http::Request<Body>` and return `http::Response<Body>`; `fetch` and object calls take and return them too. Conversions are `wasip3`'s `http-compat`. `Body` is bytes or a response's stream; `RequestExt` adds `query` and `cookie`. The old types are deleted, no aliases. N-710's and N-713's fixes (work after the answer waits for it to be out; a streamed body's writer can fail) are carried over: `Body::stream`'s writer returns `Result<()>`. examples/echo and `echo_maps_requests_and_responses_both_ways` check the mapping both ways through a node. Evidence: notes/sdk-http.md.
+- **Status:** done on `sdk/http-types` (sdk-http agent)
+
+### B-702: the `http` crate adds 43–69 KB to every Rust app
+- **Where:** guest components
+- **Scenario:** against 7b3f9c6, composed components grow +43 KB (hello, +12.7%) to +69 KB (oauth, +15.1%); +2.9–3.4% for apps with SQLite. A linker map puts it in `http` itself: `HeaderName::from_bytes`' table of standard names (16.9 KB), URI and `HeaderMap` code (about 13 KB), `bytes` (about 4 KB). Building requests without `http_from_wasi_request` already took 11.8 KB back.
+- **Status:** accepted with B-701 (the cost of the crate; notes/sdk-http.md has the numbers)
+
+### B-703: `fetch` of a request with a `host` header fails
+- **Where:** `sdk/rust/src/fetch.rs`
+- **Scenario:** from source: `wasi:http` forbids a `host` header on an outgoing request, so an app that forwards an incoming request's headers (they include `host`) gets an error. `wasip3`'s `http_into_wasi_request` moves `host` into the URI's authority; the SDK builds its request itself (it sets `content-length` and sends no body for an empty one) and doesn't.
+- **Status:** open (low)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

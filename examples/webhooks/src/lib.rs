@@ -14,7 +14,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
-use nanovm_sdk::{Request, Response, Result, fetch, kv, serde_json};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, Result, fetch, kv, serde_json};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -41,27 +43,27 @@ struct Delivery {
     error: Option<String>,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     let now = now()?;
-    Ok(match (req.method(), req.path()) {
-        ("PUT", "/config") => match req.json::<Config>() {
+    Ok(match (req.method().as_str(), req.uri().path()) {
+        ("PUT", "/config") => match req.body().json::<Config>() {
             Ok(c) if !c.secret.is_empty() && c.targets.iter().all(|t| t.starts_with("http")) && c.targets.len() <= 10 => {
                 kv::set("config", serde_json::to_vec(&c)?).await?;
-                Response::new(204)
+                Response::builder().status(204).body(Body::empty())?
             }
-            _ => Response::text("{\"secret\", \"targets\": up to 10 URLs}\n").status(400),
+            _ => text(400, "{\"secret\", \"targets\": up to 10 URLs}\n")?,
         },
         ("POST", "/in") => {
-            let Some(config) = kv::get("config").await? else { return Ok(Response::not_found()) };
+            let Some(config) = kv::get("config").await? else { return text(404, "not found") };
             let config: Config = serde_json::from_slice(&config)?;
-            if !signed(&config.secret, req.header("x-hub-signature-256").unwrap_or_default(), req.body()) {
-                return Ok(Response::text("bad signature\n").status(401));
+            if !signed(&config.secret, header(&req, "x-hub-signature-256").unwrap_or_default(), req.body()) {
+                return text(401, "bad signature\n");
             }
             let id = kv::increment("next", 1).await?;
             let delivery = Delivery {
                 id,
-                body: req.text()?.into(),
-                content_type: req.header("content-type").unwrap_or("application/json").into(),
+                body: req.body().text()?.into(),
+                content_type: header(&req, "content-type").unwrap_or("application/json").into(),
                 pending: config.targets,
                 done: vec![],
                 tries: 0,
@@ -74,7 +76,7 @@ async fn handle(req: Request) -> Result {
             nanovm_sdk::after(async move {
                 let _ = deliver(delivery).await;
             });
-            Response::json(format!(r#"{{"id":{id}}}"#)).status(202)
+            json(202, format!(r#"{{"id":{id}}}"#))?
         }
         ("POST", "/retry") => {
             let mut retried = 0;
@@ -84,10 +86,10 @@ async fn handle(req: Request) -> Result {
                     retried += 1;
                 }
             }
-            Response::json(format!(r#"{{"retried":{retried}}}"#))
+            json(200, format!(r#"{{"retried":{retried}}}"#))?
         }
-        ("GET", "/deliveries") => Response::json(serde_json::to_string(&all().await?)?),
-        _ => Response::not_found(),
+        ("GET", "/deliveries") => json(200, serde_json::to_string(&all().await?)?)?,
+        _ => text(404, "not found")?,
     })
 }
 
@@ -96,21 +98,19 @@ async fn handle(req: Request) -> Result {
 async fn deliver(mut d: Delivery) -> Result<()> {
     let mut failed = vec![];
     for target in std::mem::take(&mut d.pending) {
-        let sent = fetch(target.as_str())
-            .method("POST")
-            .header("content-type", &d.content_type)
-            .header("x-relay-delivery", d.id.to_string())
-            .body(d.body.as_str())
-            .send()
-            .await;
+        let request = Request::post(target.as_str()).header(CONTENT_TYPE, d.content_type.as_str());
+        let sent = match request.header("x-relay-delivery", d.id).body(d.body.as_str()) {
+            Ok(request) => fetch(request).await.map_err(|e| format!("{e:?}")),
+            Err(e) => Err(e.to_string()),
+        };
         match sent {
-            Ok(r) if (200..300).contains(&r.status) => d.done.push(target),
+            Ok(r) if r.status().is_success() => d.done.push(target),
             Ok(r) => {
-                d.error = Some(format!("{target}: {}", r.status));
+                d.error = Some(format!("{target}: {}", r.status().as_u16()));
                 failed.push(target);
             }
             Err(e) => {
-                d.error = Some(format!("{target}: {e:?}"));
+                d.error = Some(format!("{target}: {e}"));
                 failed.push(target);
             }
         }
@@ -122,6 +122,11 @@ async fn deliver(mut d: Delivery) -> Result<()> {
         d.next_at = now()? + (1000u64 << (d.tries - 1).min(10));
     }
     save(&d).await
+}
+
+/// Header `name`, if it is text.
+fn header<'a>(req: &'a Request<Body>, name: &str) -> Option<&'a str> {
+    req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
 /// `signature` is `sha256=` and the hex HMAC-SHA256 of `body` under `secret`;
@@ -151,4 +156,14 @@ async fn all() -> Result<Vec<Delivery>> {
 
 fn now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64)
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

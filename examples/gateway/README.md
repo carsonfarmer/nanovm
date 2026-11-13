@@ -24,8 +24,8 @@ What it shows:
 - **A quota per user, exact.** Each user is an object (`/{user}/`), so
   "check, then spend" can't race, however many requests a user sends at
   once.
-- **Streaming through.** `fetch(..).stream()` reads the upstream's answer as
-  it is generated and `Response::stream` passes each piece on at once,
+- **Streaming through.** `fetch_streaming(..)` reads the upstream's answer as
+  it is generated and `Body::stream` passes each piece on at once,
   counting tokens on the way. The count parses the Server-Sent Events
   across reads (an event ends at a blank line, wherever the network split
   it; LF, CRLF or CR line ends), not substrings of each read: an event cut
@@ -41,8 +41,11 @@ What it shows:
   OpenAI's API does), else the token events seen. A stream that ends
   without `[DONE]` keeps its reservation. A stream cut off
   by the client, the deadline or the upstream (its body breaks off:
-  `Streaming::next` is an error, not an end) keeps its reservation; an
-  upstream error status is answered `502` before anything is reserved.
+  `Streaming::next` is an error, not an end) keeps its reservation. An
+  upstream that breaks off breaks the client's stream off too (the stream
+  returns that error), so the client can tell a cut answer from a whole
+  one. An upstream error status is answered `502` before anything is
+  reserved.
 - **Streams hold their object.** While a user's completion streams, their
   other requests wait; other users are not held up. Long completions need a
   `post_return_timeout_ms` to match.
