@@ -322,10 +322,12 @@ impl Proxy {
         if name != caller {
             return Err((StatusCode::BAD_GATEWAY, format!("{host} serves another app now")));
         }
-        let pq = parts.uri.path_and_query().map_or("", |p| p.as_str()).strip_prefix("/objects").unwrap_or_default().to_owned();
-        let Some((object, _)) = crate::table::route(&pq) else {
+        // The object is the path's; the query goes on with it.
+        let path = parts.uri.path().strip_prefix("/objects").unwrap_or_default().to_owned();
+        let Some((object, _)) = crate::table::route(&path) else {
             return Err((StatusCode::BAD_REQUEST, crate::table::BAD_OBJECT.into()));
         };
+        let pq = parts.uri.query().map_or_else(|| path.clone(), |q| format!("{path}?{q}"));
         let theirs: Vec<_> = parts.headers.keys().filter(|k| k.as_str().starts_with("nanovm-") && *k != crate::egress::CALLERS).cloned().collect();
         for k in theirs {
             parts.headers.remove(k);

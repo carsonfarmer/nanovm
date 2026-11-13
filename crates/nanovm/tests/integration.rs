@@ -4797,6 +4797,29 @@ mod nodes {
         assert_eq!(holder(&store, &app, &y).await.0, names[1], "the call crossed to y's node");
     }
 
+    /// A call to an object's root with a query and no slash after its id
+    /// (`http://nanovm/objects/{id}?…`) reaches the object on another node,
+    /// as it does on one node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_cross_node_root_calls_accept_a_query_without_a_trailing_slash() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let _a = serve(leased("root_calls_a", &la, private.local_addr().unwrap()), la, store.clone()).await;
+        let _b = serve(leased("root_calls_b", &lb, private.local_addr().unwrap()), lb, store.clone()).await;
+        let published = publish("nodes-root-calls", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "root.test", &published).await;
+        let (x, y) = (homed(&names, &app, &names[0]), homed(&names, &app, &names[1]));
+        let url = format!("http://nanovm/objects/{y}?v=1").replace('?', "%3F").replace('=', "%3D");
+        let (status, body) = get(proxy, "root.test", &format!("/{x}/fetch?url={url}")).await;
+        assert_eq!(status, 200, "{body}");
+        let r: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(r["status"], 200, "{r}");
+        assert!(r["body"].as_str().unwrap().contains(&format!(r#""object":"{y}""#)), "{r}");
+        assert_eq!(holder(&store, &app, &y).await.0, names[1], "the call crossed to y's node");
+    }
+
     /// An object calls an object on another node, through the proxy, which
     /// commits there; a call back to the caller is refused at once (508),
     /// though the wait it would close is on another node.
