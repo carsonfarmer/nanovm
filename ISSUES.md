@@ -457,6 +457,48 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix (proposed):** a pointer object to the last shipped snapshot, written after it, and retention of versions before the second-last snapshot.
 - **Status:** in part on `fix/lease-r3fix`: the object's head names its last version, and a restore follows parent digests back from it to the last snapshot, fetching only those. Retention (deleting versions before the second-last snapshot) remains.
 
+### B-500: recovery was offline and whole-node only (beta audit)
+- **Where:** `scripts/backup.py` (restic), `ship.rs`, `supervisor.rs`
+- **Scenario:** backup needed the node stopped; restore replaced the whole root, so every tenant lost what it wrote since the snapshot; the store that shipping fills had no restore command; no restore of one app or object.
+- **Fix:** shipping every committed version to `capture.store` is the backup; restic and `scripts/backup.py` are gone (AGENTS.md rule 1: no old way kept for its own sake). `nanovm admin … restore <app> [<object> [<version>]]` restores into a running node through the operator socket: the object is paused (`ship::pause`; `503 object-restoring`; its instance stopped through the worker), its unshipped versions shipped, the version fetched and checked, staged under `<data_dir>/restore/`, decided (`ready`) and installed with the journal; a version older than the head becomes the version after it. `ship::recover` finishes or drops a restore a crash cut short, at supervisor start. `versions` and `backlog` commands. Evidence: `notes/beta-recovery.md`.
+- **Status:** fixed on `beta/recovery`
+
+### B-501: a store outage became a write outage after 16 versions, and its backlog copied the volume every 16
+- **Where:** `committed.rs` (`prepare`), `config.rs` (`CaptureConfig`)
+- **Scenario:** with `remote_ack` off (one node), an object's writes were refused once 16 versions waited (`max_versions`): a 16-write outage of the store. And every 16th version was a snapshot of the whole volume, so a long outage's backlog grew with the volume's size, not with what was written.
+- **Fix:** `max_versions` is gone; `max_mb` (bytes, per object) bounds what waits. A scheduled snapshot is skipped while more than `snapshot_every` versions wait. The backlog is visible (`admin backlog`, `nanovm.capture.waiting.*`, a log line when it starts, every minute, when it ends). `remote_ack` (several nodes) is unchanged. Test: `writes_go_on_through_a_store_outage_and_ship_in_order_after` (60 writes with the store down, then everything ships in order; snapshots only at 1 and 17); mutation-checked (a 16-version bound back; snapshots every 16 regardless).
+- **Status:** fixed on `beta/recovery`
+
+### B-502: the supervisor, root, wrote through paths in an app's directory, which the app's worker controls
+- **Where:** `ship.rs` (`restore` staged under `objects/<app>/~restore/`; `mark`; `discard`; supervisor's `restored` chown)
+- **Scenario (from source):** with leases, a claim restored an object as root by writing the store's versions to `objects/<app>/~restore/<object>/<n>.tar` with `create_dir_all` and `fs::write`, which follow symlinks. A compromised worker (uid of its app) owns `objects/<app>` and can make `~restore` a symlink: root then creates directories and writes the app's own bytes under a path of the worker's choosing outside the jail. `mark` (`~shipped/~new`, written with `fs::write`) and `discard` (`remove_dir_all` through an intermediate symlink) have the same shape for every node with a store.
+- **Fix:** a restore stages under `<data_dir>/restore/<app>/<object>` (no jail reaches it), is given to the app's uid there, and is installed by descriptor (`openat` with `O_NOFOLLOW` at each name, `renameat`, `remove_at`), as are the directories it makes. `mark` and `discard` are left to the `r3-lease` fix (`fix/r3-lease` rewrites both): they should open `~shipped` and the object's directories the same way.
+- **Status:** fixed for restore on `beta/recovery`; `mark`/`discard` open (with `fix/r3-lease`)
+
+### B-503: a commit could fail with "gap in committed versions" while the shipper pruned
+- **Where:** `committed.rs` (`head`)
+- **Scenario:** reproduced by `restores_an_object_and_an_app_into_a_running_node`: an app writing steadily while its versions shipped got `500 commit-failed: gap in committed versions` at its 25th write. The shipper removes shipped versions (all but the last) while the worker lists the directory; a listing can see some removed ones and not others (in any order), which `head` took for a gap.
+- **Fix:** `head` takes the last version it sees and doesn't require the others to be contiguous (nothing else can make a gap: versions are published in order, and only the shipper removes them). Test: `a_commit_goes_on_past_versions_pruned_out_of_order`; mutation-checked.
+- **Status:** fixed on `beta/recovery`
+
+### B-504: the shipper shipped a version naming another app or object as this one's
+- **Where:** `ship.rs` (`ship_object`)
+- **Scenario (from source):** the shipper (root) read `~committed/<object>/<n>.tar`, which the worker writes, and checked only its sequence, parent and epoch. A compromised worker could put there (or symlink to) a version of another object, or another app's, and have it shipped and restored as its own.
+- **Fix:** a version ships only if its identity names this app and object; a restore checks the same of each version it fetches. Test: `a_version_naming_another_object_is_not_shipped`; mutation-checked.
+- **Status:** fixed on `beta/recovery`
+
+### B-505: a fresh node pointed at an existing store serves its objects empty until they are restored
+- **Where:** `ship.rs`, `object.rs`
+- **Scenario:** with one node there is no claim before serving, so a node started on an empty root with the store of a lost node serves each object empty; a write then makes version 1, which can't ship (the head is further on), so it waits until `max_mb` and the object's writes are refused. The runbook says to restore with ingress off.
+- **Fix (proposed):** an object with no history here asks the store for its head before its first instance (as a claim does with leases), restoring it if the store has one. It costs a store round trip per cold start of an object never written here (N-183's cost); an owner decision.
+- **Status:** open
+
+### B-506 (efficiency): restoring an older version fetches every version after it
+- **Where:** `ship.rs` (`restore`)
+- **Scenario:** the version to restore is found by following parent digests back from the head, so every version between it and the head is fetched whole; only their identities (the first 4.5 KiB of each) are needed.
+- **Fix (proposed):** a ranged read of each version's identity on the way back.
+- **Status:** open
+
 ### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
 - **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
 - **Scenario:** found by the quality agent while writing D-52. The node's linker defines every WASIp2 interface, including `wasi:filesystem@0.2` and `wasi:sockets@0.2`, and the WASIp2 filesystem shares the `WasiCtx`'s read-write preopens. A guest using `std::fs` links (`instantiate_pre` succeeds). Today `ALLOWED_IMPORTS` refuses it at load, by name, so nothing is exploitable; but that check is the single layer between a guest and writes to `/data` that bypass the quota and the journal (no rollback). Sockets have a second layer (wasmtime's default address check denies every address).
@@ -577,7 +619,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-5: data lifecycle (planning)
 - **What:** a plan for deleting an app's or an object's data, exporting a volume, backups and retention, and how each is authorized (likely through the proxy).
-- **Status:** offline backup/restore done in `fab908c` with validated main follow-through. Restic snapshots retain journals under app admission locks; only complete snapshots are tagged, and restore requires an exact ID and new destination. Real jailed SQL/file/KV crash recovery into a fresh root passes unprivileged and as root, including another write/restart. Six mutations caught; full suite, ten SQL tests, Python CLI tests, demo, benchmark and adversarial review pass. Host runtime unchanged at 5,085; tooling adds 89 lines. README defines offline authorization, ownership/deployment records, retention guidance and old-writer fencing. Deletion API, live snapshots, automated retention and actual off-node deployment remain open; no active file ownership after main integration.
+- **Status (2026-11-13, `beta/recovery`):** backup is continuous shipping to `capture.store`; restore of one object (to its head or an earlier version) or of an app's objects runs in a running node through the operator socket (`nanovm admin … restore`, `versions`, `backlog`), authorized as root on the node's host (B-500). The offline restic backup below is gone. Remaining: retention in the store (N-166), auto-restore on a fresh node (B-505), deletion (`beta/objects`). Earlier: offline backup/restore done in `fab908c` with validated main follow-through. Restic snapshots retain journals under app admission locks; only complete snapshots are tagged, and restore requires an exact ID and new destination. Real jailed SQL/file/KV crash recovery into a fresh root passes unprivileged and as root, including another write/restart. Six mutations caught; full suite, ten SQL tests, Python CLI tests, demo, benchmark and adversarial review pass. Host runtime unchanged at 5,085; tooling adds 89 lines. README defines offline authorization, ownership/deployment records, retention guidance and old-writer fencing. Deletion API, live snapshots, automated retention and actual off-node deployment remain open; no active file ownership after main integration.
 
 ### W-6: JS and Python guests
 - **What:** guests built with componentize-js and componentize-py, running the same endpoints as `counter`, to prove the host for other languages.

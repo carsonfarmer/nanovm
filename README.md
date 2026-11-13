@@ -13,7 +13,8 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
 **Current scope (2026-11-08):** single-node durable acceptance and rejected-request
-rollback, tested offline backup/restore, and opt-in local committed-state capture.
+rollback, opt-in committed-state capture, and backup by shipping every committed
+version to a store, with restore of one object or app into a running node.
 Shipping committed versions to a store, and with several nodes remote
 acknowledgement and restore on takeover (below), are tested in process, not yet in
 production. One node acknowledges a write once it is durable on its own disk.
@@ -43,8 +44,9 @@ an in-process node) ships each object's versions in order. Each is put once at
 once the object's head, `<app>/<object>/head`, names it; the head moves one version
 at a time, each following the last, by a write conditional on the head read
 (`If-Match`; a lock and a rename on a directory store). Shipped versions are removed
-here but the last. `max_versions` and `max_mb` bound what waits here: with the store
-down, writes are refused once they are reached; nothing is silently dropped. A
+here but the last. `max_mb` bounds, in bytes, what waits here for each object: with
+the store down, writes go on until it is reached, then are refused; nothing is
+silently dropped (see [Backup and restore](#backup-and-restore)). A
 commit is acknowledged once durable here unless `remote_ack = true`, which also
 waits (2 s at most, then fails the request: the commit still stands locally) for the
 head to name its version; with `leases` a `store` is required, and a config file's
@@ -54,10 +56,10 @@ ships only under its live lease, once it has claimed the head with it, versions 
 follow the head: a node that lost the object can't make a version count, however
 late its upload lands (W-90). The claim also makes the node's copy of the object the
 head's, restoring it from the store if need be, so a takeover never serves state
-older than the head. `nanovm::ship::restore` rebuilds an object from the store on a
-fresh root, from the last snapshot before the head, and keeps its last version, so
-history goes on. Capture defaults off. Not yet: remote retention (every version
-stays in the store). Do not manually prune history or
+older than the head. `nanovm admin … restore` rebuilds an object, or an app's
+objects, from the store in a running node (see [Backup and restore](#backup-and-restore)).
+Capture defaults off. Not yet: remote retention (every version stays in the store).
+Do not manually prune history or
 disable capture on a root with history. Tests exercise both commit gates,
 process-exit and failed-sync recovery, history exhaustion, random change sequences
 restored at every version, shipping, outages and restore on a fresh root; these do
@@ -421,84 +423,98 @@ Sockets are indexed by object within each app; a publish visits that object's so
 
 ## Backup and restore
 
-`python3 scripts/backup.py` is an **offline, operator-only** wrapper around
-[restic](https://restic.readthedocs.io/en/stable/). It adds no runtime endpoint or
-host dependencies. Install Python 3.9+, restic 0.14+ and GNU coreutils on Linux.
-Restic supplies encryption, authenticated content, deduplication and remote
-repository support; nanovm supplies the app-lock boundary and restore drill.
+**The backup is the store.** With `[capture]` and a `store` (a directory on
+another disk, `file:///path`, or `s3://bucket/prefix`), a node ships every
+committed version of every object there, as it commits, while it serves: there is
+no backup to schedule and nothing to stop. Turn capture on before the node takes
+its first write: an object is in the store from its first commit with capture on.
 
-1. Stop ingress, drain requests if possible, then stop the supervisor and **all**
-   embedded writers. Disable automatic restarts for the entire backup. Holding
-   existing app locks rejects lingering owners but cannot prevent a supervisor
-   creating a new app. `--stopped` acknowledges this operational requirement;
-   it does not stop processes. Keep the directory inodes stable.
-2. Configure `RESTIC_REPOSITORY` and a securely stored `RESTIC_PASSWORD_FILE`
-   (use absolute paths). Initialize a repository with `restic init` once. Use
-   root for root-run jailed volumes; use the same UID for an unprivileged node.
-   The repository must be outside the data root; off-node storage is needed
-   to survive losing the node or disk. Store the password separately: losing
-   it makes the encrypted backup unrecoverable. No credentials go into git.
-3. Run `python3 scripts/backup.py backup /srv/nanovm --stopped`. Save its full
-   snapshot ID and the deployment record. The wrapper locks all app directories
-   before invoking restic and reads **all of `objects/`**, including `~journal`
-   logs and retained files. Never exclude or manually clear journals: tentative
-   data can remain after a crash. Scratch, compilation caches and registry caches
-   are deliberately omitted. Only exit-zero backups receive the wrapper's
-   completion tag; an incomplete restic snapshot is not an approved recovery point.
-4. Run `python3 scripts/backup.py restore FULL_SNAPSHOT_ID /srv/nanovm-restored`
-   with the repository credentials. The destination's parent must exist and be
-   trusted; the destination itself must not exist, even as an empty directory or
-   symlink. Restore verifies file contents and syncs the destination filesystem
-   before returning success. On error, an incomplete destination may remain:
-   do not serve it, and retry into another new root. Restore only trusted
-   repositories; completion tags are an operational convention, not authorization
-   against someone with repository write credentials.
-5. Reinstall the **same nanovm build**, restore operator configuration, and point
-   `data_dir` at the fresh root. Preserve numeric app UIDs/GIDs and the original
-   `jail_uid_base` for root-run nodes. Keep the same app identity (DNS record owner
-   plus repository), immutable OCI manifest digests, trust policy and guest config.
-   Save those deployment records and ensure the signed OCI artifacts remain
-   available separately: a data snapshot is not a deployment/package backup.
-   The worker recovers the saved undo logs on first object access. Exercise reads
-   and a new write/restart before switching ingress. **Fence the old node first**;
-   a copied volume does not make two writers safe.
-
-The snapshot recovers local committed state at quiescence, not external effects,
-open sockets or lost publishes. Writes after the snapshot are outside its recovery
-point. This is not live backup, point-in-time recovery, synchronous replication or
-automatic failover. Keep several independently checked recovery points; choose
-retention and `restic forget/prune` policy explicitly rather than deleting the
-last known-good backup automatically. Run `restic check --read-data` periodically
-and after repository transfer; encrypted storage is still sensitive tenant data.
-Remote upload performance, backend durability and a second physical host have not
-been tested here.
-
-The executable drill uses the existing composed SQL/KV fixture: commit values,
-kill a jailed worker after tentative SQL/file/KV writes, stop its supervisor,
-back up, move the original root away, restore into a fresh root without caches,
-verify rollback through HTTP, and write/restart again. Run it after building the
-SQLite fixture with `bash experiments/sqlite-filesystem/build.sh --compose`:
-
-```sh
-env -u RUST_BACKTRACE cargo test --locked -p nanovm --test integration \
-  sqlite_backup_restores_into_a_fresh_root -- --ignored --nocapture
-python3 -m unittest discover -s scripts -p test_backup.py -v
-sudo python3 -m unittest discover -s scripts -p test_backup.py -v
+```toml
+[capture]
+store = "s3://my-bucket/nanovm"   # credentials and region from AWS_*
+max_mb = 256                      # what may wait here per object, store down
 ```
 
-The Python checks use disposable repositories to cover active-owner refusal,
-incomplete backups, missing repository content, journals, empty directories,
-numeric ownership/modes and refusal to overwrite existing destinations. The
-root invocation checks UID/GID preservation; the unprivileged one induces a real
-permission-denied backup. Neither touches an operator's existing volumes.
-The complete real-process drill also passes as root with jailed worker UIDs.
-Six deliberate mutations are caught, including omitted journals and final sync.
-Recovery delivery's main CI passed; its parallel branch run exposed an unrelated
-max-app admission fixture race (N-43). That fixture now gates observed upstream
-requests instead of assuming short guest sleeps survive cold startup.
-CI runs both privilege variants of the CLI tests and the SQL restore drill;
-orb setup installs restic idempotently. Runtime size remains 5,085 lines, with
-89 additional operator-tool lines counted separately.
+- **What a lost node loses** is what it had committed but not yet shipped: with
+  the store up, the versions of the last few tens of milliseconds. `nanovm admin
+  … backlog` says what waits now (versions, bytes, objects); the supervisor's
+  snapshots carry it (`nanovm.capture.waiting.*`), and its log says when versions
+  start to wait, every minute while they do, and when none does again. With
+  `remote_ack = true` a write is answered only once it is in the store (the
+  default with several nodes).
+- **A store outage is not a write outage.** A node that answers once a write is
+  durable on its own disk (`remote_ack` off, the default with one node) goes on
+  committing; each object's unshipped versions may take up to `max_mb` (256 MiB)
+  here before its writes are refused. During an outage versions are changes, not
+  copies of the volume (a scheduled snapshot is skipped while more than
+  `snapshot_every` versions wait), so the backlog grows with what is written. Size
+  the disk for it: per object, its `disk_mb` volume, up to twice that more while a
+  request runs (the journal), and `max_mb` in an outage. When the store is back,
+  everything ships in order. Writes refused at `max_mb` answer `500 commit-failed`
+  and roll back.
+- **Retention:** the store keeps every version (nothing deletes them yet), so any
+  version can be restored. When retention comes (N-166), a version stays
+  restorable while the store keeps it, the snapshot before it and every version
+  after it.
+
+**Restore into a running node.** Run on the node's host, as the node's user
+(root), through the node's [control socket](#operator-commands):
+
+```sh
+nanovm admin --config /etc/nanovm/nanovm.toml versions                    # apps in the store
+nanovm admin --config /etc/nanovm/nanovm.toml versions <app>              # its objects
+nanovm admin --config /etc/nanovm/nanovm.toml versions <app> <object>     # head, versions, when stored
+nanovm admin --config /etc/nanovm/nanovm.toml restore <app> <object>      # to its head
+nanovm admin --config /etc/nanovm/nanovm.toml restore <app> <object> 41   # to version 41
+nanovm admin --config /etc/nanovm/nanovm.toml restore <app>               # each object to its head
+```
+
+`<app>` is the app's name on the node (`apps` lists them; it names the
+directory under `objects/`). A restore:
+
+1. pauses the object: its instance stops once what is queued for it is served,
+   and it answers `503 object-restoring` until the restore ends. The app's other
+   objects, and other apps, keep serving.
+2. ships what the object committed here that the store doesn't have, so no
+   acknowledged write is lost. If the store refuses it, the restore stops and says
+   so; `--discard-unshipped` drops it instead.
+3. fetches the version from the store, back from the head to the last snapshot
+   before it, checking each against the SHA-256 its key names (a damaged or
+   foreign version is refused and nothing changes), and rebuilds the volume beside
+   the node's data, outside every worker's reach.
+4. replaces the object's volume, its journal (whose undo was for the old volume)
+   and its versions here, all at once, and resumes it.
+
+**Going back makes a new version.** Restoring version 41 of an object whose head
+is 50 makes version 51, with 41's contents, after the head: the head only moves
+forward, versions 42 to 50 stay in the store (restore 50 to undo the restore), and
+the command says so. Restoring the head rebuilds the object from the store and
+makes no version. With leases, a restore takes the object's lease first and is
+refused while another node holds it: run it on that node.
+
+**A crash during a restore** (of the supervisor, or the machine) leaves the object
+as it was if the restore wasn't decided yet; once decided, the supervisor finishes
+it when it next starts, before any worker serves. Either way nothing stays paused.
+
+**A lost node** is replaced by a fresh one with the same configuration and an
+empty `data_dir`: keep ingress off, run `restore <app>` for each app (`versions`
+lists them), then open ingress. Until then the fresh node would serve those
+objects empty. Fence the old node first: two nodes writing one object's history is
+refused by the store, but the second one's writes are lost. The runbook is
+[notes/recovery-runbook.md](notes/recovery-runbook.md); the evidence,
+[notes/beta-recovery.md](notes/beta-recovery.md).
+
+Tests: `restores_an_object_and_an_app_into_a_running_node` (two apps under a
+supervisor, through `nanovm admin`, one writing throughout; a version going back,
+the head over a damaged volume, a whole app, a paused object, refused names and a
+damaged version in the store, an unshippable local version),
+`a_restore_cut_short_is_finished_or_undone` (a crash at each of 9 points),
+`writes_go_on_through_a_store_outage_and_ship_in_order_after`,
+`an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox`, and
+`sqlite_restores_a_lost_node_from_the_store` (a SQLite app's worker killed
+mid-request, the node's data deleted, a fresh node restored from the store: the
+committed rows, file and key, not the cut-short ones; then a write that survives a
+restart).
 
 ## Operator commands
 
@@ -513,6 +529,9 @@ and its answer one line, `{"ok": …}` or `{"error": "…"}`, which the CLI prin
 | Command | What it does |
 |---|---|
 | `apps` | The apps this node knows, with the version and pid of each running worker. |
+| `restore <app> [<object> [<version>]] [--discard-unshipped]` | Restores an object, or each of an app's objects, from the store (see [Backup and restore](#backup-and-restore)). |
+| `versions [<app> [<object>]]` | The apps in the store, an app's objects, or an object's head and versions. |
+| `backlog` | What waits on this node to be shipped: versions, bytes, objects. |
 
 ## Commits
 

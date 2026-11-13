@@ -5009,6 +5009,43 @@ mod nodes {
         assert_eq!((head["sequence"].as_u64(), head["node"].as_str()), (Some(2), Some(names[1].as_str())));
     }
 
+    /// With leases, an object is restored on the node holding it: the restore
+    /// takes its lease and claims its head, going back to an older version as
+    /// the version after the head. The other node refuses to restore it while
+    /// it is held. The proxy then serves the restored object, and its history
+    /// goes on from the restore.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_object_is_restored_on_the_node_holding_it() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("restore_leased_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("restore_leased_b", &lb, private.local_addr().unwrap());
+        let shipped = PathBuf::from(cfg_a.capture.as_ref().unwrap().store.clone().unwrap());
+        let a = serve(cfg_a, la, store.clone()).await;
+        let b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-restore", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "restore.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let head = || serde_json::from_slice::<nanovm::ship::Head>(&std::fs::read(shipped.join(&app).join(&object).join("head")).unwrap()).unwrap();
+        for v in ["one", "two", "three"] {
+            assert_eq!(get(proxy, "restore.test", &format!("/{object}/commit?v={v}")).await.0, 200);
+        }
+        let before = head();
+        assert_eq!(before.node, names[0]);
+        let args = |a: &[&str]| a.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let e = b.command(&args(&["restore", &app, &object, "1"])).await.unwrap_err();
+        assert!(format!("{e:#}").contains(&format!("Held(\"{}\")", names[0])), "{e:#}");
+        let done = a.command(&args(&["restore", &app, &object, "1"])).await.unwrap();
+        assert_eq!((&done[0]["version"], &done[0]["head"]), (&1.into(), &(before.sequence + 1).into()), "{done}");
+        assert_eq!(get(proxy, "restore.test", &format!("/{object}/commit")).await, (200, r#"{"file":"one","key":"one"}"#.into()));
+        assert_eq!(get(proxy, "restore.test", &format!("/{object}/commit?v=four")).await.0, 200);
+        let after = head();
+        assert_eq!((after.sequence, after.node.as_str()), (before.sequence + 2, names[0].as_str()));
+        assert!(after.lease > before.lease, "taken again after the restore: {after:?}");
+    }
+
     /// Node A answers a request and works on after answering; meanwhile it
     /// is cut off from the lease store. Its lease runs out, so it refuses the
     /// object's requests, and node B takes the lease and serves them. A's
