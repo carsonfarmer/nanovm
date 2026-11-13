@@ -2505,8 +2505,10 @@ mod tests {
         j.commit().unwrap();
         drop(j);
         let root = |name: &str| std::env::temp_dir().join(format!("nanovm-w90-{name}-{}", std::process::id()));
-        let objects_b = root("b");
-        let _ = std::fs::remove_dir_all(&objects_b);
+        // As a node lays them out, `<data_dir>/objects/<app>`: a restore
+        // stages in `<data_dir>/restore`.
+        let objects_b = root("b").join("objects/app");
+        let _ = std::fs::remove_dir_all(root("b"));
         std::fs::create_dir_all(&objects_b).unwrap();
         let (b, b_obj) = take("b", std::time::Duration::from_secs(10), &objects_b).await;
         assert!(!ship(&a, &va).await.unwrap(), "shipped without the lease");
@@ -2527,7 +2529,7 @@ mod tests {
         let vc = crate::app::object_dir(&third, "o").join(VOLUME);
         assert_eq!(tree(&vc), tree(&vb));
         assert_eq!(std::fs::read(vc.join("a")).unwrap(), b"B'sst world");
-        for d in [objects_a.parent().unwrap(), &objects_b, &root("c")] {
+        for d in [objects_a.parent().unwrap(), &root("b"), &root("c")] {
             std::fs::remove_dir_all(d).unwrap();
         }
     }
