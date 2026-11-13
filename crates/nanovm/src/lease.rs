@@ -165,9 +165,8 @@ impl Leases {
 
     /// Takes the lease on `key` (`<app>/<object>`), at the next epoch,
     /// unless another node's live session holds it. The grant is in the
-    /// session this began in, so only while that is still this node's and
-    /// live when the store has answered: it can have ended meanwhile, and
-    /// the object been taken over.
+    /// session this began in, which can end while the store answers: it
+    /// holds only while `until` has a deadline for it.
     pub async fn acquire(&self, key: &str) -> std::result::Result<Grant, Refused> {
         let Own { id, until, .. } = self.session.lock().clone();
         if until <= mono_ns() {
@@ -192,10 +191,7 @@ impl Leases {
             };
             // Any grant this node held on it before is over.
             self.held.lock().remove(key);
-            return match self.until(&grant) {
-                Some(_) => Ok(grant),
-                None => Err(Refused::Unavailable("this node's session ended while it took the lease".into())),
-            };
+            return Ok(grant);
         }
         Err(Refused::Unavailable(format!("{key}'s lease keeps changing")))
     }
@@ -377,7 +373,8 @@ pub async fn serve<B: http_body::Body<Data = bytes::Bytes>>(
         leases.release(&key, &grant).await;
         return res.status(503).body(format!("claiming {key}: {e}").into()).unwrap();
     }
-    // The grant with the `until` of its own session, never another's.
+    // The grant with the `until` of its own session, never another's: the
+    // session it was taken in may have ended while the store answered.
     let Some(until) = leases.until(&grant) else { return res.status(503).body("this node's session ended".into()).unwrap() };
     let body = serde_json::to_vec(&(&grant, grant.session, until)).expect("grants serialize");
     leases.hold(&key, grant);

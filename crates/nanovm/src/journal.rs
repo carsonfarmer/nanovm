@@ -1277,7 +1277,9 @@ mod tests {
         let before = tree(&w);
         let mut j = Journal::open(&w, 1 << 30, obj.clone(), None).unwrap();
         change(&mut j, &w);
-        session.set(1, mono_ns());
+        // The lease lapses: the node's session is over, a new one begun (a
+        // session's deadline never moves back).
+        session.set(2, mono_ns() + 60_000_000_000);
         assert!(j.commit().is_err());
         let x = volume();
         assert!(Journal::open(&x, 1 << 30, obj.clone(), None).unwrap().commit().is_err(),
