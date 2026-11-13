@@ -71,11 +71,11 @@ fn disk(path: &Path) -> anyhow::Result<Disk> {
 }
 
 fn volume(root: &Path, id: &str) -> PathBuf {
-    root.join("objects/stress").join(id)
+    nanovm::app::object_dir(&root.join("objects/stress"), id).join("data")
 }
 
 async fn request(node: &Arc<Node>, root: &Path, id: &str, path: &str) -> anyhow::Result<load::Reply> {
-    let journal = root.join("objects/stress/~journal").join(id);
+    let journal = nanovm::app::object_dir(&root.join("objects/stress"), id).join("journal");
     let mut peak = Disk::default();
     let mut samples = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(10));
@@ -238,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
         digest: "local-hostile".into(),
         env: Default::default(),
         config: Default::default(),
+        secrets: Default::default(),
         worker: Default::default(),
         limits: serde_json::from_value(json!({"memory_mb":64,"cpu_ms":60000,
             "request_timeout_ms":120000,"disk_mb":16,"max_files":12010,"max_resources":256}))?,

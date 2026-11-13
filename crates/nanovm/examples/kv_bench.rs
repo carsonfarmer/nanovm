@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
         digest: "bench".into(),
         env: Default::default(),
         config: Default::default(),
+        secrets: Default::default(),
         worker: Default::default(),
         limits: serde_json::from_value(
             serde_json::json!({"memory_mb":32,"cpu_ms":5000,"request_timeout_ms":10000,"disk_mb":16,"max_files":10000}),

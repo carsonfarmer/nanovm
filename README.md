@@ -5,7 +5,7 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 - Each `(app, object-id)` has exactly one live instance, which serves one request at a time.
 - Each object has its own memory cap, CPU budget, deadlines and handle cap.
 - Each object has its own quota'd filesystem: scratch `/tmp` and a persistent `/data` volume.
-- Each app has an egress allowlist.
+- Each app has an egress allowlist, within the operator's.
 - Each object has a composed Spin KV store in its volume, and each app its host-injected `wasi:config` values.
 - Objects accept WebSockets and publish to their own sockets.
 - Memory is lost on eviction; `/data` survives eviction and restarts.
@@ -13,7 +13,8 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 Apps are signed artifacts in OCI registries. A proxy finds each host's app in DNS; each app runs in its own jailed worker process, under a supervisor that runs no guest code and owns the network (see [The jail](#the-jail)). [PLAN.md](PLAN.md) has the design and what comes next.
 
 **Current scope (2026-11-08):** single-node durable acceptance and rejected-request
-rollback, tested offline backup/restore, and opt-in local committed-state capture.
+rollback, opt-in committed-state capture, and backup by shipping every committed
+version to a store, with restore of one object or app into a running node.
 Shipping committed versions to a store, and with several nodes remote
 acknowledgement and restore on takeover (below), are tested in process, not yet in
 production. One node acknowledges a write once it is durable on its own disk.
@@ -33,8 +34,8 @@ gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 version at both dirty commit gates: the whole volume every `snapshot_every` (16)
 versions, otherwise what the commit changed (listings of changed directories, new
 or moved files whole, files changed in place as their changed byte ranges). Versions
-are staged before the journal's commit decision and published under
-`objects/<app>/~committed/<object>/`; recovery discards a rejected one or completes
+are staged before the journal's commit decision and published in the object's
+directory, under `committed/`; recovery discards a rejected one or completes
 an accepted one before new work. A commit with capture costs 2 more syncs. With
 `store` set (a directory, `file:///path`, or an object store URL as for `leases`,
 e.g. `s3://bucket/prefix`, credentials and region from `AWS_*`), the supervisor (or
@@ -45,8 +46,9 @@ once the object's head, `<app>/<object>/head`, names it; the head moves one vers
 at a time, each following the last, by a write conditional on the head read
 (`If-Match`; a lock and a rename on a directory store), read once and then moved from
 what the node last wrote: a version costs a put and a head move. Shipped versions are removed
-here but the last. `max_versions` and `max_mb` bound what waits here: with the store
-down, writes are refused once they are reached; nothing is silently dropped. A
+here but the last. `max_mb` bounds, in bytes, what waits here for each object: with
+the store down, writes go on until it is reached, then are refused; nothing is
+silently dropped (see [Backup and restore](#backup-and-restore)). A
 commit is acknowledged once durable here unless `remote_ack = true`, which also
 waits (2 s at most, whatever the app's deadlines, then fails the request with 500: the
 commit still stands locally) for the head to name its version, and then serves the object nothing (503 `not-stored`,
@@ -62,10 +64,10 @@ head's, restoring it from the store if need be, so a takeover never serves state
 older than the head; a discard the claim makes is synced before the claim counts and
 is never taken for a current copy if cut short. A claim that finds the object's
 history broken in the store (a version missing) refuses the object on that node for a
-minute without asking the store again. `nanovm::ship::restore` rebuilds an object from the store on a
-fresh root, from the last snapshot before the head, and keeps its last version, so
-history goes on. Capture defaults off. Not yet: remote retention (every version
-stays in the store). Do not manually prune history or
+minute without asking the store again. `nanovm admin … restore` rebuilds an object, or an app's
+objects, from the store in a running node (see [Backup and restore](#backup-and-restore)).
+Capture defaults off. Not yet: remote retention (every version stays in the store).
+Do not manually prune history or
 disable capture on a root with history. Tests exercise both commit gates,
 process-exit and failed-sync recovery, history exhaustion, random change sequences
 restored at every version, shipping, outages and restore on a fresh root; these do
@@ -74,7 +76,8 @@ not certify physical power loss or remote hosts.
 ## Build an app
 
 One command builds and runs an app on your machine, one publishes it. Rust apps use
-[nanovm-sdk](sdk/rust/README.md) (one async function from a request to a response);
+[nanovm-sdk](sdk/rust/README.md) (one async function from an `http::Request` to an
+`http::Response`, the `http` crate's types);
 JavaScript apps are a Workers-style module ([js/](js/README.md)). Once:
 
 ```bash
@@ -102,7 +105,7 @@ machine: loopback only, no registry, signature or jail. `nanovm publish hello.wa
 ghcr.io/you/hello:1.0.0` checks the app as a node will, pushes it as nodes pull it ([Apps](#apps)),
 and prints how to sign it and the TXT record that routes a host to it.
 [examples/chat](examples/chat) is a live multi-room chat on the same SDK. A recorded run and the
-reasons for each choice: [notes/onramp.md](notes/onramp.md). Twenty-two more examples, from a URL
+reasons for each choice: [notes/onramp.md](notes/onramp.md). Twenty-three more examples, from a URL
 shortener to a job queue, each with an end-to-end test: [notes/examples.md](notes/examples.md).
 
 ## SQLite beta
@@ -219,6 +222,31 @@ Every attack in the storm, and how it ended:
 | fetch cloud metadata (169.254.169.254) | denied (not on the allowlist) |
 | allowlisted name that resolves to 127.0.0.1 | denied by the resolved-IP check (in this sandbox, which has no DNS, it fails to resolve instead; the `localhost` integration test covers the IP check) |
 
+## Deploy and operate
+
+To run a single-node beta for a few trusted developers, follow
+[deploy/single-node](deploy/single-node/README.md), the operator guide: TLS
+(Caddy), the proxy, the node, the capture store and backups, limits and
+observability, with links to the runbooks for everything after.
+
+| Path | What it is |
+|---|---|
+| [deploy/single-node](deploy/single-node/README.md) | the operator guide, `install.sh`, `check-host.py`, the Caddyfile, sizing, an end-to-end test |
+| [deploy/systemd](deploy/systemd/README.md) | hardened units, the sysctl, cgroup and store drop-ins, reference configs, a test in systemd-nspawn |
+| [deploy/container](deploy/container/README.md) | a Dockerfile for the node and the proxy, run flags, reference configs, a local test |
+| [deploy/monitoring](deploy/monitoring/README.md) | Prometheus alerts and recording rules, with promtool tests |
+| [docs/ops/runbooks.md](docs/ops/runbooks.md) | upgrade, rollback, backup and restore, disk full, crash loops, Collector outage; [drills](docs/ops/drills) reproduce them |
+| [docs/ops/errors.md](docs/ops/errors.md) | every `x-nanovm-error` reason; `errors-check.sh` triggers them |
+| [tools/release](tools/release/README.md) | release packaging and notes; the release workflow ships disabled until the owner approves it |
+| [tools/bench-history](tools/bench-history/README.md) | `bench --quick` per commit, compared and charted by a nightly workflow |
+| [experiments/fs-matrix](experiments/fs-matrix/README.md) | durable writes on ext4, XFS and btrfs, with and without `discard` (measured before round 3) |
+
+`crates/nanovm/tests/configs.rs` loads every config shipped here (and every
+app's `nanovm.json`) with the loaders the binary uses, so a renamed key fails a
+test instead of an operator's start. Evidence: [notes/ops.md](notes/ops.md)
+(the ops branches) and [notes/beta-deployable.md](notes/beta-deployable.md)
+(the same on round 3).
+
 ## The jail
 
 ```
@@ -241,10 +269,11 @@ A worker reads its config and component from stdin, then jails itself while it s
   - limits can be read, never raised
   - `fcntl` for descriptor flags and OFD file locks, plus `flock`: no `F_SETOWN` or `F_SETSIG`, which would have the kernel signal another process of the same uid
   - `socketpair` for a local stream pair only: a datagram socket could `sendto` any named or abstract socket on the host
+  - `fstatfs`, for the free space the node keeps in reserve
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
-- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker runs in a cgroup of its own, `<cgroup>/worker-<n>`, which it enters before it runs and which is removed once it has exited, also when its supervisor goes without waiting for it. The node refuses to start if `cgroup` is not a cgroup v2 directory or another node uses it, and at startup removes only the `worker-<n>` cgroups an earlier run left, killing what still runs in them. The node's `[worker]` memory, CPU and pids limits are set on a worker's cgroup before the worker is given its app, and they cover the whole process: also the engine a worker builds before it has an app (about 2 KiB a slot of `max_live_objects`, half of it kernel memory for the stacks' mappings: 19 MiB in all at 8,192 slots), since memory stays charged to the cgroup a process was in when it allocated it. A `memory_mb` below what a worker holds when it is given its app would OOM-kill it, so that start is refused, saying so.
+- **cgroup v2** (on by default; see [Limits](#limits)). Each worker runs in a cgroup of its own, `<cgroup>/worker-<n>`, which it enters before it runs and which is removed once it has exited, also when its supervisor goes without waiting for it. The node refuses to start if `cgroup` is not a cgroup v2 directory or another node uses it, and at startup removes only the `worker-<n>` cgroups an earlier run left, killing what still runs in them. The node's `[worker]` memory, CPU and pids limits are set on a worker's cgroup before the worker is given its app, and they cover the whole process: also the engine a worker builds before it has an app (about 2 KiB a slot of `max_live_objects`, half of it kernel memory for the stacks' mappings: 19 MiB in all at 8,192 slots), since memory stays charged to the cgroup a process was in when it allocated it. A `memory_mb` below what a worker holds when it is given its app would OOM-kill it, so that start is refused, saying so.
 
 Mount and network namespaces were left out on purpose: Landlock already confines the filesystem, and with no `socket()` there is no network to remove.
 
@@ -266,24 +295,58 @@ The in-process benchmark below measures the node inside a worker, and is unchang
 `nanovm proxy --config proxy.toml` is the public front door. It finds the app a request's host serves in a TXT record at `_nanovm.<host>`:
 
 ```
-app=ghcr.io/org/app:prod; trust=<issuer> <subject>; trust=…; min=1.2.0
+app=ghcr.io/org/app:prod; trust=<issuer> <subject>; trust=…; alias=www.example.com; min=1.2.0
 ```
 
-That is the repository and the tag deployed, each identity whose signature is accepted, and an optional version floor. Whoever controls the domain controls its routing; deploying moves the tag, and rolling back moves it back. The proxy:
-- asks a DNS-over-HTTPS resolver (`resolver`, Cloudflare's by default) and keeps the answer for its TTL;
+That is the repository and the tag deployed, each identity whose signature is accepted, the other names that may serve the app (below), and an optional version floor. Whoever controls the domain controls its routing; deploying moves the tag, and rolling back moves it back.
+
+**The operator decides which hosts are served and who may deploy.** Two lists in `proxy.toml`, both empty by default, so a new proxy serves nothing:
+
+```toml
+hosts = ["example.com", "*.apps.example.com"]
+signers = [
+  "https://token.actions.githubusercontent.com https://github.com/acme/*",
+  "https://accounts.google.com alice@example.com",
+]
+```
+
+- `hosts`: a name, or `*.name` for any name under it at any depth (`a.apps.example.com`, not `apps.example.com`). Any other host gets 403 before its record is looked up.
+- `signers`: `<issuer> <subject>`, the subject exact or ending in `*` for any subject that starts with what comes before it (end the prefix with `/`: `https://github.com/acme` would also match `https://github.com/acme-evil/…`). A record's `trust=` entries are cut to the ones a signer matches, and only those go to the node, so an app signed by any other identity is refused even if its record trusts it. A record left with none gets 403.
+
+**Aliases.** An app belongs to the name its record is found at, after CNAMEs (W-15), so `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app with one set of data, if example.com's record says `alias=www.example.com`. A name the record doesn't list gets 403: otherwise any domain could CNAME onto another's record and serve that app, with its data, under its own origin, and keep its users' cookies. To run someone else's repository under your own name, write your own record; that is a separate app with its own data.
+
+The proxy:
+- asks a DNS-over-HTTPS resolver (`resolver`, Cloudflare's by default) and keeps the answer for its TTL; an answer other than NOERROR or NXDOMAIN (SERVFAIL, say) is a failure, not "no record";
 - asks the registry which digest the tag names, and keeps that for `tag_ttl_s` (30 s);
-- looks each host or tag up once however many requests ask at once, keeps a failed lookup's answer for 5 s rather than asking again, and remembers at most 10,000 of each;
+- looks each host or tag up once however many requests ask at once, and keeps a failed lookup's answer for 5 s rather than asking again;
+- remembers up to 10,000 hosts and tags with an answer (an app, a digest), and apart from them up to 1,000 without one: no record (kept 30 s), refused, failed, or being looked up. While 1,000 of those are fresh, a host it doesn't know gets 503 rather than a lookup. So names made up under a `*.` entry cost at most 1,000 lookups at a time, however many come, and never push out a host that has an app (`made_up_names_cost_bounded_lookups_and_keep_live_routes`);
+- keeps serving a host's last route, and a tag's last digest, while looking it up again fails or takes over 5 s (a resolver or registry outage), for up to a day past its TTL, asking again every 30 s (RFC 8767's serve-stale). A host or tag it never found fails as before (502). The node still fetches a manifest and its signatures whenever an app's worker starts, so an app whose worker restarts during a registry outage is down until the registry is back (B-406);
 - drops every `nanovm-*` header a client sent, and hop-by-hop headers (`Connection` and what it lists, `Keep-Alive`, `TE`, `Trailer`, `Proxy-Authorization`), names the app to the node (below), and forwards HTTP requests; it holds WebSockets itself and forwards their events;
 - speaks plain HTTP: TLS is left to a terminator in front (Caddy, a cloud load balancer, Cloudflare), which also renews and reloads certificates;
 - gives a client 10 s for each request's headers (or between requests), and waits out running out of file descriptors rather than exiting (the node's front end does too);
 - makes a client keep sending a request's body: it may keep the proxy waiting 10 s in all, plus a second for every 4 KiB it sends, or gets a 408 (`body-timeout`) and its connection is closed. A body trickled a byte at a time is cut after about 10 s; an upload at 4 KiB/s or faster never is. The node applies the same rule as it reads a body, so a client that reaches it directly is held to it too;
 - refuses a request head over 64 KiB (431), as every hop does (node, worker links, egress responses).
 
-A host with no record is a 404; a malformed record, or more than one, is a 502.
+A host with no record is a 404; a host the proxy doesn't serve, an alias its record doesn't list, or a record trusting no allowed signer, a 403; a malformed record, or more than one, a 502.
 
 **Many nodes.** The proxy may place objects on several nodes: list them in `nodes` (each `host:port`, as that node's `name`). An object's home is chosen by rendezvous hashing, and the nodes keep leases on their objects in an object store (`leases = "s3://bucket/prefix"` on every node, with `name`; credentials from `AWS_*`), so an object has one live instance across nodes and a node that lost its lease can't commit. A node that doesn't hold an object answers 421 and the proxy tries the one that does (or the next), for up to `failover_ms`. When a node stops, its objects move after its `lease_ms` (10 s; each node's session record carries its own, which the others wait out). With leases a node ships its objects' committed versions to `capture.store` (required), and answers a write once it counts there; the node taking an object over restores it from there before serving it, so a failover loses no answered write and serves no older state (a write answered an error because it didn't count in time, 500 or 504, isn't served until it does). `failover_ms` must exceed every node's `lease_ms` (the proxy can't check it) and the proxy's 1 s connect timeout. A node that took a request but hasn't answered within `failover_ms` gets the client a 504 (the request may have run there); the proxy never sends it again. Calls between objects then go through the proxy's private endpoint (the node's `proxy`). See `notes/multinode.md`.
 
-DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs); the table is public; and a cold lookup adds a round trip.
+DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs its record lists); the table is public; and a cold lookup adds a round trip.
+
+## Limits
+
+Every app shares a node with others, so each has bounds that no request, client or app can lift for itself. Per object (each app's `[limits]`, clamped to the node's): memory, CPU per request, deadlines, request and response sizes, queued requests, outbound requests, host resources, and a disk quota with a file count. Beyond those:
+
+**Clients** (`[clients]` in both `nanovm.toml` and `proxy.toml`; 0 turns one off). The proxy, and a node that clients reach directly, allow:
+- `rate` requests a second from one client address (default 100), in bursts of twice that, and `app_rate` to one app (default 1,000): past either, `429 rate-limited` with `Retry-After`;
+- `connections_per_client` connections from one address (default 256): past it, `503 too-many-connections` with `Retry-After`, then the connection closes;
+- `connections` in all (default 10,000): past it, new connections wait in the listen backlog until one closes.
+
+An IPv6 client counts by its /64. Peers in `trusted` (default loopback) forward other clients' requests: a TLS terminator in front of the proxy, or the proxy in front of a node. Their own requests and connections aren't limited, and a request's client is the last address in its `X-Forwarded-For` that isn't trusted, so what a client writes there itself is never read. List the terminator's address (or range) in the proxy's `trusted`, and have it set `X-Forwarded-For` (Caddy does): one that doesn't leaves every request it forwards unlimited, as its own. A node whose proxy isn't on its own host must list the proxy in its `trusted`, or the proxy is limited as one client. The rates use `governor` (GCRA); keys that have refilled are forgotten every 10 s.
+
+**Disk.** An app's objects' volumes may hold `app_disk_mb` in all (default: a quarter of `data_dir`'s filesystem); past it that app's writes are cut short and then refused, as on a full disk, and no other app's are. Below `disk_reserve_mb` of free space on that filesystem (default: a twentieth of it, at most 1 GiB), writes that need more space are refused for every app (growing a file, making an entry), while writes in place, truncation, deletes, rollbacks and commits go on, so a full node refuses cleanly instead of failing commits. Each refusal is an `fs-denied` event naming which limit refused it; the guest sees `insufficient-space`. The budget counts what an object's quota counts, the logical size of its files: an object's journal (up to 68 KiB between requests), its capture outbox and filesystem blocks are on top, which is what the reserve, real free space, is for.
+
+**Workers.** Each app's worker runs in a cgroup v2 of its own, with `[worker]` limits that default to a quarter of the host's memory and all its cores but one, so no app can take the host. With `cgroup = "auto"` (the default) the supervisor makes its own cgroup the subtree for them: it moves itself into `<own>/supervisor` and puts workers in `<own>/workers`, which under systemd needs `Delegate=yes` (and `ProtectControlGroups=no`). Where it can't (no cgroup v2 with the memory and cpu controllers, or its cgroup isn't its own), the node refuses to start and says so: set `cgroup = "off"` to run workers without these limits, or name a delegated directory.
 
 ## Apps
 
@@ -297,16 +360,16 @@ nanovm-min-version: 1.4.0                    # optional floor
 
 The node trusts these headers because only the proxy can reach it, and strips them before the guest sees the request. A request without them reaches only the node's own `/_nanovm/` routes.
 
-**An app is a DNS name's deployment of a repository.** Its name on the node (`example.com_ghcr.io_org_app-<hash>`), its volumes and its uid come from the name that owns its `_nanovm` record (`nanovm-host`) and `registry/repository`, so every version that name runs, whoever signed it, sees the same data. The owner is the name the record was found at after CNAMEs, so `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app. Whoever controls that name chooses the version it runs, so no domain can name another's repository and switch its app to an old version on its data (a review finding); a CNAME to someone else's record only serves their app as their record configures it. Only those who can push to a repository can put a signed artifact in it, so naming another identity never reaches a different app's data. The registry is written one way only: lower case, without `:443`. A team signs from CI, or lists each member's identity.
+**An app is a DNS name's deployment of a repository.** Its name on the node (`example.com_ghcr.io_org_app-<hash>`), its volumes and its uid come from the name that owns its `_nanovm` record (`nanovm-host`) and `registry/repository`, so every version that name runs, whoever signed it, sees the same data. The owner is the name the record was found at after CNAMEs, so `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app, if the owner's record lists the alias (`alias=www.example.com`; see "The proxy"). Whoever controls that name chooses the version it runs, so no domain can name another's repository and switch its app to an old version on its data (a review finding), and no domain can serve another's app and data under its own name without that name's record listing it. Only those who can push to a repository can put a signed artifact in it, so naming another identity never reaches a different app's data. The registry is written one way only: lower case, without `:443`. A team signs from CI, or lists each member's identity.
 
 What happens on the first request for a digest:
 1. **Signature first.** The supervisor pulls the manifest anonymously, then the Sigstore bundles attached to it as referrers. It verifies them offline against Sigstore's public-good trusted root, embedded in the binary: an exact issuer and identity from the trust header, over the manifest digest. It also checks the version (`org.opencontainers.image.version` in the manifest) against the floor. Nothing else is downloaded until that passes.
-2. **Then the blobs.** The supervisor fetches the config blob (the app's limits and env) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
-3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB head on the host: a header map, or a request's headers with the method, scheme, authority and path the guest set on it, which together may not pass 64 KiB; 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. The component goes to a fresh jailed worker, which compiles it.
+2. **Then the blobs.** The supervisor fetches the config blob (the app's limits, env, config and the names of the secrets it needs) and the `application/wasm` layer, checks them against the digests the signed manifest pins, and caches them by digest under `data_dir/registry`.
+3. **Then the worker.** The app's limits are clamped to the operator's `limits` (an instance's resource table also holds at most `memory_mb × 16` handles, since each may hold a 64 KiB head on the host: a header map, or a request's headers with the method, scheme, authority and path the guest set on it, which together may not pass 64 KiB; 256 at 16 MiB, 1,024 at 64 MiB), and its worker gets `worker`. Its egress reaches only what both its `egress` and the operator's `limits.egress` allow: an app asking for `*.com` gets only the hosts the operator lists, and with no operator list (the default) none; private addresses stay refused in both. The component goes to a fresh jailed worker, which compiles it.
 
 **A running version under a new policy** (other identities, or a higher floor) is checked against it before the worker serves it; a refusal leaves the version running. The supervisor remembers up to 16 accepting policies per running version, then forgets them and checks each again as it comes.
 
-**How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight, whose worker is retired (its next request starts it again). Open proxy sockets do not pin workers. With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since anyone's DNS can name an app, this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
+**How many apps.** A node runs at most `max_apps` workers (100). A new app takes the slot of the least recently used idle app, one with no requests in flight, whose worker is retired (its next request starts it again). Open proxy sockets do not pin workers. With none idle, the new app is refused (502) until one is. The node forgets apps with no worker once it knows of `2 × max_apps`. Since the DNS of any host the proxy serves can name an app (any name under a `*.` entry in its `hosts`), this is what keeps a node's processes, uids and memory bounded; it does not stop one party from keeping every slot busy, which needs per-client limits in the proxy.
 
 **Bounds.** Every registry read is bounded: a manifest, config, token or signature at 4 MiB, a component at `max_component_mb` (64), and 16 signatures per load. At most four registry fetches run at once across the node, each within `load_timeout_ms` (60 s) in all, so a registry that answers a byte at a time holds nothing for long. Digests are checked before they name anything. Registries, and their redirects and token servers, must be on public addresses: a deploy names the registry, so it must not reach the node's own network.
 
@@ -316,7 +379,7 @@ What happens on the first request for a digest:
 
 **Uids.** An app's uid is the owner of its `objects/<app>` directory, or the next free one for a new app. It is stable across restarts, with no separate record.
 
-**Publishing.** `nanovm publish app.wasm <registry>/<repository>:<version> [--manifest nanovm.json]` pushes an app as nodes pull it: artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, the component as its one `application/wasm` layer, the tag as its version. It first checks the component as a node will (imports, handler export, manifest), and prints the digest, how to sign and the TXT record. Registry credentials come from `NANOVM_REGISTRY_USER`/`NANOVM_REGISTRY_TOKEN`. [.github/workflows/publish-app.yml](.github/workflows/publish-app.yml) is a manual template that builds one app, publishes it and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity; [publish-guests.yml](.github/workflows/publish-guests.yml) does the same for the test guests with `oras`. No key exists anywhere. A person can sign from a laptop with `cosign` and a browser sign-in (not yet tested end to end, W-102).
+**Publishing.** `nanovm publish app.wasm <registry>/<repository>:<version> [--manifest nanovm.json]` pushes an app as nodes pull it: artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, the component as its one `application/wasm` layer, the tag as its version. It first checks the component as a node will (imports, handler export, manifest) and that the manifest holds no [secret](#secrets), and prints the digest, how to sign and the TXT record. Registry credentials come from `NANOVM_REGISTRY_USER`/`NANOVM_REGISTRY_TOKEN`. [.github/workflows/publish-app.yml](.github/workflows/publish-app.yml) is a manual template that builds one app, publishes it and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity; [publish-guests.yml](.github/workflows/publish-guests.yml) does the same for the test guests with `oras`. No key exists anywhere. A person can sign from a laptop with `cosign` and a browser sign-in (not yet tested end to end, W-102).
 
 ## Key-value and config
 
@@ -396,7 +459,23 @@ acceptance, continued reader/writer/directory-stream use, exact entry-quota recl
 rejection and restart. Premature inode release fails it; restored code passes.
 This test-only follow-up does not change runtime LOC or the adoption gates.
 
-**`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`. Environment variables (`env`) still work alongside it.
+**`wasi:config/store`** (0.2.0-rc.1) serves the `"config"` table of the app's `nanovm.json`, and the app's [secrets](#secrets) over it. Environment variables (`env`) still work alongside it.
+
+## Secrets
+
+A package is public (nodes pull it anonymously), so nothing in its `config` or `env` is secret. An app's secrets come from the node's operator instead, and never enter its package.
+
+- **The app declares them** in `nanovm.json`, `"secrets": ["client_secret"]`, and reads them with its config: `config::get("client_secret")` in Rust, `env.config.client_secret` in JavaScript. Config (`wasi:config/store`) rather than environment variables: JavaScript apps read only config, and programs tend to print their environment.
+- **The operator gives them** on each node: `secrets = "/etc/nanovm/secrets"` in the node's config names a directory only the user nanovm runs as may use (`chmod 700`; otherwise the node doesn't start). It holds each app's as `<app>.json`, a JSON object of strings: `{"client_secret": "…"}`. `<app>` is the app's name on the node ([Apps](#apps)), as its `data_dir/objects/<app>` directory is named: `<host>_<registry>_<repository>-` and the first 16 hex digits of the SHA-256 of `<host> <registry>/<repository>` (`printf '%s' 'example.com ghcr.io/org/app' | sha256sum | cut -c1-16`); a request to an app without a secret it declares says which file it wants. Write the file whole and rename it into place.
+- **When:** the supervisor reads an app's file when it starts the app's worker and hands the values over on the worker's stdin, never in its arguments or environment. It looks at each running app's file every second: a change (written, replaced, removed, even touched) retires the worker, whose requests in flight finish as in a version switch, and the next request starts one with the new values.
+- **Fail closed:** a secret the app declares and the file doesn't give, or a file that isn't one, can't be read or isn't a JSON object of strings, stops the app. Its requests get 502 naming the file and what is wrong with it, never what it holds, until the file is fixed.
+- **Only that app:** the values reach only its own jailed worker, whose uid can't read the directory and whose jail can't reach it. A secret overrides the package's config value of the same name.
+- **Not in what the host reports:** whatever the host passes on of what the guest wrote, it masks every secret value in first (with as many `*`): telemetry (the guest's stdout and stderr, the paths of its requests out, events) and the detail of a failed request sent to its client. The match is exact: a guest that encodes or splits its secret can still leak it, as it can over its egress.
+- **`nanovm publish` refuses** a manifest whose `config` or `env` holds a declared secret, a non-empty value under a key named like a credential (ending in `secret`, `password`, `token`, `apikey`, `credentials` and the like; not `token_url` or `max_tokens`), or a value shaped like one: a private key, a URL with a password, or a token with a well-known provider's prefix (`sk-`, `ghp_`, `AKIA`, `xoxb-` and others). It names the key, never the value.
+- **Locally,** `nanovm run app.wasm --secrets secrets.json` gives them as an operator would, and a change to the file restarts it. Keep the file out of version control.
+- **Several nodes** each read their own directory: give every node that may run the app its file.
+
+Tests: `secrets_reach_only_their_apps_worker`, `changed_or_bad_secrets_restart_or_stop_the_app` and `secrets_stay_out_of_telemetry_and_error_text` (integration, on jailed workers), `oauth_and_gateway_get_their_keys_from_the_node` (examples), `nanovm_run_takes_secrets_from_a_file`, `example_manifests_hold_no_secrets` and the publish refusals in `nanovm_publish_pushes_what_a_node_loads` (dev), and `secrets.rs`'s unit tests. Evidence: [notes/beta-secrets.md](notes/beta-secrets.md).
 
 ## Calls between objects
 
@@ -429,84 +508,175 @@ Sockets are indexed by object within each app; a publish visits that object's so
 
 ## Backup and restore
 
-`python3 scripts/backup.py` is an **offline, operator-only** wrapper around
-[restic](https://restic.readthedocs.io/en/stable/). It adds no runtime endpoint or
-host dependencies. Install Python 3.9+, restic 0.14+ and GNU coreutils on Linux.
-Restic supplies encryption, authenticated content, deduplication and remote
-repository support; nanovm supplies the app-lock boundary and restore drill.
+**The backup is the store.** With `[capture]` and a `store` (a directory on
+another disk, `file:///path`, or `s3://bucket/prefix`), a node ships every
+committed version of every object there, as it commits, while it serves: there is
+no backup to schedule and nothing to stop. Turn capture on before the node takes
+its first write: an object is in the store from its first commit with capture on.
 
-1. Stop ingress, drain requests if possible, then stop the supervisor and **all**
-   embedded writers. Disable automatic restarts for the entire backup. Holding
-   existing app locks rejects lingering owners but cannot prevent a supervisor
-   creating a new app. `--stopped` acknowledges this operational requirement;
-   it does not stop processes. Keep the directory inodes stable.
-2. Configure `RESTIC_REPOSITORY` and a securely stored `RESTIC_PASSWORD_FILE`
-   (use absolute paths). Initialize a repository with `restic init` once. Use
-   root for root-run jailed volumes; use the same UID for an unprivileged node.
-   The repository must be outside the data root; off-node storage is needed
-   to survive losing the node or disk. Store the password separately: losing
-   it makes the encrypted backup unrecoverable. No credentials go into git.
-3. Run `python3 scripts/backup.py backup /srv/nanovm --stopped`. Save its full
-   snapshot ID and the deployment record. The wrapper locks all app directories
-   before invoking restic and reads **all of `objects/`**, including `~journal`
-   logs and retained files. Never exclude or manually clear journals: tentative
-   data can remain after a crash. Scratch, compilation caches and registry caches
-   are deliberately omitted. Only exit-zero backups receive the wrapper's
-   completion tag; an incomplete restic snapshot is not an approved recovery point.
-4. Run `python3 scripts/backup.py restore FULL_SNAPSHOT_ID /srv/nanovm-restored`
-   with the repository credentials. The destination's parent must exist and be
-   trusted; the destination itself must not exist, even as an empty directory or
-   symlink. Restore verifies file contents and syncs the destination filesystem
-   before returning success. On error, an incomplete destination may remain:
-   do not serve it, and retry into another new root. Restore only trusted
-   repositories; completion tags are an operational convention, not authorization
-   against someone with repository write credentials.
-5. Reinstall the **same nanovm build**, restore operator configuration, and point
-   `data_dir` at the fresh root. Preserve numeric app UIDs/GIDs and the original
-   `jail_uid_base` for root-run nodes. Keep the same app identity (DNS record owner
-   plus repository), immutable OCI manifest digests, trust policy and guest config.
-   Save those deployment records and ensure the signed OCI artifacts remain
-   available separately: a data snapshot is not a deployment/package backup.
-   The worker recovers the saved undo logs on first object access. Exercise reads
-   and a new write/restart before switching ingress. **Fence the old node first**;
-   a copied volume does not make two writers safe.
-
-The snapshot recovers local committed state at quiescence, not external effects,
-open sockets or lost publishes. Writes after the snapshot are outside its recovery
-point. This is not live backup, point-in-time recovery, synchronous replication or
-automatic failover. Keep several independently checked recovery points; choose
-retention and `restic forget/prune` policy explicitly rather than deleting the
-last known-good backup automatically. Run `restic check --read-data` periodically
-and after repository transfer; encrypted storage is still sensitive tenant data.
-Remote upload performance, backend durability and a second physical host have not
-been tested here.
-
-The executable drill uses the existing composed SQL/KV fixture: commit values,
-kill a jailed worker after tentative SQL/file/KV writes, stop its supervisor,
-back up, move the original root away, restore into a fresh root without caches,
-verify rollback through HTTP, and write/restart again. Run it after building the
-SQLite fixture with `bash experiments/sqlite-filesystem/build.sh --compose`:
-
-```sh
-env -u RUST_BACKTRACE cargo test --locked -p nanovm --test integration \
-  sqlite_backup_restores_into_a_fresh_root -- --ignored --nocapture
-python3 -m unittest discover -s scripts -p test_backup.py -v
-sudo python3 -m unittest discover -s scripts -p test_backup.py -v
+```toml
+[capture]
+store = "s3://my-bucket/nanovm"   # credentials and region from AWS_*
+max_mb = 256                      # what may wait here per object, store down
 ```
 
-The Python checks use disposable repositories to cover active-owner refusal,
-incomplete backups, missing repository content, journals, empty directories,
-numeric ownership/modes and refusal to overwrite existing destinations. The
-root invocation checks UID/GID preservation; the unprivileged one induces a real
-permission-denied backup. Neither touches an operator's existing volumes.
-The complete real-process drill also passes as root with jailed worker UIDs.
-Six deliberate mutations are caught, including omitted journals and final sync.
-Recovery delivery's main CI passed; its parallel branch run exposed an unrelated
-max-app admission fixture race (N-43). That fixture now gates observed upstream
-requests instead of assuming short guest sleeps survive cold startup.
-CI runs both privilege variants of the CLI tests and the SQL restore drill;
-orb setup installs restic idempotently. Runtime size remains 5,085 lines, with
-89 additional operator-tool lines counted separately.
+- **What a lost node loses** is what it had committed but not yet shipped: with
+  the store up, the versions of the last few tens of milliseconds. `nanovm admin
+  … backlog` says what waits now (versions, bytes, objects); the supervisor's
+  snapshots carry it (`nanovm.capture.waiting.*`), and its log says when versions
+  start to wait, every minute while they do, and when none does again. With
+  `remote_ack = true` a write is answered only once it is in the store (the
+  default with several nodes).
+- **A store outage is not a write outage.** A node that answers once a write is
+  durable on its own disk (`remote_ack` off, the default with one node) goes on
+  committing; each object's unshipped versions may take up to `max_mb` (256 MiB)
+  here before its writes are refused. During an outage versions are changes, not
+  copies of the volume (a scheduled snapshot is skipped while more than
+  `snapshot_every` versions wait), so the backlog grows with what is written. Size
+  the disk for it: per object, its `disk_mb` volume, up to twice that more while a
+  request runs (the journal), and `max_mb` in an outage. When the store is back,
+  everything ships in order. Writes refused at `max_mb` answer `500 commit-failed`
+  and roll back.
+- **Retention:** the store keeps every version (only an operator's `delete` or
+  `delete-app` removes an object's, all of them), so any version can be
+  restored. When retention comes (N-166), a version stays restorable while the
+  store keeps it, the snapshot before it and every version
+  after it.
+
+**Restore into a running node.** Run on the node's host, as the node's user
+(root), through the node's [control socket](#operator-commands):
+
+```sh
+nanovm admin --config /etc/nanovm/nanovm.toml versions                    # apps in the store
+nanovm admin --config /etc/nanovm/nanovm.toml versions <app>              # its objects
+nanovm admin --config /etc/nanovm/nanovm.toml versions <app> <object>     # head, versions, when stored
+nanovm admin --config /etc/nanovm/nanovm.toml restore <app> <object>      # to its head
+nanovm admin --config /etc/nanovm/nanovm.toml restore <app> <object> 41   # to version 41
+nanovm admin --config /etc/nanovm/nanovm.toml restore <app>               # each object to its head
+```
+
+`<app>` is the app's name on the node (`apps` lists them; it names the
+directory under `objects/`). A restore:
+
+1. pauses the object: its instance stops once what is queued for it is served,
+   and it answers `503 object-restoring` until the restore ends. The app's other
+   objects, and other apps, keep serving.
+2. ships what the object committed here that the store doesn't have, so no
+   acknowledged write is lost. If the store refuses it, the restore stops and says
+   so; `--discard-unshipped` drops it instead.
+3. fetches the version from the store, back from the head to the last snapshot
+   before it, checking each against the SHA-256 its key names (a damaged or
+   foreign version is refused and nothing changes), and rebuilds the volume beside
+   the node's data, outside every worker's reach.
+4. replaces the object's volume, its journal (whose undo was for the old volume)
+   and its versions here, all at once, ships the version it made (if any), and
+   resumes the object.
+
+**Going back makes a new version.** Restoring version 41 of an object whose head
+is 50 makes version 51, with 41's contents, after the head: the head only moves
+forward, versions 42 to 50 stay in the store (restore 50 to undo the restore), and
+the command says so. Restoring the head rebuilds the object from the store and
+makes no version. With leases, a restore takes the object's lease first and is
+refused while another node holds it: run it on that node.
+
+**A crash during a restore** (of the supervisor, or the machine) leaves the object
+as it was if the restore wasn't decided yet; once decided, the supervisor finishes
+it when it next starts, before any worker serves. Either way nothing stays paused.
+
+**A lost node** is replaced by a fresh one with the same configuration and an
+empty `data_dir`: keep ingress off, run `restore <app>` for each app (`versions`
+lists them), then open ingress. Until then the fresh node would serve those
+objects empty. Fence the old node first: two nodes writing one object's history is
+refused by the store, but the second one's writes are lost. The runbook is
+[notes/recovery-runbook.md](notes/recovery-runbook.md); the evidence,
+[notes/beta-recovery.md](notes/beta-recovery.md).
+
+Tests: `restores_an_object_and_an_app_into_a_running_node` (two apps under a
+supervisor, through `nanovm admin`, one writing throughout; a version going back,
+the head over a damaged volume, a whole app, a paused object, refused names and a
+damaged version in the store, an unshippable local version),
+`a_restore_cut_short_is_finished_or_undone` (a crash at each of 9 points),
+`writes_go_on_through_a_store_outage_and_ship_in_order_after`,
+`an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox`, and
+`sqlite_restores_a_lost_node_from_the_store` (a SQLite app's worker killed
+mid-request, the node's data deleted, a fresh node restored from the store: the
+committed rows, file and key, not the cut-short ones; then a write that survives a
+restart).
+
+## Operator commands
+
+`nanovm admin --config <nanovm.toml> <command> [<argument>…]` runs a command in a
+running node, through the node's one control path: a Unix socket at
+`<data_dir>/admin/socket`, owned by the supervisor. Its directory has mode 0700,
+so only the supervisor's own user (root in production) can connect. Workers run
+as other users, and the jail lets no worker make a socket; no HTTP route, public
+or private, leads to it. A command is one line of JSON (an array of strings)
+and its answer one line, `{"ok": …}` or `{"error": "…"}`, which the CLI prints.
+
+| Command | What it does |
+|---|---|
+| `apps` | The apps this node knows, with the version and pid of each running worker. |
+| `delete <app> <object>` | Deletes one object's data on this node, and what the node shipped of it (see below). |
+| `delete-app <app>` | Deletes all of an app's data on this node (its objects, scratch and compile cache), and what it shipped. |
+| `restore <app> [<object> [<version>]] [--discard-unshipped]` | Restores an object, or each of an app's objects, from the store (see [Backup and restore](#backup-and-restore)). |
+| `versions [<app> [<object>]]` | The apps in the store, an app's objects, or an object's head and versions. |
+| `backlog` | What waits on this node to be shipped: versions, bytes, objects. |
+
+`<app>` is the app's name on the node: its directory's name under `objects/`, and
+how `apps` lists it once it has run since the node started. A delete first drains and stops the app's worker, as a
+version switch does: requests in flight finish, new ones wait, and nothing of the
+app is live, mid-commit or being shipped. Then what the node shipped to
+`capture.store` goes (every key under `<app>/<object>/`, or `<app>/`: the head and
+all versions), then the node's copy: moved at once into `<data_dir>/deleted`, then
+removed, so a delete cut short leaves the data whole or gone (the rest is removed
+when the node next starts). The worker starts again with the app's next request,
+and a deleted object starts from nothing, with a new history. A delete removes the
+object's [backup](#backup-and-restore) too: what the store held of it can't be
+restored afterwards (unless the store keeps its own old versions, such as an S3
+bucket's versioning). Not with `leases` (several nodes): another node may hold the
+object, so the node refuses.
+
+## Data lifecycle
+
+An object has storage only once it has committed a change, and only while it holds
+something; nothing else creates or deletes an object's data.
+
+- **Where:** `objects/<app>/<shard>/<object>/`, where `<shard>` is the first byte of
+  the object id's SHA-256 in hex: 256 shards, so no directory holds more than a
+  share of an app's objects (65,000 subdirectories is a limit on some filesystems,
+  [N-35](ISSUES.md)). In it: `data` (the volume, the guest's `/data`), `journal`
+  (its undo log and the files a request removed), and with capture `committed`
+  and `shipped`.
+- **Made by the first change.** Until then an instance's `/data` is an empty
+  directory from the app's pool (`objects/<app>/~new`, one per instance live at
+  once, reused, like `/tmp`'s scratch). The first create in it moves it into the
+  object's place. So a scanner's 404s and reads of objects that don't exist leave
+  nothing: the audit's 300 `GET /scanN/wp-login.php` left 301 directories, now 0.
+- **Removed when the instance ends, if empty.** An object whose volume is empty,
+  with no captured history, goes when its instance ends. A new object that never
+  committed (its first request failed, trapped or ran out of time) is rolled back
+  first, so it leaves nothing; any other object's uncommitted work is rolled back
+  when it next starts, as always. And an object deletes its own storage by
+  removing its files: no new API. With capture, an emptied object keeps its history (its last
+  version records the empty volume) and so its directory and its place under the
+  cap; an operator deletes it.
+- **At most `max_objects_per_app` per app** (node config, default 10,000): an app
+  past it gets `507 object-limit` for a request to an object without storage,
+  before any guest code runs; existing objects are served. The count is the
+  objects' directories, kept in memory by the app's worker (counted when it
+  starts), and taken exactly at the first change, so clients making new objects
+  at once can't pass it: one that loses that race gets `insufficient-space` from
+  its create, as from a full disk.
+- **A full disk makes no new objects:** a request to an object without storage
+  gets `507 disk-full` when the filesystem has less free than the object's quota
+  (`disk_mb` and `max_files`) above the node's reserve (`disk_reserve_mb`, see
+  "Disk" above), and so does a first create then. Objects that exist are served
+  and keep their quotas; below the reserve their growth is refused
+  (`insufficient-space`), while writes in place and commits go on.
+- **Never automatic for data:** nothing deletes an object that holds data, however
+  old or idle; that is the app's, or an operator's (`nanovm admin delete`).
+
+## Commits
 
 ## Commits
 
@@ -619,10 +789,12 @@ Every scenario completed with 0 failed requests.
 The supervisor and each worker check these at startup and refuse to start, naming the fix, rather than failing requests at runtime. The limits apply per worker process, so per app:
 
 - **File descriptors:** each live object holds 2 (`/data` and `/tmp`). The check needs about `2 × max_live_objects + 1024`. The worker raises its soft limit to the hard limit itself, before it jails itself; the demo's 8,000 objects per app need `ulimit -n` of at least 17,088.
-- **Memory mappings:** about 8 per pool slot. The default `vm.max_map_count` of 65,530 fits roughly 7,600 objects; 8,000 needs `sysctl -w vm.max_map_count=68352` or more.
+- **Memory mappings:** about 24 per pool slot (`engine::MAPS_PER_OBJECT`) plus 4,096. The default `vm.max_map_count` of 65,530 fits about 2,500 objects per app; 8,000 needs `sysctl -w vm.max_map_count=196864` or more.
 - **Address space:** the engine reserves each pool slot's 4 memories (`memory_reservation_mb` + 64 KiB each), stacks and tables up front, about 522 GiB at the defaults. Under `ulimit -v` or `LimitAS=` below that, `nanovm serve` refuses to start with the number; remove the limit or lower `max_live_objects` or `memory_reservation_mb`.
 - **The jail** needs Landlock (Linux 5.13+) and seccomp. A separate uid per app needs the supervisor to run as root.
 - **Don't run with `RUST_BACKTRACE` set.** wasmtime then captures a stack backtrace for every guest-visible error. That includes routine ones, like reading a file that doesn't exist yet. With it set, warm throughput across 1,000 objects fell from 63K/s to 23K/s.
+
+[deploy/single-node/check-host.py](deploy/single-node/check-host.py) checks each of these against a node's config before it starts; [deploy/systemd](deploy/systemd/README.md) has hardened units for the node and the proxy, with a sysctl drop-in for the mappings.
 
 ## Tests
 
@@ -653,7 +825,7 @@ The tests cover:
   - unit tests roll back every kind of change, commit them, survive a crash at each step of recovery, ignore a torn record, journal writes to a file removed while open and to one opened write-only, and record nothing for a failed `rmdir` or a refused change
 - calls between objects: the callee's volume and commit, and cycles (an object calling itself, or back through another) refused at once
 - an allowed outbound request through the full egress path
-- the egress allowlist, including DNS rebinding to loopback
+- the egress allowlist, including DNS rebinding to loopback, within the operator's (an app asking for `*.com` reaches only what the node's `limits.egress` lists, in-process and through the supervisor)
 - LRU and idle eviction, and capacity limits
 - churn past capacity
 - the HTTP front end
@@ -669,10 +841,14 @@ The tests cover:
   These skip, saying why, where ghcr.io can't be reached.
 - open response bodies counting against `max_outbound_concurrency`, in-process and through the supervisor
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
+- client limits at the proxy and a node's own listener: per-client and per-app rates (429), connections per client (503) and in all, and a client that forges `X-Forwarded-For` from an untrusted peer, or writes addresses left of its own behind a trusted one
+- disk on an 8 MiB tmpfs (as root): an app that fills its budget is refused while another app writes on, and below the node's reserve every app's growth is refused cleanly while writes in place still commit
+- a node with `cgroup = "auto"` that can't make a cgroup subtree refuses to start (where it can, its workers run under the host-sized defaults)
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.
 - apps from a registry on loopback, in dev mode: downloads bounded by `max_component_mb` and 4 MiB of metadata, a floor checked against the running version, a switch that finishes when its request goes away, at most `max_apps` workers (taking only idle apps' slots), and slow registries held to four fetches at once and a deadline
 - the proxy hanging up on clients that stall their headers, and surviving running out of file descriptors
 - the proxy: a host's DNS record names its app at the version its tag names now, a client can name no app itself nor reach `/_nanovm/`, a missing or bad record is refused, moving the tag deploys, and proxy-owned WebSockets send events with the current digest
+- the operator's admission: an unlisted host refused before any DNS lookup, a record's identities cut to the operator's signers (end to end: the CI-signed counter refused when only another identity is listed), an alias its owner's record doesn't list refused, 30,000 made-up hosts costing at most 1,001 lookups and never pushing out a live route, a SERVFAIL not taken for "no record", and a route or digest served stale through a resolver outage
 - key-value: persistence, shared filesystem byte/file quotas, bad names, 1 MiB read/write bounds, streamed keys/backpressure and completion lifetimes, cancellation-safe replacement, raw-file visibility and jailed execution. Optional probes cover mutation recovery cuts, 1,000 same-request replacements and 10,000-key scale.
 - config values served through `wasi:config`, locally and from a registry app's `nanovm.json`
 - WebSockets through the proxy: echo, binary, committed fan-out scoped by app and object, a guest-initiated close, the object told how a socket ended, refusals by an object that doesn't answer `OPEN`; per-object, per-app and total caps, bounded messages and slow clients, publish deadlines, worker restart and version switches without reconnecting
@@ -750,7 +926,8 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 | Path | What it is |
 |---|---|
 | `crates/nanovm/src/engine.rs` | Engine config, pooling allocator, epoch ticker, `.cwasm` cache |
-| `crates/nanovm/src/app.rs` | Component loading and the linker |
+| `crates/nanovm/src/app.rs` | Component loading and the linker; an app's objects: where each is, how many, and whether there is room for another |
+| `crates/nanovm/src/admin.rs` | The operator's control path: the supervisor's admin socket and `nanovm admin` |
 | `crates/nanovm/src/object.rs` | The per-object actor: instance lifecycle, limits, CPU accounting, heavy lanes, poisoning |
 | `crates/nanovm/src/table.rs` | The node: one app, object id → actor, LRU and idle eviction |
 | `crates/nanovm/src/quota.rs` | Per-mount byte and file quotas over WASIp3 filesystem calls |
@@ -767,6 +944,9 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 | `crates/nanovm/src/ws.rs` | WebSockets: the proxy's sockets, WebSocket-over-HTTP events and per-object channels |
 | `crates/nanovm/support/load.rs` | In-process load generator shared by the benchmark and the tests (not part of the node) |
 | `guests/` | `counter`, `hostile` and shared `util` (wasm32-wasip2 with wasip3 bindings) |
+| `deploy/` | Single-node operator guide, systemd units, container image, alerts ([Deploy and operate](#deploy-and-operate)) |
+| `docs/ops/` | Runbooks, drills and the error guide |
+| `tools/release/`, `tools/bench-history/` | Release packaging and notes; benchmark history |
 
 ## Known limits of this phase
 
@@ -774,3 +954,5 @@ result remains recorded in HANDOFF Q73. Env/config stay injected.
 - **The CPU budget is the CPU time of the thread polling the guest** (user and kernel, so the guest's own file calls count; waiting for a core or the disk doesn't). An overloaded node slows a request down to its wall-clock deadline (504) rather than failing it for CPU ([N-640](ISSUES.md)).
 - **Without root, apps share the supervisor's uid.** Landlock and seccomp still separate them.
 - **A worker's stderr lines are passed on whole up to 4 KiB**; longer ones are split.
+- **Only an empty volume is removed.** A volume holding only empty directories is kept: the KV provider leaves `.kv/<store>/` when its last key goes ([B-203](ISSUES.md)).
+- **The object count is per worker,** from the directories when it starts: an object a lease takeover restores (`ship::claim`) isn't counted until the app's worker next starts.

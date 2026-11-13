@@ -11,35 +11,38 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, kv, object, quote};
+use nanovm_sdk::http::header::{CONTENT_TYPE, LOCATION};
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, Result, kv, object, quote};
 
 nanovm_sdk::serve!(handle);
 
 const NEW: &str = "new";
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     if nanovm_sdk::id() == NEW {
-        return match req.method() {
-            "POST" => mint(req.text()?).await,
-            _ => Ok(Response::not_found()),
+        return match req.method().as_str() {
+            "POST" => mint(req.body().text()?).await,
+            _ => text(404, "not found"),
         };
     }
     let Some(url) = kv::get_text("url").await? else {
-        return Ok(match req.method() {
-            "POST" if req.path() == "/" => create(req.text()?).await?,
-            _ => Response::not_found(),
-        });
+        return match req.method().as_str() {
+            "POST" if req.uri().path() == "/" => create(req.body().text()?).await,
+            _ => text(404, "not found"),
+        };
     };
-    Ok(match (req.method(), req.path()) {
+    let redirect = || Response::builder().status(302).header(LOCATION, &url).body(Body::empty());
+    Ok(match (req.method().as_str(), req.uri().path()) {
         ("GET", "/") => {
             kv::increment("clicks", 1).await?;
             kv::increment(&format!("day:{}", today()?), 1).await?;
-            Response::new(302).header("location", &url)
+            redirect()?
         }
-        ("HEAD", "/") => Response::new(302).header("location", &url),
-        ("GET", "/stats") => Response::json(stats(&url).await?),
-        ("POST", "/") => Response::text("that code is taken\n").status(409),
-        _ => Response::not_found(),
+        ("HEAD", "/") => redirect()?,
+        ("GET", "/stats") => json(200, stats(&url).await?)?,
+        ("POST", "/") => text(409, "that code is taken\n")?,
+        _ => text(404, "not found")?,
     })
 }
 
@@ -49,11 +52,11 @@ async fn create(url: &str) -> Result {
     let url = url.trim();
     let ok = (url.starts_with("https://") || url.starts_with("http://")) && url.len() <= 2048;
     if !ok || url.contains(char::is_whitespace) {
-        return Ok(Response::text("the body is an http(s) URL of at most 2048 bytes\n").status(400));
+        return text(400, "the body is an http(s) URL of at most 2048 bytes\n");
     }
     kv::set("url", url).await?;
     let code = nanovm_sdk::id();
-    Ok(Response::json(format!(r#"{{"code":{},"url":{}}}"#, quote(&code), quote(url))).status(201))
+    json(201, format!(r#"{{"code":{},"url":{}}}"#, quote(&code), quote(url)))
 }
 
 /// Picks a random code and asks that object to take the link; a code that
@@ -61,12 +64,12 @@ async fn create(url: &str) -> Result {
 async fn mint(url: &str) -> Result {
     for _ in 0..5 {
         let code = random_code(7);
-        let reply = object(&code).post("/", url).send().await?;
-        if reply.status != 409 {
-            return Ok(Response::bytes("application/json", reply.body).status(reply.status));
+        let reply = object(&code).post("/", url).await?;
+        if reply.status() != 409 {
+            return Ok(reply);
         }
     }
-    Ok(Response::text("no free code; try again\n").status(503))
+    text(503, "no free code; try again\n")
 }
 
 async fn stats(url: &str) -> Result<String> {
@@ -79,6 +82,16 @@ async fn stats(url: &str) -> Result<String> {
     days.sort();
     let clicks = kv::get_text("clicks").await?.unwrap_or("0".into());
     Ok(format!(r#"{{"url":{},"clicks":{clicks},"days":{{{}}}}}"#, quote(url), days.join(",")))
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }
 
 /// `n` random letters and digits.

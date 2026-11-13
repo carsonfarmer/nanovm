@@ -55,6 +55,7 @@ fn node(name: &str, app: &str, max_live: usize, endpoint: Option<String>) -> any
         digest: "bench".into(),
         env: Default::default(),
         config: Default::default(),
+        secrets: Default::default(),
         limits: serde_json::from_value(limits)?,
         worker: Default::default(),
     };
@@ -65,7 +66,7 @@ fn node(name: &str, app: &str, max_live: usize, endpoint: Option<String>) -> any
         telemetry_endpoint: endpoint.unwrap_or_else(|| NodeConfig::default().telemetry_endpoint),
         // NANOVM_BENCH_CAPTURE=1: every commit is captured, with room for all.
         capture: std::env::var_os("NANOVM_BENCH_CAPTURE")
-            .map(|_| serde_json::from_value(json!({ "max_mb": 1 << 20, "max_versions": 1u64 << 40 })))
+            .map(|_| serde_json::from_value(json!({ "max_mb": 1 << 20 })))
             .transpose()?,
         ..NodeConfig::default()
     };

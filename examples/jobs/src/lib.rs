@@ -17,24 +17,26 @@
 use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, config, object, serde_json, sqlite};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, config, object, serde_json, sqlite};
 use serde_json::{Value, json};
 
 nanovm_sdk::serve!(handle);
 
-async fn handle(req: Request) -> Result {
-    if req.path() == "/work" {
+async fn handle(req: Request<Body>) -> Result {
+    if req.uri().path() == "/work" {
         return work(&req).await;
     }
     schema().await?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     let max: i64 = config::get("max_attempts").ok().flatten().and_then(|m| m.parse().ok()).unwrap_or(3);
-    let path: Vec<&str> = req.path().trim_matches('/').split('/').collect();
+    let path: Vec<&str> = req.uri().path().trim_matches('/').split('/').collect();
     let lease = req.query("lease").unwrap_or_default();
-    Ok(match (req.method(), path.as_slice()) {
+    Ok(match (req.method().as_str(), path.as_slice()) {
         ("POST", ["jobs"]) => {
-            let Ok(payload) = req.json::<Value>() else { return Ok(Response::text("the payload is JSON\n").status(400)) };
-            let key = req.header("idempotency-key");
+            let Ok(payload) = req.body().json::<Value>() else { return text(400, "the payload is JSON\n") };
+            let key = req.headers().get("idempotency-key").and_then(|v| v.to_str().ok());
             // The same key again is the same job, whatever became of it.
             let added = sqlite::execute(
                 "INSERT INTO jobs (key, payload, state, attempts, visible_at) VALUES (?, ?, 'ready', 0, ?) \
@@ -47,7 +49,7 @@ async fn handle(req: Request) -> Result {
                 _ => sqlite::last_insert_rowid().await?,
             };
             let job = job(id).await?;
-            Response::json(job.to_string()).status(if added == 1 { 201 } else { 200 })
+            json(if added == 1 { 201 } else { 200 }, job.to_string())?
         }
         ("POST", ["lease"]) => {
             let visibility: i64 = req.query_or("visibility_ms", 30_000).clamp(1, 3_600_000);
@@ -69,34 +71,34 @@ async fn handle(req: Request) -> Result {
             )
             .await?;
             match leased.first() {
-                Some(row) => Response::json(job(row.get("id")?).await?.to_string()),
-                None => Response::new(204),
+                Some(row) => json(200, job(row.get("id")?).await?.to_string())?,
+                None => Response::builder().status(204).body(Body::empty())?,
             }
         }
         ("POST", ["jobs", id, verb @ ("ack" | "nack")]) => {
-            let text = req.text().unwrap_or_default();
+            let note = req.body().text().unwrap_or_default();
             let changed = match *verb {
                 "ack" => {
                     let sql = "UPDATE jobs SET state = 'done', result = ?3, lease = NULL \
                                WHERE id = ?1 AND lease = ?2 AND state = 'leased'";
-                    sqlite::execute(sql, &[id, &lease, &text]).await?
+                    sqlite::execute(sql, &[id, &lease, &note]).await?
                 }
                 _ => {
                     let sql = "UPDATE jobs SET state = CASE WHEN attempts >= ?3 THEN 'dead' ELSE 'ready' END, \
                                error = ?4, lease = NULL, visible_at = ?5 WHERE id = ?1 AND lease = ?2 AND state = 'leased'";
                     let visible_at = now + req.query_or("delay_ms", 1000i64).max(0);
-                    sqlite::execute(sql, &[id, &lease, &max, &text, &visible_at]).await?
+                    sqlite::execute(sql, &[id, &lease, &max, &note, &visible_at]).await?
                 }
             };
             // A lease that ran out may have gone to another worker.
-            if changed == 0 { Response::text("not your lease\n").status(409) } else { Response::new(204) }
+            if changed == 0 { text(409, "not your lease\n")? } else { Response::builder().status(204).body(Body::empty())? }
         }
         ("GET", ["jobs", id]) => match id.parse() {
             Ok(id) => match job(id).await? {
-                Value::Null => Response::not_found(),
-                job => Response::json(job.to_string()),
+                Value::Null => text(404, "not found")?,
+                job => json(200, job.to_string())?,
             },
-            Err(_) => Response::not_found(),
+            Err(_) => text(404, "not found")?,
         },
         ("GET", [""]) => {
             let counts = sqlite::query("SELECT state, count(*) AS n FROM jobs GROUP BY state", &[]).await?;
@@ -104,7 +106,7 @@ async fn handle(req: Request) -> Result {
             for row in counts.iter() {
                 out[row.get::<String>("state")?] = row.get::<i64>("n")?.into();
             }
-            Response::json(out.to_string())
+            json(200, out.to_string())?
         }
         ("GET", ["dead"]) => {
             let dead = sqlite::query("SELECT id FROM jobs WHERE state = 'dead' ORDER BY id LIMIT 100", &[]).await?;
@@ -112,7 +114,7 @@ async fn handle(req: Request) -> Result {
             for row in dead.iter() {
                 jobs.push(job(row.get("id")?).await?);
             }
-            Response::json(Value::from(jobs).to_string())
+            json(200, Value::from(jobs).to_string())?
         }
         ("POST", ["dead", id, "retry"]) => {
             let changed = sqlite::execute(
@@ -120,9 +122,9 @@ async fn handle(req: Request) -> Result {
                 &[&now, id],
             )
             .await?;
-            if changed == 0 { Response::not_found() } else { Response::new(204) }
+            if changed == 0 { text(404, "not found")? } else { Response::builder().status(204).body(Body::empty())? }
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
@@ -145,16 +147,16 @@ async fn job(id: i64) -> Result<Value> {
 /// with `"fail": true` fails. Each ack and nack commits in the queue when
 /// the call returns, so a result travels with its ack: a worker that keeps
 /// nothing can't lose a result after acking.
-async fn work(req: &Request) -> Result {
-    let Some(queue) = req.query("queue") else { return Ok(Response::text("queue=…\n").status(400)) };
-    let queue = object(queue);
+async fn work(req: &Request<Body>) -> Result {
+    let Some(queue) = req.query("queue") else { return text(400, "queue=…\n") };
+    let queue = object(&queue);
     let (mut done, mut failed) = (0, 0);
     for _ in 0..req.query_or("max", 10).min(100) {
-        let reply = queue.post("/lease?visibility_ms=30000", "").send().await?;
-        if reply.status != 200 {
+        let reply = queue.post("/lease?visibility_ms=30000", "").await?;
+        if reply.status() != 200 {
             break;
         }
-        let job: Value = serde_json::from_slice(&reply.body)?;
+        let job: Value = serde_json::from_slice(reply.body())?;
         let (id, lease) = (&job["id"], job["lease"].as_str().unwrap_or_default());
         let (path, body) = match job["payload"]["text"].as_str() {
             Some(text) if job["payload"]["fail"] != true => {
@@ -170,12 +172,12 @@ async fn work(req: &Request) -> Result {
         // An ack the queue failed to commit is safe to send again; one that
         // never lands only means the job is done twice, after its lease.
         for _ in 0..3 {
-            if queue.post(&path, body.as_str()).send().await?.status < 500 {
+            if queue.post(&path, body.as_str()).await?.status().as_u16() < 500 {
                 break;
             }
         }
     }
-    Ok(Response::json(json!({ "done": done, "failed": failed }).to_string()))
+    json(200, json!({ "done": done, "failed": failed }).to_string())
 }
 
 thread_local! {
@@ -194,4 +196,14 @@ async fn schema() -> Result<()> {
         READY.set(true);
     }
     Ok(())
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

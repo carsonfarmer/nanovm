@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
 use serde::Deserialize;
 
 /// Declares a config struct in which every field has a default, so the
@@ -33,6 +33,12 @@ config! {
         capture: Option<CaptureConfig> = None::<CaptureConfig>,
         /// Upper bound on objects with a live instance; sizes the pooling allocator.
         max_live_objects: usize = 1000usize,
+        /// The most objects one app may have on this node: an object counts
+        /// from its first committed change until its volume is empty again
+        /// (or an operator deletes it). A new one past it is refused (507
+        /// `object-limit`), as is one when the disk has less free than its
+        /// quota (507 `disk-full`).
+        max_objects_per_app: u64 = 10_000u64,
         /// The proxy's private endpoint: committed publishes go to its
         /// `/publish`, and with `leases`, calls to other objects to its
         /// `/objects/…`, which places them.
@@ -68,13 +74,9 @@ config! {
         /// When the supervisor runs as root, app `i`'s worker runs as uid and
         /// gid `jail_uid_base + i`.
         jail_uid_base: u32 = 200_000u32,
-        /// A delegated cgroup v2 directory, with the memory, cpu and pids
-        /// controllers enabled for its children, used by this node alone.
-        /// Each worker runs in a cgroup of its own under it, with the node's
-        /// `[worker]` limits.
-        cgroup: Option<PathBuf> = None::<PathBuf>,
-        /// The most an app gets: each of its limits is clamped to these.
-        /// Egress entries are the app's own.
+        /// The most an app gets: each of its limits is clamped to these, and
+        /// its egress reaches only what both its list and this `egress`
+        /// allow (by default nothing).
         limits: Limits = Limits::default(),
         /// Every app's worker limits.
         worker: WorkerLimits = WorkerLimits::default(),
@@ -92,6 +94,27 @@ config! {
         /// are plain HTTP. Allowed only in a build with the `dev` feature and
         /// with a loopback `listen`.
         dev: bool = false,
+        /// A directory only this user can use, holding each app's secrets
+        /// as `<app>.json` (see `secrets`). None: apps get none.
+        secrets: Option<PathBuf> = None::<PathBuf>,
+        /// Where workers run, each in a cgroup v2 of its own with the
+        /// `[worker]` limits: `"auto"` makes the supervisor's own cgroup a
+        /// subtree for them (systemd: `Delegate=yes`) and refuses to start
+        /// where it can't; a directory names a delegated one, used by this
+        /// node alone, with the cpu, memory and pids controllers enabled for
+        /// its children; `"off"` runs workers without those limits.
+        cgroup: String = "auto",
+        /// What clients may ask of `listen` when they reach it directly.
+        clients: ClientLimits = ClientLimits::default(),
+        /// Bytes all of an app's objects' volumes may hold, in MiB: past it
+        /// that app's writes are refused. 0 is a quarter of `data_dir`'s
+        /// filesystem.
+        app_disk_mb: u64 = 0u64,
+        /// Free space kept on `data_dir`'s filesystem, in MiB: below it,
+        /// writes that need more space are refused for every app, so
+        /// commits, rollbacks and deletes always find room. 0 is a
+        /// twentieth of the filesystem, at most 1 GiB.
+        disk_reserve_mb: u64 = 0u64,
     }
 }
 
@@ -110,6 +133,9 @@ pub struct AppConfig {
     /// Values the guest reads through `wasi:config/store`.
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// The operator's secrets for the app, read with (and over) `config`.
+    #[serde(default)]
+    pub secrets: crate::secrets::Secrets,
     #[serde(default)]
     pub limits: Limits,
     #[serde(default)]
@@ -148,15 +174,48 @@ config! {
         /// For local development only: registries may be on private
         /// addresses, and loopback ones are plain HTTP (as for the node).
         dev: bool = false,
+        /// The hosts served: `name`, or `*.name` for any name under it. Any
+        /// other host is refused (403) before its record is looked up.
+        hosts: Vec<String> = Vec::new(),
+        /// The identities that may deploy, `<issuer> <subject>`, the subject
+        /// exact or ending in `*` (then any subject that starts with what
+        /// comes before it). A record's `trust=` entries are cut to these,
+        /// and a record left with none is refused (403).
+        signers: Vec<String> = Vec::new(),
+        /// What clients may ask of `listen`.
+        clients: ClientLimits = ClientLimits::default(),
     }
 }
 
 config! {
-    /// Operator-owned limits for each object's immutable local capture history.
-    /// Exhaustion rejects new writes; versions are never silently discarded.
+    /// What one client, and one app, may ask of a public listener (see
+    /// `gate`). 0 turns a limit off.
+    pub struct ClientLimits {
+        /// Requests a second from one client address (an IPv6 /64), with
+        /// bursts of twice that.
+        rate: u32 = 100u32,
+        /// Requests a second to one app, with bursts of twice that.
+        app_rate: u32 = 1000u32,
+        /// Connections open at once from one client address.
+        connections_per_client: usize = 256usize,
+        /// Connections open at once in all: past it, new ones wait.
+        connections: usize = 10_000usize,
+        /// Peers that forward other clients' requests (a TLS terminator, the
+        /// proxy), as addresses or CIDR ranges. Their own requests and
+        /// connections aren't limited, and a request's client is the last
+        /// address in its `X-Forwarded-For` that isn't one of theirs.
+        trusted: Vec<String> = vec!["127.0.0.1".to_string(), "::1".to_string()],
+    }
+}
+
+config! {
+    /// Each object's committed versions, captured here and shipped to `store`.
     pub struct CaptureConfig {
+        /// The most an object's versions may take here, in MiB: those not
+        /// shipped yet (all of them while the store is down), and the last.
+        /// Writes to the object are refused beyond it, never versions
+        /// dropped. Size the disk for it beside the objects' `disk_mb`.
         max_mb: u64 = 256u64,
-        max_versions: u64 = 16u64,
         /// Every this many versions, one holds the whole volume; the rest
         /// hold what a commit changed.
         snapshot_every: u64 = 16u64,
@@ -176,10 +235,11 @@ config! {
 
 config! {
     /// Limits on an app's whole worker process, applied through its cgroup.
-    /// 0 leaves a limit unset.
+    /// The defaults leave the rest of the host room: a quarter of its memory
+    /// and all its cores but one. 0 leaves a limit unset.
     pub struct WorkerLimits {
-        memory_mb: u64 = 0u64,
-        cpus: f64 = 0.0f64,
+        memory_mb: u64 = host_memory_mb() / 4,
+        cpus: f64 = or_cores_over(0, 1).saturating_sub(1).max(1) as f64,
         pids: u64 = 0u64,
     }
 }
@@ -255,9 +315,11 @@ impl NodeConfig {
                 bail!("with leases, {key} is an object store every node shares, such as s3://bucket/prefix, not {url:?}");
             }
         }
-        // A relative data_dir is relative to the config file (joining keeps
-        // an absolute one as it is).
-        cfg.data_dir = path.parent().unwrap_or(Path::new(".")).join(&cfg.data_dir);
+        // A relative data_dir or secrets is relative to the config file
+        // (joining keeps an absolute one as it is).
+        let dir = path.parent().unwrap_or(Path::new("."));
+        cfg.data_dir = dir.join(&cfg.data_dir);
+        cfg.secrets = cfg.secrets.map(|s| dir.join(s));
         cfg.validate()?;
         Ok(cfg)
     }
@@ -275,11 +337,21 @@ impl NodeConfig {
         if !self.leases.is_empty() && self.capture.as_ref().is_none_or(|c| c.store.is_none()) {
             bail!("a node with leases ships its objects' versions (capture.store): another node restores an object it takes over from there");
         }
+        crate::egress::EgressPolicy::parse(&[], &self.limits.egress, self.dev).context("limits.egress")?;
+        crate::gate::trusted(&self.clients.trusted)?;
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
 
 impl ProxyConfig {
+    /// What `nanovm proxy --config` reads.
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: ProxyConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.nodes.is_empty() {
             bail!("the proxy has no nodes");
@@ -289,6 +361,16 @@ impl ProxyConfig {
         if self.failover_ms <= crate::proxy::CONNECT.as_millis() as u64 {
             bail!("failover_ms must be more than the proxy's connect timeout, {:?}", crate::proxy::CONNECT);
         }
+        for h in &self.hosts {
+            let name = h.strip_prefix("*.").unwrap_or(h);
+            ensure!(!name.is_empty() && !name.contains(['*', ':', '/']) && *h == h.to_ascii_lowercase(), "hosts entry {h:?} is not `name` or `*.name` in lower case");
+        }
+        for s in &self.signers {
+            let star = s.find('*').is_none_or(|i| i == s.len() - 1);
+            let words: Vec<_> = s.split_whitespace().collect();
+            ensure!(words.len() == 2 && words.join(" ") == *s && star && !s.contains(','), "signers entry {s:?} is not `<issuer> <subject>`, the subject maybe ending in `*`");
+        }
+        crate::gate::trusted(&self.clients.trusted)?;
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
@@ -304,6 +386,13 @@ fn dev_on_loopback(dev: bool, listen: &str, built: bool) -> anyhow::Result<()> {
         bail!("dev mode needs a loopback listen address, not {addr}");
     }
     Ok(())
+}
+
+/// The host's memory, in MiB.
+fn host_memory_mb() -> u64 {
+    // SAFETY: sysconf only reads.
+    let (pages, size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+    (pages.max(0) as u64 * size.max(0) as u64) >> 20
 }
 
 /// `n`, or for 0 the number of cores divided by `div` (at least 1).
@@ -348,8 +437,8 @@ mod tests {
         assert_eq!(serde_json::json!(d.clamped(&d)), serde_json::json!(d));
     }
 
-    /// Validation refuses a listen address that isn't one, and dev mode off
-    /// loopback.
+    /// Validation refuses a listen address that isn't one, dev mode off
+    /// loopback, and an egress cap naming a private address outside it.
     #[test]
     fn validate_checks_listen_and_dev() {
         let mut cfg = NodeConfig::default();
@@ -365,7 +454,12 @@ mod tests {
             cfg.listen = public.into();
             assert!(cfg.validate().unwrap_err().to_string().contains("dev mode"), "{public}");
         }
+        cfg.limits.egress = vec!["10.0.0.1".into()];
+        cfg.listen = "127.0.0.1:1".into();
+        cfg.validate().unwrap();
         cfg.dev = false;
+        assert!(cfg.validate().unwrap_err().to_string().contains("limits.egress"));
+        cfg.limits.egress.clear();
         cfg.validate().unwrap();
         let proxy = ProxyConfig { dev: true, ..ProxyConfig::default() };
         assert!(proxy.validate().unwrap_err().to_string().contains("dev mode"), "the default listen is public");
@@ -385,11 +479,45 @@ mod tests {
             (cfg.max_live_objects, cfg.memory_reservation_mb, cfg.heavy_lanes, cfg.max_component_mb),
             (1000, 128, 0, 64)
         );
-        assert!(cfg.cgroup.is_none() && !cfg.dev);
+        assert!(cfg.cgroup == "auto" && !cfg.dev);
         assert_eq!(ProxyConfig::default().max_sockets_per_app, 1000);
 
         let cfg: NodeConfig = toml::from_str("[limits]\ncpu_ms = 9\n").unwrap();
         assert_eq!((cfg.limits.cpu_ms, cfg.limits.memory_mb), (9, 64));
+    }
+
+    /// The proxy serves no host and lets no identity deploy until its
+    /// operator lists them; its lists hold only what they can match: names
+    /// or `*.name`, in lower case, and `<issuer> <subject>` pairs whose only
+    /// `*` ends the subject.
+    #[test]
+    fn proxy_lists_are_empty_by_default_and_checked() {
+        let cfg: ProxyConfig = toml::from_str("").unwrap();
+        assert!(cfg.hosts.is_empty() && cfg.signers.is_empty());
+        let check = |hosts: &[&str], signers: &[&str]| {
+            let list = |l: &[&str]| l.iter().map(|s| s.to_string()).collect();
+            ProxyConfig { hosts: list(hosts), signers: list(signers), ..ProxyConfig::default() }.validate().map_err(|e| e.to_string())
+        };
+        check(&["a.com", "*.a.com", "localhost"], &["https://i s", "https://i repo:org/*", "https://i *"]).unwrap();
+        for bad in ["", "*", "*.", "A.com", "a.com:443", "*a.com", "a.*.com", "http://a.com"] {
+            assert!(check(&[bad], &[]).unwrap_err().contains("hosts entry"), "{bad:?}");
+        }
+        for bad in ["https://i", "https://i  s", "https://i s t", " https://i s", "https://i\ts", "https://* s", "https://i s*x", "https://i a,b"] {
+            assert!(check(&[], &[bad]).unwrap_err().contains("signers entry"), "{bad:?}");
+        }
+    }
+
+    /// A worker may use a quarter of the host's memory and all its cores
+    /// but one (on one core, that core); 0 still leaves a limit unset.
+    #[test]
+    fn worker_limits_are_sized_from_the_host() {
+        let w = WorkerLimits::default();
+        assert!(host_memory_mb() >= 64 && w.memory_mb == host_memory_mb() / 4, "{w:?}");
+        let cores = std::thread::available_parallelism().unwrap().get();
+        assert_eq!(w.cpus, cores.saturating_sub(1).max(1) as f64);
+        assert_eq!(w.pids, 0);
+        let off: NodeConfig = toml::from_str("[worker]\nmemory_mb = 0\ncpus = 0.0").unwrap();
+        assert_eq!((off.worker.memory_mb, off.worker.cpus), (0, 0.0));
     }
 
     /// A misspelt key anywhere is an error rather than silently a default,
@@ -452,8 +580,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Loading resolves a relative data directory against the config file's
-    /// directory, and validates.
+    /// Loading resolves a relative data or secrets directory against the
+    /// config file's directory, and validates.
     #[test]
     fn load_resolves_relative_paths_and_validates() {
         let dir = std::env::temp_dir().join(format!("nanovm-config-test-{}", std::process::id()));
@@ -465,6 +593,8 @@ mod tests {
         assert_eq!(cfg.app_dirs("a")[1], dir.join("nanovm-data/tmp/a"));
         std::fs::write(&path, "data_dir = \"/abs\"").unwrap();
         assert_eq!(NodeConfig::load(&path).unwrap().data_dir, Path::new("/abs"));
+        std::fs::write(&path, "secrets = \"s\"").unwrap();
+        assert_eq!(NodeConfig::load(&path).unwrap().secrets, Some(dir.join("s")));
 
         std::fs::write(&path, "dev = true\nlisten = \"0.0.0.0:1\"").unwrap();
         assert!(NodeConfig::load(&path).is_err(), "validated");

@@ -9,7 +9,9 @@
 
 use std::cell::Cell;
 
-use nanovm_sdk::{Request, Response, Result, sqlite};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, sqlite};
 use serde::Deserialize;
 
 nanovm_sdk::serve!(handle);
@@ -20,45 +22,45 @@ struct Note {
     body: String,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     schema().await?;
-    let path: Vec<&str> = req.path().trim_matches('/').split('/').collect();
-    let note = || req.json::<Note>().ok().filter(|n| n.title.len() <= 200 && n.body.len() <= 64 << 10);
+    let path: Vec<&str> = req.uri().path().trim_matches('/').split('/').collect();
+    let note = || req.body().json::<Note>().ok().filter(|n| n.title.len() <= 200 && n.body.len() <= 64 << 10);
     // A note's id is its rowid in the index.
     let id = match path.as_slice() {
         ["notes", id] => match id.parse::<i64>() {
             Ok(id) => id,
-            Err(_) => return Ok(Response::not_found()),
+            Err(_) => return text(404, "not found"),
         },
         _ => 0,
     };
-    Ok(match (req.method(), path.as_slice()) {
+    Ok(match (req.method().as_str(), path.as_slice()) {
         ("POST", ["notes"]) => {
-            let Some(n) = note() else { return Ok(bad()) };
+            let Some(n) = note() else { return bad() };
             sqlite::execute("INSERT INTO notes (title, body) VALUES (?, ?)", &[&n.title, &n.body]).await?;
-            Response::json(format!(r#"{{"id":{}}}"#, sqlite::last_insert_rowid().await?)).status(201)
+            json(201, format!(r#"{{"id":{}}}"#, sqlite::last_insert_rowid().await?))?
         }
         ("GET", ["notes", _]) => {
             let rows = sqlite::query("SELECT rowid AS id, title, body FROM notes WHERE rowid = ?", &[&id]).await?;
             match rows.json().as_array().and_then(|r| r.first().cloned()) {
-                Some(note) => Response::json(note.to_string()),
-                None => Response::not_found(),
+                Some(note) => json(200, note.to_string())?,
+                None => text(404, "not found")?,
             }
         }
         ("PUT", ["notes", _]) => {
-            let Some(n) = note() else { return Ok(bad()) };
+            let Some(n) = note() else { return bad() };
             match sqlite::execute("UPDATE notes SET title = ?, body = ? WHERE rowid = ?", &[&n.title, &n.body, &id]).await? {
-                0 => Response::not_found(),
-                _ => Response::new(204),
+                0 => text(404, "not found")?,
+                _ => Response::builder().status(204).body(Body::empty())?,
             }
         }
         ("DELETE", ["notes", _]) => match sqlite::execute("DELETE FROM notes WHERE rowid = ?", &[&id]).await? {
-            0 => Response::not_found(),
-            _ => Response::new(204),
+            0 => text(404, "not found")?,
+            _ => Response::builder().status(204).body(Body::empty())?,
         },
         ("GET", ["search"]) => {
-            let Some(query) = fts_query(req.query("q").unwrap_or_default()) else {
-                return Ok(Response::text("q: one to ten words\n").status(400));
+            let Some(query) = fts_query(&req.query("q").unwrap_or_default()) else {
+                return text(400, "q: one to ten words\n");
             };
             let found = sqlite::query(
                 "SELECT rowid AS id, title, snippet(notes, 1, '[', ']', '…', 12) AS snippet FROM notes \
@@ -66,9 +68,9 @@ async fn handle(req: Request) -> Result {
                 &[&query],
             )
             .await?;
-            Response::json(found.json().to_string())
+            json(200, found.json().to_string())?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
@@ -83,8 +85,8 @@ fn fts_query(q: &str) -> Option<String> {
     (1..=10).contains(&words.len()).then(|| words.join(" "))
 }
 
-fn bad() -> Response {
-    Response::text("{\"title\": up to 200 bytes, \"body\": up to 64 KiB}\n").status(400)
+fn bad() -> Result {
+    text(400, "{\"title\": up to 200 bytes, \"body\": up to 64 KiB}\n")
 }
 
 thread_local! {
@@ -98,4 +100,14 @@ async fn schema() -> Result<()> {
         READY.set(true);
     }
     Ok(())
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

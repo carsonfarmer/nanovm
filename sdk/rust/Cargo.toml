@@ -7,14 +7,19 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/carsonfarmer/nanovm"
 
 [dependencies]
-# WASI 0.3.0, what nanovm's wasmtime hosts.
-wasip3 = { version = "0.9.0", features = ["async-spawn"] }
+# WASI 0.3.0, what nanovm's wasmtime hosts. `http-compat` converts its HTTP
+# types to and from the `http` crate's.
+wasip3 = { version = "0.9.0", features = ["async-spawn", "http-compat"] }
 wit-bindgen = "0.62"
+# Requests and responses are the `http` crate's, re-exported as `nanovm_sdk::http`.
+http = "1.3.1"
+# Query strings (`RequestExt::query`).
+form_urlencoded = "1.2"
 serde = { version = "1", optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]
-# `Request::json`: parse a body with serde.
+# `Body::json`: parse a body with serde.
 json = ["dep:serde", "dep:serde_json"]
 
 # Built on its own (`cargo doc`, `cargo check`), the SDK is its own workspace;

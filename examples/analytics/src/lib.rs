@@ -13,7 +13,9 @@
 use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, serde_json, sqlite};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, serde_json, sqlite};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -37,15 +39,15 @@ enum Batch {
 
 const DAY_MS: i64 = 86_400_000;
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     schema().await?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-    Ok(match (req.method(), req.path()) {
+    Ok(match (req.method().as_str(), req.uri().path()) {
         ("POST", "/events") => {
-            let events = match req.json::<Batch>() {
+            let events = match req.body().json::<Batch>() {
                 Ok(Batch::One(e)) => vec![e],
                 Ok(Batch::Many(e)) if e.len() <= 100 => e,
-                _ => return Ok(bad()),
+                _ => return bad(),
             };
             let ok = |e: &Event| {
                 let name = (1..=64).contains(&e.name.len()) && e.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
@@ -53,7 +55,7 @@ async fn handle(req: Request) -> Result {
                 name && at && e.path.len() <= 512 && e.user.len() <= 128
             };
             if !events.iter().all(ok) {
-                return Ok(bad());
+                return bad();
             }
             // One statement for the batch; the trigger counts each event.
             let n = sqlite::execute(
@@ -64,11 +66,11 @@ async fn handle(req: Request) -> Result {
                 &[&now, &serde_json::to_string(&events)?],
             )
             .await?;
-            Response::json(format!(r#"{{"accepted":{n}}}"#)).status(202)
+            json(202, format!(r#"{{"accepted":{n}}}"#))?
         }
         ("GET", "/days" | "/days.csv") => {
             let today = sqlite::query("SELECT date(? / 1000, 'unixepoch') AS d", &[&now]).await?.first().expect("a row").get::<String>("d")?;
-            let (from, to) = (req.query("from").unwrap_or(&today), req.query("to").unwrap_or(&today));
+            let (from, to) = (req.query("from").unwrap_or(today.clone()), req.query("to").unwrap_or(today));
             let days = sqlite::query(
                 "SELECT d.day, d.name, d.events, \
                         (SELECT count(DISTINCT user) FROM events e WHERE e.day = d.day AND e.name = d.name) AS users \
@@ -76,8 +78,8 @@ async fn handle(req: Request) -> Result {
                 &[&from, &to],
             )
             .await?;
-            if req.path() == "/days" {
-                return Ok(Response::json(days.json().to_string()));
+            if req.uri().path() == "/days" {
+                return json(200, days.json().to_string());
             }
             // Names are letters, digits and `_.-`, days digits and `-`: nothing to quote.
             let mut csv = String::from("day,name,events,users\n");
@@ -85,14 +87,15 @@ async fn handle(req: Request) -> Result {
                 let (day, name): (String, String) = (row.get("day")?, row.get("name")?);
                 csv.push_str(&format!("{day},{name},{},{}\n", row.get::<i64>("events")?, row.get::<i64>("users")?));
             }
-            Response::bytes("text/csv; charset=utf-8", csv).header("content-disposition", "attachment; filename=\"days.csv\"")
+            let csv_file = Response::builder().header(CONTENT_TYPE, "text/csv; charset=utf-8");
+            csv_file.header("content-disposition", "attachment; filename=\"days.csv\"").body(csv.into())?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
-fn bad() -> Response {
-    Response::text("an event is {\"name\": 1-64 of [A-Za-z0-9_.-], \"path\", \"user\", \"at\"?}, up to 100 at once\n").status(400)
+fn bad() -> Result {
+    text(400, "an event is {\"name\": 1-64 of [A-Za-z0-9_.-], \"path\", \"user\", \"at\"?}, up to 100 at once\n")
 }
 
 thread_local! {
@@ -115,4 +118,14 @@ async fn schema() -> Result<()> {
     }
     READY.set(true);
     Ok(())
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

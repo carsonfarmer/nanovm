@@ -1,6 +1,6 @@
 # Issues
 
-One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done twice or missed. Before starting one, set its status to `fixing` (or `in progress`), with who has it, and push; when it is on `main`, set `fixed in <commit>` (or `done in <commit>`) in the same push. New problems get the next `N-` number, new work the next `W-` number.
+One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done twice or missed. Before starting one, set its status to `fixing` (or `in progress`), with who has it, and push; when it is on `main`, set `fixed in <commit>` (or `done in <commit>`) in the same push. New problems get the next `N-` number, new work the next `W-` number. Agents working in parallel each take a range of their own so their entries can't collide when their branches merge (the beta branches: `B-1xx` secrets, `B-2xx` objects, `B-3xx` limits, `B-4xx` deploy, `B-5xx` recovery, `B-6xx` deployable, `B-7xx` the SDK, `B-8xx` their integration; round 3's reviews `N-7xx`); a merge that still brings two entries with one ID renumbers one and keeps both.
 
 - **Reproduced**: shown against the real code or the OS. **From source**: traced through the code, not run.
 - Status: `open`, `fixing`, `fixed in <commit>`, or `deferred: <why>`.
@@ -229,7 +229,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `object.rs`, `new_store`; `demo/demo.sh` creates a fresh set of 5,000 object IDs each run
 - **Scenario:** every persistent object volume is a direct child of the app directory. Repeated demos reached 65,000 directory links on this orb; new objects fail with `instantiate-failed` while existing objects work, despite free disk/inodes and live-store capacity. Eviction does not delete persistent volumes.
 - **Reproduced:** yes: `stat` reports 65,000 links on the counter app directory and a direct `mkdir` fails with `Too many links`. The first affected demo had seven cold-start failures; the next had 65,000 instantiation failures. Existing solo/canary objects still answered. This predates the telemetry response changes.
-- **Status:** open; plan directory sharding/data lifecycle without deleting existing volumes. W-2 validation uses a fresh disposable data root and preserves the exhausted directory.
+- **Status:** fixed on `beta/objects` (B-202): objects are sharded 256 ways and capped per app (`max_objects_per_app`, default 10,000). An existing data directory in the old layout is not read: not supported, see AGENTS.md rule 1; start from a fresh data directory.
 
 ### N-36: jailed-worker telemetry drops spans under sustained HTTP load
 - **Where:** worker SDK export queue and supervisor relay; fixed by W-2, delivered on main in `49d0ae4`.
@@ -457,6 +457,60 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix (proposed):** a pointer object to the last shipped snapshot, written after it, and retention of versions before the second-last snapshot.
 - **Status:** in part on `fix/lease-r3fix`: the object's head names its last version, and a restore follows parent digests back from it to the last snapshot, fetching only those. Retention (deleting versions before the second-last snapshot) remains.
 
+### B-500: recovery was offline and whole-node only (beta audit)
+- **Where:** `scripts/backup.py` (restic), `ship.rs`, `supervisor.rs`
+- **Scenario:** backup needed the node stopped; restore replaced the whole root, so every tenant lost what it wrote since the snapshot; the store that shipping fills had no restore command; no restore of one app or object.
+- **Fix:** shipping every committed version to `capture.store` is the backup; restic and `scripts/backup.py` are gone (AGENTS.md rule 1: no old way kept for its own sake). `nanovm admin … restore <app> [<object> [<version>]]` restores into a running node through the operator socket: the object is paused (`ship::pause`; `503 object-restoring`; its instance stopped through the worker), its unshipped versions shipped, the version fetched and checked, staged under `<data_dir>/restore/`, decided (`ready`) and installed with the journal; a version older than the head becomes the version after it. `ship::recover` finishes or drops a restore a crash cut short, at supervisor start. `versions` and `backlog` commands. Evidence: `notes/beta-recovery.md`.
+- **Status:** fixed on `beta/recovery`
+
+### B-501: a store outage became a write outage after 16 versions, and its backlog copied the volume every 16
+- **Where:** `committed.rs` (`prepare`), `config.rs` (`CaptureConfig`)
+- **Scenario:** with `remote_ack` off (one node), an object's writes were refused once 16 versions waited (`max_versions`): a 16-write outage of the store. And every 16th version was a snapshot of the whole volume, so a long outage's backlog grew with the volume's size, not with what was written.
+- **Fix:** `max_versions` is gone; `max_mb` (bytes, per object) bounds what waits. A scheduled snapshot is skipped while more than `snapshot_every` versions wait. The backlog is visible (`admin backlog`, `nanovm.capture.waiting.*`, a log line when it starts, every minute, when it ends). `remote_ack` (several nodes) is unchanged. Test: `writes_go_on_through_a_store_outage_and_ship_in_order_after` (60 writes with the store down, then everything ships in order; snapshots only at 1 and 17); mutation-checked (a 16-version bound back; snapshots every 16 regardless).
+- **Status:** fixed on `beta/recovery`
+
+### B-502: the supervisor, root, wrote through paths in an app's directory, which the app's worker controls
+- **Where:** `ship.rs` (`restore` staged under `objects/<app>/~restore/`; `mark`; `discard`; supervisor's `restored` chown)
+- **Scenario (from source):** with leases, a claim restored an object as root by writing the store's versions to `objects/<app>/~restore/<object>/<n>.tar` with `create_dir_all` and `fs::write`, which follow symlinks. A compromised worker (uid of its app) owns `objects/<app>` and can make `~restore` a symlink: root then creates directories and writes the app's own bytes under a path of the worker's choosing outside the jail. `mark` (`~shipped/~new`, written with `fs::write`) and `discard` (`remove_dir_all` through an intermediate symlink) have the same shape for every node with a store.
+- **Fix:** a restore stages under `<data_dir>/restore/<app>/<object>` (no jail reaches it), is given to the app's uid there, and is installed by descriptor (`openat` with `O_NOFOLLOW` at each name, `renameat`, `remove_at`), as are the directories it makes. `mark` and `discard` are left to the `r3-lease` fix (`fix/r3-lease` rewrites both): they should open `~shipped` and the object's directories the same way.
+- **Status:** fixed: restore on `beta/recovery`; `mark`, `discard` and the prune on round 3 (c882871); both on the per-object layout (`ship::object_at`, `install` through `sub`/`remove_at`/`renameat`) on `beta/integration`
+
+### B-503: a commit could fail with "gap in committed versions" while the shipper pruned
+- **Where:** `committed.rs` (`head`)
+- **Scenario:** reproduced by `restores_an_object_and_an_app_into_a_running_node`: an app writing steadily while its versions shipped got `500 commit-failed: gap in committed versions` at its 25th write. The shipper removes shipped versions (all but the last) while the worker lists the directory; a listing can see some removed ones and not others (in any order), which `head` took for a gap.
+- **Fix:** `head` takes the last version it sees and doesn't require the others to be contiguous (nothing else can make a gap: versions are published in order, and only the shipper removes them). Test: `a_commit_goes_on_past_versions_pruned_out_of_order`; mutation-checked.
+- **Status:** fixed on `beta/recovery`
+
+### B-504: the shipper shipped a version naming another app or object as this one's
+- **Where:** `ship.rs` (`ship_object`)
+- **Scenario (from source):** the shipper (root) read `~committed/<object>/<n>.tar`, which the worker writes, and checked only its sequence, parent and epoch. A compromised worker could put there (or symlink to) a version of another object, or another app's, and have it shipped and restored as its own.
+- **Fix:** a version ships only if its identity names this app and object; a restore checks the same of each version it fetches. Test: `a_version_naming_another_object_is_not_shipped`; mutation-checked.
+- **Status:** fixed on `beta/recovery`
+
+### B-505: a fresh node pointed at an existing store serves its objects empty until they are restored
+- **Where:** `ship.rs`, `object.rs`
+- **Scenario:** with one node there is no claim before serving, so a node started on an empty root with the store of a lost node serves each object empty; a write then makes version 1, which can't ship (the head is further on), so it waits until `max_mb` and the object's writes are refused. The runbook says to restore with ingress off.
+- **Fix (proposed):** an object with no history here asks the store for its head before its first instance (as a claim does with leases), restoring it if the store has one. It costs a store round trip per cold start of an object never written here (N-183's cost); an owner decision.
+- **Status:** open
+
+### B-506 (efficiency): restoring an older version fetches every version after it
+- **Where:** `ship.rs` (`restore`)
+- **Scenario:** the version to restore is found by following parent digests back from the head, so every version between it and the head is fetched whole; only their identities (the first 4.5 KiB of each) are needed.
+- **Fix (proposed):** a ranged read of each version's identity on the way back.
+- **Status:** open
+
+### B-507: with `remote_ack`, an app's post-return deadline, not the 2 s ack bound, decides how long a write waits for the store
+- **Where:** `object.rs` (the commit runs in the post-return phase), `ship.rs` (`stored`)
+- **Scenario:** reproduced by `nodes::an_object_is_restored_on_the_node_holding_it` before it raised hostile's `post_return_timeout_ms` (500 ms): 3 of 7 runs on a busy machine answered a write `504` (the instance killed at its deadline while the shipper's store writes synced), not `500 commit-failed` after 2 s. The commit stands locally either way. Existing multi-node tests use the same 500 ms app and may fail the same way under disk load.
+- **Fix (proposed):** say in the README that `post_return_timeout_ms` bounds the remote-ack wait, or run the wait outside the instance's deadline. Multi-node behaviour, left as it is here.
+- **Status:** fixed on round 3 (065078e): the wait is the node's 2 s (`ship::ACK`), whatever the app's deadlines
+
+### B-508: the admin socket can't be bound under a long `data_dir` (for `beta/objects`)
+- **Where:** `admin.rs` (`listen` binds `<data_dir>/admin/socket` by path)
+- **Scenario:** reproduced in this worktree: `a_cached_compile_is_used_without_reading_the_component` and `jailed_workers_export_otel_without_guest_network_access` fail at `Supervisor::new` (`binding …/admin/socket`): their socket paths are 109 and 110 bytes, past `sun_path`'s 108. A node whose `data_dir` is long doesn't start. Not this branch's code; recorded for the objects agent.
+- **Fix (proposed):** bind relative to the admin directory (or through `/proc/self/fd/<dir>/socket`), and have the client do the same.
+- **Status:** fixed on `beta/objects` (bound and reached through `/proc/self/fd/<dir>/socket`; `the_admin_socket_takes_a_long_data_dir`)
+
 ### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
 - **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
 - **Scenario:** found by the quality agent while writing D-52. The node's linker defines every WASIp2 interface, including `wasi:filesystem@0.2` and `wasi:sockets@0.2`, and the WASIp2 filesystem shares the `WasiCtx`'s read-write preopens. A guest using `std::fs` links (`instantiate_pre` succeeds). Today `ALLOWED_IMPORTS` refuses it at load, by name, so nothing is exploitable; but that check is the single layer between a guest and writes to `/data` that bypass the quota and the journal (no rollback). Sockets have a second layer (wasmtime's default address check denies every address).
@@ -593,6 +647,57 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the script copies the host's CA bundle and no longer `demo/static`, links `sleep`, and its default set includes the `cgroup` tests. Docs corrected.
 - **Status:** fixed on `fix/r3-worker`
 
+### B-201: any request to an unknown object made a permanent volume (beta audit)
+- **Where:** `object.rs` (`new_store` made `<objects>/<app>/<id>` before instantiating), `table.rs` (any valid first path segment is an object)
+- **Scenario:** the production audit sent 300 `GET /scanN/wp-login.php`: all 404, and 301 volume directories stayed on disk. Nothing removed a volume, ever. The journal log and the capture directory already appeared only with a change; the volume was the one thing made up front.
+- **Reproduced:** yes: `objects_that_change_nothing_leave_nothing` (300 such GETs and 20 reads of unknown objects) failed with 320 directories under `objects/counter` before the fix.
+- **Fix:** an object has a directory only from its first change: until then an instance's `/data` is an empty directory from the app's pool (`~new`, one per live instance, reused), moved into the object's place by the first create (`Journal::place`). When an instance ends (`Journal`'s `Drop`), an object it made that never committed is rolled back at once (others still roll back when they next start), and an object whose volume is then empty, with no captured history, is removed (`Objects::settle`). After: 0 directories; a new object whose first request fails leaves nothing (`failed_and_emptied_objects_leave_nothing`).
+- **Status:** fixed on `beta/objects`
+
+### B-202: no per-app object cap, and about 65k objects broke an app's new objects (N-35)
+- **Where:** `app.rs` (`Objects`), `config.rs` (`max_objects_per_app`)
+- **Scenario:** nothing bounded how many objects an app kept on a node; every volume, journal and capture directory was a direct child of one directory per app, so 65,000 subdirectories (a limit on some filesystems) failed every new object of the app (N-35).
+- **Fix:** objects live at `<objects>/<app>/<shard>/<id>/` (`data`, `journal`, `committed`, `shipped`), the shard the first byte of the id's SHA-256: 65,000 objects put under 400 in any directory (`objects_are_sharded`). A node config `max_objects_per_app` (default 10,000) caps an app's objects: a request to an object without storage gets `507 object-limit` before any guest code runs, and a first create past it gets `insufficient-space`; the place is taken atomically at the first change, so 40 clients making objects at once against a cap of 5 make exactly 5 (`an_app_has_at_most_its_objects`). The count is per worker, from the shards when it starts. A client that crafts ids for one shard can still fill that shard, and the cap only stops it at the cap: raise the cap past 65,000 on such a filesystem only with that in mind.
+- **Status:** fixed on `beta/objects`
+
+### B-203: the KV provider leaves `.kv/<store>/` when its last key goes, so such an object is never empty
+- **Where:** `components/keyvalue/provider` (`delete`)
+- **Scenario:** an object that deletes all its keys keeps two empty directories, so its volume isn't empty and the object isn't removed (B-201's rule is conservative: only an empty volume goes).
+- **Suggestion:** after a delete, remove the store's directory (and `.kv`) when a listing shows it empty; only then, so a delete costs no extra journal record.
+- **Status:** open
+
+### B-204: a full disk still made new object directories (beta audit)
+- **Where:** `object.rs` (`new_store`), `app.rs` (`Objects::room`)
+- **Scenario:** on an 8 MiB root, about 700 one-counter objects filled the disk; every write then failed with `500 commit-failed`, yet requests went on making object directories (9,003).
+- **Fix:** a request to an object without storage gets `507 disk-full` when the filesystem has less free than the object's quota (`disk_mb`, and `max_files` entries where the filesystem counts them), checked with `statfs` (added to the worker's seccomp list) before anything is made, and again at the first create. Existing objects are served. `a_full_disk_makes_no_new_objects` (root: a 4 MiB tmpfs) fills it with counters until the first `disk-full`, then checks that 200 more requests to new objects are refused and make nothing. Reserving room for existing objects' writes is the disk budget's (`beta/limits`).
+- **Status:** fixed on `beta/objects`
+
+### B-205: no way to delete an object's or an app's data (W-5)
+- **Where:** `supervisor.rs` (`delete`, `remove`), `ship.rs` (`Store::remove`), `admin.rs`
+- **Fix:** an object deletes its own storage by removing its files (B-201; no new WIT). An operator runs `nanovm admin delete <app> <object>` or `delete-app <app>` on a running node: the app's worker drains and stops (as for a version switch), the shipper is held off, what the node shipped goes from `capture.store` (`<app>/<object>/` or `<app>/`), then the node's copy is moved into `<data_dir>/deleted` at once and removed; the app starts again with its next request (`an_operator_deletes_an_object_and_an_app`). Nothing deletes an object that holds data on its own.
+- **Status:** fixed on `beta/objects`; with `leases` (several nodes) deletes are refused (B-206).
+
+### B-206: operator deletes are refused on nodes with leases
+- **Where:** `supervisor.rs` (`delete`)
+- **Scenario:** with several nodes another node may hold the object, serve it and ship its versions; deleting its store keys under it would break its shipping, and deleting this node's copy wouldn't delete the object.
+- **Suggestion:** delete through the object's lease: take it (as a failover does), delete the store's head and versions, release. Needs W-90's head fencing to cover a delete.
+- **Status:** open (owner question)
+
+### B-207: an object a lease takeover restores is not in its app's count until the worker restarts
+- **Where:** `supervisor.rs` (`restored`), `app.rs` (`Objects`)
+- **Scenario:** `ship::claim` restores an object's directory from the supervisor, outside the worker that counts. The count is low by such objects until the worker next starts (it saturates at 0 when they go). Only with leases; with `beta/recovery` merged, also an operator's `restore` of an object this node didn't have (the worker keeps running through it).
+- **Status:** open (minor)
+
+### B-208: one operator control path into a running node
+- **Where:** `admin.rs`, `supervisor.rs` (`command`), `main.rs` (`nanovm admin`)
+- **Fix:** a Unix socket at `<data_dir>/admin/socket` in a 0700 directory of the supervisor's own user; a line of JSON (an array of strings) in, a line out. Bound and reached through `/proc/self/fd`, so a long `data_dir` fits a socket's 107-byte path. `admin_socket_is_the_supervisors_own`: uid 65534 gets EACCES; no HTTP route reaches it; `jail_blocks_escapes`: a jailed worker can't connect to it. `recovery` adds its restore commands here.
+- **Status:** done on `beta/objects` (1b11455)
+
+### B-209 (tests): `a_node_that_lost_an_objects_lease_cannot_commit_it` once got a 200 with an empty body
+- **Where:** `tests/integration.rs` (`nodes::`), the end of a streamed body whose instance resets
+- **Scenario:** in one full serial run on `beta/objects` (after merging 7b3f9c6), under load average about 26 from other agents, the first request's answer came back `200` with an empty body instead of `finished`. The guest writes `finished` from work after its answer; that work's commit is then refused (the node lost the lease) and the instance resets. Not reproduced in 10 runs since (two full runs and 8 targeted ones, 6 under added CPU load). Suspected: the client reads the body's end while the reset instance's store is being dropped, the race N-710 narrowed.
+- **Status:** open (not reproduced)
+
 ### N-720: concurrent claims overwrote each other's shipped markers
 - **Where:** `ship.rs` (`mark`)
 - **Scenario:** found by the second lease review (`review2/lease`, finding 1). `mark` wrote every object's marker through one fixed temporary file, `<objects>/~shipped/~new`. Every lease grant claims (and may restore and mark) its object, grants run concurrently, and the shipper marks too. A marker could then hold another object's sequence, or a mix: `stored` acknowledged versions the store never got, and `ship_object` skipped them; the losing rename failed with ENOENT, so that claim answered 503.
@@ -661,6 +766,183 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** yes: `the_shipper_catches_up_a_marker_left_behind` (before: refused).
 - **Fix:** a version up to the head's is the head's history when this copy has the head's version (a claim made it so; versions here are a chain): it is marked, not shipped again.
 - **Status:** fixed on `fix/r3-lease` (73dbc48)
+
+### N-550 (docs): README understated the memory mappings a worker needs threefold
+- **Where:** README "Host requirements on Linux"; `engine.rs` (`MAPS_PER_OBJECT`, `preflight`)
+- **Scenario:** found by the ops agent. README said about 8 mappings per pool slot (65,530 fits roughly 7,600 objects; 8,000 need 68,352). `preflight` has required `24 × (max_live_objects + 32) + 4096` since `c504f29`: the default 65,530 fits about 2,500 objects, and the demo's 8,000 need 196,864. An operator sizing from README got a worker that refuses to start.
+- **Reproduced:** from source (the arithmetic in `preflight`); the host here has 1,048,576 and is shared, so the default was not tried.
+- **Status:** fixed on `ideas/systemd-units` (README line and `deploy/systemd/90-nanovm.conf`); on round 3 with `beta/deployable`
+
+### B-601: round 3's workers show as `/proc/self/exe worker`, not `nanovm worker`
+- **Where:** `supervisor.rs` (`spawn`: `Command::new(&self.exe).arg("worker")`)
+- **Scenario:** found by `beta/deployable` merging `ideas/ops`. N-552 (37dd88e) spawned workers from `/proc/self/exe` with `arg0("nanovm")`, so `ps` and `pgrep -f "nanovm worker"` kept showing them as before. The spare-worker port (091c810, N-224/N-225) rewrote the spawn without the `arg0`: on round 3 a worker's command line is `/proc/self/exe worker`, so ops' own checks (`deploy/systemd/test/in-container.sh`, `deploy/container/test/local.sh`) and an operator's `pgrep -f "nanovm worker"` find no worker.
+- **Reproduced:** yes: `supervised_workers_contain_attacks` now reads each worker's `/proc/<pid>/cmdline`; without the fix it is the binary's path and `worker`, not `nanovm\0worker`.
+- **Fix:** `arg0("nanovm")` again (the same line; 0 runtime lines).
+- **Status:** fixed on `beta/deployable`
+
+### B-602: the ops reference configs don't parse on round 3, and nothing tested them
+- **Where:** `deploy/systemd/{nanovm,proxy}.toml`, `deploy/container/{nanovm,proxy}.toml`, `docs/ops/errors-check.sh`
+- **Scenario:** found by the production audit. `ideas/ops` wrote its configs on `3dafe33`, before round 3 renamed the node's `publish_to` to `proxy` and the proxy's `node` to `nodes`. On round 3 `nanovm serve` and `nanovm proxy` refuse them (`unknown field`), so `install.sh`, the units and the image start nothing. No test loaded a shipped config.
+- **Reproduced:** yes, `tests/configs.rs` fails on all four files before the fix.
+- **Fix:** the configs use today's keys (no aliases, AGENTS.md rule 1). `tests/configs.rs` loads every shipped config with the real loader (`NodeConfig::load`, the new `ProxyConfig::load` that `nanovm proxy` now calls, `AppSpec` for each `nanovm.json`). +5 runtime lines.
+- **Status:** fixed on `beta/deployable` (4ea16e6)
+
+### B-603: check-host doesn't know round 3's address-space preflight or capture
+- **Where:** `deploy/single-node/check-host.py`
+- **Scenario:** found by `beta/deployable`. Round 3's `engine::preflight` refuses to start under an address-space limit below `n × (4 × (memory_reservation_mb + 64 KiB) + 4 MiB) + 1 GiB` (N-671; about 522 GiB at the defaults), which `check-host.py` didn't check, and it described capture history as full copies kept here, not round 3's changes between snapshots, shipped to `store`.
+- **Reproduced:** from source (the arithmetic in `preflight`).
+- **Fix:** check-host checks the unit's `LimitAS` (or the shell's `ulimit -v`) against the same formula, and describes capture as round 3 keeps it. A unit test pins the formula; mutating `GUARD` or dropping the check fails it.
+- **Status:** fixed on `beta/deployable`
+
+### B-604: with a capture store, a node under the hardened unit ships one version per object, then nothing, silently
+- **Where:** `deploy/systemd/nanovm.service` (`CapabilityBoundingSet`); `ship.rs` (`run`, `authority`, `mark`)
+- **Scenario:** found by `beta/deployable` testing the units with `[capture] store` set. The supervisor ships a version, moves the head, then records it in `objects/<app>/~shipped/<object>` and removes shipped versions from `objects/<app>/~committed/<object>/`: directories the app's uid owns. The unit keeps only `CAP_CHOWN CAP_SETUID CAP_SETGID CAP_KILL`, so as root without `CAP_DAC_OVERRIDE` both fail with EACCES. `ship::run` takes every `PermissionDenied` as "this node holds no lease on the object" and waits quietly, so it logs nothing, never marks version 1, and retries the same step forever: later versions pile up here until `max_versions`, then writes are refused; with `remote_ack` every write fails after 2 s.
+- **Reproduced:** yes, `deploy/systemd/test/nspawn.sh`, store mode: one version of three in the store, three left here, nothing in the node's journal. Outside the unit (root with every capability) the same config ships all three.
+- **Fix (deploy):** `deploy/systemd/nanovm-store.conf`, a drop-in for any store, adds `CAP_DAC_OVERRIDE` (and the directory store's `ReadWritePaths`, an object store's `EnvironmentFile`). After: 3 of 3 shipped, 1 left here, 70/70 checks in four modes.
+- **Runtime half:** `run` took a filesystem EACCES for "no lease" and swallowed it: N-728, fixed on round 3 (73dbc48).
+- **Status:** fixed on `beta/deployable` for the units (the store drop-in); the silent swallowing is N-728
+
+### B-100: an app's secrets were published in its public package (beta blocker)
+- **Where:** `registry.rs` (`AppSpec`: `env` and `config` are the OCI config blob), `main.rs` (`publish`: nodes pull anonymously, so the package is public), `examples/oauth`, `examples/gateway`
+- **Scenario:** an app's only inputs were its manifest's `env` and `config`, published with it. Every API key an app needed was readable by anyone who could pull it. The oauth and gateway examples said so ("needs a secret store", IDEAS G-78, which is in no file on this branch).
+- **Fix (`beta/secrets`):** a node's `secrets` directory (only the user nanovm runs as may use it, or the node doesn't start) holds each app's as `<app>.json`, keyed as apps are (`registry::app_name`). The supervisor reads it when it starts the app's worker and sends it over the spec channel (stdin); the guest reads it through `wasi:config/store`, over its package's config. A manifest declares the keys it needs (`"secrets": [...]`); a start without one of them, or with a file that isn't a JSON object of strings, fails closed with a 502 naming the file and the problem, never the content. A change to the file retires the worker within about a second; the next request starts one with the new values. The host masks every secret value in what it reports of what the guest wrote (telemetry batches, a failed request's detail). `nanovm publish` refuses declared secrets and credential-like keys or values in `config`/`env`. `nanovm run --secrets <file>` for local use. Both examples moved off package-held keys. Evidence and tests: notes/beta-secrets.md.
+- **Status:** fixed on `beta/secrets`
+
+### B-101: masking matches exact values only
+- **Where:** `secrets.rs` (`Secrets::mask`), used by `telemetry.rs` (`Client::send_bytes`) and `object.rs` (`serve`)
+- **Scenario:** the host masks the exact bytes of each secret. A guest that percent-encodes, escapes, splits or transforms its secret before writing it (a JSON-escaped secret holding `"`, a URL path with a percent-encoded character) is reported unmasked; so is one it sends out over its egress, which no mask could stop. A very short secret (a few bytes) masks unrelated bytes too, and can make a telemetry batch unparseable, which the supervisor then drops (fail closed: nothing leaks, but that app's telemetry for the batch is lost). Masking is a guard against accidents, not against a guest that means to leak.
+- **Status:** open (accepted for the beta; a minimum secret length or masking common encodings are the options)
+
+### B-104: without root, a worker is dumpable
+- **Where:** `jail.rs` (`Jail::enter`)
+- **Scenario:** with root, the worker's `setresuid` makes it non-dumpable (`fs.suid_dumpable` = 0): no core dump holds its secrets, and no process of its uid may trace it or read its memory (checked in `secrets_reach_only_their_apps_worker`: its `/proc/<pid>/environ` and `mem` are root's). Without root nothing changes its uid, so it stays dumpable, and a crash with core dumps enabled writes its memory, secrets included, where the user's core dumps go. `prctl(PR_SET_DUMPABLE, 0)` in the jail would close it; not done here because it also makes the worker's own `/proc/self` files root's, which a non-root worker may need, and the jail isn't this work's file.
+- **Status:** open (low: production runs as root)
+
+### B-105: a failed worker start's whole error chain goes to the client
+- **Where:** `supervisor.rs` (`ensure`: `down(&why)`)
+- **Scenario:** a client whose request starts an app that fails to start gets the full error as its 502 detail, for example a registry error or a missing secret's name and file name. Secret values are never in it (B-100), but it tells the public about the node's setup. Pre-existing; found while choosing what the secrets errors say (they name the file, not the directory).
+- **Status:** open (owner: log the detail, answer clients with its first line)
+
+### B-400: anyone who points DNS at the proxy deploys (beta blocker, deploy)
+- **Where:** `proxy.rs` (`forward`, `lookup`), `config.rs` (`ProxyConfig`)
+- **Scenario:** the proxy served any host whose `_nanovm` TXT record parsed, and told the node to accept whatever identities that record trusted. The domain owner, not the operator, decided what ran on the node.
+- **Status:** fixed in d287d22: `hosts` (names and `*.name`) and `signers` (`<issuer> <subject>`, the subject exact or up to a final `*`) in `proxy.toml`, both empty by default. An unlisted host is 403 before any lookup; a record's `trust=` entries are cut to the signers before the node hears them; a record left with none is 403. Tests: `unlisted_hosts_are_refused_before_any_lookup`, `records_trust_only_the_operators_signers`, `the_proxy_routes_hosts_by_dns`. The empty default is an owner question (notes/beta-deploy.md).
+
+### B-401: the app alone chooses its egress; the operator can't cap it (beta blocker, deploy)
+- **Where:** `egress.rs` (`EgressPolicy`), `config.rs` (`Limits::clamped` kept the app's list), `supervisor.rs`, `app.rs`
+- **Scenario:** a signed manifest asking for `*.com` reached every `.com` host from the operator's IP: the node was an HTTP relay for any app.
+- **Status:** fixed in d287d22: the node's `limits.egress` is the operator's list, and a request must match both it and the app's (default empty: no egress). Private addresses stay refused in both. Tests: `the_operators_list_caps_the_apps`, `egress_is_capped_by_the_operator` (in process and through the supervisor). `nanovm run` takes the manifest's list as its cap.
+
+### B-402: made-up Host headers each cost a DNS-over-HTTPS lookup, and 10,000 wiped the route cache (beta blocker, deploy)
+- **Where:** `proxy.rs` (`Cache`)
+- **Scenario:** every new host cost a lookup; past 10,000 cached hosts the cache dropped every entry, live routes included, so a flood of random hosts both cost unbounded lookups and made every app look itself up again.
+- **Status:** fixed in d287d22: unlisted hosts never reach the cache (B-400); under a `*.name` entry, hosts with an app are kept apart (10,000) from the rest (no record, refused, failed, in flight: 1,000), and while 1,000 of the rest are fresh a new host is 503 rather than looked up. Test: `made_up_names_cost_bounded_lookups_and_keep_live_routes` (30,000 made-up names: at most 1,001 lookups; the live route isn't looked up again).
+
+### B-403: any domain could serve another's app, with its data, under its own origin (beta blocker, deploy)
+- **Where:** `proxy.rs` (`lookup`); W-15
+- **Scenario:** apps belong to the name their record is found at after CNAMEs (W-15), so `_nanovm.evil.com CNAME _nanovm.victim.com` served victim.com's app and data at evil.com: its users' sessions and cookies at an origin evil.com controls, which it can point elsewhere at any time.
+- **Status:** fixed in d287d22: an alias is served only if the owner's record lists it (`alias=<host>`); W-15's shared app stays for aliases that consent. Test: `aliases_need_the_owners_consent`, and `the_proxy_routes_hosts_by_dns` end to end.
+
+### B-404: a resolver failure read as "no record"
+- **Where:** `proxy.rs` (`lookup`)
+- **Scenario:** a DNS-over-HTTPS answer with status SERVFAIL (or any status) and no records was a 404, remembered 30 s: a resolver outage looked like every app being removed.
+- **Status:** fixed in d287d22: only NOERROR and NXDOMAIN answer; anything else is a failure (502, then B-405). Test: `a_failing_resolver_is_not_an_answer`.
+
+### B-405: a registry or DNS-over-HTTPS outage takes every app down within 30 s (deploy)
+- **Where:** `proxy.rs` (`Cache`)
+- **Scenario:** routes last their TTL and digests `tag_ttl_s` (30 s); once one ran out, a failed lookup was the answer (502) for every request.
+- **Status:** fixed in 185f832: a found route or digest stands in for failures to look it up again (or a lookup taking over 5 s) for up to a day past its TTL, asked again every 30 s (RFC 8767's serve-stale). A host or tag never found fails as before. Tests: `found_answers_outlast_an_outage_for_a_while`, `a_resolver_outage_keeps_the_last_route`. Not covered: a proxy restarted during an outage has nothing to serve (the cache is in memory); B-406.
+
+### B-406: a worker start fetches the manifest and signatures again, so a registry outage stops any app whose worker restarts (deploy)
+- **Where:** `registry.rs` (`load`, `verify`), `supervisor.rs` (`start`)
+- **Scenario:** a worker retired as idle or least recently used, or one that crashed, starts again through `Registry::load`, which fetches the manifest and the signatures from the registry every time, by design ("whether a signature exists is the registry's current answer"). During a registry outage that app is down until the registry is back, whatever the proxy serves.
+- **Proposal:** keep the manifest and each accepted `(digest, policy)` on disk next to the blob cache once verified, and fall back to them when the registry fails (not when it answers "no signatures"), for as long as the proxy serves stale (B-405). It changes the registry's trust rule, so it is the owner's call.
+- **Status:** open
+
+### B-407: the TLS terminator lists the hosts again
+- **Where:** `deploy/single-node/Caddyfile` (on `ideas/single-node`)
+- **Scenario:** Caddy issues certificates only for the hosts listed in its Caddyfile, so an operator keeps the same list twice (Caddyfile and `hosts`); Caddy's on-demand TLS needs an `ask` endpoint, which nanovm doesn't provide.
+- **Proposal:** the proxy's private listener answers `GET /ask?domain=<host>` with 200 when `hosts` matches it, so Caddy's `on_demand_tls { ask … }` can use one list.
+- **Status:** open
+
+### B-701: the Rust SDK has its own `Request` and `Response` (owner decision: use the `http` crate's)
+- **Where:** `sdk/rust/src/lib.rs`, `fetch.rs` (was `http.rs`), `ws.rs`; every Rust app (`examples/`, `js/runtime`)
+- **Scenario:** the SDK's `Request`, `Response`, `Reply` and `Fetch` builder (about 300 lines) duplicated `http::Request`/`Response`, unfamiliar to Rust developers who know `http` from hyper, axum or Spin.
+- **Fix:** handlers take `http::Request<Body>` and return `http::Response<Body>`; `fetch` and object calls take and return them too. Conversions are `wasip3`'s `http-compat`. `Body` is bytes or a response's stream; `RequestExt` adds `query` and `cookie`. The old types are deleted, no aliases. N-710's and N-713's fixes (work after the answer waits for it to be out; a streamed body's writer can fail) are carried over: `Body::stream`'s writer returns `Result<()>`. examples/echo and `echo_maps_requests_and_responses_both_ways` check the mapping both ways through a node. Evidence: notes/sdk-http.md.
+- **Status:** done on `sdk/http-types` (sdk-http agent)
+
+### B-702: the `http` crate adds 43–69 KB to every Rust app
+- **Where:** guest components
+- **Scenario:** against 7b3f9c6, composed components grow +43 KB (hello, +12.7%) to +69 KB (oauth, +15.1%); +2.9–3.4% for apps with SQLite. A linker map puts it in `http` itself: `HeaderName::from_bytes`' table of standard names (16.9 KB), URI and `HeaderMap` code (about 13 KB), `bytes` (about 4 KB). Building requests without `http_from_wasi_request` already took 11.8 KB back.
+- **Status:** accepted with B-701 (the cost of the crate; notes/sdk-http.md has the numbers)
+
+### B-703: `fetch` of a request with a `host` header fails
+- **Where:** `sdk/rust/src/fetch.rs`
+- **Scenario:** from source: `wasi:http` forbids a `host` header on an outgoing request, so an app that forwards an incoming request's headers (they include `host`) gets an error. `wasip3`'s `http_into_wasi_request` moves `host` into the URI's authority; the SDK builds its request itself (it sets `content-length` and sends no body for an empty one) and doesn't.
+- **Status:** open (low)
+
+### B-210: after a claim restores an object, the supervisor's chown follows the path the worker can change
+- **Where:** `supervisor.rs` (`restored`, `chown_tree`)
+- **Scenario:** found while moving B-502's descriptor paths onto the per-object layout. `restored` gives what a claim restored to the app's uid by walking `objects/<app>/<shard>/<object>` by path as root: `lchown` doesn't follow the last name, but a shard (or, before, `~committed`) the worker replaced with a symlink is followed. `claim`'s `discard` refuses such a symlink first, but a claim that keeps the copy (`current`) doesn't discard. Same exposure as on `cf/round3`; only with leases.
+- **Suggestion:** chown through `dir_at` (`fchownat` with `AT_SYMLINK_NOFOLLOW` from the object's directory, opened a name at a time), as `mark` and `discard` do.
+- **Status:** fixed by the recovery merge on `beta/integration`: `restored` and its path walk are gone. A restore (a claim's or an operator's) gives what it staged to the app's uid outside every jail, and `install` makes the shard and object directories by descriptor (`fchown` on the directory it made) before renaming the staged volume and versions in
+
+### B-800: an operator's delete removes the object's only backup (objects x recovery)
+- **Where:** `supervisor.rs` (`delete`: `Store::remove` of `<app>/<object>/` or `<app>/`), README "Operator commands" and "Backup and restore", notes/recovery-runbook.md
+- **Scenario:** found merging `beta/recovery` onto `beta/objects` (the integration branch's range is B-8xx). Objects' delete removes what the node shipped (the head and every version), so a recreated object starts a new history. Recovery made the store the only backup (restic is gone) and its runbook said "nanovm never deletes from it". Together, `delete` and `delete-app` can't be undone, by nanovm or from a backup, and the runbook's sentence was false. Neither branch's tests fail: each feature works; they disagree on what a delete leaves.
+- **Fix (docs, done):** README, PLAN and the runbook say a delete removes the backup too, and that only a store keeping its own old versions (S3 bucket versioning, object lock) can bring it back.
+- **Recommendation (owner):** keep delete removing the store's copy (it is what an erasure request needs, and an object that keeps its head in the store can't start a new history), and say in the operator guide to turn on bucket versioning with a lifecycle rule if deletes must be undoable for a while. Alternative: a two-step delete that renames the store's prefix aside for a grace period, then purges; more code, and a second retention policy to run.
+- **Status:** open (owner decision); documented
+
+### B-301: no rate limits or connection caps (beta audit)
+- **Where:** `proxy.rs` (`serve`), the node's front end (`main.rs`, `server::serve_http1`)
+- **Scenario:** a client could send any number of requests a second, to any app, and hold any number of connections, at the proxy and at a node reached directly; one client or one app could take all of either.
+- **Fix:** `gate` (both listeners, `[clients]`): requests a second per client address (an IPv6 /64) and per app (`governor`, GCRA; 429 with `Retry-After`), connections per client address (503 with `Retry-After`) and in all (the listener stops accepting). The client behind a trusted forwarder is the last untrusted address in `X-Forwarded-For`; trusted peers (default loopback) aren't limited. Hostile tests: `clients_past_their_rate_are_refused_however_they_forward` (spoofed and prepended `X-Forwarded-For`), `apps_past_their_rate_are_refused`, `connections_are_capped_per_client_and_in_all`. Evidence: notes/beta-limits.md.
+- **Status:** fixed on `beta/limits`
+
+### B-302: one app could fill a node's disk and stop every app's writes (beta audit)
+- **Where:** `quota.rs`
+- **Scenario:** objects had a quota each but an app had none, and nothing kept the node's disk from filling: on an 8 MiB root, about 560 counter objects filled it and every write on the node then failed `500 commit-failed`, reported as the object's own quota being full.
+- **Fix:** a per-app budget (`app_disk_mb`, default a quarter of `data_dir`'s filesystem) over the same logical bytes each object's quota counts, shared by the app's instances (`quota::Disk`), and a free-space reserve (`disk_reserve_mb`, default a twentieth of the filesystem, at most 1 GiB): below it, growth and new entries are refused for every app while writes in place, deletes, rollbacks and commits go on. ENOSPC from the journal now says the node's disk is full. Tests on an 8 MiB tmpfs: `a_full_app_budget_refuses_only_that_apps_writes`, `the_disk_reserve_keeps_writes_committing`; unit: `objects_share_their_apps_budget`, `below_the_reserve_only_growth_is_refused`.
+- **Status:** fixed on `beta/limits`
+
+### B-303: workers ran without cgroup limits by default (beta audit)
+- **Where:** `config.rs` (`cgroup`, `[worker]`), `supervisor.rs`
+- **Scenario:** `cgroup` was unset and `[worker]` limits 0 by default (and in the ops reference config), so one app could touch `memory_mb × max_live_objects` (64 GiB) and use every core.
+- **Fix:** `[worker]` defaults to a quarter of the host's memory and all its cores but one; `cgroup = "auto"` (default) makes the supervisor's own cgroup v2 the workers' subtree (it moves itself into `<own>/supervisor`, workers go in `<own>/workers`) and refuses to start where it can't, naming `cgroup = "off"`. Owner question: fail closed (built) or warn and run.
+- **Reproduced:** this sandbox's controllers are on cgroup v1, so only the refusal is tested here (`workers_run_under_host_sized_limits_or_the_node_refuses_to_start`); its delegated branch runs in `scripts/vm-test.sh`.
+- **Status:** fixed on `beta/limits` (for `deployable`: the ops configs should drop their `[worker] = 0` lines and the `cgroup` path, and keep `Delegate=yes`)
+
+### B-304: an app's disk budget counts logical bytes, not blocks or its journals
+- **Where:** `quota.rs`
+- **Scenario:** the budget counts what each object's quota counts. An object's journal (up to 68 KiB between requests, more during one), its capture outbox, directories and block rounding are on top, so many tiny objects cost far more disk than their budget says (the audit's ~14 KiB a counter object on tmpfs). The objects cap (`beta/objects`) bounds how many there are; the reserve keeps a full disk from failing commits.
+- **Status:** open (by design for now)
+
+### B-305: the reserve counts bytes, not inodes
+- **Where:** `quota.rs` (`Disk::low`)
+- **Scenario:** a filesystem out of inodes (ext4's are fixed at mkfs) refuses new files with free bytes left; the reserve doesn't look at `f_favail`. `max_files` per object and the objects cap bound it.
+- **Status:** open
+
+### B-306: deleting an object must tell its app's disk budget
+- **Where:** `quota::Disk` (`idle`)
+- **Scenario:** a worker counts an object without an instance at what its volume held when last measured, so a volume removed under a running worker would stay counted until the worker restarts.
+- **Status:** not an issue with `beta/objects`' delete, merged here: `nanovm admin delete` drains and stops the app's worker first, and the next one measures the app afresh. A volume a lease takeover restores is measured when its object next starts, and so is one an operator's `restore` replaces under a running worker (`beta/recovery`, merged on `beta/integration`: the object is paused and its instance stopped meanwhile).
+
+### B-307: a worker measures all its app's volumes when it starts
+- **Where:** `quota::Disk::open` (from `App::load`)
+- **Scenario:** the app budget starts from a walk of every object's volume, on each worker start (first request, version switch, restart): measured about 3–4 µs a file, warm, so 10,000 objects of 5 files add 150–250 ms. The objects cap bounds it. Alternatives: walk in the background with a short window in which only the objects' own quotas hold, or keep each object's usage in a small file its commits update.
+- **Status:** open
+
+### B-308: rate limits are per listener, and WebSocket messages aren't requests
+- **Where:** `gate.rs`
+- **Scenario:** each proxy (and each node a client reaches directly) keeps its own counts, so with several proxies a client or an app gets the rate at each; a socket's messages count only as the request that opened it (their own bounds are the socket backlog and caps).
+- **Status:** open (by design for one node)
+
+### B-309 (tests): `the_proxy_outlasts_idle_and_excess_connections` bound the default private port
+- **Where:** `tests/integration.rs`
+- **Scenario:** the test's proxy listened on a free port but left `publish_listen` at its default, 127.0.0.1:8444; on a machine where anything else held 8444 (another agent's proxy) the proxy exited at once ("Address already in use") and the test failed with "the proxy never listened". Seen once in a full run on `beta/limits`.
+- **Fix:** the test gives the private listener a free port too.
+- **Status:** fixed on `beta/limits`
 
 ## Planned work
 
@@ -734,7 +1016,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-5: data lifecycle (planning)
 - **What:** a plan for deleting an app's or an object's data, exporting a volume, backups and retention, and how each is authorized (likely through the proxy).
-- **Status:** offline backup/restore done in `fab908c` with validated main follow-through. Restic snapshots retain journals under app admission locks; only complete snapshots are tagged, and restore requires an exact ID and new destination. Real jailed SQL/file/KV crash recovery into a fresh root passes unprivileged and as root, including another write/restart. Six mutations caught; full suite, ten SQL tests, Python CLI tests, demo, benchmark and adversarial review pass. Host runtime unchanged at 5,085; tooling adds 89 lines. README defines offline authorization, ownership/deployment records, retention guidance and old-writer fencing. Deletion API, live snapshots, automated retention and actual off-node deployment remain open; no active file ownership after main integration.
+- **Status:** deletion done on `beta/objects` (B-201, B-205): an object's storage exists only from its first committed change and goes when its volume is empty (no captured history); `nanovm admin delete <app> <object>` and `delete-app <app>` delete on a running node, the store's copy included; refused with leases (B-206). No automatic deletion of data, so no retention policy for volumes is needed. Backup and restore done on `beta/recovery` (B-500): backup is continuous shipping to `capture.store`; restore of one object (to its head or an earlier version) or of an app's objects runs in a running node through the same socket (`restore`, `versions`, `backlog`), authorized as root on the node's host. The offline restic backup is gone. Since the store is the backup, a delete can't be undone (B-800). Remaining: retention in the store
 
 ### W-6: JS and Python guests
 - **What:** guests built with componentize-js and componentize-py, running the same endpoints as `counter`, to prove the host for other languages.
@@ -777,7 +1059,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-15: key apps by the DNS name that owns their record (owner decided 2026-10-30)
 - **What:** today an app is keyed by the request's host and repository, so `example.com` and `www.example.com` are two apps with separate data. Key it instead by the name whose `_nanovm` TXT record was found, after CNAMEs: the `name` of the TXT answer in the DNS-over-HTTPS JSON, lowercased, without a trailing dot or the `_nanovm.` prefix. The proxy sends that as `nanovm-host`. Then `_nanovm.www.example.com CNAME _nanovm.example.com` makes both hosts one app. Still safe: a CNAME to someone else's record only serves their app as their record configures it, which anyone could already reach through their own domain; no name can choose another name's version or data. Test with the DoH stub answering a CNAME chain (two hosts, one app; a third host with its own record, its own app). Update README's "The proxy" and "Apps", and Q52 in HANDOFF.
-- **Status:** fixed in 54054c0
+- **Status:** fixed in 54054c0; amended by B-403 (d287d22): "a CNAME to someone else's record only serves their app" also served their data under the alias's origin, so the owner's record must now list each alias (`alias=<host>`).
 
 ### W-16: build and test CI
 - **What:** run a production-feature build check and the unit/integration suite on pushes and pull requests; build guests locally without publishing packages. Read-only token, Ubuntu 24.04, locked dependencies, serial test scheduling to reduce N-32 contention.
@@ -862,3 +1144,11 @@ The checkpoints below are historical, not outstanding product decisions.
 ### W-80: W-9 production capture, shipping and restore
 - **Done (bc8f45a, cf/storage):** crash-atomic capture of each committed version at both commit points as changes against the version before (listings, whole new or moved entries, byte ranges), snapshots every `snapshot_every`; a bounded local outbox (`max_versions`, `max_mb`: full means writes are refused); a put-once `Store` (directory, S3-compatible with SigV4 + `If-None-Match: *`); `remote_ack` (off by default: the owner hasn't chosen an RPO); an epoch and a fence object as the hook for W-10's leases; `ship::restore` on a fresh root.
 - **Open:** remote retention (N-166; the head is the snapshot pointer); a shipper notification (N-165); a `nanovm restore` command. Decided and done on `fix/lease-r3fix`: acknowledgement is remote by default with leases, local on one node; shipping is fenced by the head (W-90).
+
+### B-102: pulling from private registries with credentials (recorded, not built)
+- **What:** nodes pull anonymously, so packages must be public. With B-100, a package holds no secrets, so public packages leak only the code and its non-secret config. Private pulls are needed only if the code itself is confidential. If wanted: the node's operator gives registry credentials per registry host, in the same root-only directory (for example `registries.json`), and `registry::Oci` sends them only to that host and its token server, never across a redirect to another host. Publishing already takes `NANOVM_REGISTRY_USER`/`TOKEN`.
+- **Status:** deferred: not needed for the beta (owner question in notes/beta-secrets.md)
+
+### B-103: developers setting their own app's secrets
+- **What:** in the beta the operator sets secrets on the node. Letting a developer set their own needs to know who they are: an authenticated deploy (the `deploy` agent's identity work), then a channel that accepts secrets only from the identity the app's trust policy names, for example sealed to the node's public key so nothing in between can read them.
+- **Status:** deferred: owner question in notes/beta-secrets.md

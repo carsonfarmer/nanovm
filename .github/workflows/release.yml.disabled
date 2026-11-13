@@ -1,0 +1,85 @@
+# DISABLED until the owner approves publishing releases (AGENTS.md: outward-facing
+# actions need the owner's OK). GitHub reads only .yml/.yaml files here, so this
+# never runs. To enable: git mv .github/workflows/release.yml.disabled .github/workflows/release.yml
+name: Release
+
+# Only a pushed version tag runs this: pushing a branch never does.
+#   git tag -a v0.2.0 -m v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the tag names the crate's version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nanovm"))')
+          test "${GITHUB_REF_NAME#v}" = "$version" || { echo "tag $GITHUB_REF_NAME, crate $version"; exit 1; }
+      # A release build without the `dev` feature: dev mode cannot be configured.
+      - name: Build
+        run: cargo build --release --locked -p nanovm --bin nanovm
+      - name: Package
+        run: tools/release/package.sh target/release/nanovm "$GITHUB_REF_NAME" ${{ matrix.target }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanovm-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum --check ./*.sha256
+          sha256sum nanovm-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Release notes
+        run: python3 tools/release/changelog.py "$GITHUB_REF_NAME" > notes.md && cat notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=()
+          [[ $GITHUB_REF_NAME == *-* ]] && pre=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "nanovm $GITHUB_REF_NAME" --notes-file notes.md "${pre[@]}"

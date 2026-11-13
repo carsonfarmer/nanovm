@@ -199,6 +199,41 @@ async fn say(ws: &mut Ws, text: &str) {
     ws.send(Message::text(text)).await.unwrap();
 }
 
+/// examples/echo: what the SDK hands an app (`http::Request`) and what it
+/// sends for the app's `http::Response`, through the node: the status both
+/// ways, every value of a repeated header in order, header bytes that
+/// aren't UTF-8, the method, the URI within the object, and the body's
+/// bytes. The relay passes the same through a call between objects too
+/// (the SDK's outgoing request and the answer it reads back).
+#[tokio::test(flavor = "multi_thread")]
+async fn echo_maps_requests_and_responses_both_ways() {
+    let app = App::start("echo", json!({})).await;
+    let raw = reqwest::header::HeaderValue::from_bytes(b"caf\xe9 \xff\x80").unwrap();
+    let body = b"\x00\xff\r\nnot UTF-8".to_vec();
+    let direct = format!("http://{}", app.addr);
+    for (path, host) in [("/a/x/y?status=418&q=%20", direct.as_str()), ("/a/relay/b/x/y?status=418&q=%20", "http://nanovm")] {
+        let req = app.http.request(Method::PATCH, app.url(path)).body(body.clone());
+        let req = req.header("x-echo-twice", "1").header("x-echo-twice", "2").header("x-echo-raw", raw.clone());
+        let res = req.header("content-type", "application/x-test").header("x-other", "kept out").send().await.unwrap();
+        assert_eq!(res.status().as_u16(), 418, "{path}: the app's status");
+        let headers = res.headers().clone();
+        let twice: Vec<_> = headers.get_all("x-echo-twice").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(twice, ["1", "2"], "{path}: each value of a repeated header, in order");
+        assert_eq!(headers["x-echo-raw"].as_bytes(), raw.as_bytes(), "{path}: bytes that aren't UTF-8, as sent");
+        assert_eq!((headers["content-type"].to_str().unwrap(), headers.get("x-other")), ("application/x-test", None), "{path}");
+        let seen = format!("PATCH {host}/x/y?status=418&q=%20");
+        assert_eq!(headers["x-seen"].to_str().unwrap(), seen, "{path}: the method and URI, within the object");
+        assert_eq!(headers["content-length"].to_str().unwrap(), body.len().to_string(), "{path}: bytes have their length");
+        assert_eq!(res.bytes().await.unwrap().to_vec(), body, "{path}: the body's bytes");
+    }
+    for status in [200, 201, 299, 404, 500, 599] {
+        let res = app.get(format!("/a/?status={status}")).await;
+        assert_eq!((res.status, res.headers.get("x-nanovm-error")), (status, None), "a status the app chose, not a failure");
+        let relayed = app.get(format!("/a/relay/b/?status={status}")).await;
+        assert_eq!(relayed.status, status, "through a call between objects");
+    }
+}
+
 /// examples/shortener: a link per object, a redirect that counts clicks per
 /// day, codes minted by one object asking another to take a link.
 #[tokio::test(flavor = "multi_thread")]
@@ -1172,6 +1207,16 @@ async fn todos_sync_offline_edits_and_report_conflicts() {
 /// An example app on an in-process dev-mode node, its requests dispatched
 /// straight to it: for apps whose egress must reach a server on loopback,
 /// which `nanovm run` (like a production node) refuses.
+/// `manifest` with each table of `patch` (`limits`, `config`, `env`) changed.
+fn patched(mut manifest: Value, patch: &Value) -> Value {
+    for (table, changes) in patch.as_object().unwrap() {
+        for (k, v) in changes.as_object().unwrap() {
+            manifest[table][k] = v.clone();
+        }
+    }
+    manifest
+}
+
 struct Local {
     node: std::sync::Arc<nanovm::table::Node>,
     cfg: nanovm::config::NodeConfig,
@@ -1181,7 +1226,8 @@ struct Local {
 
 impl Local {
     /// `examples/target/{name}.wasm` with its manifest, `patch`'s `limits`,
-    /// `config` and `env` changed, and objects idling out after 300 ms.
+    /// `config` and `env` changed, `patch`'s `secrets` given as an operator
+    /// gives them, and objects idling out after 300 ms.
     fn start(name: &str, patch: Value) -> Local {
         let wasm = std::fs::read(repo().join(format!("examples/target/{name}.wasm")))
             .unwrap_or_else(|_| panic!("build it: tools/build-app.sh examples/{name} -o examples/target/{name}.wasm"));
@@ -1193,18 +1239,19 @@ impl Local {
         std::os::unix::fs::symlink(root.join("cwasm-cache"), data.join("cache")).unwrap();
         let mut manifest: Value = serde_json::from_slice(&std::fs::read(repo().join(format!("examples/{name}/nanovm.json"))).unwrap()).unwrap();
         manifest["limits"]["idle_timeout_ms"] = 300.into();
-        for (table, changes) in patch.as_object().unwrap() {
-            for (k, v) in changes.as_object().unwrap() {
-                manifest[table][k] = v.clone();
-            }
-        }
+        let mut patch = patch;
+        let secrets = serde_json::from_value(patch.as_object_mut().unwrap().remove("secrets").unwrap_or_default()).unwrap_or_default();
+        let manifest = patched(manifest, &patch);
         let spec: nanovm::registry::AppSpec = serde_json::from_value(manifest).unwrap();
-        let cfg = nanovm::config::NodeConfig { data_dir: data, max_live_objects: 16, memory_reservation_mb: 64, dev: true, ..Default::default() };
+        let mut cfg = nanovm::config::NodeConfig { data_dir: data, max_live_objects: 16, memory_reservation_mb: 64, dev: true, ..Default::default() };
+        // The operator allows what the app asks for.
+        cfg.limits.egress = spec.limits.egress.clone();
         let app = nanovm::config::AppConfig {
             name: name.into(),
             digest: "local".into(),
             env: spec.env,
             config: spec.config,
+            secrets,
             limits: spec.limits,
             worker: Default::default(),
         };
@@ -1408,7 +1455,7 @@ async fn gateway_streams_completions_within_quotas() {
     let patch = json!({
         "limits": {"egress": [api], "post_return_timeout_ms": 1500},
         "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "400", "max_tokens": "100"},
-        "env": {"UPSTREAM_KEY": "test-key"},
+        "secrets": {"upstream_key": "test-key"},
     });
     let app = Local::start("gateway", patch);
     let usage = async |app: &Local| app.send("GET", "/ann/usage", &[], "").await.json()["used"].as_i64().unwrap();
@@ -1630,7 +1677,7 @@ async fn oauth_signs_in_with_one_time_state_and_scoped_sessions() {
         "limits": {"egress": [gh]},
         "config": {"authorize_url": "https://github.example/authorize", "token_url": format!("http://{gh}/token"),
                    "user_url": format!("http://{gh}/user"), "client_id": "app-1", "redirect_uri": "http://app/auth/callback"},
-        "env": {"CLIENT_SECRET": "s3cret"},
+        "secrets": {"client_secret": "s3cret"},
     });
     let app = Local::start("oauth", patch);
     // The state, and the browser's nonce cookie it is bound to.
@@ -1685,7 +1732,7 @@ async fn review_oauth_state_must_be_bound_to_the_starting_browser() {
         "limits": {"egress": [gh]},
         "config": {"authorize_url": "https://github.example/authorize", "token_url": format!("http://{gh}/token"),
                    "user_url": format!("http://{gh}/user"), "client_id": "app-1", "redirect_uri": "https://app.example/auth/callback"},
-        "env": {"CLIENT_SECRET": "s3cret"},
+        "secrets": {"client_secret": "s3cret"},
     });
     let app = Local::start("oauth", patch);
     // A browser starts a sign-in; `cookies` is what it already holds.
@@ -1726,6 +1773,118 @@ async fn review_oauth_state_must_be_bound_to_the_starting_browser() {
     assert_eq!(callback(&first, nonce).await, (302, true));
 }
 
+/// An example as an operator runs it: published to a registry on loopback
+/// without its secrets, and served by a supervised node (dev mode, so no
+/// signatures and loopback egress) whose secrets directory gives them, in a
+/// jailed worker (as a uid of its own when the tests run as root).
+struct Served {
+    _sup: std::sync::Arc<nanovm::supervisor::Supervisor>,
+    addr: std::net::SocketAddr,
+    app: String,
+    host: String,
+    http: reqwest::Client,
+}
+
+impl Served {
+    async fn start(name: &str, patch: Value, secrets: Value) -> Served {
+        use std::os::unix::fs::PermissionsExt;
+        static REGISTRY: std::sync::OnceLock<container_registry::test_support::RunningRegistry> = std::sync::OnceLock::new();
+        let registry = REGISTRY.get_or_init(|| container_registry::ContainerRegistry::builder().build_for_testing().run_in_background()).bound_addr();
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+        let (data, dir) = (root.join("examples-served").join(name), root.join("examples-secrets").join(name));
+        for d in [&data, &dir] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir_all(root.join("cwasm-cache")).unwrap();
+        std::os::unix::fs::symlink(root.join("cwasm-cache"), data.join("cache")).unwrap();
+
+        // The package: what `nanovm publish` would push, which holds no secret.
+        let manifest: Value = serde_json::from_slice(&std::fs::read(repo().join(format!("examples/{name}/nanovm.json"))).unwrap()).unwrap();
+        let manifest = patched(manifest, &patch);
+        let spec: nanovm::registry::AppSpec = serde_json::from_value(manifest.clone()).unwrap();
+        nanovm::secrets::check_package(&spec).unwrap();
+        for value in secrets.as_object().unwrap().values() {
+            assert!(!manifest.to_string().contains(value.as_str().unwrap()), "the package holds a secret");
+        }
+        let wasm = std::fs::read(repo().join(format!("examples/target/{name}.wasm"))).unwrap();
+        let r = format!("{registry}/examples/{name}:1.0.0").parse().unwrap();
+        let oci = nanovm::registry::Oci::new(true).unwrap();
+        let digest = oci.push_app(&r, None, manifest.to_string().into_bytes(), wasm, &"1.0.0".parse().unwrap()).await.unwrap();
+        let app = format!("{registry}/examples/{name}@{digest}");
+
+        // The operator's part: the app's secrets, named as the node names it.
+        let host = format!("{name}.example");
+        let file = dir.join(format!("{}.json", nanovm::registry::app_name(&host, &app.parse().unwrap())));
+        std::fs::write(file, secrets.to_string()).unwrap();
+        let mut cfg = nanovm::config::NodeConfig {
+            data_dir: data,
+            secrets: Some(dir),
+            max_live_objects: 16,
+            memory_reservation_mb: 64,
+            dev: true,
+            // Workers without cgroup limits: this host may delegate none.
+            cgroup: "off".into(),
+            ..Default::default()
+        };
+        // The operator allows the egress the app asks for.
+        cfg.limits.egress = spec.limits.egress;
+        let sup = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let s = sup.clone();
+        tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
+        let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        Served { _sup: sup, addr, app, host, http }
+    }
+
+    /// A request as the proxy sends it on: naming the app and its host.
+    async fn send(&self, method: &str, path: &str, headers: &[(&str, &str)], body: impl Into<reqwest::Body>) -> Reply {
+        let mut req = self.http.request(Method::from_bytes(method.as_bytes()).unwrap(), format!("http://{}{path}", self.addr)).body(body)
+            .header("nanovm-app", &self.app).header("nanovm-trust", "dev dev").header("nanovm-host", &self.host);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let res = req.send().await.unwrap_or_else(|e| panic!("{method} {path}: {e:?}"));
+        let (status, headers) = (res.status().as_u16(), res.headers().clone());
+        Reply { status, headers, body: res.bytes().await.unwrap().to_vec() }
+    }
+}
+
+/// examples/oauth and examples/gateway as an operator runs them: their
+/// packages hold no key (`nanovm publish` would take them), and the node's
+/// secrets directory gives each its own, which its jailed worker reads with
+/// its config. GitHub's stand-in signs in only with the client secret, and
+/// the API's stand-in records the key it is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn oauth_and_gateway_get_their_keys_from_the_node() {
+    let gh = github().await;
+    let oauth = Served::start("oauth", json!({
+        "limits": {"egress": [gh]},
+        "config": {"authorize_url": "https://github.example/authorize", "token_url": format!("http://{gh}/token"),
+                   "user_url": format!("http://{gh}/user"), "client_id": "app-1", "redirect_uri": "http://app/auth/callback"},
+    }), json!({"client_secret": "s3cret"})).await;
+    let to = oauth.send("GET", "/auth/login", &[], "").await;
+    assert_eq!(to.status, 302, "{to:?}");
+    let state = to.header("location").split("state=").nth(1).unwrap().split('&').next().unwrap().to_string();
+    let nonce = to.header("set-cookie").split(';').next().unwrap().to_string();
+    let back = oauth.send("GET", &format!("/auth/callback?code=good&state={state}"), &[("cookie", &nonce)], "").await;
+    assert_eq!((back.status, back.header("location")), (302, "/u-ann/me"), "{back:?}");
+    let session = back.header("set-cookie").split(';').next().unwrap().to_string();
+    let me = oauth.send("GET", "/u-ann/me", &[("cookie", &session)], "").await;
+    assert_eq!(me.json(), json!({"login": "ann", "id": 7, "name": "Ann"}));
+
+    let (api, keys) = llm().await;
+    let gateway = Served::start("gateway", json!({
+        "limits": {"egress": [api]},
+        "config": {"upstream": format!("http://{api}/v1/complete"), "tokens_per_day": "400", "max_tokens": "100"},
+    }), json!({"upstream_key": "test-key"})).await;
+    let res = gateway.send("POST", "/ann/complete", &[], json!({"prompt": "n 2 ms 0"}).to_string()).await;
+    assert!(res.status == 200 && res.text().ends_with("data: [DONE]\n\n"), "{res:?}");
+    assert_eq!(keys.lock().unwrap().as_slice(), ["Bearer test-key"]);
+}
+
 /// review2 (D1): over https the session cookie is a `__Host-` one too, which
 /// only this origin can set. A sibling host could plant a plain `session`
 /// cookie (`Domain=` the parent, `Path=/u-{its login}`) holding its own
@@ -1738,7 +1897,7 @@ async fn review2_oauth_session_cookie_is_a_host_cookie_over_https() {
         "limits": {"egress": [gh]},
         "config": {"authorize_url": "https://github.example/authorize", "token_url": format!("http://{gh}/token"),
                    "user_url": format!("http://{gh}/user"), "client_id": "app-1", "redirect_uri": "https://app.example/auth/callback"},
-        "env": {"CLIENT_SECRET": "s3cret"},
+        "secrets": {"client_secret": "s3cret"},
     });
     let app = Local::start("oauth", patch);
     let to = app.send("GET", "/auth/login", &[], "").await;

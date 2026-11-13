@@ -28,8 +28,8 @@ What it shows:
   link even when two feeds carry the same post.
 - **Bad input is reported, not stored.** A feed that answers an error or
   isn't XML gives `502`; nothing it said is kept.
-- **Egress is an allowlist.** Only hosts in the manifest's `egress` can be
-  fetched.
+- **Egress is an allowlist.** Only hosts in the manifest's `egress` that a
+  node's operator also allows (its `[limits] egress`) can be fetched.
 
 The test runs this app on an in-process dev node with feeds served on
 loopback.

@@ -53,13 +53,15 @@ fn app(name: &str) -> AppConfig {
         digest: "test".into(),
         env: Default::default(),
         config: Default::default(),
+        secrets: Default::default(),
         limits: serde_json::from_value(limits).unwrap(),
         worker: Default::default(),
     }
 }
 
-/// A dev-mode node config with its own data directory; the compile cache is
-/// shared between tests.
+/// A dev-mode node config with its own data directory, whose operator allows
+/// the egress the test apps ask for; the compile cache is shared between
+/// tests.
 fn node_cfg(test: &str, max_live: usize) -> NodeConfig {
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let dir = root.join("nodes").join(test);
@@ -68,13 +70,16 @@ fn node_cfg(test: &str, max_live: usize) -> NodeConfig {
     let cache = root.join("cwasm-cache");
     std::fs::create_dir_all(&cache).unwrap();
     std::os::unix::fs::symlink(&cache, dir.join("cache")).unwrap();
-    let cfg = NodeConfig {
+    let mut cfg = NodeConfig {
         data_dir: dir,
         max_live_objects: max_live,
         memory_reservation_mb: 64,
         dev: true,
+        // The cgroup tests name their own; the rest run where none is delegated.
+        cgroup: "off".into(),
         ..NodeConfig::default()
     };
+    cfg.limits.egress = ["example.com", "localhost", "127.0.0.1"].map(String::from).into();
     cfg.validate().unwrap();
     cfg
 }
@@ -110,9 +115,15 @@ async fn settle(node: &Arc<Node>) {
 
 // ---- persistence and isolation ----------------------------------------
 
+/// Object `id`'s directory under `objects` (an app's): its volume, `data`,
+/// its `journal` and its `committed` versions.
+fn object_dir(objects: &Path, id: &str) -> PathBuf {
+    nanovm::app::object_dir(objects, id)
+}
+
 fn captured_files(objects: &Path, id: &str, sequence: u64) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     use std::io::Read;
-    let file = std::fs::File::open(objects.join(format!("~committed/{id}/{sequence:020}.tar"))).unwrap();
+    let file = std::fs::File::open(object_dir(objects, id).join(format!("committed/{sequence:020}.tar"))).unwrap();
     tar::Archive::new(file).entries().unwrap().map(|entry| {
         let mut entry = entry.unwrap();
         let path = entry.path().unwrap().into_owned();
@@ -150,7 +161,7 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
         assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
     }
     eventually("versions shipped", || shipped(3)).await;
-    let local = cfg.app_dirs("counter")[0].join("~committed/o");
+    let local = object_dir(&cfg.app_dirs("counter")[0], "o").join("committed");
     eventually("shipped versions removed", || std::fs::read_dir(&local).unwrap().count() == 1).await;
     node.shutdown().await;
     drop(node);
@@ -158,8 +169,8 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
     for (name, count) in [("ship_restored", 3), ("ship_restored_again", 4)] {
         let fresh = shipping(name);
         let objects = fresh.app_dirs("counter")[0].clone();
-        let last = nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &objects).await.unwrap();
-        assert_eq!(last, count);
+        let restored = nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &objects, None, 0).await.unwrap();
+        assert_eq!((restored.version, restored.head), (count, count));
         let node = node_with(fresh.clone(), app("counter"));
         assert_eq!(get(&node, "o", "/").await.json()["count"], count);
         assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], count + 1);
@@ -176,8 +187,9 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
 
 /// With remote acknowledgement, a commit whose version can't be stored is
 /// not acknowledged, though it stands here, and the object serves nothing
-/// until it counts (N-725); and with the store down, once the capture
-/// limits are reached writes are refused, never versions dropped.
+/// until it counts (N-725); and with the store down, writes go on until the
+/// versions waiting here reach `max_mb`, then are refused, never versions
+/// dropped; the backlog says what waits.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() {
     for remote_ack in [true, false] {
@@ -185,26 +197,31 @@ async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() 
         cfg.capture = Some(nanovm::config::CaptureConfig {
             // A store no write reaches.
             store: Some("/dev/null/store".into()),
-            max_versions: 3,
+            max_mb: 1,
             remote_ack,
             ..Default::default()
         });
         let node = node_with(cfg.clone(), app("counter"));
         let r = request(&node, "POST", "o", "/incr", "").await;
-        let local = cfg.app_dirs("counter")[0].join("~committed/o");
+        let local = object_dir(&cfg.app_dirs("counter")[0], "o").join("committed");
         if remote_ack {
             assert_eq!(r.error.as_deref(), Some("commit-failed"), "{}", r.body);
             assert_eq!(std::fs::read_dir(&local).unwrap().count(), 1, "the commit stands here");
             assert_eq!(get(&node, "o", "/").await.error.as_deref(), Some("not-stored"), "served before it counts");
         } else {
             assert_eq!(r.json()["count"], 1);
-            for n in 2..=3 {
-                assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
+            // Each version about 300 KiB: three fit in 1 MiB with the first.
+            let value = |n: u8| String::from_utf8(vec![b'a' + n; 300 << 10]).unwrap();
+            for n in 1..=3 {
+                assert_eq!(request(&node, "PUT", "o", "/kv/k", &value(n)).await.status, 204, "write {n}");
             }
-            let r = request(&node, "POST", "o", "/incr", "").await;
+            let r = request(&node, "PUT", "o", "/kv/k", &value(4)).await;
             assert_eq!(r.error.as_deref(), Some("commit-failed"), "a full outbox refuses: {}", r.body);
-            assert_eq!(get(&node, "o", "/").await.json()["count"], 3);
-            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 3, "every unshipped version kept");
+            assert_eq!(get(&node, "o", "/kv/k").await.body, value(3));
+            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 4, "every unshipped version kept");
+            let backlog = nanovm::ship::backlog(&cfg.data_dir.join("objects"));
+            assert_eq!((backlog.versions, backlog.objects), (4, 1));
+            assert!(backlog.bytes > 900 << 10, "{backlog:?}");
         }
         node.shutdown().await;
     }
@@ -234,6 +251,78 @@ async fn a_slow_acknowledgement_is_not_cut_short_by_the_apps_deadline() {
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(t0.elapsed() >= Duration::from_millis(900), "answered before the store acknowledged: {:?}", t0.elapsed());
     held.join().unwrap();
+    node.shutdown().await;
+}
+
+/// With the store down, a node that answers once a write is durable here
+/// keeps answering writes, many more than the 16 versions it once held,
+/// without a snapshot of the volume for each 16; once the store is back,
+/// every version ships, in order, and the backlog empties. Another object
+/// that stopped writing ships too.
+#[tokio::test(flavor = "multi_thread")]
+async fn writes_go_on_through_a_store_outage_and_ship_in_order_after() {
+    use nanovm::ship::Dir;
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ship-outage");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let (store, down) = (base.join("store"), base.join("store.down"));
+    let mut cfg = node_cfg("ship_outage", 8);
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
+    let node = node_with(cfg.clone(), app("counter"));
+    let head = |o: &str| {
+        let bytes = std::fs::read(store.join("counter").join(o).join("head")).ok();
+        bytes.map_or(0, |h| serde_json::from_slice::<nanovm::ship::Head>(&h).unwrap().sequence)
+    };
+    // A big file in the volume, which a snapshot would copy whole.
+    assert_eq!(request(&node, "PUT", "o", "/kv/big", &"b".repeat(200 << 10)).await.status, 204);
+    assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], 1);
+    // Shipped, and marked so (just after the head moves).
+    let objects = cfg.data_dir.join("objects");
+    eventually("shipped", || head("o") == 2 && nanovm::ship::backlog(&objects).versions == 0).await;
+    // The store goes away: a file where its directory was.
+    std::fs::rename(&store, &down).unwrap();
+    std::fs::write(&store, "down").unwrap();
+    for n in 2..=60 {
+        let r = request(&node, "POST", "o", "/incr", "").await;
+        assert_eq!(r.status, 200, "write {n} during the outage: {}", r.body);
+        assert_eq!(r.json()["count"], n);
+        if n == 3 {
+            assert_eq!(request(&node, "POST", "p", "/incr", "").await.json()["count"], 1);
+        }
+    }
+    let backlog = nanovm::ship::backlog(&objects);
+    assert_eq!((backlog.versions, backlog.objects), (60, 2));
+    println!("{} bytes wait to be shipped", backlog.bytes);
+    // The store is back.
+    std::fs::remove_file(&store).unwrap();
+    std::fs::rename(&down, &store).unwrap();
+    let t0 = Instant::now();
+    while head("o") < 61 || head("p") < 1 || nanovm::ship::backlog(&objects).versions > 0 {
+        assert!(t0.elapsed() < Duration::from_secs(20), "shipped {} and {} of 61 and 1", head("o"), head("p"));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // In order: each version in the store follows the one before. Of the
+    // 16-version marks, only the first in the outage (17, with 15 waiting)
+    // took a snapshot.
+    let (head, _) = nanovm::ship::head(&Dir(store.clone()), "counter", "o").await.unwrap();
+    let (mut digest, mut snapshots) = (head.digest.clone(), vec![]);
+    for n in (1..=61).rev() {
+        let bytes = std::fs::read(store.join(format!("counter/o/{n:020}-{digest}.tar"))).unwrap();
+        let version = nanovm::committed::identity(&bytes[..]).unwrap();
+        assert_eq!(version.sequence, n);
+        snapshots.extend(version.snapshot.then_some(n));
+        digest = version.parent;
+    }
+    assert_eq!(digest, "", "version 1 is the first");
+    assert_eq!(snapshots, [17, 1]);
+    node.shutdown().await;
+    drop(node);
+    // A fresh root restores all of it.
+    let mut fresh = node_cfg("ship_outage_restored", 8);
+    fresh.capture = cfg.capture.clone();
+    nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &fresh.app_dirs("counter")[0], None, 0).await.unwrap();
+    let node = node_with(fresh, app("counter"));
+    assert_eq!(get(&node, "o", "/").await.json()["count"], 60);
     node.shutdown().await;
 }
 
@@ -287,6 +376,175 @@ async fn volume_survives_eviction_memory_does_not() {
     let r = get(&node, "a", "/").await;
     assert_eq!(r.json()["count"], 3, "volume kept");
     assert_eq!(r.json()["instance_hits"], 1, "fresh instance");
+}
+
+/// Every directory under `objects` (an app's), relative to it, but the
+/// empty ones waiting in its pool (`~new`).
+fn dirs_under(objects: &Path) -> Vec<String> {
+    let mut found = vec![];
+    let mut stack = vec![objects.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let rel = e.path().strip_prefix(objects).unwrap().to_string_lossy().into_owned();
+            if e.file_type().unwrap().is_dir() && rel != "~new" {
+                found.push(rel);
+                stack.push(e.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A scanner's 404s and reads of objects that don't exist leave nothing on
+/// disk, while instances are live and after they are gone: an object's
+/// directory appears with the first change it commits. The audit's 300
+/// `wp-login.php` probes left 301 volume directories.
+#[tokio::test(flavor = "multi_thread")]
+async fn objects_that_change_nothing_leave_nothing() {
+    let node = node("objects_that_change_nothing_leave_nothing", "counter", 1000);
+    let objects = node.cfg.app_dirs("counter")[0].clone();
+    for n in 0..300 {
+        let r = get(&node, &format!("scan{n}"), "/wp-login.php").await;
+        assert_eq!(r.status, 404, "{}", r.body);
+    }
+    for n in 0..20 {
+        let r = get(&node, &format!("read{n}"), "/").await;
+        assert_eq!((r.status, r.json()["count"].as_u64()), (200, Some(0)), "{}", r.body);
+    }
+    assert_eq!(dirs_under(&objects), Vec::<String>::new(), "while live");
+    assert_eq!(request(&node, "POST", "w", "/incr", "").await.status, 200);
+    let written = dirs_under(&objects);
+    assert!(!written.is_empty() && written.iter().all(|d| !d.contains("scan") && !d.contains("read")), "{written:?}");
+    node.shutdown().await;
+    assert_eq!(dirs_under(&objects), written, "once gone");
+    // The pool holds at most one empty directory per instance that was live at once.
+    let pool = std::fs::read_dir(objects.join("~new")).map_or(0, |d| d.count());
+    assert!(pool <= 321, "{pool}");
+}
+
+/// The ids of the objects with a directory under `objects` (an app's).
+fn objects_in(objects: &Path) -> Vec<String> {
+    let shards = std::fs::read_dir(objects).unwrap().flatten().filter(|s| s.file_name().len() == 2);
+    let mut ids: Vec<_> = shards.flat_map(|s| std::fs::read_dir(s.path()).unwrap().flatten())
+        .map(|o| o.file_name().to_string_lossy().into_owned()).collect();
+    ids.sort();
+    ids
+}
+
+/// A new object whose first request fails leaves nothing, nor does one
+/// that empties its volume, once its instance ends; and only empty volumes
+/// go.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_and_emptied_objects_leave_nothing() {
+    let node = node("failed_and_emptied_objects_leave_nothing", "hostile", 8);
+    let objects = node.cfg.app_dirs("hostile")[0].clone();
+    // Writes a file and a key, then fails: rolled back when the instance ends.
+    for then in ["panic", "fail", "error"] {
+        let r = get(&node, &format!("failed-{then}"), &format!("/commit?v=x&then={then}")).await;
+        assert!(r.status >= 500, "{then}: {}", r.status);
+    }
+    // A request that fails at 507 (`fail`) commits: it answered.
+    eventually("failed instances to end", || objects_in(&objects) == ["failed-fail"]).await;
+    assert_eq!(get(&node, "failed-panic", "/commit").await.json()["file"], "", "rolled back");
+    assert_eq!(objects_in(&objects), ["failed-fail"], "only the one that answered kept its change");
+    // An object that empties its volume goes when its instance ends.
+    assert_eq!(get(&node, "emptied", "/files?mount=data&n=2").await.status, 200);
+    assert_eq!(get(&node, "kept", "/files?mount=data&n=2").await.status, 200);
+    assert_eq!(get(&node, "emptied", "/clean?mount=data&n=2").await.json()["removed"], 2);
+    assert_eq!(get(&node, "kept", "/clean?mount=data&n=1").await.json()["removed"], 1);
+    assert!(objects_in(&objects).contains(&"emptied".to_string()), "while its instance lives");
+    node.shutdown().await;
+    assert_eq!(objects_in(&objects), ["failed-fail", "kept"]);
+}
+
+/// An app has at most `max_objects_per_app` objects, however many clients
+/// make new ones at once; reads of unknown objects are refused once it has
+/// them (507 `object-limit`), existing objects are served, and an object
+/// that goes makes room. Counted again when the app starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_has_at_most_its_objects() {
+    let mut cfg = node_cfg("an_app_has_at_most_its_objects", 64);
+    cfg.max_objects_per_app = 5;
+    let node = node_with(cfg.clone(), app("hostile"));
+    let objects = node.cfg.app_dirs("hostile")[0].clone();
+    let made = futures::future::join_all((0..40).map(|n| {
+        let node = node.clone();
+        async move { get(&node, &format!("o{n}"), "/files?mount=data&n=1").await.status }
+    }))
+    .await;
+    assert_eq!(made.iter().filter(|s| **s == 200).count(), 5, "{made:?}");
+    assert!(made.iter().all(|s| [200, 507].contains(s)), "{made:?}");
+    let kept = objects_in(&objects);
+    assert_eq!(kept.len(), 5, "{kept:?}");
+    let r = get(&node, "another", "/").await;
+    assert_eq!((r.status, r.error.as_deref()), (507, Some("object-limit")), "{}", r.body);
+    assert!(r.body.contains("max_objects_per_app"), "{}", r.body);
+    assert_eq!(get(&node, &kept[0], "/").await.status, 200, "existing objects are served");
+    assert_eq!(objects_in(&objects), kept, "a refusal makes nothing");
+    // One empties itself and its instance ends: there is room again.
+    assert_eq!(get(&node, &kept[0], "/clean?mount=data&n=1").await.status, 200);
+    assert_eq!(get(&node, &kept[0], "/panic").await.status, 500);
+    eventually("the emptied object to go", || objects_in(&objects).len() == 4).await;
+    // Its place is given back once its directory is removed, a moment later.
+    let t0 = Instant::now();
+    while get(&node, "another", "/files?mount=data&n=1").await.status != 200 {
+        assert!(t0.elapsed() < Duration::from_secs(2), "no room made");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let r = get(&node, "one-more", "/files?mount=data&n=1").await;
+    assert_eq!((r.status, r.error.as_deref()), (507, Some("object-limit")));
+    node.shutdown().await;
+    drop(node);
+    // A node started on the same data counts them again.
+    let node = node_with(cfg, app("hostile"));
+    let r = get(&node, "one-more", "/").await;
+    assert_eq!((r.status, r.error.as_deref()), (507, Some("object-limit")));
+    assert_eq!(objects_in(&objects).len(), 5);
+}
+
+/// The audit's full disk: on a small filesystem, new objects are refused
+/// (507 `disk-full`) once it has less free than a new object's quota, and
+/// nothing is made for them; objects that exist are still served. Root
+/// only: it mounts a tmpfs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_disk_makes_no_new_objects() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipped: mounting a tmpfs needs root");
+        return;
+    }
+    let mut cfg = node_cfg("a_full_disk_makes_no_new_objects", 64);
+    let mnt = cfg.data_dir.join("small");
+    std::fs::create_dir(&mnt).unwrap();
+    let mounted = std::process::Command::new("mount").args(["-t", "tmpfs", "-o", "size=4m", "tmpfs"]).arg(&mnt).status().unwrap();
+    assert!(mounted.success());
+    let _unmount = scopeguard::guard(mnt.clone(), |m| _ = std::process::Command::new("umount").arg("-l").arg(m).status());
+    std::os::unix::fs::symlink(cfg.data_dir.join("cache"), mnt.join("cache")).unwrap();
+    cfg.data_dir = mnt;
+    let node = node_with(cfg, app("counter"));
+    let objects = node.cfg.app_dirs("counter")[0].clone();
+    let mut refused = None;
+    for n in 0..2000 {
+        let r = request(&node, "POST", &format!("o{n}"), "/incr", "").await;
+        if r.status != 200 {
+            refused = Some((n, r));
+            break;
+        }
+    }
+    let (n, r) = refused.expect("the disk filled");
+    eprintln!("a 4 MiB disk held {n} counters before the first refusal: {}", r.body);
+    assert_eq!((r.status, r.error.as_deref()), (507, Some("disk-full")), "{}", r.body);
+    let made = objects_in(&objects);
+    assert_eq!(made.len(), n, "every object before the refusal, none after");
+    for m in n..n + 100 {
+        let r = request(&node, "POST", &format!("o{m}"), "/incr", "").await;
+        assert_eq!(r.error.as_deref(), Some("disk-full"), "{}", r.body);
+        assert_eq!(get(&node, &format!("r{m}"), "/").await.error.as_deref(), Some("disk-full"));
+    }
+    assert_eq!(objects_in(&objects), made, "nothing made while the disk is full");
+    let r = get(&node, "o0", "/").await;
+    assert_eq!((r.status, r.json()["count"].as_u64()), (200, Some(1)), "existing objects are served");
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -423,7 +681,7 @@ async fn cpu_kill_does_not_poison_next_instance() {
 async fn start_up_is_charged_guest_cpu_not_host_work() {
     let mut cfg = node_cfg("start_up_is_charged_guest_cpu", 8);
     cfg.epoch_tick_ms = 1;
-    let vol = cfg.data_dir.join("objects/hostile/s");
+    let vol = object_dir(&cfg.data_dir.join("objects/hostile"), "s").join("data");
     std::fs::create_dir_all(&vol).unwrap();
     for i in 0..20_000 {
         std::fs::write(vol.join(format!("f{i}")), b"").unwrap();
@@ -767,9 +1025,147 @@ async fn data_quota_survives_restart() {
     let r = get(&node, "d", "/fill?mount=data&mb=1&name=c").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "insufficient-space");
-    let vol = node.cfg.data_dir.join("objects/hostile/d");
+    let vol = object_dir(&node.cfg.data_dir.join("objects/hostile"), "d").join("data");
     assert_eq!(std::fs::metadata(vol.join("a")).unwrap().len(), 4 << 20);
     assert!(node.metrics.fs_denied.load(Relaxed) >= 1);
+}
+
+/// `hostile` with room for file work (see `filler`) and a 2 MiB quota: a
+/// new object needs that much free on the small disk below.
+fn small_filler() -> AppConfig {
+    let mut f = filler();
+    f.limits.disk_mb = 2;
+    f
+}
+
+/// A supervisor whose data is on a tmpfs of `mb` MiB, as the audit's 8 MiB
+/// root was, with `app_disk_mb` and `disk_reserve_mb`; why not, unless root.
+async fn on_a_small_disk(test: &str, mb: u64, budget: u64, reserve: u64) -> Result<(Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, SmallDisk), String> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err("mounting a tmpfs needs root".into());
+    }
+    let mut cfg = node_cfg(test, 8);
+    let cache = std::fs::read_link(cfg.data_dir.join("cache")).unwrap();
+    let mounted = std::process::Command::new("mount").args(["-t", "tmpfs", "-o", &format!("size={mb}m"), "tmpfs"]).arg(&cfg.data_dir).status();
+    if !mounted.as_ref().is_ok_and(|s| s.success()) {
+        return Err(format!("mount -t tmpfs failed: {mounted:?}"));
+    }
+    let disk = SmallDisk(cfg.data_dir.clone());
+    std::os::unix::fs::symlink(cache, cfg.data_dir.join("cache")).unwrap();
+    (cfg.app_disk_mb, cfg.disk_reserve_mb) = (budget, reserve);
+    let (sup, addr) = supervised_with(cfg).await;
+    Ok((sup, addr, disk))
+}
+
+/// A tmpfs, unmounted when dropped.
+struct SmallDisk(PathBuf);
+
+impl Drop for SmallDisk {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount").arg("-l").arg(&self.0).status();
+    }
+}
+
+/// The `fs-denied` events the supervisor at `addr` has had from its workers.
+async fn denials(addr: std::net::SocketAddr) -> Vec<String> {
+    stats_json(addr).await;
+    let logs = captures().lock()[&addr].1.lock().logs.clone();
+    logs.iter().filter(|l| l["kind"] == "fs-denied").map(|l| l["detail"].as_str().unwrap_or_default().to_owned()).collect()
+}
+
+/// An app that fills its disk budget has its own writes refused, with a
+/// status that says so, and no other app's: on the audit's 8 MiB disk,
+/// where one app's objects stopped every write on the node.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_app_budget_refuses_only_that_apps_writes() {
+    let (_sup, addr, _disk) = match on_a_small_disk("a_full_app_budget_refuses_only_that_apps_writes", 8, 3, 1).await {
+        Ok(s) => s,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (a, b) = (publish("budget-a", &small_filler()).await, publish("budget-b", &small_filler()).await);
+    let fill = async |app: &str, object: &str, name: &str, mb: u32| {
+        let (status, body) = app_get(addr, app, &format!("/{object}/fill?mount=data&mb={mb}&name={name}")).await;
+        (status, serde_json::from_str::<serde_json::Value>(&body).unwrap_or_default())
+    };
+    assert_eq!(fill(&a, "o1", "fill.bin", 2).await.0, 200);
+    // Another object of the same app gets what is left of its 3 MiB.
+    let (status, body) = fill(&a, "o2", "f", 2).await;
+    assert_eq!((status, body["error"].as_str(), body["written"].as_u64()), (507, Some("insufficient-space"), Some(1 << 20)), "{body}");
+    assert!(denials(addr).await.iter().any(|d| d.contains("the app's 3 MiB disk budget is full")));
+    // The other app's writes go on.
+    let (status, body) = fill(&b, "o1", "f", 2).await;
+    assert_eq!(status, 200, "{body}");
+    // Freeing an object's space lets the app write again.
+    assert_eq!(app_get(addr, &a, "/o1/clean?mount=data").await.0, 200);
+    let (status, body) = fill(&a, "o2", "g", 1).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// Below the node's free-space reserve every app's writes that need more
+/// space are refused cleanly (507 from the app, not a failed commit), while
+/// writes in place still commit; freeing space ends it. A new object isn't
+/// started once the disk has less free than its quota above the reserve
+/// (objects' room check, with limits' reserve).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_disk_reserve_keeps_writes_committing() {
+    let (_sup, addr, _disk) = match on_a_small_disk("the_disk_reserve_keeps_writes_committing", 8, 100, 3).await {
+        Ok(s) => s,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (files, counter) = (publish("reserve-files", &small_filler()).await, publish("reserve-counter", &app("counter")).await);
+    let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(raw(addr, &format!("POST /c0/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await.0, 200);
+    // Objects that exist, each with room under its 2 MiB quota to grow by 1 MiB.
+    for g in 0..4 {
+        assert_eq!(app_get(addr, &files, &format!("/g{g}/fill?mount=data&mb=0")).await.0, 200);
+    }
+    // New objects of 2 MiB fill the disk until one hasn't its quota free
+    // above the reserve: it is refused before it runs.
+    let mut hogs = 0;
+    let body = loop {
+        let (status, body) = app_get(addr, &files, &format!("/hog{hogs}/fill?mount=data&mb=2")).await;
+        hogs += 1;
+        if status != 200 {
+            assert_eq!(status, 507, "{body}");
+            break body;
+        }
+    };
+    assert!(body.contains("disk-full") && body.contains("above the node's 3.0 MiB reserve"), "{body}");
+    // Objects that exist grow down to the reserve, then are refused by it:
+    // with less than the reserve and 2 MiB free, at most two grow.
+    let refused = 'grow: {
+        for g in 0..4 {
+            let (status, body) = app_get(addr, &files, &format!("/g{g}/fill?mount=data&mb=1")).await;
+            if status != 200 {
+                break 'grow (status, body);
+            }
+        }
+        panic!("four objects grew by 1 MiB with less than the reserve and 2 MiB free");
+    };
+    assert!(refused.0 == 507 && refused.1.contains("insufficient-space"), "{refused:?}");
+    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk is below its 3.0 MiB reserve")));
+    // Every app's growth is refused by the app, as on a full disk, and a new
+    // object before it runs: never a failed commit, as the audit saw on
+    // every write.
+    let incr = async |object: &str| {
+        raw(addr, &format!("POST /{object}/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await
+    };
+    let (status, body) = incr("c0").await;
+    assert!(status == 507 && body.contains("insufficient-space"), "{status} {body}");
+    for i in 1..20 {
+        let (status, body) = incr(&format!("c{i}")).await;
+        assert!(status == 507 && body.contains("disk-full"), "{status} {body}");
+    }
+    // A write in place still commits.
+    let (status, body) = app_get(addr, &files, "/mine/fill?mount=data&mb=1&name=x").await;
+    assert_eq!(status, 200, "{body}");
+    // The hogs made (the last was refused, so never made), and what grew.
+    for object in (0..hogs - 1).map(|h| format!("hog{h}")).chain((0..4).map(|g| format!("g{g}"))) {
+        assert_eq!(app_get(addr, &files, &format!("/{object}/clean?mount=data")).await.0, 200);
+    }
+    let (status, body) = incr("c1").await;
+    assert_eq!(status, 200, "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -787,7 +1183,7 @@ async fn renames_between_mounts_are_cross_device() {
     let node = node("renames_between_mounts_are_cross_device", "hostile", 8);
     let r = get(&node, "r", "/cross-rename").await;
     assert_eq!(r.json()["error"], "cross-device", "{}", r.body);
-    assert!(!node.cfg.data_dir.join("objects/hostile/r/x.txt").exists());
+    assert!(!object_dir(&node.cfg.data_dir.join("objects/hostile"), "r").join("data/x.txt").exists());
 }
 
 // ---- egress -----------------------------------------------------------
@@ -921,6 +1317,40 @@ async fn egress_listed_host_allowed() {
     let r = get(&node, "n", "/fetch?url=https://example.com/").await;
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.json()["status"], 200);
+}
+
+/// An app reaches only what both its list and the operator's allow, in
+/// process and through the supervisor: one asking for every port of a host
+/// gets the one port the operator lists.
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_is_capped_by_the_operator() {
+    let mut ports = vec![];
+    for _ in 0..2 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        ports.push(listener.local_addr().unwrap().port());
+        tokio::spawn(nanovm::server::serve_http1(listener, |_| async { nanovm::server::ok_json(serde_json::json!({})) }));
+    }
+    let mut hostile = app("hostile");
+    hostile.limits.egress = vec!["127.0.0.1".into()];
+    let capped = |test: &str| {
+        let mut cfg = node_cfg(test, 8);
+        cfg.limits.egress = vec![format!("127.0.0.1:{}", ports[0])];
+        cfg
+    };
+    let node = node_with(capped("egress_capped_in_process"), hostile.clone());
+    let (_sup, addr) = supervised_with(capped("egress_capped_supervised")).await;
+    let published = publish("egress_capped", &hostile).await;
+    for (port, allowed) in [(ports[0], true), (ports[1], false)] {
+        let path = format!("/fetch?url=http://127.0.0.1:{port}/");
+        let r = get(&node, "n", &path).await;
+        let (status, body) = app_get(addr, &published, &format!("/n{path}")).await;
+        for (status, body) in [(r.status, r.body), (status, body)] {
+            match allowed {
+                true => assert_eq!(status, 200, "{body}"),
+                false => assert!(status == 502 && body.contains("HttpRequestDenied"), "{status} {body}"),
+            }
+        }
+    }
 }
 
 // ---- eviction and capacity --------------------------------------------
@@ -1112,7 +1542,7 @@ async fn supervised_at(mut cfg: NodeConfig, listener: tokio::net::TcpListener, l
     captures().lock().retain(|_, (sup, _)| sup.strong_count() != 0);
     captures().lock().insert(addr, (Arc::downgrade(&sup), captured));
     let s = sup.clone();
-    tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
+    tokio::spawn(nanovm::gate::serve(sup.gate.clone(), listener, None, move |req| s.clone().handle(req)));
     sup
 }
 
@@ -1137,6 +1567,11 @@ async fn publish_wasm(repo: &str, app: &AppConfig, wasm: Vec<u8>) -> String {
 
 async fn publish_version(repo: &str, app: &AppConfig, wasm: Vec<u8>, version: &str) -> String {
     let spec = serde_json::json!({ "limits": app.limits, "env": app.env, "config": app.config });
+    publish_spec(repo, spec, wasm, version).await
+}
+
+/// Publishes `wasm` with the manifest `spec` (its config blob).
+async fn publish_spec(repo: &str, spec: serde_json::Value, wasm: Vec<u8>, version: &str) -> String {
     let r = format!("{}/nanovm/{repo}:latest", registry()).parse().unwrap();
     let oci = nanovm::registry::Oci::new(true).unwrap();
     let version = version.parse().unwrap();
@@ -1175,6 +1610,276 @@ async fn stats_json(addr: std::net::SocketAddr) -> serde_json::Value {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     captured.lock().snapshot()
+}
+
+/// `nanovm admin --config … <args>` against the node `cfg` describes: its
+/// exit status, and what it printed.
+fn admin(cfg: &NodeConfig, args: &[&str]) -> (bool, String) {
+    let config = cfg.data_dir.join("admin.toml");
+    std::fs::write(&config, format!("data_dir = {:?}\n", cfg.data_dir)).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nanovm"))
+        .args(["admin", "--config"]).arg(&config).args(args).output().unwrap();
+    let text = [out.stdout, out.stderr].concat();
+    (out.status.success(), String::from_utf8_lossy(&text).into_owned())
+}
+
+/// The admin socket answers the supervisor's own user (root here) and no
+/// one else: its directory refuses any other user, no HTTP route reaches it,
+/// and the jail lets no worker make a socket (`jail_blocks_escapes`).
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_socket_is_the_supervisors_own() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let cfg = node_cfg("admin_socket_is_the_supervisors_own", 8);
+    let (_sup, addr) = supervised_with(cfg.clone()).await;
+    let counter = publish("counter", &app("counter")).await;
+    assert_eq!(app_get(addr, &counter, "/a/").await.0, 200);
+
+    let (ok, out) = admin(&cfg, &["apps"]);
+    assert!(ok, "{out}");
+    let apps: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(apps[0]["app"], worker(&counter), "{out}");
+    let (ok, out) = admin(&cfg, &["nonsense"]);
+    assert!(!ok && out.contains("unknown command"), "{out}");
+
+    let socket = nanovm::admin::socket(&cfg);
+    let dir = std::fs::metadata(socket.parent().unwrap()).unwrap();
+    assert_eq!((dir.permissions().mode() & 0o777, dir.uid()), (0o700, unsafe { libc::geteuid() }));
+    // Another user can't connect.
+    if unsafe { libc::geteuid() } == 0 {
+        let path = std::ffi::CString::new(socket.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the child makes only async-signal-safe calls, then exits.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            unsafe {
+                let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                addr.sun_family = libc::AF_UNIX as u16;
+                let bytes = path.as_bytes_with_nul();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr().cast(), addr.sun_path.as_mut_ptr(), bytes.len());
+                if libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(65534) != 0 || libc::setuid(65534) != 0 {
+                    libc::_exit(100);
+                }
+                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let r = libc::connect(fd, (&raw const addr).cast(), size_of::<libc::sockaddr_un>() as u32);
+                libc::_exit(if r == 0 { 0 } else { *libc::__errno_location() });
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert_eq!(libc::WEXITSTATUS(status), libc::EACCES, "another user connected (0) or failed otherwise");
+    }
+    // No HTTP route leads there, with or without an app.
+    for path in ["/_nanovm/admin", "/_nanovm/command", "/_nanovm/delete"] {
+        assert_eq!(http_get(addr, path).await.0, 404, "{path}");
+        assert_eq!(app_get(addr, &counter, path).await.0, 400, "{path}");
+    }
+}
+
+/// A node whose data directory is too long for a socket's path (at most 107
+/// bytes) still serves its admin socket: it is bound, and reached, through
+/// the directory it is in, opened (recovery's B-508).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_admin_socket_takes_a_long_data_dir() {
+    let mut cfg = node_cfg("the_admin_socket_takes_a_long_data_dir", 8);
+    cfg.data_dir = cfg.data_dir.join("long".repeat(30));
+    let socket = nanovm::admin::socket(&cfg);
+    assert!(socket.as_os_str().len() > 160, "{}", socket.display());
+    let (_sup, _addr) = supervised_with(cfg.clone()).await;
+    let (ok, out) = admin(&cfg, &["apps"]);
+    assert!(ok && out.trim() == "[]", "{out}");
+}
+
+/// An operator deletes an object, then all of an app's data, on a running
+/// node: its worker stops first, the node's copy and what it shipped go,
+/// the rest of the app is untouched, and the app goes on from nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_deletes_an_object_and_an_app() {
+    let mut cfg = node_cfg("an_operator_deletes_an_object_and_an_app", 8);
+    let store = cfg.data_dir.join("store");
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
+    let (_sup, addr) = supervised_with(cfg.clone()).await;
+    let counter = publish("counter", &app("counter")).await;
+    let name = worker(&counter);
+    let objects = cfg.app_dirs(&name)[0].clone();
+    let incr = async |id: &str| raw(addr, &format!("POST /{id}/incr HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(&counter)), b"").await;
+    let count = async |id: &str| serde_json::from_str::<serde_json::Value>(&app_get(addr, &counter, &format!("/{id}/")).await.1).unwrap()["count"].clone();
+    let shipped = |id: &str| store.join(&name).join(id).join("head");
+    for id in ["a", "a", "b"] {
+        assert_eq!(incr(id).await.0, 200);
+    }
+    eventually_long("both shipped", || shipped("a").exists() && shipped("b").exists()).await;
+
+    let (ok, out) = admin(&cfg, &["delete", &name, "a"]);
+    assert!(ok, "{out}");
+    assert!(!object_dir(&objects, "a").exists() && !store.join(&name).join("a").exists(), "a is gone, here and in the store");
+    assert!(object_dir(&objects, "b").exists() && shipped("b").exists(), "b is untouched");
+    assert_eq!((count("a").await, count("b").await), (0.into(), 1.into()));
+    // It goes on from nothing, and ships again.
+    assert_eq!(incr("a").await.0, 200);
+    eventually_long("a shipped again", || shipped("a").exists()).await;
+
+    let (ok, out) = admin(&cfg, &["delete-app", &name]);
+    assert!(ok, "{out}");
+    for dir in cfg.app_dirs(&name) {
+        assert!(!dir.exists(), "{} is left", dir.display());
+    }
+    assert!(!store.join(&name).exists(), "nothing of the app in the store");
+    assert_eq!(std::fs::read_dir(cfg.data_dir.join("deleted")).unwrap().count(), 0, "nothing left over");
+    assert_eq!((count("a").await, count("b").await), (0.into(), 0.into()), "the app starts from nothing");
+
+    for bad in [vec!["delete", "../x", "a"], vec!["delete", &name, ".."], vec!["delete", &name, "_nanovm"], vec!["delete-app", "a/b"]] {
+        let (ok, out) = admin(&cfg, &bad);
+        assert!(!ok && out.contains("not an app and object"), "{bad:?}: {out}");
+    }
+}
+
+/// Waits until `f` holds, for up to 10 s.
+async fn eventually_long(what: &str, mut f: impl FnMut() -> bool) {
+    let t0 = Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// `POST path` on `app`, with no body.
+async fn app_post(addr: std::net::SocketAddr, app: &str, path: &str) -> (u16, String) {
+    let head = format!("POST {path} HTTP/1.1\r\nHost: x\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n", names(app));
+    raw(addr, &head, b"").await
+}
+
+/// `nanovm admin` with `args`, off the runtime's threads: the command's
+/// JSON answer, or its error.
+async fn admin_json(cfg: &NodeConfig, args: &[&str]) -> Result<serde_json::Value, String> {
+    let (cfg, args) = (cfg.clone(), args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+    let (ok, out) = tokio::task::spawn_blocking(move || admin(&cfg, &args.iter().map(String::as_str).collect::<Vec<_>>())).await.unwrap();
+    if ok { Ok(serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))) } else { Err(out) }
+}
+
+/// An operator restores one object, then all of one app's objects, from the
+/// store into a running node, through `nanovm admin`: to an older version
+/// (which becomes the version after the head: the head only moves on, and
+/// the versions between stay in the store), and to the head, over a damaged
+/// volume. Another app writes throughout without missing a write; while an
+/// object is paused for a restore it answers 503 and the app's other objects
+/// serve. Bad names and a damaged version in the store are refused, and
+/// nothing changes.
+#[tokio::test(flavor = "multi_thread")]
+async fn restores_an_object_and_an_app_into_a_running_node() {
+    let store = Path::new(env!("CARGO_TARGET_TMPDIR")).join("restore-store");
+    let _ = std::fs::remove_dir_all(&store);
+    let mut cfg = node_cfg("restore_running", 8);
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
+    let (sup, addr) = supervised_with(cfg.clone()).await;
+    let (a, b) = (publish("restore-a", &app("counter")).await, publish("restore-b", &app("counter")).await);
+    let (wa, wb) = (worker(&a), worker(&b));
+    let head = |app: &str, o: &str| {
+        let bytes = std::fs::read(store.join(app).join(o).join("head")).ok();
+        bytes.map_or(0, |h| serde_json::from_slice::<nanovm::ship::Head>(&h).unwrap().sequence)
+    };
+    let count = |(status, body): (u16, String)| {
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["count"].as_u64().unwrap()
+    };
+    // B writes throughout.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = tokio::spawn({
+        let (b, stop) = (b.clone(), stop.clone());
+        async move {
+            let mut n = 0;
+            while !stop.load(Relaxed) {
+                n += 1;
+                let (status, body) = app_post(addr, &b, "/w/incr").await;
+                assert_eq!((status, serde_json::from_str::<serde_json::Value>(&body).unwrap()["count"].as_u64()), (200, Some(n)), "{body}");
+            }
+            n
+        }
+    });
+    for n in 1..=5 {
+        assert_eq!(count(app_post(addr, &a, "/o/incr").await), n);
+    }
+    assert_eq!(count(app_post(addr, &a, "/p/incr").await), 1);
+    let t0 = Instant::now();
+    while head(&wa, "o") < 5 || head(&wa, "p") < 1 {
+        assert!(t0.elapsed() < Duration::from_secs(5), "never shipped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Back to version 3, live: made version 6.
+    let done = admin_json(&cfg, &["restore", &wa, "o", "3"]).await.unwrap();
+    assert_eq!((&done[0]["object"], &done[0]["version"], &done[0]["head"]), (&"o".into(), &3.into(), &6.into()), "{done}");
+    assert!(done[0]["said"].as_str().unwrap().contains("versions 4 to 5 stay in the store"), "{done}");
+    assert_eq!(head(&wa, "o"), 6, "the restore shipped its version");
+    assert_eq!(count(app_get(addr, &a, "/o/").await), 3);
+    assert_eq!(count(app_post(addr, &a, "/o/incr").await), 4);
+    eventually("version 7 shipped", || head(&wa, "o") == 7).await;
+    let versions = admin_json(&cfg, &["versions", &wa, "o"]).await.unwrap();
+    assert_eq!(versions["head"], 7, "{versions}");
+    let listed: Vec<_> = versions["versions"].as_array().unwrap().iter().map(|v| v["version"].as_u64().unwrap()).collect();
+    assert_eq!(listed, (1..=7).collect::<Vec<_>>());
+    assert!(admin_json(&cfg, &["versions"]).await.unwrap().as_array().unwrap().contains(&wb.clone().into()));
+
+    // The volume is damaged under the running node: back to the head.
+    let volume = object_dir(&cfg.app_dirs(&wa)[0], "o").join("data");
+    std::fs::write(volume.join("count"), "999").unwrap();
+    assert_eq!(count(app_get(addr, &a, "/o/").await), 999);
+    let done = admin_json(&cfg, &["restore", &wa, "o"]).await.unwrap();
+    assert_eq!((&done[0]["version"], &done[0]["head"]), (&7.into(), &7.into()), "{done}");
+    assert_eq!(count(app_get(addr, &a, "/o/").await), 4);
+
+    // Paused, an object answers 503 and the app's others serve.
+    let objects = cfg.app_dirs(&wa)[0].clone();
+    sup.pause(&wa, "o", &objects).await.unwrap();
+    assert_eq!(app_get(addr, &a, "/o/").await, (503, r#"{"detail":"the object is being restored","error":"object-restoring"}"#.into()));
+    assert_eq!(count(app_get(addr, &a, "/p/").await), 1);
+    assert!(admin_json(&cfg, &["restore", &wa, "o"]).await.unwrap_err().contains("being restored already"));
+    nanovm::ship::resume(&objects, "o").unwrap();
+
+    // All of the app's objects, to their heads.
+    let done = admin_json(&cfg, &["restore", &wa]).await.unwrap();
+    let mut restored: Vec<_> = done.as_array().unwrap().iter().map(|r| (r["object"].as_str().unwrap().to_owned(), r["version"].as_u64().unwrap())).collect();
+    restored.sort();
+    assert_eq!(restored, [("o".to_owned(), 7), ("p".to_owned(), 1)]);
+    assert_eq!((count(app_get(addr, &a, "/o/").await), count(app_get(addr, &a, "/p/").await)), (4, 1));
+
+    // A version here the store refuses (it doesn't follow the head) stops a
+    // restore, which would drop it, unless the operator says to drop it.
+    let committed = object_dir(&objects, "o").join("committed");
+    std::fs::copy(committed.join(format!("{:020}.tar", 7)), committed.join(format!("{:020}.tar", 8))).unwrap();
+    let e = admin_json(&cfg, &["restore", &wa, "o"]).await.unwrap_err();
+    assert!(e.contains("versions the store doesn't"), "{e}");
+    assert!(committed.join(format!("{:020}.tar", 8)).exists());
+    let done = admin_json(&cfg, &["restore", &wa, "o", "--discard-unshipped"]).await.unwrap();
+    assert_eq!(done[0]["version"], 7, "{done}");
+    assert!(!committed.join(format!("{:020}.tar", 8)).exists());
+
+    // Refused: names that aren't one, a version the store doesn't have, and a
+    // version whose bytes aren't what its key names. Nothing changes.
+    for args in [vec!["restore", "..", "o"], vec!["restore", &wa, "../p"], vec!["restore", &wa, "_nanovm"], vec!["restore", &wa, "o", "8"], vec!["versions", "..", "o"]] {
+        assert!(admin_json(&cfg, &args).await.is_err(), "{args:?}");
+    }
+    let key = std::fs::read_dir(store.join(&wa).join("o")).unwrap().map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(&format!("{:020}-", 2))).unwrap();
+    let mut bytes = std::fs::read(&key).unwrap();
+    let last = bytes.len() - 1024 - 1;
+    bytes[last / 2] ^= 1;
+    std::fs::write(&key, bytes).unwrap();
+    let e = admin_json(&cfg, &["restore", &wa, "o", "2"]).await.unwrap_err();
+    assert!(e.contains("isn't what its key names"), "{e}");
+    assert_eq!(count(app_get(addr, &a, "/o/").await), 4);
+    assert_eq!(count(app_post(addr, &a, "/o/incr").await), 5);
+    // Neither a client nor a guest reaches the worker's eviction.
+    assert_eq!(http_get(addr, "/_nanovm/evict/o").await.0, 404);
+    assert_eq!(app_get(addr, &a, "/_nanovm/evict/o").await.0, 400);
+
+    stop.store(true, Relaxed);
+    let writes = writer.await.unwrap();
+    assert!(writes > 10, "B wrote {writes} times");
+    eventually("everything shipped", || head(&wb, "w") == writes && head(&wa, "o") == 8).await;
+    // Marked shipped just after the head moves.
+    let t0 = Instant::now();
+    while admin_json(&cfg, &["backlog"]).await.unwrap() != serde_json::json!({ "versions": 0, "bytes": 0, "objects": 0 }) {
+        assert!(t0.elapsed() < Duration::from_secs(2), "versions still wait");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1230,6 +1935,8 @@ async fn supervised_workers_contain_attacks() {
         };
         assert_eq!(field("Seccomp:"), "2", "{app}");
         assert_eq!(field("NoNewPrivs:"), "1", "{app}");
+        // Shown as `nanovm worker`, though spawned from /proc/self/exe (N-552).
+        assert_eq!(std::fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap(), "nanovm\0worker\0", "{app}");
         if unsafe { libc::geteuid() } == 0 {
             let uid: u32 = field("Uid:").parse().unwrap();
             assert!(uid >= 200_000, "{app} runs as uid {uid}");
@@ -1342,7 +2049,9 @@ fn jail_blocks_escapes() {
     if unsafe { libc::geteuid() } == 0 {
         std::os::unix::fs::chown(dir.join("mine"), Some(200_099), Some(200_099)).unwrap();
     }
-    // A host service's datagram socket, for the probe to try to reach.
+    // A host service's datagram socket, for the probe to try to reach, and
+    // a socket as the admin socket is.
+    let _admin = std::os::unix::net::UnixListener::bind(dir.join("admin.sock")).unwrap();
     let service = format!("nanovm-jail-probe-{}", std::process::id());
     let service_sock = {
         use std::os::linux::net::SocketAddrExt;
@@ -1388,6 +2097,7 @@ fn jail_blocks_escapes() {
         ("tcp_socket", "denied"),
         ("unix_socket", "denied"),
         ("unix_datagram", "denied"),
+        ("admin_socket", "denied"),
         ("fork", "denied"),
         ("exec", "denied"),
         ("setuid_root", "denied"),
@@ -1461,6 +2171,7 @@ fn jailed(dir: &Path) {
             a.send_to_addr(b"x", &std::os::unix::net::SocketAddr::from_abstract_name(&service)?)
         });
         report("unix_datagram", sent.is_ok());
+        report("admin_socket", std::os::unix::net::UnixStream::connect(dir.join("admin.sock")).is_ok());
         let pid = libc::fork();
         if pid == 0 {
             libc::_exit(0);
@@ -1568,6 +2279,13 @@ fn test_cgroup(name: &str, controllers: &[&str]) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// Runs `cfg`'s workers in the test cgroup `root`, under no limits but those
+/// a test sets: the defaults need controllers a test cgroup may lack.
+fn in_cgroup(cfg: &mut NodeConfig, root: &Path) {
+    cfg.cgroup = root.to_str().unwrap().into();
+    cfg.worker = nanovm::config::WorkerLimits { memory_mb: 0, cpus: 0.0, pids: 0 };
+}
+
 /// Kills what is left in a test cgroup and removes it.
 async fn remove_cgroup(root: &Path) {
     for _ in 0..200 {
@@ -1604,7 +2322,7 @@ async fn workers_are_placed_in_their_cgroups() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("workers_are_placed_in_their_cgroups", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     let (sup, addr) = supervised_with(cfg).await;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
     for a in [&counter, &hostile] {
@@ -1625,6 +2343,38 @@ async fn workers_are_placed_in_their_cgroups() {
     eventually("the exited worker's cgroup to go", || !group.exists()).await;
     drop(sup);
     remove_cgroup(&root).await;
+}
+
+/// By default a node runs its workers under the `[worker]` limits, sized
+/// from the host: in a cgroup subtree it makes of its own where cgroup v2
+/// lets it, and otherwise it refuses to start, saying how to run without.
+#[tokio::test(flavor = "multi_thread")]
+async fn workers_run_under_host_sized_limits_or_the_node_refuses_to_start() {
+    let mut cfg = node_cfg("workers_run_under_host_sized_limits", 8);
+    cfg.cgroup = "auto".into();
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
+    if let Err(e) = nanovm::supervisor::Supervisor::new(cfg.clone(), exe, 1, None) {
+        let e = format!("{e:#}");
+        assert!(e.contains("cgroup = \"auto\"") && e.contains("cgroup = \"off\""), "{e}");
+        return eprintln!("refused, as it should be where no cgroup v2 subtree can be made: {e}");
+    }
+    {
+        // Where it can, the supervisor moves itself into `<own>/supervisor`
+        // and puts workers in `<own>/workers`, under the default limits.
+        let (sup, addr) = supervised_with(cfg).await;
+        let counter = publish("counter", &app("counter")).await;
+        assert_eq!(app_get(addr, &counter, "/x/").await.0, 200);
+        let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
+        let mine = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        assert!(mine.trim_end().ends_with("/supervisor"), "{mine}");
+        let theirs = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        let group = PathBuf::from("/sys/fs/cgroup").join(theirs.lines().find_map(|l| l.strip_prefix("0::/")).unwrap());
+        assert!(group.parent().unwrap().ends_with("workers"), "{}", group.display());
+        let w = nanovm::config::WorkerLimits::default();
+        assert_eq!(std::fs::read_to_string(group.join("memory.max")).unwrap().trim(), (w.memory_mb << 20).to_string());
+        assert_eq!(std::fs::read_to_string(group.join("cpu.max")).unwrap().trim(), format!("{} 100000", w.cpus as u64 * 100_000));
+        drop(sup);
+    }
 }
 
 /// Waits until a worker spawned ahead has built its engine (its stacks and
@@ -1661,7 +2411,7 @@ async fn review_spare_engine_memory_is_charged_to_the_app() {
     };
     let slots = 8192;
     let mut cfg = node_cfg("review_spare_engine_memory_is_charged_to_the_app", slots);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     cfg.worker.memory_mb = 512;
     let (sup, addr) = supervised_with(cfg).await;
     let counter = publish("counter", &app("counter")).await;
@@ -1691,7 +2441,7 @@ async fn worker_memory_max_kills_only_that_worker() {
     };
     // Each hostile object may hold 32 MiB; eight holding 30 MiB exceed 160.
     let mut cfg = node_cfg("worker_memory_max_kills_only_that_worker", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     cfg.worker.memory_mb = 160;
     let (sup, addr) = supervised_with(cfg).await;
     let mut big = app("hostile");
@@ -1727,7 +2477,7 @@ async fn worker_cpu_and_pids_limits_hold() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("worker_cpu_and_pids_limits_hold", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     cfg.worker.cpus = 0.2;
     cfg.worker.pids = 64;
     let (sup, addr) = supervised_with(cfg).await;
@@ -1774,7 +2524,7 @@ async fn review2_startup_removes_only_cgroups_it_made() {
     let (mut removed, mut started) = (vec![], vec![]);
     for (dir, kept) in [(&root, &theirs), (&plain, &plain.join("keep"))] {
         let mut cfg = node_cfg("review2_startup_removes_only_cgroups_it_made", 8);
-        cfg.cgroup = Some(dir.clone());
+        in_cgroup(&mut cfg, &dir);
         let sup = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None);
         if !kept.exists() {
             removed.push(kept.clone());
@@ -1814,7 +2564,7 @@ async fn startup_removes_an_earlier_runs_worker_cgroups() {
     let mut left = std::process::Command::new("sleep").arg("60").spawn().unwrap();
     std::fs::write(busy.join("cgroup.procs"), left.id().to_string()).unwrap();
     let mut cfg = node_cfg("startup_removes_an_earlier_runs_worker_cgroups", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     let (sup, _) = supervised_with(cfg).await;
     gone(&[&idle, &busy]).await;
     let kept: Vec<_> = [&idle, &busy].into_iter().filter(|d| d.exists()).cloned().collect();
@@ -1836,7 +2586,7 @@ async fn two_nodes_cannot_share_a_cgroup() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("two_nodes_cannot_share_a_cgroup", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     let (first, addr) = supervised_with(cfg).await;
     let counter = publish("counter", &app("counter")).await;
     let (status, body) = app_get(addr, &counter, "/x/").await;
@@ -1846,7 +2596,7 @@ async fn two_nodes_cannot_share_a_cgroup() {
     let fresh = root.join("worker-999999");
     std::fs::create_dir(&fresh).unwrap();
     let mut cfg = node_cfg("two_nodes_cannot_share_a_cgroup-second", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     let second = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None);
     let second = second.map(drop).map_err(|e| format!("{e:#}"));
     let kept = fresh.exists();
@@ -1874,7 +2624,7 @@ fn a_dropped_supervisors_worker_cgroups_go() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let made = rt.block_on(async {
         let mut cfg = node_cfg("a_dropped_supervisors_worker_cgroups_go", 8);
-        cfg.cgroup = Some(root.clone());
+        in_cgroup(&mut cfg, &root);
         let (_sup, addr) = supervised_with(cfg).await;
         let counter = publish("counter", &app("counter")).await;
         let (status, body) = app_get(addr, &counter, "/x/").await;
@@ -1905,7 +2655,7 @@ async fn a_worker_memory_limit_below_a_spares_use_is_refused_clearly() {
         Err(why) => return eprintln!("skipped: {why}"),
     };
     let mut cfg = node_cfg("a_worker_memory_limit_below_a_spares_use_is_refused_clearly", 8);
-    cfg.cgroup = Some(root.clone());
+    in_cgroup(&mut cfg, &root);
     cfg.worker.memory_mb = 1;
     let (sup, addr) = supervised_with(cfg).await;
     let counter = publish("counter", &app("counter")).await;
@@ -2078,7 +2828,8 @@ async fn published(name: &str) -> Result<Vec<(semver::Version, String)>, String>
 /// A supervisor that checks signatures.
 async fn signed(test: &str) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
     let mut cfg = node_cfg(test, 8);
-    cfg.dev = false;
+    // Outside dev mode the operator's egress list names no private address.
+    (cfg.dev, cfg.limits.egress) = (false, vec![]);
     supervised_with(cfg).await
 }
 
@@ -2129,6 +2880,36 @@ async fn registry_apps_need_a_trusted_signature() {
     let (_sup, addr) = signed("registry_trust_header").await;
     let head = format!("GET /a/ HTTP/1.1\r\nHost: x\r\nnanovm-app: {app}\r\nConnection: close\r\n\r\n");
     assert_eq!(raw(addr, &head, b"").await.0, 400);
+}
+
+/// An app signed by an identity the proxy's operator doesn't list is
+/// refused even though its record trusts that identity: the node hears only
+/// the identities the operator lets deploy. One the operator lists, here by
+/// a prefix, deploys.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_operators_signers_deploy() {
+    let (version, app) = published("counter").await.expect("published signed counter is reachable").pop().unwrap();
+    let (_sup, node) = signed("only_the_operators_signers_deploy").await;
+    let other = "https://accounts.example.com someone@example.com";
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let txt = format!("app={}:{version}; trust={SIGNER}; trust={other}", app.split_once('@').unwrap().0);
+    records.lock().insert("_nanovm.counter.test".to_string(), vec![txt]);
+    let resolver = doh(records).await;
+    let github = "https://token.actions.githubusercontent.com https://github.com/carsonfarmer/*";
+    for (signer, allowed) in [(other, false), (github, true)] {
+        let cfg = nanovm::config::ProxyConfig {
+            nodes: vec![node.to_string()], resolver: resolver.clone(), listen: "127.0.0.1:0".into(),
+            hosts: vec!["counter.test".into()], signers: vec![signer.into()], ..Default::default()
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+        let (status, body) = raw(addr, "GET /a/ HTTP/1.1\r\nHost: counter.test\r\nConnection: close\r\n\r\n", b"").await;
+        match allowed {
+            true => assert_eq!(status, 200, "{body}"),
+            false => assert!(status == 502 && body.contains("not signed by a trusted identity"), "{status} {body}"),
+        }
+    }
 }
 
 /// Naming a new version switches the app: requests in flight on the old
@@ -2185,7 +2966,7 @@ async fn kv_values_persist_in_the_volume() {
 
     node.shutdown().await;
     assert_eq!(get(&node, "k", "/kv/greeting").await.body, "hello", "a new instance sees it");
-    let file = node.cfg.data_dir.join("objects/counter/k/.kv/default/Z3JlZXRpbmc");
+    let file = object_dir(&node.cfg.data_dir.join("objects/counter"), "k").join("data/.kv/default/Z3JlZXRpbmc");
     assert_eq!(std::fs::read(file).unwrap(), b"hello");
 
     assert_eq!(request(&node, "DELETE", "k", "/kv/greeting", "").await.status, 204);
@@ -2263,7 +3044,7 @@ async fn kv_works_in_a_jailed_worker() {
     assert!(body.contains(r#""set":true"#), "{body}");
     let (_, body) = app_get(addr, &hostile, "/p/kv?op=plant").await;
     assert!(body.contains("IsDirectory"), "{body}");
-    let bucket = std::fs::read_dir(node_dir("kv_works_in_a_jailed_worker").join("objects").join(worker(&hostile)).join("p/.kv/default")).unwrap();
+    let bucket = std::fs::read_dir(object_dir(&node_dir("kv_works_in_a_jailed_worker").join("objects").join(worker(&hostile)), "p").join("data/.kv/default")).unwrap();
     let mut names: Vec<_> = bucket.flatten().map(|e| e.file_name()).collect();
     names.sort();
     assert_eq!(names, ["aw", "azA"], "only the seed and planted directory are there");
@@ -2287,7 +3068,7 @@ async fn kv_values_are_bounded() {
     assert_eq!(get(&node, "m", "/kv?op=get").await.json()["bytes"], 1 << 20, "failed write keeps old value");
 
     node.shutdown().await;
-    let file = node.cfg.data_dir.join("objects/hostile/m/.kv/default/azA");
+    let file = object_dir(&node.cfg.data_dir.join("objects/hostile"), "m").join("data/.kv/default/azA");
     std::fs::write(file, vec![7u8; (1 << 20) + 1]).unwrap();
     let r = get(&node, "m", "/kv?op=get").await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -2361,11 +3142,11 @@ async fn sqlite_composed_provider() {
             // Simulate an unwriteable database during host recovery. Neither
             // a failed startup nor its retry may discard the remaining undo.
             let base = node.cfg.app_dirs(&app.name)[0].clone();
-            let db = base.join("a/composed.db");
+            let db = object_dir(&base, "a").join("data/composed.db");
             let parked = base.join("parked.db");
             std::fs::rename(&db, &parked).unwrap();
             std::fs::create_dir(&db).unwrap();
-            let log = base.join("~journal/a/log");
+            let log = object_dir(&base, "a").join("journal/log");
             for _ in 0..2 {
                 let blocked = get(&node, "a", "/").await;
                 assert!(blocked.status >= 500, "{}", blocked.body);
@@ -2433,11 +3214,11 @@ async fn sqlite_captures_recover_without_the_original_node() {
     assert_eq!(get(&node, "a", "/?v=rejected&then=trap").await.status, 500);
     assert_eq!(get(&node, "a", "/?v=second").await.json(), expected(&["first", "second"], "second", false));
     settle(&node).await;
-    let source = cfg.app_dirs(&app.name)[0].join("~committed/a");
+    let source = object_dir(&cfg.app_dirs(&app.name)[0], "a").join("committed");
     let mut fresh = node_cfg("sqlite_capture_recovered", 2);
     fresh.capture = cfg.capture.clone();
     let objects = fresh.app_dirs(&app.name)[0].clone();
-    let received = objects.join("~committed/a");
+    let received = object_dir(&objects, "a").join("committed");
     std::fs::create_dir_all(&received).unwrap();
     let mut versions: Vec<_> = std::fs::read_dir(&source).unwrap().map(|e| e.unwrap().path()).collect();
     versions.sort();
@@ -2470,7 +3251,7 @@ async fn sqlite_captures_recover_without_the_original_node() {
     node.shutdown().await;
     drop(node);
     std::fs::remove_dir_all(&cfg.data_dir).unwrap();
-    assert_eq!(nanovm::committed::restore(&received, &objects.join("a")).unwrap(), 2);
+    assert_eq!(nanovm::committed::restore(&received, &object_dir(&objects, "a").join("data")).unwrap(), 2);
     let node = Node::new(fresh.clone(), &app, &wasm, None).unwrap();
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     assert_eq!(get(&node, "a", "/?v=continued").await.json(), expected(&["first", "second", "continued"], "continued", true));
@@ -2500,7 +3281,7 @@ async fn sqlite_composed_recovery_cuts() {
     assert_eq!(get(&node, "timeout", "/?v=before").await.status, 200);
     let timed_out = get(&node, "timeout", "/timeout?v=discard-timeout").await;
     assert_eq!(timed_out.error.as_deref(), Some("timeout"), "{}", timed_out.body);
-    let entered = node.cfg.app_dirs(&app.name)[0].join("timeout/sql-wait");
+    let entered = object_dir(&node.cfg.app_dirs(&app.name)[0], "timeout").join("data/sql-wait");
     assert_eq!(std::fs::read(&entered).unwrap(), b"entered", "must reach SQLite's blocking wait");
     let recovered = get(&node, "timeout", "/").await;
     assert_eq!(recovered.json(), serde_json::json!({"rows":["before"],"file":"before","key":"before","reused":false}));
@@ -2606,7 +3387,7 @@ async fn sqlite_over_the_existing_filesystem() {
         get(&node, "a", "/transaction").await.json(),
         expected(&["first", "second"], "second")
     );
-    let database = cfg.app_dirs(&app.name)[0].join("a/probe.db");
+    let database = object_dir(&cfg.app_dirs(&app.name)[0], "a").join("data/probe.db");
     let before = std::fs::metadata(&database).unwrap().len();
     let mut grown = expected(&["first", "second"], "second");
     grown["blob_bytes"] = 262144.into();
@@ -2664,8 +3445,8 @@ async fn sqlite_survives_a_jailed_worker_crash() {
             async move { app_get(addr, &image, "/a/?v=uncommitted&then=sleep").await }
         });
         // Both clients write markers after SQLite's INSERT completes, before response commit.
-        let marker = cfg.app_dirs(&name)[0].join("a/marker");
-        let key = cfg.app_dirs(&name)[0].join("a/.kv/default/bWFya2Vy");
+        let marker = object_dir(&cfg.app_dirs(&name)[0], "a").join("data/marker");
+        let key = object_dir(&cfg.app_dirs(&name)[0], "a").join("data/.kv/default/bWFya2Vy");
         eventually("SQLite, file and KV writes before SIGKILL", || {
             std::fs::read(&marker).is_ok_and(|v| v == b"uncommitted")
                 && std::fs::read(&key).is_ok_and(|v| v == b"uncommitted")
@@ -2691,10 +3472,13 @@ async fn sqlite_survives_a_jailed_worker_crash() {
     }
 }
 
-/// A real process crash followed by offline backup and recovery elsewhere.
+/// The node is lost after a real process crash; a fresh node restores the
+/// app from the store its versions were shipped to, through `nanovm admin`,
+/// and serves: what was committed, without what the crash cut short, then
+/// new writes, which survive another restart.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the SQLite experiment and restic"]
-async fn sqlite_backup_restores_into_a_fresh_root() {
+#[ignore = "requires the separately built SQLite experiment (WASI SDK)"]
+async fn sqlite_restores_a_lost_node_from_the_store() {
     async fn start(cfg: &NodeConfig, path: &Path) -> (tokio::process::Child, std::net::SocketAddr) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2718,30 +3502,25 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
         }
     }
 
-    let mut cfg = node_cfg("sqlite_backup_source", 8);
-    let workspace = node_cfg("sqlite_backup_drill", 8).data_dir;
+    let mut cfg = node_cfg("sqlite_restore_source", 8);
+    let workspace = node_cfg("sqlite_restore_drill", 8).data_dir;
+    let store = workspace.join("store");
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), ..Default::default() });
     let mut app = app("counter");
     app.limits.memory_mb = 64;
     app.limits.cpu_ms = 2000;
     app.limits.request_timeout_ms = 30_000;
     cfg.limits.cpu_ms = app.limits.cpu_ms;
     let wasm = std::fs::read(repo().join("target/sqlite-filesystem/composed.wasm")).unwrap();
-    let image = publish_wasm("backup-probe", &app, wasm).await;
+    let image = publish_wasm("restore-probe", &app, wasm).await;
     let name = worker(&image);
-    let run = |program: &str, args: &[&str]| {
-        std::process::Command::new(program).args(args)
-            .env("RESTIC_REPOSITORY", workspace.join("repository"))
-            .env("RESTIC_PASSWORD", "disposable-restore-drill")
-            .env("RESTIC_CACHE_DIR", workspace.join("restic-cache"))
-            .output().unwrap()
-    };
-    assert!(run("restic", &["init"]).status.success());
-    let script = repo().join("scripts/backup.py");
-    let backup = || run("python3", &[script.to_str().unwrap(), "backup", cfg.data_dir.to_str().unwrap(), "--stopped"]);
+    let shipped = |n: u64| std::fs::read(store.join(&name).join("a/head")).ok()
+        .is_some_and(|h| serde_json::from_slice::<nanovm::ship::Head>(&h).unwrap().sequence >= n);
     let (mut source, addr) = start(&cfg, &workspace.join("source.toml")).await;
     let (status, body) = app_get(addr, &image, "/a/?v=durable").await;
     assert_eq!(status, 200, "{body}");
-    assert!(!backup().status.success(), "backup must refuse a live jailed owner");
+    let source_objects = cfg.data_dir.join("objects");
+    eventually("the durable write shipped", || shipped(1) && nanovm::ship::backlog(&source_objects).versions == 0).await;
     let children: Vec<i32> = std::fs::read_dir(format!("/proc/{}/task", source.id().unwrap())).unwrap()
         .flat_map(|thread| std::fs::read_to_string(thread.unwrap().path().join("children")).unwrap()
             .split_whitespace().map(|pid| pid.parse().unwrap()).collect::<Vec<_>>())
@@ -2756,32 +3535,27 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
         async move { app_get(addr, &image, "/a/?v=uncommitted&then=sleep").await }
     });
     let objects = cfg.app_dirs(&name)[0].clone();
-    eventually("tentative SQL/file/KV changes before backup", || {
-        std::fs::read(objects.join("a/marker")).is_ok_and(|v| v == b"uncommitted")
-            && std::fs::read(objects.join("a/.kv/default/bWFya2Vy")).is_ok_and(|v| v == b"uncommitted")
+    eventually("tentative SQL/file/KV changes", || {
+        std::fs::read(object_dir(&objects, "a").join("data/marker")).is_ok_and(|v| v == b"uncommitted")
+            && std::fs::read(object_dir(&objects, "a").join("data/.kv/default/bWFya2Vy")).is_ok_and(|v| v == b"uncommitted")
     }).await;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     let _ = pending.await;
     eventually("worker reaped", || !Path::new(&format!("/proc/{pid}")).exists()).await;
     source.kill().await.unwrap();
-    assert!(objects.join("~journal/a/log").exists(), "backup must include crash-left undo");
-    let saved = backup();
-    assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stderr));
-    let snapshot = String::from_utf8(saved.stdout).unwrap();
-    let snapshot = snapshot.trim();
-    assert_eq!(snapshot.len(), 64);
-    // Make the source unavailable: the fresh root cannot rely on its cache or files.
-    std::fs::rename(&cfg.data_dir, workspace.join("offline-source")).unwrap();
-    let fresh = workspace.join("fresh");
-    let restored = run("python3", &[script.to_str().unwrap(), "restore", snapshot, fresh.to_str().unwrap()]);
-    assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
-    assert!(!fresh.join("cache").exists());
-    assert!(!fresh.join("tmp").exists());
-    let restored_objects = fresh.join("objects").join(&name);
-    assert_eq!(std::fs::read(restored_objects.join("a/marker")).unwrap(), b"uncommitted");
-    assert!(restored_objects.join("~journal/a/log").exists());
-    cfg.data_dir = fresh;
+    assert!(object_dir(&objects, "a").join("journal/log").exists(), "the crash left undo");
+    // The node is lost: a fresh one, on an empty root, restores the app.
+    std::fs::remove_dir_all(&cfg.data_dir).unwrap();
+    cfg.data_dir = workspace.join("fresh");
+    std::fs::create_dir_all(&cfg.data_dir).unwrap();
     let (mut destination, addr) = start(&cfg, &workspace.join("restored.toml")).await;
+    let (ok, out) = tokio::task::spawn_blocking({
+        let (cfg, name) = (cfg.clone(), name.clone());
+        move || admin(&cfg, &["restore", &name])
+    }).await.unwrap();
+    assert!(ok, "{out}");
+    let restored_objects = cfg.app_dirs(&name)[0].clone();
+    assert!(!object_dir(&restored_objects, "a").join("journal/log").exists());
     let (status, body) = app_get(addr, &image, "/a/").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(),
@@ -2799,7 +3573,7 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(),
         serde_json::json!({"rows": ["durable", "after-restore"], "file": "after-restore", "key": "after-restore", "reused": false}));
     reopened.kill().await.unwrap();
-    println!("fresh-root restore: crash-left SQL/file/KV rolled back together; new writes survived another restart");
+    println!("lost node restored from the store: crash-left SQL/file/KV absent; new writes survived another restart");
 }
 
 /// Faults at every VFS mutation/sync boundary of a multi-database transaction.
@@ -2956,7 +3730,7 @@ async fn sqlite_repeated_updates_remain_bounded() {
             if rollback {
                 assert_eq!(result.error.as_deref(), Some("guest-error"), "{}", result.body);
                 assert!(result.body.contains("after 1000 completed statements"), "{}", result.body);
-                let dir = node.cfg.app_dirs(&app.name)[0].join("~journal").join(&object);
+                let dir = object_dir(&node.cfg.app_dirs(&app.name)[0], &object).join("journal");
                 let log = std::fs::metadata(dir.join("log")).unwrap().len();
                 let retained: u64 = std::fs::read_dir(&dir).unwrap().map(|entry| {
                     let entry = entry.unwrap();
@@ -3000,7 +3774,7 @@ async fn sqlite_exclusive_wal_checkpoints() {
         let changed = get(&node, &control, &format!("{prefix}&op=mutate")).await;
         assert_eq!(changed.status, 200, "{}", changed.body);
         let expected = changed.json()["state"].clone();
-        let volume = node.cfg.app_dirs(&app.name)[0].join(&control);
+        let volume = object_dir(&node.cfg.app_dirs(&app.name)[0], &control).join("data");
         for db in ["pressure", "aux"] {
             assert!(std::fs::metadata(volume.join(format!("{db}.db-wal"))).unwrap().len() > 32);
             assert!(!volume.join(format!("{db}.db-shm")).exists());
@@ -3043,7 +3817,7 @@ async fn sqlite_exclusive_wal_checkpoints() {
     let failed = get(&node, "default-checkpoint", &format!("{prefix}&op=churn&n=1000")).await;
     assert_eq!(failed.error.as_deref(), Some("guest-error"), "{}", failed.body);
     assert!(node.metrics.fs_denied.load(Relaxed) > denials);
-    let wal = node.cfg.app_dirs(&app.name)[0].join("default-checkpoint/pressure.db-wal");
+    let wal = object_dir(&node.cfg.app_dirs(&app.name)[0], "default-checkpoint").join("data/pressure.db-wal");
     println!("default WAL autocheckpoint exhausts the 1 MiB volume: WAL {} bytes", std::fs::metadata(wal).unwrap().len());
     let recovered = get(&node, "default-checkpoint", prefix).await;
     assert_eq!(recovered.status, 200, "{}", recovered.body);
@@ -3090,7 +3864,7 @@ async fn benchmark_database_modes() {
                             bytes += body["sqlite_write_bytes"].as_u64().unwrap();
                             syncs += body["sqlite_syncs"].as_u64().unwrap();
                         }
-                        let volume = node.cfg.app_dirs(&app.name)[0].join(&object);
+                        let volume = object_dir(&node.cfg.app_dirs(&app.name)[0], &object).join("data");
                         let live: u64 = std::fs::read_dir(volume).unwrap()
                             .map(|e| e.unwrap().metadata().unwrap().len()).sum();
                         peak = peak.max(live);
@@ -3190,7 +3964,7 @@ async fn the_journal_is_out_of_reach_and_works_from_a_relative_data_dir() {
     let node = node_with(cfg, app("hostile"));
     let r = get(&node, "c", "/commit?v=one").await;
     assert_eq!(r.status, 200, "{}", r.body);
-    let r = get(&node, "c", "/rename?mount=data&from=../~journal/c&to=j").await;
+    let r = get(&node, "c", "/rename?mount=data&from=../journal&to=j").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(get(&node, "c", "/commit?v=two&then=panic").await.status, 500);
     let r = get(&node, "c", "/commit").await;
@@ -3269,6 +4043,184 @@ async fn only_well_formed_publishes_are_held() {
     }
 }
 
+// ---- Secrets ---------------------------------------------------------------
+
+/// A secrets directory for `test` that only this user can use, outside the
+/// node's data directory, as an operator keeps one.
+fn secrets_dir(test: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("secrets").join(test);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
+/// Gives the app named `name` on the node `secrets`, as an operator should:
+/// a new file renamed into place.
+fn give(dir: &Path, name: &str, secrets: &str) {
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, secrets).unwrap();
+    std::fs::rename(tmp, dir.join(format!("{name}.json"))).unwrap();
+}
+
+/// The counter guest's manifest, needing the secrets `needs`.
+fn needing(needs: &[&str]) -> serde_json::Value {
+    serde_json::json!({ "limits": app("counter").limits, "secrets": needs })
+}
+
+/// Polls `GET path` on `app` until `done` holds of its answer, for up to 10 s.
+async fn until(addr: std::net::SocketAddr, app: &str, path: &str, done: impl Fn(u16, &str) -> bool) -> (u16, String) {
+    let t0 = Instant::now();
+    loop {
+        let (status, body) = app_get(addr, app, path).await;
+        if done(status, &body) {
+            return (status, body);
+        }
+        assert!(t0.elapsed() < Duration::from_secs(10), "still {status} {body}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// An app's secrets reach its own jailed worker, which reads them with its
+/// config (`wasi:config`), and no other app: not through its config, not
+/// through the file (the directory is root's alone, and a worker runs as a
+/// uid of its own), and not through the worker's arguments or environment,
+/// which other processes may read.
+#[tokio::test(flavor = "multi_thread")]
+async fn secrets_reach_only_their_apps_worker() {
+    let test = "secrets_reach_only_their_apps_worker";
+    let (mut cfg, dir) = (node_cfg(test, 8), secrets_dir(test));
+    cfg.secrets = Some(dir.clone());
+    let (_sup, addr) = supervised_with(cfg).await;
+    let a = publish_spec("secret-a", needing(&["api_key"]), guest("counter"), "1.0.0").await;
+    let b = publish_spec("secret-b", needing(&[]), guest("counter"), "1.0.0").await;
+    let key = "sk-a-0123456789abcdef";
+    give(&dir, &worker(&a), &format!(r#"{{"api_key": "{key}", "greeting": "from the operator"}}"#));
+    assert_eq!(app_get(addr, &a, "/x/config/api_key").await, (200, key.into()));
+    assert_eq!(app_get(addr, &b, "/x/config/api_key").await.0, 404, "another app's secret");
+    // b's own, once it has one: b's worker restarts with it, and a's keeps its.
+    give(&dir, &worker(&b), r#"{"api_key": "b's own"}"#);
+    until(addr, &b, "/x/config/api_key", |s, body| (s, body) == (200, "b's own")).await;
+    assert_eq!(app_get(addr, &a, "/x/config/api_key").await, (200, key.into()));
+
+    let pid = stats_json(addr).await["workers"][worker(&a).as_str()]["pid"].as_u64().unwrap();
+    for file in ["cmdline", "environ"] {
+        let seen = std::fs::read(format!("/proc/{pid}/{file}")).unwrap();
+        assert!(!seen.windows(key.len()).any(|w| w == key.as_bytes()), "the worker's {file} holds the secret");
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::{fs::MetadataExt, process::CommandExt};
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let uid: u32 = status.lines().find_map(|l| l.strip_prefix("Uid:")).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        assert!(uid >= 200_000, "the worker runs as uid {uid}");
+        // Its uid can't read the file (nor can its jail reach the directory).
+        let read = std::process::Command::new("cat").arg(dir.join(format!("{}.json", worker(&a)))).uid(uid).gid(uid).output().unwrap();
+        assert!(!read.status.success() && read.stdout.is_empty(), "uid {uid} read the secrets file");
+        // It is not dumpable: no core dump holds its secrets, and no
+        // process of its uid may trace it or read its memory.
+        for file in ["environ", "mem"] {
+            assert_eq!(std::fs::metadata(format!("/proc/{pid}/{file}")).unwrap().uid(), 0, "{file}: the worker is dumpable");
+        }
+    }
+}
+
+/// A change to an app's secrets restarts its worker with them. A file the
+/// node can't use stops the app (fail closed): its requests get 502 naming
+/// the file and what is wrong, never what the file holds. So does a
+/// missing secret the app needs. A secrets directory others can use stops
+/// the node from starting.
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_or_bad_secrets_restart_or_stop_the_app() {
+    use std::os::unix::fs::PermissionsExt;
+    let test = "changed_or_bad_secrets_restart_or_stop_the_app";
+    let (mut cfg, dir) = (node_cfg(test, 8), secrets_dir(test));
+    cfg.secrets = Some(dir.clone());
+    let (_sup, addr) = supervised_with(cfg.clone()).await;
+    let a = publish_spec("secret-change", needing(&["api_key"]), guest("counter"), "1.0.0").await;
+    let name = worker(&a);
+    let (status, body) = app_get(addr, &a, "/x/config/api_key").await;
+    assert_eq!(status, 502, "{body}");
+    assert!(body.contains(&format!("the app's secrets, from the node's secrets directory: the app needs secrets api_key; {name}.json doesn't give them")), "{body}");
+
+    give(&dir, &name, r#"{"api_key": "one"}"#);
+    until(addr, &a, "/x/config/api_key", |s, body| (s, body) == (200, "one")).await;
+    let pid = |v: serde_json::Value| v["workers"][name.as_str()]["pid"].as_u64().unwrap();
+    let first = pid(stats_json(addr).await);
+    give(&dir, &name, r#"{"api_key": "two"}"#);
+    until(addr, &a, "/x/config/api_key", |s, body| (s, body) == (200, "two")).await;
+    assert_ne!(pid(stats_json(addr).await), first, "a new worker");
+
+    // serde_json alone would say `invalid type: integer `4242…``.
+    give(&dir, &name, r#"{"api_key": 4242424242424242}"#);
+    let (_, body) = until(addr, &a, "/x/config/api_key", |s, _| s == 502).await;
+    assert!(body.contains(&format!("{name}.json is not a JSON object of strings (line 1, column")) && !body.contains("4242"), "{body}");
+    std::fs::remove_file(dir.join(format!("{name}.json"))).unwrap();
+    std::fs::create_dir(dir.join(format!("{name}.json"))).unwrap();
+    until(addr, &a, "/x/config/api_key", |s, body| s == 502 && body.contains(&format!("{name}.json is not a file"))).await;
+    std::fs::remove_dir(dir.join(format!("{name}.json"))).unwrap();
+    give(&dir, &name, r#"{"api_key": "three"}"#);
+    until(addr, &a, "/x/config/api_key", |s, body| (s, body) == (200, "three")).await;
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
+    let e = nanovm::supervisor::Supervisor::new(cfg, exe, 1, None).err().expect("a directory others can read");
+    assert!(e.to_string().contains("only its owner, the user nanovm runs as, may use it"), "{e:#}");
+}
+
+/// A guest that writes its secret to stdout and stderr, puts it in the path
+/// of a request out, and then fails with it in its error or its panic. The
+/// host reports all of that (the failure, with the guest's last output, to
+/// the client; the output, the request out and its refusal to telemetry),
+/// but masked: nothing the collector receives, and no answer, holds the
+/// secret.
+#[tokio::test(flavor = "multi_thread")]
+async fn secrets_stay_out_of_telemetry_and_error_text() {
+    use http_body_util::BodyExt;
+    let test = "secrets_stay_out_of_telemetry_and_error_text";
+    let (mut cfg, dir) = (node_cfg(test, 8), secrets_dir(test));
+    cfg.secrets = Some(dir.clone());
+    // Every batch the collector is sent, as sent.
+    let received = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+    let collector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    cfg.telemetry_endpoint = format!("http://{}", collector.local_addr().unwrap());
+    let r = received.clone();
+    tokio::spawn(nanovm::server::serve_http1(collector, move |req: http::Request<hyper::body::Incoming>| {
+        let r = r.clone();
+        async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            r.lock().extend(body);
+            http::Response::new(http_body_util::Full::new(bytes::Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+        }
+    }));
+    let (sup, addr) = supervised_with(cfg).await;
+    let leaky = serde_json::json!({ "limits": app("hostile").limits, "secrets": ["api_key"] });
+    let leaky = publish_spec("secret-leak", leaky, probe(), "1.0.0").await;
+    let key = "sk-leak-0123456789abcdef";
+    give(&dir, &worker(&leaky), &format!(r#"{{"api_key": "{key}"}}"#));
+    let masked = "*".repeat(key.len());
+
+    let (status, body) = app_get(addr, &leaky, "/x/leak?key=api_key").await;
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains(r#""error":"trap""#) && body.contains(&format!("panic {masked}")) && body.contains(&format!("stderr {masked}")), "{body}");
+    assert!(!body.contains(key), "{body}");
+    let (status, body) = app_get(addr, &leaky, "/y/leak?key=api_key&then=error").await;
+    assert_eq!(status, 500, "{body}");
+    assert!(body.contains(r#""error":"guest-error""#) && body.contains(&format!("error {masked}")) && !body.contains(key), "{body}");
+
+    let t0 = Instant::now();
+    while let Err(e) = sup.flush_telemetry().await {
+        assert!(t0.elapsed() < Duration::from_secs(2), "telemetry flush failed: {e:#}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let received = received.lock().clone();
+    let holds = |s: &str| received.windows(s.len()).any(|w| w == s.as_bytes());
+    for reported in [format!("/leak/{masked}"), format!("stdout {masked}"), format!("stderr {masked}"), format!("panic {masked}")] {
+        assert!(holds(&reported), "telemetry should report {reported:?}");
+    }
+    assert!(!holds(key), "telemetry holds the secret");
+}
+
 // ---- WebSockets ----------------------------------------------------------
 
 mod sockets {
@@ -3291,6 +4243,8 @@ mod sockets {
         }
         cfg.listen = "127.0.0.1:0".into();
         cfg.nodes = vec![node.to_string()];
+        cfg.hosts.extend(apps.iter().map(|(host, _)| host.to_string()));
+        cfg.signers = vec!["dev dev".into()];
         cfg.resolver = doh(records.clone()).await;
         cfg.tag_ttl_s = 0;
         cfg.dev = true;
@@ -3387,11 +4341,13 @@ mod sockets {
     /// Owners, not request hosts or repositories, scope channels and caps.
     #[tokio::test(flavor = "multi_thread")]
     async fn sockets_stay_with_their_record_owner_and_repository() {
-        let cfg = nanovm::config::ProxyConfig { max_sockets_per_app: 2, ..Default::default() };
+        let hosts = ["other", "alias", "alias2"].map(String::from).into();
+        let cfg = nanovm::config::ProxyConfig { max_sockets_per_app: 2, hosts, ..Default::default() };
         let (_sup, _node, addr, records) = front("socket_owners", cfg, &[("counter", app("counter")), ("replacement", app("counter"))]).await;
         {
             let mut r = records.lock();
-            let same = r["_nanovm.counter"].clone();
+            let same = vec![format!("{}; alias=alias; alias=alias2", r["_nanovm.counter"][0])];
+            r.insert("_nanovm.counter".into(), same.clone());
             r.insert("_nanovm.other".into(), same);
             for alias in ["alias", "alias2"] {
                 r.insert(format!("_nanovm.{alias}"), vec!["CNAME _nanovm.counter".into()]);
@@ -3641,11 +4597,14 @@ async fn doh(records: Arc<parking_lot::Mutex<std::collections::HashMap<String, V
     format!("http://{addr}/dns-query")
 }
 
-/// A dev-mode proxy in front of `node`, asking `resolver`, and asking the
-/// registry for a tag's digest every time.
+/// A dev-mode proxy in front of `node`, serving `*.test` to apps the dev
+/// identity signs, asking `resolver`, and asking the registry for a tag's
+/// digest every time.
 async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::SocketAddr {
     let cfg = nanovm::config::ProxyConfig {
         nodes: vec![node.to_string()],
+        hosts: vec!["*.test".into()],
+        signers: vec!["dev dev".into()],
         resolver,
         tag_ttl_s: 0,
         dev: true,
@@ -3656,6 +4615,137 @@ async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::Sock
     let addr = listener.local_addr().unwrap();
     tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
     addr
+}
+
+/// A proxy in front of `node` serving `counter` at `counter.test` and
+/// `hostile` at `hostile.test`, with `clients` its client limits.
+async fn gated(test: &str, clients: nanovm::config::ClientLimits) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+    let (sup, node) = supervised(test).await;
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    for (host, name) in [("counter.test", "counter"), ("hostile.test", "hostile")] {
+        let app = publish(&format!("{test}-{name}"), &app(name)).await;
+        records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", app.split_once('@').unwrap().0)]);
+    }
+    let cfg = nanovm::config::ProxyConfig {
+        nodes: vec![node.to_string()], resolver: doh(records).await, dev: true, listen: "127.0.0.1:0".into(), clients,
+        // The operator serves both hosts and lets the dev identity deploy.
+        hosts: vec!["counter.test".into(), "hostile.test".into()], signers: vec!["dev dev".into()],
+        ..Default::default()
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
+    (sup, addr)
+}
+
+/// `GET /a/` on `host` with `extra` headers: the status line and headers,
+/// lowercased.
+async fn head_of(addr: std::net::SocketAddr, host: &str, extra: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(format!("GET /a/ HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out).await;
+    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
+    text.split_once("\r\n\r\n").map_or(text.clone(), |(h, _)| h.to_owned())
+}
+
+/// `n` requests at once to `host`, the `i`th with `extra(i)` headers: how
+/// many were answered 200, and how many 429 with a retry-after.
+async fn at_once(addr: std::net::SocketAddr, host: &str, n: usize, extra: impl Fn(usize) -> String) -> (usize, usize) {
+    let heads = futures::future::join_all((0..n).map(|i| {
+        let extra = extra(i);
+        async move { head_of(addr, host, &extra).await }
+    }));
+    let heads = heads.await;
+    let refused = |h: &String| h.starts_with("http/1.1 429") && h.contains("retry-after: ") && h.contains("x-nanovm-error: rate-limited");
+    (heads.iter().filter(|h| h.starts_with("http/1.1 200")).count(), heads.iter().filter(|h| refused(h)).count())
+}
+
+/// A client past its rate (here 1 a second, 2 at once) is answered 429
+/// with a retry-after, by the proxy and by a node it reaches directly. What
+/// it says in X-Forwarded-For is heard only from a trusted peer, and then
+/// only right of what the client wrote itself, so it can't spread its
+/// requests over addresses it makes up, nor spend another client's.
+#[tokio::test(flavor = "multi_thread")]
+async fn clients_past_their_rate_are_refused_however_they_forward() {
+    use nanovm::config::ClientLimits;
+    // 127.0.0.1 is a client like any other.
+    let untrusted = ClientLimits { rate: 1, trusted: vec!["192.0.2.1".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("rate_untrusted", untrusted).await;
+    let (ok, refused) = at_once(proxy, "counter.test", 10, |i| format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
+    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
+    // Behind a trusted terminator, each client has its own rate.
+    let trusted = ClientLimits { rate: 1, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("rate_trusted", trusted).await;
+    let from = |client: &str| format!("X-Forwarded-For: {client}\r\n");
+    // The terminator's own requests aren't limited (and start the app).
+    let (ok, _) = at_once(proxy, "counter.test", 10, |_| String::new()).await;
+    assert_eq!(ok, 10);
+    let (ok, refused) = at_once(proxy, "counter.test", 10, |_| from("198.51.100.1")).await;
+    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
+    // Whatever it writes before its own address.
+    let forged = ["203.0.113.66, 198.51.100.1", "198.51.100.2, 198.51.100.1", "127.0.0.1, 198.51.100.1", "junk, 198.51.100.1"];
+    assert_eq!(at_once(proxy, "counter.test", forged.len(), |i| from(forged[i])).await, (0, forged.len()));
+    assert_eq!(at_once(proxy, "counter.test", 1, |_| from("198.51.100.2")).await, (1, 0));
+    // A node reached directly limits its clients too.
+    let mut cfg = node_cfg("rate_node", 8);
+    cfg.clients = ClientLimits { rate: 1, trusted: vec![], ..ClientLimits::default() };
+    let (_sup, node) = supervised_with(cfg).await;
+    let counter = publish("rate-node", &app("counter")).await;
+    let statuses: Vec<_> = futures::future::join_all((0..10).map(|_| app_get(node, &counter, "/a/"))).await.into_iter().map(|r| r.0).collect();
+    assert!(statuses.iter().filter(|s| **s == 429).count() >= 7, "{statuses:?}");
+}
+
+/// Past an app's rate (here 1 a second, 2 at once), its requests are
+/// refused whichever client sends them; another app's are not.
+#[tokio::test(flavor = "multi_thread")]
+async fn apps_past_their_rate_are_refused() {
+    use nanovm::config::ClientLimits;
+    let limits = ClientLimits { rate: 0, app_rate: 1, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("app_rate", limits).await;
+    let (ok, refused) = at_once(proxy, "counter.test", 10, |i| format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
+    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
+    assert_eq!(at_once(proxy, "hostile.test", 1, |_| "X-Forwarded-For: 198.51.100.1\r\n".into()).await, (1, 0));
+}
+
+/// A client gets `connections_per_client` connections, past which one is
+/// answered 503 with a retry-after and closed; past `connections` in all, a
+/// new one waits until another closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn connections_are_capped_per_client_and_in_all() {
+    use nanovm::config::ClientLimits;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let request = b"GET /a/ HTTP/1.1\r\nHost: counter.test\r\nConnection: close\r\n\r\n";
+    let answer = async |s: &mut tokio::net::TcpStream| {
+        s.write_all(request).await.unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+        String::from_utf8_lossy(&out).to_ascii_lowercase()
+    };
+    let limits = ClientLimits { connections_per_client: 2, trusted: vec![], ..ClientLimits::default() };
+    let (_sup, proxy) = gated("connections_per_client", limits).await;
+    let connect = || tokio::net::TcpStream::connect(proxy);
+    let (a, mut b) = (connect().await.unwrap(), connect().await.unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let refused = answer(&mut connect().await.unwrap()).await;
+    assert!(refused.starts_with("http/1.1 503") && refused.contains("retry-after: 1") && refused.contains("too-many-connections"), "{refused}");
+    assert!(answer(&mut b).await.starts_with("http/1.1 200"));
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(answer(&mut connect().await.unwrap()).await.starts_with("http/1.1 200"));
+
+    let limits = ClientLimits { connections: 2, connections_per_client: 0, ..ClientLimits::default() };
+    let (_sup, proxy) = gated("connections_in_all", limits).await;
+    let connect = || tokio::net::TcpStream::connect(proxy);
+    let (a, _b) = (connect().await.unwrap(), connect().await.unwrap());
+    let mut third = connect().await.unwrap();
+    let waiting = tokio::spawn(async move { answer(&mut third).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!waiting.is_finished(), "served past the cap");
+    drop(a);
+    let served = tokio::time::timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap();
+    assert!(served.starts_with("http/1.1 200"), "{served}");
 }
 
 /// The proxy serves each host the app its `_nanovm` record names, at the
@@ -3673,7 +4763,7 @@ async fn the_proxy_routes_hosts_by_dns() {
     let record = |host: &str, txt: &[&str]| {
         records.lock().insert(format!("_nanovm.{host}"), txt.iter().map(|t| t.to_string()).collect());
     };
-    record("counter.test", &[&format!("app={tagged}; trust=dev dev")]);
+    record("counter.test", &[&format!("app={tagged}; trust=dev dev; alias=www.counter.test")]);
     let at = |host: &str, app: &str| nanovm::registry::app_name(host, &app.parse().unwrap());
     let get = async |host: &str, path: &str, extra: &str| {
         raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n"), b"").await
@@ -3700,10 +4790,20 @@ async fn the_proxy_routes_hosts_by_dns() {
     record("other.test", &[&format!("app={tagged}; trust=dev dev")]);
     let (status, body) = get("other.test", "/a/", "").await;
     assert!(status == 200 && body.contains(&at("other.test", &counter)), "{body}");
-    // An alias (its record a CNAME of counter.test's) is counter.test's app.
+    // An alias (its record a CNAME of counter.test's, which lists it) is
+    // counter.test's app; a name counter.test's record doesn't list serves
+    // nothing, nor does a host the proxy doesn't serve, or a record trusting
+    // only identities the proxy doesn't let deploy.
     record("www.counter.test", &["CNAME _nanovm.counter.test"]);
     let (status, body) = get("WWW.counter.test", "/a/", "").await;
     assert!(status == 200 && body.contains(&at("counter.test", &counter)), "{body}");
+    record("evil.test", &["CNAME _nanovm.counter.test"]);
+    record("counter.example", &[&format!("app={tagged}; trust=dev dev")]);
+    record("unsigned.test", &[&format!("app={tagged}; trust=other signer")]);
+    for (host, why) in [("evil.test", "doesn't list it"), ("counter.example", "doesn't serve"), ("unsigned.test", "trusts no identity")] {
+        let (status, body) = get(host, "/a/", "").await;
+        assert!(status == 403 && body.contains(why), "{host}: {status} {body}");
+    }
 
     // No record is no app; a bad record, or two, is the proxy's error.
     assert_eq!(get("nowhere.test", "/a/", "").await.0, 404);
@@ -4045,7 +5145,8 @@ async fn the_proxy_outlasts_idle_and_excess_connections() {
     let start = |name: &str| {
         let addr = port();
         let cfg = dir.join(format!("{name}.toml"));
-        let toml = format!("listen = \"{addr}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\n");
+        // Its own private port too: the default, 8444, may be another's.
+        let toml = format!("listen = \"{addr}\"\npublish_listen = \"{}\"\nresolver = \"http://127.0.0.1:1/dns-query\"\nhosts = [\"x\"]\n", port());
         std::fs::write(&cfg, toml).unwrap();
         let cmd = format!("ulimit -n 64 && exec {} proxy --config {}", env!("CARGO_BIN_EXE_nanovm"), cfg.display());
         let child = tokio::process::Command::new("sh").args(["-c", &cmd]).kill_on_drop(true).spawn().unwrap();
@@ -4233,7 +5334,7 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     records.lock().insert("_nanovm.good.test".into(), vec![format!("app={}:latest; trust=dev dev", counter.split_once('@').unwrap().0)]);
     let cfg = nanovm::config::ProxyConfig {
         nodes: vec![node.to_string()], resolver: doh(records).await, telemetry_endpoint: endpoint,
-        listen: "127.0.0.1:0".into(), dev: true, ..Default::default()
+        listen: "127.0.0.1:0".into(), dev: true, hosts: vec!["*.test".into()], signers: vec!["dev dev".into()], ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = listener.local_addr().unwrap();
@@ -4556,7 +5657,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/begin");
         begin.add_permits(1);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/finish");
-        let after = objects.join(&id).join("after.txt");
+        let after = object_dir(&objects, &id).join("data/after.txt");
         assert!(after.exists(), "post-return work wrote");
         if fail {
             // A file the commit can't sync, as on a failing disk.
@@ -4583,7 +5684,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         if !fail {
             assert_eq!(captured_files(&objects, &id, 2)[Path::new("data/after.txt")], b"after");
         } else {
-            assert!(!objects.join(format!("~committed/{id}/{:020}.tar", 2)).exists());
+            assert!(!object_dir(&objects, &id).join(format!("committed/{:020}.tar", 2)).exists());
         }
         assert_eq!(captured_files(&objects, &id, 1), first, "later work changed a published version");
     }
@@ -4599,11 +5700,11 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
             let response = reopened.dispatch(id, http::Request::builder().uri("/callee").body(bytes::Bytes::new()).unwrap()).await;
             assert_eq!(response.status(), 200);
             response.into_body().collect().await.unwrap();
-            assert_eq!(std::fs::read(objects.join(id).join("before.txt")).unwrap(), b"before");
+            assert_eq!(std::fs::read(object_dir(&objects, id).join("data/before.txt")).unwrap(), b"before");
         }
-        assert_eq!(std::fs::read(objects.join("parent1/after.txt")).unwrap(), b"after");
-        assert!(!objects.join("parent2/after.txt").exists());
-        assert!(!objects.join("~committed/parent2/00000000000000000002.tar").exists(), "recovery published rejected post-return work");
+        assert_eq!(std::fs::read(object_dir(&objects, "parent1").join("data/after.txt")).unwrap(), b"after");
+        assert!(!object_dir(&objects, "parent2").join("data/after.txt").exists());
+        assert!(!object_dir(&objects, "parent2").join("committed/00000000000000000002.tar").exists(), "recovery published rejected post-return work");
         reopened.shutdown().await;
     }
     tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
@@ -4963,7 +6064,7 @@ mod nodes {
         records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={tagged}; trust=dev dev")]);
         let cfg = nanovm::config::ProxyConfig {
             nodes: nodes.to_vec(), resolver: doh(records).await, tag_ttl_s: 0, dev: true, listen: "127.0.0.1:0".into(),
-            failover_ms: 20_000, ..Default::default()
+            failover_ms: 20_000, hosts: vec![host.into()], signers: vec!["dev dev".into()], ..Default::default()
         };
         let proxy = nanovm::proxy::Proxy::new(cfg).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5152,6 +6253,50 @@ mod nodes {
         assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
     }
 
+    /// With leases, an object is restored on the node holding it: the restore
+    /// takes its lease and claims its head, going back to an older version as
+    /// the version after the head. The other node refuses to restore it while
+    /// it is held. The proxy then serves the restored object, and its history
+    /// goes on from the restore.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_object_is_restored_on_the_node_holding_it() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("restore_leased_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("restore_leased_b", &lb, private.local_addr().unwrap());
+        let shipped = PathBuf::from(cfg_a.capture.as_ref().unwrap().store.clone().unwrap());
+        let a = serve(cfg_a, la, store.clone()).await;
+        let b = serve(cfg_b, lb, store.clone()).await;
+        // A write waits for its version to count in the store (remote ack)
+        // in its post-return phase: hostile's 500 ms is short for a busy disk.
+        let mut hostile = app("hostile");
+        hostile.limits.post_return_timeout_ms = 5_000;
+        let published = publish("nodes-restore", &hostile).await;
+        let (proxy, app) = proxy(&names, private, "restore.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let head = || serde_json::from_slice::<nanovm::ship::Head>(&std::fs::read(shipped.join(&app).join(&object).join("head")).unwrap()).unwrap();
+        for v in ["one", "two", "three"] {
+            let written = get(proxy, "restore.test", &format!("/{object}/commit?v={v}")).await;
+            assert_eq!(written.0, 200, "{written:?}");
+        }
+        let before = head();
+        assert_eq!(before.node, names[0]);
+        let args = |a: &[&str]| a.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let e = b.command(&args(&["restore", &app, &object, "1"])).await.unwrap_err();
+        assert!(format!("{e:#}").contains(&format!("Held(\"{}\")", names[0])), "{e:#}");
+        let done = a.command(&args(&["restore", &app, &object, "1"])).await.unwrap();
+        assert_eq!((&done[0]["version"], &done[0]["head"]), (&1.into(), &(before.sequence + 1).into()), "{done}");
+        assert_eq!(head().sequence, before.sequence + 1, "shipped under the restore's lease");
+        assert_eq!(get(proxy, "restore.test", &format!("/{object}/commit")).await, (200, r#"{"file":"one","key":"one"}"#.into()));
+        let written = get(proxy, "restore.test", &format!("/{object}/commit?v=four")).await;
+        assert_eq!(written.0, 200, "{written:?}");
+        let after = head();
+        assert_eq!((after.sequence, after.node.as_str()), (before.sequence + 2, names[0].as_str()));
+        assert!(after.lease > before.lease, "taken again after the restore: {after:?}");
+    }
+
     /// Node A answers a request and works on after answering; meanwhile it
     /// is cut off from the lease store. Its lease runs out, so it refuses the
     /// object's requests, and node B takes the lease and serves them. A's
@@ -5218,7 +6363,7 @@ mod nodes {
             }
         }
         assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
-        assert!(objects_a.join(&app).join(&object).join("before.txt").exists(), "A committed what it wrote before answering");
+        assert!(object_dir(&objects_a.join(&app), &object).join("data/before.txt").exists(), "A committed what it wrote before answering");
 
         // A's work after answering calls another object (through the proxy,
         // to B, since A can take no lease) and writes; its commit is refused.
@@ -5239,8 +6384,8 @@ mod nodes {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert!(refused["detail"].as_str().unwrap().contains("no longer holds the object's lease"), "{refused}");
-        assert!(objects_a.join(&app).join(&object).join("after.txt").exists(), "A wrote after answering");
-        assert!(objects_a.join(&app).join("~journal").join(&object).join("log").exists(), "the write is uncommitted");
+        assert!(object_dir(&objects_a.join(&app), &object).join("data/after.txt").exists(), "A wrote after answering");
+        assert!(object_dir(&objects_a.join(&app), &object).join("journal/log").exists(), "the write is uncommitted");
     }
 
     /// A guest answering as a node that doesn't hold its object (421, naming
@@ -5374,7 +6519,7 @@ mod nodes {
 
         let r = call(&x, &format!("http://nanovm/objects/{y}/commit?v=via-x")).await;
         assert_eq!((r["status"].as_u64(), r["body"].as_str()), (Some(200), Some(r#"{"file":"via-x","key":"via-x"}"#)), "{r}");
-        assert_eq!(std::fs::read_to_string(objects_b.join(&app).join(&y).join("c.txt")).unwrap(), "via-x");
+        assert_eq!(std::fs::read_to_string(object_dir(&objects_b.join(&app), &y).join("data/c.txt")).unwrap(), "via-x");
         assert_eq!(holder(&store, &app, &y).await.0, names[1]);
 
         let t0 = Instant::now();
