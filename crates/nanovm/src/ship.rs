@@ -801,6 +801,41 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// A claim that must drop a node's copy (another node claimed the object
+    /// since, and this copy has a version the head never named) is cut short
+    /// by a crash: the volume is gone, and removing the versions got as far
+    /// as the later one (`remove_dir_all` goes in directory order, here the
+    /// newest first). The next claim must still restore the head's state,
+    /// never serve the object with no volume.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_a_discard_cut_short_is_not_taken_for_a_current_copy() {
+        let base = tempdir("cut-short");
+        let store = Objects(Arc::new(object_store::memory::InMemory::new()));
+        let objects = base.join("a");
+        let dir = objects.join("~committed/o");
+        let text = || std::fs::read_to_string(objects.join("o/v")).map_err(|e| e.to_string());
+        // A shipped version 1, committed 2 (unshipped), then B took the
+        // object over at epoch 2 and claimed its head.
+        let one = version(&dir, 1, 1, "", "one");
+        store.put(&version_key("app", "o", 1, &one), std::fs::read(dir.join(format!("{:020}.tar", 1))).unwrap()).await.unwrap();
+        let head = Head { sequence: 1, digest: one.clone(), node: "b".into(), lease: 2 };
+        store.swap(&head_key("app", "o"), serde_json::to_vec(&head).unwrap(), None).await.unwrap().unwrap();
+        version(&dir, 2, 1, &one, "two");
+        mark(&marker(&dir), 1).unwrap();
+        std::fs::create_dir_all(objects.join("o")).unwrap();
+        std::fs::write(objects.join("o/v"), "two").unwrap();
+        // The order discard removes things in, as `remove_dir_all` here does.
+        let order: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(order[0], format!("{:020}.tar", 2)[..], "this filesystem lists the newest first");
+        // A's claim at epoch 3 is cut short: the volume went, then version 2.
+        std::fs::remove_dir_all(objects.join("o")).unwrap();
+        std::fs::remove_file(dir.join(format!("{:020}.tar", 2))).unwrap();
+        // A claims again, at epoch 4.
+        claim(&store, "a", 4, "app", "o", &objects).await.unwrap();
+        assert_eq!(text(), Ok("one".into()), "A serves the object with no volume, its versions say version 1");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// A node ships an object's versions only under its live lease on the
     /// object, at the epoch it claimed the head with: not with no lease, nor
     /// a released, lapsed, or since-replaced one, though the lease record may
