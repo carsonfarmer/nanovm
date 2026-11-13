@@ -422,7 +422,8 @@ impl Supervisor {
         let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
         let file = self.cfg.secrets.as_ref().map(|dir| secrets_file(dir, &w.name));
         let stamp = file.as_deref().and_then(crate::secrets::stamp);
-        let secrets = crate::secrets::load(file.as_deref(), &p.spec.secrets).context("the app's secrets, from the node's secrets directory")?;
+        let from = if file.is_some() { "from the node's secrets directory" } else { "the node has no secrets directory" };
+        let secrets = crate::secrets::load(file.as_deref(), &p.spec.secrets).with_context(|| format!("the app's secrets, {from}"))?;
         let app = AppConfig {
             name: w.name.clone(),
             digest: want.digest.clone(),

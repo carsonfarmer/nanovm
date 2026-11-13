@@ -412,8 +412,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Loading resolves a relative data directory against the config file's
-    /// directory, and validates.
+    /// Loading resolves a relative data or secrets directory against the
+    /// config file's directory, and validates.
     #[test]
     fn load_resolves_relative_paths_and_validates() {
         let dir = std::env::temp_dir().join(format!("nanovm-config-test-{}", std::process::id()));
@@ -425,6 +425,8 @@ mod tests {
         assert_eq!(cfg.app_dirs("a")[1], dir.join("nanovm-data/tmp/a"));
         std::fs::write(&path, "data_dir = \"/abs\"").unwrap();
         assert_eq!(NodeConfig::load(&path).unwrap().data_dir, Path::new("/abs"));
+        std::fs::write(&path, "secrets = \"s\"").unwrap();
+        assert_eq!(NodeConfig::load(&path).unwrap().secrets, Some(dir.join("s")));
 
         std::fs::write(&path, "dev = true\nlisten = \"0.0.0.0:1\"").unwrap();
         assert!(NodeConfig::load(&path).is_err(), "validated");
