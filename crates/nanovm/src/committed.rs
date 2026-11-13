@@ -4,7 +4,8 @@
 //! The app's existing storage lock owns this tree; no distributed fence is
 //! implied.
 //!
-//! `~committed/<object>/<sequence>.tar` is a published version. One being
+//! `committed/<sequence>.tar`, in the object's directory, is a published
+//! version. One being
 //! staged is `<sequence>.<decision>.staged` beside them, where `<decision>`
 //! names the journal key its commit replaces: recovery discards it while
 //! that is still the journal's key, and publishes it once it isn't.
@@ -71,9 +72,9 @@ fn invalid(message: &str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message)
 }
 
-pub(super) fn directory(base: &Path, journal: &Path) -> PathBuf {
-    base.join("~committed")
-        .join(journal.file_name().expect("journal has an object name"))
+/// Where the versions of the object whose directory is `base` are.
+pub fn directory(base: &Path) -> PathBuf {
+    base.join("committed")
 }
 
 fn filename(sequence: u64) -> String {
@@ -189,7 +190,7 @@ pub(super) fn prepare(
     if !out.try_exists()? {
         fs::create_dir_all(out)?;
         // Persist the archive directory's name before a commit can depend on it.
-        for dir in [out, out.parent().expect("inside ~committed"), volume.parent().expect("inside app")] {
+        for dir in [out, out.parent().expect("in the object's directory")] {
             sync(dir)?;
         }
     }

@@ -33,6 +33,12 @@ config! {
         capture: Option<CaptureConfig> = None::<CaptureConfig>,
         /// Upper bound on objects with a live instance; sizes the pooling allocator.
         max_live_objects: usize = 1000usize,
+        /// The most objects one app may have on this node: an object counts
+        /// from its first committed change until its volume is empty again
+        /// (or an operator deletes it). A new one past it is refused (507
+        /// `object-limit`), as is one when the disk has less free than its
+        /// quota (507 `disk-full`).
+        max_objects_per_app: u64 = 10_000u64,
         /// The proxy's private endpoint: committed publishes go to its
         /// `/publish`, and with `leases`, calls to other objects to its
         /// `/objects/…`, which places them.

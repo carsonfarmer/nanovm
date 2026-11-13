@@ -110,9 +110,15 @@ async fn settle(node: &Arc<Node>) {
 
 // ---- persistence and isolation ----------------------------------------
 
+/// Object `id`'s directory under `objects` (an app's): its volume, `data`,
+/// its `journal` and its `committed` versions.
+fn object_dir(objects: &Path, id: &str) -> PathBuf {
+    nanovm::app::object_dir(objects, id)
+}
+
 fn captured_files(objects: &Path, id: &str, sequence: u64) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     use std::io::Read;
-    let file = std::fs::File::open(objects.join(format!("~committed/{id}/{sequence:020}.tar"))).unwrap();
+    let file = std::fs::File::open(object_dir(objects, id).join(format!("committed/{sequence:020}.tar"))).unwrap();
     tar::Archive::new(file).entries().unwrap().map(|entry| {
         let mut entry = entry.unwrap();
         let path = entry.path().unwrap().into_owned();
@@ -150,7 +156,7 @@ async fn shipped_versions_restore_an_object_on_a_fresh_root() {
         assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
     }
     eventually("versions shipped", || shipped(3)).await;
-    let local = cfg.app_dirs("counter")[0].join("~committed/o");
+    let local = object_dir(&cfg.app_dirs("counter")[0], "o").join("committed");
     eventually("shipped versions removed", || std::fs::read_dir(&local).unwrap().count() == 1).await;
     node.shutdown().await;
     drop(node);
@@ -201,7 +207,7 @@ async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() 
             let r = request(&node, "POST", "o", "/incr", "").await;
             assert_eq!(r.error.as_deref(), Some("commit-failed"), "a full outbox refuses: {}", r.body);
             assert_eq!(get(&node, "o", "/").await.json()["count"], 3);
-            let local = cfg.app_dirs("counter")[0].join("~committed/o");
+            let local = object_dir(&cfg.app_dirs("counter")[0], "o").join("committed");
             assert_eq!(std::fs::read_dir(local).unwrap().count(), 3, "every unshipped version kept");
         }
         node.shutdown().await;
@@ -303,6 +309,124 @@ async fn objects_that_change_nothing_leave_nothing() {
     // The pool holds at most one empty directory per instance that was live at once.
     let pool = std::fs::read_dir(objects.join("~new")).map_or(0, |d| d.count());
     assert!(pool <= 321, "{pool}");
+}
+
+/// The ids of the objects with a directory under `objects` (an app's).
+fn objects_in(objects: &Path) -> Vec<String> {
+    let shards = std::fs::read_dir(objects).unwrap().flatten().filter(|s| s.file_name().len() == 2);
+    let mut ids: Vec<_> = shards.flat_map(|s| std::fs::read_dir(s.path()).unwrap().flatten())
+        .map(|o| o.file_name().to_string_lossy().into_owned()).collect();
+    ids.sort();
+    ids
+}
+
+/// A new object whose first request fails leaves nothing, nor does one
+/// that empties its volume, once its instance ends; and only empty volumes
+/// go.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_and_emptied_objects_leave_nothing() {
+    let node = node("failed_and_emptied_objects_leave_nothing", "hostile", 8);
+    let objects = node.cfg.app_dirs("hostile")[0].clone();
+    // Writes a file and a key, then fails: rolled back when the instance ends.
+    for then in ["panic", "fail", "error"] {
+        let r = get(&node, &format!("failed-{then}"), &format!("/commit?v=x&then={then}")).await;
+        assert!(r.status >= 500, "{then}: {}", r.status);
+    }
+    // A request that fails at 507 (`fail`) commits: it answered.
+    eventually("failed instances to end", || objects_in(&objects) == ["failed-fail"]).await;
+    assert_eq!(get(&node, "failed-panic", "/commit").await.json()["file"], "", "rolled back");
+    assert_eq!(objects_in(&objects), ["failed-fail"], "only the one that answered kept its change");
+    // An object that empties its volume goes when its instance ends.
+    assert_eq!(get(&node, "emptied", "/files?mount=data&n=2").await.status, 200);
+    assert_eq!(get(&node, "kept", "/files?mount=data&n=2").await.status, 200);
+    assert_eq!(get(&node, "emptied", "/clean?mount=data&n=2").await.json()["removed"], 2);
+    assert_eq!(get(&node, "kept", "/clean?mount=data&n=1").await.json()["removed"], 1);
+    assert!(objects_in(&objects).contains(&"emptied".to_string()), "while its instance lives");
+    node.shutdown().await;
+    assert_eq!(objects_in(&objects), ["failed-fail", "kept"]);
+}
+
+/// An app has at most `max_objects_per_app` objects, however many clients
+/// make new ones at once; reads of unknown objects are refused once it has
+/// them (507 `object-limit`), existing objects are served, and an object
+/// that goes makes room. Counted again when the app starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_has_at_most_its_objects() {
+    let mut cfg = node_cfg("an_app_has_at_most_its_objects", 64);
+    cfg.max_objects_per_app = 5;
+    let node = node_with(cfg.clone(), app("hostile"));
+    let objects = node.cfg.app_dirs("hostile")[0].clone();
+    let made = futures::future::join_all((0..40).map(|n| {
+        let node = node.clone();
+        async move { get(&node, &format!("o{n}"), "/files?mount=data&n=1").await.status }
+    }))
+    .await;
+    assert_eq!(made.iter().filter(|s| **s == 200).count(), 5, "{made:?}");
+    assert!(made.iter().all(|s| [200, 507].contains(s)), "{made:?}");
+    let kept = objects_in(&objects);
+    assert_eq!(kept.len(), 5, "{kept:?}");
+    let r = get(&node, "another", "/").await;
+    assert_eq!((r.status, r.error.as_deref()), (507, Some("object-limit")), "{}", r.body);
+    assert!(r.body.contains("max_objects_per_app"), "{}", r.body);
+    assert_eq!(get(&node, &kept[0], "/").await.status, 200, "existing objects are served");
+    assert_eq!(objects_in(&objects), kept, "a refusal makes nothing");
+    // One empties itself and its instance ends: there is room again.
+    assert_eq!(get(&node, &kept[0], "/clean?mount=data&n=1").await.status, 200);
+    assert_eq!(get(&node, &kept[0], "/panic").await.status, 500);
+    eventually("the emptied object to go", || objects_in(&objects).len() == 4).await;
+    assert_eq!(get(&node, "another", "/files?mount=data&n=1").await.status, 200);
+    let r = get(&node, "one-more", "/files?mount=data&n=1").await;
+    assert_eq!((r.status, r.error.as_deref()), (507, Some("object-limit")));
+    node.shutdown().await;
+    drop(node);
+    // A node started on the same data counts them again.
+    let node = node_with(cfg, app("hostile"));
+    let r = get(&node, "one-more", "/").await;
+    assert_eq!((r.status, r.error.as_deref()), (507, Some("object-limit")));
+    assert_eq!(objects_in(&objects).len(), 5);
+}
+
+/// The audit's full disk: on a small filesystem, new objects are refused
+/// (507 `disk-full`) once it has less free than a new object's quota, and
+/// nothing is made for them; objects that exist are still served. Root
+/// only: it mounts a tmpfs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_disk_makes_no_new_objects() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipped: mounting a tmpfs needs root");
+        return;
+    }
+    let mut cfg = node_cfg("a_full_disk_makes_no_new_objects", 64);
+    let mnt = cfg.data_dir.join("small");
+    std::fs::create_dir(&mnt).unwrap();
+    let mounted = std::process::Command::new("mount").args(["-t", "tmpfs", "-o", "size=4m", "tmpfs"]).arg(&mnt).status().unwrap();
+    assert!(mounted.success());
+    let _unmount = scopeguard::guard(mnt.clone(), |m| _ = std::process::Command::new("umount").arg("-l").arg(m).status());
+    std::os::unix::fs::symlink(cfg.data_dir.join("cache"), mnt.join("cache")).unwrap();
+    cfg.data_dir = mnt;
+    let node = node_with(cfg, app("counter"));
+    let objects = node.cfg.app_dirs("counter")[0].clone();
+    let mut refused = None;
+    for n in 0..2000 {
+        let r = request(&node, "POST", &format!("o{n}"), "/incr", "").await;
+        if r.status != 200 {
+            refused = Some((n, r));
+            break;
+        }
+    }
+    let (n, r) = refused.expect("the disk filled");
+    assert_eq!((r.status, r.error.as_deref()), (507, Some("disk-full")), "{}", r.body);
+    let made = objects_in(&objects);
+    assert_eq!(made.len(), n, "every object before the refusal, none after");
+    for m in n..n + 100 {
+        let r = request(&node, "POST", &format!("o{m}"), "/incr", "").await;
+        assert_eq!(r.error.as_deref(), Some("disk-full"), "{}", r.body);
+        assert_eq!(get(&node, &format!("r{m}"), "/").await.error.as_deref(), Some("disk-full"));
+    }
+    assert_eq!(objects_in(&objects), made, "nothing made while the disk is full");
+    let r = get(&node, "o0", "/").await;
+    assert_eq!((r.status, r.json()["count"].as_u64()), (200, Some(1)), "existing objects are served");
+    node.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -439,7 +563,7 @@ async fn cpu_kill_does_not_poison_next_instance() {
 async fn start_up_is_charged_guest_cpu_not_host_work() {
     let mut cfg = node_cfg("start_up_is_charged_guest_cpu", 8);
     cfg.epoch_tick_ms = 1;
-    let vol = cfg.data_dir.join("objects/hostile/s");
+    let vol = object_dir(&cfg.data_dir.join("objects/hostile"), "s").join("data");
     std::fs::create_dir_all(&vol).unwrap();
     for i in 0..20_000 {
         std::fs::write(vol.join(format!("f{i}")), b"").unwrap();
@@ -783,7 +907,7 @@ async fn data_quota_survives_restart() {
     let r = get(&node, "d", "/fill?mount=data&mb=1&name=c").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(r.json()["error"], "insufficient-space");
-    let vol = node.cfg.data_dir.join("objects/hostile/d");
+    let vol = object_dir(&node.cfg.data_dir.join("objects/hostile"), "d").join("data");
     assert_eq!(std::fs::metadata(vol.join("a")).unwrap().len(), 4 << 20);
     assert!(node.metrics.fs_denied.load(Relaxed) >= 1);
 }
@@ -803,7 +927,7 @@ async fn renames_between_mounts_are_cross_device() {
     let node = node("renames_between_mounts_are_cross_device", "hostile", 8);
     let r = get(&node, "r", "/cross-rename").await;
     assert_eq!(r.json()["error"], "cross-device", "{}", r.body);
-    assert!(!node.cfg.data_dir.join("objects/hostile/r/x.txt").exists());
+    assert!(!object_dir(&node.cfg.data_dir.join("objects/hostile"), "r").join("data/x.txt").exists());
 }
 
 // ---- egress -----------------------------------------------------------
@@ -2061,7 +2185,7 @@ async fn kv_values_persist_in_the_volume() {
 
     node.shutdown().await;
     assert_eq!(get(&node, "k", "/kv/greeting").await.body, "hello", "a new instance sees it");
-    let file = node.cfg.data_dir.join("objects/counter/k/.kv/default/Z3JlZXRpbmc");
+    let file = object_dir(&node.cfg.data_dir.join("objects/counter"), "k").join("data/.kv/default/Z3JlZXRpbmc");
     assert_eq!(std::fs::read(file).unwrap(), b"hello");
 
     assert_eq!(request(&node, "DELETE", "k", "/kv/greeting", "").await.status, 204);
@@ -2139,7 +2263,7 @@ async fn kv_works_in_a_jailed_worker() {
     assert!(body.contains(r#""set":true"#), "{body}");
     let (_, body) = app_get(addr, &hostile, "/p/kv?op=plant").await;
     assert!(body.contains("IsDirectory"), "{body}");
-    let bucket = std::fs::read_dir(node_dir("kv_works_in_a_jailed_worker").join("objects").join(worker(&hostile)).join("p/.kv/default")).unwrap();
+    let bucket = std::fs::read_dir(object_dir(&node_dir("kv_works_in_a_jailed_worker").join("objects").join(worker(&hostile)), "p").join("data/.kv/default")).unwrap();
     let mut names: Vec<_> = bucket.flatten().map(|e| e.file_name()).collect();
     names.sort();
     assert_eq!(names, ["aw", "azA"], "only the seed and planted directory are there");
@@ -2163,7 +2287,7 @@ async fn kv_values_are_bounded() {
     assert_eq!(get(&node, "m", "/kv?op=get").await.json()["bytes"], 1 << 20, "failed write keeps old value");
 
     node.shutdown().await;
-    let file = node.cfg.data_dir.join("objects/hostile/m/.kv/default/azA");
+    let file = object_dir(&node.cfg.data_dir.join("objects/hostile"), "m").join("data/.kv/default/azA");
     std::fs::write(file, vec![7u8; (1 << 20) + 1]).unwrap();
     let r = get(&node, "m", "/kv?op=get").await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -2241,7 +2365,7 @@ async fn sqlite_composed_provider() {
             let parked = base.join("parked.db");
             std::fs::rename(&db, &parked).unwrap();
             std::fs::create_dir(&db).unwrap();
-            let log = base.join("~journal/a/log");
+            let log = object_dir(&base, "a").join("journal/log");
             for _ in 0..2 {
                 let blocked = get(&node, "a", "/").await;
                 assert!(blocked.status >= 500, "{}", blocked.body);
@@ -2309,11 +2433,11 @@ async fn sqlite_captures_recover_without_the_original_node() {
     assert_eq!(get(&node, "a", "/?v=rejected&then=trap").await.status, 500);
     assert_eq!(get(&node, "a", "/?v=second").await.json(), expected(&["first", "second"], "second", false));
     settle(&node).await;
-    let source = cfg.app_dirs(&app.name)[0].join("~committed/a");
+    let source = object_dir(&cfg.app_dirs(&app.name)[0], "a").join("committed");
     let mut fresh = node_cfg("sqlite_capture_recovered", 2);
     fresh.capture = cfg.capture.clone();
     let objects = fresh.app_dirs(&app.name)[0].clone();
-    let received = objects.join("~committed/a");
+    let received = object_dir(&objects, "a").join("committed");
     std::fs::create_dir_all(&received).unwrap();
     let mut versions: Vec<_> = std::fs::read_dir(&source).unwrap().map(|e| e.unwrap().path()).collect();
     versions.sort();
@@ -2346,7 +2470,7 @@ async fn sqlite_captures_recover_without_the_original_node() {
     node.shutdown().await;
     drop(node);
     std::fs::remove_dir_all(&cfg.data_dir).unwrap();
-    assert_eq!(nanovm::committed::restore(&received, &objects.join("a")).unwrap(), 2);
+    assert_eq!(nanovm::committed::restore(&received, &object_dir(&objects, "a").join("data")).unwrap(), 2);
     let node = Node::new(fresh.clone(), &app, &wasm, None).unwrap();
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     assert_eq!(get(&node, "a", "/?v=continued").await.json(), expected(&["first", "second", "continued"], "continued", true));
@@ -2376,7 +2500,7 @@ async fn sqlite_composed_recovery_cuts() {
     assert_eq!(get(&node, "timeout", "/?v=before").await.status, 200);
     let timed_out = get(&node, "timeout", "/timeout?v=discard-timeout").await;
     assert_eq!(timed_out.error.as_deref(), Some("timeout"), "{}", timed_out.body);
-    let entered = node.cfg.app_dirs(&app.name)[0].join("timeout/sql-wait");
+    let entered = object_dir(&node.cfg.app_dirs(&app.name)[0], "timeout").join("data/sql-wait");
     assert_eq!(std::fs::read(&entered).unwrap(), b"entered", "must reach SQLite's blocking wait");
     let recovered = get(&node, "timeout", "/").await;
     assert_eq!(recovered.json(), serde_json::json!({"rows":["before"],"file":"before","key":"before","reused":false}));
@@ -2482,7 +2606,7 @@ async fn sqlite_over_the_existing_filesystem() {
         get(&node, "a", "/transaction").await.json(),
         expected(&["first", "second"], "second")
     );
-    let database = cfg.app_dirs(&app.name)[0].join("a/probe.db");
+    let database = object_dir(&cfg.app_dirs(&app.name)[0], "a").join("data/probe.db");
     let before = std::fs::metadata(&database).unwrap().len();
     let mut grown = expected(&["first", "second"], "second");
     grown["blob_bytes"] = 262144.into();
@@ -2540,8 +2664,8 @@ async fn sqlite_survives_a_jailed_worker_crash() {
             async move { app_get(addr, &image, "/a/?v=uncommitted&then=sleep").await }
         });
         // Both clients write markers after SQLite's INSERT completes, before response commit.
-        let marker = cfg.app_dirs(&name)[0].join("a/marker");
-        let key = cfg.app_dirs(&name)[0].join("a/.kv/default/bWFya2Vy");
+        let marker = object_dir(&cfg.app_dirs(&name)[0], "a").join("data/marker");
+        let key = object_dir(&cfg.app_dirs(&name)[0], "a").join("data/.kv/default/bWFya2Vy");
         eventually("SQLite, file and KV writes before SIGKILL", || {
             std::fs::read(&marker).is_ok_and(|v| v == b"uncommitted")
                 && std::fs::read(&key).is_ok_and(|v| v == b"uncommitted")
@@ -2633,14 +2757,14 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
     });
     let objects = cfg.app_dirs(&name)[0].clone();
     eventually("tentative SQL/file/KV changes before backup", || {
-        std::fs::read(objects.join("a/marker")).is_ok_and(|v| v == b"uncommitted")
-            && std::fs::read(objects.join("a/.kv/default/bWFya2Vy")).is_ok_and(|v| v == b"uncommitted")
+        std::fs::read(object_dir(&objects, "a").join("data/marker")).is_ok_and(|v| v == b"uncommitted")
+            && std::fs::read(object_dir(&objects, "a").join("data/.kv/default/bWFya2Vy")).is_ok_and(|v| v == b"uncommitted")
     }).await;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     let _ = pending.await;
     eventually("worker reaped", || !Path::new(&format!("/proc/{pid}")).exists()).await;
     source.kill().await.unwrap();
-    assert!(objects.join("~journal/a/log").exists(), "backup must include crash-left undo");
+    assert!(object_dir(&objects, "a").join("journal/log").exists(), "backup must include crash-left undo");
     let saved = backup();
     assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stderr));
     let snapshot = String::from_utf8(saved.stdout).unwrap();
@@ -2654,8 +2778,8 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
     assert!(!fresh.join("cache").exists());
     assert!(!fresh.join("tmp").exists());
     let restored_objects = fresh.join("objects").join(&name);
-    assert_eq!(std::fs::read(restored_objects.join("a/marker")).unwrap(), b"uncommitted");
-    assert!(restored_objects.join("~journal/a/log").exists());
+    assert_eq!(std::fs::read(object_dir(&restored_objects, "a").join("data/marker")).unwrap(), b"uncommitted");
+    assert!(object_dir(&restored_objects, "a").join("journal/log").exists());
     cfg.data_dir = fresh;
     let (mut destination, addr) = start(&cfg, &workspace.join("restored.toml")).await;
     let (status, body) = app_get(addr, &image, "/a/").await;
@@ -2832,7 +2956,7 @@ async fn sqlite_repeated_updates_remain_bounded() {
             if rollback {
                 assert_eq!(result.error.as_deref(), Some("guest-error"), "{}", result.body);
                 assert!(result.body.contains("after 1000 completed statements"), "{}", result.body);
-                let dir = node.cfg.app_dirs(&app.name)[0].join("~journal").join(&object);
+                let dir = object_dir(&node.cfg.app_dirs(&app.name)[0], &object).join("journal");
                 let log = std::fs::metadata(dir.join("log")).unwrap().len();
                 let retained: u64 = std::fs::read_dir(&dir).unwrap().map(|entry| {
                     let entry = entry.unwrap();
@@ -2876,7 +3000,7 @@ async fn sqlite_exclusive_wal_checkpoints() {
         let changed = get(&node, &control, &format!("{prefix}&op=mutate")).await;
         assert_eq!(changed.status, 200, "{}", changed.body);
         let expected = changed.json()["state"].clone();
-        let volume = node.cfg.app_dirs(&app.name)[0].join(&control);
+        let volume = object_dir(&node.cfg.app_dirs(&app.name)[0], &control).join("data");
         for db in ["pressure", "aux"] {
             assert!(std::fs::metadata(volume.join(format!("{db}.db-wal"))).unwrap().len() > 32);
             assert!(!volume.join(format!("{db}.db-shm")).exists());
@@ -2919,7 +3043,7 @@ async fn sqlite_exclusive_wal_checkpoints() {
     let failed = get(&node, "default-checkpoint", &format!("{prefix}&op=churn&n=1000")).await;
     assert_eq!(failed.error.as_deref(), Some("guest-error"), "{}", failed.body);
     assert!(node.metrics.fs_denied.load(Relaxed) > denials);
-    let wal = node.cfg.app_dirs(&app.name)[0].join("default-checkpoint/pressure.db-wal");
+    let wal = object_dir(&node.cfg.app_dirs(&app.name)[0], "default-checkpoint").join("data/pressure.db-wal");
     println!("default WAL autocheckpoint exhausts the 1 MiB volume: WAL {} bytes", std::fs::metadata(wal).unwrap().len());
     let recovered = get(&node, "default-checkpoint", prefix).await;
     assert_eq!(recovered.status, 200, "{}", recovered.body);
@@ -2966,7 +3090,7 @@ async fn benchmark_database_modes() {
                             bytes += body["sqlite_write_bytes"].as_u64().unwrap();
                             syncs += body["sqlite_syncs"].as_u64().unwrap();
                         }
-                        let volume = node.cfg.app_dirs(&app.name)[0].join(&object);
+                        let volume = object_dir(&node.cfg.app_dirs(&app.name)[0], &object).join("data");
                         let live: u64 = std::fs::read_dir(volume).unwrap()
                             .map(|e| e.unwrap().metadata().unwrap().len()).sum();
                         peak = peak.max(live);
@@ -3066,7 +3190,7 @@ async fn the_journal_is_out_of_reach_and_works_from_a_relative_data_dir() {
     let node = node_with(cfg, app("hostile"));
     let r = get(&node, "c", "/commit?v=one").await;
     assert_eq!(r.status, 200, "{}", r.body);
-    let r = get(&node, "c", "/rename?mount=data&from=../~journal/c&to=j").await;
+    let r = get(&node, "c", "/rename?mount=data&from=../journal&to=j").await;
     assert_eq!(r.status, 507, "{}", r.body);
     assert_eq!(get(&node, "c", "/commit?v=two&then=panic").await.status, 500);
     let r = get(&node, "c", "/commit").await;
@@ -4321,7 +4445,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/begin");
         begin.add_permits(1);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/finish");
-        let after = objects.join(&id).join("after.txt");
+        let after = object_dir(&objects, &id).join("data/after.txt");
         assert!(after.exists(), "post-return work wrote");
         if fail {
             // A file the commit can't sync, as on a failing disk.
@@ -4348,7 +4472,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         if !fail {
             assert_eq!(captured_files(&objects, &id, 2)[Path::new("data/after.txt")], b"after");
         } else {
-            assert!(!objects.join(format!("~committed/{id}/{:020}.tar", 2)).exists());
+            assert!(!object_dir(&objects, &id).join(format!("committed/{:020}.tar", 2)).exists());
         }
         assert_eq!(captured_files(&objects, &id, 1), first, "later work changed a published version");
     }
@@ -4364,11 +4488,11 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
             let response = reopened.dispatch(id, http::Request::builder().uri("/callee").body(bytes::Bytes::new()).unwrap()).await;
             assert_eq!(response.status(), 200);
             response.into_body().collect().await.unwrap();
-            assert_eq!(std::fs::read(objects.join(id).join("before.txt")).unwrap(), b"before");
+            assert_eq!(std::fs::read(object_dir(&objects, id).join("data/before.txt")).unwrap(), b"before");
         }
-        assert_eq!(std::fs::read(objects.join("parent1/after.txt")).unwrap(), b"after");
-        assert!(!objects.join("parent2/after.txt").exists());
-        assert!(!objects.join("~committed/parent2/00000000000000000002.tar").exists(), "recovery published rejected post-return work");
+        assert_eq!(std::fs::read(object_dir(&objects, "parent1").join("data/after.txt")).unwrap(), b"after");
+        assert!(!object_dir(&objects, "parent2").join("data/after.txt").exists());
+        assert!(!object_dir(&objects, "parent2").join("committed/00000000000000000002.tar").exists(), "recovery published rejected post-return work");
         reopened.shutdown().await;
     }
     tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
@@ -4909,7 +5033,7 @@ mod nodes {
             }
         }
         assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
-        assert!(objects_a.join(&app).join(&object).join("before.txt").exists(), "A committed what it wrote before answering");
+        assert!(object_dir(&objects_a.join(&app), &object).join("data/before.txt").exists(), "A committed what it wrote before answering");
 
         // A's work after answering calls another object (through the proxy,
         // to B, since A can take no lease) and writes; its commit is refused.
@@ -4930,8 +5054,8 @@ mod nodes {
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
         assert!(refused["detail"].as_str().unwrap().contains("no longer holds the object's lease"), "{refused}");
-        assert!(objects_a.join(&app).join(&object).join("after.txt").exists(), "A wrote after answering");
-        assert!(objects_a.join(&app).join("~journal").join(&object).join("log").exists(), "the write is uncommitted");
+        assert!(object_dir(&objects_a.join(&app), &object).join("data/after.txt").exists(), "A wrote after answering");
+        assert!(object_dir(&objects_a.join(&app), &object).join("journal/log").exists(), "the write is uncommitted");
     }
 
     /// A guest answering as a node that doesn't hold its object (421, naming
@@ -5065,7 +5189,7 @@ mod nodes {
 
         let r = call(&x, &format!("http://nanovm/objects/{y}/commit?v=via-x")).await;
         assert_eq!((r["status"].as_u64(), r["body"].as_str()), (Some(200), Some(r#"{"file":"via-x","key":"via-x"}"#)), "{r}");
-        assert_eq!(std::fs::read_to_string(objects_b.join(&app).join(&y).join("c.txt")).unwrap(), "via-x");
+        assert_eq!(std::fs::read_to_string(object_dir(&objects_b.join(&app), &y).join("data/c.txt")).unwrap(), "via-x");
         assert_eq!(holder(&store, &app, &y).await.0, names[1]);
 
         let t0 = Instant::now();

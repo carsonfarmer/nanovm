@@ -2,8 +2,10 @@
 //! cached compile), checks the component's imports against the capabilities
 //! the node offers, and pre-links it so instantiation is cheap.
 
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use anyhow::{Context, bail};
 use wasmtime::Engine;
@@ -38,9 +40,7 @@ pub struct App {
     pub egress: Route,
     /// Its `wasi:config` values, shared by every object of the app.
     pub config: Arc<WasiConfigVariables>,
-    /// Where its objects' volumes are, without symlinks: the journal
-    /// compares a volume's path with where its open files really are.
-    pub objects: PathBuf,
+    pub objects: Arc<Objects>,
     pub scratch: Arc<Scratch>,
     /// Advisory local exclusion, retained through every App owner's lifetime.
     _ownership: std::fs::File,
@@ -169,9 +169,192 @@ impl App {
             pre,
             egress,
             config: Arc::new(cfg.config.iter().collect()),
-            objects: objects.canonicalize()?,
+            objects: Arc::new(Objects::load(objects.canonicalize()?, node.max_objects_per_app, &cfg.limits)?),
             scratch: Scratch::new(tmp)?,
             _ownership: ownership,
         })
+    }
+}
+
+/// Where object `id`'s directory is under `objects` (an app's): in one of
+/// 256 shards, named by the first byte of the id's SHA-256, so no directory
+/// holds more than a share of an app's objects (N-35). In it, `data` is the
+/// volume (see `journal` for the rest).
+pub fn object_dir(objects: &Path, id: &str) -> PathBuf {
+    use sha2::Digest;
+    objects.join(format!("{:02x}", sha2::Sha256::digest(id)[0])).join(id)
+}
+
+/// A new object refused: to the guest, a full disk.
+fn refused(reason: &'static str, detail: String) -> std::io::Error {
+    std::io::Error::new(ErrorKind::QuotaExceeded, Refused(reason, detail))
+}
+
+/// Why a new object was refused: a response's error, and its detail.
+#[derive(Debug)]
+pub struct Refused(pub &'static str, pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// An app's objects on this node. An object has a directory only from its
+/// first change on (see `journal`); these are counted, up to the node's
+/// `max_objects_per_app`.
+pub struct Objects {
+    /// Where their directories are, without symlinks: the journal compares
+    /// a volume's path with where its open files really are.
+    pub dir: PathBuf,
+    /// Empty directories, each the volume of an object that has none, until
+    /// its first change moves it into the object's place.
+    pub pool: Arc<Scratch>,
+    count: AtomicU64,
+    max: u64,
+    /// The bytes and entries a new object may use: its quota.
+    need: (u64, u64),
+}
+
+impl Objects {
+    fn load(dir: PathBuf, max: u64, limits: &crate::config::Limits) -> std::io::Result<Objects> {
+        let mut count = 0;
+        for shard in std::fs::read_dir(&dir)? {
+            let shard = shard?;
+            if shard.file_name().len() == 2 {
+                count += std::fs::read_dir(shard.path())?.count() as u64;
+            }
+        }
+        let pool = Scratch::new(dir.join("~new"))?;
+        Ok(Objects { dir, pool, count: count.into(), max, need: (limits.disk_mb << 20, limits.max_files) })
+    }
+
+    /// Whether a new object may be made: refused while the app has its
+    /// most, or the disk has less free than the object's quota.
+    pub fn room(&self) -> std::io::Result<()> {
+        if self.count.load(Relaxed) >= self.max {
+            return Err(self.most());
+        }
+        let fs = rustix::fs::statvfs(&self.dir)?;
+        if fs.f_bavail * fs.f_frsize < self.need.0 || (fs.f_files > 0 && fs.f_favail < self.need.1) {
+            let (mb, files) = (self.need.0 >> 20, self.need.1);
+            return Err(refused("disk-full", format!("the disk has less free than a new object may use ({mb} MiB, {files} files)")));
+        }
+        Ok(())
+    }
+
+    /// Takes a place for a new object, if there is [`room`](Self::room).
+    pub fn admit(&self) -> std::io::Result<()> {
+        self.room()?;
+        let more = self.count.try_update(Relaxed, Relaxed, |n| (n < self.max).then_some(n + 1));
+        more.map(drop).map_err(|_| self.most())
+    }
+
+    /// An object's place, given back: it has no directory any more.
+    /// Saturating: a restore (`ship::claim`) may make an object it never
+    /// counted.
+    pub fn release(&self) {
+        self.count.update(Relaxed, Relaxed, |n| n.saturating_sub(1));
+    }
+
+    fn most(&self) -> std::io::Error {
+        refused("object-limit", format!("the app has its most objects, {} (max_objects_per_app)", self.max))
+    }
+
+    /// Removes `base`, an object's directory, if its volume is empty or
+    /// gone and it has no captured history (`committed`): an object that
+    /// never committed a change, or emptied its volume, leaves nothing.
+    pub fn settle(&self, base: &Path) -> std::io::Result<()> {
+        let empty = match std::fs::read_dir(base.join(crate::journal::VOLUME)) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) if e.kind() == ErrorKind::NotFound => true,
+            Err(e) => return Err(e),
+        };
+        if !empty || crate::committed::directory(base).try_exists()? {
+            return Ok(());
+        }
+        match std::fs::remove_dir_all(base) {
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            removed => removed.map(|()| self.release()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn objects(name: &str, max: u64, need: (u64, u64)) -> Objects {
+        let dir = std::env::temp_dir().join(format!("nanovm-objects-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let limits = crate::config::Limits { disk_mb: need.0, max_files: need.1, ..Default::default() };
+        Objects::load(dir, max, &limits).unwrap()
+    }
+
+    fn reason(e: std::io::Error) -> &'static str {
+        e.get_ref().and_then(|e| e.downcast_ref::<Refused>()).expect("refused").0
+    }
+
+    /// Objects are counted from their directories; a place is taken only
+    /// while there is room, however many threads ask at once; one given
+    /// back makes room again; and a disk with less free than a new object's
+    /// quota has none.
+    #[test]
+    fn room_for_objects() {
+        let o = objects("room", 0, (1, 1));
+        for id in ["a", "b", "c"] {
+            std::fs::create_dir_all(object_dir(&o.dir, id).join("data")).unwrap();
+        }
+        let dir = o.dir.clone();
+        let o = Objects::load(dir.clone(), 8, &crate::config::Limits { disk_mb: 1, max_files: 1, ..Default::default() }).unwrap();
+        assert_eq!(o.count.load(Relaxed), 3, "counted, but not the pool");
+        let admitted: usize = std::thread::scope(|s| {
+            let threads: Vec<_> = (0..16).map(|_| s.spawn(|| o.admit().is_ok() as usize)).collect();
+            threads.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        assert_eq!((admitted, o.count.load(Relaxed)), (5, 8));
+        assert_eq!(reason(o.room().unwrap_err()), "object-limit");
+        o.release();
+        o.room().unwrap();
+        let full = Objects { need: (u64::MAX, 1), ..o };
+        assert_eq!(reason(full.room().unwrap_err()), "disk-full");
+        assert_eq!(reason(full.admit().unwrap_err()), "disk-full");
+        assert_eq!(full.count.load(Relaxed), 7, "a refusal takes no place");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An object goes when its volume is empty or gone and it has no
+    /// captured history; any entry in its volume, or history, keeps it.
+    #[test]
+    fn only_empty_objects_go() {
+        let o = objects("settle", 10, (0, 0));
+        let base = |id| object_dir(&o.dir, id);
+        let made = |id, files: &[&str]| {
+            std::fs::create_dir_all(base(id).join("journal")).unwrap();
+            std::fs::write(base(id).join("journal/log"), "log").unwrap();
+            for f in files {
+                let path = base(id).join(f);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "x").unwrap();
+            }
+            o.count.fetch_add(1, Relaxed);
+        };
+        made("empty", &[]);
+        std::fs::create_dir(base("empty").join("data")).unwrap();
+        made("gone", &[]);
+        made("file", &["data/f"]);
+        made("dir", &[]);
+        std::fs::create_dir_all(base("dir").join("data/sub")).unwrap();
+        made("history", &["committed/00000000000000000001.tar"]);
+        for id in ["empty", "gone", "file", "dir", "history", "never"] {
+            o.settle(&base(id)).unwrap();
+        }
+        let left: Vec<_> = ["empty", "gone", "file", "dir", "history"].into_iter().filter(|id| base(id).exists()).collect();
+        assert_eq!(left, ["file", "dir", "history"]);
+        assert_eq!(o.count.load(Relaxed), 3);
+        std::fs::remove_dir_all(&o.dir).unwrap();
     }
 }

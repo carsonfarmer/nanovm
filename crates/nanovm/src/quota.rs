@@ -68,13 +68,12 @@ struct Inner {
 }
 
 impl QuotaGuard {
-    /// A budget whose starting usage is what's already under `volume`, so a
-    /// persistent volume starts each instance with its real usage.
-    pub fn new(volume: &Path, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>, capture: Option<&crate::config::CaptureConfig>) -> std::io::Result<Self> {
-        // First, so a failed request or a crash is undone before it's counted.
-        let journal = Journal::open(volume, limits.disk_mb << 20, obj.clone(), capture)?;
+    /// A budget whose starting usage is what's already under the journal's
+    /// volume, so a persistent volume starts each instance with its real
+    /// usage.
+    pub fn new(journal: Journal, limits: &Limits, metrics: Arc<Metrics>, obj: Arc<ObjShared>) -> std::io::Result<Self> {
         let (mut bytes, mut files) = (0, 0);
-        let mut stack = vec![volume.to_path_buf()];
+        let mut stack = vec![journal.volume().to_path_buf()];
         while let Some(dir) = stack.pop() {
             for entry in std::fs::read_dir(&dir)? {
                 let (path, md) = entry.and_then(|e| Ok((e.path(), e.metadata()?)))?;
@@ -219,8 +218,11 @@ impl QuotaGuard {
         let (q, obj) = (self.0.clone(), self.0.lock().obj.clone());
         let held = obj.storage().await;
         tokio::task::spawn_blocking(move || {
-            let _held = held;
-            q.lock().journal.commit()
+            let committed = q.lock().journal.commit();
+            // Its last handle may end the instance's journal (see its
+            // `Drop`), which must finish before the volume is free.
+            drop((q, held));
+            committed
         })
         .await?
     }
@@ -241,6 +243,8 @@ impl Inner {
             .and_then(|()| f(&mut self.journal))
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::StorageFull => self.full(),
+                // No room for another object (`Objects::admit`).
+                std::io::ErrorKind::QuotaExceeded => self.deny(ErrorCode::InsufficientSpace, e.to_string()),
                 // A path the journal refuses (`Journal::creating`), as the syscall would.
                 std::io::ErrorKind::NotADirectory => ErrorCode::NotDirectory,
                 std::io::ErrorKind::InvalidFilename => ErrorCode::NameTooLong,
@@ -498,7 +502,10 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         let quota = guard(store);
         quota.check_new_entry()?;
         if let Some(p) = local(store, &fd, &path) {
-            quota.journal(|j| j.creating(&p))?;
+            quota.journal(|j| {
+                let p = j.place(&p)?;
+                j.creating(&p)
+            })?;
         }
         WasiFilesystem::create_directory_at(&stock(store), fd, path).await?;
         quota.adjust(0, 1);
@@ -527,7 +534,7 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         flags: DescriptorFlags,
     ) -> FilesystemResult<Resource<Descriptor>> {
         let (inner, quota) = (stock(store), guard(store));
-        let local = local(store, &fd, &path);
+        let mut local = local(store, &fd, &path);
         // In the volume, a truncation is made a `set_size` the journal sees.
         let truncate = local.is_some() && open_flags.contains(OpenFlags::TRUNCATE);
         let (mut created, mut freed) = (false, 0);
@@ -537,8 +544,11 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
                 Some(_) => {}
                 None if open_flags.contains(OpenFlags::CREATE) => {
                     quota.check_new_entry()?;
-                    if let Some(p) = &local {
-                        quota.journal(|j| j.creating(p))?;
+                    if let Some(p) = &mut local {
+                        quota.journal(|j| {
+                            *p = j.place(p)?;
+                            j.creating(p)
+                        })?;
                     }
                     created = true;
                 }
@@ -684,7 +694,7 @@ mod tests {
             ..Limits::default()
         };
         let dir = tempdir("empty");
-        let g = QuotaGuard::new(&dir, &limits, metrics.clone(), obj, None).unwrap();
+        let g = QuotaGuard::new(crate::journal::Journal::open(&dir, limits.disk_mb << 20, obj.clone(), None, None).unwrap(), &limits, metrics.clone(), obj).unwrap();
         std::fs::remove_dir(dir).unwrap();
         g.0.lock().max_bytes = bytes;
         (g, metrics)
@@ -696,9 +706,7 @@ mod tests {
 
     fn volume_guard(v: &Path, max: u64) -> QuotaGuard {
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(v, &Limits::default(), Default::default(), obj.clone(), None).unwrap();
-        g.0.lock().journal = Journal::open(v, max, obj, None).unwrap();
-        g
+        QuotaGuard::new(Journal::open(v, max, obj.clone(), None, None).unwrap(), &Limits::default(), Default::default(), obj).unwrap()
     }
 
     #[tokio::test]
@@ -841,7 +849,7 @@ mod tests {
             ..Limits::default()
         };
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj, None).unwrap();
+        let g = QuotaGuard::new(crate::journal::Journal::open(&dir, limits.disk_mb << 20, obj.clone(), None, None).unwrap(), &limits, Default::default(), obj).unwrap();
         assert_eq!(usage(&g), (15, 4));
         assert_eq!(g.0.lock().max_bytes, 2 << 20);
         std::fs::remove_dir_all(dir).unwrap();
@@ -979,7 +987,7 @@ mod tests {
         std::fs::write(dir.join("f"), [0; 10]).unwrap();
         std::fs::write(dir.join("g"), [0; 10]).unwrap();
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &Limits::default(), Default::default(), obj, None).unwrap();
+        let g = QuotaGuard::new(crate::journal::Journal::open(&dir, Limits::default().disk_mb << 20, obj.clone(), None, None).unwrap(), &Limits::default(), Default::default(), obj).unwrap();
         let f = std::fs::File::options().write(true).open(dir.join("f")).unwrap();
         g.unlink(&dir.join("f"), 10).unwrap();
         assert_eq!(usage(&g), (10, 1));
@@ -997,7 +1005,7 @@ mod tests {
         let dir = tempdir("new-unlinked").canonicalize().unwrap();
         let limits = Limits { disk_mb: 1, ..Limits::default() };
         let obj = Arc::new(ObjShared::new("app".into(), "obj"));
-        let g = QuotaGuard::new(&dir, &limits, Default::default(), obj, None).unwrap();
+        let g = QuotaGuard::new(crate::journal::Journal::open(&dir, limits.disk_mb << 20, obj.clone(), None, None).unwrap(), &limits, Default::default(), obj).unwrap();
         let create = |name: &str| {
             let path = dir.join(name);
             g.journal(|j| j.creating(&path)).unwrap();

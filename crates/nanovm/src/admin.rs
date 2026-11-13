@@ -8,8 +8,9 @@
 //! of JSON, an array of strings, and gets one line back, `{"ok": …}` or
 //! `{"error": "…"}`. `Supervisor::command` runs them.
 
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Weak;
 
 use anyhow::Context;
@@ -24,6 +25,13 @@ const MAX_LINE: u64 = 64 << 10;
 /// Where a node's admin socket is.
 pub fn socket(cfg: &NodeConfig) -> PathBuf {
     cfg.data_dir.join("admin").join("socket")
+}
+
+/// Runs `f` on a name for `path` that is short whatever `data_dir` is: a
+/// socket's path is at most 107 bytes.
+fn short<T>(path: &Path, f: impl FnOnce(&str) -> std::io::Result<T>) -> anyhow::Result<T> {
+    let dir = std::fs::File::open(path.parent().expect("in admin/"))?;
+    f(&format!("/proc/self/fd/{}/socket", dir.as_raw_fd())).with_context(|| format!("{}", path.display()))
 }
 
 /// Binds the admin socket, in a directory of mode 0700 that must be the
@@ -41,7 +49,7 @@ pub fn listen(cfg: &NodeConfig) -> anyhow::Result<tokio::net::UnixListener> {
     {
         return Err(e.into());
     }
-    tokio::net::UnixListener::bind(&path).with_context(|| format!("binding {}", path.display()))
+    short(&path, |p| tokio::net::UnixListener::bind(p))
 }
 
 /// Serves commands on `listener` while the supervisor lives.
@@ -77,7 +85,7 @@ pub async fn serve(listener: tokio::net::UnixListener, sup: Weak<Supervisor>) {
 pub fn client(cfg: &NodeConfig, args: &[String]) -> anyhow::Result<()> {
     use std::io::{Read, Write};
     let path = socket(cfg);
-    let mut conn = std::os::unix::net::UnixStream::connect(&path).with_context(|| format!("connecting to {}", path.display()))?;
+    let mut conn = short(&path, |p| std::os::unix::net::UnixStream::connect(p))?;
     conn.write_all(format!("{}\n", serde_json::to_string(args)?).as_bytes())?;
     let mut reply = String::new();
     conn.read_to_string(&mut reply)?;

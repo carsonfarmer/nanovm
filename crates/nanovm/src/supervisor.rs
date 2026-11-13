@@ -800,12 +800,12 @@ fn restored(objects: &Path, object: &str) -> std::io::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
-    let uid = std::fs::metadata(objects)?.uid();
-    let committed = objects.join("~committed");
-    for d in [committed.join(object), committed, objects.join(object)].iter().filter(|d| d.exists()) {
-        chown_tree(d, uid).map_err(std::io::Error::other)?;
+    let (uid, base) = (std::fs::metadata(objects)?.uid(), crate::app::object_dir(objects, object));
+    if !base.try_exists()? {
+        return Ok(());
     }
-    Ok(())
+    std::os::unix::fs::lchown(base.parent().expect("in a shard"), Some(uid), Some(uid))?;
+    chown_tree(&base, uid).map_err(std::io::Error::other)
 }
 
 /// Gives a worker's cgroup its app's worker limits.
