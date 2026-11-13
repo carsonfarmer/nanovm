@@ -114,6 +114,13 @@ All runs as root on the shared 4-core machine, debug builds, `RUST_TEST_THREADS=
 - **Unit** (`secrets.rs`): loading, refusal messages that never quote the file (four malformed
   shapes), masking of overlapping values in place, the directory check, and the publish rules.
 
+### Full suite
+
+After merging `cf/round3` at 7b3f9c6, `env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked -p
+nanovm` (as root, every example and the JavaScript test app rebuilt): 159 unit, 11 dev, 28 examples,
+101 integration (14 ignored, as on the base), 17 JavaScript and 2 example tests pass.
+`cargo check --locked -p nanovm --bin nanovm` and the SDK's own tests pass.
+
 ### Mutation checks
 
 Each mechanism broken in turn on the committed tree, its tests run, then restored with
@@ -134,13 +141,15 @@ Each mechanism broken in turn on the committed tree, its tests run, then restore
 | secrets not added to `wasi:config` | `secrets_reach_only_their_apps_worker`: `(404, "no such config key")` |
 | no restart when the file changes | `changed_or_bad_secrets_restart_or_stop_the_app`: still `200 one` after 10 s |
 | the directory not checked at start | the same: the supervisor starts on a 0755 directory |
+| secrets not added to `wasi:config`, against the examples | `oauth_and_gateway_get_their_keys_from_the_node`: `401 GitHub refused the code` |
 | `nanovm run` doesn't watch `--secrets` | `nanovm_run_takes_secrets_from_a_file`: no restart line in 60 s |
 
-All 14 restored cleanly. The script: `scratchpad/b-secrets/mutate.py` (not committed).
+All 15 restored cleanly. The script: `scratchpad/b-secrets/mutate.py` (not committed).
 
 ### Cost
 
-- Runtime lines (CI's count): 7,410 → 7,542 (+132): `secrets.rs` 80, `supervisor.rs` 32 (read at
+- Runtime lines (CI's count): 7,418 → 7,550 (+132) over `cf/round3` at 7b3f9c6 (7,410 → 7,542 over the
+  earlier base): `secrets.rs` 80, `supervisor.rs` 32 (read at
   start, the watcher, `retire`), `telemetry.rs` 8, `config.rs` 5, `main.rs` 4, `registry.rs` 2,
   `lib.rs` 1. One new direct dependency, `memchr` (already in the tree through other crates).
 - The request path is unchanged: config is built once per worker; masking runs on error details and
