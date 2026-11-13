@@ -85,6 +85,9 @@ impl HttpClient for Client {
 
 pub struct Telemetry {
     runtime: tokio::runtime::Handle,
+    /// A worker's export runtime runs until this is dropped, after its
+    /// providers have shut down (see `Drop`).
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
     traces: trace::SdkTracerProvider,
     logs: logs::SdkLoggerProvider,
     tracer: trace::SdkTracer,
@@ -98,17 +101,19 @@ impl Telemetry {
         // waits behind guest work on the node's threads, which can hold one
         // for a tick (N-222); the supervisor isolates its control runtime the
         // same way (N-36). It uses the egress dialer's second pool of links.
-        let runtime = match upstream {
+        let (runtime, stop) = match upstream {
             Some(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-                let handle = rt.handle().clone();
+                let rt = tokio::runtime::Builder::new_current_thread().thread_name("nanovm-export").enable_all().build()?;
+                let (handle, (stop, stopped)) = (rt.handle().clone(), tokio::sync::oneshot::channel());
+                // Until the owner has shut its providers down (see `Drop`);
+                // dropping the runtime then ends the thread that did that.
                 std::thread::Builder::new().name("nanovm-export".into()).spawn(move || {
                     crate::link::set_thread(1);
-                    rt.block_on(std::future::pending::<()>())
+                    let _ = rt.block_on(stopped);
                 })?;
-                handle
+                (handle, Some(stop))
             }
-            None => tokio::runtime::Handle::current(),
+            None => (tokio::runtime::Handle::current(), None),
         };
         let client = Client {
             runtime,
@@ -140,6 +145,7 @@ impl Telemetry {
             .build();
         Ok(Self {
             runtime: client.runtime.clone(),
+            stop,
             tracer: traces.tracer("nanovm"),
             traces,
             logger: logs.logger("nanovm"),
@@ -230,11 +236,12 @@ impl Drop for Telemetry {
     fn drop(&mut self) {
         // SDK shutdown waits for export threads. Keep that wait off both the
         // async runtime and a snapshot callback dropping its last Node reference.
-        let traces = self.traces.clone();
-        let logs = self.logs.clone();
+        // A worker's export runtime, which their exports run on, stops after.
+        let (traces, logs, stop) = (self.traces.clone(), self.logs.clone(), self.stop.take());
         self.runtime.spawn_blocking(move || {
             let _ = traces.shutdown_with_timeout(DEADLINE);
             let _ = logs.shutdown_with_timeout(DEADLINE);
+            drop(stop);
         });
     }
 }
@@ -681,6 +688,55 @@ mod tests {
             }
         }).await.expect("all pending signals exported on drop");
         server.abort();
+    }
+
+    /// A worker exports on a runtime of its own thread (N-222). Dropping the
+    /// owner exports what is pending, then ends that runtime and its
+    /// threads, rather than leaving them behind, one set per owner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_dropping_worker_telemetry_releases_export_threads() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        fn export_threads() -> usize {
+            std::fs::read_dir("/proc/self/task").unwrap().flatten()
+                .filter(|t| std::fs::read_to_string(t.path().join("comm")).is_ok_and(|c| c.trim_end() == "nanovm-export"))
+                .count()
+        }
+        // A thread takes its name once it runs.
+        async fn settle(n: usize, why: &str) {
+            let started = std::time::Instant::now();
+            while export_threads() != n {
+                assert!(started.elapsed() < Duration::from_secs(5), "{} export threads, not {n}: {why}", export_threads());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let before = export_threads();
+        let spans = Arc::new(AtomicUsize::new(0));
+        let mut owners = Vec::new();
+        for _ in 0..3 {
+            // The supervisor's end of the worker's egress link, counting spans.
+            let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let count = spans.clone();
+            tokio::spawn(crate::link::serve(tokio::net::UnixStream::from_std(peer).unwrap(), vec![], move |req| {
+                let count = count.clone();
+                async move {
+                    let traces = req.uri().path() == "/telemetry/traces";
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                    if traces {
+                        let batch = collector::trace::v1::ExportTraceServiceRequest::decode(body).unwrap();
+                        count.fetch_add(batch.resource_spans.iter().flat_map(|r| &r.scope_spans).map(|s| s.spans.len()).sum(), Relaxed);
+                    }
+                    Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+                }
+            }));
+            let telemetry = Telemetry::new("http://127.0.0.1:9", "app", "v1", Some(crate::link::Dialer::new(ctl, 2))).unwrap();
+            drop(telemetry.span("last-request", "room", &Context::new(), SpanKind::Server));
+            owners.push(telemetry);
+        }
+        settle(before + 3, "one for each owner").await;
+        drop(owners);
+        settle(before, "they outlived their owners").await;
+        assert_eq!(spans.load(Relaxed), 3, "each owner exported its last span before its runtime stopped");
     }
 
     /// Exercise the private relay as a compromised worker, not a guest:
