@@ -18,7 +18,7 @@ telemetry_endpoint = "http://127.0.0.1:4318"
 # App i runs as uid/gid jail_uid_base + i. Never change it on a node with
 # data: an app's uid is the owner of its objects directory.
 jail_uid_base = 200000
-# With nanovm-cgroup.conf installed, each worker goes in <cgroup>/<app>:
+# With nanovm-cgroup.conf installed, each worker goes in <cgroup>/worker-<n>:
 # cgroup = "/sys/fs/cgroup/system.slice/nanovm.service/apps"
 
 # Operator ceilings: each app's own limits are clamped to these.

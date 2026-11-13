@@ -50,12 +50,13 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H @/run/hostile.h http://127.0.0.
 check "hostile spin killed (500 cpu)" '[ "$code" = 500 ]'
 code=$(curl -s -o /run/esc.json -w '%{http_code}' -H @/run/hostile.h "http://127.0.0.1:8080/h1/escape")
 echo "escape: $code $(head -c 300 /run/esc.json)"
-check "two workers running" '[ "$(pgrep -fc "nanovm worker")" = 2 ]'
+# One worker per app and the spare the supervisor keeps ready (N-224).
+check "three workers running (two apps, one spare)" '[ "$(pgrep -fc "nanovm worker")" = 3 ]'
 if [ -n "${CGROUP:-}" ]; then
   G=/sys/fs/cgroup/system.slice/nanovm.service
   echo "cgroups: $(cd $G && find . -name cgroup.procs | sort | while read f; do echo "$(dirname $f)=[$(tr '\n' ' ' < $f)]"; done | tr '\n' ' ')"
   check "supervisor in supervisor/" 'grep -qx "$(systemctl show -p MainPID --value nanovm)" $G/supervisor/cgroup.procs'
-  check "each worker in apps/<app>" '[ "$(cat $G/apps/*/cgroup.procs | sort | tr "\n" " ")" = "$(pgrep -f "nanovm worker" | sort | tr "\n" " ")" ]'
+  check "each worker in apps/worker-<n>" '[ "$(cat $G/apps/*/cgroup.procs | sort | tr "\n" " ")" = "$(pgrep -f "nanovm worker" | sort | tr "\n" " ")" ]'
   check "service group itself empty" '[ ! -s $G/cgroup.procs ]'
 fi
 W=$(pgrep -f "nanovm worker" | head -1)

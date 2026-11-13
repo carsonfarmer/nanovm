@@ -46,7 +46,7 @@ Deliberately **not** set on the node, each for a reason seen in testing:
 - `MemoryDenyWriteExecute=yes`: wasmtime makes compiled code executable with
   `mprotect`. The worker's seccomp filter already refuses W+X memory.
 - `UMask=0077`: workers run as other uids and must traverse `data_dir/objects/`.
-- `ProtectControlGroups=yes` with the cgroup drop-in: creating `apps/<app>` fails
+- `ProtectControlGroups=yes` with the cgroup drop-in: creating `apps/worker-<n>` fails
   with `EROFS`.
 - `ProcSubset=pid`: it hides `/proc/sys/vm/max_map_count`, and the worker's
   preflight then silently skips its mappings check.
