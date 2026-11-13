@@ -97,8 +97,11 @@ no need for write-to-temp-then-rename.
   app, through its queue; it commits before it answers.
 - `ws::events(&req)`, `ws::Answer` (`accept`, `subscribe`, `text`, `binary`,
   `close`) and `ws::publish(channel, msg)` for WebSockets.
-- `after(async { … })`: work that runs once the handler has answered (its
-  changes commit when it is done).
+- `after(async { … })`: work that runs once the client has the whole answer
+  (or has gone), before the object's next request; work it passes to
+  `after` runs too. What it changes commits when all of it is done, and
+  rolls back if any of it panics or runs out of time; the answer stands.
+  The main README's "Commits" has the model, which `ctx.waitUntil` shares.
 - `id()`, `app()`, `env(key)`, `sleep(d)`, `quote(s)`; `wasip3` for the rest.
 
 The [chat example](../../examples/chat) uses most of it.

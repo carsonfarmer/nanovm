@@ -406,8 +406,11 @@
     const answer = (res, ctx) => {
       if (!(res instanceof Response)) throw new TypeError('fetch() must return a Response');
       const s = unread(res[S]);
-      return [s.status, flat(s.headers), s.body, ctx[S].length ? Promise.all(ctx[S]) : undefined];
+      return [s.status, flat(s.headers), s.body, ctx[S].length ? settled(ctx) : undefined];
     };
+    // Resolves once every waitUntil promise has, those registered meanwhile
+    // included; rejects with the first rejection.
+    const settled = (ctx, n = ctx[S].length) => Promise.all(ctx[S]).then(() => ctx[S].length > n ? settled(ctx) : undefined);
     return [serve, answer];
   };
 }

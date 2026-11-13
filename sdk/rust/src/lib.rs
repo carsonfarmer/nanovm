@@ -37,6 +37,7 @@ use std::future::Future;
 pub use wasip3;
 use wasip3::http::types as wit;
 use wasip3::{wit_future, wit_stream};
+use wit_bindgen::rt::async_support::FutureReader;
 
 pub mod config;
 pub mod fs;
@@ -75,32 +76,43 @@ pub async fn __serve<F: Future<Output = Result>>(
     request: wit::Request,
     handler: impl FnOnce(Request) -> F,
 ) -> core::result::Result<wit::Response, wit::ErrorCode> {
-    let result = handler(Request::read(request).await).await;
-    let later = AFTER.with(|a| a.take());
-    match result {
-        Ok(response) => {
-            for work in later {
-                wasip3::spawn_local(work);
-            }
-            response.into_wit()
-        }
-        // A failed request's instance is discarded: nothing runs after it.
-        Err(Error(why)) => Err(wit::ErrorCode::InternalError(Some(why))),
+    AFTER.set(Some(Vec::new()));
+    // A failed request's instance is discarded: nothing runs after it.
+    let response = handler(Request::read(request).await).await.map_err(|Error(why)| wit::ErrorCode::InternalError(Some(why)))?;
+    let streamed = response.writer.is_some();
+    let (response, out) = response.answer()?;
+    match streamed || AFTER.with_borrow(|a| a.as_ref().is_some_and(|a| !a.is_empty())) {
+        // Started only once the answer is out, so that no panic in it can
+        // fail the answer (one before the node has taken it would).
+        true => wasip3::spawn_local(async move {
+            let _ = out.await;
+            AFTER.take().into_iter().flatten().for_each(wasip3::spawn_local);
+        }),
+        false => AFTER.set(None),
     }
+    Ok(response)
 }
 
 thread_local! {
-    static AFTER: std::cell::RefCell<Vec<std::pin::Pin<Box<dyn Future<Output = ()>>>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Work for after the answer, waiting until it is out; `None` once it is.
+    static AFTER: std::cell::RefCell<Option<Vec<std::pin::Pin<Box<dyn Future<Output = ()>>>>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Runs `work` once the handler has answered: the client gets its response
-/// without waiting for it (a webhook's sender, say), and the object takes no
-/// other request until `work` is done, within the app's
-/// `post_return_timeout_ms`. What `work` changes commits when it finishes,
-/// and rolls back if it panics or runs out of time (the answer already sent
-/// stands). Nothing runs if the handler returns an error.
+/// Runs `work` after the answer, once the client has all of it (or has
+/// gone): the client doesn't wait for it (a webhook's sender, say), and
+/// nothing `work` does can change or fail the answer. The object takes no
+/// other request until `work`, and any work it passes to `after` in turn,
+/// is done, within the app's `post_return_timeout_ms`. What all of it
+/// changes commits together when it is done; if any of it panics or time
+/// runs out, all of that rolls back and the instance is replaced, while the
+/// answer and what the handler changed stand. Nothing runs if the handler
+/// returns an error.
 pub fn after(work: impl Future<Output = ()> + 'static) {
-    AFTER.with(|a| a.borrow_mut().push(Box::pin(work)));
+    let work = Box::pin(work);
+    AFTER.with_borrow_mut(|a| match a {
+        Some(waiting) => waiting.push(work),
+        None => wasip3::spawn_local(work),
+    });
 }
 
 /// Why a request failed. A handler that returns one rolls back everything the
@@ -359,9 +371,11 @@ impl Response {
     /// reads it, after the handler has returned. Meanwhile the object serves
     /// nothing else: its other requests wait until `body` is done, and it has
     /// the app's `post_return_timeout_ms` for it, after which the object is
-    /// stopped and what it changed since answering rolls back. What it
-    /// changed before answering has already committed. Set `content-length`
-    /// if you know it; without one the body is chunked.
+    /// stopped and what it changed since answering rolls back. `body` starts
+    /// as the handler returns: what it changes before the node has taken the
+    /// answer (as it takes the first piece) commits with the answer, the
+    /// rest once it ends. Set `content-length` if you know it; without one
+    /// the body is chunked.
     pub fn stream<F: Future<Output = ()> + 'static>(content_type: &str, body: impl FnOnce(Body) -> F + 'static) -> Response {
         let writer: Box<dyn FnOnce(Body) -> std::pin::Pin<Box<dyn Future<Output = ()>>>> = Box::new(|b| Box::pin(body(b)));
         let mut response = Response::new(200).header("content-type", content_type);
@@ -411,7 +425,12 @@ impl Response {
     }
 
     /// The response as `wasip3`'s, for a handler written against it directly.
-    pub fn into_wit(mut self) -> core::result::Result<wit::Response, wit::ErrorCode> {
+    pub fn into_wit(self) -> core::result::Result<wit::Response, wit::ErrorCode> {
+        self.answer().map(|(response, _)| response)
+    }
+
+    /// The response as `wasip3`'s, and the future that resolves once it is out.
+    fn answer(mut self) -> core::result::Result<(wit::Response, FutureReader<core::result::Result<(), wit::ErrorCode>>), wit::ErrorCode> {
         let body = match self.writer.and_then(|w| w.0.take()) {
             Some(writer) => {
                 let (tx, rx) = wit_stream::new();
@@ -425,9 +444,9 @@ impl Response {
             }
         };
         let headers = fields(&self.headers)?;
-        let (response, _) = wit::Response::new(headers, Some(body), no_trailers());
+        let (response, out) = wit::Response::new(headers, Some(body), no_trailers());
         let _ = response.set_status_code(self.status);
-        Ok(response)
+        Ok((response, out))
     }
 }
 
@@ -448,7 +467,7 @@ fn stream(data: Vec<u8>) -> wit_bindgen::rt::async_support::StreamReader<u8> {
 
 type Trailers = core::result::Result<Option<wit::Fields>, wit::ErrorCode>;
 
-fn no_trailers() -> wit_bindgen::rt::async_support::FutureReader<Trailers> {
+fn no_trailers() -> FutureReader<Trailers> {
     wit_future::new(|| Ok(None)).1
 }
 

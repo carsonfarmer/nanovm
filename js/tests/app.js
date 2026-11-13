@@ -92,11 +92,12 @@ const routes = {
     return new Response("answered first");
   },
   // review2: waitUntil work that writes while the handler is running and
-  // rejects after it has answered.
+  // rejects after it has answered, having written again.
   "POST /later-throw-straddle": async (req, env, ctx) => {
     ctx.waitUntil((async () => {
       await env.kv.put("early", hits);
       await new Promise((r) => setTimeout(r, 200));
+      await env.kv.put("late", hits);
       throw new Error("waitUntil work failed");
     })());
     await new Promise((r) => setTimeout(r, 50));
@@ -114,6 +115,23 @@ const routes = {
       await new Promise((r) => setTimeout(r, 200));
     })());
     return new Response("answered first");
+  },
+  // waitUntil work that, after the answer, registers more work and ends;
+  // that work writes later.
+  "POST /later-nested-ok": async (req, env, ctx) => {
+    ctx.waitUntil((async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      ctx.waitUntil((async () => {
+        await new Promise((r) => setTimeout(r, 50));
+        await env.kv.put("nested", hits);
+      })());
+    })());
+    return new Response("answered first");
+  },
+  // A long answer, and waitUntil work that has failed by the time it is out.
+  "POST /later-big": async (req, env, ctx) => {
+    ctx.waitUntil(Promise.reject(new Error("waitUntil work failed")));
+    return new Response("x".repeat(1 << 20));
   },
   // review2: a waitUntil promise that can never settle.
   "POST /later-never": async (req, env, ctx) => {

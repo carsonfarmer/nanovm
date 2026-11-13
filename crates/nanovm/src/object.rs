@@ -693,7 +693,13 @@ async fn serve(
 
                 let (resp, mut failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
-                        let mut res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
+                        // The guest learns its answer is out (the future
+                        // `response.new` gave it resolves) once the client
+                        // has read it whole, or gone: only then can its work
+                        // after the answer fail without failing the answer.
+                        let (sent, out) = oneshot::channel::<()>();
+                        let out = async move { _ = out.await; req_io.await };
+                        let mut res = acc.with(|mut s| res.into_http(&mut s, out))?;
                         // Only the node refuses requests to the proxy: a guest
                         // answering as one would have the proxy run its
                         // request again and again.
@@ -703,6 +709,7 @@ async fn serve(
                                 inner: b,
                                 remaining: max_resp,
                                 abort,
+                                _sent: sent,
                             }
                             .boxed_unsync()
                         });
@@ -928,6 +935,8 @@ struct GuardedBody<B> {
     inner: B,
     remaining: u64,
     abort: Arc<AtomicBool>,
+    /// Dropped with the body, once it is read or abandoned.
+    _sent: oneshot::Sender<()>,
 }
 
 impl<B> Body for GuardedBody<B>
@@ -1046,6 +1055,7 @@ mod tests {
             inner: Full::new(Bytes::from_static(b)),
             remaining,
             abort: Arc::new(AtomicBool::new(abort)),
+            _sent: oneshot::channel().0,
         };
         assert_eq!(body(b"12345", 5, false).collect().await.unwrap().to_bytes(), "12345");
         let e = body(b"123456", 5, false).collect().await.unwrap_err();
