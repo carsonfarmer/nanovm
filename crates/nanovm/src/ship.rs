@@ -22,15 +22,18 @@
 //! once they are reached (the store down, say), never dropping a version.
 
 use std::io::{self, ErrorKind};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
+use rustix::fs::{AtFlags, CWD, Mode, OFlags, openat, renameat, unlinkat};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::committed::{DIR, dir_at, remove_at};
 use crate::config::CaptureConfig;
 use crate::lease::Leases;
 
@@ -81,21 +84,31 @@ fn hex(bytes: &[u8]) -> String {
 pub struct Dir(pub PathBuf);
 
 /// Writes `bytes` (synced if `synced`) to a new file in `dir` that no other
-/// write can open: its name is random and it is created exclusively.
-/// Returns its path.
-fn written(dir: &Path, bytes: &[u8], synced: bool) -> io::Result<PathBuf> {
+/// write can open: its name is random, and it is created exclusively, never
+/// through a symlink. Returns its name.
+fn written(dir: &OwnedFd, bytes: &[u8], synced: bool) -> io::Result<String> {
     use std::io::Write;
     let mut name = [0u8; 8];
     // SAFETY: getentropy writes at most `name.len()` bytes into `name`.
     if unsafe { libc::getentropy(name.as_mut_ptr().cast(), name.len()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let path = dir.join(format!("~new.{:016x}", u64::from_ne_bytes(name)));
-    let mut file = std::fs::File::options().write(true).create_new(true).open(&path)?;
+    let name = format!("~new.{:016x}", u64::from_ne_bytes(name));
+    let new = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut file = std::fs::File::from(openat(dir, &name, new, Mode::from_raw_mode(0o644))?);
     match file.write_all(bytes).and_then(|()| if synced { file.sync_all() } else { Ok(()) }) {
-        Ok(()) => Ok(path),
-        Err(e) => Err(std::fs::remove_file(&path).err().unwrap_or(e)),
+        Ok(()) => Ok(name),
+        Err(e) => Err(unlinkat(dir, &name, AtFlags::empty()).err().map_or(e, io::Error::from)),
     }
+}
+
+/// `<objects>/<under>`, where the object whose versions are in `dir`
+/// (`<objects>/~committed/<object>`) has more, opened a name at a time from
+/// the app's directory, never through a symlink its worker could plant
+/// there (B-502); made where missing if `make`.
+fn app_dir(dir: &Path, under: &Path, make: bool) -> io::Result<OwnedFd> {
+    let objects = dir.parent().and_then(Path::parent).expect("in ~committed");
+    dir_at(&openat(CWD, objects, DIR, Mode::empty())?, under, make)
 }
 
 /// Syncs `dir`, which a name changed in; and when it was `fresh` (made just
@@ -118,7 +131,7 @@ impl Store for Dir {
             let dir = path.parent().expect("keys have a directory");
             let fresh = !dir.exists();
             std::fs::create_dir_all(dir)?;
-            let new = written(dir, &bytes, true)?;
+            let new = dir.join(written(&openat(CWD, dir, DIR, Mode::empty())?, &bytes, true)?);
             // A link never replaces a name: of puts racing at a key, one
             // stores its bytes, and the others find them.
             let linked = std::fs::hard_link(&new, &path);
@@ -163,7 +176,7 @@ impl Store for Dir {
             if now != at {
                 return Ok(None);
             }
-            let new = written(dir, &bytes, true)?;
+            let new = dir.join(written(&openat(CWD, dir, DIR, Mode::empty())?, &bytes, true)?);
             std::fs::rename(&new, &path)?;
             sync_names(&root, dir, fresh)?;
             Ok(Some(tag(&bytes)))
@@ -242,21 +255,30 @@ pub async fn head(store: &dyn Store, app: &str, object: &str) -> io::Result<(Hea
     }
 }
 
+/// Where object `object` keeps its versions, under its app's `objects`
+/// (`<data_dir>/objects/<app>`): `<objects>/~committed/<object>`. With
+/// `marker`, `app_dir` and `discard`, the only places that know the layout.
+pub(crate) fn versions(objects: &Path, object: &str) -> PathBuf {
+    objects.join("~committed").join(object)
+}
+
 /// Where the shipper records the last version the head has named of the
-/// object whose versions are in `dir` (`<objects>/~committed/<object>`):
+/// object whose versions are in `dir` (`versions`):
 /// `<objects>/~shipped/<object>`.
 pub(crate) fn marker(dir: &Path) -> PathBuf {
     let objects = dir.parent().and_then(Path::parent).expect("in ~committed");
     objects.join("~shipped").join(dir.file_name().expect("an object's"))
 }
 
-/// Records `sequence` in `marker`, whole: through a file of its own, as
-/// claims and the shipper mark objects at once. Unsynced: a marker a crash
-/// takes back is caught up from the head (see `ship_object`).
-fn mark(marker: &Path, sequence: u64) -> io::Result<()> {
-    let dir = marker.parent().expect("in ~shipped");
-    std::fs::create_dir_all(dir)?;
-    std::fs::rename(written(dir, sequence.to_string().as_bytes(), false)?, marker)
+/// Records `sequence` as the last version of the object whose versions are
+/// in `dir` that its head has named (`marker`): whole, through a file of its
+/// own (claims and the shipper mark objects at once), by name (`app_dir`).
+/// Unsynced: a marker a crash takes back is caught up from the head (see
+/// `ship_object`).
+fn mark(dir: &Path, sequence: u64) -> io::Result<()> {
+    let shipped = app_dir(dir, Path::new("~shipped"), true)?;
+    let new = written(&shipped, sequence.to_string().as_bytes(), false)?;
+    Ok(renameat(&shipped, new.as_str(), &shipped, dir.file_name().expect("an object's"))?)
 }
 
 /// The last version of the object whose versions are in `dir` that the
@@ -331,7 +353,7 @@ pub(crate) async fn ship_object(
     dir: &Path,
     known: &mut Option<(Head, Tag)>,
 ) -> io::Result<bool> {
-    let (marker, shipped) = (marker(dir), shipped(dir));
+    let shipped = shipped(dir);
     let (versions, _) = published(dir)?;
     let unshipped: Vec<_> = versions.iter().copied().filter(|&n| n > shipped).collect();
     if !unshipped.is_empty() {
@@ -365,14 +387,17 @@ pub(crate) async fn ship_object(
             } else if crate::committed::digest(&at(head.sequence))? != head.digest {
                 return Err(astray());
             }
-            mark(&marker, n)?;
+            mark(dir, n)?;
         }
         *known = tag.map(|tag| (head, tag));
     }
-    for &n in versions.iter().rev().skip(1) {
-        match std::fs::remove_file(dir.join(format!("{n:020}.tar"))) {
-            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
-            _ => {}
+    if versions.len() > 1 {
+        let here = app_dir(dir, &Path::new("~committed").join(object), false)?;
+        for &n in versions.iter().rev().skip(1) {
+            match unlinkat(&here, format!("{n:020}.tar"), AtFlags::empty()) {
+                Err(e) if e != Errno::NOENT => return Err(e.into()),
+                _ => {}
+            }
         }
     }
     Ok(true)
@@ -452,7 +477,7 @@ pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Lea
 /// restored from the store. So a node never serves state older than the
 /// head, nor ships history the head has moved past.
 pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object: &str, objects: &Path) -> io::Result<()> {
-    let dir = objects.join("~committed").join(object);
+    let dir = versions(objects, object);
     for _ in 0..4 {
         // This copy as it is before the head is read: the shipper may move
         // the head meanwhile (under the grant it began with), and removes
@@ -470,8 +495,8 @@ pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object:
         };
         // Dropped, durably, before the claim, which makes what is here count.
         if !current {
-            discard(objects, object)?;
             std::fs::create_dir_all(objects)?;
+            discard(objects, object)?;
             sync_fs(objects)?;
         }
         let claimed = Head { node: node.into(), lease, ..head.clone() };
@@ -486,35 +511,35 @@ pub async fn claim(store: &dyn Store, node: &str, lease: u64, app: &str, object:
     Err(io::Error::other(format!("{app}/{object}'s head keeps moving")))
 }
 
-/// Whether this node's copy of `object` (under `objects`), with `versions`
-/// published (and whether one is being staged), is the head's: it has its
+/// Whether this node's copy of `object` (under `objects`), with versions
+/// `here` published (and whether one is being staged), is the head's: it has its
 /// volume and the head's version, and versions after it count only if no
 /// other node has claimed the object since this one (`node`) did, which
 /// another node can't have served. A copy with versions and no volume is
 /// one a discard cut short.
-fn current(objects: &Path, object: &str, (versions, staged): (Vec<u64>, bool), head: &Head, node: &str) -> io::Result<bool> {
-    let at = objects.join("~committed").join(object).join(format!("{:020}.tar", head.sequence));
-    let whole = (versions.is_empty() && !staged) || objects.join(object).is_dir();
-    let has = head.sequence == 0 || (versions.contains(&head.sequence) && crate::committed::digest(&at)? == head.digest);
+fn current(objects: &Path, object: &str, (here, staged): (Vec<u64>, bool), head: &Head, node: &str) -> io::Result<bool> {
+    let at = versions(objects, object).join(format!("{:020}.tar", head.sequence));
+    let whole = (here.is_empty() && !staged) || objects.join(object).is_dir();
+    let has = head.sequence == 0 || (here.contains(&head.sequence) && crate::committed::digest(&at)? == head.digest);
     let ours = head.node == node || head.lease == 0;
-    Ok(whole && has && (ours || (!staged && versions.last().is_none_or(|&n| n == head.sequence))))
+    Ok(whole && has && (ours || (!staged && here.last().is_none_or(|&n| n == head.sequence))))
 }
 
 /// Drops this node's copy of `object` (under `objects`): its volume first,
 /// which a copy with versions has (see `current`), then its journal and
 /// marker, and its versions last; so a discard cut short is never taken
-/// for a current copy.
+/// for a current copy. By name from the app's directory, never through a
+/// symlink its worker could plant there (B-502).
 fn discard(objects: &Path, object: &str) -> io::Result<()> {
-    let [journal, staging, marker, versions] = ["~journal", "~restore", "~shipped", "~committed"].map(|d| objects.join(d).join(object));
-    let gone = |done: io::Result<()>| match done {
-        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    };
-    for path in [objects.join(object), journal, staging] {
-        gone(std::fs::remove_dir_all(path))?;
+    let app = openat(CWD, objects, DIR, Mode::empty())?;
+    remove_at(&app, object.as_ref())?;
+    for under in ["~journal", "~restore", "~shipped", "~committed"] {
+        match openat(&app, under, DIR, Mode::empty()) {
+            Err(Errno::NOENT) => {}
+            dir => remove_at(&dir?, object.as_ref())?,
+        }
     }
-    gone(std::fs::remove_file(marker))?;
-    gone(std::fs::remove_dir_all(versions))
+    Ok(())
 }
 
 /// Rebuilds object `object` of app `app` from what `store` holds, as the
@@ -553,10 +578,10 @@ pub async fn restore(store: &dyn Store, app: &str, object: &str, objects: &Path)
     let last = crate::committed::restore(&staging, &objects.join(object))?;
     // The volume first, then the version that says it is there.
     sync_fs(objects)?;
-    let out = objects.join("~committed").join(object);
+    let out = versions(objects, object);
     std::fs::create_dir_all(&out)?;
     std::fs::rename(staging.join(format!("{last:020}.tar")), out.join(format!("{last:020}.tar")))?;
-    mark(&marker(&out), last)?;
+    mark(&out, last)?;
     std::fs::remove_dir_all(staging)?;
     sync_fs(objects)?;
     Ok(last)
@@ -1048,7 +1073,7 @@ mod tests {
         let head = Head { sequence: 1, digest: one.clone(), node: "b".into(), lease: 2 };
         store.swap(&head_key("app", "o"), serde_json::to_vec(&head).unwrap(), None).await.unwrap().unwrap();
         version(&dir, 2, 1, &one, "two");
-        mark(&marker(&dir), 1).unwrap();
+        mark(&dir, 1).unwrap();
         std::fs::create_dir_all(objects.join("o")).unwrap();
         std::fs::write(objects.join("o/v"), "two").unwrap();
         // The order discard removes things in, as `remove_dir_all` here does.
@@ -1120,6 +1145,40 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    /// The supervisor (root) marks, drops and prunes an object's copy by
+    /// name from the app's directory, which the app's worker writes: a
+    /// symlink it plants there (`~shipped`, `~journal`, an object's
+    /// `~committed` directory) is refused, never followed, so nothing
+    /// outside changes (B-502).
+    #[tokio::test]
+    async fn the_supervisor_never_follows_a_symlink_the_app_planted() {
+        let base = tempdir("planted");
+        let (objects, outside) = (base.join("a"), base.join("outside"));
+        let listing = |d: &Path| {
+            let mut names: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            names.sort();
+            names
+        };
+        // Outside: what a symlink leads to, two versions of an object.
+        let one = version(&outside.join("o"), 1, 0, "", "theirs");
+        version(&outside.join("o"), 2, 0, &one, "theirs");
+        std::fs::create_dir_all(objects.join("~committed")).unwrap();
+        for under in ["~shipped", "~journal"] {
+            std::os::unix::fs::symlink(&outside, objects.join(under)).unwrap();
+        }
+        std::os::unix::fs::symlink(outside.join("o"), objects.join("~committed/o")).unwrap();
+        let before = (listing(&outside), listing(&outside.join("o")));
+        assert!(mark(&objects.join("~committed/o"), 3).is_err(), "marked through ~shipped");
+        assert!(discard(&objects, "o").is_err(), "dropped through ~journal");
+        // The shipper, marking in a real `~shipped`, prunes what it shipped.
+        std::fs::remove_file(objects.join("~shipped")).unwrap();
+        let store = Objects(Arc::new(object_store::memory::InMemory::new()));
+        let pruned = ship_object(&store, None, "app", "o", &objects.join("~committed/o"), &mut None).await;
+        assert!(pruned.is_err(), "pruned through ~committed/o");
+        assert_eq!((listing(&outside), listing(&outside.join("o"))), before, "changed outside the app's directory");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// A failure shipping one object (here the store refuses its puts with
     /// PermissionDenied, as a directory store does on EACCES) is that
     /// object's: logged and tried again a second later, never taken for
@@ -1188,7 +1247,7 @@ mod tests {
         for n in 2..=3 {
             version(&dir, n, 0, &parents[n as usize - 1], &format!("v{n}"));
         }
-        mark(&marker(&dir), 1).unwrap();
+        mark(&dir, 1).unwrap();
         version(&dir, 4, 0, &parents[3], "v4");
         ship_object(&store, None, "app", "o", &dir, &mut None).await.unwrap();
         assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 4);

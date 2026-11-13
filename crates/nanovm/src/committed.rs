@@ -345,12 +345,12 @@ fn names(path: &Path) -> io::Result<&Path> {
     }
 }
 
-const DIR: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+pub(crate) const DIR: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
 
 /// The directory `path` names in `root`, opened a name at a time and never
 /// through a symlink, as journal recovery reaches entries, so nothing it
 /// reaches is outside; made where missing if `make`.
-fn dir_at(root: &OwnedFd, path: &Path, make: bool) -> io::Result<OwnedFd> {
+pub(crate) fn dir_at(root: &OwnedFd, path: &Path, make: bool) -> io::Result<OwnedFd> {
     let mut dir = openat(root, ".", DIR, Mode::empty())?;
     for name in names(path)? {
         if make && let Err(e) = mkdirat(&dir, name, Mode::from_raw_mode(0o777)) && e != Errno::EXIST {
@@ -386,7 +386,7 @@ fn listing(dir: &OwnedFd) -> io::Result<Vec<(OsString, bool)>> {
 }
 
 /// Removes `name` from `dir`, and all in it, never through a symlink.
-fn remove_at(dir: &OwnedFd, name: &OsStr) -> io::Result<()> {
+pub(crate) fn remove_at(dir: &OwnedFd, name: &OsStr) -> io::Result<()> {
     match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Err(Errno::NOENT) => Ok(()),
         Ok(st) if FileType::from_raw_mode(st.st_mode) == FileType::Directory => {
