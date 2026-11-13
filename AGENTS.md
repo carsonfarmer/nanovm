@@ -100,6 +100,12 @@ A wasmtime-based host that runs untrusted WASIp3 HTTP components as durable obje
   delete `target/debug/.fingerprint/nanovm-*` and the test binaries
   (`target/debug/deps/{integration,dev,js,examples}-*`) first. Otherwise cargo reuses binaries
   that carry the other checkout's paths, and your tests run someone else's code.
+  - `cp -al` also hardlinks cargo's lock files (`.cargo-lock`, `.cargo-build-lock`,
+    `.cargo-artifact-lock`), so both worktrees' builds wait on one lock. Replace each with a file
+    of its own:
+    `for f in $(find . -path '*/target/*' -name '.cargo-*lock' -links +1 -type f); do rm -f "$f" && : > "$f"; done`.
+- **The scratchpad is shared** by every agent in a session: keep your scratch files in a
+  subdirectory of your own (`scratchpad/<your name>/`), and never clean anyone else's.
 - `pkill -f <pattern>` can kill your own shell; use `pkill -x nanovm` or pid files.
 
 ## Working with the owner
