@@ -591,6 +591,11 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** a Unix socket at `<data_dir>/admin/socket` in a 0700 directory of the supervisor's own user; a line of JSON (an array of strings) in, a line out. Bound and reached through `/proc/self/fd`, so a long `data_dir` fits a socket's 107-byte path. `admin_socket_is_the_supervisors_own`: uid 65534 gets EACCES; no HTTP route reaches it; `jail_blocks_escapes`: a jailed worker can't connect to it. `recovery` adds its restore commands here.
 - **Status:** done on `beta/objects` (1b11455)
 
+### B-209 (tests): `a_node_that_lost_an_objects_lease_cannot_commit_it` once got a 200 with an empty body
+- **Where:** `tests/integration.rs` (`nodes::`), the end of a streamed body whose instance resets
+- **Scenario:** in one full serial run on `beta/objects` (after merging 7b3f9c6), under load average about 26 from other agents, the first request's answer came back `200` with an empty body instead of `finished`. The guest writes `finished` from work after its answer; that work's commit is then refused (the node lost the lease) and the instance resets. Not reproduced in 10 runs since (two full runs and 8 targeted ones, 6 under added CPU load). Suspected: the client reads the body's end while the reset instance's store is being dropped, the race N-710 narrowed. On this branch a reset instance's drop also rolls back its journal, which makes the drop slower, not faster.
+- **Status:** open (not reproduced)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
