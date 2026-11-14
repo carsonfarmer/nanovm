@@ -4,24 +4,26 @@ The storage files' runtime (CI's count: non-blank, non-comment lines before
 the test module) at 7988cae: ship 604, journal 764, quota 666, committed 423,
 lease 271 = **2,728**. Must reach 2,319, aim 2,046.
 
-**Result: 2,548 (-180, -6.6%).** Not "must reach": what is left is behaviour
-(below, function by function). Under rustfmt (max_width 120) applied to both
-the base and the result, 3,185 -> 2,989 (-196): the base files are not
-rustfmt-clean (rustfmt adds 457 lines to them), so neither was reformatted
-here; new code follows each file's style and joins no statements.
+**Result: 2,544 (-184, -6.7%).** Not "must reach": what is left is behaviour
+(below, function by function). Formatted with the repo's `rustfmt.toml`
+(base and HEAD copies in a temp dir, counted the CI way), 3,185 -> 2,985
+(-200): the savings are not layout. The base files are not rustfmt-clean
+(rustfmt adds 457 lines to them), so nothing was reformatted in place; new
+code follows each file's style and joins no statements.
 
-| File | 7988cae | trim/storage | Delta |
-|---|---|---|---|
-| ship.rs | 604 | 546 | -58 |
-| journal.rs | 764 | 767 | +3 |
-| quota.rs | 666 | 637 | -29 |
-| committed.rs | 423 | 345 | -78 |
-| lease.rs | 271 | 253 | -18 |
-| **Total** | **2,728** | **2,548** | **-180** |
+| File | 7988cae | trim/storage | Delta | Formatted: base | HEAD | Delta |
+|---|---|---|---|---|---|---|
+| ship.rs | 604 | 546 | -58 | 792 | 713 | -79 |
+| journal.rs | 764 | 763 | -1 | 847 | 851 | +4 |
+| quota.rs | 666 | 637 | -29 | 721 | 695 | -26 |
+| committed.rs | 423 | 345 | -78 | 465 | 388 | -77 |
+| lease.rs | 271 | 253 | -18 | 360 | 338 | -22 |
+| **Total** | **2,728** | **2,544** | **-184** | **3,185** | **2,985** | **-200** |
 
-journal.rs is +3 because `Journal::changes` now builds the version's manifest
-itself (+10), which removed the manifest conversion and a type from
-committed.rs (-28); its own cut, sharing `committed::parent_at`, is -7.
+journal.rs is about even because `Journal::changes` now builds the version's
+manifest itself (+10), which removed the manifest conversion and a type from
+committed.rs (-28); its own cuts (sharing `committed::parent_at`, a cancelled
+record's unread paths) are -11.
 
 ## Duplication found, and what happened to it
 
@@ -42,6 +44,7 @@ committed.rs (-28); its own cut, sharing `committed::parent_at`, is -7.
 | The app's disk twice in an instance's quota | `quota::Inner::disk`, `Park::disk` | 2 | One |
 | One-caller helpers | `quota::QuotaGuard::refuse`, `committed::last`, `lease::Leases::unhold` | 11 | Inlined |
 | Two journal calls (two locks, two checks) after a rename | `QuotaGuard::rename`: `renamed`, then `discard_created` | 3 | One call |
+| Parsing what nothing reads | `journal::undo` read a cancelled rename's two (signed) paths and dropped them | 4 | Not parsed |
 | Test-only code counted as runtime | `impl Default for quota::Disk` | 5 | `#[cfg(test)]`, after the tests |
 
 Left for the coordinator (they span other agents' files; the base has them):
@@ -96,7 +99,7 @@ repeats another.
   before the claim, a discard cut short). `restore`/`install`/`recover`/
   `staging`/`owner`/`own` (~120: B-50x, crash-safe at each cut point, root
   never through a symlink). `pause`/`resume`/`paused` (17).
-- **journal.rs (767).** The undo journal (round 1-2, hardened by N-5 to
+- **journal.rs (763).** The undo journal (round 1-2, hardened by N-5 to
   N-690): records, signing, recovery that resumes, path-length refusal,
   concurrent syncs, the object lifecycle (`place`, `Drop`). Capture adds
   `changes` and the two commit gates. `fd_path`'s macOS branch (10) is the
@@ -123,7 +126,7 @@ round trip per version); the shipper's changed-directory skip (4, CPU per
 ## Tests
 
 Full suite (`env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked -p
-nanovm --no-fail-fast`), at the last runtime change: lib 194 passed (1
+nanovm --no-fail-fast`), at the last runtime change (6e01ca9): lib 194 passed (1
 ignored), configs 1, dev 11, examples 29, integration 128 (14 ignored), js 17:
 all passed, the same counts as beta/integration's final row
 (notes/beta-integration.md) but for `committed_state`'s 2, deleted. SQLite
