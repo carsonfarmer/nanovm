@@ -22,14 +22,6 @@ Runtime is 5,320 lines, above the under-5k goal. Older checkpoint
 counts and candidate designs below are historical, not current delivery claims.
 The line goal guides simplicity; it is not a hard limit or correctness tradeoff.
 
-`cargo run --locked -p nanovm --example committed_state` runs W-9's bounded
-storage-only experiment: immutable versions from the real journal, independent
-receiver processes, ordered/idempotent receipt, interrupted-transfer retry and
-fresh-root recovery after deleting the source. It also demonstrates that a locally
-accepted but unsent write is lost. This is not a runtime replication feature,
-remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
-gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
-
 **Capture and shipping:** optional node `[capture]` configuration captures a
 version at both dirty commit gates: the whole volume every `snapshot_every` (16)
 versions, otherwise what the commit changed (listings of changed directories, new
