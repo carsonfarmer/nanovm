@@ -453,6 +453,51 @@ mod tests {
         out
     }
 
+    /// Redaction through the export client must leave protobuf framing intact,
+    /// even when a secret's bytes coincide with a length rather than log text.
+    #[tokio::test]
+    async fn review_secret_redaction_preserves_otlp_framing() {
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        let batch = collector::logs::v1::ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        body: Some(common::AnyValue { value: Some(common::any_value::Value::StringValue("z".repeat(97))) }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let encoded = batch.encode_to_vec();
+        assert_eq!(collector::logs::v1::ExportLogsServiceRequest::decode(encoded.as_slice()).unwrap(), batch);
+        assert!(stamp("logs", &encoded, "app", "digest").is_ok(), "valid supervisor input");
+        let (captured, mut received) = tokio::sync::mpsc::channel(2);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = Arc::new(Relay::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap());
+        let server = tokio::spawn(crate::server::serve_http1(listener, move |req| {
+            let captured = captured.clone();
+            async move {
+                captured.send(req.into_body().collect().await.unwrap().to_bytes()).await.unwrap();
+                Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            }
+        }));
+        let mut client = Client {
+            runtime: tokio::runtime::Handle::current(), upstream: None, relay: Some(relay), secrets: Default::default(),
+        };
+        let request = || Request::post("http://nanovm/v1/logs").body(Bytes::from(encoded.clone())).unwrap();
+        assert_eq!(client.send_bytes(request()).await.unwrap().status(), 200);
+        let control = received.recv().await.unwrap();
+        assert_eq!(control.as_ref(), encoded.as_slice(), "export without secrets preserves the input");
+        client.secrets = Arc::new(crate::secrets::Secrets([("key".into(), "a".into())].into()));
+        assert_eq!(client.send_bytes(request()).await.unwrap().status(), 200);
+        let redacted = received.recv().await.unwrap();
+        server.abort();
+        let decoded = collector::logs::v1::ExportLogsServiceRequest::decode(redacted.as_ref());
+        assert_eq!(decoded, Ok(batch), "a secret absent from log text must not corrupt OTLP framing");
+    }
+
     /// A worker's 1 MiB batch of 2-byte empty spans costs the supervisor
     /// about its size to stamp, not the 200 MiB that decoding it did (N-74).
     #[test]
