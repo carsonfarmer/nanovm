@@ -83,8 +83,6 @@ pub struct Supervisor {
     /// Links all workers may hold open at once: each costs the supervisor a
     /// file descriptor, and its upstream another.
     links: Arc<tokio::sync::Semaphore>,
-    /// Held while giving a new app its uid.
-    uids: Arc<Mutex<()>>,
     /// To the proxy's private endpoint: publishes, and calls to objects.
     proxy: reqwest::Client,
     leases: Option<Arc<crate::lease::Leases>>,
@@ -102,11 +100,9 @@ pub struct Supervisor {
     started: Instant,
     /// What clients that reach `listen` directly may ask of it.
     pub gate: Arc<crate::gate::Gate>,
-    /// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`).
-    cgroup: Option<PathBuf>,
-    /// Held open: the cgroup its workers run under is its alone (see
-    /// [`Cgroup::take`]).
-    _cgroup_held: Option<std::fs::File>,
+    /// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`),
+    /// held open: it is this supervisor's alone (see [`Cgroup::take`]).
+    cgroup: Option<(PathBuf, std::fs::File)>,
 }
 
 #[derive(Default)]
@@ -128,8 +124,7 @@ struct Worker {
 
 struct Failed {
     at: Instant,
-    digest: String,
-    policy: Policy,
+    want: AppRef,
     why: String,
 }
 
@@ -198,7 +193,7 @@ impl Supervisor {
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
         cfg.secrets.as_deref().map(crate::secrets::check_dir).transpose()?;
-        let cgroup = cgroup(&cfg)?;
+        let cgroup = cgroup(&cfg)?.map(|dir| Cgroup::take(&dir).map(|held| (dir, held))).transpose()?;
         // What deletes an earlier run cut short left.
         let _ = std::fs::remove_dir_all(cfg.data_dir.join("deleted"));
         // Restores a crash cut short, before any worker serves their objects.
@@ -214,7 +209,6 @@ impl Supervisor {
             // A quarter of the fds: half for links and their upstreams, half
             // for clients and the rest.
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
-            uids: Arc::default(),
             relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None, &Default::default())?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
@@ -222,7 +216,6 @@ impl Supervisor {
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
             shipping: Arc::default(),
             backlog: Mutex::default(),
-            _cgroup_held: cgroup.as_deref().map(Cgroup::take).transpose()?,
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
@@ -326,20 +319,19 @@ impl Supervisor {
     /// here first goes to the store, so no acknowledged write is lost; if it
     /// can't, the restore stops, unless `discard` (then it is dropped).
     pub async fn restore(&self, app: &str, object: Option<&str>, to: Option<u64>, discard: bool) -> anyhow::Result<Vec<crate::ship::Restored>> {
-        anyhow::ensure!(crate::table::valid_name(app), "{app:?} is not an app's name");
+        anyhow::ensure!(crate::table::valid_name(app) && object.is_none_or(crate::table::valid_object), "not an app and object");
         let store = self.capture.clone().context("restoring needs a store (capture.store)")?;
         let objects = self.cfg.app_dirs(app)[0].clone();
         if !objects.exists() {
-            let (cfg, name, uids) = (self.cfg.clone(), app.to_owned(), self.uids.clone());
-            tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
+            let (cfg, name) = (self.cfg.clone(), app.to_owned());
+            tokio::task::spawn_blocking(move || app_dirs(&cfg, &name)).await??;
         }
         let ids = match object {
             Some(o) => vec![o.to_owned()],
             None => store.list(app).await?.into_iter().map(|(name, _)| name).collect(),
         };
         let mut done = vec![];
-        for id in ids.iter().filter(|o| object.is_some() || crate::table::valid_object(o)) {
-            anyhow::ensure!(crate::table::valid_object(id), "{id:?} is not an object id");
+        for id in ids.iter().filter(|o| crate::table::valid_object(o)) {
             let restored = self.held(app, Some(id), async || self.restore_object(&*store, app, id, &objects, to, discard).await).await;
             let before = done.iter().map(|r: &crate::ship::Restored| r.object.as_str()).collect::<Vec<_>>().join(", ");
             done.push(restored.with_context(|| format!("restoring {app}/{id} (restored before it: [{before}])"))?);
@@ -414,17 +406,14 @@ impl Supervisor {
             // is let go, as only it lets the version ship.
             let dir = crate::ship::versions(objects, id);
             let ship = async || {
-                let mut shipped = Ok(());
+                let mut shipped = Ok(false);
                 for _ in 0..3 {
-                    shipped = match crate::ship::ship_object(store, self.leases.as_deref(), app, id, &dir, &mut None).await {
-                        Ok(false) => Err(std::io::Error::other("this node holds no lease on it")),
-                        shipped => shipped.map(drop),
-                    };
-                    if shipped.is_ok() {
+                    shipped = crate::ship::ship_object(store, self.leases.as_deref(), app, id, &dir, &mut None).await;
+                    if let Ok(true) = shipped {
                         break;
                     }
                 }
-                shipped
+                shipped?.then_some(()).ok_or_else(|| std::io::Error::other("this node holds no lease on it"))
             };
             if let Err(e) = ship().await
                 && !discard
@@ -605,7 +594,7 @@ impl Supervisor {
         }
         if let Some(f) = &*failed
             && f.at.elapsed() < RESTART_BACKOFF
-            && (&f.digest, &f.policy) == (&want.digest, &want.policy)
+            && (&f.want.digest, &f.want.policy) == (&want.digest, &want.policy)
         {
             return Err(down(&f.why));
         }
@@ -620,8 +609,7 @@ impl Supervisor {
                 let res = down(&why);
                 *failed = Some(Failed {
                     at: Instant::now(),
-                    digest: want.digest.clone(),
-                    policy: want.policy.clone(),
+                    want: want.clone(),
                     why,
                 });
                 Err(res)
@@ -679,7 +667,7 @@ impl Supervisor {
             env: p.spec.env,
             config: p.spec.config,
             secrets,
-            limits: p.spec.limits.clamped(&self.cfg.limits),
+            limits: p.spec.limits.clamped(&self.cfg.limits).0,
             worker: self.cfg.worker.clone(),
         };
         let policy = EgressPolicy::parse(&app.limits.egress, &self.cfg.limits.egress, self.cfg.dev).context("egress")?;
@@ -689,8 +677,8 @@ impl Supervisor {
         };
 
         // Walking directories blocks; this thread serves other requests.
-        let (cfg, name, uids) = (self.cfg.clone(), w.name.clone(), self.uids.clone());
-        let uid = tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
+        let (cfg, name) = (self.cfg.clone(), w.name.clone());
+        let uid = tokio::task::spawn_blocking(move || app_dirs(&cfg, &name)).await??;
 
         let mut spare = self.spare.lock().await.take();
         // One that has died meanwhile is replaced.
@@ -780,19 +768,19 @@ impl Supervisor {
                     }
                 }
                 if req.uri().path().starts_with(crate::telemetry::PATH) {
-                    let Ok(_slot) = slots.try_acquire() else { return verdict_ok(429) };
+                    let Ok(_slot) = slots.try_acquire() else { return verdict(429, "ok") };
                     return telemetry.handle(req, &app, &digest).await
                         .map(|r| r.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync()))
-                        .unwrap_or_else(verdict_ok);
+                        .unwrap_or_else(|status| verdict(status, "ok"));
                 }
                 if req.method() != http::Method::POST || req.uri().path().trim_end_matches('/') != "/publish" {
-                    return verdict_ok(404);
+                    return verdict(404, "ok");
                 }
                 let object = req.headers().get(ws::OBJECT_HEADER).cloned().unwrap_or_else(|| http::HeaderValue::from_static(""));
                 let status = http.post(format!("{proxy}/publish")).header(APP_HEADER, app).header(ws::OBJECT_HEADER, object)
                     .timeout(Duration::from_secs(30)).body(reqwest::Body::wrap(req.into_body())).send().await
                     .map_or(502, |r| r.status().as_u16());
-                verdict_ok(status)
+                verdict(status, "ok")
             }
         }));
 
@@ -835,7 +823,7 @@ impl Supervisor {
         let (requests, worker_requests) = UnixStream::pair()?;
         let (egress, worker_egress) = UnixStream::pair()?;
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
-        let cgroup = self.cgroup.as_deref().map(Cgroup::new).transpose()?;
+        let cgroup = self.cgroup.as_ref().map(|(dir, _)| Cgroup::new(dir)).transpose()?;
         let into = cgroup.as_ref().map(|c| format!(" into {}", c.0.display())).unwrap_or_default();
         let procs = cgroup.as_ref().map(|c| c.0.join("cgroup.procs"));
         let procs = procs.map(|p| std::fs::OpenOptions::new().write(true).open(&p).with_context(|| format!("opening {}", p.display()))).transpose()?;
@@ -1002,19 +990,16 @@ async fn call(http: &reqwest::Client, proxy: &str, app: &str, host: &str, req: R
             res.headers_mut().insert(crate::egress::VERDICT, "ok".parse().unwrap());
             res
         }
-        Err(_) => {
-            let mut res = verdict_ok(502);
-            res.headers_mut().insert(crate::egress::VERDICT, "ConnectionRefused".parse().unwrap());
-            res
-        }
+        Err(_) => verdict(502, "ConnectionRefused"),
     }
 }
 
-/// A forwarded request's answer from the supervisor itself.
-fn verdict_ok(status: u16) -> Response<wasmtime_wasi_http::WasiBody> {
+/// A forwarded request's answer from the supervisor itself, with its
+/// `verdict` for the worker (see `egress::VERDICT`).
+fn verdict(status: u16, verdict: &'static str) -> Response<wasmtime_wasi_http::WasiBody> {
     let mut res = Response::new(Empty::new().map_err(|e| match e {}).boxed_unsync());
     *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
-    res.headers_mut().insert(crate::egress::VERDICT, "ok".parse().unwrap());
+    res.headers_mut().insert(crate::egress::VERDICT, http::HeaderValue::from_static(verdict));
     res
 }
 
@@ -1029,16 +1014,16 @@ fn get(pq: &str) -> Request<Body> {
 /// them the uid the app runs as (returned): the owner of its volumes if it
 /// has any, else the next free one. Ownership is the record, so a uid
 /// survives restarts and config changes.
-fn app_dirs(cfg: &NodeConfig, name: &str, uids: &Mutex<()>) -> anyhow::Result<Option<u32>> {
+fn app_dirs(cfg: &NodeConfig, name: &str) -> anyhow::Result<Option<u32>> {
+    /// Held while giving a new app its uid.
+    static UIDS: Mutex<()> = Mutex::new(());
     use std::os::unix::fs::MetadataExt;
     let volume = cfg.app_dirs(name)[0].clone();
-    std::fs::create_dir_all(&volume)?;
-    let ownership = std::fs::File::open(&volume)?;
-    ownership.try_lock().context("app storage is already owned or cannot be locked")?;
+    let _ownership = crate::app::lock(&volume)?;
     let uid = if unsafe { libc::geteuid() } != 0 {
         None
     } else {
-        let _one_at_a_time = uids.lock();
+        let _one_at_a_time = UIDS.lock();
         let base = cfg.jail_uid_base;
         let objects = cfg.data_dir.join("objects");
         let owner = |p: &Path| std::fs::metadata(p).ok().map(|m| m.uid()).filter(|&u| u >= base);
@@ -1133,32 +1118,31 @@ fn delegate(limits: &WorkerLimits) -> anyhow::Result<PathBuf> {
         bail!("the {c} controller is not available in {}", own.display());
     }
     let enable: Vec<_> = wanted.iter().filter(|(_, on)| *on).map(|(c, _)| format!("+{c}")).collect();
-    let write = |dir: &Path, file: &str, value: &str| {
-        std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(file), value)).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
-    };
     write(&own.join("supervisor"), "cgroup.procs", "0")?;
     write(&own, "cgroup.subtree_control", &enable.join(" "))?;
     write(&own.join("workers"), "cgroup.subtree_control", &enable.join(" "))?;
     Ok(own.join("workers"))
 }
 
+/// Writes `value` to cgroup `dir`'s `file`, making `dir` first if need be.
+fn write(dir: &Path, file: &str, value: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(file), value)).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
+}
+
 /// Gives a worker's cgroup its app's worker limits.
 fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
-    let set = |file: &str, value: String| {
-        std::fs::write(dir.join(file), &value).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
-    };
     if w.memory_mb > 0 {
         // A limit below what the worker holds already (its engine) would OOM-kill it.
         let held = std::fs::read_to_string(dir.join("memory.current")).ok().and_then(|m| m.trim().parse::<u64>().ok());
         let held = held.unwrap_or_default().div_ceil(1 << 20);
         anyhow::ensure!(held < w.memory_mb, "[worker] memory_mb = {} is below the {held} MiB a worker holds before it has an app", w.memory_mb);
-        set("memory.max", (w.memory_mb << 20).to_string())?;
+        write(dir, "memory.max", &(w.memory_mb << 20).to_string())?;
     }
     if w.cpus > 0.0 {
-        set("cpu.max", format!("{} 100000", (w.cpus * 100_000.0) as u64))?;
+        write(dir, "cpu.max", &format!("{} 100000", (w.cpus * 100_000.0) as u64))?;
     }
     if w.pids > 0 {
-        set("pids.max", w.pids.to_string())?;
+        write(dir, "pids.max", &w.pids.to_string())?;
     }
     Ok(())
 }
@@ -1166,20 +1150,18 @@ fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
 /// Counts what waits on the node to be shipped every 10 s, while the
 /// supervisor lives, for its snapshots, and says so when versions start to
 /// wait, every minute while they do, and when none does again.
-async fn count_backlog(sup: std::sync::Weak<Supervisor>) {
+async fn count_backlog(sup: std::sync::Weak<Supervisor>) -> Option<()> {
     let mut said = None::<Instant>;
     loop {
-        let Some(objects) = sup.upgrade().map(|s| s.cfg.data_dir.join("objects")) else { return };
-        let Ok(b) = tokio::task::spawn_blocking(move || crate::ship::backlog(&objects)).await else { return };
+        let objects = sup.upgrade()?.cfg.data_dir.join("objects");
+        let b = tokio::task::spawn_blocking(move || crate::ship::backlog(&objects)).await.ok()?;
         if b.versions > 0 && said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
             eprintln!("nanovm: {} versions ({} bytes) of {} objects wait to be shipped", b.versions, b.bytes, b.objects);
             said = Some(Instant::now());
         } else if b.versions == 0 && said.take().is_some() {
             eprintln!("nanovm: every version is shipped");
         }
-        let Some(s) = sup.upgrade() else { return };
-        *s.backlog.lock() = b;
-        drop(s);
+        *sup.upgrade()?.backlog.lock() = b;
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }
@@ -1248,7 +1230,7 @@ mod tests {
         let ownership = std::fs::File::open(&objects).unwrap();
         ownership.try_lock().unwrap();
         let before = ownership.metadata().unwrap();
-        let result = app_dirs(&cfg, "app", &Mutex::new(()));
+        let result = app_dirs(&cfg, "app");
         let after = ownership.metadata().unwrap();
         let untouched = !tmp.exists() && !cache.exists() && (before.uid(), before.gid()) == (after.uid(), after.gid());
         drop(ownership);
@@ -1261,7 +1243,7 @@ mod tests {
     /// verdict a worker trusts.
     #[test]
     fn verdicts_mark_the_supervisors_answers() {
-        let res = verdict_ok(204);
+        let res = verdict(204, "ok");
         assert_eq!(res.status(), 204);
         assert_eq!(res.headers()[crate::egress::VERDICT], "ok");
     }

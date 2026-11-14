@@ -44,11 +44,8 @@ pub fn listen(cfg: &NodeConfig) -> anyhow::Result<tokio::net::UnixListener> {
     // SAFETY: geteuid has no preconditions.
     anyhow::ensure!(md.is_dir() && md.uid() == unsafe { libc::geteuid() }, "{} is not the supervisor's own directory", dir.display());
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(e.into());
-    }
+    // An earlier run's; if it can't go, binding says so.
+    let _ = std::fs::remove_file(&path);
     short(&path, |p| tokio::net::UnixListener::bind(p))
 }
 
