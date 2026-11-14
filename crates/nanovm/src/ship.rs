@@ -1217,6 +1217,27 @@ mod tests {
         hex(&bytes)
     }
 
+    /// Deleting an object also deletes its remote head. A recreated version
+    /// must repopulate the store even when its bytes match the deleted one.
+    #[tokio::test]
+    async fn review_recreated_identical_object_is_actually_shipped() {
+        let base = tempdir("recreated-identical");
+        let store = Dir(base.join("store"));
+        let dir = versions(&base.join("node/objects/app"), "o");
+        let mut known = None;
+        let first = version(&dir, 1, 0, "", "one");
+        ship_object(&store, None, "app", "o", &dir, &mut known).await.unwrap();
+        assert_eq!(head(&store, "app", "o").await.unwrap().0.sequence, 1);
+        store.remove("app/o").await.unwrap();
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+        assert_eq!(version(&dir, 1, 0, "", "one"), first);
+        ship_object(&store, None, "app", "o", &dir, &mut known).await.unwrap();
+        assert_eq!(shipped(&dir), 1);
+        let actual = head(&store, "app", "o").await.unwrap().0.sequence;
+        std::fs::remove_dir_all(base).unwrap();
+        assert_eq!(actual, 1, "the shipper marked a recreated version shipped without repopulating the store");
+    }
+
     /// What object `object` of `app` holds, restored from `store` on a fresh
     /// root: the text of its version, or why not.
     async fn restored(store: &dyn Store, object: &str, root: &Path) -> Result<String, String> {
