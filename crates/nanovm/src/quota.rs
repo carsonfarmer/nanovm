@@ -1087,6 +1087,33 @@ mod tests {
         assert_eq!(disk.idle.lock().len(), 1, "only the nonzero durable object needs retained accounting");
     }
 
+    /// Check admission against actual filesystem headroom without writing
+    /// any data or filling the filesystem.
+    #[test]
+    fn review3_growth_grants_preserve_the_disk_reserve() {
+        let dir = tempdir("review3-reserve-grant");
+        let fs = std::fs::File::open(&dir).unwrap();
+        let st = rustix::fs::fstatvfs(&fs).unwrap();
+        let free = st.f_bavail * st.f_frsize;
+        assert!(free > 1 << 20, "test needs at least 1 MiB free, found {free}");
+        let disk = Disk { fs: Some(fs), reserve: free / 2, ..Disk::default() };
+        assert!(disk.low().is_none(), "the filesystem starts above the reserve");
+        let (granted, _) = disk.grant(free);
+        let headroom = free - disk.reserve;
+        // Independent controls: no growth is allowed below the reserve,
+        // and the app budget still cuts partial grants correctly.
+        let below = Disk { fs: Some(std::fs::File::open(&dir).unwrap()), reserve: u64::MAX, ..Disk::default() };
+        assert_eq!(below.grant(1).0, 0);
+        assert_eq!(below.grant(0).0, 0);
+        let budget = Disk { max: 10, ..Disk::default() };
+        assert_eq!(budget.grant(12).0, 10);
+        assert_eq!(budget.grant(1).0, 0);
+        budget.add(-4);
+        assert_eq!(budget.grant(5).0, 4);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(granted <= headroom, "growth grant {granted} exceeds measured headroom {headroom} above reserve {} (free {free})", disk.reserve);
+    }
+
     /// Below the node's reserve nothing grows and nothing new is made, but
     /// files are still overwritten in place and shrunk.
     #[test]
