@@ -183,6 +183,33 @@ mod tests {
         assert_eq!(masked, format!("x {} and {}, é", "*".repeat(11), "*".repeat(9)));
     }
 
+    /// The host, not the guest, Debug-escapes HTTP error payloads before
+    /// redaction. That must not expose a literal secret containing escapes.
+    #[tokio::test]
+    async fn review_guest_error_redaction_masks_host_escaped_secrets() {
+        use http_body_util::BodyExt;
+        use wasmtime_wasi_http::p3::bindings::http::types::ErrorCode;
+        let secret = "credential-line-one\ncredential-line-two";
+        let secrets = Secrets([("key".into(), secret.into())].into());
+        assert_eq!(secrets.masked(secret.into()), "*".repeat(secret.len()), "literal control is masked");
+        let ordinary = "ordinary diagnostic";
+        let ordinary_code = ErrorCode::InternalError(Some(ordinary.into()));
+        assert!(secrets.masked(format!("{ordinary_code:?}")).contains(ordinary), "non-secret detail remains useful");
+
+        let code = ErrorCode::InternalError(Some(secret.into()));
+        // This is the error formatting/redaction/JSON response sequence in
+        // object::serve's guest-error branch, using its real error type.
+        let response = crate::object::error_response(500, "guest-error", &secrets.masked(format!("{code:?}")));
+        assert_eq!(response.status(), 500);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "guest-error");
+        let detail = json["detail"].as_str().unwrap();
+        let escaped = format!("{secret:?}");
+        assert!(!detail.contains(&escaped), "host Debug escaping must not preserve the secret in the client error detail");
+        assert!(detail.contains(&"*".repeat(secret.len())), "the guest error's secret payload is masked");
+    }
+
     /// The directory must be the owner's alone.
     #[test]
     fn the_directory_is_private() {
