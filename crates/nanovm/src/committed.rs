@@ -111,11 +111,6 @@ pub(crate) fn list(dir: &Path) -> io::Result<(Vec<(u64, u64)>, Vec<String>)> {
     Ok((versions, staged))
 }
 
-/// The last version published in `dir` (0: none).
-fn last(dir: &Path) -> io::Result<u64> {
-    Ok(list(dir)?.0.last().map_or(0, |v| v.0))
-}
-
 struct Bounded {
     file: File,
     remaining: u64,
@@ -233,7 +228,7 @@ pub(super) fn prepare(
 /// has replaced, and returns its sequence. Recovery does it again if the
 /// rename is lost.
 pub(super) fn publish(out: &Path, key: &[u8; 8]) -> io::Result<u64> {
-    let next = last(out)? + 1;
+    let next = list(out)?.0.last().map_or(0, |v| v.0) + 1;
     fs::rename(out.join(format!("{next:020}{}", decided_by(key))), out.join(filename(next)))?;
     Ok(next)
 }

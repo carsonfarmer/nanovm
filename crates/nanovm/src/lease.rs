@@ -25,7 +25,7 @@
 //! `objects/<app>/<object>` `{node, session, epoch}`, with no node once
 //! released. Deleting a record restarts its epochs: never do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -216,13 +216,6 @@ impl Leases {
         self.held.lock().insert(key.into(), grant);
     }
 
-    fn unhold(&self, key: &str, grant: &Grant) {
-        let mut held = self.held.lock();
-        if held.get(key).is_some_and(|g| g.epoch == grant.epoch) {
-            held.remove(key);
-        }
-    }
-
     /// The epoch of the lease this node holds on `key`, live: held by a
     /// worker, and in this node's session, which hasn't lapsed.
     pub fn epoch(&self, key: &str) -> Option<u64> {
@@ -232,7 +225,11 @@ impl Leases {
 
     /// Gives up the lease `grant` took on `key`, unless it has moved on.
     pub async fn release(&self, key: &str, grant: &Grant) {
-        self.unhold(key, grant);
+        if let Entry::Occupied(held) = self.held.lock().entry(key.into())
+            && held.get().epoch == grant.epoch
+        {
+            held.remove();
+        }
         let version = UpdateVersion { e_tag: grant.e_tag.clone(), version: grant.version.clone() };
         let released = ObjectRecord { node: String::new(), session: 0, epoch: grant.epoch };
         let _ = self.put(&format!("objects/{key}"), &released, Some(&version)).await;
