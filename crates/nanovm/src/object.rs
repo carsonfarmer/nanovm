@@ -433,10 +433,8 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
         table,
         http,
         hooks: EgressHooks {
-            route: app.egress.clone(),
             node: Arc::downgrade(node),
             sem: Arc::new(Semaphore::new(limits.max_outbound_concurrency)),
-            metrics: node.metrics.clone(),
             obj: shared.clone(),
             held: Default::default(),
             publish_max: (limits.max_response_body_kb << 10) as usize,
@@ -507,10 +505,10 @@ enum Exit {
 /// changes stand whether or not a publish gets through). Only while the node
 /// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route, node, shared) = acc.with(|mut s| {
+    let (quota, held, node, shared) = acc.with(|mut s| {
         let s = s.data_mut();
         let held = std::mem::take(&mut *s.hooks.held.lock());
-        (s.quota.clone(), held, s.hooks.route.clone(), s.hooks.node.clone(), s.shared.clone())
+        (s.quota.clone(), held, s.hooks.node.clone(), s.shared.clone())
     });
     // Only while the node holds the object's lease (see `Journal::commit`):
     // otherwise neither its changes nor its publishes go out. Its time is
@@ -521,7 +519,7 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
     shared.set_phase(Phase::PostReturn);
     committed?;
     let id = shared.id.clone();
-    if !held.is_empty() {
+    if !held.is_empty() && let Some(node) = node.upgrade() {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {
             for body in held {
@@ -529,16 +527,13 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
                 // it reaches only that object's sockets.
                 let req = http::Request::post(format!("http://{}/publish", crate::ws::PUBLISH_HOST));
                 let req = req.header(crate::ws::OBJECT_HEADER, &*id).body(body).expect("ids are header-safe");
-                match (&route, node.upgrade()) {
-                    (crate::egress::Route::Supervisor(up), _) => {
+                match &node.app.egress {
+                    crate::egress::Route::Supervisor(up) => {
                         if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
                             let _ = res.into_body().collect().await;
                         }
                     }
-                    (crate::egress::Route::Direct(_), Some(node)) => {
-                        node.sockets.publish(req.map(Full::new)).await;
-                    }
-                    _ => {}
+                    crate::egress::Route::Direct(_) => _ = node.sockets.publish(req.map(Full::new)).await,
                 }
             }
         })
@@ -953,6 +948,26 @@ fn classify(store: &Store<ObjState>, e: &wasmtime::Error) -> Exit {
         return Exit::Poisoned(Poison::Trap, with_tail(format!("trap: {trap}")));
     }
     Exit::Poisoned(Poison::Trap, with_tail(format!("{e:#}")))
+}
+
+/// `body`, holding `guard` until it is dropped.
+pub fn holding<B, G>(body: B, guard: G) -> UnsyncBoxBody<Bytes, B::Error>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    G: Send + 'static,
+{
+    body.map_frame(move |f| {
+        let _ = &guard;
+        f
+    })
+    .boxed_unsync()
+}
+
+/// An answer with `status` and no body.
+pub fn empty_response<E: 'static>(status: u16) -> http::Response<UnsyncBoxBody<Bytes, E>> {
+    let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
+    *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
+    res
 }
 
 pub fn error_response(status: u16, reason: &str, detail: &str) -> http::Response<RespBody> {

@@ -16,7 +16,6 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use wasmtime_wasi_http::{Error, RequestOptions, WasiBody, WasiHttpHooks};
 
-use crate::metrics::Metrics;
 
 #[derive(Debug, Clone)]
 enum HostPat {
@@ -153,11 +152,9 @@ pub(crate) const CALLS: &str = "/objects/";
 pub const CALLERS: &str = "nanovm-callers";
 
 pub struct EgressHooks {
-    pub route: Route,
-    /// The node, for calls to other objects of the app.
+    /// The node, for its app's egress and calls to other objects of the app.
     pub node: std::sync::Weak<crate::table::Node>,
     pub sem: Arc<Semaphore>,
-    pub metrics: Arc<Metrics>,
     pub obj: Arc<crate::object::ObjShared>,
     /// The bodies of publishes to the object's sockets, held until its
     /// request commits (see [`hold`]).
@@ -166,29 +163,31 @@ pub struct EgressHooks {
 }
 
 type IoFuture = Box<dyn Future<Output = Result<(), Error>> + Send>;
+type Sent = (http::Response<WasiBody>, IoFuture);
+
+/// What a request that has no connection of its own is done with.
+fn done() -> IoFuture {
+    Box::new(async { Ok(()) })
+}
 
 impl WasiHttpHooks for EgressHooks {
     fn send_request(
         &mut self,
-        request: http::Request<WasiBody>,
+        mut request: http::Request<WasiBody>,
         options: Option<RequestOptions>,
         _fut: Box<dyn Future<Output = Result<(), Error>> + Send>,
-    ) -> Box<dyn Future<Output = Result<(http::Response<WasiBody>, IoFuture), Error>> + Send> {
-        let route = self.route.clone();
-        let sem = self.sem.clone();
-        let metrics = self.metrics.clone();
-        let obj = self.obj.clone();
-        if request.uri().host() == Some(crate::ws::PUBLISH_HOST)
-            && [crate::telemetry::PATH, crate::lease::PATH].iter().any(|p| request.uri().path().starts_with(p))
-        {
-            return Box::new(async { Err(Error::HttpRequestDenied) });
-        }
-        let internal = request.uri().host() == Some(crate::ws::PUBLISH_HOST) && request.uri().path().starts_with(CALLS);
-        if !internal && request.uri().host() == Some(crate::ws::PUBLISH_HOST) {
+    ) -> Box<dyn Future<Output = Result<Sent, Error>> + Send> {
+        let (node, sem, obj) = (self.node.clone(), self.sem.clone(), self.obj.clone());
+        let ours = request.uri().host() == Some(crate::ws::PUBLISH_HOST);
+        let internal = ours && request.uri().path().starts_with(CALLS);
+        if ours && !internal {
+            // The supervisor's own routes; anything else is a publish.
+            if [crate::telemetry::PATH, crate::lease::PATH].iter().any(|p| request.uri().path().starts_with(p)) {
+                return Box::new(async { Err(Error::HttpRequestDenied) });
+            }
             let (held, max) = (self.held.clone(), self.publish_max);
-            return Box::new(async move { Ok((hold(request, &held, max).await, Box::new(async { Ok(()) }) as IoFuture)) });
+            return Box::new(async move { Ok((hold(request, &held, max).await, done())) });
         }
-        let node = self.node.clone();
         Box::new(async move {
             use opentelemetry::{KeyValue, propagation::TextMapPropagator, trace::{Span, SpanKind, TraceContextExt}};
             let node = node.upgrade().ok_or(Error::ConnectionTerminated)?;
@@ -197,7 +196,6 @@ impl WasiHttpHooks for EgressHooks {
             span.set_attribute(KeyValue::new("http.request.method", request.method().as_str().chars().take(32).collect::<String>()));
             span.set_attribute(KeyValue::new("url.path", request.uri().path().chars().take(1024).collect::<String>()));
             let context = parent.with_remote_span_context(span.span_context().clone());
-            let mut request = request;
             if internal {
                 request.extensions_mut().insert(context.clone());
             } else {
@@ -209,34 +207,26 @@ impl WasiHttpHooks for EgressHooks {
             let target = (!internal).then(|| request.uri().clone());
             let res = async {
                 if internal {
-                    return Ok((call(&node, sem, &obj, request, &mut span).await?, Box::new(async { Ok(()) }) as IoFuture));
+                    return Ok((call(&node, sem, &obj, request, &mut span).await?, done()));
                 }
                 let permit = sem.try_acquire_owned().map_err(|_| Error::ConnectionLimitReached)?;
-                let (res, conn) = match route {
-                    Route::Direct(policy) => send(request, options, &policy).await?,
+                let (res, conn) = match &node.app.egress {
+                    Route::Direct(policy) => send(request, options, policy).await?,
                     Route::Supervisor(up) => forward(request, options, up).await?,
                 };
                 // The permit lives as long as the response body, so a guest
                 // holding bodies open holds that many connections.
-                let res = res.map(|b| {
-                    b.map_frame(move |f| {
-                        let _ = &permit;
-                        f
-                    })
-                    .boxed_unsync()
-                });
-                let io: IoFuture = Box::new(conn);
-                Ok((res, io))
+                Ok((res.map(|b| crate::object::holding(b, permit)), conn))
             }
             .await;
             let mut span = scopeguard::ScopeGuard::into_inner(span);
             client_response(&mut span, res.as_ref().map(|(response, _)| response), internal);
             if internal { return res; }
             if let Err(e) = &res {
-                metrics.egress_denied.fetch_add(1, Relaxed);
-                metrics.event("egress-denied", &obj.id, format!("{} → {e}", target.as_ref().and_then(|uri| uri.host()).unwrap_or("")), &context);
+                node.metrics.egress_denied.fetch_add(1, Relaxed);
+                node.metrics.event("egress-denied", &obj.id, format!("{} → {e}", target.as_ref().and_then(|uri| uri.host()).unwrap_or("")), &context);
             } else {
-                metrics.egress_allowed.fetch_add(1, Relaxed);
+                node.metrics.egress_allowed.fetch_add(1, Relaxed);
             }
             res
         })
@@ -291,8 +281,7 @@ async fn call(
                     .inject_context(cx, &mut opentelemetry_http::HeaderInjector(&mut parts.headers));
             }
             let req = http::Request::from_parts(parts, http_body_util::Full::new(body).map_err(|e| match e {}).boxed_unsync());
-            let (res, _) = forward(req, None, up.clone()).await?;
-            res
+            forward(req, None, up).await?.0
         }
         _ => {
             parts.uri = format!("http://{}/{}", crate::ws::PUBLISH_HOST, path.trim_start_matches('/'))
@@ -302,13 +291,7 @@ async fn call(
         }
     };
     // The permit lives as long as the response body, as for any request.
-    Ok(res.map(|b| {
-        b.map_frame(move |f| {
-            let _ = &permit;
-            f
-        })
-        .boxed_unsync()
-    }))
+    Ok(res.map(|b| crate::object::holding(b, permit)))
 }
 
 fn cancelled(mut span: crate::telemetry::Span) {
@@ -319,22 +302,21 @@ fn cancelled(mut span: crate::telemetry::Span) {
 
 fn client_response<B>(span: &mut crate::telemetry::Span, result: Result<&http::Response<B>, &Error>, internal: bool) {
     use opentelemetry::{KeyValue, trace::{Span, Status}};
-    match result {
+    let error = match result {
+        Ok(res) if internal => {
+            crate::telemetry::response(span, res);
+            res.status().is_client_error().then(|| res.status().as_u16().to_string())
+        }
         Ok(res) => {
-            if internal {
-                crate::telemetry::response(span, res);
-            } else {
-                span.set_attribute(KeyValue::new("http.response.status_code", res.status().as_u16() as i64));
-            }
-            if res.status().is_client_error() || (!internal && res.status().is_server_error()) {
-                span.set_status(Status::error(""));
-                span.set_attribute(KeyValue::new("error.type", res.status().as_u16().to_string()));
-            }
+            let status = res.status();
+            span.set_attribute(KeyValue::new("http.response.status_code", status.as_u16() as i64));
+            (status.is_client_error() || status.is_server_error()).then(|| status.as_u16().to_string())
         }
-        Err(e) => {
-            span.set_status(Status::error(""));
-            span.set_attribute(KeyValue::new("error.type", format!("{e:?}")));
-        }
+        Err(e) => Some(format!("{e:?}")),
+    };
+    if let Some(error) = error {
+        span.set_status(Status::error(""));
+        span.set_attribute(KeyValue::new("error.type", error));
     }
 }
 
@@ -354,7 +336,7 @@ async fn hold(
     } else {
         match http_body_util::Limited::new(req.into_body(), max).collect().await.map(|b| b.to_bytes()) {
             Err(_) => 413,
-            Ok(body) if !crate::ws::well_formed(&body) => 400,
+            Ok(body) if crate::ws::messages(&body).is_none() => 400,
             Ok(body) => {
                 let mut held = held.lock();
                 if held.iter().map(size).sum::<usize>() + size(&body) > max {
@@ -366,35 +348,23 @@ async fn hold(
             }
         }
     };
-    let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
-    *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
-    res
+    crate::object::empty_response(status)
 }
 
-type Sent = (http::Response<WasiBody>, futures::future::BoxFuture<'static, Result<(), Error>>);
-
 /// Hands a request to the supervisor and maps its verdict back to the error
-/// the guest would have seen from a direct send.
-async fn forward(mut req: http::Request<WasiBody>, options: Option<RequestOptions>, up: Upstream) -> Result<Sent, Error> {
-    let h = req.headers_mut();
-    for (name, d) in [
-        (CONNECT_TIMEOUT, options.and_then(|o| o.connect_timeout)),
-        (FIRST_BYTE_TIMEOUT, options.and_then(|o| o.first_byte_timeout)),
-    ] {
-        h.remove(name);
+/// the guest would have seen from a direct send. A timeout header the guest
+/// sent itself is as good as the option it could have set.
+async fn forward(mut req: http::Request<WasiBody>, options: Option<RequestOptions>, up: &Upstream) -> Result<Sent, Error> {
+    let options = options.unwrap_or_default();
+    for (name, d) in [(CONNECT_TIMEOUT, options.connect_timeout), (FIRST_BYTE_TIMEOUT, options.first_byte_timeout)] {
         if let Some(d) = d {
-            h.insert(name, d.as_millis().to_string().parse().unwrap());
+            req.headers_mut().insert(name, (d.as_millis() as u64).into());
         }
     }
     let mut res = up.send(req).await.map_err(|_| Error::ConnectionTerminated)?;
-    let verdict = res.headers_mut().remove(VERDICT);
-    match verdict.as_ref().map(|v| v.as_bytes()) {
-        Some(b"ok") => Ok((
-            res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync()),
-            Box::pin(async { Ok(()) }),
-        )),
-        Some(name) => Err(error_named(name)),
-        None => Err(Error::ConnectionTerminated),
+    match res.headers_mut().remove(VERDICT) {
+        Some(v) if v == "ok" => Ok((res.map(|b| b.map_err(|_| Error::ConnectionTerminated).boxed_unsync()), done())),
+        v => Err(error_named(v.as_ref().map_or(b"", |v| v.as_bytes()))),
     }
 }
 
@@ -435,20 +405,15 @@ pub async fn serve_forwarded(
         first_byte_timeout: ms(FIRST_BYTE_TIMEOUT),
         between_bytes_timeout: None,
     };
-    match send(req, Some(options), policy).await {
-        Ok((mut res, _conn)) => {
-            res.headers_mut().insert(VERDICT, "ok".parse().unwrap());
-            res
-        }
+    let (mut res, verdict) = match send(req, Some(options), policy).await {
+        Ok((res, _conn)) => (res, http::HeaderValue::from_static("ok")),
         Err(e) => {
-            let name = format!("{e:?}");
-            let name = name.split(['(', ' ', '{']).next().unwrap_or("ConnectionTerminated");
-            let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
-            *res.status_mut() = http::StatusCode::BAD_GATEWAY;
-            res.headers_mut().insert(VERDICT, name.parse().unwrap());
-            res
+            let name = format!("{e:?}").split(['(', ' ', '{']).next().unwrap_or_default().parse().unwrap();
+            (crate::object::empty_response(502), name)
         }
-    }
+    };
+    res.headers_mut().insert(VERDICT, verdict);
+    res
 }
 
 /// Checks `req` against `policy` and the IP filter, then sends it. The
@@ -520,8 +485,7 @@ async fn send(mut req: http::Request<WasiBody>, options: Option<RequestOptions>,
         .await
         .map_err(|_| Error::ConnectionReadTimeout)??;
     let res = res.map(|b| b.map_err(Error::from).boxed_unsync());
-    let conn = async move { conn.await.map_err(|_| Error::ConnectionTerminated)?.map_err(Error::from) };
-    Ok((res, Box::pin(conn)))
+    Ok((res, Box::new(async move { conn.await.map_err(|_| Error::ConnectionTerminated)?.map_err(Error::from) })))
 }
 
 /// One TLS client config for every request: building it parses the whole

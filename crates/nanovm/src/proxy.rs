@@ -32,14 +32,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail, ensure};
 use http::header::{CONNECTION, PROXY_AUTHORIZATION, TE, TRAILER, UPGRADE};
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use oci_spec::distribution::Reference;
 use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 
 use crate::config::ProxyConfig;
-use crate::object::{RespBody, error_response};
+use crate::object::{RespBody, empty_response, error_response};
 use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
 use crate::ws::{self, Sockets};
 
@@ -362,15 +362,12 @@ impl Proxy {
             let (proxy, host, name, object) = (proxy.clone(), host.clone(), name.clone(), target.clone());
             Box::pin(async move {
                 let event = async {
-                    let Ok((current, headers)) = proxy.resolve(&host).await else { return ws::Reply::Bad(502) };
-                    if current != name { return ws::Reply::Bad(502) }
+                    let (current, headers) = proxy.resolve(&host).await.map_err(|_| 502u16)?;
+                    if current != name { return Err(502) }
                     req.headers_mut().extend(headers);
-                    match proxy.send(&name, &object, req).await {
-                        Ok(res) => ws::answer(res, max).await,
-                        Err(_) => ws::Reply::Bad(502),
-                    }
+                    ws::answer(proxy.send(&name, &object, req).await.map_err(|_| 502u16)?, max).await
                 };
-                tokio::time::timeout(Duration::from_secs(240), event).await.unwrap_or(ws::Reply::Bad(502))
+                tokio::time::timeout(Duration::from_secs(240), event).await.unwrap_or(Err(502))
             })
         });
         sockets.upgrade(object, req, deliver).await
@@ -384,7 +381,7 @@ impl Proxy {
         let status = if req.method() != http::Method::POST || req.uri().path() != "/publish" { 404 }
             else if let Some(s) = sockets { s.publish(req).await }
             else { 200 };
-        Response::builder().status(status).body(Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap()
+        empty_response(status)
     }
 
     /// A node's call to an object of its app (see `supervisor::call`), sent on

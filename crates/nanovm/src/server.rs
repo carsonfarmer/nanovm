@@ -18,7 +18,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::object::{BoxError, RespBody, error_response};
+use crate::object::{BoxError, RespBody, empty_response, error_response};
 use crate::table::{BAD_OBJECT, Node, route};
 
 /// Serves HTTP/1.1 on every connection `listener` accepts.
@@ -178,34 +178,20 @@ where
         return error_response(400, "bad-object-id", BAD_OBJECT);
     };
     let rest = if rest.is_empty() { "/" } else { rest };
-    let pq = match req.uri().query() {
-        Some(q) => format!("{rest}?{q}"),
-        None => rest.to_string(),
-    };
-
+    let pq = req.uri().query().map_or_else(|| rest.to_string(), |q| format!("{rest}?{q}"));
     let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
     let (mut parts, body) = req.into_parts();
     let body = match Limited::new(Paced::new(body), limit).collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) if timed_out(&*e) => return body_timeout(),
-        Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
-            return error_response(
-                413,
-                "request-too-large",
-                &format!("max_request_body_kb is {}", limit >> 10),
-            );
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+            return error_response(413, "request-too-large", &format!("max_request_body_kb is {}", limit >> 10));
         }
         Err(e) => return error_response(400, "bad-request-body", &e.to_string()),
     };
-    let host = parts
-        .headers
-        .get(http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
-    parts.uri = match format!("http://{host}{pq}").parse() {
-        Ok(u) => u,
-        Err(_) => return error_response(400, "bad-uri", &pq),
-    };
+    let host = parts.headers.get(http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost");
+    let Ok(uri) = format!("http://{host}{pq}").parse() else { return error_response(400, "bad-uri", &pq) };
+    parts.uri = uri;
     node.dispatch(id, Request::from_parts(parts, body)).await
 }
 
@@ -213,32 +199,28 @@ pub fn ok_json(v: serde_json::Value) -> Response<RespBody> {
     Response::builder()
         .header("content-type", "application/json")
         .header("cache-control", "no-store")
-        .body(full(v.to_string()))
+        .body(Full::new(Bytes::from(v.to_string())).map_err(|e| match e {}).boxed_unsync())
         .unwrap()
-}
-
-fn full(b: impl Into<Bytes>) -> RespBody {
-    Full::new(b.into()).map_err(|e| match e {}).boxed_unsync()
 }
 
 async fn admin(node: &Arc<Node>, path: &str, headers: &http::HeaderMap) -> Response<RespBody> {
     match path {
-        "/ready" => Response::builder().status(204).body(full("")).unwrap(),
+        "/ready" => empty_response(204),
         "/lease" => {
             let session = headers.get(crate::lease::SESSION).and_then(|s| s.to_str().ok()?.split_once(' '));
             if let Some((Ok(id), Ok(until))) = session.map(|(i, u)| (i.parse(), u.parse())) {
                 node.renewed(id, until);
             }
-            Response::builder().status(204).body(full("")).unwrap()
+            empty_response(204)
         }
         p if p.starts_with("/evict/") => {
             node.evict(&p["/evict/".len()..]).await;
-            Response::builder().status(204).body(full("")).unwrap()
+            empty_response(204)
         }
         "/flush" => {
             let telemetry = node.telemetry.clone();
             let ok = tokio::task::spawn_blocking(move || telemetry.flush()).await.is_ok_and(|r| r.is_ok());
-            Response::builder().status(if ok { 204 } else { 503 }).body(full("")).unwrap()
+            empty_response(if ok { 204 } else { 503 })
         }
         _ => error_response(404, "not-found", path),
     }
