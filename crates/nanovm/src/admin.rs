@@ -65,12 +65,10 @@ pub async fn serve(listener: tokio::net::UnixListener, sup: Weak<Supervisor>) {
             let (read, mut write) = conn.into_split();
             let mut line = Vec::new();
             let _ = tokio::io::BufReader::new(read).take(MAX_LINE).read_until(b'\n', &mut line).await;
-            let reply = match serde_json::from_slice::<Vec<String>>(&line) {
-                Ok(args) => match sup.command(&args).await {
-                    Ok(v) => serde_json::json!({ "ok": v }),
-                    Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
-                },
-                Err(e) => serde_json::json!({ "error": format!("a command is a JSON array of strings: {e}") }),
+            let args = serde_json::from_slice::<Vec<String>>(&line).context("a command is a JSON array of strings");
+            let reply = match async { sup.command(&args?).await }.await {
+                Ok(v) => serde_json::json!({ "ok": v }),
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
             };
             let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
         });

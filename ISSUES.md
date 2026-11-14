@@ -944,6 +944,22 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the test gives the private listener a free port too.
 - **Status:** fixed on `beta/limits`
 
+### N-901 (tests): no test reaches the receiving node's check of a call cycle
+- **Where:** `table.rs` (`Node::enqueue`: a request whose `nanovm-callers` the object waits on, here, is refused 508)
+- **Scenario:** found by the node trim pass (`trim/node`), moving the check from `dispatch` into `enqueue`. With it disabled, every test passes, at 7988cae as well: `nodes::calls_reach_objects_on_other_nodes_and_cycles_across_nodes_are_refused` closes its cycle along one chain of calls, which the calling node refuses first (`wait_for`: the callee is among its own callers). The receiving node's check matters for a cycle that closes through waits on the receiving node, not along the chain: `y` (node B) serves a client's request and calls `t` (node A) while `t` waits on `s` (A), whose call to `y` waits behind that request. B lets `y`'s call through (`y` has no callers), and only A knows that `t` waits, through `s`, on `y`. Without the check the call waits for its request timeout.
+- **Suggestion:** a two-node test of that shape, expecting 508 at once.
+- **Status:** open
+
+### N-902 (trim): code the node's files repeat in storage's and edge's files
+- **Where:** found by the node trim pass (`trim/node`); each copy is in a file another agent owns, so it is recorded for them.
+- `ship.rs:own` (give a tree to a uid) and `supervisor.rs:chown_tree`: one is enough; `chown_tree` also skips a tree whose top is already the uid's. `ship.rs:owner` and `app_dirs`' owner lookup read the same thing.
+- `ship.rs:object_dirs` and `app.rs:Objects::load` both walk `<app>/<2 hex>/<id>`; one walk per app would serve both.
+- `lease.rs:serve` and `supervisor.rs:restore_object` both take a lease, claim the object, release on failure and hold the grant; a `Leases` method taking the claim would serve both.
+- `supervisor.rs:command` (`versions`) parses `ship.rs:version_key`'s keys back into sequences; `ship.rs` could list an object's versions.
+- `egress.rs:serve_forwarded`'s error answer is `supervisor::verdict(502, name)`.
+- `object.rs:run` records a refusal on the job's span and answers it twice, as `table.rs:Node::dispatch` does once.
+- **Status:** open (for the storage and edge owners)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
