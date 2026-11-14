@@ -211,7 +211,7 @@ other agents.
   the artifact type -> the node's loader refuses what was pushed; publish without
   the import check -> the uncomposed component fails without the hint.
 - Full suite, twice, at load average 13–29 from other agents: unit 103/103,
-  `dev` 8/8, `js` 9/9, `committed_state` 2/2; integration 70 passed, 12 ignored
+  `dev` 8/8, `js` 9/9, `committed_state` (since removed) 2/2; integration 70 passed, 12 ignored
   and one timing failure each run, a different one each time
   (`kv_counts_against_the_disk_quota`, then `cpu_hogs_leave_cores_for_short_requests`),
   each of which passed in the other run. Both fail the same way with

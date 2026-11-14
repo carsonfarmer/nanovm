@@ -21,14 +21,6 @@ Runtime is 5,320 lines, above the under-5k goal. Older checkpoint
 counts and candidate designs below are historical, not current delivery claims.
 The line goal guides simplicity; it is not a hard limit or correctness tradeoff.
 
-`cargo run --locked -p nanovm --example committed_state` runs W-9's bounded
-storage-only experiment: immutable versions from the real journal, independent
-receiver processes, ordered/idempotent receipt, interrupted-transfer retry and
-fresh-root recovery after deleting the source. It also demonstrates that a locally
-accepted but unsent write is lost. This is not a runtime replication feature,
-remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
-gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
-
 **Capture and shipping:** optional node `[capture]` configuration captures a
 version at both dirty commit gates: the whole volume every `snapshot_every` (16)
 versions, otherwise what the commit changed (listings of changed directories, new
@@ -336,14 +328,14 @@ See the [measurements and limitations](components/keyvalue/README.md#follow-up-m
 Tentative changes must be visible and rejectable; an undo log is the current
 implementation, not a requirement on future snapshots or replicated storage.
 
-The [bounded backend comparison](experiments/fs-backends/README.md) measures the
+The bounded backend comparison (removed; see git history) measures the
 actual journal against plain transactional pages and hash-addressed pages, outside
 Wasm. Plain pages improve small writes/batches but slow warm reads and often write
 more bytes; hashing helps shared-content batches, not unique large writes. The
 experiment includes rejection, restart and process-death checks, but is not a WASI
 filesystem replacement or production durability certification. Runtime is unchanged.
 
-The [inode follow-up](experiments/fs-backends/README.md#inode-quota-and-cache-proof-q79-2026-11-04)
+The inode follow-up (removed; see git history)
 adds shared descriptor/rename/unlink semantics, logical quotas and bounded-cache
 measurements for both candidates. Hash addressing is preferred when measured costs
 are close; unique large writes remain slower. This is a flat-namespace proof, not
@@ -361,13 +353,13 @@ under the same cap, reclaim shared-content orphans, and retain usable small
 writes/deletes and exclusive locks. The ceiling bounds file length, not allocated
 blocks or host memory; the cache target is not an RSS cap.
 These are bounded storage checks, not production integration or physical
-power-loss certification; [protocol and remaining gates](experiments/fs-backends/README.md#hardening-orphan-lookup-and-storage-failures-2026-11-05).
+power-loss certification; protocol and remaining gates (removed; see git history).
 
 **Storage decision:** keep journaling after measuring both hash and optimized plain
 pages. Plain pages improve small durable writes about 3× and match large-write
 latency, but cold/recovery/churn remain 3–5× slower and replacement code is 294
 lines larger. This rejects the current per-object redb design for adoption, not
-page-based filesystems in principle. [Simple comparison, costs and reproduction](experiments/fs-backends/README.md#adoption-decision-retain-journaling-2026-11-05).
+page-based filesystems in principle. Simple comparison, costs and reproduction (removed; see git history).
 
 The journal improvement branch reduces idle memory from 143 to 119 KiB/object
 and improves warm throughput about 15% in three matched runs. Lazy KV bucket
@@ -375,10 +367,10 @@ creation reduces a fresh read-only request from 2.550 to 0.690 ms; opening or
 reading an empty bucket consumes no directory quota. Small durable writes and
 large-value writes remain essentially unchanged. Cleanup saved 53 runtime lines,
 but the complete performance/durability work ends at **5,082 versus 5,074**;
-this is not a net code reduction. [Measurements and limitations](experiments/fs-backends/README.md#journal-follow-through-2026-11-05).
+this is not a net code reduction. Measurements and limitations (removed; see git history).
 Page adapters remain only on the experimental branches.
 
-The historical [runtime candidate](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05)
+The historical runtime candidate (removed; see git history)
 was integrated on its experimental branch behind temporary `page-fs`, using stock WASIp3 bindings and one
 file-backed transactional database for `/data` and `/tmp`. Use disposable separate
 data roots; no migration or compatibility path exists. Its provisional `storage_mb`

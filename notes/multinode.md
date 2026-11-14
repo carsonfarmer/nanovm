@@ -349,10 +349,10 @@ that runs across a loss fails its commit and resets the instance, and the next
 one goes back through the lease request.
 
 Full suite on the final tree (`--lib --test integration --example
-committed_state`): 114 unit tests pass; integration 74 pass, 13 ignored
+committed_state`, since removed): 114 unit tests pass; integration 74 pass, 13 ignored
 (opt-in), 1 fails, `kv_counts_against_the_disk_quota`, with `"error":"cpu"`:
 the known load failure N-640 (CPU budget billed as wall time; fixed on
-`cf/cpu-clock`), here at load 9–15. `committed_state` 2 pass. The production
+`cf/cpu-clock`), here at load 9–15. `committed_state` (since removed) 2 pass. The production
 check (`cargo check --bin nanovm`) is clean.
 
 Mutation checks for the review's fixes (`fix/lease-r3fix`; each removes one
@@ -374,7 +374,7 @@ mechanism, the named test then fails; restored after):
 Suite on `fix/lease-r3fix`: `--lib` 151 pass; integration 92 pass, 14
 ignored (opt-in); the SQLite suite (`sqlite_ -- --ignored`) 12 pass; `dev`
 5 pass, 4 need the example and JavaScript app builds (absent here);
-`committed_state` 2 pass; `cargo check --bin nanovm` clean. Runtime lines
+`committed_state` (since removed) 2 pass; `cargo check --bin nanovm` clean. Runtime lines
 7,068 (cf/round3 9f878a9) -> 7,301 (+233: ship.rs +175, lease.rs +25,
 supervisor.rs +20, config.rs +8, proxy.rs +5).
 

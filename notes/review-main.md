@@ -1,5 +1,13 @@
 # Review of main (`0f9ee0f`) outside the runtime: what to cut
 
+**Status:** S1, S2, S4, S6, S7, S18 (except the `stats_json` helper name), S20 and O14 are
+done on `review/main`, one commit each.
+The paths and `git grep` results below describe the tree before those cuts.
+Two corrections came out of doing them:
+- S2 keeps the guest's `/bench` route and `bench.rs`: CI's
+  `sqlite_sync_waits_are_not_charged_as_cpu` uses them.
+- S7 keeps the composition-proof and provider-hardening sections, so it removed 243 lines, not 345.
+
 Scope: everything on `origin/main` except `crates/nanovm/src/*.rs`, which the
 `trim/storage`, `trim/node` and `trim/edge` agents own. Nothing was built.
 Files were read in a plain worktree with no `target/`.

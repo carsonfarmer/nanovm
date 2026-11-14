@@ -244,7 +244,7 @@ host can plant with its own valid session, signs no one in.
 
 Full suite (`env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked
 -p nanovm`, all 24 examples and the JS test app rebuilt): 155 unit, 9
-dev, 27 examples, 98 integration (14 ignored), 17 js, 2 committed_state;
+dev, 27 examples, 98 integration (14 ignored), 17 js, 2 committed_state (since removed);
 all pass.
 
 Each mutation broke the mechanism, failed a test, and was restored (`git
