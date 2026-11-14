@@ -133,7 +133,7 @@ impl Journal {
     pub fn open(volume: &Path, max: u64, obj: Arc<ObjShared>, capture: Option<&CaptureConfig>, objects: Option<&Arc<Objects>>) -> std::io::Result<Journal> {
         let base = volume.parent().expect("a volume has a parent").to_path_buf();
         let dir = base.join("journal");
-        let key = match recover(&base, &dir, &obj)? {
+        let key = match recover(&base, &dir)? {
             Some(key) => key,
             None => key()?,
         };
@@ -687,7 +687,7 @@ impl Drop for Journal {
         }
         let settled = (|| {
             if undo {
-                recover(&self.base, &self.dir, &self.obj)?;
+                recover(&self.base, &self.dir)?;
             }
             objects.settle(&self.base)
         })();
@@ -701,7 +701,7 @@ impl Drop for Journal {
 /// the log, and returns its key. Failure leaves the current undo intact and
 /// refuses to start the object. Only already-applied or never-performed
 /// operations may be skipped.
-fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[u8; 8]>> {
+fn recover(base: &Path, dir: &Path) -> std::io::Result<Option<[u8; 8]>> {
     let log = match std::fs::read(dir.join(LOG)) {
         Ok(log) => log,
         Err(e) if e.kind() == ErrorKind::NotFound => return clear(dir).map(|()| None),
@@ -713,7 +713,7 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
     let file = File::options().write(true).open(dir.join(LOG))?;
     let undos = decode(&log, &key);
     // What commits staged settles first; a key seen here may not be durable yet.
-    committed::settle(&committed::directory(base), obj, &key, !undos.is_empty(), || {
+    committed::settle(&committed::directory(base), &key, !undos.is_empty(), || {
         #[cfg(test)]
         tests::sync_point()?;
         file.sync_data()

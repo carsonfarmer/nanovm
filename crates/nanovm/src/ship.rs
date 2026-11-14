@@ -398,19 +398,8 @@ pub(crate) async fn caught_up(dir: &Path) -> io::Result<bool> {
 /// The sequences of the versions published in `dir`, in order (none if it
 /// isn't there), and whether one is being staged.
 fn published(dir: &Path) -> io::Result<(Vec<u64>, bool)> {
-    let (mut versions, mut staged) = (vec![], false);
-    let entries = match std::fs::read_dir(dir) {
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((versions, staged)),
-        entries => entries?,
-    };
-    for entry in entries {
-        let name = entry?.file_name();
-        let name = name.to_str().unwrap_or_default();
-        staged |= name.ends_with(".staged");
-        versions.extend(name.strip_suffix(".tar").and_then(|n| n.parse::<u64>().ok()));
-    }
-    versions.sort();
-    Ok((versions, staged))
+    let (versions, staged) = crate::committed::list(dir)?;
+    Ok((versions.into_iter().map(|(n, _)| n).collect(), !staged.is_empty()))
 }
 
 /// The node, and its lease's epoch, under which this node may move the head
@@ -579,8 +568,8 @@ pub fn backlog(objects: &Path) -> Backlog {
     for (_, object) in object_dirs(objects) {
         let dir = crate::committed::directory(&object.path());
         let shipped = shipped(&dir);
-        let waiting = published(&dir).map(|v| v.0).unwrap_or_default().into_iter().filter(|&n| n > shipped);
-        let sizes: Vec<u64> = waiting.filter_map(|n| std::fs::metadata(dir.join(format!("{n:020}.tar"))).ok()).map(|m| m.len()).collect();
+        let versions = crate::committed::list(&dir).map(|v| v.0).unwrap_or_default();
+        let sizes: Vec<u64> = versions.into_iter().filter(|v| v.0 > shipped).map(|v| v.1).collect();
         if !sizes.is_empty() {
             (out.objects, out.versions) = (out.objects + 1, out.versions + sizes.len() as u64);
             out.bytes += sizes.iter().sum::<u64>();

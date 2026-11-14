@@ -92,39 +92,37 @@ pub fn digest(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-// No independent mutable cursor: the contiguous immutable filenames are the
-// head. Returns the last sequence, and how many versions and bytes are here:
-// a shipper removes those it shipped but the last, maybe meanwhile, in any
-// order, so this may see some of them and not others (B-503).
-fn head(dir: &Path) -> io::Result<(u64, u64, u64)> {
+/// The versions published in `dir` (`<sequence>.tar`), in order, each with
+/// its size, and the names of those staged, in order; none if `dir` isn't
+/// there. No independent mutable cursor: the last name is the head. A
+/// shipper removes those it shipped but the last, maybe meanwhile, in any
+/// order, so this may see some of them and not others (B-503).
+pub(crate) fn list(dir: &Path) -> io::Result<(Vec<(u64, u64)>, Vec<String>)> {
+    let (mut versions, mut staged) = (vec![], vec![]);
     let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((0, 0, 0)),
-        Err(e) => return Err(e),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok((versions, staged)),
+        entries => entries?,
     };
-    let (mut count, mut last, mut bytes) = (0u64, 0u64, 0u64);
     for entry in entries {
         let entry = entry?;
-        let name = entry.file_name();
-        if name.to_str().is_some_and(|n| n.ends_with(".staged")) {
-            continue;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".staged") {
+            staged.push(name);
+        } else if let Some(n) = name.strip_suffix(".tar").and_then(|n| n.parse().ok()).filter(|&n| name == filename(n)) {
+            match entry.metadata() {
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                md => versions.push((n, md?.len())),
+            }
         }
-        let sequence = name
-            .to_str()
-            .and_then(|s| s.strip_suffix(".tar"))
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| invalid("invalid committed version name"))?;
-        if sequence == 0 || name != filename(sequence).as_str() || !entry.file_type()?.is_file() {
-            return Err(invalid("invalid committed version entry"));
-        }
-        let len = match entry.metadata() {
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            len => len?.len(),
-        };
-        (count, last) = (count + 1, last.max(sequence));
-        bytes = bytes.checked_add(len).ok_or_else(|| invalid("capture size overflow"))?;
     }
-    Ok((last, count, bytes))
+    versions.sort();
+    staged.sort();
+    Ok((versions, staged))
+}
+
+/// The last version published in `dir` (0: none).
+fn last(dir: &Path) -> io::Result<u64> {
+    Ok(list(dir)?.0.last().map_or(0, |v| v.0))
 }
 
 struct Bounded {
@@ -166,11 +164,9 @@ pub(super) fn prepare(
     key: &[u8; 8],
     changes: Option<&Changes>,
 ) -> io::Result<()> {
-    let (last, count, used) = head(out)?;
-    let limit = cap
-        .max_mb
-        .checked_mul(1 << 20)
-        .ok_or_else(|| invalid("capture limit overflow"))?;
+    let (versions, _) = list(out)?;
+    let (last, used) = (versions.last().map_or(0, |v| v.0), versions.iter().map(|v| v.1).sum::<u64>());
+    let limit = cap.max_mb.saturating_mul(1 << 20);
     if used >= limit {
         return Err(ErrorKind::StorageFull.into());
     }
@@ -179,16 +175,14 @@ pub(super) fn prepare(
         format: FORMAT,
         app: obj.app.to_string(),
         object: obj.id.to_string(),
-        sequence: last
-            .checked_add(1)
-            .ok_or_else(|| invalid("capture sequence overflow"))?,
+        sequence: last + 1,
         epoch,
         parent: if last == 0 {
             String::new()
         } else {
             digest(&out.join(filename(last)))?
         },
-        snapshot: changes.is_none() || (last % every == 0 && count <= every),
+        snapshot: changes.is_none() || (last % every == 0 && versions.len() as u64 <= every),
     };
     let metadata = serde_json::to_vec(&version)?;
     if !out.try_exists()? {
@@ -266,7 +260,7 @@ pub(super) fn prepare(
 /// has replaced, and returns its sequence. Recovery does it again if the
 /// rename is lost.
 pub(super) fn publish(out: &Path, key: &[u8; 8]) -> io::Result<u64> {
-    let next = head(out)?.0 + 1;
+    let next = last(out)? + 1;
     fs::rename(out.join(format!("{next:020}{}", decided_by(key))), out.join(filename(next)))?;
     Ok(next)
 }
@@ -276,32 +270,14 @@ pub(super) fn publish(out: &Path, key: &[u8; 8]) -> io::Result<u64> {
 /// discarded. When the journal has records to roll back (`undecided`), the
 /// discard is durable first, even one an earlier recovery made: a second
 /// recovery must not mistake a rejected version for a commit. Any other
-/// decided, and is published once `decided` has made the decision durable.
-pub(super) fn settle(
-    out: &Path,
-    obj: &ObjShared,
-    key: &[u8; 8],
-    undecided: bool,
-    decided: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
-    let mut staged = vec![];
-    match fs::read_dir(out) {
-        Ok(entries) => {
-            for entry in entries {
-                let name = entry?.file_name().to_string_lossy().into_owned();
-                if name.ends_with(".staged") {
-                    staged.push(name);
-                }
-            }
-        }
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    }
-    staged.sort();
+/// decided, and is published, under the sequence `prepare` named it with,
+/// once `decided` has made the decision durable.
+pub(super) fn settle(out: &Path, key: &[u8; 8], undecided: bool, decided: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    let (_, mut staged) = list(out)?;
     if let Some(i) = staged.iter().position(|n| n.ends_with(&decided_by(key))) {
         fs::remove_file(out.join(staged.remove(i)))?;
     }
-    if undecided {
+    if undecided && out.exists() {
         sync(out)?;
     }
     if staged.is_empty() {
@@ -311,14 +287,8 @@ pub(super) fn settle(
     // capture becomes visible to a receiver.
     decided()?;
     for name in staged {
-        let (last, ..) = head(out)?;
-        let path = out.join(&name);
-        let version = read_version(&mut tar::Archive::new(File::open(&path)?).entries()?)?;
-        let parent = if last == 0 { String::new() } else { digest(&out.join(filename(last)))? };
-        if version.app != *obj.app || version.object != *obj.id || version.sequence != last + 1 || version.parent != parent {
-            return Err(invalid("out-of-order committed version"));
-        }
-        fs::rename(&path, out.join(filename(version.sequence)))?;
+        let sequence = name.split('.').next().unwrap_or_default();
+        fs::rename(out.join(&name), out.join(format!("{sequence}.tar")))?;
     }
     sync(out)
 }
@@ -485,35 +455,22 @@ pub fn apply(root: &Path, file: &Path) -> io::Result<Version> {
 
 /// Rebuilds at `root`, which must not exist yet, the volume that the
 /// versions in `dir` (`<sequence>.tar`) end with: the last snapshot, then
-/// each change after it, checked against the version before. Returns the
-/// last version's sequence.
+/// each change after it. They are a chain, each the parent its successor
+/// names: `ship::restore` fetches them so, and checks each. Returns the last
+/// version's sequence.
 pub fn restore(dir: &Path, root: &Path) -> io::Result<u64> {
-    let mut versions = vec![];
-    for entry in fs::read_dir(dir)? {
-        let name = entry?.file_name();
-        let n = name.to_str().and_then(|n| n.strip_suffix(".tar")?.parse::<u64>().ok());
-        versions.push(n.filter(|&n| name == filename(n).as_str()).ok_or_else(|| invalid("invalid committed version name"))?);
-    }
-    versions.sort();
+    let versions: Vec<u64> = list(dir)?.0.into_iter().map(|(n, _)| n).collect();
     let mut snapshot = None;
     for &n in versions.iter().rev() {
-        if read_version(&mut tar::Archive::new(File::open(dir.join(filename(n)))?).entries()?)?.snapshot {
+        if identity(File::open(dir.join(filename(n)))?)?.snapshot {
             snapshot = Some(n);
             break;
         }
     }
     let snapshot = snapshot.ok_or_else(|| invalid("no snapshot"))?;
     fs::create_dir(root)?;
-    let mut parent = None;
     for &n in versions.iter().filter(|&&n| n >= snapshot) {
-        let path = dir.join(filename(n));
-        // Checked before it is applied.
-        let version = read_version(&mut tar::Archive::new(File::open(&path)?).entries()?)?;
-        if version.sequence != n || parent.as_ref().is_some_and(|p| *p != version.parent) {
-            return Err(invalid("broken chain of committed versions"));
-        }
-        apply(root, &path)?;
-        parent = Some(digest(&path)?);
+        apply(root, &dir.join(filename(n)))?;
     }
     Ok(snapshot.max(*versions.last().expect("a snapshot is one")))
 }
