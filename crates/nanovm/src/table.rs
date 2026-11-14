@@ -188,20 +188,13 @@ impl Node {
             opentelemetry_sdk::propagation::TraceContextPropagator::new()
                 .extract(&opentelemetry_http::HeaderExtractor(req.headers()))
         });
-        let mut span = self.telemetry.request("request", id, &req, &parent);
+        let span = self.telemetry.request("request", id, &req, &parent);
         // The actor owns the recording span through post-return work. Only
         // immutable context is shared with guest logs and calls.
         let context = parent.with_remote_span_context(span.span_context().clone());
         let enqueued = Instant::now();
         let callers: Vec<Arc<str>> = req.headers().get(crate::egress::CALLERS).and_then(|h| h.to_str().ok())
             .map_or(vec![], |c| c.split(',').filter(|c| valid_object(c)).map(Arc::from).collect());
-        // A call from another node: its callers wait on it, so it must not
-        // wait on them (see `wait_for`).
-        if !callers.is_empty() && reaches(&self.objects.lock(), id, |o| callers.iter().any(|c| &**c == o)) {
-            let response = error_response(508, "call-cycle", &format!("{id} is already waiting on its callers"));
-            crate::telemetry::response(&mut span, &response);
-            return response;
-        }
         let (reply, rx) = oneshot::channel();
         let job = Box::new(Job {
             req,
@@ -212,19 +205,27 @@ impl Node {
             callers,
         });
         match self.enqueue(id, job) {
-            Err(resp) => resp,
+            Err((mut job, response)) => {
+                crate::telemetry::response(&mut job.span, &response);
+                response
+            }
             Ok(()) => rx.await.unwrap_or_else(|_| error_response(503, "object-unavailable", "the object stopped before answering")),
         }
     }
 
-    fn enqueue(self: &Arc<Self>, id: &str, mut job: Box<Job>) -> Result<(), http::Response<RespBody>> {
+    /// Queues `job` for object `id`, starting its actor if it isn't live; or
+    /// gives `job` back with the answer that refuses it.
+    fn enqueue(self: &Arc<Self>, id: &str, mut job: Box<Job>) -> Result<(), (Box<Job>, http::Response<RespBody>)> {
         let (app, key): (_, Arc<str>) = (&self.app, id.into());
         let mut objects = self.objects.lock();
+        // A call from another node: its callers wait on it, so it must not
+        // wait on them (see `wait_for`).
+        if !job.callers.is_empty() && reaches(&objects, id, |o| job.callers.iter().any(|c| &**c == o)) {
+            return Err((job, error_response(508, "call-cycle", &format!("{id} is already waiting on its callers"))));
+        }
         if let Some(e) = objects.get(&key) {
             if e.shared.lost() {
-                let response = misdirected(None);
-                crate::telemetry::response(&mut job.span, &response);
-                return Err(response);
+                return Err((job, misdirected(None)));
             }
             match e.tx.try_send(job) {
                 Ok(()) => return Ok(()),
@@ -235,7 +236,7 @@ impl Node {
                     tokio::spawn(async move { tx.send(job).await });
                     return Ok(());
                 }
-                Err(mpsc::error::TrySendError::Full(mut job)) => {
+                Err(mpsc::error::TrySendError::Full(job)) => {
                     self.metrics.rejected_busy.fetch_add(1, Relaxed);
                     let max = app.cfg.limits.max_queue;
                     let response = error_response(
@@ -243,8 +244,7 @@ impl Node {
                         "object-busy",
                         &format!("queue full ({max} waiting)"),
                     );
-                    crate::telemetry::response(&mut job.span, &response);
-                    return Err(response);
+                    return Err((job, response));
                 }
                 Err(mpsc::error::TrySendError::Closed(j)) => {
                     objects.remove(&key);
@@ -260,8 +260,7 @@ impl Node {
                 "node-at-capacity",
                 &format!("{max} live objects, none idle"),
             );
-            crate::telemetry::response(&mut job.span, &response);
-            return Err(response);
+            return Err((job, response));
         }
         let mut shared = ObjShared::new(app.name.clone(), id);
         shared.leases = self.leases.as_ref().map(|l| l.session.clone());
