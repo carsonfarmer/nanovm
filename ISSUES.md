@@ -944,6 +944,11 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the test gives the private listener a free port too.
 - **Status:** fixed on `beta/limits`
 
+### TS-1 (removable): duplication between the storage files and others' (storage trim)
+- **Where:** `ship::own` and `supervisor::chown_tree` (a recursive `lchown` of a tree only root reaches); `app::Objects::disk` (`statvfs` by path against the reserve) and `quota::Disk::low` (`fstatvfs` on a kept descriptor, the same reserve); the `<app>/<shard>/<object>` walk in `ship::object_dirs`, `quota::Disk::open` and `app::Objects::load`; `geteuid` through `unsafe libc` in `ship::owner`, `admin::listen`, `secrets` and `supervisor::app_dirs`; `lease::serve` sending a grant's session twice (`(grant, grant.session, until)`, read in `table.rs`).
+- **Scenario:** found by the storage trim (`trim/storage`, notes/trim-storage.md); each spans a file another agent owns, so it was left. `ship::own` (9 lines) can go if `chown_tree` is `pub(crate)` and maps to `io::Error`.
+- **Status:** open (for the coordinator)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).
