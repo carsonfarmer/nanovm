@@ -18,6 +18,7 @@ use opentelemetry_sdk::logs;
 use opentelemetry_sdk::trace;
 pub use opentelemetry_sdk::trace::Span;
 use prost::Message;
+use prost::encoding::{decode_varint, encode_varint, encoded_len_varint};
 
 use crate::egress::Upstream;
 
@@ -64,7 +65,7 @@ impl std::fmt::Debug for Client {
 #[async_trait::async_trait]
 impl HttpClient for Client {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        if request.body().len() > MAX_BATCH { return Err("telemetry batch too large".into()) }
+        // The exporter refuses a batch over `MAX_BATCH` before it gets here.
         let mut request = request;
         if !self.secrets.0.is_empty() {
             let mut body = request.body().to_vec();
@@ -173,6 +174,16 @@ impl Telemetry {
             .start_with_context(&self.tracer, parent)
     }
 
+    /// A server span for `req` to `object`, with its method and path.
+    pub fn request<B>(&self, name: &'static str, object: &str, req: &Request<B>, parent: &Context) -> Span {
+        use opentelemetry::trace::Span as _;
+        let mut span = self.span(name, object, parent, SpanKind::Server);
+        span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
+        let path = req.uri().path();
+        span.set_attribute(KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
+        span
+    }
+
     /// A forwarding hop ends at response headers; the worker's request event
     /// separately owns the guest lifecycle through its final commit.
     pub async fn forward<B, R, F, Fut>(&self, name: &'static str, mut req: Request<B>, send: F) -> Response<R>
@@ -181,13 +192,10 @@ impl Telemetry {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent = propagator.extract(&opentelemetry_http::HeaderExtractor(req.headers()));
         let object = crate::table::route(req.uri().path()).map_or("", |(id, _)| id);
-        let mut span = scopeguard::guard(self.span(name, object, &parent, SpanKind::Server), |mut span| {
+        let span = scopeguard::guard(self.request(name, object, &req, &parent), |mut span| {
             span.set_status(opentelemetry::trace::Status::error("cancelled"));
             span.set_attribute(KeyValue::new("error.type", "cancelled"));
         });
-        span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
-        let path = req.uri().path();
-        span.set_attribute(KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
         let context = parent.with_remote_span_context(span.span_context().clone());
         propagator.inject_context(&context, &mut opentelemetry_http::HeaderInjector(req.headers_mut()));
         let res = send(req).await;
@@ -364,7 +372,7 @@ fn trusted(key: u64, mut kv: &[u8]) -> anyhow::Result<bool> {
     while !kv.is_empty() {
         match field(&mut kv)? {
             (k, value) if k == 1 << 3 | LEN => name = value,
-            (k, mut value) if k == 3 << 3 => index = varint(&mut value)?,
+            (k, mut value) if k == 3 << 3 => index = decode_varint(&mut value)?,
             (k, _) if matches!(k >> 3, 1 | 3) => anyhow::bail!("bad attribute"),
             _ => {}
         }
@@ -376,26 +384,26 @@ const LEN: u64 = 2;
 
 /// Writes field `key` holding what `f` writes.
 fn nested(out: &mut Vec<u8>, key: u64, f: impl FnOnce(&mut Vec<u8>) -> anyhow::Result<()>) -> anyhow::Result<()> {
-    put_varint(key, out);
+    encode_varint(key, out);
     // Room for the length (5 bytes reach 32 GiB), shrunk to fit after.
     let at = out.len();
     out.extend([0; 5]);
     f(out)?;
-    let mut len = [0; 5];
-    let n = put_varint((out.len() - at - 5) as u64, &mut len.as_mut_slice());
-    out[at..at + n].copy_from_slice(&len[..n]);
+    let len = (out.len() - at - 5) as u64;
+    let n = encoded_len_varint(len);
     out.copy_within(at + 5.., at + n);
     out.truncate(out.len() - (5 - n));
+    encode_varint(len, &mut &mut out[at..at + n]);
     Ok(())
 }
 
 /// The next field: its key, and its contents (a varint's bytes, for one).
 fn field<'a>(m: &mut &'a [u8]) -> anyhow::Result<(u64, &'a [u8])> {
-    let key = varint(m)?;
+    let key = decode_varint(m)?;
     let n = match key & 7 {
         0 => m.iter().position(|b| b & 0x80 == 0).map_or(m.len() + 1, |i| i + 1),
         1 => 8,
-        LEN => varint(m)? as usize,
+        LEN => decode_varint(m)? as usize,
         5 => 4,
         _ => anyhow::bail!("unsupported wire type"),
     };
@@ -403,31 +411,6 @@ fn field<'a>(m: &mut &'a [u8]) -> anyhow::Result<(u64, &'a [u8])> {
     let (value, rest) = m.split_at(n);
     *m = rest;
     Ok((key, value))
-}
-
-fn varint(m: &mut &[u8]) -> anyhow::Result<u64> {
-    let mut v = 0;
-    for i in 0..10 {
-        let (&b, rest) = m.split_first().ok_or_else(|| anyhow::anyhow!("truncated telemetry batch"))?;
-        *m = rest;
-        v |= u64::from(b & 0x7f) << (7 * i);
-        if b < 0x80 {
-            return Ok(v);
-        }
-    }
-    anyhow::bail!("bad varint")
-}
-
-/// Writes `v` as a varint, returning its length.
-fn put_varint(mut v: u64, out: &mut impl std::io::Write) -> usize {
-    let mut n = 1;
-    while v >= 0x80 {
-        let _ = out.write_all(&[v as u8 | 0x80]);
-        v >>= 7;
-        n += 1;
-    }
-    let _ = out.write_all(&[v as u8]);
-    n
 }
 
 #[cfg(test)]
@@ -446,8 +429,8 @@ mod tests {
     fn raw(fields: &[(u64, &[u8])]) -> Vec<u8> {
         let mut out = Vec::new();
         for (key, value) in fields {
-            put_varint(*key, &mut out);
-            if key & 7 == LEN { put_varint(value.len() as u64, &mut out); }
+            encode_varint(*key, &mut out);
+            if key & 7 == LEN { encode_varint(value.len() as u64, &mut out); }
             out.extend_from_slice(value);
         }
         out
