@@ -53,7 +53,7 @@ pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 /// How long a worker asked to stop has to flush its telemetry and exit,
 /// past the time its objects may take to finish their work after their
-/// answers (`post_return_timeout_ms`), before it is killed (see `drain`).
+/// answers (`post_return_timeout_ms`), before it is killed (see `Worker::stop`).
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Compiling a large component on first start can take a while.
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -150,7 +150,7 @@ struct Live {
     /// Its slot among `max_apps`, passed on to the worker that replaces it.
     slot: Mutex<Option<OwnedSemaphorePermit>>,
     /// Sending true gives the worker time to exit before it is killed (see
-    /// `drain`); dropping this kills it at once. Closure acknowledges
+    /// `Worker::stop`); dropping this kills it at once. Closure acknowledges
     /// actual process exit, not just receipt of the request.
     kill: watch::Sender<bool>,
 }
@@ -164,6 +164,27 @@ impl Live {
 impl Worker {
     fn live(&self) -> Option<Arc<Live>> {
         self.live.lock().clone().filter(|l| l.alive())
+    }
+
+    /// Takes its worker, if it has one, and waits until nothing holds it but
+    /// this (its requests have finished and their bodies have been read), or
+    /// its longest request has had its time, then asks the worker to stop and
+    /// waits for it to be gone: what still holds it can't keep it running
+    /// beside the next version. Hung up on, a worker lets its objects finish
+    /// their work after their answers, flushes its telemetry and exits (see
+    /// `worker_main`); one that takes longer than that work may, and
+    /// `STOP_TIMEOUT` more, is killed. Returns its slot, for the next worker.
+    async fn stop(&self) -> Option<OwnedSemaphorePermit> {
+        let old = self.live.lock().take()?;
+        let slot = old.slot.lock().take();
+        let deadline = Instant::now() + old.drain;
+        while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        old.link.hang_up();
+        old.kill.send_replace(true);
+        old.kill.closed().await;
+        slot
     }
 }
 
@@ -340,9 +361,8 @@ impl Supervisor {
             Some(id) => self.pause(app, id, &objects).await.map(|()| None)?,
             None => Some(w.starting.lock().await),
         };
-        let live = w.live.lock().take_if(|_| object.is_none());
-        if let Some(old) = live {
-            drain(old).await;
+        if object.is_none() {
+            w.stop().await;
         }
         let key = object.map_or(app.to_string(), |o| format!("{app}/{o}"));
         self.shipping.write().await.insert(key.clone());
@@ -641,10 +661,7 @@ impl Supervisor {
             .map(|(_, o)| o)
             .ok_or_else(full)?;
         let Ok(_switching) = idle.starting.try_lock() else { return Err(full()) };
-        let old = idle.live.lock().take().ok_or_else(full)?;
-        let slot = old.slot.lock().take();
-        drain(old).await;
-        slot.ok_or_else(full)
+        idle.stop().await.ok_or_else(full)
     }
 
     /// Gets the app version `want` names, retires the running worker, then
@@ -666,16 +683,7 @@ impl Supervisor {
             worker: self.cfg.worker.clone(),
         };
         let policy = EgressPolicy::parse(&app.limits.egress, &self.cfg.limits.egress, self.cfg.dev).context("egress")?;
-        let old = w.live.lock().take();
-        let slot = match old {
-            Some(old) => {
-                let slot = old.slot.lock().take();
-                drain(old).await;
-                slot
-            }
-            None => None,
-        };
-        let slot = match slot {
+        let slot = match w.stop().await {
             Some(slot) => slot,
             None => self.slot(w).await?,
         };
@@ -949,7 +957,7 @@ impl Drop for Cgroup {
 
 async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
     match live.link.send(req).await {
-        // The body holds the worker until it has been read; see `drain`.
+        // The body holds the worker until it has been read; see `Worker::stop`.
         Ok(res) => res.map(|b| {
             b.map_frame(move |f| {
                 let _ = &live;
@@ -965,31 +973,13 @@ async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<Re
     }
 }
 
-/// Waits until nothing holds `old` but this (its requests have finished and
-/// their bodies have been read), or its longest request has had its time,
-/// then asks the worker to stop and waits for it to be gone: what still
-/// holds it can't keep it running beside the next version. Hung up on, a
-/// worker lets its objects finish their work after their answers, flushes
-/// its telemetry and exits (see `worker_main`); one that takes longer than
-/// that work may, and `STOP_TIMEOUT` more, is killed.
-async fn drain(old: Arc<Live>) {
-    let deadline = Instant::now() + old.drain;
-    while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    old.link.hang_up();
-    old.kill.send_replace(true);
-    old.kill.closed().await;
-}
-
-/// Drains `w`'s worker `l`, unless it has already gone; the next request
+/// Stops `w`'s worker `l`, unless it has already gone; the next request
 /// starts another.
 async fn retire(w: Arc<Worker>, l: Arc<Live>) {
     let _switching = w.starting.lock().await;
-    let old = w.live.lock().take_if(|live| Arc::ptr_eq(live, &l));
-    drop(l);
-    if let Some(old) = old {
-        drain(old).await;
+    if w.live.lock().as_ref().is_some_and(|live| Arc::ptr_eq(live, &l)) {
+        drop(l);
+        w.stop().await;
     }
 }
 
