@@ -512,7 +512,7 @@ pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyh
 /// Private control port: network policy must restrict it to nodes.
 pub async fn serve_publish(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
     loop {
-        let (p, sock) = (proxy.clone(), crate::server::accept(&listener).await);
+        let (p, (sock, _)) = (proxy.clone(), crate::server::accept(&listener).await);
         crate::server::serve_conn(sock, Some(CLIENT_TIMEOUT), (), move |req| p.clone().publish(req));
     }
 }

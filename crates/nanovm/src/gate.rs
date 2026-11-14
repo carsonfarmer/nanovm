@@ -94,9 +94,8 @@ where
 {
     loop {
         let slot = gate.connections.clone().acquire_owned().await?;
-        let sock = crate::server::accept(&listener).await;
-        let Ok(peer) = sock.peer_addr().map(|a| a.ip()) else { continue };
-        match gate.hold(peer) {
+        let (sock, peer) = crate::server::accept(&listener).await;
+        match gate.hold(peer.ip()) {
             Some(held) => crate::server::serve_conn(sock, header_timeout, (slot, held), f.clone()),
             None => crate::server::serve_conn(sock, Some(REFUSE_TIMEOUT), slot, |_| {
                 let mut res = error_response(503, "too-many-connections", "this client has as many connections open as it may");

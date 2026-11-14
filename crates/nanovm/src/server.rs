@@ -28,18 +28,19 @@ where
     Fut: Future<Output = Response<RespBody>> + Send + 'static,
 {
     loop {
-        serve_conn(accept(&listener).await, None, (), f.clone());
+        serve_conn(accept(&listener).await.0, None, (), f.clone());
     }
 }
 
-/// The next connection on `listener`. An error, such as running out of file
-/// descriptors, is logged and waited out rather than ending the server.
-pub async fn accept(listener: &TcpListener) -> TcpStream {
+/// The next connection on `listener`, and its peer. An error, such as
+/// running out of file descriptors, is logged and waited out rather than
+/// ending the server.
+pub async fn accept(listener: &TcpListener) -> (TcpStream, std::net::SocketAddr) {
     loop {
         match listener.accept().await {
-            Ok((sock, _)) => {
+            Ok((sock, peer)) => {
                 let _ = sock.set_nodelay(true);
-                return sock;
+                return (sock, peer);
             }
             Err(e) => {
                 eprintln!("nanovm: accepting a connection: {e}");
