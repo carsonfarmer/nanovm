@@ -599,6 +599,51 @@ mod tests {
         assert!(cache.cells.lock()[0].len() <= MAX_CACHED);
     }
 
+    /// Disconnecting during a lookup must not consume unknown-name capacity forever.
+    #[tokio::test]
+    async fn review_cancelled_route_lookups_release_unknown_capacity() {
+        use tokio::io::AsyncWriteExt;
+        let cache = Arc::new(Cache::<u32>::new(|_| true));
+        let healthy = || async { Ok((7, Duration::from_secs(60))) };
+        assert_eq!(cache.get("control", healthy()).await, Ok(7));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (serving, notified) = (cache.clone(), started.clone());
+        let connection = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            crate::server::serve_conn(socket, Some(CLIENT_TIMEOUT), move |_: Request<Incoming>| {
+                let (cache, started) = (serving.clone(), notified.clone());
+                async move {
+                    let _ = cache.get("disconnected", async {
+                        started.notify_one();
+                        std::future::pending::<anyhow::Result<(u32, Duration)>>().await
+                    }).await;
+                    error_response(200, "control", "")
+                }
+            }).await.unwrap()
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: control.test\r\n\r\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started.notified()).await.expect("lookup started");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), connection).await.expect("disconnected handler cancelled").unwrap();
+
+        // Exercise the same cache cancellation for the remaining capacity without
+        // opening another thousand TCP connections or depending on wall-clock races.
+        for i in 1..MAX_UNKNOWN {
+            let key = format!("cancelled-{i}");
+            let lookup = cache.get(&key, std::future::pending());
+            tokio::pin!(lookup);
+            assert!(futures::poll!(&mut lookup).is_pending(), "lookup {i} admitted before cancellation");
+        }
+        tokio::time::sleep(ERROR_TTL + Duration::from_millis(100)).await;
+        assert_eq!(cache.get("control", healthy()).await, Ok(7), "cached route remains healthy");
+        assert_eq!(cache.get("new-healthy-route", healthy()).await, Ok(7),
+            "cancelled lookups must release capacity for a new healthy route");
+    }
+
     type Down = Arc<std::sync::atomic::AtomicBool>;
 
     /// A DNS-over-HTTPS stub answering TXT queries for `_nanovm.<host>` from
