@@ -62,8 +62,8 @@ exposed pool exhaustion at object 53; pool totals now match the existing per-app
 core/memory/table allowances, without increasing guest memory limits. Opening
 existing stores no longer attempts mkdir, so full stores remain readable.
 
-`cargo run --locked -p nanovm --example kv_stress` exercises 100/1,000/10,000 keys,
-replacement, byte/file limits, exact on-disk values and rollback/restart. It samples
+A stress run (`kv_stress`, since removed; it is in git history) exercised 100/1,000/10,000
+keys, replacement, byte/file limits, exact on-disk values and rollback/restart. It sampled
 journal usage every 10 ms; those timings are diagnostic, not uninstrumented
 benchmarks. On this orb, 10,000 three-byte values occupied 30,000 logical bytes
 but 5,120,000 allocated bytes, excluding directory metadata. Logical quotas are
@@ -75,8 +75,8 @@ original retained; commit and rollback both pass. No journal data-format change.
 
 Three alternating release runs compare the saved native host/counter from
 `ef3a6b2` with this migration, with no overlapping builds/services. `kv_bench`
-uses the in-process Node's HTTP request API (not a network server), checks exact
-responses, and measures 1,000 reads and 200 writes at each size plus 100 cold
+(since removed with the native host; it is in git history) used the in-process Node's
+HTTP request API (not a network server), checked exact responses, and measured 1,000 reads and 200 writes at each size plus 100 cold
 objects. Medians are milliseconds/request:
 
 | Operation | Native | Composed |
@@ -150,7 +150,7 @@ large reads and was reverted.
 
 Reproduce the diagnostic dependency in a disposable checkout: copy the fetched
 `wasmtime-environ-50.0.0` crate into an isolated directory, apply the patch with
-`patch -p3` there, and build `kv_bench` with Cargo's
+`patch -p3` there, and build `kv_bench` (from git history) with Cargo's
 `--config 'patch.crates-io.wasmtime-environ.path="/absolute/copied/crate"'`.
 Save that binary separately; restore Cargo.lock and build the stock control.
 Use the same composed `counter.wasm` for both. `kv_bench` creates a fresh compiled
