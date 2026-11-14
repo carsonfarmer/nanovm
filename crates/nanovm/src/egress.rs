@@ -5,7 +5,7 @@
 //! checked, never re-resolved.
 
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -64,8 +64,7 @@ impl EgressPolicy {
 
 /// `entries` as rules: `host`, `host:port` or `*.suffix[:port]`.
 fn rules(entries: &[String], dev: bool) -> anyhow::Result<Vec<Rule>> {
-    let mut rules = Vec::new();
-    for e in entries {
+    entries.iter().map(|e| {
         let e = e.trim().to_ascii_lowercase();
         let (wild, rest) = e.strip_prefix("*.").map_or((false, e.as_str()), |r| (true, r));
         // `host`, `host:port` or `[v6]:port`.
@@ -80,22 +79,18 @@ fn rules(entries: &[String], dev: bool) -> anyhow::Result<Vec<Rule>> {
             Ok(_) => anyhow::bail!("egress entry {e:?} is a private address"),
             Err(_) => HostPat::Exact(host.to_string()),
         };
-        rules.push(Rule {
+        Ok(Rule {
             host,
             port: a.port_u16(),
-        });
-    }
-    Ok(rules)
+        })
+    }).collect()
 }
 
-/// True for addresses reachable on the public internet.
+/// True for addresses reachable on the public internet; an IPv4-mapped
+/// address is its IPv4 one.
 pub fn is_global(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_global_v4(v4),
+    match ip.to_canonical() {
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_global_v4(v4);
-            }
             let s = v6.segments();
             !(v6.is_unspecified()
                 || v6.is_loopback()
@@ -106,23 +101,22 @@ pub fn is_global(ip: IpAddr) -> bool {
                 || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64
                 || s[0] == 0x2002) // 6to4
         }
+        IpAddr::V4(ip) => {
+            let o = ip.octets();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking
+                || o[0] >= 240)
+        }
     }
-}
-
-fn is_global_v4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_multicast()
-        || o[0] == 0
-        || (o[0] == 100 && (o[1] & 0xc0) == 64) // CGNAT
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0) // IETF protocol assignments
-        || (o[0] == 198 && (o[1] & 0xfe) == 18) // benchmarking
-        || o[0] >= 240)
 }
 
 /// A worker's link to its supervisor, which makes the worker's outbound
