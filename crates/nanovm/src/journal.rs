@@ -914,11 +914,8 @@ fn undo(mut log: &[u8]) -> Option<Undo> {
         [2] => Undo::Created(path(log)?),
         [3] => Undo::RemovedDir(path(log)?),
         [4] => Undo::Renamed(path(log)?, path(log)?),
-        [5] => {
-            path(log)?;
-            path(log)?;
-            Undo::Cancelled
-        }
+        // A cancelled rename: its paths are signed, and nothing reads them.
+        [5] => Undo::Cancelled,
         _ => return None,
     })
 }
