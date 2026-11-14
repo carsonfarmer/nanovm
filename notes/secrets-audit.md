@@ -72,4 +72,477 @@ Who holds what:
    The secretless fix (short-lived mTLS through a sidecar, or an nftables cgroup rule on one host)
    needs no nanovm code. A shared token would add a new long-lived secret.
 
-Details follow in the next commit.
+## Details
+
+### S1. The object-store credential (leases and capture store)
+
+**What and where.**
+- `leases` (`M:config.rs:40-44`, `B:config.rs:46-50`) and `[capture] store` (`M:config.rs:163-167`,
+  `B:config.rs:222-226`) are object-store URLs. `Leases::open` (`M+B:lease.rs:131-137`) opens
+  both with `object_store::parse_url_opts(url, std::env::vars())`: every environment variable
+  whose lower-cased name is an S3 config key configures the client. `ship::store` opens
+  `capture.store` through it (`M:ship.rs:74`, `B:ship.rs:89`).
+- Only `aws-base` is compiled (`M:crates/nanovm/Cargo.toml:65`, `B:…:69`): `s3://` works;
+  `gs://` and `az://` fail with "feature not enabled".
+- Beta's deploy material puts static keys in `/etc/nanovm/store.env`, loaded with
+  `EnvironmentFile=` (`B:deploy/systemd/nanovm-store.conf:16-18`; documented in
+  `B:deploy/systemd/README.md:47-48`, `B:deploy/single-node/README.md:295-300` and
+  `B:notes/recovery-runbook.md:13-16`). Both READMEs say "credentials and region from `AWS_*`".
+- There is no `LoadCredential=` on either ref.
+
+**Who holds it, and for how long.** The supervisor of every node, as root. Workers never see it:
+they start with an empty environment (`M:supervisor.rs:587`, `B:supervisor.rs:837`). The
+environment is per process, so one identity serves the lease store and the capture store, and
+the reference setup copies it to every node. It lives until someone rotates it.
+
+**If it is stolen.**
+- **Read.** Every version of every object of every app is a plain tar of its volume; neither ref
+  encrypts anything. That includes what apps keep in their data (S6).
+- **Write.** A version is `<app>/<object>/<seq>-<sha256>.tar`, and the object's `head` names the
+  one that counts. With write access, an attacker can put a tar under its own hash and move the
+  head. Nodes restore the head on takeover (`ship::claim`) and on `admin restore`, so
+  attacker-chosen state lands in any app's object.
+- **Delete.** `admin delete` and `delete-app` remove from the store, so the credential has delete
+  rights, and can delete every backup (B-800).
+- **Leases.** Forged `nodes/<node>` or `objects/<app>/<object>` records break the one-instance
+  guarantee: two live instances of an object, or none.
+- **Fencing.** The recovery runbook fences a lost node by revoking "its store credentials"
+  (`B:notes/recovery-runbook.md:90-91`). With one shared key, that stops every node.
+
+**Options today, with no new code.** `object_store` 0.14.2's `AmazonS3Builder::build`
+(`src/aws/builder.rs:1168-1255` in the vendored source) tries, in order: static keys, web
+identity, an ECS task role, EKS Pod Identity, then the instance metadata service. So:
+- **EC2:** attach an instance profile and set no keys. Credentials come from IMDSv2, are temporary and rotate
+  automatically. [EC2 roles](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html)
+- **EKS:** IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`), or Pod Identity
+  (`AWS_CONTAINER_CREDENTIALS_FULL_URI` + `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`).
+  [IRSA](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html),
+  [Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html)
+- **ECS:** `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, which ECS sets itself.
+- **MinIO:** `AssumeRoleWithWebIdentity` against MinIO's own STS (`AWS_ENDPOINT_URL_STS`), with
+  any OIDC token MinIO trusts in the token file (Kubernetes, SPIRE's JWT-SVIDs written by
+  spiffe-helper, a cloud's identity token).
+  [MinIO STS](https://min.io/docs/minio/linux/developers/security-token-service/AssumeRoleWithWebIdentity.html)
+- **A VM outside AWS:** IAM Roles Anywhere's `aws_signing_helper serve` answers like IMDS on
+  localhost; point `AWS_METADATA_ENDPOINT` at it. Its key can live in a TPM and its certificate
+  can be short-lived (SPIRE, step-ca).
+  [Roles Anywhere helper](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/credential-helper.html)
+- **Per node:** give each node its own role, limited to the bucket prefix. Then fencing a node
+  revokes only its role.
+- **The unit:** drop the `EnvironmentFile=`. IMDS is reachable, since
+  `RestrictAddressFamilies=` allows `AF_INET`.
+
+**What needs code, or has no option.**
+- **GCS and Azure** with their own identity (metadata server, GCP Workload Identity Federation,
+  managed identity): add `gcp-base`/`azure-base` to `object_store`'s features (one line) and a test
+  per scheme. `config.rs`'s shared-store check already accepts any URL other than `memory:`,
+  `file:` and `/`. Today GCS works only through its S3 interoperability API, with HMAC keys
+  (static).
+- **Cloudflare R2, Backblaze B2 and most S3-compatibles** issue only static keys. R2's temporary
+  credentials are minted with a parent API token, which only moves the long-lived secret.
+- **Least privilege.** Leases need conditional puts under `nodes/` and `objects/`; shipping needs
+  put-if-absent and conditional head writes; only `admin delete` needs delete. One process-wide
+  identity can't split these. A credential per store URL would be new code.
+- **Encryption.** Store read access stops meaning data access only if versions are encrypted
+  before they ship (a data key per app, wrapped by a KMS key the node reaches through its
+  identity). New code.
+
+### S2. The beta secrets directory
+
+**What and where.**
+- `secrets = "/etc/nanovm/secrets"` (`B:config.rs:97-99`, `B:deploy/systemd/nanovm.toml:23-25`),
+  made `0700` by `B:deploy/single-node/install.sh:24` and checked at start (`B:supervisor.rs:179`,
+  `B:secrets.rs:85-92`).
+- Each app's `<app>.json` is read when its worker starts (`B:supervisor.rs:655-658`,
+  `B:secrets.rs:57-75`), checked for changes every second (`B:supervisor.rs:243`), sent on the
+  worker's stdin, and served through `wasi:config` (`B:app.rs:175`).
+- Design and docs: `B:notes/beta-secrets.md`, `B:README.md:464-478`,
+  `B:deploy/single-node/README.md:218-244`. Containers mount the directory read-only
+  (`B:deploy/container/README.md:46-49`).
+
+**Who holds it, and for how long.**
+- **The operator**, for every tenant. Developers hand values over out of band; they can't set
+  their own until deploys are authenticated (B-103).
+- **Each node's disk**, in plaintext. With several nodes, "each reads its own directory; nothing
+  copies secrets between them" (`B:notes/beta-secrets.md:167`), so there are as many copies as
+  nodes.
+- **Each app's worker memory.** It is not dumpable only when the supervisor runs as root (B-104).
+- **Lifetime** is whatever the provider issued. OAuth client secrets, LLM API keys and bot tokens
+  usually never expire. Rotation is by hand; the node restarts the worker when the file changes.
+
+**If it is stolen.** Root on any node, a backup of `/etc/nanovm`, or the channel between the
+operator and developers gives every tenant's keys to their upstream services. A malicious version
+of an app, signed by an identity its record trusts, reads its own keys and can send them wherever
+its egress reaches. Masking hides only exact values in telemetry and error text (B-101).
+
+**Keep what beta already does.** Secrets are never in the package (`check_package`), never in
+argv or the environment, and never copied verbatim into errors or telemetry. Each app gets only
+its own, behind its uid and Landlock. A missing secret fails closed, and a changed file restarts
+the worker.
+
+**Options today, with no new code.**
+- **Fill the directory from a secret manager**, authenticated by the node's own identity: Vault
+  Agent templates (with AWS, GCP or Kubernetes auth), or a timer that reads AWS Secrets Manager or
+  GCP Secret Manager with the instance role. Nothing long-lived is then copied by hand. nanovm
+  already picks up changes. [Vault Agent templates](https://developer.hashicorp.com/vault/docs/agent-and-proxy/agent/template)
+- **Short-lived values where the upstream allows them** (Vault's dynamic database credentials,
+  for example) work too, since a change restarts the worker.
+- **At rest:** systemd's `LoadCredentialEncrypted=` keeps the files sealed to the TPM. Set
+  `secrets` to the unit's credentials directory, check that its mode passes `check_dir`, and
+  expect a rotation to restart the unit. [systemd credentials](https://systemd.io/CREDENTIALS/)
+
+**Secretless, with new code.**
+- **Per-app workload identity.** The node, or the proxy, acts as an OIDC issuer. Each worker gets
+  a short-lived JWT whose subject is the app's name (host and repository), refreshed through
+  `wasi:config` or a host function. Apps exchange it at AWS STS (`AssumeRoleWithWebIdentity`),
+  GCP Workload Identity Federation or Entra workload identity federation, so they need no API
+  keys for those clouds. It needs an issuer signing key (in a KMS, or rotated hourly with old keys
+  left in the JWKS until their tokens expire), a public JWKS URL, and token refresh.
+  [AWS](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRoleWithWebIdentity.html),
+  [GCP](https://cloud.google.com/iam/docs/workload-identity-federation),
+  [Entra](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation)
+- **Egress-side injection** for APIs that take only a static key. `egress.rs` already builds every
+  outbound request on the host, so the supervisor's forwarder could add an operator-held
+  `Authorization` header for one (app, host) pair. The guest never holds the key, so a malicious
+  version can use it only through that host and can't take it away. The key is still long-lived,
+  but it never enters the guest.
+- B-103's plan (sealing to a node's public key) adds a long-lived node key: see S8.
+
+**What has no secretless option.** Third-party APIs that issue only static keys (most LLM
+providers, many bot platforms) and GitHub's web sign-in, which takes a client secret. These can
+be kept out of the guest and out of hand-copied files, but not removed.
+
+### S3. Proxy↔node trust by network position
+
+**What and where.**
+- **Proxy to node:** plain HTTP through hyper's `HttpConnector` (`M:proxy.rs:69`,
+  `B:proxy.rs:75`; sent at `B:proxy.rs:301-303,331-335`). The node takes the app, its trust policy,
+  its version floor and its host from `nanovm-*` headers (`B:registry.rs:76-83,106-149`,
+  `B:supervisor.rs:441-447`). It also trusts WebSocket events and `nanovm-callers`. W-602 says it
+  plainly: "a node reached without the proxy trusts what it is sent".
+- **Node to proxy:** the supervisor posts publishes and calls between objects to `cfg.proxy`
+  (`B:supervisor.rs:780-786,996-1010`). The proxy's `publish_listen` serves `/publish` and
+  `/objects/…`, trusting `nanovm-app`, `nanovm-host` and `nanovm-callers`
+  (`B:proxy.rs:386-422,527-533`: "network policy must restrict it to nodes").
+- **Docs:** `B:deploy/systemd/nanovm.toml:4-5`, `B:deploy/systemd/proxy.toml:9-10`,
+  `B:README.md:361,493`. `M+B:PLAN.md`: "The node has no TLS and no auth of its own", and
+  "Multi-node operation still needs authenticated ingress/internal-call placement".
+- **Rate limits** trust `X-Forwarded-For` from the addresses in `[clients] trusted`
+  (`B:config.rs:203-207`). That is network position too.
+
+**Who holds it.** Nobody; there is no secret. On one host both ports are on loopback. With
+several nodes, each node's `listen` and the proxy's `publish_listen` face a network.
+
+**If an attacker reaches the node's port:**
+- They can ask for any app version signed by any Sigstore identity, naming their own
+  `nanovm-trust`. The beta's `signers` and `hosts` lists live only in the proxy, so they are
+  bypassed. The node still checks the signature, and data is keyed by host and repository, so
+  another repository's data stays out of reach.
+- They can drive a host's own app with a forged `nanovm-callers`, reaching routes the app keeps
+  for its own objects.
+- They skip the proxy's per-client and per-app rate limits.
+
+**If an attacker reaches `publish_listen`:** they can publish into any app's WebSockets by naming
+it, and call any app's objects as if they were one of its own.
+
+On a single-node VM, "an attacker" means any local process, of any uid: the units restrict
+neither addresses nor uids. Workers can't, because their jail allows no sockets.
+
+**Options today, with no new code** (all secretless):
+- **One host:** an nftables `output` rule that admits loopback connections to `:8080` only from
+  sockets in `nanovm-proxy.service`'s cgroup, and to `:8444` only from `nanovm.service`'s
+  (`socket cgroupv2`; check it on the target kernel). The container setup already gets the same
+  result by sharing one network namespace (`B:deploy/container/README.md:39`).
+- **Several hosts:** a sidecar doing mTLS with short-lived certificates. SPIRE issues X.509-SVIDs
+  (one hour by default) and rotates them; ghostunnel or Envoy terminates and originates mTLS and
+  checks the peer's SPIFFE ID; nanovm keeps speaking plain HTTP to loopback.
+  [SPIRE](https://spiffe.io/docs/latest/spire-about/), [ghostunnel](https://github.com/ghostunnel/ghostunnel)
+- **Or** a private network whose security groups admit only proxies to `:8080` and only nodes to
+  `:8444`. That is secretless but coarse.
+- A WireGuard mesh would add long-lived static keys; prefer SPIFFE.
+
+**With new code:** native mTLS with rustls (already a dependency, `B:Cargo.toml:34-35`), reading a
+certificate that spiffe-helper rotates, or the SPIFFE Workload API, and checking the peer's
+SPIFFE ID in both directions. On one host, Unix sockets with peer credentials, as the admin
+socket's directory check already does. Not a shared bearer token: that would be a new long-lived
+secret on every node and proxy.
+
+### S4. Registry push credentials
+
+**What and where.**
+- `nanovm publish` reads `NANOVM_REGISTRY_USER` and `NANOVM_REGISTRY_TOKEN` (`M:main.rs:58-59,78`,
+  `B:main.rs:61-62,82`).
+- `Oci::push_app` asks `/v2/` how to authenticate. On a Bearer challenge it sends the login as
+  Basic to the token realm (https or loopback only) and gets a token for
+  `repository:<name>:pull,push`. On a Basic challenge it sends the login with every request, to
+  the registry's origin only (`B:registry.rs:436-461,491-527,569-570`).
+- The workflows pass `github.actor` and `GITHUB_TOKEN` (`M+B:publish-app.yml:55-56`).
+  `publish-guests.yml:38` uses `oras login` with the same token.
+
+**Who holds it, and for how long.**
+- **CI:** `GITHUB_TOKEN`, limited to `packages: write` by the workflow. It expires when the job
+  ends (24 hours at most).
+- **A developer publishing from a laptop:** for GHCR, a classic personal access token with
+  `write:packages`. GitHub Packages takes classic tokens, and GitHub's page ticks `repo` too when
+  `write:packages` is ticked. It lives as long as it was created for, often with no expiry.
+  [GHCR auth](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-with-a-personal-access-token-classic)
+
+**If it is stolen.**
+- **Moving a tag is a deploy**: the proxy resolves `app=<repo>:<tag>`. Nodes run only signed
+  versions, so a stolen push credential can't run new code. But it can move a host back to any
+  older signed version, unless the record sets `min=`, and it can delete or overwrite tags.
+- **With `repo` scope**, it can push to the branch the trusted workflow runs on and dispatch
+  `publish-app.yml`. CI then signs the attacker's code as the trusted identity: arbitrary code
+  under the app's host, with its data.
+
+**Options today, with no new code.**
+- **Publish only from CI**, as the template does; then no developer holds a push credential.
+- **Other registries through GitHub's OIDC token**, passed in the existing variables:
+  - ECR: `aws-actions/configure-aws-credentials` with a role, then `NANOVM_REGISTRY_USER=AWS` and
+    `NANOVM_REGISTRY_TOKEN=$(aws ecr get-login-password)` (12 hours).
+  - Artifact Registry: `google-github-actions/auth` with Workload Identity Federation, then user
+    `oauth2accesstoken` and `gcloud auth print-access-token` (1 hour).
+  - ACR: `azure/login` with a federated credential, then `az acr login --expose-token` (about 3
+    hours).
+  - nanovm passes the login as Basic either way, so these work as they are.
+    [GitHub OIDC](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/about-security-hardening-with-openid-connect),
+    [ECR](https://docs.aws.amazon.com/AmazonECR/latest/userguide/registry_auth.html),
+    [Artifact Registry](https://cloud.google.com/artifact-registry/docs/docker/authentication),
+    [ACR](https://learn.microsoft.com/en-us/azure/container-registry/container-registry-authentication)
+- **From a laptop**, the same commands give 1-12 hour tokens from the developer's SSO session
+  instead of a stored token. GHCR has no such exchange: from a laptop it needs a PAT.
+- **Set `min=`** on records, so a moved tag can't go below the floor.
+
+**With new code:** support Docker credential helpers (`credHelpers` in `~/.docker/config.json`),
+so `docker-credential-ecr-login` or `docker-credential-gcr` mint a token for each push from the
+developer's identity; or have `nanovm publish` exchange a GitHub OIDC token itself.
+
+The publishing job holds `packages: write` and `id-token: write` while it runs third-party actions
+and `cargo install`; see S11.
+
+### S5. Secrets in public packages (main)
+
+- **On main,** an app's only inputs are its manifest's `env` and `config`, published as the
+  package's config blob and pulled anonymously.
+- **The oauth example** ships `"env": { "CLIENT_SECRET": "set-me" }`
+  (`M:examples/oauth/nanovm.json:9`, read at `M:examples/oauth/src/lib.rs:81`).
+- **The gateway's README** tells developers to put the API key in `env` as `UPSTREAM_KEY`
+  (`M:examples/gateway/README.md:16-18`, read at `M:examples/gateway/src/lib.rs:48`), and says it
+  is published (`:48-49`).
+- `nanovm publish` on main checks nothing, so anyone who pulls has the key, for as long as any
+  copy exists.
+- **Fixed on beta:** the manifest lists `secrets`, the node gives the values (S2), and
+  `check_package` refuses credential-like keys and values at publish (`B:secrets.rs:97-125`,
+  called at `B:main.rs:70`). Landing beta fixes it; S2's caveats then apply.
+
+### S6. Credentials apps keep in their own data
+
+- **oauth.** The session id is the credential: 64 random hex digits in a cookie, valid 30 days
+  (`SESSION_MS`). It is stored as the KV key `session:{id}`, in `auth` and in each user's object
+  (`M:examples/oauth/src/lib.rs:98,133`; `B:…:103,138`).
+  - KV keys are file names under `/data/.kv/` (`B:README.md:386`), so every shipped version of
+    those objects holds every live session id in plaintext.
+  - Anyone with the store credential (S1), a node's disk or a backup can sign in as any user.
+  - Fix in the example, with no nanovm code: store `sha256(id)` and look sessions up by the hash.
+    A leaked store then holds nothing a browser can present.
+- **webhooks.** Each endpoint's HMAC secret is stored in its KV `config`
+  (`M:examples/webhooks/src/lib.rs:49`, `B:…:51`), and ships with every version.
+  `PUT /{hook}/config` is unauthenticated, as its README says.
+  - GitHub signs deliveries with a shared secret only, so a secret is unavoidable for GitHub.
+  - Senders that implement Standard Webhooks' asymmetric `v1a` signatures (Ed25519), or Discord's
+    interactions, can be checked with a public key alone.
+    [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md)
+- **jobs and locks** hand out random fencing tokens for leases. They are not credentials worth
+  stealing.
+- **In general,** whatever an app keeps goes to the store unencrypted. Encrypting versions before
+  they ship would make S1's read access useless; that is new code (S1).
+
+### S7. Telemetry: Collector credentials and the unauthenticated hop
+
+- **No telemetry secret in nanovm.** The node and the proxy send OTLP/HTTP with no credentials:
+  `Relay::new` refuses an endpoint with a user, password, query or fragment, and `send` adds only
+  `content-type` (`M:telemetry.rs:258-285`, `B:telemetry.rs:267-293`). Only the supervisor
+  connects; workers go through it. The backend credential lives in the Collector's exporter, by
+  design (`M+B:demo/otel-collector.yaml:1-3`, `B:deploy/single-node/README.md:335-339`).
+- **Who and how long:** the Collector's host. Vendor API keys (Grafana Cloud, Honeycomb, Datadog
+  and similar) usually don't expire.
+- **If it is stolen:** write access to all telemetry, and with many vendors read access too:
+  guests' stdout and stderr, request paths, error text (declared secrets masked, exact matches
+  only).
+- **The node→Collector hop is unauthenticated**, so anyone reaching `:4318` can inject spans and
+  logs (fake errors, alert noise) or flood it. The reference setup keeps it on loopback.
+- **Options today, with no new code:**
+  - Collector extensions that use the host's cloud identity instead of a key: `sigv4auth` (AWS:
+    Amazon Managed Prometheus, X-Ray, CloudWatch), `googleclientauth` (Google Cloud), `azureauth`
+    (Azure Monitor, managed identity). Vendors that accept only API keys keep one, on the Collector
+    alone. [Collector extensions](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension)
+  - Across hosts: a Collector on each node's loopback, forwarding to a gateway Collector over mTLS
+    with short-lived certificates (the Collector reads certificate files; SPIRE or cert-manager
+    rotate them).
+- **With new code:** the node presenting a client certificate to a remote Collector, reloaded when
+  it rotates.
+
+### S8. Planned designs that would add long-lived secrets (beta)
+
+- **B-102** (`B:ISSUES.md:1148-1150`) plans private registry pulls with "registry credentials per
+  registry host, in the same root-only directory (for example `registries.json`)". Every node
+  would hold static pull credentials.
+  - Instead: ECR pulls with the node's instance role (`ecr:GetAuthorizationToken`, 12-hour
+    tokens), and Artifact Registry with the metadata server's one-hour token. Both fit
+    `registry::Oci`'s existing path (a login sent as Basic to the token realm).
+  - GHCR's private pulls from outside GitHub need a PAT; there is no workload identity. So keep
+    packages public, as now, or use a registry that accepts identities.
+- **B-103** (`B:ISSUES.md:1152-1154`, `B:notes/beta-secrets.md:176-179`) plans for developers to
+  set their own secrets "sealed to the node's public key". That adds a long-lived private key on
+  every node, and every secret ever sealed to it falls with it.
+  - Instead: seal to a KMS key (AWS KMS, Cloud KMS) whose decrypt right is granted to nodes'
+    identities.
+  - Or keep each app's secrets in a secret manager. Through the provider's OIDC federation, the
+    deploy identity (the `<issuer> <subject>` the trust policy names) may write only that app's
+    path, and nodes may read it.
+
+### S9. restic password and repository credentials (main)
+
+- **What and where:** main's backup is `scripts/backup.py`, a wrapper around restic
+  (`M:README.md:430-463`, `M:scripts/backup.py:24,102-103`). The operator sets
+  `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` and the repository's own credentials (for S3,
+  `AWS_*` again).
+- **Lifetime:** the password is the encryption key of every snapshot, so it must live as long as
+  they do.
+- **Options:** `RESTIC_PASSWORD_COMMAND` can read the password at run time from a KMS-backed
+  secret manager with the node's identity, so no copy sits on disk. An S3 repository can be
+  reached with an instance role.
+- **On beta,** restic is gone (`B:notes/beta-recovery.md:9-25`). The capture store (S1) replaces
+  it, without encryption, so the bucket credential now also guards the data's confidentiality.
+
+### S10. Deploy authority: DNS, signers and the Sigstore root
+
+- **No secret of nanovm's authorizes a deploy.**
+  - The TXT record `_nanovm.<host>` (`app=…; trust=<issuer> <subject>; min=…`) is not signed.
+    The proxy asks a DoH resolver for it (`B:proxy.rs:436-465`) and doesn't check DNSSEC.
+  - The node checks that the OCI artifact carries a Sigstore bundle from one of the record's
+    identities (`M:registry.rs:313-346`, `B:registry.rs:317-350`).
+  - Signing is keyless: a GitHub Actions OIDC token (minutes) buys a 10-minute Fulcio certificate
+    (`actions/attest-build-provenance`), or a developer signs in through a browser with `cosign`.
+    [Artifact attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations),
+    [Sigstore keyless](https://docs.sigstore.dev/cosign/signing/overview/)
+- **The long-lived credential behind deploys is the DNS account:** a registrar or DNS-provider
+  login, or an API token if records are automated. The developer or the domain's owner holds it,
+  outside nanovm.
+  - Whoever controls a host's DNS controls its routing.
+  - On main, the node accepts any identity a record names. On beta, the proxy cuts `trust=` to
+    the operator's `signers` (`B:config.rs:180-184`, `B:proxy.rs:450-451`).
+  - An app's data is keyed by host and repository, so a hijacked record never reaches another
+    repository's data. It can still serve allowed signed code under that host.
+- **Prefix signers are broad.** `https://github.com/org/*` (as in
+  `B:deploy/systemd/proxy.toml:21`) lets any workflow, on any branch of any repository in the
+  org, deploy wherever a record trusts it. Records should pin the workflow and the ref.
+- **The trust anchor** is Sigstore's public-good root, embedded in the binary without its TUF
+  client (`M:registry.rs:213`, `B:registry.rs:217`, `B:Cargo.toml:50-51`). These are public keys,
+  not secrets, but long-lived: when Sigstore rotates them, nodes need a new build.
+- **Options:**
+  - Signing is already keyless.
+  - Protect the DNS account with SSO and hardware keys, and a registrar lock.
+  - Sign the zone with DNSSEC and use a validating resolver. Checking the answer's AD bit in the
+    proxy would be new code.
+  - Change records through infrastructure-as-code with OIDC (for example Route 53 through a
+    GitHub OIDC role), so no DNS API token is stored. Providers that issue only static API tokens
+    can't do this.
+
+### S11. CI tokens
+
+- **No repository secrets** are used on either ref. Workflows use `GITHUB_TOKEN`/`github.token`
+  (`M+B:publish-app.yml:56`, `M+B:publish-guests.yml:38`, `B:bench-history.yml:46`,
+  `B:release.yml.disabled:80`) and the job's OIDC token for attestations (`id-token: write` at
+  `M+B:publish-app.yml:34`, `M+B:publish-guests.yml:17`, `B:release.yml.disabled:56`). `ci.yml` has
+  only `contents: read`.
+- **Lifetime:** the job, 24 hours at most; OIDC tokens last minutes.
+- **Two tidy-ups, no code:**
+  - `publish-guests.yml:38` writes `${{ secrets.GITHUB_TOKEN }}` into the script's text. Pass it
+    through `env:` to `--password-stdin` instead.
+  - The jobs with `packages: write` and `id-token: write` run third-party actions by mutable tag:
+    `actions/checkout@v5`, `dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`,
+    `oras-project/setup-oras@v1`, `actions/attest-build-provenance@v3`. Pin them by commit SHA,
+    or sign in a separate job that only receives the digest and attests it.
+    [Hardening for GitHub Actions](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions)
+
+### S12. TLS keys (beta)
+
+- **What and where:** Caddy holds an ACME account key and the certificates' keys
+  (`B:deploy/single-node/Caddyfile:1-13`, `B:deploy/single-node/README.md:149-164`).
+- **Lifetime:** Let's Encrypt certificates last 90 days, and Caddy makes a new key at each renewal
+  unless `reuse_private_keys` is set. The account key lasts until replaced.
+- **If stolen:** a certificate key lets someone with a network position impersonate the app hosts
+  until it expires. The account key alone can't get certificates without passing a challenge.
+- **Options:** already automated and short. Shorter with a CA's short-lived certificate profile;
+  or terminate at a managed load balancer, whose provider holds the keys.
+- **nanovm itself holds no TLS keys.** The proxy and the node speak plain HTTP
+  (`B:proxy.rs:521-525`, W-14). Outbound TLS (registries, DoH, egress) uses webpki roots and no
+  client certificates (`M:egress.rs:524-528`, `B:egress.rs:533-537`).
+
+### S13. Containers (beta)
+
+- The image (`B:deploy/container/Dockerfile`) and its configs hold no secrets. App secrets are
+  mounted read-only (`B:deploy/container/README.md:46-49`).
+- The README doesn't say how a store credential gets in. `-e` or `--env-file` would make it
+  readable by anyone who can run `docker inspect`.
+- Instead, use the host's instance role (IMDSv2 needs a hop limit of 2 to reach a container), or
+  IRSA or Pod Identity on Kubernetes.
+
+### S14. Local secrets for `nanovm run` (beta)
+
+- `nanovm run app.wasm --secrets secrets.json` reads a plaintext file and restarts when it changes
+  (`B:main.rs:102-136`). The README says to keep it out of version control (`B:README.md:475`).
+- The examples' READMEs write keys into `~/…-secrets.json` (`B:examples/gateway/README.md:8-9`).
+- Use dev-only keys with low limits. The tests use throwaway values (`s3cret`, `test-key`).
+
+### S15-S17. Not secrets, or already secretless
+
+- **The journal's MAC key** (`M:journal.rs:20-30,758`, `B:journal.rs:20-30,844`): 8 random bytes
+  per object, made by the node with `getentropy` and stored in the log's first block. It marks
+  which undo records are genuine (a truncated keyed SHA-256). Nobody provisions or sees it, and it
+  never leaves the object's log. Not a credential.
+- **The admin socket** (`B:admin.rs:1-53`): a Unix socket in a `0700` directory owned by the
+  supervisor's user (root). No token, and no HTTP route reaches it. On main the only admin surface
+  is `/_nanovm/ready` (`M:supervisor.rs:294-300`).
+- **Pulls and lookups:** nodes pull anonymously (`B:registry.rs:353-434`). The proxy resolves tags
+  anonymously and asks a public DoH resolver. The cost is that packages must be public (B-102).
+- **The workers' environment** is empty (`env_clear()`). They get only their own app's secrets, on
+  stdin, and never the store credential.
+- **Tests and scripts** hold only throwaway values: `RESTIC_PASSWORD="disposable-test-only"`
+  (`M:scripts/test_backup.py:29`), `s3cret`, `test-key`, and `Basic bWU6c2VjcmV0` (`me:secret`,
+  `B:registry.rs:908`). The integration tests check CI-signed guests from ghcr.io, pulled
+  anonymously.
+
+## What removing them would take
+
+**Possible today, with no nanovm code:**
+- **S1** on AWS and MinIO: instance roles, web identity, ECS or Pod Identity credentials, one role
+  per node.
+- **S2:** fill the directory from a secret manager, using the node's identity.
+- **S3:** short-lived mTLS through a SPIFFE sidecar, or an nftables cgroup rule on one host.
+- **S4:** publish only from CI; for ECR, Artifact Registry and ACR, exchange OIDC tokens for
+  short-lived registry tokens.
+- **S6:** hash the session ids in the oauth example.
+- **S7:** Collector auth extensions that use cloud identity.
+- **S9:** `RESTIC_PASSWORD_COMMAND` (main only).
+- **S11:** pin actions by SHA, and pass tokens through `env`.
+
+**New code:**
+- **Per-app workload identity** (S2): nanovm as an OIDC issuer, with its key in a KMS or rotated
+  hourly.
+- **Egress-side key injection** (S2).
+- **Native mTLS** between proxy and node (S3).
+- **`gcp-base` and `azure-base`** for `object_store` (S1).
+- **Encryption of shipped versions** (S1, S6).
+- **Docker credential helpers** for `nanovm publish` (S4).
+- **Designs for B-102 and B-103 without node-held keys** (S8).
+
+**No secretless option:**
+- Third-party APIs that issue only static keys (most LLM providers, many bot platforms).
+- GitHub's OAuth client secret, and GitHub's webhook secret.
+- Storage providers without temporary credentials (R2, B2 and most S3-compatibles).
+- The DNS account.
+
+These can be kept out of guests, out of packages and out of hand-copied files, and fetched by
+identity from a secret manager. They can't be removed.
