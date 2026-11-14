@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["runtime"]
+
+[workspace.package]
+edition = "2024"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+debug = false

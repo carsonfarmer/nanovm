@@ -200,7 +200,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### N-31 (removable): code the phase 7 review found removable
 - **What:** `check_digest` in `AppRef::from_headers` repeats the one in `fetch`, which runs before any path (1 line); TLS in the proxy (`proxy.rs` `tls`, `tls_cert`/`tls_key`, about 30 lines) if a terminator in front is assumed (owner's call: there is no ACME anyway); depending on `oci-spec` directly instead of oci-client, which the runtime now uses only for its re-exports (fewer dependencies, not lines).
-- **Status:** partly done in 57d17a4: the runtime depends on `oci-spec` instead of oci-client (10 fewer crates in the runtime build; three small serde structs read the manifest fields it needs). The `check_digest` in `from_headers` stays on purpose: Reference parsing accepts upper case and other algorithms, and the early check answers a malformed digest with a 400 before any start lock or registry work. Its last part, dropping TLS from the proxy, is W-14 (decided).
+- **Status:** partly done in 57d17a4: the runtime depends on `oci-spec` instead of oci-client (10 fewer crates in the runtime build; three small serde structs read the manifest fields it needs). The `check_digest` in `from_headers` stays on purpose: Reference parsing accepts upper case and other algorithms, and the early check answers a malformed digest with a 400 before any start lock or registry work. Its last part, dropping TLS from the proxy, is W-14 (decided). Since `cf/oci-push` oci-client is gone entirely (owner's decision): `nanovm publish`, `examples/dev-registry.rs` and the test helpers push through `registry::Oci::push_app`, and 7 more crates left the build.
 
 ### N-32 (tests): persistence tests coupled to small CPU budgets
 - **W-9 baseline evidence (2026-11-08):** unchanged `kv_counts_against_the_disk_quota` fails repeatedly at 100 ms CPU (expected 198 small keys, then eight 1 MiB values in a targeted run); `kv_refuses_bad_names_and_streams_keys` hits its 10 s deadline in the full serial suite, then passes targeted. Same runtime passed CI 42437123623 on docs-only `fed57b1`. Production limits and fixtures are not changed in the storage experiment; this remains unresolved, not cured by a rerun.
@@ -314,13 +314,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `journal.rs` (`recover`, the `Undo::Created` arm; `creating` records the create first)
 - **Scenario:** found by the quality agent's model-based quota test (D-46). A guest creates `d/a` (a file or a directory) where `d` is a file: `creating` records `Created(d/a)` (its `symlink_metadata` fails with ENOTDIR, not NotFound), and the create then fails. If that request fails (an error answer, a trap, CPU, a crash), the next start recovers the log; `symlink_metadata(d/a)` fails with ENOTDIR again, which recovery treated as an error, so the journal refuses to start the object, every time: the object answers 503 `instantiate-failed` (`Not a directory`) for good. Any app that creates paths from request data can be bricked by a client who makes it create under a file and then fail.
 - **Reproduced:** yes: `quota_usage_always_matches_the_model` shrank it to two requests (commit an empty file `d`; then `mkdir d/a` in a request that fails); `a_failed_create_under_a_file_rolls_back` fails without the fix (`recovery succeeds: NotADirectory`).
-- **Fix:** recovery treats NotADirectory like NotFound for a `Created` record: nothing can be there, so the create never happened. One line; also repairs logs already written.
+- **Fix:** recovery treats NotADirectory like NotFound for a `Created` record: nothing can be there, so the create never happened. One line.
 - **Status:** fixed in 6fdb057 (recovery); the class is closed on `ideas/recover-class`: `creating` and `removing_dir` refuse what they can't name instead of recording it (see N-503, N-504)
 
 ### N-503: a failed create of an over-long name bricks the object if its request then fails
 - **Where:** `journal.rs` (`creating`, `recover`)
 - **Scenario:** found by the quality agent's second hostile guest (D-58). The N-502 class with another errno: a 256-byte name fails `symlink_metadata` with ENAMETOOLONG, is recorded as `Created`, the create fails, and a failed request leaves recovery failing on every start (503 `instantiate-failed`, `File name too long`). Any app that names files from request data can be bricked by a long name and a failing request.
-- **Reproduced:** yes (`unusual_names_commit_and_roll_back` on `ideas/hostile2`; `logs_naming_impossible_paths_recover` and `random_path_shapes_always_roll_back` fail without the fix).
+- **Reproduced:** yes (`unusual_names_commit_and_roll_back` on `ideas/hostile2`; `random_path_shapes_always_roll_back` fails without the fix). `records_of_operations_that_cannot_succeed_recover` checks what the journal does record of operations that can't succeed: a create under a missing directory, and a rename to under a file or under a name past NAME_MAX whose cancellation a crash kept from being durable.
 - **Fix:** see N-504.
 - **Status:** fixed on `ideas/recover-class`
 
@@ -328,7 +328,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `journal.rs` (`creating`, `removing_dir`, `renaming`, `recover`)
 - **Scenario:** found by the second hostile guest (D-58). A guest reaches any depth by opening each directory from its parent's descriptor; the journal names entries by absolute path. Creating a directory whose path reaches PATH_MAX (16 levels of 255-byte names under a 72-byte volume path) was recorded, made, then failed the commit (`File name too long`) and every later recovery: the object answered 503 `instantiate-failed` for good. A directory renamed under a deep one could also move what is under it out of the journal's reach.
 - **Reproduced:** yes (`/deep` on `ideas/hostile2`: depths 12-15 commit and roll back; 16-20 brick the object).
-- **Fix (one class with N-502, N-503):** `creating` and `removing_dir` record only when `symlink_metadata` says NotFound (or, for `removing_dir`, a directory); any other error is returned, so the guest gets the error the syscall would give (`not-directory`, `name-too-long`) and nothing is recorded. Returning rather than recording nothing: for a whole path too long for the journal but not for the guest's descriptor, the create would succeed out of the journal's reach. `renaming` refuses a move that would put anything under it at PATH_MAX or more (walking a moved directory, at most `max_files` entries). Recovery treats path-shape errors (NotFound, NotADirectory, ENAMETOOLONG, and ELOOP) as "nothing there" for every record, repairing logs already written; real I/O errors stay fatal (since N-690, ENAMETOOLONG only for a name past NAME_MAX: recovery reaches entries through descriptors).
+- **Fix (one class with N-502, N-503):** `creating` and `removing_dir` record only when `symlink_metadata` says NotFound (or, for `removing_dir`, a directory); any other error is returned, so the guest gets the error the syscall would give (`not-directory`, `name-too-long`) and nothing is recorded. Returning rather than recording nothing: for a whole path too long for the journal but not for the guest's descriptor, the create would succeed out of the journal's reach. `renaming` refuses a move that would put anything under it at PATH_MAX or more (walking a moved directory, at most `max_files` entries). Recovery treats path-shape errors (NotFound, NotADirectory, ENAMETOOLONG, and ELOOP) as "nothing there" for every record; real I/O errors stay fatal (since N-690, ENAMETOOLONG only for a name past NAME_MAX: recovery reaches entries through descriptors).
 - **Status:** fixed on `ideas/recover-class`
 
 
@@ -346,12 +346,116 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Fix:** the supervisor spawns `/proc/self/exe`, which in the forked child is the supervisor's own image even after its file is replaced or deleted (argv[0] stays `nanovm`, so `ps` is unchanged). +2 runtime lines.
 - **Status:** fixed on `ideas/worker-exe` (the same drill: the new app starts from the running image)
 
+### N-200: an in-process node could not publish to its sockets
+- **Where:** `egress.rs` (`send_request`), `object.rs` (`commit`)
+- **Scenario:** a node built in-process (tests, the benchmark, embedders, `nanovm run`) sent a guest's `http://nanovm/publish/` to its egress policy, which denied it, so only jailed workers could publish, and nothing could run a WebSocket app on one machine without the supervisor and proxy.
+- **Status:** fixed on `cf/onramp` (416f85d, ported from 1392e99): every node holds publishes until its request commits; a jailed worker forwards them as before, an in-process node hands them to `Node::sockets` (the proxy's `ws::Sockets`). `only_well_formed_publishes_are_held` fails without it.
+
+### N-201: a publish to another `http://nanovm/` path was accepted and dropped
+- **Where:** `egress.rs` (`hold`)
+- **Scenario:** a worker held a POST to, say, `http://nanovm/elsewhere` as a publish and answered 200; the supervisor then dropped it, so the guest believed it had published.
+- **Status:** fixed on `cf/onramp` (416f85d): anything but `/publish` gets 404 at once.
+
+### N-202: the QuickJS runtime's allocator declarations trip rustc 1.99's runtime-symbol lint
+- **Where:** `js/runtime/src/lib.rs` (`extern "C"` malloc, calloc, realloc, free)
+- **Scenario:** declared with `*mut u8` where std's runtime symbols take `c_void`; rustc 1.99 warns (`suspicious_runtime_symbol_definitions`). Harmless on wasm32 today (same ABI) but a future toolchain may make it an error.
+- **Status:** fixed on `cf/onramp` (3308ee0): `c_void` signatures, cast at the allocator boundary.
+
+### N-203 (tests): `kv_counts_against_the_disk_quota` fails under load on the base too
+- **Where:** `tests/integration.rs`
+- **Scenario:** the test writes 198 one-byte keys in one `hostile` request, under that app's 100 ms CPU budget and 1 s deadline. At load average 13–19 from other agents it failed with `cpu` or `timeout` in 4 of 4 alternating runs of `cf/main-next`'s test binary and 4 of 4 of `cf/onramp`'s (one run of each in the first round produced no result), and passed alone at lower load. It measures the machine, not the quota.
+- **Status:** open: give the fill its own app limits (as `kv_refuses_bad_names_and_streams_keys` does for its 1,500 keys), keeping the quota assertions.
+
+### N-600: SQLite's own syncs are charged to the request's CPU budget
+- **Where:** `components/sqlite/provider` (`PRAGMA journal_mode=DELETE; synchronous=FULL`, the VFS's `block_on` around `sync`), CPU accounting in `object.rs` (`charged`: time inside the store's polls)
+- **Scenario:** found by the examples (`examples/leaderboard`, `examples/shop`). Every SQLite statement that writes is a SQLite transaction with its own journal file and syncs, and the provider waits for each host fsync inside the guest's poll, so the wait counts as CPU. Under `nanovm run` (debug build, 4 cores at load 21-26), one-row `INSERT` statements cost ~6-12 ms each: 10 in one request took 97 ms, 20 took 243 ms, 40 were refused with `cpu` ("used more than 200ms of CPU in one request"; 200 ms is the most `nanovm run` allows). A checkout of four writing statements and one call failed with `cpu` in 1 of 4 runs. The same rows as one statement (`INSERT … SELECT … FROM json_each(?)`): 100 rows in 25-47 ms. The examples write one statement per request (a batch statement; a trigger for multi-table changes) and say why.
+- **Why (from source):** `object.rs` builds the WASI context with `allow_blocking_current_thread(true)`, so wasmtime-wasi runs a guest's `sync`/`sync_data` (and every other file call) inline, inside the store's poll that `ObjShared::charged` times. The journal's own waits are given back with `uncharge` (`journal.rs`), but `QuotaFs`'s `sync`/`sync_data` delegate straight through (`quota.rs`), so a guest's own fsyncs count as CPU. Only SQLite issues them today (synchronous=FULL, several per writing statement).
+- **Reproduced:** yes (numbers above; `leaderboard_pages_and_ranks_from_sqlite` and `shop_checkout_is_all_or_nothing` were the failing tests before the examples were changed).
+- **Status:** open, for the storage owners: nanovm's outer journal already makes the request atomic and durable, so SQLite's DELETE journal and FULL syncs are redundant work (experiments/sqlite-filesystem found MEMORY mode recovers correctly, "not a general endorsement"). Either the provider syncs less (e.g. `synchronous=OFF` or `journal_mode=MEMORY`, after the recovery matrix is rerun), or `QuotaFs`'s `sync`/`sync_data` uncharge their wait as the journal does (a few lines in `quota.rs`).
+
+### N-601 (tests): restarting `nanovm run` raced the old process's storage lock
+- **Where:** `tests/dev.rs` (`drop(run); start(..)`), and the examples harness as first written
+- **Scenario:** `kill_on_drop` sends SIGKILL without waiting; a `nanovm run` started on the same data before the old one has exited fails with "app storage is already owned or cannot be locked" and exits. Seen in 2 of ~16 runs of the shop example's test at load ~25.
+- **Status:** fixed on `ideas/examples` (42b2fc2 for the examples harness, fa88fe7 for `dev.rs`): kill, then wait for the process, then start.
+
+### N-602: `nanovm run` lowered a manifest's limits without saying so
+- **Where:** `main.rs` (`run`: `spec.limits.clamped(&cfg.limits)`)
+- **Scenario:** `nanovm run` caps every limit at its node's defaults (1 MiB request bodies, 200 ms CPU, 5 s deadlines). A manifest asking for `max_request_body_kb: 4096` got 1024, and a 3 MiB upload was refused with `413` (found by `examples/files`); nothing at startup said the manifest had been overridden.
+- **Status:** fixed on `ideas/examples`: `run` prints a line for each limit it lowers (`the manifest's max_request_body_kb is 4096; nanovm run allows at most 1024, so it is 1024 here`). `nanovm_run_says_when_it_lowers_a_limit` times out waiting for that line without it. Raising the caps (a flag, or the manifest's own limits up to a higher ceiling) is left open.
+
+### N-603: the SQLite provider refused full-text search
+- **Where:** `components/sqlite/provider/src/lib.rs` (the authorizer)
+- **Scenario:** the provider denies every `PRAGMA` but `integrity_check`, and the authorizer also sees the statements SQLite's own modules prepare: FTS5 asks `PRAGMA main.data_version` (FTS3/4 and R-Tree ask `page_size`), so `CREATE VIRTUAL TABLE … USING fts5` and every write to one failed with `access-denied`, although the bundled SQLite has FTS5 compiled in (found by `examples/notes`).
+- **Status:** fixed on `ideas/examples`: the two read-only pragmas (no value) are allowed; setting pragmas stays denied (the SQLite experiment's policy test, which checks `journal_mode=WAL` and `synchronous=OFF`, is unchanged). `notes_search_their_own_full_text_index` fails with `Error::AccessDenied` without it.
+
+### N-180: a cycle of calls closed through waits on two other nodes is ended by the timeout, not refused
+- **Where:** `table.rs` (`wait_for`, `dispatch`), with leases
+- **Scenario:** a call carries its callers, so a node refuses (508) any cycle along one chain of calls, and any whose waits are recorded on that node. Concurrent requests whose waits are recorded on two or more other nodes (x on A waits on y on B, y waits on z on C, z calls x) can still close a cycle: it holds until the request timeout. Found while building W-10.
+- **Status:** open; refusing it needs a wait graph shared between nodes (owner's call: notes/multinode.md)
+
+### N-181: with leases, the lease store is a hard dependency of every node
+- **Where:** `lease.rs`
+- **Scenario:** a node that can't renew its session for 7/8 of `lease_ms` stops serving all its objects; if the store is unreachable from every node, the whole cluster stops after `lease_ms`, and new objects can't be placed meanwhile (the proxy retries for `failover_ms`, then 503). Inherent to lease fencing (etcd and Consul behave alike); S3's availability bounds the cluster's.
+- **Status:** open, owner's call (notes/multinode.md)
+
+### N-182: with more than one node, the proxy buffers each request body to retry it
+- **Where:** `proxy.rs` (`send`)
+- **Scenario:** to send a request again after a 421 or to the next node, the proxy holds its body, up to `max_request_body_kb` (1 MiB), per request in flight; one node still streams. Adds to what W-35 bounds.
+- **Status:** open (with W-35)
+
+### N-183: each instantiation with leases costs a store round trip
+- **Where:** `lease.rs`, `object.rs` (`run`)
+- **Scenario:** an object's actor takes its lease (a read and a conditional write) before instantiating and releases it (a write) when it exits, so a cold start waits on the store (tens of ms on S3) and LRU churn costs three store requests per instantiation.
+- **Status:** open; W-91 would keep released leases for a while. Since `fix/lease-r3fix` each acquisition also claims the object's head (a read and a conditional write), and a takeover restores the object from the store before its first request.
+
 ### N-640: the CPU budget charged time waiting for a core, so overload became CPU kills
 - **Where:** `object.rs` (`ObjShared::charged`, `cpu_used_ns`, `uncharge`, the epoch callback), `journal.rs` (its three `uncharge` sites)
 - **Scenario:** found by the orchestrator on a 4-core VM at load ~20. The per-request budget read the wall clock before and after each poll, so time the guest's thread spent descheduled, or blocked in an fsync the guest asked for, was billed as CPU. On an overloaded node honest requests got 500 `cpu`, and the restarts added load. `sqlite_repeated_updates_remain_bounded`, `sqlite_handled_storage_exhaustion` and `sqlite_journal_pressure_matrix` (5–10 s budgets) and `kv_counts_against_the_disk_quota` (100 ms, see N-32) failed under load and passed idle. N-600 (examples agent) is the same bug: the SQLite provider's synced one-row writes were charged their fsync waits.
 - **Reproduced:** yes. `cpu_budget_is_cpu_not_time_waiting_for_a_core` runs the node on one CPU shared with seven busy threads: before, a request needing about 33 ms of CPU was killed after 12–16 ms of CPU, and `/spin` after 14–18 ms, against a 100 ms budget (5 runs). `sqlite_sync_waits_are_not_charged_as_cpu` (100 synced one-row transactions, default 200 ms budget) failed 3 of 3 at load 16.
 - **Fix:** each poll is charged the change in the polling thread's `CLOCK_THREAD_CPUTIME_ID`: user and kernel time, so the guest's own file calls count and waiting for a core or the disk doesn't. The epoch callback runs on that thread and reads the poll in progress the same way; nothing reads it from another thread. The journal's own work (undo records, renames into the journal, the commit and any capture) stays uncharged, measured with the same clock instead of as wall time, so no request is charged more than before. `guest_cpu_ns` is now CPU time. The wall-clock deadlines (504) still stop requests that are slow for any reason. After: the test's request succeeds with 31–40 ms of CPU and `/spin` is killed after 102–103 ms (5 runs); the SQLite tests above and the new one pass under load 21–37 where the old build fails 4 of 5. Tests whose fixtures assumed wall billing get deadlines sized for a busy disk (`filler`, the two 1,000-statement SQLite tests, the 1,500-key KV test) or for lane turns (`cpu_hogs_leave_cores_for_short_requests`), and the quota test `kv_counts_against_the_disk_quota` moves to `filler` like its siblings: its 198 writes use 100–160 ms of real CPU on this loaded host, half of it kernel time. Cost: about 0.16 µs per clock read, 8.1 reads per warm GET (≈2%). Details: `notes/cpuclock.md`.
 - **Status:** fixed on `cf/cpu-clock`
+
+### N-160 (efficiency): a small durable write cost 9 device flushes
+- **Where:** `journal.rs`
+- **Scenario:** the first record of every request made the log and synced three directories; every record was synced on its own; commit synced each changed path, deleted the log and synced its directory. A counter `POST /incr` (create, write, rename over) took 6 fsync + 3 fdatasync, 23 device writes, 2 discards and 9 flushes (private nojournal ext4 loop).
+- **Fix:** the log is made once per object and kept; its first block holds a format tag and a random key that signs every record, and a commit writes a new key (one overwritten block, synced) instead of deleting the log. Records made back to back share a sync. Now 15 writes, 1 discard, 5 flushes; journaled ext4 16.9 writes + 12.7 flushes -> 9.5 + 5.5.
+- **Status:** fixed in d464eec, 1aec24f (cf/storage)
+
+### N-161 (efficiency): a commit blocked its worker thread, and every object on it
+- **Where:** `quota.rs` (`QuotaGuard::commit`), `object.rs` (`commit`)
+- **Scenario:** a commit's syncs ran inline on a tokio worker: a 4-thread worker had at most 4 commits in flight though fdatasync here does 543/s from one thread and 11k/s from four.
+- **Fix:** the commit runs on a blocking thread and is awaited; its syncs of changed paths go up to 16 at once. `block_in_place`, tried first, hung `post_return_work_keeps_context_and_reports_commit_failure`: do not use it inside wasmtime's event loop.
+- **Status:** fixed in 1aec24f (cf/storage)
+
+### N-162: a request that wrote many files overran its post-return deadline committing them
+- **Where:** `journal.rs` (`commit`)
+- **Scenario:** `kv_refuses_bad_names_and_streams_keys` writes 1,500 keys; their commit synced 1,500 files one by one, longer than the 5 s post-return deadline on a loaded disk: the instance was killed and the request reported a timeout though nothing was wrong.
+- **Fix:** paths sync up to 16 at a time (N-161). Still open: the same test (and `kv_counts_against_the_disk_quota`) can exceed the 10 s request deadline under load average ~20, at 2 record syncs per key (temp-file create, rename), as on base.
+- **Status:** commit part fixed in 1aec24f; record syncs per KV key open
+
+### N-163: a guest's sync reached the disk
+- **Where:** `quota.rs` (`sync`, `sync_data`)
+- **Scenario:** the stock host fsyncs on a guest's `sync`/`sync-data`, though a request's writes are durable at its commit and rolled back otherwise, synced or not. The SQLite provider syncs ~1.7 times per write statement (strace: 120 fsyncs over 70 `POST /set`), and a guest could make the device flush in a loop without writing anything.
+- **Fix:** both are a validated no-op.
+- **Status:** fixed in 1aec24f (cf/storage)
+
+### N-164 (efficiency): capture cost 8 syncs and a full-volume copy per commit
+- **Where:** `committed.rs`, `journal.rs`
+- **Scenario:** W-9 capture (b7bf806) synced the archive directory and its two ancestors on every commit, staged in the journal directory and published by a hard link with two more directory syncs, and copied the whole volume each time: `POST /incr` with capture took 17 flushes and 39.8 writes, against 9 and 22 without.
+- **Fix:** versions are changes against the one before (snapshot every 16), staged beside the published ones under a name tied to the journal key, published by an unsynced same-directory rename that recovery redoes: 7 flushes and 20.9 writes with capture, 5 and 15.0 without.
+- **Status:** fixed in bc8f45a (cf/storage)
+
+### N-165 (efficiency): the shipper polls every object's capture directory
+- **Where:** `ship.rs` (`run`)
+- **Scenario:** every 20 ms the shipper lists `~committed/` of every app and stats each object's directory, skipping unchanged ones: ~0.1 core at 10k objects, and up to 20 ms added to a `remote_ack` commit. A worker can't notify the supervisor's shipper except through the filesystem.
+- **Fix (proposed):** a notification over the worker's supervisor link when a version is published.
+- **Status:** open (since N-724 the shipper ships 32 objects at once and reads each head once, but still finds new versions by polling)
+
+### N-166 (efficiency): restoring an object downloads every version it ever had
+- **Where:** `ship.rs` (`restore`)
+- **Scenario:** keys are probed from sequence 1 until one is missing; only versions from the last snapshot on are needed, and the store keeps everything (no remote retention yet).
+- **Fix (proposed):** a pointer object to the last shipped snapshot, written after it, and retention of versions before the second-last snapshot.
+- **Status:** in part on `fix/lease-r3fix`: the object's head names its last version, and a restore follows parent digests back from it to the last snapshot, fetching only those. Retention (deleting versions before the second-last snapshot) remains.
 
 ### N-500: only the import allowlist keeps a guest's WASIp2 file writes out of the quota and journal
 - **Where:** `app.rs` (`linker`: `wasmtime_wasi::p2::add_to_linker_async`; `check_imports`), `object.rs` (`/data` and `/tmp` preopened read-write in the `WasiCtx`)
@@ -377,8 +481,8 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### N-690: recovery dropped the undo of a real entry whose whole path is past PATH_MAX
 - **Where:** `journal.rs` (`recover`)
-- **Scenario:** found by the independent review of PR #1 (a regression from N-504). Recovery took ENAMETOOLONG as "nothing there" for every record. But a log written by the binary before N-504, in the same encoding, can name a real entry whose whole path is past PATH_MAX while each of its names fits: `creating` then recorded `Created` on any error, and the guest made the entry through its parent's descriptor. Recovery skipped the record, truncated the log and kept the uncommitted entry, so the failed request's changes were partly kept; the recovery before N-504 failed closed. A base an operator moved deeper turns any record into such a path.
-- **Reproduced:** yes: `long_paths_in_old_logs_are_undone` (every record kind, 200-byte names in a directory whose own path is 3,996 bytes, the changes made through its descriptor): recovery succeeded and kept all seven changes.
+- **Scenario:** found by the independent review of PR #1 (a regression from N-504). Recovery took ENAMETOOLONG as "nothing there" for every record. But the log's paths are relative to the data root, which can move deeper between a crash and the recovery after it (a backup restored into a longer root): a real entry whose whole path fitted is then past PATH_MAX while each of its names fits. Recovery skipped the record, truncated the log and kept the uncommitted entry, so the failed request's changes were partly kept.
+- **Reproduced:** yes: `long_paths_after_the_root_moves_are_undone` (a change of each kind, recorded through the journal, to 200-byte names whose whole paths fit; then the root moves about 780 bytes deeper): recovery by path keeps the changes; through descriptors it undoes them all.
 - **Fix:** recovery reaches each entry through its parent's descriptor, opened one name at a time from the base (`openat` with `O_DIRECTORY | O_NOFOLLOW`), and undoes and syncs it relative to that parent (`fstatat`, `unlinkat`, `mkdirat`, `renameat`, `openat`). ENAMETOOLONG then only means a name past NAME_MAX, which nothing can have. N-502..N-504's tests pass unchanged, and new writes still refuse paths at PATH_MAX.
 - **Status:** fixed on `cf/main-next`
 
@@ -393,8 +497,170 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `egress.rs` (`hold`, `EgressHooks::held`), `object.rs` (`commit`)
 - **Scenario:** found by the independent review of PR #1 (it predates the PR). A publish to `http://nanovm/publish/` is held in the worker until its request commits. `hold` bounded what a request holds by the publishes' bodies (`max_response_body_kb`), but kept each whole request: the guest's headers (up to N-75's 64 KiB a request), its URI and the request itself. Sent requests have left the resource table, so N-75's cap no longer counts them, and nothing else bounded them: 300 publishes of a 12-byte body with 60 KiB of headers held about 18 MB, past a 16 MiB object's memory; 5,461 empty-item publishes held 25 times their bodies. The supervisor reads none of it: it forwards a publish's body with the app it names and the object the worker names.
 - **Reproduced:** yes: `held_publishes_are_bounded_like_one_publish` (unit): 300 such publishes retained 18,524,700 bytes against an 8 MiB publish limit; 5,461 tiny ones 1,660,144 bytes against 64 KiB.
-- **Fix:** only the body is held, and the commit sends it as `POST http://nanovm/publish` named with the object's id (what `hold` used to add). `hold` checks the method and path the supervisor checks, answering 404 as it would (before, the guest was told 200 and the supervisor's 404 was dropped). Each held body counts its slot toward the limit too, under one lock. After: 13,200 bytes and 65,516 bytes (1,489 publishes).
+- **Fix:** only the body is held, and the commit sends it as `POST http://nanovm/publish` named with the object's id (what `hold` used to add), to the supervisor or, for an in-process node, to its own sockets (N-200). `hold` checks the method as well as the path (N-201), answering 404 as the supervisor would. Each held body counts its slot toward the limit too, under one lock. After: 13,200 bytes and 65,516 bytes (1,489 publishes).
 - **Status:** fixed on `cf/main-next`
+
+### N-693: compatibility with data an earlier build wrote (round-3 review S2): not supported
+- **Where:** `committed.rs` (`adopt`, a reader of main's format-1 versions), `journal.rs` (`recover`), `lease.rs` (a session record without `lease_ms`)
+- **Scenario:** round-3 review S2 asked that a node keep what main's build left in its data directory: a capture main had decided but not published, and main's whole-volume versions without an epoch. 7d03ade built that: recovery adopted main's staged capture, and versions were read in main's format as well as this one. Separately, M4 (3acd297) judged a session record without `lease_ms` by the taker's own.
+- **Status:** not supported, see AGENTS.md rule 1: there is exactly one version of nanovm, v1. All three were removed on `fix/no-compat`. A version says `"format": 1` and is read only so; a log is refused unless its first block is the `nanovmj1` tag and a key; a session record without `lease_ms` doesn't parse and is refused. Operators start from a fresh data directory.
+
+### N-710: work after the answer could fail the answer (round-3 review 2, D4 findings 1 and 4)
+- **Where:** `js/runtime/src/lib.rs` (`handle`), `sdk/rust/src/lib.rs` (`__serve`, `after`), `object.rs` (the future `response.new` gives the guest)
+- **Scenario:** D4 made a failed `ctx.waitUntil` abort the instance so that its writes after the answer roll back. But the work ran from the moment the handler returned, so the abort could land before the node had taken the answer: a promise that can never settle (found on the first poll) or one that had already rejected failed every such request with `500 trap`, and the handler's own writes rolled back. Rust's `after` work had the same flaw (a panic before its first wait), and a failure after the node took the answer could still cut the body of a client slow to read it (the node aborts a body when the instance dies).
+- **Reproduced:** yes: `review2_wait_until_that_never_settles_fails_the_answered_request` and `review2_wait_until_rejected_before_the_answer_fails_the_answered_request` (js.rs) got `500 trap` with storage `{}`; `after_work_that_panics_leaves_the_answer_standing` (integration.rs) got `500 trap` for `/panic-at-once`.
+- **Fix:** the node resolves the future `response.new` returns (WASI's "result of transmission") once the client has read the answer whole or gone, not when the request body was consumed. The SDK starts `after` work only then, and the JavaScript runtime runs its waitUntil settling as `after` work, so its abort comes only then. One model for both, in README "Commits".
+- **Status:** fixed in 2031f79 and c65cfb3 (`fix/r3-dev`)
+
+### N-711: waitUntil work's writes before the answer commit with it, even if it later rejects (round-3 review 2, D4 finding 2)
+- **Where:** `js/runtime` (waitUntil semantics)
+- **Scenario:** a waitUntil promise's work starts when it is made, so what it writes while the handler runs is in the journal when the answer commits, and stays committed when the work rejects afterwards. The same holds for a Rust streamed body's writer, which starts as the handler returns: what it writes before the node has taken the answer commits with it.
+- **Status:** by design, documented in 2031f79 (README "Commits", js/README.md): the answer commits everything written up to it. The node has one journal per request, not one per task, so the only alternatives were holding back the answer until all waitUntil work ends (which defeats waitUntil) or failing the answer after it was sent. `review2_wait_until_that_wrote_before_the_answer_commits_that_write_when_it_rejects` now asserts this (and that the work's write after the answer rolls back).
+
+### N-712: a waitUntil promise registered after the answer was never awaited or checked (round-3 review 2, D4 finding 3)
+- **Where:** `js/runtime/src/prelude.js` (`answer`)
+- **Scenario:** `answer` took `Promise.all` of the promises registered by then; one that waitUntil work registered later was neither awaited (dropped if it outlived the rest) nor checked (its rejection ignored, its write committed). Rust's `after` called from `after` work was queued for the next request instead of running in this one.
+- **Reproduced:** yes: `review2_wait_until_registered_after_the_answer_commits_its_write_when_it_rejects` (`{"nested":1}` committed), `wait_until_registered_after_the_answer_is_waited_for`, `after_work_passed_on_by_after_work_runs_before_the_next_request`.
+- **Fix:** the runtime waits until the set is empty (`settled`: `Promise.all`, again while more were registered); `after` from work after the answer starts it at once, so it is part of the same post-return stretch.
+- **Status:** fixed in 2031f79 (`fix/r3-dev`)
+
+### N-713: a broken upstream stream reached the gateway's client looking whole (round-3 review 2, D3)
+- **Where:** `sdk/rust/src/lib.rs` (`Response::stream`), `examples/gateway`
+- **Scenario:** `Streaming::next` reports an upstream cut, but a streamed response's writer returned `()` and its trailers were always `Ok(None)`, so the gateway's client got 3 tokens and a clean end.
+- **Reproduced:** yes: `review2_gateway_tells_its_client_when_the_upstream_breaks_off` (examples.rs).
+- **Fix:** the writer returns `Result<()>`; on `Err` the SDK ends the body with an error in its trailers (the node then fails the body, so the client sees it break off), and once the answer is out panics as `after` work, so what the writer changed rolls back, as on a panic. The gateway's writer uses `?` on `next()`; `events`, `files` and `site` return `Ok(())`. This changes `Response::stream`'s signature (no compatibility path, AGENTS.md rule 1).
+- **Status:** fixed in 551d13d (`fix/r3-dev`)
+
+### N-714: the oauth example's session cookie was a plain cookie over https (round-3 review 2, D1)
+- **Where:** `examples/oauth/src/lib.rs`
+- **Scenario:** a sibling host could set `session=<its own valid session>; Domain=<parent>; Path=/u-<its login>`, and a victim's browser was signed in as the attacker on the attacker's pages: login CSRF without the callback.
+- **Reproduced:** yes: `review2_oauth_session_cookie_is_a_host_cookie_over_https` (a planted plain `session` cookie got `200`).
+- **Fix:** over https the session cookie is `__Host-session` (Secure, Path=/, no Domain), as the nonce cookie already was; logout clears it with the same attributes.
+- **Status:** fixed in a50b695 (`fix/r3-dev`)
+
+### N-715: a guest that traps while its answer commits gets a 500, though the commit may land
+- **Where:** `object.rs` (`serve`: `commit(acc).await` runs while the store's event loop goes on)
+- **Scenario:** found while fixing N-710. After the guest returns its answer, the node commits it on a blocking thread and the guest's other tasks keep running. If one traps before the commit ends, the store's run ends, the reply still pending gets `500 trap`, and the commit thread (which owns the volume until it ends, S1) still lands the writes. The SDKs no longer fail work after the answer before it is out (N-710), so this needs a guest that traps on its own (a raw `spawn_local` task that panics at once). The same holds for a request deadline that passes during the commit (S1).
+- **Reproduced:** from source; not run.
+- **Suggestion:** treat it as the existing ambiguous-outcome case ("Do not interpret every error as a rollback", README "Commits"), or have the node finish the answer's commit before reporting the trap.
+- **Status:** open
+
+### N-700: startup removed every empty directory under `cgroup` (round-3 review 2, W1)
+- **Where:** `supervisor.rs` (`Supervisor::new`, the sweep of an earlier run's worker cgroups)
+- **Scenario:** the sweep rmdir'ed every empty entry under `cgroup`, not only `worker-<n>`: an operator's empty cgroup there went, and with `cgroup` set by mistake to a plain directory, so did its empty subdirectories (each spawn then failed with "No such file or directory", naming no `cgroup.procs`). A leftover whose worker had not exited yet was busy, skipped and never removed.
+- **Reproduced:** yes: `review2_startup_removes_only_cgroups_it_made` (`reserved` and `keep` removed), `startup_removes_an_earlier_runs_worker_cgroups` (a leftover holding a process was still there 10 s later).
+- **Fix:** `Cgroup::take` refuses a `cgroup` that is not a cgroup v2 directory (by its filesystem magic), and removes only `worker-<digits>`, killing what is left in one (`cgroup.kill`) and removing it once empty. spawn names `cgroup.procs` when it can't open it.
+- **Status:** fixed in ab37a00 (`fix/r3-worker`)
+
+### N-701: a worker's cgroup leaked when the worker was dropped without being waited for (round-3 review 2)
+- **Where:** `supervisor.rs` (`Cgroup`'s drop; the spare, the reaper task, `spawn`)
+- **Scenario:** dropping a `tokio::process::Child` SIGKILLs it without waiting, and the cgroup's removal ran at once, failed (the process still inside) and was never retried: the spare and the cancelled reaper when a supervisor goes, a spawn that fails at its stdin write.
+- **Reproduced:** yes: `a_dropped_supervisors_worker_cgroups_go` (the spare's `worker-1` still there 10 s after its supervisor's runtime was dropped).
+- **Fix:** a cgroup found busy when dropped has what is in it killed, and a short-lived thread removes it once empty (bounded at 10 s). The reaped path is unchanged.
+- **Status:** fixed in ab37a00 (`fix/r3-worker`)
+
+### N-702: two nodes sharing one `cgroup` could remove each other's fresh worker cgroups (round-3 review 2, suspected)
+- **Where:** `supervisor.rs` (startup sweep; `Cgroup::new` makes `worker-<n>` before its worker enters it)
+- **Scenario:** a node's new `worker-<n>` is empty from its `mkdir` until the worker enters it at exec. Another node configured with the same `cgroup` and starting then removed it, and the first node's spawn failed. With the sweep now killing what is in an earlier run's cgroups (N-700), sharing would be worse: one node would kill the other's workers.
+- **Reproduced:** yes: `two_nodes_cannot_share_a_cgroup` makes an empty `worker-<n>` in the first node's cgroup, as its spawn does; the second node's startup removed it.
+- **Fix:** a node holds an exclusive lock on `cgroup` for its life; a second one refuses to start ("another node runs its workers in cgroup …"). The first keeps serving.
+- **Status:** fixed in ab37a00 (`fix/r3-worker`)
+
+### N-703: a retired worker's last telemetry was lost (round-3 review 2, W2)
+- **Where:** `supervisor.rs` (`drain`, the reaper, `worker_main`)
+- **Scenario:** a jailed worker never drops its telemetry, and retiring it (a version switch, an eviction for another app's slot) SIGKILLed it outright: what it recorded since its last export (up to 1 s), egress-denied events among it, never reached the collector.
+- **Reproduced:** yes: `review2_a_retired_workers_last_telemetry_reaches_the_collector` (3 of 3 rounds lost).
+- **Fix:** `drain` hangs up on the worker (`Dialer::hang_up`); the worker's serve loop returns, it flushes its telemetry and exits; the reaper kills it if it hasn't exited within `STOP_TIMEOUT` (2 s). Retirement took 10-16 ms in the test (debug build). A later graceful node shutdown can call `drain` for each worker.
+- **Status:** fixed in 7fbdeb4 (`fix/r3-worker`)
+
+### N-704: a `[worker] memory_mb` below a spare's use OOM-killed it at hand-over, and the start failed with "Broken pipe" (round-3 review 2, suspected)
+- **Where:** `supervisor.rs` (`limit`, called when a spare is given its app)
+- **Scenario:** a spare builds its engine before it has an app and before its cgroup has the `[worker]` limits. Setting a `memory.max` below what it then holds makes the kernel OOM-kill it, and the start fails at the next write to it.
+- **Reproduced:** yes, in the VM (`scripts/vm-test.sh`): `a_worker_memory_limit_below_a_spares_use_is_refused_clearly` (`memory_mb = 1`) got `502 {"detail":"Broken pipe (os error 32)","error":"worker-down"}` with one `oom_kill`.
+- **Fix:** before setting `memory.max`, `limit` compares it with the cgroup's `memory.current` and refuses the start: "[worker] memory_mb = 1 is below the N MiB a worker holds before it has an app". No OOM kill.
+- **Status:** fixed on `fix/r3-worker`
+
+### N-705: retiring a worker cut off its objects' work after the answer
+- **Where:** `supervisor.rs` (`drain`, `slot`), `object.rs` (post-return phase)
+- **Scenario:** found while fixing N-703. A drain waits for requests and their response bodies, not for work a guest does after its answer (`after`, `waitUntil`, a streamed body's tail), which the node commits when it ends. A switch or an eviction for another app's slot then killed the worker, and that work's writes rolled back at the object's next start. The drain's own bound (request plus post-return time) shows the work was meant to be waited for. Before N-703 the kill came at once; with N-703 alone, at the flush.
+- **Reproduced:** yes: `a_retired_workers_work_after_the_answer_commits` (`/slow` in `tests/sdk-after`: 500 ms, then a write; then a request to the next version): `"later": false`.
+- **Fix:** a worker asked to stop runs `Node::shutdown` (its objects finish their queued and after-answer work and commit) before it flushes its telemetry; the supervisor gives it `post_return_timeout_ms` plus 2 s before it kills it.
+- **Status:** fixed on `fix/r3-worker`
+
+### N-706: `scripts/vm-test.sh` could no longer run the cgroup tests; the `cgroup` doc named per-app limits (round-3 review 2)
+- **Where:** `scripts/vm-test.sh`, `config.rs` (`cgroup`), PLAN.md
+- **Scenario:** the script copied the deleted `demo/static` (`set -e` stopped it), and the VM had no CA certificates, so every test failed building its HTTP client. Worker limits are the node's `[worker]`, not an app's `[app.worker]`.
+- **Fix:** the script copies the host's CA bundle and no longer `demo/static`, links `sleep`, and its default set includes the `cgroup` tests. Docs corrected.
+- **Status:** fixed on `fix/r3-worker`
+
+### N-720: concurrent claims overwrote each other's shipped markers
+- **Where:** `ship.rs` (`mark`)
+- **Scenario:** found by the second lease review (`review2/lease`, finding 1). `mark` wrote every object's marker through one fixed temporary file, `<objects>/~shipped/~new`. Every lease grant claims (and may restore and mark) its object, grants run concurrently, and the shipper marks too. A marker could then hold another object's sequence, or a mix: `stored` acknowledged versions the store never got, and `ship_object` skipped them; the losing rename failed with ENOENT, so that claim answered 503.
+- **Reproduced:** yes: `review_concurrent_claims_mark_each_object_its_own_head`, 66 and 41 of 320 claims wrong in two runs.
+- **Fix:** `mark` writes through `written` (a random name, created exclusively, synced), as `Dir::put` does, then renames.
+- **Status:** fixed on `fix/r3-lease` (dbb3cea). The marker is now written by descriptor, never through a symlink the app's worker could plant (B-502, the recovery agent's; c882871).
+
+### N-721: a claim's discard cut short was taken for a current copy, served with no volume
+- **Where:** `ship.rs` (`current`, `discard`)
+- **Scenario:** review finding 2 (crash). `current` judged a copy only by its versions; `discard` removed the volume, then the versions with `remove_dir_all` (directory order), then the marker. A crash after the volume and the later versions were gone, but before the head's version, left a copy the next claim kept: the object was served with no volume. A crash after the versions but before the marker left a marker that acknowledged (and skipped shipping) the next versions.
+- **Reproduced:** yes: `review_a_discard_cut_short_is_not_taken_for_a_current_copy` (the copy was kept; the volume read failed with ENOENT).
+- **Fix:** a copy with versions is current only with its volume, which `discard` removes first; the marker goes before the versions, which go last. Wherever a discard stops, the next claim judges the copy as the first did, or (no versions left) as an empty copy. `discard` (and the shipper's prune) work by descriptor, never through a symlink the app's worker could plant (B-502; c882871).
+- **Status:** fixed on `fix/r3-lease` (b3cd8a3)
+
+### N-722: a claim's discard wasn't durable before the claim made the copy count
+- **Where:** `ship.rs` (`claim`)
+- **Scenario:** review finding 5 (power loss, traced). `discard` unlinks without syncing, then the claim's conditional write of the head makes what is here count for this node. `syncfs` ran only inside `restore`, and only when the head names a version. A power loss could bring back a version the claim dropped, now under this node's claim, and it would ship.
+- **Reproduced:** yes, the order: `a_claim_syncs_what_it_dropped_before_claiming` (a sync that fails must stop the claim; before, the head was claimed with no sync at all).
+- **Fix:** the claim syncs the filesystem after a discard, before writing the head.
+- **Status:** fixed on `fix/r3-lease` (b3cd8a3)
+
+### N-723: a claim racing the shipper's old grant dropped versions committed after the shipper listed them
+- **Where:** `ship.rs` (`claim`)
+- **Scenario:** the review's unproven suspicion, now proven. The shipper ships under the grant it found when it began. An object's actor can give its lease up and take it again meanwhile (idle eviction, LRU), and the new grant's claim runs while the shipper still ships under the old one. The claim read the head, then listed this node's versions; in between, the shipper moved the head on and removed the version the claim's head named. The claim took its own copy for a stale one, dropped it, and restored the head: a version committed after the shipper listed its own (and, with `remote_ack = false`, answered) was lost.
+- **Reproduced:** yes: `a_claim_racing_the_shippers_old_grant_keeps_later_versions` (before: the copy held `v4`, version 5 gone).
+- **Fix:** the claim lists this copy before it reads the head. The shipper removes a version only after moving the head past it, and the head only moves forward, so the head read after names a version listed here if this copy has it; one removed after the listing makes the claim read again (NotFound), never drop the copy.
+- **Status:** fixed on `fix/r3-lease` (b3cd8a3)
+
+### N-724: remote acknowledgement couldn't keep up with objects committing at once
+- **Where:** `ship.rs` (`run`, `ship_object`)
+- **Scenario:** review finding 3. With `remote_ack` (the default with leases) each commit waits at most 2 s for its version to count. The shipper shipped one object at a time, three store round trips a version (head read, put, head swap), and any failure made the whole loop sleep a second. At 25 ms a store call, 14 of 40 simultaneous commits were answered 500 though they stood.
+- **Reproduced:** yes: `review_remote_acks_keep_up_with_objects_committing_at_once`; `measure_remote_acks` (numbers in `notes/multinode.md`).
+- **Fix:** up to 32 objects ship at once (a fair semaphore), each its versions in order; the head is read once and then moved from what this node last wrote (a stale one fails the conditional move and is read again); a failure is its object's own (logged, that object tried again a second later).
+- **Status:** fixed on `fix/r3-lease` (73dbc48)
+
+### N-725: a takeover served older state than the old node had served
+- **Where:** `journal.rs` (the commit decision comes before `stored`), `object.rs` (`run`)
+- **Scenario:** review finding 4. A write whose acknowledgement times out is answered 500 but stands on its node, which served it to later requests. If that node stopped before shipping it, the node taking over restored the head without it: clients read "one!" from A, then "zero" from B.
+- **Reproduced:** yes: `review_a_takeover_never_serves_older_state_than_was_served` (unit), `nodes::a_write_answered_500_is_served_only_once_it_counts` (integration: A served, 200, the write it had answered 504 for; the app's 1 s deadline ends the 2 s wait first, so such a write is answered 500 or 504).
+- **Fix:** with `remote_ack`, an instance starts only once every version published here counts in the store (`ship::caught_up`, waiting as a commit does, up to 2 s); otherwise the request gets 503 `not-stored` with `Retry-After: 1`. Instance start is the one place: a failed commit always ends its instance, and every instance (after a crash too, once recovery has settled a staged commit) passes there before the guest can read the volume. The wait holds the object's lease, so its shipper can ship meanwhile.
+- **Status:** fixed on `fix/r3-lease` (fb9f2e9). The commit's wait for the store is bounded by its own 2 s (`ship::ACK`), never by the app's deadlines: a commit runs in a `committing` phase (B-507, the recovery agent's; 065078e), so such a write is answered 500 commit-failed, whatever the app's post-return deadline.
+
+### N-726: a claim whose restore could never succeed was retried for every request, on every node
+- **Where:** `lease.rs` (`serve`)
+- **Scenario:** the review's second unproven suspicion, now proven. A version the head names missing from the store (or not what its key names) fails every restore. Each request took the object's lease at a new epoch, rewrote its head, fetched its history down to the missing version, and released the lease; the worker answered 421, so the proxy tried every node in turn for `failover_ms`.
+- **Reproduced:** yes: `an_object_whose_history_is_broken_is_refused_without_asking_the_store_again` (before: 5 requests, 5 claims, epoch 5).
+- **Fix:** a claim failing with `NotFound` or `InvalidData` (the store's history is broken; a store that can't be reached is `Other`) is logged and remembered: the node refuses the object (503, the reason) for 60 s without asking the store. So each node tries at most once a minute.
+- **Status:** fixed on `fix/r3-lease` (5f08d93). Open: the worker turns the supervisor's 503 into a 421, so the client gets the proxy's 503 after `failover_ms`, not the reason.
+
+### N-727: configs that can't hold leases were accepted
+- **Where:** `config.rs`, `proxy.rs`
+- **Scenario:** review finding 6. `lease_ms = 0` renewed every `0 / 4` ms, hammering the store. With leases, a `memory:` or directory store is each node's own (a directory store gives each node its own heads: a takeover restores nothing), and `object_store`'s local files can't update a record conditionally (this build doesn't compile them in, so a `file:` lease store failed at startup with "feature not enabled"). A proxy `failover_ms` at or below its 1 s connect timeout answered a hung connect 504 "may have run there" though nothing was sent.
+- **Fix:** `lease_ms = 0` is refused; a config file with `leases` must name object stores for `leases` and `capture.store` (not `memory:`, `file:` or a directory; programmatic configs, as in tests, bring stores their nodes share); the proxy refuses `failover_ms` at or below `proxy::CONNECT`. `failover_ms` against the nodes' `lease_ms` can't be checked in one process: the config docs say it must exceed every node's. Test: `configs_that_cannot_hold_leases_are_refused`.
+- **Status:** fixed on `fix/r3-lease` (3f853b7)
+
+### N-728: the shipper took a filesystem PermissionDenied for "no lease" (B-604)
+- **Where:** `ship.rs` (`run`, `authority`)
+- **Scenario:** found by the deployable agent (B-604). `run` treated every `PermissionDenied` from `ship_object` as "this node holds no live lease on the object" and waited quietly. Under the hardened systemd unit (no `CAP_DAC_OVERRIDE`) the supervisor can't write in an app's directories, so a node shipped one version per object (put and head move succeed, marking fails with EACCES) and then stopped silently.
+- **Reproduced:** yes: `a_failure_shipping_one_object_is_its_own_and_not_taken_for_no_lease` (a store refusing puts with PermissionDenied: before, tried again every 20 ms, quietly).
+- **Fix:** having no lease isn't an error: `ship_object` answers `Ok(false)`; every error is logged and its object tried again a second later. The permissions themselves are B-604's.
+- **Status:** fixed on `fix/r3-lease` (73dbc48)
+
+### N-729: a shipped marker a power loss took back stopped shipping for good
+- **Where:** `ship.rs` (`ship_object`)
+- **Scenario:** found while fixing N-725 (traced). The marker is renamed into place without a directory sync, and versions are removed after it. A power loss can leave a marker behind the head with versions up to the head still here; the shipper then refused the first of them ("doesn't follow its head") on every round, and with N-725's fix the object would serve nothing.
+- **Reproduced:** yes: `the_shipper_catches_up_a_marker_left_behind` (before: refused).
+- **Fix:** a version up to the head's is the head's history when this copy has the head's version (a claim made it so; versions here are a chain): it is marked, not shipped again.
+- **Status:** fixed on `fix/r3-lease` (73dbc48)
 
 ## Planned work
 
@@ -472,11 +738,11 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-6: JS and Python guests
 - **What:** guests built with componentize-js and componentize-py, running the same endpoints as `counter`, to prove the host for other languages.
-- **Status:** open
+- **Status:** JavaScript done on `cf/onramp` with our own QuickJS runtime (`js/`; componentize-js has no WASIp3 HTTP yet), `env.kv` on the composed provider, nine tests in `tests/js.rs`. Python open.
 
 ### W-7: `nanovm publish`
 - **What:** one command that pushes an app with `oras` (layout as in `publish-guests.yml`) and signs it keylessly (`cosign` with a browser sign-in, or a CI attestation).
-- **Status:** open
+- **Status:** done on `cf/onramp` (e74577c): `nanovm publish` pushes the same layout itself (with oci-client; since `cf/oci-push`, nanovm's own `registry::Oci`), checks the component as a node will first, and prints the signing steps and TXT record; `.github/workflows/publish-app.yml` is the manual attestation template. Signing stays outside the CLI (W-102).
 
 ### W-8: benchmarks against workerd and Spin
 - **What:** density (memory per object), cold starts and warm latency against workerd (Durable Objects) and Spin, on the same machine, with the method written down.
@@ -491,7 +757,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-10: groundwork for many nodes
 - **What:** a lease hook before instantiation in `table.rs` (always granted on one node), an epoch carried by each commit, request ids so the proxy can retry safely. Placement belongs in the proxy.
-- **Status:** open, after W-9 capture/recovery evidence and explicit acknowledgement/fencing decisions; not authorized by adding an epoch field alone.
+- **Status:** done on `cf/multinode` (multinode agent): the proxy places objects on `nodes` by rendezvous hashing and follows 421s; nodes take leases with rising epochs from an object store (conditional writes; `object_store`, S3 and compatibles), renew one session record each, refuse and evict what they lost, and refuse commits without the lease (`Node::lease_epoch`); calls between objects go through the proxy with their callers. No request ids are needed: the proxy retries only refusals that ran nothing. Failover, a lost node's late commit and cross-node calls are tested; see `notes/multinode.md`. The epoch is not yet part of W-9's committed versions (W-90), and data does not move between nodes until W-9's stream does.
 
 ### W-11: run requests that don't write in parallel
 - **What:** stateless routes on any node, and read-only requests on read replicas of an object. On one node, a reader beside the writer would see uncommitted data (the undo journal writes in place), so replicas need committed state: a snapshot, or W-9's change records. Whether a request writes isn't known in advance, so routes would be declared read-only, with `/data` mounted read-only to enforce it.
@@ -499,7 +765,7 @@ The checkpoints below are historical, not outstanding product decisions.
 
 ### W-12: trusted caller header on calls between objects
 - **What:** the node sets `nanovm-caller: <id>` on calls and strips it from client requests, so an object can serve internal endpoints only to its app's objects. Left out of the first version because testing it needs a guest that echoes headers (a guest change; see W-1's note on publishing).
-- **Status:** open
+- **Status:** done with W-602 on `cf/multinode-r3`, as `nanovm-callers` (the chain, caller last) rather than `nanovm-caller`
 
 ### W-13: removable code in the rewrite's files
 - **What:** from the review's list, for the agent rewriting these files: drop the registry's manifest cache and the SHA-256 re-check in `Registry::store` (oci-client already checks digests) and its `to_vec` copy (N-18); drop the `memory_mb <= memory_reservation_mb` checks in `config.rs` (the pool and the limiter already enforce both). Keep the digest-format check of N-3. Owner's call, smaller: stop forwarding the guest's connect and first-byte timeouts, the fs-denied event throttle, the worker-side `well_formed` check on publishes.
@@ -552,3 +818,47 @@ The checkpoints below are historical, not outstanding product decisions.
 - **What:** each event answer and each publish is collected whole in the proxy, up to `max_response_body_kb` (8 MiB), with no bound across sockets, objects or apps: 1,000 sockets of one app answered at once is 8 GiB, and publishes are as many as objects committing at once. One app's plain Wasm can so exhaust the proxy every app shares. Parsing is not the problem: an answer is parsed and applied within one poll, so its parse (about 6–14 times its size, `ws::parse`) is bounded by the proxy's threads, and publishes now parse in about their size (N-72). Found by the sec review.
 - **Design:** (1) collect an answer up to `socket_backlog_kb`, not `max_response_body_kb` (in `Proxy::socket`'s `deliver`): `apply` queues an answer's messages at once, each costing its length plus 64, so an answer bigger than the socket's backlog overflows it and drops the socket anyway (only a flood of subscribe controls would fit). Answers then cost at most one backlog per socket, within the per-socket budgets the proxy already has. (2) publishes: a proxy-wide semaphore of publish bytes in flight (an operator setting, or `max_sockets_per_app × socket_backlog_kb` per app), acquired for the declared or collected size before buffering, so one app's commits wait rather than grow the proxy.
 - **Status:** open
+
+### W-100: publish nanovm-sdk to crates.io
+- **What:** apps depend on the SDK by git today. Its bindings read WIT from `../../components/keyvalue/wit` and `../../wit/config`, which a git checkout has and a crates.io package would not: vendor the two WIT packages into `sdk/rust/wit` (with Spin's license) before publishing, and pin `wasip3` with nodes' wasmtime.
+- **Status:** open
+
+### W-101: compose without the `wac` CLI
+- **What:** `tools/build-app.sh` needs `wac` 0.12 (`cargo install`, about a minute) only for apps that use key-value. A prebuilt, digest-pinned provider published with each release, or a small composer on the `wac-graph` library outside the runtime crate, would drop that install. Composing inside `nanovm run` was rejected: `publish` and nodes need the composed component, so it belongs in the build (notes/onramp.md).
+- **Status:** open
+
+### W-102: test the laptop signing path end to end
+- **What:** `nanovm publish` prints `cosign attest --new-bundle-format …` for signing without CI. The node accepts Sigstore bundles attached as OCI referrers over the manifest digest (as GitHub attestations are); whether cosign's new-bundle attestation lands where `registry::verify` looks, with a subject it accepts, is untested here (no cosign, and nothing may be published to a real registry). Verify against a throwaway public repository, then document the exact command, or replace it with what works.
+- **Status:** open
+
+### W-103: warn when a published app can't be pulled anonymously
+- **What:** nodes pull anonymously, and a new ghcr.io package is private, so a first publish looks fine and then every node refuses it. After pushing, `nanovm publish` could read the manifest back anonymously with `registry::Oci` and say "make the package public" when that fails.
+- **Status:** open
+
+### W-104: move the test guests onto the SDK
+- **What:** `guests/counter` and `guests/hostile` still use `guests/util`. Porting them shrinks them by about a third (cf/optimistic-feynman's D1), but any change under `guests/**` republishes them from main, which needs the owner's approval.
+- **Status:** open
+
+### W-600: let a request roll back and still choose its answer
+- **What:** a handler that returns an error rolls back everything the request did, and the client gets `500` with `x-nanovm-error: guest-error`; any answer it gives instead, whatever its status, commits. So a checkout whose card is declined after it has written (`examples/shop`) can only say `500`, never `402`, and an app that wants a clean `409` must check everything before its first write. A way to answer *and* roll back (for example a reserved response header the host strips, which marks the request failed but sends the response) would let the SDK offer `Response::rollback()`. It touches the commit path in `object.rs`, so it is for its owners.
+- **Status:** open
+
+### W-601: let an app serve `/`
+- **What:** every URL's first segment names an object, so `/` is `400 bad-object-id` and a site has to live at `/www/` (`examples/site`). A per-app default object for paths that don't name one (or for `/` only), set in the manifest, would let a domain's root be a site. It changes routing in `server.rs`/`proxy.rs`, so it is for their owners.
+- **Status:** open
+
+### W-602: tell an object who is calling it
+- **What:** a call between objects (`http://nanovm/objects/{id}/…`) reaches its target as an ordinary request, so an object can't tell its app's own calls from a client's, and every route meant for other objects is public (`examples/tictactoe`'s `/join`, `examples/chat`'s `/rooms/…`); apps must write them defensively. The host could set a header naming the calling object on calls and strip it from every request that enters from outside (the node's front door and the worker link), so an object could keep internal routes. It is a security property of every entry path (`server.rs`, `egress.rs`, the worker link), so it is for their owners.
+- **Status:** done on `cf/multinode-r3` (with W-10): calls carry `nanovm-callers` (the objects waiting on the call, the caller last), which only nodes set: the calling worker overwrites a guest's own, the proxy drops a client's and keeps only the node's on its private call route between nodes. `callers_are_named_by_nodes_only` (one node behind the proxy) and `nodes::callers_are_named_by_nodes_only_across_nodes` check that a client's forged header never reaches the guest and a call shows its caller; each of the three rules is mutation-checked. README: "The callee knows its caller". A node reached without the proxy trusts what it is sent, as for `nanovm-app`.
+
+### W-90: carry W-10's epoch in W-9's committed versions, fenced at the store
+- **What:** name each committed version `(app, object, epoch, seq)` from `Node::lease_epoch` (the line before `quota.commit()` in `object::commit`), and make the write that makes a version durable off the node conditional on the object's lease record (`If-Match` the version the grant, or the last commit, produced), so a node that lost the lease mid-commit can't publish a version. A taker restores up to the head it found. Contract in `notes/multinode.md`.
+- **Status:** done on `fix/lease-r3fix` (round-3 review M1–M5, S3): versions carry the lease epoch (`cf/storage-r3`) and are put once at `<app>/<object>/<seq>-<sha256>.tar`; a version counts only once the object's head (`<app>/<object>/head`, `{sequence, digest, node, lease}`) names it, and every head write is conditional on the version read. Before a worker gets a lease, its supervisor claims the head at the lease's epoch (`ship::claim`), so a node with an earlier lease can't move it however late its upload lands (`review_takeover_during_upload_fences_the_old_writer`); the shipper moves it only under this node's live lease, once claimed, to a version that follows it (`review_shipping_requires_a_live_matching_epoch_not_just_a_node_name`); `remote_ack` and restore follow the head. The claim makes the node's copy the head's, restoring it if need be, so a takeover never serves older state (`nodes::review_failover_with_separate_disks_preserves_remote_acknowledged_state`); with leases a store is required and acknowledgement defaults to remote. The head lives in the capture store rather than the lease record (notes/multinode.md says why). Open: remote retention (N-166).
+
+### W-91: keep a released lease for a while
+- **What:** an evicted object's node keeps its lease (it is in the node's session anyway) for a grace period after the instance goes, then releases it, so a cold start within the period skips the store (N-183). Meanwhile another node gets 421 and the proxy sends the request back to the holder, which is the object's home anyway unless the node list changed.
+- **Status:** open (proposal)
+
+### W-80: W-9 production capture, shipping and restore
+- **Done (bc8f45a, cf/storage):** crash-atomic capture of each committed version at both commit points as changes against the version before (listings, whole new or moved entries, byte ranges), snapshots every `snapshot_every`; a bounded local outbox (`max_versions`, `max_mb`: full means writes are refused); a put-once `Store` (directory, S3-compatible with SigV4 + `If-None-Match: *`); `remote_ack` (off by default: the owner hasn't chosen an RPO); an epoch and a fence object as the hook for W-10's leases; `ship::restore` on a fresh root.
+- **Open:** remote retention (N-166; the head is the snapshot pointer); a shipper notification (N-165); a `nanovm restore` command. Decided and done on `fix/lease-r3fix`: acknowledgement is remote by default with leases, local on one node; shipping is fenced by the head (W-90).

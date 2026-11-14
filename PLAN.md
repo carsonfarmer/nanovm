@@ -92,7 +92,7 @@ nanovm/
   With the default 4 GiB reservation, each memory slot takes about 4 GiB of virtual address space. Density mode uses a small reservation instead (for example 128 MiB). It costs explicit bounds checks but gives roughly 100k slots. The benchmark measures both modes.
 - **Precompiled cache:** components are precompiled to `.cwasm`, keyed by content hash plus `precompile_compatibility_hash`. They are loaded with `Component::deserialize_file`, which is required for copy-on-write memory images on macOS; Linux uses memfd.
 - **Deploy-time validation (`ALLOWED_IMPORTS` in app.rs):** a component is rejected if `component_type().imports()` contains anything outside these prefixes: `wasi:io/`, `wasi:clocks/`, `wasi:random/`, `wasi:cli/` (any version), `wasi:filesystem/{types,preopens}@0.3`, `wasi:http/{types,client}@0.3`. It must also export `wasi:http/handler@0.3`. Sockets, the WASI 0.2 filesystem, `wasi:http/outgoing-handler` and custom imports are all refused, and the error names the offending import.
-- **WASI 0.2 filesystem:** refused at load (above). Rust guests built for wasm32-wasip2 must use the wasip3 filesystem API (see `guests/util`), not `std::fs`, which imports the 0.2 filesystem. Quota support for 0.2 is a follow-up.
+- **WASI 0.2 filesystem:** refused at load (above). Rust guests built for wasm32-wasip2 must use the wasip3 filesystem API (see `guests/util` and `sdk/rust`), not `std::fs`, which imports the 0.2 filesystem. Quota support for 0.2 is a follow-up.
 - `ServicePre::new(linker.instantiate_pre(&component))` is built once per app and cloned for each instantiation.
 
 ## Object actor (src/object.rs)
@@ -103,13 +103,14 @@ nanovm/
     recv request
     → p3::Request::from_http(hooks, req)
     → svc.handle(acc, req)
-    → res.into_http(..)
-    → wrap body
+    → res.into_http(.., out)                   // `out`: the guest's "transmitted" future
+    → wrap body                                // resolves `out` when dropped: read whole, or the client gone
     → reply
     → poll_fn(poll_no_interesting_tasks)        // strict serial
   })
   ```
   `from_http` takes scheme and authority from the URI only, so `server.rs` rebuilds the URI as `http://{Host}{path}` before dispatch. The request body is collected (capped at `max_request_body_kb`) before it reaches the actor.
+- **Work after the answer:** a guest trap ends the store's run, so one before the node has the answer fails the request, and one while the client still reads the body cuts it. So the future `response.new` gives the guest resolves only once the wrapped body is dropped (read whole, or the client gone), and the SDKs start `after` work, and fail work after the answer, only after it (README "Commits").
 - **Deadlines:** the run_concurrent future is wrapped in an outer `poll_fn` that reads a shared `(phase, since)`. On expiry it drops the future and the Store. Upstream documents timeouts inside run_concurrent as unreliable.
 
   | Phase | Deadline | On expiry |
@@ -307,7 +308,7 @@ client ─► proxy ─► supervisor (nanovm serve): no untrusted code
   - **seccomp:** an allowlist of the syscalls Wasmtime, tokio and the filesystem host need. There is no `socket`, `connect`, `bind`, `execve`, `ptrace`, `mount` or namespace calls, `clone` only creates threads, and anything else fails with `EPERM`. With no way to make a socket, the worker has no network beyond the two it inherited.
   - **no_new_privs** and `PR_SET_PDEATHSIG`, so a worker dies with its supervisor.
 - **Mount and network namespaces were dropped from the Q23 plan.** Landlock already confines the filesystem, and seccomp's lack of `socket` already removes the network, so namespaces would be redundant defence.
-- **cgroup v2 (supervisor):** when `cgroup` is set, each worker goes into `<cgroup>/<app>` before it is handed anything. `memory.max`, `cpu.max` and `pids.max` come from the app's `[app.worker]` section.
+- **cgroup v2 (supervisor):** when `cgroup` is set, each worker runs in a cgroup of its own under it, entered before it runs, so its memory is all charged there. `memory.max`, `cpu.max` and `pids.max` come from the node's `[worker]` section and are set before it is handed its app. The supervisor holds `cgroup` (a lock on the directory) so no other node uses it, and removes a worker's cgroup only once the worker has exited.
 - **Links (`link.rs`), not HTTP/2.** Each direction is HTTP/1.1, one request per connection at a time, over socketpairs. The dialing side passes one end over a control socket with `SCM_RIGHTS` and pools the connections; a request runs inline in its own task at both ends.
   - The first version used one HTTP/2 connection per worker. It was slower, because every request crossed a shared connection task in each process. It also died after 1,024 stream resets (see README).
   - Each front-end thread has its own single-threaded runtime, `SO_REUSEPORT` listener and pool, so a request stays on one thread.
@@ -592,11 +593,12 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
 5. **Data lifecycle (Q44).** Planning first: deleting an app's or an object's data, exporting a volume, backups and retention. (W-5)
    - **Offline recovery slice (Q88):** operator-only `scripts/backup.py` uses restic, not a custom archive or runtime endpoint. Stop every writer; hold all existing app-directory locks while copying the complete objects tree, including undo logs and retained files. Tag only complete snapshots, restore an exact ID to a nonexistent root, verify contents and sync before serving. Deployment inputs remain separately retained. The real-process drill removes access to the original root and checks SQL/file/KV crash rollback plus new writes across restart. Runtime remains 5,085 lines; tooling is counted separately, not a runtime reduction. Live snapshots, deletion authorization, automated retention, off-node deployment validation and distributed failover remain future work.
    - **Validated at `fab908c`:** real-process drill passes as root and unprivileged; all default and optional SQL tests, CLI failure/ownership tests, six mutations, demo and quick benchmark pass. Review's credential-path problem is fixed without per-backend environment normalization. Runtime and the benchmark binary are unchanged. Restic is installed by CI and idempotent orb setup; no remote repository or production cutover was provisioned.
-6. **More guest languages and a publish command (Q47).** JS and Python guests through componentize-js and componentize-py; `nanovm publish` wrapping the `oras` push and keyless signing. (W-6, W-7)
+6. **More guest languages and a publish command (Q47).** JavaScript runs on QuickJS (`js/`, our own runtime: componentize-js has no WASIp3 HTTP yet); Python is open. `nanovm publish` pushes and prints the keyless signing steps (`cf/onramp`). (W-6, W-7)
 7. **Numbers against the alternatives (Q47).** Density, cold starts and warm latency against workerd and Spin. (W-8)
 8. **Toward many nodes (Q48–Q50).** Research and groundwork, after the proxy lands:
    - **Committed versions shipped off the node:** separate three concerns: coherent tentative state that can be rejected, local commit, and acknowledgement after the selected durability policy. Undo logging is today's implementation, not a requirement; snapshots, copy-on-write or transactional storage are valid candidates. Replication needs ordered committed content/namespace changes or immutable snapshot manifests, not merely the current undo log. Capture the committed version before subsequent writes can alter it. Include object identity, sequence and fencing epoch; replay must be idempotent. Decide whether success means local durability, remote backup or a regional quorum before promising failover guarantees. Async replication implies a nonzero loss window. (W-9)
    - **Placement and leases:** the proxy places each object on a home node (rendezvous hashing to start); a node takes a lease with an epoch before instantiating an object, and every commit carries the epoch, so a node that lost its lease can't commit. On one node the lease is always granted, so the hook can land early. (W-10)
+     - **Built on `cf/multinode`:** leases in an object store with conditional writes, one session record renewed per node; another node takes an object after seeing its holder's session unchanged for `lease_ms`, ending that session first, so no clock sync is needed. Nodes refuse (421) and evict what they lost; commits check the lease (`Node::lease_epoch`), and calls between objects go through the proxy carrying their callers. Joining the epoch to W-9's versions and fencing them at the store is W-90. Design, safety argument and open decisions: `notes/multinode.md`.
    - **Requests that don't write can run in parallel** (Q50): stateless routes on any node, and read-only requests on read replicas of an object fed by committed change records. On one node it needs care: the undo journal writes in place, so a concurrent reader would see uncommitted data. (W-11)
 9. **Cleanups:** the rest of the review's removable-code list (registry cache and re-hash, config memory checks), for the agent doing the rewrite. (W-13)
 
@@ -675,6 +677,15 @@ prove remote durability. A receiver still needs validated bounds/identity/chain,
 durable ordered receipt, interrupted restore recovery and an explicit authority
 for deciding which history may become writable. No distributed fence exists.
 
+**Delivered on cf/storage (W-80):** the journal's decision is now a key in its
+kept log; captured versions are changes against the version before (snapshot every
+16), staged under a name tied to that key and published by rename (2 syncs per
+commit); a bounded outbox the supervisor ships to a put-once store (directory or
+S3-compatible), where a second writer of a sequence is refused; an epoch and fence
+object as W-10's hook; opt-in `remote_ack` (default local, per the decision below);
+restore from the store onto a fresh root, history continuing. Open: remote
+retention and a snapshot pointer, commit-time fencing, the decision below.
+
 **Next decisions:** retain local-durable acknowledgement with asynchronous transfer,
 or gate responses on a durable remote receipt? Local-only plus asynchronous
 transfer allows loss of acknowledged writes; no bounded RPO follows without a lag
@@ -687,6 +698,8 @@ This is a recommendation for owner approval, not implemented policy. A receiver
 and restore protocol must carry the selected authority/epoch; adding a sequence
 field alone cannot prevent two restored roots from accepting divergent version N+1.
 W-10 must fence storage commits, not merely check a lease before instantiation.
+W-10 now checks the lease at every commit, but only W-9's store write can fence a
+commit that outlives the lease: see W-90 and `notes/multinode.md`.
 
 ## Follow-ups
 

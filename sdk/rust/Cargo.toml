@@ -1,0 +1,22 @@
+[package]
+name = "nanovm-sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Write nanovm apps: WASIp3 HTTP handlers run as durable objects"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/carsonfarmer/nanovm"
+
+[dependencies]
+# WASI 0.3.0, what nanovm's wasmtime hosts.
+wasip3 = { version = "0.9.0", features = ["async-spawn"] }
+wit-bindgen = "0.62"
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+# `Request::json`: parse a body with serde.
+json = ["dep:serde", "dep:serde_json"]
+
+# Built on its own (`cargo doc`, `cargo check`), the SDK is its own workspace;
+# as a dependency this table is ignored.
+[workspace]

@@ -1,0 +1,13 @@
+[package]
+name = "oauth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nanovm-sdk = { path = "../../sdk/rust", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"

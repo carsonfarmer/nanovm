@@ -33,8 +33,23 @@ config! {
         capture: Option<CaptureConfig> = None::<CaptureConfig>,
         /// Upper bound on objects with a live instance; sizes the pooling allocator.
         max_live_objects: usize = 1000usize,
-        /// Private proxy endpoint receiving committed publishes.
-        publish_to: String = "http://127.0.0.1:8444/publish",
+        /// The proxy's private endpoint: committed publishes go to its
+        /// `/publish`, and with `leases`, calls to other objects to its
+        /// `/objects/…`, which places them.
+        proxy: String = "http://127.0.0.1:8444",
+        /// With more than one node: where the nodes keep their leases on
+        /// objects, an object store URL (`s3://bucket/prefix`; credentials
+        /// from the environment, as `AWS_ACCESS_KEY_ID` and so on). Empty:
+        /// this is the only node, and every object is its own (see `lease`).
+        leases: String = "",
+        /// This node as the proxy lists it (`host:port`), naming it as a
+        /// lease holder. Every node's must differ.
+        name: String = "",
+        /// How long a node's leases outlive its last renewal: the longest an
+        /// object is unavailable after its node stops (see `lease`). Each
+        /// node's session record carries its own, which other nodes wait
+        /// out before taking its objects, so nodes may differ.
+        lease_ms: u64 = 10_000u64,
         /// OTLP/HTTP collector base URL. Only the supervisor connects to it.
         telemetry_endpoint: String = "http://127.0.0.1:4318",
         /// Virtual address space reserved per linear memory: no memory grows
@@ -54,8 +69,9 @@ config! {
         /// gid `jail_uid_base + i`.
         jail_uid_base: u32 = 200_000u32,
         /// A delegated cgroup v2 directory, with the memory, cpu and pids
-        /// controllers enabled for its children. Each worker is placed in
-        /// `<cgroup>/<app>` with that app's `[app.worker]` limits.
+        /// controllers enabled for its children, used by this node alone.
+        /// Each worker runs in a cgroup of its own under it, with the node's
+        /// `[worker]` limits.
         cgroup: Option<PathBuf> = None::<PathBuf>,
         /// The most an app gets: each of its limits is clamped to these.
         /// Egress entries are the app's own.
@@ -105,8 +121,15 @@ config! {
     pub struct ProxyConfig {
         /// Address the proxy listens on.
         listen: String = "0.0.0.0:8443",
-        /// The node it forwards to.
-        node: String = "127.0.0.1:8080",
+        /// The nodes it places objects on (`host:port`, each as the node's
+        /// `name`).
+        nodes: Vec<String> = vec!["127.0.0.1:8080".to_string()],
+        /// How long a request may wait for its object's node: for a node that
+        /// stopped to lose its leases (its `lease_ms`) and another to take
+        /// over. It must exceed every node's `lease_ms`, with the time a
+        /// takeover takes to restore an object; the proxy can't check that,
+        /// as each node has its own. More than the connect timeout (1 s).
+        failover_ms: u64 = 30_000u64,
         /// Private control listener; only nodes may reach it.
         publish_listen: String = "127.0.0.1:8444",
         /// OTLP/HTTP Collector base URL for front-door request events.
@@ -134,6 +157,20 @@ config! {
     pub struct CaptureConfig {
         max_mb: u64 = 256u64,
         max_versions: u64 = 16u64,
+        /// Every this many versions, one holds the whole volume; the rest
+        /// hold what a commit changed.
+        snapshot_every: u64 = 16u64,
+        /// Where published versions are shipped, then removed here but the
+        /// last: an object store URL, as `leases` takes (`s3://bucket/prefix`,
+        /// `file:///path`; credentials and region from `AWS_*`). None keeps
+        /// them all here.
+        store: Option<String> = None::<String>,
+        /// Acknowledge a commit once its version counts in the store (its
+        /// head names it), not once it is durable here. Unset in a config
+        /// file, it is on for a node with `leases`: a node taking an object
+        /// over restores it from the store, so a write answered only here
+        /// would be lost. Off for one node.
+        remote_ack: bool = false,
     }
 }
 
@@ -200,6 +237,24 @@ impl NodeConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut cfg: NodeConfig = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        // With leases, a write is answered once its version counts in the
+        // store, unless the config says otherwise (see `CaptureConfig`).
+        let leased = !cfg.leases.is_empty();
+        let said = toml::from_str::<toml::Table>(&text)?.get("capture").is_some_and(|c| c.get("remote_ack").is_some());
+        if let Some(capture) = cfg.capture.as_mut().filter(|_| leased && !said) {
+            capture.remote_ack = true;
+        }
+        // Every node must see the same leases and heads, written
+        // conditionally: memory and directories are each node's own, and
+        // `object_store`'s local files can't update a record conditionally.
+        // (A programmatic config's caller brings stores its nodes share, as
+        // tests do.)
+        let store = cfg.capture.as_ref().and_then(|c| c.store.as_deref()).unwrap_or_default();
+        for (key, url) in [("leases", cfg.leases.as_str()), ("capture.store", store)].iter().filter(|_| leased) {
+            if ["memory:", "file:", "/"].iter().any(|own| url.starts_with(own)) {
+                bail!("with leases, {key} is an object store every node shares, such as s3://bucket/prefix, not {url:?}");
+            }
+        }
         // A relative data_dir is relative to the config file (joining keeps
         // an absolute one as it is).
         cfg.data_dir = path.parent().unwrap_or(Path::new(".")).join(&cfg.data_dir);
@@ -208,12 +263,32 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if !self.leases.is_empty() && self.name.is_empty() {
+            bail!("a node with leases has a name");
+        }
+        if self.lease_ms == 0 {
+            bail!("lease_ms is 0: a node renews its leases every lease_ms / 4");
+        }
+        if self.capture.as_ref().is_some_and(|c| c.remote_ack && c.store.is_none()) {
+            bail!("capture.remote_ack needs a capture.store");
+        }
+        if !self.leases.is_empty() && self.capture.as_ref().is_none_or(|c| c.store.is_none()) {
+            bail!("a node with leases ships its objects' versions (capture.store): another node restores an object it takes over from there");
+        }
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
 
 impl ProxyConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.nodes.is_empty() {
+            bail!("the proxy has no nodes");
+        }
+        // Else a node that doesn't accept a connection in time would be taken
+        // for one that took the request and may have run it (504).
+        if self.failover_ms <= crate::proxy::CONNECT.as_millis() as u64 {
+            bail!("failover_ms must be more than the proxy's connect timeout, {:?}", crate::proxy::CONNECT);
+        }
         dev_on_loopback(self.dev, &self.listen, cfg!(feature = "dev"))
     }
 }
@@ -329,6 +404,52 @@ mod tests {
         ] {
             assert!(toml::from_str::<NodeConfig>(bad).is_err(), "{bad}");
         }
+    }
+
+    /// A node with leases needs a store to ship to, from which another node
+    /// restores its objects, and answers a write once it is shipped unless
+    /// its config says otherwise; one node answers once it is durable here.
+    #[test]
+    fn leases_need_a_store_and_acknowledge_remotely_by_default() {
+        let dir = std::env::temp_dir().join(format!("nanovm-config-ack-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("n.toml");
+        let ack = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            NodeConfig::load(&path).map(|c| c.capture.unwrap().remote_ack).map_err(|e| e.to_string())
+        };
+        let leased = "leases = \"s3://b/leases\"\nname = \"10.0.0.1:8080\"\n";
+        assert!(ack(leased).unwrap_err().contains("capture.store"));
+        assert_eq!(ack(&format!("{leased}[capture]\nstore = \"s3://b/s\"")), Ok(true));
+        assert_eq!(ack(&format!("{leased}[capture]\nstore = \"s3://b/s\"\nremote_ack = false")), Ok(false));
+        assert_eq!(ack("[capture]\nstore = \"/s\""), Ok(false));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Hostile configs a node or proxy refuses: leases renewed in a busy
+    /// loop; with leases, stores each node would have its own of (memory, a
+    /// directory) or couldn't update conditionally (`object_store`'s local
+    /// files: sessions would lapse at their first renewal); a proxy that
+    /// would give up on a node before a connect to it can time out.
+    #[test]
+    fn configs_that_cannot_hold_leases_are_refused() {
+        let dir = std::env::temp_dir().join(format!("nanovm-config-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("n.toml");
+        let load = |leases: &str, store: &str, more: &str| {
+            let text = format!("leases = {leases:?}\nname = \"10.0.0.1:8080\"\n{more}\n[capture]\nstore = {store:?}\n");
+            std::fs::write(&path, text).unwrap();
+            NodeConfig::load(&path).map(drop).map_err(|e| e.to_string())
+        };
+        assert_eq!(load("s3://b/leases", "s3://b/versions", ""), Ok(()));
+        assert!(load("s3://b/leases", "s3://b/versions", "lease_ms = 0").unwrap_err().contains("lease_ms"));
+        for (leases, store) in [("memory:", "s3://b/v"), ("file:///l", "s3://b/v"), ("s3://b/l", "/v"), ("s3://b/l", "file:///v"), ("s3://b/l", "memory:")] {
+            assert!(load(leases, store, "").unwrap_err().contains("every node shares"), "{leases} {store}");
+        }
+        let proxy = |failover_ms| ProxyConfig { failover_ms, ..Default::default() }.validate().map_err(|e| e.to_string());
+        assert!(proxy(1000).unwrap_err().contains("connect timeout"));
+        assert_eq!(proxy(1001).map_err(drop), Ok(()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Loading resolves a relative data directory against the config file's

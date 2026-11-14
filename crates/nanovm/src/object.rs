@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -42,6 +42,8 @@ pub struct Job {
     pub enqueued: Instant,
     pub context: opentelemetry::Context,
     pub span: crate::telemetry::Span,
+    /// For a call, the objects waiting on it (see `egress::CALLERS`).
+    pub callers: Vec<Arc<str>>,
 }
 
 #[repr(u8)]
@@ -52,19 +54,22 @@ pub enum Phase {
     Handling,
     PostReturn,
     Cold,
+    /// The node commits what a request changed: its work, not the guest's.
+    Committing,
 }
 
 impl Phase {
-    pub(crate) const ALL: [Phase; 5] = [
+    pub(crate) const ALL: [Phase; 6] = [
         Phase::Starting,
         Phase::Idle,
         Phase::Handling,
         Phase::PostReturn,
         Phase::Cold,
+        Phase::Committing,
     ];
 
     pub fn as_str(self) -> &'static str {
-        ["starting", "idle", "handling", "post-return", "cold"][self as usize]
+        ["starting", "idle", "handling", "post-return", "cold", "committing"][self as usize]
     }
 }
 
@@ -86,7 +91,16 @@ pub struct ObjShared {
     lane: Mutex<Option<OwnedSemaphorePermit>>,
     /// The objects its calls are waiting on, one entry per call.
     pub waiting_on: Mutex<Vec<Arc<str>>>,
+    /// The objects waiting on its request, while they do.
+    pub callers: Mutex<Vec<Arc<str>>>,
+    /// With more than one node, its node's session, and lease on it.
+    pub leases: Option<Arc<crate::lease::Session>>,
+    pub lease: Mutex<Option<crate::lease::Grant>>,
     pub context: Mutex<opentelemetry::Context>,
+    /// Set by the epoch callback when it makes the guest yield.
+    yielding: AtomicBool,
+    /// Held by a commit, which can outlive the instance it was for.
+    storage: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ObjShared {
@@ -98,6 +112,28 @@ impl ObjShared {
             phase: AtomicU8::new(Phase::Cold as u8),
             since_ns: now.into(),
             ..Default::default()
+        }
+    }
+
+    /// Whether its node may serve it and commit its changes: with one node
+    /// always, else while it holds the object's lease in its current session.
+    pub fn holds(&self) -> bool {
+        self.leases.as_ref().is_none_or(|s| self.lease.lock().as_ref().is_some_and(|g| s.holds(g)))
+    }
+
+    /// Whether it had a lease that its node no longer holds.
+    pub fn lost(&self) -> bool {
+        self.leases.as_ref().is_some_and(|s| self.lease.lock().as_ref().is_some_and(|g| !s.holds(g)))
+    }
+
+    /// The epoch of its node's lease on it, which its committed versions
+    /// carry; an error once the node no longer holds it, so a node that lost
+    /// the object can't commit (W-10). 0 with one node.
+    pub fn lease_epoch(&self) -> std::io::Result<u64> {
+        let Some(s) = &self.leases else { return Ok(0) };
+        match &*self.lease.lock() {
+            Some(g) if s.holds(g) => Ok(g.epoch),
+            _ => Err(std::io::Error::other("this node no longer holds the object's lease")),
         }
     }
 
@@ -155,6 +191,13 @@ impl ObjShared {
     /// and commits (and captures) are the node's work, not the guest's.
     pub fn uncharge(&self, t0: u64) {
         self.poll_start_ns.fetch_add(thread_cpu_ns().saturating_sub(t0), Relaxed);
+    }
+
+    /// Holds the object's volume for a commit until it ends, whatever comes
+    /// of the request it is for: one killed at its deadline leaves it
+    /// running with the disk (see `run`).
+    pub async fn storage(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.storage.clone().lock_owned().await
     }
 
     /// CPU charged to the current request, including the poll in progress.
@@ -417,8 +460,10 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
             st.cpu_exceeded = true;
             return Err(wasmtime::format_err!("cpu budget exceeded"));
         }
-        // Hand back the lane at every tick so heavy requests take turns.
+        // At every tick, let the other tasks on this thread run, and hand
+        // back the lane so heavy requests take turns.
         st.shared.lane.lock().take();
+        st.shared.yielding.store(true, Relaxed);
         if used < HEAVY_AFTER_NS {
             return Ok(UpdateDeadline::Yield(1));
         }
@@ -426,6 +471,16 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
         Ok(UpdateDeadline::YieldCustom(
             1,
             Box::pin(async move {
+                // A free lane is taken at once, without a yield.
+                let mut yielded = false;
+                poll_fn(|cx| {
+                    if std::mem::replace(&mut yielded, true) {
+                        return Poll::Ready(());
+                    }
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                })
+                .await;
                 if let Ok(p) = heavy.acquire_owned().await {
                     *shared.lane.lock() = Some(p);
                 }
@@ -447,26 +502,41 @@ enum Exit {
 }
 
 /// Makes the request's changes durable, then sends what it published (the
-/// changes stand whether or not a publish gets through).
+/// changes stand whether or not a publish gets through). Only while the node
+/// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route, id) = acc.with(|mut s| {
+    let (quota, held, route, node, shared) = acc.with(|mut s| {
         let s = s.data_mut();
-        (s.quota.clone(), std::mem::take(&mut *s.hooks.held.lock()), s.hooks.route.clone(), s.shared.id.clone())
+        let held = std::mem::take(&mut *s.hooks.held.lock());
+        (s.quota.clone(), held, s.hooks.route.clone(), s.hooks.node.clone(), s.shared.clone())
     });
-    quota.commit()?;
-    if let crate::egress::Route::Supervisor(up) = route
-        && !held.is_empty()
-    {
+    // Only while the node holds the object's lease (see `Journal::commit`):
+    // otherwise neither its changes nor its publishes go out. Its time is
+    // the node's (a store acknowledging remotely may take `ship::ACK`), not
+    // counted against the guest's post-return deadline.
+    shared.set_phase(Phase::Committing);
+    let committed = quota.commit().await;
+    shared.set_phase(Phase::PostReturn);
+    committed?;
+    let id = shared.id.clone();
+    if !held.is_empty() {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {
             for body in held {
                 // All a held publish is: its body, named with its object so
                 // it reaches only that object's sockets.
                 let req = http::Request::post(format!("http://{}/publish", crate::ws::PUBLISH_HOST));
-                let req = req.header(crate::ws::OBJECT_HEADER, &*id);
-                let req = req.body(Full::new(body).map_err(|e| match e {}).boxed_unsync()).expect("ids are header-safe");
-                if let Ok(res) = up.send(req).await {
-                    let _ = res.into_body().collect().await;
+                let req = req.header(crate::ws::OBJECT_HEADER, &*id).body(body).expect("ids are header-safe");
+                match (&route, node.upgrade()) {
+                    (crate::egress::Route::Supervisor(up), _) => {
+                        if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
+                            let _ = res.into_body().collect().await;
+                        }
+                    }
+                    (crate::egress::Route::Direct(_), Some(node)) => {
+                        node.sockets.publish(req.map(Full::new)).await;
+                    }
+                    _ => {}
                 }
             }
         })
@@ -501,10 +571,23 @@ impl Drop for Pending {
 }
 
 pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx: mpsc::Receiver<Box<Job>>) {
+    let _lease = scopeguard::guard((), |()| node.release(&shared));
     loop {
         let Some(mut job) = rx.recv().await else { return };
         *shared.context.lock() = job.context.clone();
         shared.set_phase(Phase::Starting);
+        // Boxed: only nodes with leases wait on it.
+        if node.leases.is_some()
+            && let Err(response) = Box::pin(node.acquire(&shared)).await
+        {
+            crate::telemetry::response(&mut job.span, &response);
+            let _ = job.reply.send(response);
+            shared.set_phase(Phase::Cold);
+            if node.try_retire(&shared, &rx) {
+                return;
+            }
+            continue;
+        }
         // A store holds a slot until it is dropped, and the pool has room for
         // every slot. An evicted object's store lives until its actor next
         // runs, so a new object waits here until that store is gone rather
@@ -521,27 +604,46 @@ pub async fn run(node: Arc<Node>, app: Arc<App>, shared: Arc<ObjShared>, mut rx:
         });
         let started = async {
             let mut store = new_store(&node, &app, &shared)?;
+            // Acknowledging remotely, it serves only what counts in the store
+            // (see `ship::caught_up`); recovery may just have settled a commit.
+            let versions = app.objects.join("~committed").join(&*shared.id);
+            if node.cfg.capture.as_ref().is_some_and(|c| c.remote_ack) && !crate::ship::caught_up(&versions).await? {
+                return Ok(None);
+            }
             *counted = true;
             let live = node.metrics.stores_live.fetch_add(1, Relaxed) + 1;
             node.metrics.stores_peak.fetch_max(live, Relaxed);
             let svc = shared
                 .charged(&node.metrics, pin!(app.pre.instantiate_async(&mut store)))
                 .await?;
-            anyhow::Ok((store, svc))
+            anyhow::Ok(Some((store, svc)))
         }
         .await;
         crate::telemetry::duration(&mut job.span, "nanovm.instantiate.duration_ms", t0);
         match started {
-            Ok((store, svc)) => {
-                match serve(&node, &app, &shared, store, svc, job, &mut rx).await {
+            Ok(Some((store, svc))) => {
+                let exit = serve(&node, &app, &shared, store, svc, job, &mut rx).await;
+                // A commit its request's deadline cut short still owns the
+                // volume. Recovering it for the next instance (or another
+                // actor's, once this one retires) before the commit ends let
+                // the key it then wrote void that instance's records (S1).
+                drop(shared.storage().await);
+                match exit {
                     Exit::Closed => return,
                     Exit::Idle => _ = node.metrics.evicted_idle.fetch_add(1, Relaxed),
-                    Exit::Reset => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),
+                    Exit::Reset if shared.holds() => node.metrics.event("rolled-back", &shared.id, "a request failed", &shared.context.lock()),
+                    Exit::Reset => node.metrics.event("lease-lost", &shared.id, "this node no longer holds the object's lease", &shared.context.lock()),
                     Exit::Poisoned(p, detail) => {
                         node.metrics.poison(p);
                         node.metrics.event(p.as_str(), &shared.id, detail, &shared.context.lock());
                     }
                 }
+            }
+            Ok(None) => {
+                let mut response = error_response(503, "not-stored", "its last commit doesn't count in the store yet");
+                response.headers_mut().insert(http::header::RETRY_AFTER, http::HeaderValue::from_static("1"));
+                crate::telemetry::response(&mut job.span, &response);
+                let _ = job.reply.send(response);
             }
             Err(e) => {
                 let e = format!("{e:#}");
@@ -582,13 +684,14 @@ async fn serve(
         async move |acc: &Accessor<ObjState>| -> wasmtime::Result<()> {
             loop {
                 shared.set_phase(Phase::Idle);
-                let job = if let Some(job) = first.take() { job } else {
+                let mut job = if let Some(job) = first.take() { job } else {
                     let Some(mut job) = rx.recv().await else { return Ok(()) };
                     crate::telemetry::duration(&mut job.span, "nanovm.queue.duration_ms", job.enqueued);
                     job.span.set_attribute(opentelemetry::KeyValue::new("nanovm.cold_start", false));
                     job
                 };
                 *shared.context.lock() = job.context.clone();
+                *shared.callers.lock() = std::mem::take(&mut job.callers);
                 shared.begin_request();
                 // The next tick, not one that passed while the object was
                 // idle: a stale deadline made every request yield to the
@@ -611,12 +714,23 @@ async fn serve(
 
                 let (resp, mut failed) = match svc.handle(acc, req).await? {
                     Ok(res) => {
-                        let res = acc.with(|mut s| res.into_http(&mut s, req_io))?;
+                        // The guest learns its answer is out (the future
+                        // `response.new` gave it resolves) once the client
+                        // has read it to its end, or gone: only then can its
+                        // work after the answer fail without failing it.
+                        let (sent, out) = oneshot::channel::<()>();
+                        let out = async move { _ = out.await; req_io.await };
+                        let mut res = acc.with(|mut s| res.into_http(&mut s, out))?;
+                        // Only the node refuses requests to the proxy: a guest
+                        // answering as one would have the proxy run its
+                        // request again and again.
+                        res.headers_mut().remove(crate::lease::OWNER);
                         let res = res.map(|b| {
                             GuardedBody {
                                 inner: b,
                                 remaining: max_resp,
                                 abort,
+                                sent: Some(sent),
                             }
                             .boxed_unsync()
                         });
@@ -648,6 +762,8 @@ async fn serve(
                     p.phase("nanovm.post_return.duration_ms");
                     if let Some(tx) = p.reply.take() { let _ = tx.send(resp); }
                 }
+                // Its callers have their answer.
+                shared.callers.lock().clear();
                 // Let tasks the guest left running (e.g. streaming the body)
                 // finish before taking the next request.
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
@@ -684,8 +800,10 @@ async fn serve(
         let mut fut = pin!(shared.charged(&node.metrics, run));
         let mut timer = pin!(tokio::time::sleep(Duration::from_secs(3600)));
         let mut armed = None;
+        let wake = Arc::new(SelfWake { tick_ns: node.cfg.epoch_tick_ms * 1_000_000, ..Default::default() });
+        let waker = Waker::from(wake.clone());
         poll_fn(|cx| {
-            if let Poll::Ready(r) = fut.as_mut().poll(cx) {
+            if let Poll::Ready(r) = wake.poll(cx, &waker, &shared.yielding, fut.as_mut()) {
                 return Poll::Ready(Ok(r.and_then(|r| r)));
             }
             let t1 = now_ns();
@@ -694,6 +812,7 @@ async fn serve(
                 let ms = match phase {
                     Phase::Idle => limits.idle_timeout_ms,
                     Phase::PostReturn => limits.post_return_timeout_ms,
+                    Phase::Committing => limits.post_return_timeout_ms + crate::ship::ACK.as_millis() as u64,
                     Phase::Handling | Phase::Starting | Phase::Cold => limits.request_timeout_ms,
                 };
                 let elapsed = Duration::from_nanos(t1.saturating_sub(since));
@@ -735,6 +854,70 @@ async fn serve(
     exit
 }
 
+/// The store's waker. Wasmtime wakes the actor during its own poll a few
+/// times in an ordinary request (the guest returning, its task ending), and
+/// Tokio takes a task that wakes itself for one that yields: it queues it
+/// behind the others and wakes an idle thread to steal it, so each request
+/// woke threads for nothing and moved between them. A wake during the poll
+/// polls again at once instead.
+///
+/// So a poll holds its thread at most about a tick, as a guest that only
+/// computes does: the epoch callback's yield always reaches Tokio, and so
+/// does any wake once the poll has run for a tick, which bounds a loop of
+/// self-wakes that runs no guest code too. A guest that wakes itself in a
+/// tight loop (each wake goes back to the host, which runs it again) is
+/// charged for it and killed at its CPU budget like a spinner.
+#[derive(Default)]
+struct SelfWake {
+    /// `IDLE`, `POLLING`, or `WOKEN` during the poll.
+    state: AtomicU8,
+    task: Mutex<Option<Waker>>,
+    tick_ns: u64,
+}
+
+const IDLE: u8 = 0;
+const POLLING: u8 = 1;
+const WOKEN: u8 = 2;
+
+impl SelfWake {
+    fn poll<F: Future>(&self, cx: &mut Context<'_>, waker: &Waker, yielding: &AtomicBool, mut fut: Pin<&mut F>) -> Poll<F::Output> {
+        use std::sync::atomic::Ordering::SeqCst;
+        {
+            let mut task = self.task.lock();
+            if !task.as_ref().is_some_and(|t| t.will_wake(cx.waker())) {
+                *task = Some(cx.waker().clone());
+            }
+        }
+        let start = now_ns();
+        loop {
+            self.state.store(POLLING, SeqCst);
+            let poll = fut.as_mut().poll(&mut Context::from_waker(waker));
+            if poll.is_ready() || self.state.swap(IDLE, SeqCst) != WOKEN {
+                return poll;
+            }
+            if yielding.swap(false, Relaxed) || now_ns() - start >= self.tick_ns {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+impl Wake for SelfWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if let Err(IDLE) = self.state.compare_exchange(POLLING, WOKEN, SeqCst, SeqCst)
+            && let Some(task) = &*self.task.lock()
+        {
+            task.wake_by_ref();
+        }
+    }
+}
+
 fn classify(store: &Store<ObjState>, e: &wasmtime::Error) -> Exit {
     let st = store.data();
     let tail = st.stderr.text();
@@ -774,6 +957,8 @@ struct GuardedBody<B> {
     inner: B,
     remaining: u64,
     abort: Arc<AtomicBool>,
+    /// Dropped once the body has been read to its end or failed, or with it.
+    sent: Option<oneshot::Sender<()>>,
 }
 
 impl<B> Body for GuardedBody<B>
@@ -788,7 +973,7 @@ where
         if self.abort.load(Relaxed) {
             return Poll::Ready(Some(Err("instance terminated".into())));
         }
-        match Pin::new(&mut self.inner).poll_frame(cx) {
+        let poll = match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     let n = data.len() as u64;
@@ -802,7 +987,11 @@ where
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
+        };
+        if matches!(poll, Poll::Ready(None | Some(Err(_)))) {
+            self.sent = None;
         }
+        poll
     }
 
     fn is_end_stream(&self) -> bool {
@@ -892,12 +1081,27 @@ mod tests {
             inner: Full::new(Bytes::from_static(b)),
             remaining,
             abort: Arc::new(AtomicBool::new(abort)),
+            sent: None,
         };
         assert_eq!(body(b"12345", 5, false).collect().await.unwrap().to_bytes(), "12345");
         let e = body(b"123456", 5, false).collect().await.unwrap_err();
         assert!(e.to_string().contains("max_response_body_kb"));
         let e = body(b"1", 5, true).collect().await.unwrap_err();
         assert_eq!(e.to_string(), "instance terminated");
+    }
+
+    /// The guest hears that its answer is out once the body has been read
+    /// to its end, though whoever read it keeps it.
+    #[tokio::test]
+    async fn guarded_body_says_when_it_has_been_read() {
+        use oneshot::error::TryRecvError::{Closed, Empty};
+        let (sent, mut out) = oneshot::channel::<()>();
+        let inner = Full::new(Bytes::from_static(b"1"));
+        let mut body = GuardedBody { inner, remaining: 5, abort: Arc::default(), sent: Some(sent) };
+        assert!(body.frame().await.unwrap().is_ok());
+        assert_eq!(out.try_recv(), Err(Empty));
+        assert!(body.frame().await.is_none());
+        assert_eq!(out.try_recv(), Err(Closed));
     }
 
     /// The task of an idle object holds little: once, moved-in futures held
@@ -961,6 +1165,6 @@ mod tests {
         shared.begin_start();
         assert!(shared.cpu_used_ns() < 5_000_000);
         let names = Phase::ALL.map(Phase::as_str);
-        assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold"]);
+        assert_eq!(names, ["starting", "idle", "handling", "post-return", "cold", "committing"]);
     }
 }

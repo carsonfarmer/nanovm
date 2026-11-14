@@ -9,9 +9,8 @@
 use std::path::Path;
 
 use anyhow::Context;
-use nanovm::registry::{APP_TYPE, CONFIG_TYPE, Oci, VERSION, WASM_TYPE};
-use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
-use oci_client::manifest::{OCI_IMAGE_MEDIA_TYPE, OciImageManifest};
+use nanovm::registry::Oci;
+use oci_spec::distribution::Reference;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -20,22 +19,13 @@ async fn main() -> anyhow::Result<()> {
     registry.bind(addr);
     let running = registry.run_in_background();
     let guests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guests");
-    let client = oci_client::Client::new(ClientConfig {
-        protocol: ClientProtocol::Http,
-        ..Default::default()
-    });
+    let oci = Oci::new(true)?;
     for guest in ["counter", "hostile"] {
         let wasm = guests.join(format!("target/wasm32-wasip2/release/{guest}.wasm"));
         let wasm = std::fs::read(&wasm).with_context(|| format!("{}: run scripts/build-guests.sh", wasm.display()))?;
         let spec = std::fs::read(guests.join(guest).join("nanovm.json"))?;
-        let (layer, config) = (ImageLayer::new(wasm, WASM_TYPE.into(), None), Config::new(spec, CONFIG_TYPE.into(), None));
-        let version = [(VERSION.to_string(), "1.0.0".to_string())].into();
-        let mut manifest = OciImageManifest::build(std::slice::from_ref(&layer), &config, Some(version));
-        (manifest.media_type, manifest.artifact_type) = (Some(OCI_IMAGE_MEDIA_TYPE.into()), Some(APP_TYPE.into()));
-        let r = format!("{}/nanovm/{guest}:latest", running.bound_addr()).parse()?;
-        let auth = oci_client::secrets::RegistryAuth::Anonymous;
-        client.push(&r, &[layer], config, &auth, Some(manifest)).await?;
-        let digest = Oci::new(true)?.digest(&r).await?;
+        let r: Reference = format!("{}/nanovm/{guest}:latest", running.bound_addr()).parse()?;
+        let digest = oci.push_app(&r, None, spec, wasm, &semver::Version::new(1, 0, 0)).await?;
         println!("{guest} {}/{}@{digest}", r.registry(), r.repository());
     }
     std::future::pending().await

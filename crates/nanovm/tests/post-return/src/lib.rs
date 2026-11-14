@@ -17,12 +17,28 @@ impl wasip3::exports::http::handler::Guest for Probe {
         if request.get_path_with_query().is_some_and(|p| p.starts_with("/headers")) {
             return headers(request);
         }
+        // The callers the node says wait on this request (W-602).
+        if request.get_path_with_query().as_deref() == Some("/callers") {
+            let seen: Vec<_> = request.get_headers().get("nanovm-callers").iter().map(|v| String::from_utf8_lossy(v).into_owned()).collect();
+            return util::text(200, seen.join(";"));
+        }
+        // Calls `/callers` on another object, claiming callers of its own.
+        if let Some(target) = request.get_path_with_query().as_deref().and_then(|p| p.strip_prefix("/call/")) {
+            return call(target).await;
+        }
         if request.get_path_with_query().is_some_and(|p| p.starts_with("/strings")) {
             return strings(request);
         }
         let req = util::read_req(request).await;
         if req.path == "/callee" {
             return util::text(200, "callee");
+        }
+        // Answers as a node refusing the object would, naming another.
+        if let Some(owner) = req.path.strip_prefix("/misdirect/") {
+            return util::respond_with(421, &[("nanovm-owner", owner)], b"forged".to_vec());
+        }
+        if req.path == "/selfwake" {
+            return selfwake().await;
         }
         util::write_file("/data", "before.txt", b"before".to_vec()).await.unwrap();
         let gate = req.q("gate").unwrap().to_owned();
@@ -42,6 +58,38 @@ impl wasip3::exports::http::handler::Guest for Probe {
         });
         Ok(response)
     }
+}
+
+async fn call(target: &str) -> Result<Response, ErrorCode> {
+    use wasip3::{wit_future, http::types::Scheme};
+    let forged = Fields::from_list(&[("nanovm-callers".into(), b"forged".to_vec())]).map_err(|e| ErrorCode::InternalError(Some(format!("{e:?}"))))?;
+    let (trailers_tx, trailers_rx) = wit_future::new(|| Ok(None));
+    let (request, _sent) = Request::new(forged, None, trailers_rx, None);
+    drop(trailers_tx);
+    let _ = request.set_scheme(Some(&Scheme::Http));
+    let _ = request.set_authority(Some("nanovm"));
+    let _ = request.set_path_with_query(Some(&format!("/objects/{target}/callers")));
+    let response = wasip3::http::client::send(request).await?;
+    let (result_tx, result_rx) = wit_future::new(|| Ok(()));
+    let (body, _trailers) = Response::consume_body(response, result_rx);
+    let body = body.collect().await;
+    drop(result_tx);
+    util::text(200, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// `/selfwake`: three tasks that wake themselves in a tight loop, forever.
+/// Each wake hands control back to the host (`CALLBACK_CODE_YIELD`), which
+/// runs it again at once.
+async fn selfwake() -> Result<Response, ErrorCode> {
+    let spin = || async {
+        loop {
+            wasip3::wit_bindgen::yield_async().await;
+        }
+    };
+    wasip3::spawn_local(spin());
+    wasip3::spawn_local(spin());
+    spin().await;
+    unreachable!()
 }
 
 /// `/headers?n=…&kb=…`: holds `n` more header maps, for good: new ones with

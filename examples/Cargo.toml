@@ -1,0 +1,11 @@
+# Example apps, built on the SDK in sdk/rust: `tools/build-app.sh examples/<app>`.
+[workspace]
+resolver = "3"
+members = ["hello", "chat", "shortener", "ratelimit", "locks", "polls", "leaderboard", "shop", "jobs", "events", "files", "site", "presence", "tictactoe", "flags", "wiki", "notes", "analytics", "reminders", "todos", "webhooks", "gateway", "feeds", "oauth"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+debug = false

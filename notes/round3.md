@@ -1,0 +1,183 @@
+# Round 3: what changed, why, and how to pick it
+
+Round 3 worked from five priorities: land the security fixes, cut the cost of durable writes,
+get committed state off the node, run on many nodes, and give developers an on-ramp. Each piece
+was built on its own branch, measured, and integrated into two branches:
+
+- **`cf/main-next`**: fixes only. It is `origin/main` (59b3783) plus security and correctness
+  fixes. Land it first: every commit is small, has a test that fails without it, and CI passes.
+- **`cf/round3`**: `cf/main-next` plus the verified improvements below. CI passes on it, including
+  the SQLite durability suite, the restic backup drill, JavaScript, `nanovm run`, the 22 example
+  apps, and the multi-node tests.
+
+Numbers come from one shared 4-core VM that was often under heavy load (load average 10–30).
+Where a number is CPU per request, it is process CPU from `/proc`, alternating builds, medians
+over at least three rounds. Read them as before/after on the same machine.
+
+## 1. `cf/main-next`: fixes to land on main
+
+| Commit | Fix | Why it matters | Runtime lines |
+|---|---|---|---|
+| f84fa93 | Build only the dependency features the node uses | fewer crates and a smaller binary | 0 |
+| 4a2778d | N-70: only stream socketpairs in the jail | a datagram socketpair could `sendto` any socket on the host | +1 |
+| 0f79ca1, 1f89e09 | N-71: refuse forged socket events however the type is spelled | a client could inject WebSocket events into objects | small |
+| 573b7cc | N-72: parse GRIP publishes into typed structs | a publish could amplify memory and CPU in the proxy | small |
+| 01c778b | N-73: send the host the egress policy allowed | domain fronting past the egress allowlist | small |
+| 4ffcf4d, 47e1d9c | N-75: bound host-held header maps by the instance's memory limit | a guest could hold unbounded host memory in headers | small |
+| 3071c8d | N-74: stamp worker telemetry at the wire level | a hostile 1 MiB batch cost 278 MB / 308 ms; now 3 MB / 10 ms | small |
+| 0ac2849 | wasmtime 50.0.1 | security release (five advisories) | 0 |
+| 6fdb057, 98f25be, 80b9fe6 | N-502..N-504: the journal refuses paths it can't name; recovery treats impossible paths as nothing there | **a client could brick an object for good** (503 on every later request) with a create under a file, a 256-byte name, or a path past PATH_MAX, followed by any failure. Found by a model-based test and a hostile guest | +34 |
+| ea4019b | N-551: the worker checks its parent by the supervisor's pid | **in a container without an init (Kubernetes, `docker run` without `--init`) no worker could start** | +2 |
+| 37dd88e | N-552: workers start from the supervisor's own image (`/proc/self/exe`) | replacing the binary under a running node started mismatched workers (502) | +2 |
+| ac3c71f | N-507: the proxy refuses a TXT trust identity containing a comma | the node then refused every request for that host; found by fuzzing | 0 |
+| 51d517e, 5a9fe61 | N-640: the CPU budget charges the thread's CPU clock, not wall time inside polls | **on a busy node, waiting for a core was billed as CPU**, so overload turned into CPU kills and restarts. Before: 178 of 1.4M GETs and 94 of 140k writes killed at load ~25; a request needing 33 ms of CPU was killed after 12–16 ms. After: none; the kill comes at 102–103 ms of real CPU for a 100 ms budget. Also fixes N-600 (SQLite's fsync waits were billed as CPU). Cost about 1.3 µs (~2%) per warm GET, within noise | +3 |
+| 50ef6d9, af293c7 | N-505: request bodies must keep coming, at the proxy and the node (408 `body-timeout`); N-680: a link connection answered before its body was sent is not pooled | **a client trickling a body held a connection, a link and an object as long as it liked**; now cut after about 10 s (any upload at 4 KiB/s or more is never cut). Before: all four entry points still open after 40 s; after: 408 at 10.0 s. CPU per request unchanged within noise | +66 |
+| 59c0b58 | N-500: the linker defines only the WASIp2 interfaces the allowlist permits | defense in depth: the raw WASIp2 filesystem and sockets can't be reached even if the allowlist changes; linker build 148 → 90 µs | +12 |
+| cc0aca8 | N-506: the node refuses a `nanovm-host` that isn't a DNS name | an invalid app name could be formed from a header starting with `.` | +3 |
+| 2310766 | N-671: preflight explains an address-space limit too small for the pool | under `ulimit -v`, every worker failed with an unexplained mapping error; now `serve` refuses to start and says why | +15 |
+
+Plus the merge of `origin/main` 59b3783 (Amp's W-9 local capture), unchanged.
+
+## 2. `cf/round3`: improvements on top
+
+Pick in this order; each line says what it depends on.
+
+### Faster app restarts and fairer cores (from `cf/speed`)
+
+| Commit | Change | Evidence | Lines |
+|---|---|---|---|
+| bda2840 | H2: heavy requests yield their thread at every tick | a spinning guest can no longer hold a thread between ticks; neutral for ordinary requests (×1.00) | +9 |
+| 091c810 | C4: the supervisor keeps one worker spawned ahead, engine already built | app restart (first request after its worker is gone) 21.5 → 11.9 ms | +54 |
+| f23cda4 | C5: the worker opens its cached component file and compiles only on a miss | restart of a 5.6 MB component 31.2 → 8.9 ms. With C4: restart 19.9 → 10.2 ms, 5.6 MB 41.1 → 11.0 ms, LRU retirement 22.4 → 12.9 ms | +21 |
+| 70df4d9, 285d96b | H3: the store re-polls on its own wakes; the worker exports telemetry from its own thread | HTTP through supervisor + jailed worker, one client: CPU per request 467 → 302 µs (×0.62), throughput +17–28%, worker context switches 4.7 → 1.1 per request. 256 clients: about ×0.94 CPU. Spans delivered 99.7–100%. Taken after N-640: with CPU billing, kills under load were 0 with and without H3 | +61 |
+
+**Independent audit** (PR #2 review: idle 4-vCPU machine, 3 alternating pairs, `/proc` CPU, medians
+[ranges]; these replace the authors' numbers above where they differ):
+- Combined restart (C4 + C5): small component 22.12 [21.94–22.32] → 11.19 [11.06–11.47] ms; synthetic
+  5.6 MB component 44.43 [43.49–45.01] → 11.16 [10.81–12.22] ms. Reproduced.
+- One-client jailed HTTP (H3): CPU per request 519 [517–520] → 408 [389–437] µs (−21.4%, not −38%);
+  throughput +11.2% (not +17–28%).
+- Saturated jailed HTTP: CPU ranges overlap, throughput slightly lower and p99 higher. No benefit at
+  saturation is established (three rounds don't establish a regression either).
+- Not independently verified: span-delivery percentages and the isolated C4, C5 and H2 numbers.
+
+Review fixes on this area (`fix/worker-r3fix`): each worker now starts in a cgroup of its own, so the
+spare's engine memory is charged where its app's limits apply (W1; worker cgroups are now
+`<cgroup>/worker-<n>`, and `[worker] memory_mb` must cover the engine, about 19 MiB at 8,192 slots);
+restart with cgroups enabled went 25.1 → 9.0 ms because the cgroup move now happens when the spare
+is spawned. A worker's telemetry export thread now stops with its owner (W2).
+
+Second review's fixes (`fix/r3-worker`, N-700..N-706, evidence in `notes/r3-worker.md`): the
+startup sweep removes only an earlier run's `worker-<n>` cgroups (killing what is left in them),
+`cgroup` must be a cgroup v2 directory no other node holds, and a worker's cgroup goes once the
+worker has exited on every path. A retired worker is asked to stop: its objects finish their work
+after the answer, it flushes its telemetry and exits (10–16 ms when idle), or is killed
+`post_return_timeout_ms` + 2 s later. A `[worker] memory_mb` below a spare's use is refused
+rather than OOM-killing it. `scripts/vm-test.sh` runs again.
+
+Not taken: H4 (link sockets registered for reads only, `cf/speed` ea938cf): a further ~10% one-client
+CPU for +64 lines and two `unsafe` blocks. Optional.
+
+The C4 and C5 commits were adapted to N-551 (the worker spec carries the supervisor's pid in its
+second part). Two tests were adapted: the backup drill counts only jailed workers (C4 keeps a
+spare), and `tests/dev.rs` reads the pulled component from its cache file (C5).
+
+### Developer on-ramp and 22 example apps (`cf/onramp`, `ideas/examples`, merged at bac4d20)
+
+- `nanovm-sdk` (Rust: one async function from request to response; SQLite, streaming, SSE,
+  cookies, `after(work)`, outbound streaming), `tools/build-app.sh`, `nanovm run app.wasm` (local
+  dev server with reload), `nanovm publish` (checks the app as a node will, pushes it).
+- JavaScript apps on QuickJS with a Workers-style `fetch(request, env)`.
+- `examples/hello`, `examples/chat`, and 22 more (URL shortener, rate limiter, locks with fencing
+  tokens, polls, leaderboard, shop with all-or-nothing checkout, job queue, SSE, uploads with
+  ranges, static site, presence, tic-tac-toe lobby, feature flags, wiki, notes with FTS5,
+  analytics, reminders, offline-first todos, webhooks, LLM gateway, feeds, OAuth), each with an
+  end-to-end test that checks eviction and restart. See `notes/examples.md`.
+- Runtime: +171 lines (onramp) and +6 (N-602, `nanovm run` says when it lowers a limit).
+  `oci-client` becomes part of the production binary (for `nanovm publish`); since dropped
+  (`cf/oci-push`, below).
+
+### Many nodes and caller identity (`cf/multinode`, ported as d4e0c7d and 748e488)
+
+- **W-10.** The proxy places each object on a node by rendezvous hashing and follows a node's 421
+  to its owner. Nodes take per-object leases with rising epochs from an object store with
+  conditional writes (S3, R2 or MinIO; in-memory for tests). A node that lost a lease can neither
+  serve nor commit the object: the check sits at W-9's commit decision, and the captured version
+  records the epoch. Calls between objects cross nodes through the proxy. With one node there is
+  no store and no measurable cost (CPU per request 105.6 vs 102.0 µs, within noise).
+  +473 runtime lines; `object_store` dependency (7 crates).
+- **W-602.** An object can tell which object called it from `nanovm-callers`, which only nodes
+  set: a client's forged header never reaches the guest, on one node or across nodes.
+- Failover and late-commit tests pass; see `notes/multinode.md` for the safety argument and its
+  limits (the epoch is fenced locally; shipping must be conditional on the lease record, W-90).
+
+### Cheaper durable writes and committed state off the node (`cf/storage`, ported as 7c3d447..4ff1df6)
+
+- **Fewer syncs per write.** The undo log is kept and a commit writes a new key that voids every
+  record at once; records made back to back share one sync; commits run off the worker thread;
+  a guest's own `sync` is a no-op because the commit already makes the request durable. A counter
+  write makes 5 sync calls instead of 9 (with capture, 7 instead of 17). These are syscalls
+  (fsync/fdatasync), reproduced exactly by an independent audit; that they are as many device
+  flushes was not reproduced on virtual storage.
+- **Evidence** (the audit's: idle 4-vCPU machine, 3 alternating pairs, medians [ranges]):
+  concurrent `POST /incr` 784 [763–797] → 3,074 [3,031–3,094]/s, p99 1,407 → 302 ms, CPU per
+  write 932 → 749.5 µs (−19.6%). Serial writes are not flat: 323 → 530/s, at the same CPU per
+  write (810 → 820 µs, +1.2%, ranges overlap). These replace the figures first given here, which
+  they contradict: serial writes flat (385 → 394/s) at about 12% more CPU did not reproduce.
+- **Committed versions as changes.** A snapshot every 16 versions, changes in between
+  (a 1-byte change to a 1 MiB file is a version under 8 KiB), each carrying the lease epoch.
+- **Shipping and restore.** Versions are shipped in order to a put-once store (a directory, or S3,
+  R2 or MinIO through `object_store`), only while this node holds the object's lease (W-90), and an
+  object can be restored on a fresh root. The default acknowledgement stays local; `remote_ack`
+  holds a commit up to 2 s for the store.
+- **Limits.** A short window between reading the lease record and the put remained (W-90; closed
+  on `fix/lease-r3fix` by a fenced head, with restore on takeover and remote acknowledgement by
+  default with leases); the shipper polls every 20 ms (N-165); restore read every version (N-166;
+  now from the last snapshot). One version, v1: a log or a version that isn't v1 is refused, and
+  data written by earlier builds is not supported (AGENTS.md, rule 1).
+- **Review fixes** (`fix/storage-r3fix`). A commit that outlives a request killed at its deadline
+  owns the volume until it ends: the next instance's recovery, and retirement, wait for it (S1).
+  Restore takes files and directories only and reaches everything from the root's descriptor
+  without following a symlink (S4). S2 asked that a node keep what main's build left in its data
+  directory: not supported (AGENTS.md rule 1, N-693); its +46 runtime lines were removed on
+  `fix/no-compat`. +79 runtime lines without them.
+- +494 runtime lines, no new dependencies. All tests pass, including 114 SQLite recovery cuts and
+  the new lease-fenced shipping tests.
+
+## 3. Branches to pick on their own (no runtime change unless stated)
+
+| Branch | What | Notes |
+|---|---|---|
+| `ideas/components` 7a3b8dd | queue, JSON documents (indexes, full-text, vectors), time series, templates, auth (JWT/JWKS, argon2id, sessions) as composed Wasm providers, like KV and SQLite | 0 runtime lines; 21 tests; squash f641461 into 1cac77b |
+| `ideas/tooling` | `tools/inspect`, `tools/volume.py` export/import, `tools/doctor`, `tools/local-stack`, `tools/debug-run` and a debugging guide, `tools/replay.py` | +3 runtime lines (`app::import_allowed`) |
+| `ideas/ops` | hardened systemd units, single-node reference deployment and host checks, container image, release workflow, benchmark history, errors guide, runbooks, filesystem matrix, Prometheus alerts | docs, scripts and workflows |
+| `ideas/deploy-validation`, `ideas/seccomp-drift`, `ideas/supply-chain`, `ideas/fuzz`, `ideas/quota-model`, `ideas/hostile2-final`, `ideas/soak`, `ideas/mutants`, `ideas/quality` | validation tests, syscall drift check (no drift), cargo-deny/audit, six fuzz targets, a model-based quota test, a second hostile guest, a 30-minute soak (RSS and fds flat), tests for untested seccomp rules | tests and CI only |
+| `cf/speed` ea938cf | H4, optional (above) | +64, two `unsafe` |
+
+Research results, not adopted: pre-initializing Rust guests or the SQLite provider (Wizer) only
+helps guests that build state at start, and it freezes std's hash keys into the snapshot so every
+instance shares them (W-640). JavaScript keeps its pre-initialization.
+
+## 4. Decisions for the owner
+
+1. **W-9 acknowledgement and RPO**: still open. Shipping exists; the default stays durable on this
+   node, with `remote_ack` as the opt-in.
+2. **Multi-node**: lease length (recommend `lease_ms` 10 s, `failover_ms` 30 s); the lease store
+   becomes a hard dependency (N-181); expiry by each node's own clock; keep `object_store`; calls
+   go through the proxy when leases are on; cross-node cycles not along one chain end at the
+   timeout (N-180).
+3. **On-ramp**: `oci-client` in the production binary, +171 runtime lines. Decided: no oci-client
+   at all. `cf/oci-push` adds push to nanovm's own `registry::Oci` (token auth with push scope,
+   existing blobs skipped, one-request uploads, bounded reads; +114 runtime lines) and drops the
+   crate from the binary and the tests (7 crates fewer). A CI job that publishes to GHCR is the
+   follow-up that checks it against a real registry.
+4. **N-228**: every worker start syncs about 30 directories; cheaper but touches N-38's guarantee.
+5. **W-600**: let a request roll back and still choose its status (a declined checkout can only
+   answer 500 today). **W-601**: an app can't serve `/`.
+6. **N-603**: the SQLite provider now allows the read-only pragmas FTS5 needs.
+
+## 5. Open items found this round
+
+N-681 (the node's own listener has no header timeout; matters only if it is reachable without
+the proxy), N-670 (Landlock ABI 2 needed for cross-directory renames), N-671 (`ulimit -v` makes workers fail
+without a clear message), W-621..W-623, W-90's remaining window, N-165 and N-166.

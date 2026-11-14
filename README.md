@@ -14,9 +14,10 @@ Apps are signed artifacts in OCI registries. A proxy finds each host's app in DN
 
 **Current scope (2026-11-08):** single-node durable acceptance and rejected-request
 rollback, tested offline backup/restore, and opt-in local committed-state capture.
-There is no production remote transfer, remote durability guarantee or automatic
-failover. W-9 receiver/recovery work precedes placement/fencing; acknowledgement/RPO
-policy remains undecided. Runtime is 5,320 lines, above the under-5k goal. Older checkpoint
+Shipping committed versions to a store, and with several nodes remote
+acknowledgement and restore on takeover (below), are tested in process, not yet in
+production. One node acknowledges a write once it is durable on its own disk.
+Runtime is 5,320 lines, above the under-5k goal. Older checkpoint
 counts and candidate designs below are historical, not current delivery claims.
 The line goal guides simplicity; it is not a hard limit or correctness tradeoff.
 
@@ -28,21 +29,81 @@ accepted but unsent write is lost. This is not a runtime replication feature,
 remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
 gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
 
-**Local capture:** optional node `[capture]` configuration
-enables full-volume TAR captures at both dirty commit gates (`max_mb = 256`,
-`max_versions = 16`, per object). Versions are staged before the journal's commit
-decision, then published under `objects/<app>/~committed/<object>/`; recovery
-discards rejected staging or completes accepted publication before new work.
-Full history rejects further dirty commits rather than discarding old versions;
-read-only commits consume no version. Capture defaults off. This is bounded local
-capture, not continuous replication: no retention, network receiver, restore API,
-distributed fence or remote acknowledgement policy is provided. Do not manually
-prune history or disable capture on a root with history. Full copies cost storage
-and write latency: two small-write release probes measured roughly half default
-write throughput. This is not a large-volume performance result. The older JSON
-experiment is not a receiver for these TARs. Tests exercise both commit gates,
-process-exit and failed-sync recovery, history exhaustion and SQL/file/KV recovery
-after source-root deletion; these do not certify physical power loss or remote hosts.
+**Capture and shipping:** optional node `[capture]` configuration captures a
+version at both dirty commit gates: the whole volume every `snapshot_every` (16)
+versions, otherwise what the commit changed (listings of changed directories, new
+or moved files whole, files changed in place as their changed byte ranges). Versions
+are staged before the journal's commit decision and published under
+`objects/<app>/~committed/<object>/`; recovery discards a rejected one or completes
+an accepted one before new work. A commit with capture costs 2 more syncs. With
+`store` set (a directory, `file:///path`, or an object store URL as for `leases`,
+e.g. `s3://bucket/prefix`, credentials and region from `AWS_*`), the supervisor (or
+an in-process node) ships up to 32 objects at once, each object's versions in order;
+a failure is that object's (logged, tried again a second later). Each is put once at
+`<app>/<object>/<sequence>-<sha256>.tar`, a key naming its bytes, and counts only
+once the object's head, `<app>/<object>/head`, names it; the head moves one version
+at a time, each following the last, by a write conditional on the head read
+(`If-Match`; a lock and a rename on a directory store), read once and then moved from
+what the node last wrote: a version costs a put and a head move. Shipped versions are removed
+here but the last. `max_versions` and `max_mb` bound what waits here: with the store
+down, writes are refused once they are reached; nothing is silently dropped. A
+commit is acknowledged once durable here unless `remote_ack = true`, which also
+waits (2 s at most, whatever the app's deadlines, then fails the request with 500: the
+commit still stands locally) for the head to name its version, and then serves the object nothing (503 `not-stored`,
+`Retry-After: 1`) until every version here counts, so no client sees state the store
+doesn't have. With `leases` a `store` is required (in a config file, `leases` and
+`store` must be object stores every node shares, not memory, `file:` or a directory),
+and a config file's `remote_ack` defaults to true. Versions carry the lease epoch they were committed under. With leases,
+a node claims an object's head at its lease's epoch before serving the object, and
+ships only under its live lease, once it has claimed the head with it, versions that
+follow the head: a node that lost the object can't make a version count, however
+late its upload lands (W-90). The claim also makes the node's copy of the object the
+head's, restoring it from the store if need be, so a takeover never serves state
+older than the head; a discard the claim makes is synced before the claim counts and
+is never taken for a current copy if cut short. A claim that finds the object's
+history broken in the store (a version missing) refuses the object on that node for a
+minute without asking the store again. `nanovm::ship::restore` rebuilds an object from the store on a
+fresh root, from the last snapshot before the head, and keeps its last version, so
+history goes on. Capture defaults off. Not yet: remote retention (every version
+stays in the store). Do not manually prune history or
+disable capture on a root with history. Tests exercise both commit gates,
+process-exit and failed-sync recovery, history exhaustion, random change sequences
+restored at every version, shipping, outages and restore on a fresh root; these do
+not certify physical power loss or remote hosts.
+
+## Build an app
+
+One command builds and runs an app on your machine, one publishes it. Rust apps use
+[nanovm-sdk](sdk/rust/README.md) (one async function from a request to a response);
+JavaScript apps are a Workers-style module ([js/](js/README.md)). Once:
+
+```bash
+rustup target add wasm32-wasip2
+cargo install --locked wac-cli@0.12.0                # composes the key-value provider into apps
+git clone https://github.com/carsonfarmer/nanovm
+cargo install --locked --path nanovm/crates/nanovm   # the CLI: a release build of the node
+```
+
+Then an app, in a directory next to the clone:
+
+```bash
+cargo new --lib hello && cd hello
+cargo add --git https://github.com/carsonfarmer/nanovm nanovm-sdk
+printf '\n[lib]\ncrate-type = ["cdylib"]\n' >> Cargo.toml
+cp ../nanovm/examples/hello/src/lib.rs src/       # the 7 lines in sdk/rust/README.md
+../nanovm/tools/build-app.sh --run                # cargo build, compose kv, nanovm run hello.wasm
+curl http://127.0.0.1:8080/alice/                 # alice has had 1 visits (from another terminal)
+```
+
+`nanovm run` serves `/{object}/…` with the node's own request path, holds WebSockets as the
+proxy does, prints a line per request and what the app prints, and restarts when the `.wasm`
+changes (run `tools/build-app.sh` again after an edit). It is for your own code on your own
+machine: loopback only, no registry, signature or jail. `nanovm publish hello.wasm
+ghcr.io/you/hello:1.0.0` checks the app as a node will, pushes it as nodes pull it ([Apps](#apps)),
+and prints how to sign it and the TXT record that routes a host to it.
+[examples/chat](examples/chat) is a live multi-room chat on the same SDK. A recorded run and the
+reasons for each choice: [notes/onramp.md](notes/onramp.md). Twenty-two more examples, from a URL
+shortener to a job queue, each with an end-to-end test: [notes/examples.md](notes/examples.md).
 
 ## SQLite beta
 
@@ -183,7 +244,7 @@ A worker reads its config and component from stdin, then jails itself while it s
 
   Anything else fails with `ENOSYS`. With no way to create a socket, a worker's only channels are its two control sockets to the supervisor.
 - **`no_new_privs`**, and the worker dies with its supervisor.
-- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker goes into `<cgroup>/<app>` with the node's `[worker]` memory, CPU and pids limits, before it is given anything.
+- **cgroup v2** (optional, `cgroup = "<delegated dir>"`). Each worker runs in a cgroup of its own, `<cgroup>/worker-<n>`, which it enters before it runs and which is removed once it has exited, also when its supervisor goes without waiting for it. The node refuses to start if `cgroup` is not a cgroup v2 directory or another node uses it, and at startup removes only the `worker-<n>` cgroups an earlier run left, killing what still runs in them. The node's `[worker]` memory, CPU and pids limits are set on a worker's cgroup before the worker is given its app, and they cover the whole process: also the engine a worker builds before it has an app (about 2 KiB a slot of `max_live_objects`, half of it kernel memory for the stacks' mappings: 19 MiB in all at 8,192 slots), since memory stays charged to the cgroup a process was in when it allocated it. A `memory_mb` below what a worker holds when it is given its app would OOM-kill it, so that start is refused, saying so.
 
 Mount and network namespaces were left out on purpose: Landlock already confines the filesystem, and with no `socket()` there is no network to remove.
 
@@ -220,6 +281,8 @@ That is the repository and the tag deployed, each identity whose signature is ac
 
 A host with no record is a 404; a malformed record, or more than one, is a 502.
 
+**Many nodes.** The proxy may place objects on several nodes: list them in `nodes` (each `host:port`, as that node's `name`). An object's home is chosen by rendezvous hashing, and the nodes keep leases on their objects in an object store (`leases = "s3://bucket/prefix"` on every node, with `name`; credentials from `AWS_*`), so an object has one live instance across nodes and a node that lost its lease can't commit. A node that doesn't hold an object answers 421 and the proxy tries the one that does (or the next), for up to `failover_ms`. When a node stops, its objects move after its `lease_ms` (10 s; each node's session record carries its own, which the others wait out). With leases a node ships its objects' committed versions to `capture.store` (required), and answers a write once it counts there; the node taking an object over restores it from there before serving it, so a failover loses no answered write and serves no older state (a write answered an error because it didn't count in time, 500 or 504, isn't served until it does). `failover_ms` must exceed every node's `lease_ms` (the proxy can't check it) and the proxy's 1 s connect timeout. A node that took a request but hasn't answered within `failover_ms` gets the client a 504 (the request may have run there); the proxy never sends it again. Calls between objects then go through the proxy's private endpoint (the node's `proxy`). See `notes/multinode.md`.
+
 DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs); the table is public; and a cold lookup adds a round trip.
 
 ## Apps
@@ -249,15 +312,15 @@ What happens on the first request for a digest:
 
 **Dev mode** (`dev = true`, refused unless the binary was built with `--features dev` and `listen` is loopback, so a default release build can't be put in dev mode) is for local development: apps need no signature, registries and egress entries may be on private addresses, and loopback registries are plain HTTP. The tests and the demo use it with a registry on loopback; signatures are tested against the CI-signed guests on ghcr.io.
 
-**Switching versions.** A request naming a digest the app's worker isn't running switches the app. The new version is fetched and verified while the old one keeps serving. The old worker then drains: no new requests, and in-flight ones (and their response bodies) finish, bounded by its longest request time. It is then killed, and only once its process has exited does the new worker start. Both versions share the app's volumes, so an object is never live in two workers. A switch, once begun, finishes even if the request that began it goes away.
+**Switching versions.** A request naming a digest the app's worker isn't running switches the app. The new version is fetched and verified while the old one keeps serving. The old worker then drains: no new requests, and in-flight ones (and their response bodies) finish, bounded by its longest request time. It is then asked to stop: its objects finish their work after the answer (within `post_return_timeout_ms`), it flushes its telemetry (its last spans and logs, egress denials among them) and exits, or is killed 2 s past that. Only once its process has exited does the new worker start. An app whose worker is retired for another app's slot stops the same way. Both versions share the app's volumes, so an object is never live in two workers. A switch, once begun, finishes even if the request that began it goes away.
 
 **Uids.** An app's uid is the owner of its `objects/<app>` directory, or the next free one for a new app. It is stable across restarts, with no separate record.
 
-**Publishing.** [.github/workflows/publish-guests.yml](.github/workflows/publish-guests.yml) is the reference pipeline. CI builds each test guest, pushes it with `oras` (artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, version `1.0.<run>`), and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity. No key exists anywhere. A person can sign the same way from a laptop with `cosign` and a browser sign-in.
+**Publishing.** `nanovm publish app.wasm <registry>/<repository>:<version> [--manifest nanovm.json]` pushes an app as nodes pull it: artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, the component as its one `application/wasm` layer, the tag as its version. It first checks the component as a node will (imports, handler export, manifest), and prints the digest, how to sign and the TXT record. Registry credentials come from `NANOVM_REGISTRY_USER`/`NANOVM_REGISTRY_TOKEN`. [.github/workflows/publish-app.yml](.github/workflows/publish-app.yml) is a manual template that builds one app, publishes it and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity; [publish-guests.yml](.github/workflows/publish-guests.yml) does the same for the test guests with `oras`. No key exists anywhere. A person can sign from a laptop with `cosign` and a browser sign-in (not yet tested end to end, W-102).
 
 ## Key-value and config
 
-**`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. The counter and hostile guest packages compose this provider. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.
+**`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. The counter and hostile guest packages compose this provider; `tools/build-app.sh` composes it into any app that imports it. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.
 - Values count against the object's disk budget and keys against its file limit, like any other file.
 - Replacement writes a temporary file and renames it over the key. It needs room for both values and a temporary entry; old descriptors retain the old value. Only the host commits, together with all the request's file/SQL changes.
 - Values are bounded to 1 MiB. Key enumeration streams with backpressure and an error completion. A combined 32-store/listing cap lasts through completion delivery; host resource limits also apply.
@@ -342,12 +405,13 @@ An object calls another object of its own app with an ordinary outgoing request 
 - The callee commits before it answers, so the caller only ever sees durable changes. Each object commits on its own: a caller that fails afterwards doesn't undo the callee's changes.
 - Calls need no egress rule. They count against the caller's `max_outbound_concurrency`, and their bodies against the app's `max_request_body_kb`.
 - **Cycles are refused.** With one request at a time per object, a call that waits on its own caller, directly (`a` calls `a`) or through other calls (`a` calls `b`, which calls `a`), could never be served. Each object records the objects its calls wait on. A call that would close a cycle gets `508 call-cycle` at once, instead of hanging until a deadline kills both requests and rolls them back. The check and the record happen under the table lock, so two objects calling each other at the same moment can't both get through.
+- **The callee knows its caller.** A call arrives with `nanovm-callers: a,b,c`: the objects waiting on it, the calling object last. Only nodes set it. The caller's node writes it over whatever the guest put on its call, the proxy drops every `nanovm-*` header a client sends, and between nodes it keeps only this one on its private route. So a request without the header came from outside the app, and an object can keep a route to its app's objects, or to one caller, by checking it. Work after an answer calls with its own id only. A node reached without the proxy trusts what it is sent, as it does `nanovm-app`.
 
 ## WebSockets
 
 The front proxy holds client sockets; the node only answers requests. Objects see sockets as ordinary requests, in [Pushpin's WebSocket-over-HTTP](https://pushpin.org/docs/protocols/websocket-over-http/), so a guest stays a plain HTTP handler and existing GRIP libraries work. No separate Pushpin process is needed.
 
-Committed publishes travel from the supervisor to the proxy's private `publish_listen` (`127.0.0.1:8444`), at `POST /publish`. Set the node's `publish_to` accordingly (default `http://127.0.0.1:8444/publish`). **Only nodes may reach this control port**, just as only proxies may reach the node. The supervisor names the app, the worker names the object; channels cannot cross either boundary. Publish bodies have a 30 s deadline.
+Committed publishes travel from the supervisor to the proxy's private `publish_listen` (`127.0.0.1:8444`), at `POST /publish`; an in-process node (`nanovm run`, tests) delivers them to sockets of its own after the commit, and refuses any other `http://nanovm/` path with 404. Set the node's `proxy` accordingly (default `http://127.0.0.1:8444`). **Only nodes may reach this control port**, just as only proxies may reach the node. The supervisor names the app, the worker names the object; channels cannot cross either boundary. Publish bodies have a 30 s deadline.
 Sockets are indexed by object within each app; a publish visits that object's sockets, not every socket in the app. CNAME aliases share channels and per-app caps; separate record owners remain isolated even when they name the same package.
 - **Opening.** A socket opened at `/{object}/…` arrives as a `POST` of `application/websocket-events` with the event `OPEN` and a `Connection-Id`. The object accepts by answering `OPEN`; any other answer refuses the socket, with the object's own status if it is a 4xx or 5xx (so a `401` reaches the client).
 - **Events.** Each later event (`TEXT`, `BINARY`, `CLOSE`, `DISCONNECT`) is a `POST` queued with the object's other requests, so events are ordered with everything else the object serves. The answer carries events for that socket.
@@ -450,6 +514,13 @@ A request's changes to `/data` (files, SQL and key-value alike) commit locally b
 
 Outbound HTTP and calls to other objects execute immediately, not behind the caller's commit gate. Their effects cannot be undone by caller rollback. Post-return writes have a second commit; already-visible headers and body bytes cannot be recalled if it fails. These are narrower guarantees than a general network output gate.
 
+**Work after the answer** (Rust's `after(work)` and streamed bodies, JavaScript's `ctx.waitUntil`) runs before the object's next request, within `post_return_timeout_ms`. One model holds for both:
+
+- The answer stands once sent and is never replaced. It commits everything written up to the node taking it: the handler's writes, and what background work wrote meanwhile. A `waitUntil` promise's work starts when it is made, and a streamed body's writer as the handler returns, so what they write before the node takes the answer shares its commit, and stands even if they later fail. `after` work starts only once the answer is out.
+- What is written after the answer is a second commit, made once all of that work is done, including work it starts meanwhile (`after` called from `after` work, `waitUntil` called from `waitUntil` work).
+- If any of it fails (a panic, a promise that rejects, before the answer or after, or can never settle, a streamed body's writer that returns an error) or runs out of time, the failure is logged, the second commit's writes roll back and the instance is replaced. The answer stands; a streamed body breaks off rather than ending as if whole.
+- A guest learns that its answer is out from the future `response.new` gave it, which the node resolves once the client has read the body whole (or gone). The SDKs start `after` work, and fail work after the answer, only then, so no failure can fail the answer or cut its body.
+
 A host I/O failure during commit, a crash at its commit marker, or a lost response can leave the caller unsure whether the request committed. Do not interpret every error as a rollback: use application-level operation IDs for idempotent retries. Durability assumes a filesystem and device that honor successful file and directory syncs; process-crash tests do not certify physical power-loss behavior.
 
 Persistence between backups depends on the original storage surviving. Offline backup/restore is described below; there is no replication or automatic failover. App admission takes a nonblocking exclusive lock on its objects directory before scratch cleanup or journal recovery. Supervisor directory preparation takes the same lock before changing ownership. Locks last through all `App` owners: embedded callers must drain and drop their `Node` and any `App` handles before reopening. A final actor may still retain ownership briefly after `shutdown()` returns; admission fails closed until it exits.
@@ -461,7 +532,7 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 `Node` callers must arrange durable storage-root preparation themselves.
 
 **How:** an undo journal (`journal.rs`), as SQLite's rollback journal, under our `wasi:filesystem` host (`quota.rs`).
-- **Before each change, the host records what the change would destroy, and fsyncs it:**
+- **Before each change, the host records what the change would destroy, and fsyncs it** (records made back to back, such as a rename's and the file it replaces, share one fsync):
   - a file's size, the first time it is written;
   - the bytes a write or truncation overwrites;
   - "remove this", for a new entry;
@@ -470,10 +541,10 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 
   A removed or replaced file is renamed into the journal, not deleted.
 - **Then the change happens in place,** so open files and `mmap` keep working, and SQLite can sit on `/data`.
-- **Commit** (before the response is released, and again after post-return work) fsyncs what changed and deletes the log. Held publishes are sent after it.
+- **Commit** (before the response is released, and again after post-return work) fsyncs what changed, up to 16 paths at a time, then writes a new random key into the log's first block and fsyncs it: records are signed with the key, so none is valid any more. The log itself is made once per object and kept (at most 68 KiB between requests), so a commit rewrites a block that already exists instead of deleting a file and syncing its directory. The commit runs on a blocking thread, not the object's. Held publishes are sent after it.
 - **Rollback** has one path. A failed request ends its instance, and every instance start replays any log left behind backwards, so a crash is handled the same way. Recovery trims each step off the log as it completes, so a crash during recovery resumes where it stopped.
 - **Costs:**
-  - One fsync per record that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request. Requests that change nothing pay nothing.
+  - One fsync per change that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request: one per changed path, then the key. A counter's `POST /incr` (create, write, rename over) costs 5 device flushes. Requests that change nothing pay nothing. A guest's own `sync` and `sync-data` do nothing: its writes are durable at commit and rolled back otherwise, synced or not.
   - Waiting for the disk isn't charged to the guest's CPU budget, and neither is the journal's own CPU (records and commit).
   - The byte quota counts logical file lengths, not allocated filesystem blocks or metadata. While a request runs, the log and retained files may each hold as much again: at most three quota-sized logical content budgets. Small files and filesystem metadata add physical overhead; `max_files` independently bounds directory entries. Size the backing disk for both limits, not just `3 × disk_mb`.
 - **Safety:**
@@ -481,7 +552,7 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
   - A recovery error preserves the failing undo and refuses to start the object. Repair the storage problem and retry; never delete the journal to force startup. Already-applied or never-performed operations remain safe to replay.
   - A commit failure poisons that journal instance, so retrying cannot falsely report success. Recovery syncs both parents of a reversed rename before retiring its record.
   - A failed rename restores its staged destination and storage accounting, keeps dirty-source sync tracking, and durably cancels its rename undo before paths can be reused. If restoration or cancellation fails, the request cannot commit and must recover. Cancelled records still consume log space.
-- **Downgrades:** cancelled renames use journal tag 5. This version reads older journals, but older binaries cannot recover a log containing that tag. Before downgrading, drain requests and finish any pending recovery with this version; never delete an uncommitted journal to make a downgrade work.
+- **One version, v1:** the log's first block holds its tag (`nanovmj1`) and key, and every committed version says `"format": 1`. Recovery refuses a log, and a restore a version, that isn't v1, rather than taking it as empty. There is exactly one version of nanovm, v1: data written by earlier builds is not supported, there is no upgrade path from them, and operators start from a fresh data directory ([AGENTS.md](AGENTS.md), rule 1).
 - **`/tmp` is not journaled.** It is per-instance scratch, deleted with the instance, so it's the fast place for temporary files. A rename between `/tmp` and `/data` fails as cross-device, as between real filesystems.
 
 **Alternatives considered:**

@@ -165,10 +165,14 @@ where
     tokio::spawn(builder.serve_connection(TokioIo::new(io), svc).with_upgrades())
 }
 
-pub async fn handle(node: Arc<Node>, req: Request<Incoming>) -> Response<RespBody> {
+pub async fn handle<B>(node: Arc<Node>, req: Request<B>) -> Response<RespBody>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
     let path = req.uri().path().to_string();
     if let Some(rest) = path.strip_prefix("/_nanovm") {
-        return admin(&node, rest).await;
+        return admin(&node, rest, req.headers()).await;
     }
     let Some((id, rest)) = route(&path) else {
         return error_response(400, "bad-object-id", BAD_OBJECT);
@@ -217,9 +221,16 @@ fn full(b: impl Into<Bytes>) -> RespBody {
     Full::new(b.into()).map_err(|e| match e {}).boxed_unsync()
 }
 
-async fn admin(node: &Arc<Node>, path: &str) -> Response<RespBody> {
+async fn admin(node: &Arc<Node>, path: &str, headers: &http::HeaderMap) -> Response<RespBody> {
     match path {
         "/ready" => Response::builder().status(204).body(full("")).unwrap(),
+        "/lease" => {
+            let session = headers.get(crate::lease::SESSION).and_then(|s| s.to_str().ok()?.split_once(' '));
+            if let Some((Ok(id), Ok(until))) = session.map(|(i, u)| (i.parse(), u.parse())) {
+                node.renewed(id, until);
+            }
+            Response::builder().status(204).body(full("")).unwrap()
+        }
         "/flush" => {
             let telemetry = node.telemetry.clone();
             let ok = tokio::task::spawn_blocking(move || telemetry.flush()).await.is_ok_and(|r| r.is_ok());

@@ -122,6 +122,121 @@ fn captured_files(objects: &Path, id: &str, sequence: u64) -> std::collections::
     }).filter(|(path, _)| path != Path::new("nanovm.json")).collect()
 }
 
+/// A node ships each committed version to a store and keeps only the last;
+/// the object is then rebuilt from the store on a fresh data root, served,
+/// and its history goes on in the store from there.
+#[tokio::test(flavor = "multi_thread")]
+async fn shipped_versions_restore_an_object_on_a_fresh_root() {
+    use nanovm::ship::Dir;
+    let store = Path::new(env!("CARGO_TARGET_TMPDIR")).join("ship-store");
+    let _ = std::fs::remove_dir_all(&store);
+    // Shipped: the object's head names the version, or a later one.
+    let shipped = |n: u64| {
+        let head = std::fs::read(store.join("counter/o/head")).ok();
+        head.and_then(|h| serde_json::from_slice::<nanovm::ship::Head>(&h).ok()).is_some_and(|h| h.sequence >= n)
+    };
+    let shipping = |name| {
+        let mut cfg = node_cfg(name, 8);
+        cfg.capture = Some(nanovm::config::CaptureConfig {
+            store: Some(store.to_str().unwrap().into()),
+            snapshot_every: 2,
+            ..Default::default()
+        });
+        cfg
+    };
+    let cfg = shipping("ship_source");
+    let node = node_with(cfg.clone(), app("counter"));
+    for n in 1..=3 {
+        assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
+    }
+    eventually("versions shipped", || shipped(3)).await;
+    let local = cfg.app_dirs("counter")[0].join("~committed/o");
+    eventually("shipped versions removed", || std::fs::read_dir(&local).unwrap().count() == 1).await;
+    node.shutdown().await;
+    drop(node);
+    std::fs::remove_dir_all(&cfg.data_dir).unwrap();
+    for (name, count) in [("ship_restored", 3), ("ship_restored_again", 4)] {
+        let fresh = shipping(name);
+        let objects = fresh.app_dirs("counter")[0].clone();
+        let last = nanovm::ship::restore(&Dir(store.clone()), "counter", "o", &objects).await.unwrap();
+        assert_eq!(last, count);
+        let node = node_with(fresh.clone(), app("counter"));
+        assert_eq!(get(&node, "o", "/").await.json()["count"], count);
+        assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], count + 1);
+        eventually("the next version shipped", || shipped(count + 1)).await;
+        node.shutdown().await;
+        drop(node);
+        if name == "ship_restored" {
+            std::fs::remove_dir_all(&fresh.data_dir).unwrap();
+        }
+    }
+    let (head, _) = nanovm::ship::head(&Dir(store.clone()), "counter", "o").await.unwrap();
+    assert_eq!((head.sequence, head.node.as_str(), head.lease), (5, "", 0));
+}
+
+/// With remote acknowledgement, a commit whose version can't be stored is
+/// not acknowledged, though it stands here, and the object serves nothing
+/// until it counts (N-725); and with the store down, once the capture
+/// limits are reached writes are refused, never versions dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox() {
+    for remote_ack in [true, false] {
+        let mut cfg = node_cfg(if remote_ack { "ship_remote_ack" } else { "ship_outbox" }, 8);
+        cfg.capture = Some(nanovm::config::CaptureConfig {
+            // A store no write reaches.
+            store: Some("/dev/null/store".into()),
+            max_versions: 3,
+            remote_ack,
+            ..Default::default()
+        });
+        let node = node_with(cfg.clone(), app("counter"));
+        let r = request(&node, "POST", "o", "/incr", "").await;
+        let local = cfg.app_dirs("counter")[0].join("~committed/o");
+        if remote_ack {
+            assert_eq!(r.error.as_deref(), Some("commit-failed"), "{}", r.body);
+            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 1, "the commit stands here");
+            assert_eq!(get(&node, "o", "/").await.error.as_deref(), Some("not-stored"), "served before it counts");
+        } else {
+            assert_eq!(r.json()["count"], 1);
+            for n in 2..=3 {
+                assert_eq!(request(&node, "POST", "o", "/incr", "").await.json()["count"], n);
+            }
+            let r = request(&node, "POST", "o", "/incr", "").await;
+            assert_eq!(r.error.as_deref(), Some("commit-failed"), "a full outbox refuses: {}", r.body);
+            assert_eq!(get(&node, "o", "/").await.json()["count"], 3);
+            assert_eq!(std::fs::read_dir(&local).unwrap().count(), 3, "every unshipped version kept");
+        }
+        node.shutdown().await;
+    }
+}
+
+/// Acknowledging remotely, a commit waits for the store (`ship::ACK`, 2 s)
+/// whatever the app's own deadlines: committing is the node's work, not the
+/// guest's (B-507). Here the store acknowledges after about a second, twice
+/// the hostile app's post-return deadline: the write is answered 200
+/// (before: 504, "deadline exceeded while post-return").
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_acknowledgement_is_not_cut_short_by_the_apps_deadline() {
+    let mut cfg = node_cfg("slow_ack", 8);
+    let store = cfg.data_dir.join("store");
+    cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), remote_ack: true, ..Default::default() });
+    let node = node_with(cfg, app("hostile"));
+    assert_eq!(get(&node, "o", "/commit?v=one").await.status, 200);
+    // The store's next move of the head waits a second for its lock.
+    let lock = std::fs::File::options().append(true).open(store.join("hostile/o/head.lock")).unwrap();
+    lock.lock().unwrap();
+    let held = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1000));
+        drop(lock);
+    });
+    let t0 = Instant::now();
+    let r = get(&node, "o", "/commit?v=two").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert!(t0.elapsed() >= Duration::from_millis(900), "answered before the store acknowledged: {:?}", t0.elapsed());
+    held.join().unwrap();
+    node.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn app_storage_has_one_local_owner() {
     let cfg = node_cfg("app_storage_has_one_local_owner", 2);
@@ -487,6 +602,50 @@ async fn cpu_hogs_leave_cores_for_short_requests() {
         p99 < Duration::from_millis(50),
         "canary p99 {p99:?} with {} hogs",
         4 * cores
+    );
+}
+
+/// A guest that has used a tick lets the other requests on its thread run:
+/// on a one-thread runtime, a short request sent while a spinner is past its
+/// first 10 ms (when it must take a heavy lane) finishes long before the
+/// spinner runs out of CPU.
+#[tokio::test(flavor = "current_thread")]
+async fn a_spinner_yields_its_thread_at_each_tick() {
+    let node = node("a_spinner_yields_its_thread_at_each_tick", "hostile", 8);
+    for id in ["canary", "spinner"] {
+        assert_eq!(get(&node, id, "/").await.status, 200);
+    }
+    let t0 = Instant::now();
+    // Spawned: the test's own future runs only once the queue is empty.
+    let timed = |id: &'static str, path: &'static str| {
+        let node = node.clone();
+        tokio::spawn(async move { (get(&node, id, path).await, t0.elapsed()) })
+    };
+    let spinner = timed("spinner", "/spin");
+    let n = node.clone();
+    let canary = tokio::spawn(async move {
+        // Without a timer, which this runtime checks only now and then: the
+        // loop runs only while the spinner lets the thread go.
+        while t0.elapsed() < Duration::from_millis(30) {
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if std::mem::replace(&mut yielded, true) {
+                    return std::task::Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            })
+            .await;
+        }
+        (get(&n, "canary", "/").await, t0.elapsed())
+    });
+    let ((canary, canary_at), (spun, spun_at)) = (canary.await.unwrap(), spinner.await.unwrap());
+    assert_eq!(spun.error.as_deref(), Some("cpu"), "{}", spun.body);
+    assert_eq!(canary.status, 200, "{}", canary.body);
+    assert!(
+        canary_at < spun_at && canary.elapsed < Duration::from_millis(50),
+        "the canary took {:?} and was done at {canary_at:?}, the spinner at {spun_at:?}",
+        canary.elapsed
     );
 }
 
@@ -923,7 +1082,14 @@ fn captures() -> &'static parking_lot::Mutex<std::collections::HashMap<std::net:
     CAPTURES.get_or_init(Default::default)
 }
 
-async fn supervised_with(mut cfg: NodeConfig) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+async fn supervised_with(cfg: NodeConfig) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    (supervised_at(cfg, listener, None).await, addr)
+}
+
+/// A supervisor serving on `listener`, with `leases` its lease store.
+async fn supervised_at(mut cfg: NodeConfig, listener: tokio::net::TcpListener, leases: Option<Arc<dyn object_store::ObjectStore>>) -> Arc<nanovm::supervisor::Supervisor> {
     let captured = Arc::new(parking_lot::Mutex::new(collector::Collector::default()));
     if cfg.telemetry_endpoint == NodeConfig::default().telemetry_endpoint {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -941,14 +1107,13 @@ async fn supervised_with(mut cfg: NodeConfig) -> (Arc<nanovm::supervisor::Superv
         }));
     }
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_nanovm"));
-    let sup = nanovm::supervisor::Supervisor::new(cfg, exe, 1).unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sup = nanovm::supervisor::Supervisor::new(cfg, exe, 1, leases).unwrap();
     let addr = listener.local_addr().unwrap();
     captures().lock().retain(|_, (sup, _)| sup.strong_count() != 0);
     captures().lock().insert(addr, (Arc::downgrade(&sup), captured));
     let s = sup.clone();
     tokio::spawn(nanovm::server::serve_http1(listener, move |req| s.clone().handle(req)));
-    (sup, addr)
+    sup
 }
 
 /// A registry on loopback for the whole test run, as dev mode allows.
@@ -971,26 +1136,12 @@ async fn publish_wasm(repo: &str, app: &AppConfig, wasm: Vec<u8>) -> String {
 }
 
 async fn publish_version(repo: &str, app: &AppConfig, wasm: Vec<u8>, version: &str) -> String {
-    use nanovm::registry::{APP_TYPE, CONFIG_TYPE, VERSION, WASM_TYPE};
-    use oci_client::client::{ClientConfig, ClientProtocol, Config, ImageLayer};
-    let layer = ImageLayer::new(wasm, WASM_TYPE.into(), None);
     let spec = serde_json::json!({ "limits": app.limits, "env": app.env, "config": app.config });
-    let config = Config::new(serde_json::to_vec(&spec).unwrap(), CONFIG_TYPE.into(), None);
-    let mut manifest = oci_client::manifest::OciImageManifest::build(
-        std::slice::from_ref(&layer),
-        &config,
-        Some([(VERSION.to_string(), version.to_string())].into()),
-    );
-    manifest.artifact_type = Some(APP_TYPE.into());
-    manifest.media_type = Some(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.into());
-    let r: oci_client::Reference = format!("{}/nanovm/{repo}:latest", registry()).parse().unwrap();
-    let client = oci_client::Client::new(ClientConfig {
-        protocol: ClientProtocol::Http,
-        ..Default::default()
-    });
-    let auth = oci_client::secrets::RegistryAuth::Anonymous;
-    client.push(&r, &[layer], config, &auth, Some(manifest)).await.unwrap();
-    let digest = nanovm::registry::Oci::new(true).unwrap().digest(&r).await.unwrap();
+    let r = format!("{}/nanovm/{repo}:latest", registry()).parse().unwrap();
+    let oci = nanovm::registry::Oci::new(true).unwrap();
+    let version = version.parse().unwrap();
+    let digest = oci.push_app(&r, None, serde_json::to_vec(&spec).unwrap(), wasm, &version).await.unwrap();
+    assert_eq!(oci.digest(&r).await.unwrap(), digest, "the tag names what was pushed");
     format!("{}/nanovm/{repo}@{digest}", registry())
 }
 
@@ -1127,6 +1278,56 @@ async fn killed_worker_is_restarted_and_keeps_its_volumes() {
     assert_eq!(captured_files(&objects, "k", 1)[Path::new("data/count")], b"1");
 }
 
+/// A worker whose compile of its component is cached starts from that alone:
+/// the registry's copy of the component is neither read nor hashed again
+/// (it was checked when fetched). Here that copy is overwritten, and a
+/// restart still serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_compile_is_used_without_reading_the_component() {
+    use sha2::Digest;
+    let test = "a_cached_compile_is_used_without_reading_the_component";
+    let (_sup, addr) = supervised(test).await;
+    let counter = publish("counter", &app("counter")).await;
+    assert_eq!(app_get(addr, &counter, "/k/").await.0, 200);
+    let wasm = guest("counter");
+    let blob = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes").join(test).join("registry")
+        .join(format!("sha256-{:x}", sha2::Sha256::digest(&wasm)));
+    std::fs::write(&blob, vec![0; wasm.len()]).unwrap();
+    let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
+    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    let t0 = Instant::now();
+    while stats_json(addr).await["workers"][worker(&counter).as_str()]["up"] == true {
+        assert!(t0.elapsed() < Duration::from_secs(2), "worker still up");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (status, body) = app_get(addr, &counter, "/k/").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// A start takes a worker spawned ahead of need, which has built its engine
+/// and waits for its app (that was 11 of a restart's 21 ms), and the next
+/// one is spawned after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn workers_are_spawned_ahead() {
+    let (_sup, addr) = supervised("workers_are_spawned_ahead").await;
+    let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
+    // In clock ticks since boot, as /proc has process start times.
+    let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let now = || std::fs::read_to_string("/proc/uptime").unwrap().split(' ').next().unwrap().parse::<f64>().unwrap() * tck;
+    let started = |pid: u64| {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        stat.rsplit(") ").next().unwrap().split(' ').nth(19).unwrap().parse::<f64>().unwrap()
+    };
+    for app in [&counter, &hostile] {
+        // Ticks are 10 ms; a spare is spawned within a few.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let asked = now();
+        assert_eq!(app_get(addr, app, "/k/").await.0, 200);
+        let pid = stats_json(addr).await["workers"][worker(app).as_str()]["pid"].as_u64().unwrap();
+        assert!(started(pid) < asked, "{app}'s worker was spawned when it was asked for");
+    }
+}
+
 /// Runs `jail_probe` in a child process (a jail cannot be left), then checks
 /// what the jail let it do.
 #[cfg(target_os = "linux")]
@@ -1148,7 +1349,10 @@ fn jail_blocks_escapes() {
         let addr = std::os::unix::net::SocketAddr::from_abstract_name(&service).unwrap();
         std::os::unix::net::UnixDatagram::bind_addr(&addr).unwrap()
     };
-    let child = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut probe = std::process::Command::new(std::env::current_exe().unwrap());
+    // Its own process group, so the signals below reach its forked child.
+    std::os::unix::process::CommandExt::process_group(&mut probe, 0);
+    let child = probe
         .args(["--exact", "jail_probe", "--nocapture", "--test-threads", "1"])
         .env("NANOVM_JAIL_PROBE", &dir)
         .env("NANOVM_JAIL_PROBE_SERVICE", &service)
@@ -1160,9 +1364,9 @@ fn jail_blocks_escapes() {
     // job control would: the kernel resumes the sleep via restart_syscall.
     std::thread::sleep(Duration::from_millis(150));
     unsafe {
-        libc::kill(child.id() as i32, libc::SIGSTOP);
+        libc::kill(-(child.id() as i32), libc::SIGSTOP);
         std::thread::sleep(Duration::from_millis(20));
-        libc::kill(child.id() as i32, libc::SIGCONT);
+        libc::kill(-(child.id() as i32), libc::SIGCONT);
     }
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1203,12 +1407,29 @@ fn jail_blocks_escapes() {
 }
 
 /// The jailed half of `jail_blocks_escapes`; a no-op when run directly.
+/// The jail takes only a process with one thread, and the test harness has
+/// two, so it runs in a forked child.
 #[cfg(target_os = "linux")]
 #[test]
 fn jail_probe() {
     let Some(dir) = std::env::var_os("NANOVM_JAIL_PROBE").map(PathBuf::from) else {
         return;
     };
+    let pid = unsafe { libc::fork() };
+    if pid != 0 {
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "the probe failed: {status}");
+        return;
+    }
+    let probed = std::panic::catch_unwind(|| jailed(&dir));
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    unsafe { libc::_exit(if probed.is_ok() { 0 } else { 1 }) }
+}
+
+#[cfg(target_os = "linux")]
+fn jailed(dir: &Path) {
     let root = unsafe { libc::geteuid() } == 0;
     nanovm::jail::Jail {
         uid: root.then_some(200_099),
@@ -1246,7 +1467,7 @@ fn jail_probe() {
         }
         report("fork", sys(pid as i64));
         report("exec", std::process::Command::new("/bin/true").status().is_ok());
-        // Raw: glibc's setuid broadcasts to every thread of the test harness.
+        // Raw: glibc's setuid broadcasts to every thread of the process.
         report("setuid_root", sys(libc::syscall(libc::SYS_setuid, 0)) && libc::getuid() == 0);
         report("ptrace", sys(libc::ptrace(libc::PTRACE_ATTACH, 1, 0, 0)));
         report("kill_init", sys(libc::kill(1, 0) as i64));
@@ -1368,7 +1589,14 @@ fn cgroup_stat(dir: &Path, file: &str, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Each worker lands in `<cgroup>/<app>`.
+/// The cgroup `pid` runs in, under the cgroup v2 mount `root` is in.
+fn cgroup_of(root: &Path, pid: u64) -> PathBuf {
+    let cgroups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    root.parent().unwrap().join(cgroups.lines().find_map(|l| l.strip_prefix("0::/")).unwrap())
+}
+
+/// Each worker runs in a cgroup of its own under `<cgroup>`, removed once
+/// the worker has exited.
 #[tokio::test(flavor = "multi_thread")]
 async fn workers_are_placed_in_their_cgroups() {
     let root = match test_cgroup("placed", &[]) {
@@ -1383,11 +1611,72 @@ async fn workers_are_placed_in_their_cgroups() {
         assert_eq!(app_get(addr, a, "/x/").await.0, 200);
     }
     let v = stats_json(addr).await;
+    let mut groups = Vec::new();
     for app in [worker(&counter), worker(&hostile)] {
         let pid = v["workers"][&app]["pid"].as_u64().unwrap();
-        let procs = std::fs::read_to_string(root.join(&app).join("cgroup.procs")).unwrap();
-        assert!(procs.lines().any(|p| p == pid.to_string()), "{app}: {procs}");
+        let group = cgroup_of(&root, pid);
+        assert_eq!(group.parent(), Some(root.as_path()), "{app}");
+        assert_eq!(std::fs::read_to_string(group.join("cgroup.procs")).unwrap().trim(), pid.to_string(), "{app}");
+        groups.push((pid, group));
     }
+    assert_ne!(groups[0].1, groups[1].1);
+    let (pid, group) = &groups[0];
+    unsafe { libc::kill(*pid as i32, libc::SIGKILL) };
+    eventually("the exited worker's cgroup to go", || !group.exists()).await;
+    drop(sup);
+    remove_cgroup(&root).await;
+}
+
+/// Waits until a worker spawned ahead has built its engine (its stacks and
+/// their guard pages take at least two mappings a slot) and waits for its
+/// app on stdin; returns its pid.
+async fn spare_built(slots: usize) -> u64 {
+    let me = std::process::id().to_string();
+    let t0 = Instant::now();
+    loop {
+        for p in std::fs::read_dir("/proc").unwrap().flatten() {
+            let stat = std::fs::read_to_string(p.path().join("stat")).unwrap_or_default();
+            if stat.rsplit(") ").next().and_then(|s| s.split(' ').nth(1)) == Some(me.as_str())
+                && std::fs::read_to_string(p.path().join("maps")).is_ok_and(|m| m.lines().count() > 2 * slots)
+                && std::fs::read_to_string(p.path().join("syscall")).is_ok_and(|s| s.starts_with("0 0x0 "))
+            {
+                return p.file_name().to_str().unwrap().parse().unwrap();
+            }
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "no spare worker built its engine");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A spare worker builds its engine before it has an app: at 8,192 slots,
+/// some 8 MiB of anonymous memory (and as much kernel memory for 33,000
+/// mappings). It does so in a cgroup of its own, which gets its app's
+/// limits when it is given its app, so those cover it: pages stay charged
+/// to the cgroup a process was in when it touched them, wherever it moves.
+#[tokio::test(flavor = "multi_thread")]
+async fn review_spare_engine_memory_is_charged_to_the_app() {
+    let root = match test_cgroup("charged", &["memory"]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let slots = 8192;
+    let mut cfg = node_cfg("review_spare_engine_memory_is_charged_to_the_app", slots);
+    cfg.cgroup = Some(root.clone());
+    cfg.worker.memory_mb = 512;
+    let (sup, addr) = supervised_with(cfg).await;
+    let counter = publish("counter", &app("counter")).await;
+    let spare = spare_built(slots).await;
+    assert_eq!(app_get(addr, &counter, "/x/").await.0, 200);
+    let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].as_u64().unwrap();
+    assert_eq!(pid, spare, "the start took the spare");
+    let group = cgroup_of(&root, pid);
+    assert_eq!(std::fs::read_to_string(group.join("memory.max")).unwrap().trim(), (512u64 << 20).to_string());
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let anon = status.lines().find_map(|l| l.strip_prefix("RssAnon:")).unwrap().trim().trim_end_matches(" kB");
+    let anon = anon.parse::<u64>().unwrap() << 10;
+    // memory.stat may lag by a batch of pages per CPU.
+    let charged = cgroup_stat(&group, "memory.stat", "anon ");
+    assert!(charged + (2 << 20) >= anon, "the worker has {anon} bytes of anonymous memory, its cgroup is charged {charged}");
     drop(sup);
     remove_cgroup(&root).await;
 }
@@ -1410,15 +1699,16 @@ async fn worker_memory_max_kills_only_that_worker() {
     big.limits.request_timeout_ms = 30_000;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &big).await);
     assert_eq!(app_get(addr, &hostile, "/x/").await.0, 200);
-    let group = root.join(worker(&hostile));
+    let pid = stats_json(addr).await["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap();
+    let group = cgroup_of(&root, pid);
     assert_eq!(std::fs::read_to_string(group.join("memory.max")).unwrap().trim(), (160u64 << 20).to_string());
 
-    let pid = stats_json(addr).await["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap();
     let mut statuses = Vec::new();
     for i in 0..8 {
         statuses.push(app_get(addr, &hostile, &format!("/m{i}/alloc?mb=30")).await.0);
     }
-    assert!(cgroup_stat(&group, "memory.events", "oom_kill ") >= 1, "no OOM kill: {statuses:?}");
+    // The killed worker's cgroup is gone; events count in its parent too.
+    assert!(cgroup_stat(&root, "memory.events", "oom_kill ") >= 1, "no OOM kill: {statuses:?}");
     assert_eq!(app_get(addr, &counter, "/n/").await.0, 200, "the other app kept serving");
     // The next request starts a fresh worker.
     assert_eq!(app_get(addr, &hostile, "/after/").await.0, 200);
@@ -1443,7 +1733,8 @@ async fn worker_cpu_and_pids_limits_hold() {
     let (sup, addr) = supervised_with(cfg).await;
     let hostile = publish("hostile", &app("hostile")).await;
     assert_eq!(app_get(addr, &hostile, "/x/").await.0, 200);
-    let group = root.join(worker(&hostile));
+    let pid = stats_json(addr).await["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap();
+    let group = cgroup_of(&root, pid);
     assert_eq!(std::fs::read_to_string(group.join("cpu.max")).unwrap().trim(), "20000 100000");
     assert_eq!(std::fs::read_to_string(group.join("pids.max")).unwrap().trim(), "64");
 
@@ -1461,6 +1752,212 @@ async fn worker_cpu_and_pids_limits_hold() {
     assert!((1..=64).contains(&pids), "pids.current = {pids}");
     drop(sup);
     remove_cgroup(&root).await;
+}
+
+/// review2 (W1): at startup the supervisor is to remove the `worker-<n>`
+/// cgroups an earlier run left. It removes every empty directory under
+/// `cgroup` instead: a cgroup the operator made there (not yet holding a
+/// process, say one with limits of its own) goes, and with `cgroup` set by
+/// mistake to a directory that is no cgroup at all, so do its empty
+/// subdirectories. Such a directory is refused, saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_startup_removes_only_cgroups_it_made() {
+    let root = match test_cgroup("foreign", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let theirs = root.join("reserved");
+    std::fs::create_dir(&theirs).unwrap();
+    let plain = Path::new(env!("CARGO_TARGET_TMPDIR")).join("review2-not-a-cgroup");
+    let _ = std::fs::remove_dir_all(&plain);
+    std::fs::create_dir_all(plain.join("keep")).unwrap();
+    let (mut removed, mut started) = (vec![], vec![]);
+    for (dir, kept) in [(&root, &theirs), (&plain, &plain.join("keep"))] {
+        let mut cfg = node_cfg("review2_startup_removes_only_cgroups_it_made", 8);
+        cfg.cgroup = Some(dir.clone());
+        let sup = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None);
+        if !kept.exists() {
+            removed.push(kept.clone());
+        }
+        started.push(sup.map(drop).map_err(|e| format!("{e:#}")));
+    }
+    remove_cgroup(&root).await;
+    let _ = std::fs::remove_dir_all(&plain);
+    assert!(removed.is_empty(), "startup removed directories it did not make: {removed:?}");
+    assert!(started[0].is_ok(), "{:?}", started[0]);
+    let refused = started[1].as_ref().is_err_and(|e| e.ends_with(&format!("cgroup {} is not a cgroup v2 directory", plain.display())));
+    assert!(refused, "a directory that is no cgroup: {:?}", started[1]);
+}
+
+/// Waits up to 10 s for `paths` to be gone.
+async fn gone(paths: &[&Path]) {
+    let t0 = Instant::now();
+    while paths.iter().any(|p| p.exists()) && t0.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The `worker-<n>` cgroups an earlier run left go at startup, also one
+/// whose worker is still there (exiting, say, when its supervisor was
+/// restarted): it is killed, and its cgroup goes once it has exited,
+/// rather than being left for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_removes_an_earlier_runs_worker_cgroups() {
+    let root = match test_cgroup("earlier", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let (idle, busy) = (root.join("worker-1000"), root.join("worker-1001"));
+    for dir in [&idle, &busy] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let mut left = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+    std::fs::write(busy.join("cgroup.procs"), left.id().to_string()).unwrap();
+    let mut cfg = node_cfg("startup_removes_an_earlier_runs_worker_cgroups", 8);
+    cfg.cgroup = Some(root.clone());
+    let (sup, _) = supervised_with(cfg).await;
+    gone(&[&idle, &busy]).await;
+    let kept: Vec<_> = [&idle, &busy].into_iter().filter(|d| d.exists()).cloned().collect();
+    let killed = left.try_wait().unwrap();
+    let _ = left.kill();
+    drop(sup);
+    remove_cgroup(&root).await;
+    assert!(kept.is_empty(), "an earlier run's worker cgroups are left: {kept:?}");
+    assert!(killed.is_some(), "an earlier run's worker still runs");
+}
+
+/// Two nodes can't run their workers in one cgroup: the second refuses to
+/// start, rather than remove at startup the empty `worker-<n>` cgroups it
+/// finds there, which can be the first's, made for a worker not yet in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_nodes_cannot_share_a_cgroup() {
+    let root = match test_cgroup("shared", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let mut cfg = node_cfg("two_nodes_cannot_share_a_cgroup", 8);
+    cfg.cgroup = Some(root.clone());
+    let (first, addr) = supervised_with(cfg).await;
+    let counter = publish("counter", &app("counter")).await;
+    let (status, body) = app_get(addr, &counter, "/x/").await;
+    assert_eq!(status, 200, "{body}");
+    let pid = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].clone();
+    // As the first node makes a worker's cgroup, before the worker is in it.
+    let fresh = root.join("worker-999999");
+    std::fs::create_dir(&fresh).unwrap();
+    let mut cfg = node_cfg("two_nodes_cannot_share_a_cgroup-second", 8);
+    cfg.cgroup = Some(root.clone());
+    let second = nanovm::supervisor::Supervisor::new(cfg, PathBuf::from(env!("CARGO_BIN_EXE_nanovm")), 1, None);
+    let second = second.map(drop).map_err(|e| format!("{e:#}"));
+    let kept = fresh.exists();
+    let served = app_get(addr, &counter, "/x/").await.0;
+    let now = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].clone();
+    drop(first);
+    remove_cgroup(&root).await;
+    assert!(kept, "the second node removed the first's fresh worker cgroup");
+    assert_eq!((served, now), (200, pid), "the first node's worker kept serving");
+    let refused = second.as_ref().is_err_and(|e| e.ends_with(&format!("another node runs its workers in cgroup {}: lock acquisition failed because the operation would block", root.display())));
+    assert!(refused, "{second:?}");
+}
+
+/// A worker's cgroup goes once the worker has exited, also when it is
+/// dropped without being waited for: here its supervisor's runtime ends,
+/// which drops the spare and cancels the task that waits for the app's
+/// worker. Either is killed, but its cgroup outlived it.
+#[test]
+fn a_dropped_supervisors_worker_cgroups_go() {
+    let root = match test_cgroup("dropped", &[]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let workers = || std::fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect::<Vec<_>>();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let made = rt.block_on(async {
+        let mut cfg = node_cfg("a_dropped_supervisors_worker_cgroups_go", 8);
+        cfg.cgroup = Some(root.clone());
+        let (_sup, addr) = supervised_with(cfg).await;
+        let counter = publish("counter", &app("counter")).await;
+        let (status, body) = app_get(addr, &counter, "/x/").await;
+        assert_eq!(status, 200, "{body}");
+        // The app's worker and the next spare.
+        eventually("a spare", || workers().len() == 2).await;
+        workers()
+    });
+    drop(rt);
+    let t0 = Instant::now();
+    while made.iter().any(|d| d.exists()) && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let left: Vec<_> = made.iter().filter(|d| d.exists()).collect();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(remove_cgroup(&root));
+    assert!(left.is_empty(), "worker cgroups left 10 s after their supervisor was dropped: {left:?}");
+}
+
+/// A `[worker] memory_mb` below what a spare worker uses before it has
+/// its app (its engine, mostly) is set when the spare is given its app, so
+/// it would OOM-kill the spare, and the start fail with an unrelated error
+/// (a broken pipe, say). The start is refused instead, saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_memory_limit_below_a_spares_use_is_refused_clearly() {
+    let root = match test_cgroup("small", &["memory"]) {
+        Ok(r) => r,
+        Err(why) => return eprintln!("skipped: {why}"),
+    };
+    let mut cfg = node_cfg("a_worker_memory_limit_below_a_spares_use_is_refused_clearly", 8);
+    cfg.cgroup = Some(root.clone());
+    cfg.worker.memory_mb = 1;
+    let (sup, addr) = supervised_with(cfg).await;
+    let counter = publish("counter", &app("counter")).await;
+    spare_built(8).await;
+    let (status, body) = app_get(addr, &counter, "/x/").await;
+    let killed = cgroup_stat(&root, "memory.events", "oom_kill ");
+    drop(sup);
+    remove_cgroup(&root).await;
+    assert_eq!((status, killed), (502, 0), "{body}");
+    assert!(body.contains("[worker] memory_mb = 1 is below the"), "{body}");
+}
+
+/// review2 (W2): a jailed worker is the only owner of an export runtime,
+/// and it never drops its telemetry: retiring it (a switch to another
+/// version here) kills it outright, without asking it to flush first. What
+/// it recorded since its last export (up to 1 s), here an egress-denied
+/// event, never reaches the collector. Asked to stop, it flushes and exits
+/// by itself, well before it would be killed (2 s; it would have exported
+/// by then anyway).
+#[tokio::test(flavor = "multi_thread")]
+async fn review2_a_retired_workers_last_telemetry_reaches_the_collector() {
+    let (_sup, addr) = supervised("review2_retired_worker_telemetry").await;
+    let seen = |name: String| captures().lock()[&addr].1.lock().logs.iter().any(|log| log["app"] == name.as_str() && log["kind"] == "egress-denied");
+    // Control: a live worker's event arrives.
+    let live = publish("hostile", &app("hostile")).await;
+    let (_, body) = app_get(addr, &live, "/s/fetch?url=http://169.254.169.254/").await;
+    assert!(body.contains("HttpRequestDenied"), "{body}");
+    stats_json(addr).await;
+    assert!(seen(worker(&live)), "a live worker's egress-denied event is exported");
+    let (mut lost, mut slow) = (vec![], vec![]);
+    for round in 0..3 {
+        let repo = format!("review2-retired-{round}");
+        let v1 = publish_version(&repo, &app("hostile"), guest("hostile"), "1.0.0").await;
+        let mut next = app("hostile");
+        next.env.insert("NEXT".into(), "1".into());
+        let v2 = publish_version(&repo, &next, guest("hostile"), "1.0.1").await;
+        assert_ne!(v1, v2);
+        let (_, body) = app_get(addr, &v1, "/s/fetch?url=http://169.254.169.254/").await;
+        assert!(body.contains("HttpRequestDenied"), "{body}");
+        // v1's worker has nothing in flight: it is retired at once.
+        let t0 = Instant::now();
+        assert_eq!(app_get(addr, &v2, "/x/").await.0, 200);
+        if t0.elapsed() >= Duration::from_secs(2) {
+            slow.push(t0.elapsed());
+        }
+        stats_json(addr).await;
+        if !seen(worker(&v1)) {
+            lost.push(round);
+        }
+    }
+    assert!(lost.is_empty(), "rounds whose egress-denied event a retired worker never exported: {lost:?}");
+    assert!(slow.is_empty(), "switches that waited for a retired worker to be killed: {slow:?}");
 }
 
 /// An upstream that answers with headers and the start of a large body,
@@ -1506,7 +2003,7 @@ async fn open_response_bodies_count_against_outbound_concurrency() {
 // ---- registry apps -------------------------------------------------------
 //
 // Signature checks load the artifacts CI publishes to GHCR without running
-// their older guest interfaces. Worker drains use locally composed guests.
+// them. Worker drains use locally composed guests.
 
 const SIGNER: &str = "https://token.actions.githubusercontent.com \
     https://github.com/carsonfarmer/nanovm/.github/workflows/publish-guests.yml@refs/heads/main";
@@ -1559,23 +2056,16 @@ async fn a_drain_that_runs_out_of_time_kills_the_old_worker() {
 
 /// Published versions, oldest first, as `(version, ghcr.io/…@digest)`.
 async fn published(name: &str) -> Result<Vec<(semver::Version, String)>, String> {
-    use oci_client::{Reference, secrets::RegistryAuth};
     let repo = format!("ghcr.io/carsonfarmer/nanovm-{name}");
-    let client = oci_client::Client::default();
-    let r: Reference = format!("{repo}:latest").parse().unwrap();
-    let tags = client
-        .list_tags(&r, &RegistryAuth::Anonymous, None, None)
-        .await
-        .map_err(|e| format!("can't list {repo}: {e}"))?;
+    let oci = nanovm::registry::Oci::new(false).unwrap();
+    let r = format!("{repo}:latest").parse().unwrap();
+    let tags = oci.get(&r, "tags", "list", "application/json", 1 << 20).await.map_err(|e| format!("can't list {repo}: {e:#}"))?;
+    let tags = tags.ok_or_else(|| format!("nothing published at {repo}"))?;
+    let tags: serde_json::Value = serde_json::from_slice(&tags).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for tag in tags.tags {
+    for tag in tags["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()) {
         let Ok(v) = tag.parse::<semver::Version>() else { continue };
-        let r: Reference = format!("{repo}:{tag}").parse().unwrap();
-        let accept = [oci_client::manifest::OCI_IMAGE_MEDIA_TYPE];
-        let (_, digest) = client
-            .pull_manifest_raw(&r, &RegistryAuth::Anonymous, &accept)
-            .await
-            .map_err(|e| e.to_string())?;
+        let digest = oci.digest(&format!("{repo}:{tag}").parse().unwrap()).await.map_err(|e| format!("{e:#}"))?;
         out.push((v, format!("{repo}@{digest}")));
     }
     out.sort();
@@ -1613,7 +2103,7 @@ async fn registry_apps_need_a_trusted_signature() {
     let pulled = registry.load(&accepted).await.unwrap();
     assert_eq!(pulled.version, version);
     assert_eq!(pulled.spec.config["greeting"], "from the registry");
-    assert!(pulled.wasm.starts_with(b"\0asm"));
+    assert!(std::fs::read(&pulled.component.1).unwrap().starts_with(b"\0asm"));
 
     let wrong_subject = SIGNER.replace("publish-guests.yml", "other.yml");
     let wrong_issuer = SIGNER.replace("token.actions", "evil");
@@ -1634,7 +2124,7 @@ async fn registry_apps_need_a_trusted_signature() {
     // Refusals do not poison an authorized reload.
     let reloaded = registry.load(&accepted).await.unwrap();
     assert_eq!(reloaded.version, version);
-    assert_eq!(reloaded.wasm, pulled.wasm);
+    assert_eq!(reloaded.component, pulled.component);
     // Trust is required at the HTTP boundary, before any instantiation.
     let (_sup, addr) = signed("registry_trust_header").await;
     let head = format!("GET /a/ HTTP/1.1\r\nHost: x\r\nnanovm-app: {app}\r\nConnection: close\r\n\r\n");
@@ -1966,6 +2456,7 @@ async fn sqlite_captures_recover_without_the_original_node() {
         assert_eq!(version["object"], "a");
         assert_eq!(version["sequence"], index + 1);
         assert_eq!(version["parent"], parent);
+        assert_eq!(version["epoch"], 0, "one node: every lease its own, at epoch 0");
         parent = format!("{:x}", Sha256::digest(&bytes));
         let target = received.join(path.file_name().unwrap());
         std::fs::write(&target, &bytes).unwrap();
@@ -1979,10 +2470,7 @@ async fn sqlite_captures_recover_without_the_original_node() {
     node.shutdown().await;
     drop(node);
     std::fs::remove_dir_all(&cfg.data_dir).unwrap();
-    let unpack = fresh.data_dir.join("unpack");
-    let last = received.join(versions.last().unwrap().file_name().unwrap());
-    tar::Archive::new(std::fs::File::open(last).unwrap()).unpack(&unpack).unwrap();
-    std::fs::rename(unpack.join("data"), objects.join("a")).unwrap();
+    assert_eq!(nanovm::committed::restore(&received, &objects.join("a")).unwrap(), 2);
     let node = Node::new(fresh.clone(), &app, &wasm, None).unwrap();
     assert_eq!(get(&node, "a", "/").await.json(), expected(&["first", "second"], "second", false));
     assert_eq!(get(&node, "a", "/?v=continued").await.json(), expected(&["first", "second", "continued"], "continued", true));
@@ -2256,7 +2744,11 @@ async fn sqlite_backup_restores_into_a_fresh_root() {
     assert!(!backup().status.success(), "backup must refuse a live jailed owner");
     let children: Vec<i32> = std::fs::read_dir(format!("/proc/{}/task", source.id().unwrap())).unwrap()
         .flat_map(|thread| std::fs::read_to_string(thread.unwrap().path().join("children")).unwrap()
-            .split_whitespace().map(|pid| pid.parse().unwrap()).collect::<Vec<_>>()).collect();
+            .split_whitespace().map(|pid| pid.parse().unwrap()).collect::<Vec<_>>())
+        // A jailed worker runs under its seccomp filter; the spare spawned
+        // ahead (N-224) has not been given an app or entered its jail yet.
+        .filter(|pid| std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|s| s.contains("Seccomp:\t2")))
+        .collect();
     assert_eq!(children.len(), 1, "one jailed app worker");
     let pid = children[0];
     let pending = tokio::spawn({
@@ -2647,6 +3139,44 @@ async fn a_failed_requests_writes_are_rolled_back() {
     assert_eq!(read().await, serde_json::json!({"file": "three", "key": "three"}));
 }
 
+/// A commit outlives a request killed at its deadline (here it waits for
+/// the one blocking thread past the post-return deadline), and it still owns
+/// the volume: the object's next instance recovers only once it has
+/// finished. Before, that instance recovered at once, and the key the late
+/// commit then wrote voided the records of the next request, which failed
+/// and kept its writes (S1). The killed request's own outcome is the
+/// commit's, as for any commit whose answer is lost: here it committed.
+#[test]
+fn review_cancelled_commit_cannot_outlive_recovery() {
+    let rt = tokio::runtime::Builder::new_multi_thread().max_blocking_threads(1).enable_all().build().unwrap();
+    rt.block_on(async {
+        let node = node("review_cancelled_commit_cannot_outlive_recovery", "hostile", 8);
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let busy = tokio::task::spawn_blocking(move || held.recv());
+        let r = get(&node, "c", "/commit?v=one").await;
+        assert_eq!(r.status, 504, "{}", r.body);
+        let mut failing = tokio::spawn({
+            let node = node.clone();
+            async move { get(&node, "c", "/commit?v=two&then=error").await }
+        });
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut failing).await.ok();
+        let waited = early.is_none();
+        release.send(()).unwrap();
+        busy.await.unwrap().unwrap();
+        // Time for a late commit to end, were it still running.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let failed = match early {
+            Some(r) => r.unwrap(),
+            None => failing.await.unwrap(),
+        };
+        assert_eq!(failed.status, 500, "{}", failed.body);
+        let r = get(&node, "c", "/commit").await;
+        assert_eq!(r.json(), serde_json::json!({"file": "one", "key": "one"}), "a failed request's writes stayed");
+        assert!(waited, "the next instance started while the commit was still running");
+        node.shutdown().await;
+    });
+}
+
 /// The journal is out of a guest's reach, and commits work with a relative
 /// `data_dir` (the demo's).
 #[tokio::test(flavor = "multi_thread")]
@@ -2726,6 +3256,19 @@ async fn objects_call_objects() {
     assert_eq!(call("b", "http://nanovm/objects/a/").await["status"], 200);
 }
 
+/// What an object posts to `http://nanovm/` is held for its sockets only at
+/// `/publish`, and only if well formed; anything else is refused at once, as
+/// a supervisor would refuse it. An in-process node holds publishes too: it
+/// no longer sends them to its egress policy, which denied them.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_well_formed_publishes_are_held() {
+    let node = node("only_well_formed_publishes_are_held", "hostile", 8);
+    for (url, status) in [("http://nanovm/elsewhere", 404), ("http://nanovm/publish/", 400)] {
+        let r = get(&node, "p", &format!("/fetch?method=POST&url={url}")).await;
+        assert_eq!(r.json()["status"], status, "{url}: {}", r.body);
+    }
+}
+
 // ---- WebSockets ----------------------------------------------------------
 
 mod sockets {
@@ -2739,7 +3282,7 @@ mod sockets {
     async fn front(label: &str, mut cfg: nanovm::config::ProxyConfig, apps: &[(&str, AppConfig)]) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr, std::net::SocketAddr, Records) {
         let control = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut node_cfg = node_cfg(label, 8);
-        node_cfg.publish_to = format!("http://{}/publish", control.local_addr().unwrap());
+        node_cfg.proxy = format!("http://{}", control.local_addr().unwrap());
         let (sup, node) = supervised_with(node_cfg).await;
         let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         for (host, app) in apps {
@@ -2747,7 +3290,7 @@ mod sockets {
             records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", published.split_once('@').unwrap().0)]);
         }
         cfg.listen = "127.0.0.1:0".into();
-        cfg.node = node.to_string();
+        cfg.nodes = vec![node.to_string()];
         cfg.resolver = doh(records.clone()).await;
         cfg.tag_ttl_s = 0;
         cfg.dev = true;
@@ -3102,7 +3645,7 @@ async fn doh(records: Arc<parking_lot::Mutex<std::collections::HashMap<String, V
 /// registry for a tag's digest every time.
 async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::SocketAddr {
     let cfg = nanovm::config::ProxyConfig {
-        node: node.to_string(),
+        nodes: vec![node.to_string()],
         resolver,
         tag_ttl_s: 0,
         dev: true,
@@ -3689,7 +4232,7 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
     let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
     records.lock().insert("_nanovm.good.test".into(), vec![format!("app={}:latest; trust=dev dev", counter.split_once('@').unwrap().0)]);
     let cfg = nanovm::config::ProxyConfig {
-        node: node.to_string(), resolver: doh(records).await, telemetry_endpoint: endpoint,
+        nodes: vec![node.to_string()], resolver: doh(records).await, telemetry_endpoint: endpoint,
         listen: "127.0.0.1:0".into(), dev: true, ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3747,6 +4290,117 @@ fn probe() -> Vec<u8> {
     std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/post_return_probe.wasm")).unwrap()
 }
 
+/// `crates/nanovm/tests/sdk-after`: an app on nanovm-sdk whose routes do
+/// work after the answer and fail in it, served on a node of its own.
+fn sdk_after(test: &str) -> Arc<Node> {
+    let (app, wasm) = sdk_after_app();
+    Node::new(node_cfg(test, 8), &app, &wasm, None).unwrap()
+}
+
+/// The `sdk-after` app and its component.
+fn sdk_after_app() -> (AppConfig, Vec<u8>) {
+    let build = std::process::Command::new("cargo").args([
+        "build", "--locked", "--release", "--target", "wasm32-wasip2", "--manifest-path",
+        "crates/nanovm/tests/sdk-after/Cargo.toml", "--target-dir", "target/test-guest",
+    ]).current_dir(repo()).status().unwrap();
+    assert!(build.success());
+    let wasm = std::fs::read(repo().join("target/test-guest/wasm32-wasip2/release/sdk_after_probe.wasm")).unwrap();
+    let mut app = app("counter");
+    (app.name, app.limits.memory_mb, app.limits.post_return_timeout_ms) = ("sdk".into(), 32, 2000);
+    (app, wasm)
+}
+
+/// Work after the answer (`after`: 500 ms, then a write) is part of its
+/// request, so retiring its worker (a switch to another version here) lets
+/// it finish and commit, as the drain lets requests finish, rather than
+/// roll it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_workers_work_after_the_answer_commits() {
+    let (mut app, wasm) = sdk_after_app();
+    let (_sup, addr) = supervised("a_retired_workers_work_after_the_answer_commits").await;
+    let v1 = publish_version("retired-after", &app, wasm.clone(), "1.0.0").await;
+    app.env.insert("NEXT".into(), "1".into());
+    let v2 = publish_version("retired-after", &app, wasm, "1.0.1").await;
+    assert_eq!(app_get(addr, &v1, "/a/slow").await, (200, "answered".to_string()));
+    let (status, files) = app_get(addr, &v2, "/a/files").await;
+    assert_eq!(status, 200, "{files}");
+    let files: serde_json::Value = serde_json::from_str(&files).unwrap();
+    assert_eq!(files["later"], true, "work after the answer was cut off by the switch: {files}");
+}
+
+/// What `/files` says: requests the instance has served, and which files the
+/// object holds.
+fn files(served: u32, written: &[&str]) -> serde_json::Value {
+    let mut v = serde_json::json!({"served": served});
+    for name in ["answered", "later", "nested", "streamed"] {
+        v[name] = written.contains(&name).into();
+    }
+    v
+}
+
+/// `after` work starts once the client has the whole answer, so nothing it
+/// does can fail the answer. Work that panics, at once or after writing,
+/// rolls back what it wrote and replaces the instance; the answer and what
+/// the handler wrote stand.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_work_that_panics_leaves_the_answer_standing() {
+    let node = sdk_after("sdk_after_panics");
+    for (id, path) in [("a", "/panic-at-once"), ("b", "/panic-later")] {
+        let r = request(&node, "POST", id, path, "").await;
+        assert_eq!((r.status, r.body.as_str()), (200, "answered"), "{path}: {:?}", r.error);
+        assert_eq!(get(&node, id, "/files").await.json(), files(1, &["answered"]), "{path}");
+    }
+}
+
+/// Work that `after` work passes to `after` runs before the object's next
+/// request, and commits or rolls back with the rest of the work after the
+/// answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_work_passed_on_by_after_work_runs_before_the_next_request() {
+    let node = sdk_after("sdk_after_nested");
+    let r = request(&node, "POST", "a", "/nested", "").await;
+    assert_eq!(r.status, 200, "{:?}", r.error);
+    assert_eq!(get(&node, "a", "/files").await.json(), files(2, &["answered", "nested"]));
+    let r = request(&node, "POST", "b", "/nested-panic", "").await;
+    assert_eq!(r.status, 200, "{:?}", r.error);
+    assert_eq!(get(&node, "b", "/files").await.json(), files(1, &["answered"]));
+}
+
+/// A client slow to read a long answer still gets it whole, though the work
+/// after it fails at once: that work waits until the answer is out.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_work_that_panics_lets_a_slow_client_read_the_whole_answer() {
+    use http_body_util::BodyExt;
+    let node = sdk_after("sdk_after_big");
+    let res = node.dispatch("a", http::Request::post("http://localhost/big-panic").body(bytes::Bytes::new()).unwrap()).await;
+    assert_eq!(res.status(), 200);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let body = res.into_body().collect().await.expect("the answer arrives whole").to_bytes();
+    assert_eq!(body.len(), 1 << 20);
+    assert_eq!(get(&node, "a", "/files").await.json(), files(1, &["answered"]));
+}
+
+/// A streamed body whose writer returns an error breaks off for the client,
+/// rather than ending as if whole, and what the writer wrote rolls back, as
+/// on a panic.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streamed_body_whose_writer_fails_breaks_off_and_rolls_back() {
+    use http_body_util::BodyExt;
+    let node = sdk_after("sdk_after_cut");
+    let res = node.dispatch("a", http::Request::get("http://localhost/cut").body(bytes::Bytes::new()).unwrap()).await;
+    assert_eq!(res.status(), 200);
+    let (mut body, mut data) = (res.into_body(), Vec::new());
+    let end = loop {
+        match body.frame().await {
+            Some(Ok(frame)) => data.extend_from_slice(&frame.into_data().unwrap_or_default()),
+            end => break end.map(|e| e.map(drop)),
+        }
+    };
+    assert_eq!(data, b"partial");
+    assert!(matches!(end, Some(Err(_))), "the body ended as if whole: {end:?}");
+    assert_eq!(get(&node, "a", "/files").await.json(), files(1, &["answered"]));
+}
+
 /// What the host holds for a guest's header maps stays within its memory
 /// limit: a map holds at most 64 KiB (its own, or a copy of one it was sent;
 /// bigger heads are refused before it), and an instance holds no more
@@ -3773,6 +4427,38 @@ async fn guest_header_maps_are_bounded_by_the_memory_limit() {
     assert_eq!(get("/c/headers?n=1&kb=100", 0).await.0, 500, "a map over 64 KiB");
     assert_eq!(get("/d/headers?n=0", 100 << 10).await.0, 431, "a head over 64 KiB");
     assert_eq!(get("/e/headers?n=100&kb=60", 50 << 10).await, (200, "100".into()), "within the limits");
+}
+
+/// A guest that wakes itself in a tight loop (each wake goes back to the
+/// host, which runs it again at once) holds its thread at most a tick at a
+/// time, as a spinner does: on a one-thread runtime a neighbour's requests
+/// get through quickly, and it is killed at its CPU budget.
+#[tokio::test(flavor = "current_thread")]
+async fn a_self_waking_guest_yields_its_thread_at_each_tick() {
+    let mut app = app("hostile");
+    app.limits.cpu_ms = 500;
+    app.limits.request_timeout_ms = 5000;
+    let node = Node::new(node_cfg("a_self_waking_guest", 8), &app, &probe(), None).unwrap();
+    assert_eq!(get(&node, "neighbour", "/callee").await.status, 200);
+    let t0 = Instant::now();
+    // Spawned: the test's own future runs only once the queue is empty.
+    let n = node.clone();
+    let waker = tokio::spawn(async move { (get(&n, "waker", "/selfwake").await, t0.elapsed()) });
+    let neighbour = tokio::spawn(async move {
+        let mut slowest = Duration::ZERO;
+        for _ in 0..5 {
+            let r = get(&node, "neighbour", "/callee").await;
+            assert_eq!(r.status, 200, "{}", r.body);
+            slowest = slowest.max(r.elapsed);
+        }
+        (slowest, t0.elapsed())
+    });
+    let ((woke, woke_at), (slowest, neighbour_at)) = (waker.await.unwrap(), neighbour.await.unwrap());
+    assert_eq!(woke.error.as_deref(), Some("cpu"), "{}", woke.body);
+    assert!(
+        neighbour_at < woke_at && slowest < Duration::from_millis(50),
+        "the neighbour's slowest request took {slowest:?}, all five {neighbour_at:?}; the waker ran {woke_at:?}"
+    );
 }
 
 /// Nor does a method, authority or path a guest sets on its requests take
@@ -3870,9 +4556,13 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/begin");
         begin.add_permits(1);
         assert_eq!(tokio::time::timeout(Duration::from_secs(5), arrivals.recv()).await.unwrap().unwrap(), "/finish");
-        let journal = objects.join("~journal").join(&id).join("log");
-        assert!(journal.exists(), "post-return write has an uncommitted journal");
-        if fail { std::fs::rename(&journal, journal.with_file_name("saved-log")).unwrap(); }
+        let after = objects.join(&id).join("after.txt");
+        assert!(after.exists(), "post-return work wrote");
+        if fail {
+            // A file the commit can't sync, as on a failing disk.
+            std::fs::rename(&after, objects.join(format!("{id}-after"))).unwrap();
+            std::os::unix::fs::symlink("after.txt", &after).unwrap();
+        }
         let mut queued = if !fail {
             let node = node.clone();
             let id = id.clone();
@@ -3896,13 +4586,12 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
             assert!(!objects.join(format!("~committed/{id}/{:020}.tar", 2)).exists());
         }
         assert_eq!(captured_files(&objects, &id, 1), first, "later work changed a published version");
-        if fail { std::fs::rename(journal.with_file_name("saved-log"), &journal).unwrap(); }
     }
     node.shutdown().await;
     let telemetry = node.telemetry.clone();
     drop(node);
-    // The injected failure happened before log deletion: restoring that
-    // undo record must retain the first commit and reject only later work.
+    // The injected failure happened before the log's new key: its undo
+    // records must retain the first commit and reject only later work.
     // This is not a claim that every ambiguous commit failure rolls back.
     for _ in 0..2 {
         let reopened = Node::new(cfg.clone(), &app, &wasm, None).unwrap();
@@ -4148,4 +4837,555 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
     }).await.expect("collector must actually refuse an export");
     assert_eq!(tokio::time::timeout(Duration::from_secs(2), app_get(addr, &counter, "/room/")).await.unwrap().0, 200);
     collector.abort();
+}
+
+/// A request to an object names, in `nanovm-callers`, the objects waiting on
+/// it, the caller last, and only nodes say so: a client's forged header never
+/// reaches the guest, nor does one a guest puts on its own call (W-602). One
+/// node, behind the proxy; `nodes::callers_are_named_by_nodes_only_across_
+/// nodes` is the same across two.
+#[tokio::test(flavor = "multi_thread")]
+async fn callers_are_named_by_nodes_only() {
+    let (_sup, node) = supervised("callers_named_by_nodes").await;
+    let records = Arc::new(parking_lot::Mutex::default());
+    let proxy = proxied(node, doh(records.clone()).await).await;
+    let published = publish_wasm("callers-probe", &app("hostile"), probe()).await;
+    let tagged = format!("{}:latest", published.split_once('@').unwrap().0);
+    records.lock().insert("_nanovm.callers.test".to_string(), vec![format!("app={tagged}; trust=dev dev")]);
+    let get = async |path: &str| {
+        raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: callers.test\r\nnanovm-callers: forged\r\nConnection: close\r\n\r\n"), b"").await
+    };
+    assert_eq!(get("/x/callers").await, (200, String::new()), "a client names no caller");
+    assert_eq!(get("/x/call/y").await, (200, "x".into()), "the node names the calling object");
+}
+
+// ---- many nodes --------------------------------------------------------------
+
+mod nodes {
+    use super::*;
+    use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path as Key};
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    type Records = Arc<parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>>;
+
+    const LEASE_MS: u64 = 500;
+
+    /// The lease store as one node sees it: the shared one, until the node
+    /// is cut off from it.
+    #[derive(Debug)]
+    struct Cut(Arc<InMemory>, Arc<AtomicBool>);
+
+    impl std::fmt::Display for Cut {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Cut")
+        }
+    }
+
+    impl Cut {
+        fn check(&self) -> object_store::Result<()> {
+            match self.1.load(SeqCst) {
+                true => Err(object_store::Error::Generic { store: "cut", source: "cut off".into() }),
+                false => Ok(()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for Cut {
+        async fn put_opts(&self, l: &Key, p: object_store::PutPayload, o: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+            self.check()?;
+            self.0.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(&self, l: &Key, o: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.check()?;
+            self.0.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &Key, o: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+            self.check()?;
+            self.0.get_opts(l, o).await
+        }
+        fn delete_stream(&self, l: futures::stream::BoxStream<'static, object_store::Result<Key>>) -> futures::stream::BoxStream<'static, object_store::Result<Key>> {
+            self.0.delete_stream(l)
+        }
+        fn list(&self, p: Option<&Key>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.0.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&Key>) -> object_store::Result<object_store::ListResult> {
+            self.0.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &Key, t: &Key, o: object_store::CopyOptions) -> object_store::Result<()> {
+            self.0.copy_opts(f, t, o).await
+        }
+    }
+
+    /// The node holding `object`'s lease, and its epoch.
+    async fn holder(store: &InMemory, app: &str, object: &str) -> (String, u64) {
+        let rec = store.get(&Key::from_iter(["objects", app, object])).await.unwrap().bytes().await.unwrap();
+        let rec: serde_json::Value = serde_json::from_slice(&rec).unwrap();
+        (rec["node"].as_str().unwrap().to_owned(), rec["epoch"].as_u64().unwrap())
+    }
+
+    /// Listeners for `n` nodes, and their names.
+    fn listeners(n: usize) -> (Vec<std::net::TcpListener>, Vec<String>) {
+        let ls: Vec<_> = (0..n).map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap()).collect();
+        let names = ls.iter().map(|l| l.local_addr().unwrap().to_string()).collect();
+        (ls, names)
+    }
+
+    /// A node's config: named for `listener`, taking leases, calling through
+    /// the proxy's private endpoint `private`, shipping to a store the nodes
+    /// of a test share (`<test>_a` and `<test>_b` share `<test>`'s) and
+    /// answering writes once shipped, as a config file's default is.
+    fn leased(test: &str, listener: &std::net::TcpListener, private: std::net::SocketAddr) -> NodeConfig {
+        let mut cfg = node_cfg(test, 8);
+        (cfg.name, cfg.leases, cfg.lease_ms) = (listener.local_addr().unwrap().to_string(), "memory:".into(), LEASE_MS);
+        cfg.proxy = format!("http://{private}");
+        cfg.limits.post_return_timeout_ms = 20_000;
+        let shared = test.strip_suffix("_a").or(test.strip_suffix("_b")).unwrap_or(test);
+        let store = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes-store").join(shared);
+        let _ = std::fs::remove_dir_all(&store);
+        cfg.capture = Some(nanovm::config::CaptureConfig { store: Some(store.to_str().unwrap().into()), remote_ack: true, ..Default::default() });
+        cfg.validate().unwrap();
+        cfg
+    }
+
+    async fn serve(cfg: NodeConfig, listener: std::net::TcpListener, leases: Arc<dyn ObjectStore>) -> Arc<nanovm::supervisor::Supervisor> {
+        listener.set_nonblocking(true).unwrap();
+        supervised_at(cfg, tokio::net::TcpListener::from_std(listener).unwrap(), Some(leases)).await
+    }
+
+    /// A dev-mode proxy placing objects on `nodes`, with its private
+    /// endpoint on `private`; and the name of the app `host` serves, its
+    /// record naming `published`.
+    async fn proxy(nodes: &[String], private: tokio::net::TcpListener, host: &str, published: &str) -> (std::net::SocketAddr, String) {
+        let records: Records = Arc::default();
+        let tagged = format!("{}:latest", published.split_once('@').unwrap().0);
+        records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={tagged}; trust=dev dev")]);
+        let cfg = nanovm::config::ProxyConfig {
+            nodes: nodes.to_vec(), resolver: doh(records).await, tag_ttl_s: 0, dev: true, listen: "127.0.0.1:0".into(),
+            failover_ms: 20_000, ..Default::default()
+        };
+        let proxy = nanovm::proxy::Proxy::new(cfg).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(nanovm::proxy::serve(proxy.clone(), listener));
+        tokio::spawn(nanovm::proxy::serve_publish(proxy, private));
+        (addr, nanovm::registry::app_name(host, &tagged.parse().unwrap()))
+    }
+
+    /// An object of `app` whose home is `node`.
+    fn homed(nodes: &[String], app: &str, node: &str) -> String {
+        (0..).map(|i| format!("o{i}")).find(|o| nanovm::proxy::rank(nodes, app, o)[0] == node).unwrap()
+    }
+
+    async fn get(proxy: std::net::SocketAddr, host: &str, path: &str) -> (u16, String) {
+        raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"), b"").await
+    }
+
+    /// Node A serves an object; A stops; node B takes the object's lease, at
+    /// the next epoch, once A's has run out, and serves the object, with what
+    /// A committed. The nodes share a data root, standing in for W-9's
+    /// stream of committed versions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_object_moves_to_another_node_when_its_node_stops() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("an_object_moves", &la, private.local_addr().unwrap());
+        let cfg_b = NodeConfig { name: names[1].clone(), ..cfg_a.clone() };
+        // A runs on a runtime of its own, so that stopping it stops all of
+        // it: its server, its session's renewals and its workers.
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let leases: Arc<dyn ObjectStore> = store.clone();
+        let a = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let _a = serve(cfg_a, la, leases).await;
+                let _ = stopped.await;
+            })
+        });
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-moves", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "moves.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+
+        let written = get(proxy, "moves.test", &format!("/{object}/commit?v=one")).await;
+        assert_eq!(written, (200, r#"{"file":"one","key":"one"}"#.into()));
+        assert_eq!(holder(&store, &app, &object).await, (names[0].clone(), 1));
+        stop.send(()).unwrap();
+        a.join().unwrap();
+        let t0 = Instant::now();
+        let read = loop {
+            // B refuses until A's worker has gone from the shared root.
+            let read = get(proxy, "moves.test", &format!("/{object}/commit")).await;
+            if read.0 == 200 || t0.elapsed() > Duration::from_secs(15) {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(read, (200, r#"{"file":"one","key":"one"}"#.into()));
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+        assert!(t0.elapsed() >= Duration::from_millis(LEASE_MS), "taken over before A's lease ran out: {:?}", t0.elapsed());
+    }
+
+    /// Nodes on disks of their own, sharing only the stores: A answers a
+    /// write once its version counts in the store; A stops; B takes the
+    /// object over and serves what A wrote, restored from the store, never
+    /// the empty object its own disk has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_failover_with_separate_disks_preserves_remote_acknowledged_state() {
+        let store = Arc::new(InMemory::new());
+        let shipped = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes-store/separate_disks");
+        let _ = std::fs::remove_dir_all(&shipped);
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let capture = nanovm::config::CaptureConfig { store: Some(shipped.to_str().unwrap().into()), remote_ack: true, ..Default::default() };
+        let mut cfg_a = leased("separate_disks_a", &la, private.local_addr().unwrap());
+        let mut cfg_b = leased("separate_disks_b", &lb, private.local_addr().unwrap());
+        (cfg_a.capture, cfg_b.capture) = (Some(capture.clone()), Some(capture));
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let leases: Arc<dyn ObjectStore> = store.clone();
+        let a = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let _a = serve(cfg_a, la, leases).await;
+                let _ = stopped.await;
+            })
+        });
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-separate-disks", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "disks.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let written = get(proxy, "disks.test", &format!("/{object}/commit?v=one")).await;
+        assert_eq!(written, (200, r#"{"file":"one","key":"one"}"#.into()));
+        let head = || std::fs::read(shipped.join(&app).join(&object).join("head")).ok().map(|h| serde_json::from_slice::<serde_json::Value>(&h).unwrap());
+        assert_eq!(head().unwrap()["sequence"], 1, "answered once it counts in the store");
+        stop.send(()).unwrap();
+        a.join().unwrap();
+        let t0 = Instant::now();
+        let read = loop {
+            let read = get(proxy, "disks.test", &format!("/{object}/commit")).await;
+            if read.0 == 200 || t0.elapsed() > Duration::from_secs(15) {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(read, (200, r#"{"file":"one","key":"one"}"#.into()), "B serves the object from its own disk");
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+        // B's history goes on from A's.
+        assert_eq!(get(proxy, "disks.test", &format!("/{object}/commit?v=two")).await.0, 200);
+        let head = head().unwrap();
+        assert_eq!((head["sequence"].as_u64(), head["node"].as_str()), (Some(2), Some(names[1].as_str())));
+    }
+
+    /// Acknowledging remotely, a write whose version doesn't count in the
+    /// store within the commit's wait is answered 500, though it stands on
+    /// its node. The node then serves the object nothing (503, Retry-After)
+    /// until its shipper has caught up: here it stops first, and the node
+    /// taking the object over serves what it last served, never older
+    /// (before: A served the write it had answered 500 for, then B the
+    /// state before it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_answered_500_is_served_only_once_it_counts() {
+        let store = Arc::new(InMemory::new());
+        let shipped = Path::new(env!("CARGO_TARGET_TMPDIR")).join("nodes-store/unacknowledged");
+        let (_, _) = (std::fs::remove_file(&shipped), std::fs::remove_dir_all(shipped.with_extension("away")));
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        // Data roots of their own, one store to ship to (see `leased`).
+        let cfg_a = leased("unacknowledged_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("unacknowledged_b", &lb, private.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let leases: Arc<dyn ObjectStore> = store.clone();
+        let a = std::thread::spawn(move || {
+            tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let _a = serve(cfg_a, la, leases).await;
+                let _ = stopped.await;
+            })
+        });
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-unacknowledged", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "unacked.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let one = (200, r#"{"file":"one","key":"one"}"#.to_string());
+        assert_eq!(get(proxy, "unacked.test", &format!("/{object}/commit?v=one")).await, one);
+        // The store goes away (a file where its directory was).
+        let away = shipped.with_extension("away");
+        std::fs::rename(&shipped, &away).unwrap();
+        std::fs::write(&shipped, "").unwrap();
+        // Answered 500 once the wait for the store (2 s) is over, whatever
+        // the app's deadlines (B-507); the commit stands. A read queued
+        // behind it finds the object's instance reset, and its next one
+        // waits for the store, in vain. (Once the object's actor has
+        // retired, a request needs a new claim, which the store being down
+        // refuses too: A serves nothing either way.)
+        let path = format!("/{object}/commit?v=two");
+        let write = tokio::spawn(async move { get(proxy, "unacked.test", &path).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let read = {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            let head = format!("GET /{object}/commit HTTP/1.1\r\nHost: unacked.test\r\nConnection: close\r\n\r\n");
+            s.write_all(head.as_bytes()).await.unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).await.unwrap();
+            out.to_lowercase()
+        };
+        let written = write.await.unwrap();
+        assert_eq!(written.0, 500, "{written:?}");
+        assert!(read.starts_with("http/1.1 503") && read.contains("retry-after: 1") && read.contains("not-stored"), "A serves what it answered 500 for: {read}");
+        // A stops, then the store is back; B takes the object over.
+        stop.send(()).unwrap();
+        a.join().unwrap();
+        std::fs::remove_file(&shipped).unwrap();
+        std::fs::rename(&away, &shipped).unwrap();
+        let t0 = Instant::now();
+        let read = loop {
+            let read = get(proxy, "unacked.test", &format!("/{object}/commit")).await;
+            if read.0 == 200 || t0.elapsed() > Duration::from_secs(15) {
+                break read;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(read, one, "B serves what A last served");
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+    }
+
+    /// Node A answers a request and works on after answering; meanwhile it
+    /// is cut off from the lease store. Its lease runs out, so it refuses the
+    /// object's requests, and node B takes the lease and serves them. A's
+    /// late commit of its work after answering is refused: it stays
+    /// uncommitted, to be rolled back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_that_lost_an_objects_lease_cannot_commit_it() {
+        let wasm = probe();
+        let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = gate.local_addr().unwrap();
+        let (begin, finish) = (Arc::new(tokio::sync::Semaphore::new(0)), Arc::new(tokio::sync::Semaphore::new(0)));
+        let (arrived, mut arrivals) = tokio::sync::mpsc::channel(4);
+        let (b, f) = (begin.clone(), finish.clone());
+        tokio::spawn(nanovm::server::serve_http1(gate, move |req| {
+            let gate = if req.uri().path() == "/begin" { b.clone() } else { f.clone() };
+            let arrived = arrived.clone();
+            async move {
+                arrived.send(req.uri().path().to_owned()).await.unwrap();
+                gate.acquire().await.unwrap().forget();
+                nanovm::server::ok_json(serde_json::json!({}))
+            }
+        }));
+        let store = Arc::new(InMemory::new());
+        let cut = Arc::new(AtomicBool::new(false));
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("lost_lease_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("lost_lease_b", &lb, private.local_addr().unwrap());
+        let objects_a = cfg_a.data_dir.join("objects");
+        let a = serve(cfg_a, la, Arc::new(Cut(store.clone(), cut.clone()))).await;
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let mut probe = app("hostile");
+        probe.limits.egress = vec![address.to_string()];
+        (probe.limits.post_return_timeout_ms, probe.limits.cpu_ms) = (20_000, 1000);
+        let published = publish_wasm("nodes-lost-lease", &probe, wasm).await;
+        let (proxy, app) = proxy(&names, private, "probe.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+
+        let path = format!("/{object}/?gate={address}");
+        let first = tokio::spawn(async move { get(proxy, "probe.test", &path).await });
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10), arrivals.recv()).await.unwrap().unwrap(), "/begin");
+        assert_eq!(holder(&store, &app, &object).await, (names[0].clone(), 1));
+        // Another of A's objects, idle; and a request queued behind A's work.
+        let idle = (0..).map(|i| format!("idle{i}")).find(|o| nanovm::proxy::rank(&names, &app, o)[0] == names[0]).unwrap();
+        assert_eq!(get(proxy, "probe.test", &format!("/{idle}/callee")).await, (200, "callee".into()));
+        let queued = format!("/{object}/callee");
+        let queued = tokio::spawn(async move { get(proxy, "probe.test", &queued).await });
+        cut.store(true, SeqCst);
+        // Past the lease A last renewed, A refuses the object, and evicts
+        // the idle one.
+        tokio::time::sleep(Duration::from_millis(LEASE_MS)).await;
+        let a_addr = names[0].parse().unwrap();
+        let t0 = Instant::now();
+        while stats_json(a_addr).await["apps"][&app]["live_objects"] != 1 {
+            assert!(t0.elapsed() < Duration::from_secs(5), "{}", stats_json(a_addr).await);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let t0 = Instant::now();
+        loop {
+            match get(proxy, "probe.test", &format!("/{object}/callee")).await {
+                (200, body) => break assert_eq!(body, "callee"),
+                other => assert!(t0.elapsed() < Duration::from_secs(10), "{other:?}"),
+            }
+        }
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 2));
+        assert!(objects_a.join(&app).join(&object).join("before.txt").exists(), "A committed what it wrote before answering");
+
+        // A's work after answering calls another object (through the proxy,
+        // to B, since A can take no lease) and writes; its commit is refused.
+        (begin.add_permits(1), finish.add_permits(1));
+        assert_eq!(tokio::time::timeout(Duration::from_secs(10), arrivals.recv()).await.unwrap().unwrap(), "/finish");
+        let (status, body) = first.await.unwrap();
+        assert!(status == 200 && body.contains("finished"), "{status} {body}");
+        // The request that waited on A is not run there, but on B.
+        assert_eq!(queued.await.unwrap(), (200, "callee".into()));
+        let t0 = Instant::now();
+        let refused = loop {
+            a.flush_telemetry().await.unwrap();
+            let logs = captures().lock()[&names[0].parse().unwrap()].1.lock().logs.clone();
+            if let Some(e) = logs.iter().find(|e| e["kind"] == "post-return-commit-failed") {
+                break e.clone();
+            }
+            assert!(t0.elapsed() < Duration::from_secs(10), "no refused commit in {logs:?}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(refused["detail"].as_str().unwrap().contains("no longer holds the object's lease"), "{refused}");
+        assert!(objects_a.join(&app).join(&object).join("after.txt").exists(), "A wrote after answering");
+        assert!(objects_a.join(&app).join("~journal").join(&object).join("log").exists(), "the write is uncommitted");
+    }
+
+    /// A guest answering as a node that doesn't hold its object (421, naming
+    /// another) is answered as it is: were it taken at its word, the proxy
+    /// would run the request again on every node until `failover_ms`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_cannot_pose_as_a_node_refusing_its_object() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let _a = serve(leased("forged_refusal_a", &la, private.local_addr().unwrap()), la, store.clone()).await;
+        let _b = serve(leased("forged_refusal_b", &lb, private.local_addr().unwrap()), lb, store.clone()).await;
+        let mut probe_app = app("hostile");
+        probe_app.limits.idle_timeout_ms = 200;
+        let published = publish_wasm("nodes-forged-refusal", &probe_app, probe()).await;
+        let (proxy, app) = proxy(&names, private, "forged.test", &published).await;
+        let object = homed(&names, &app, &names[0]);
+        let t0 = Instant::now();
+        let (status, body) = get(proxy, "forged.test", &format!("/{object}/misdirect/{}", names[1])).await;
+        assert_eq!((status, body.as_str()), (421, "forged"));
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!(holder(&store, &app, &object).await, (names[0].clone(), 1), "run once, on its home");
+        // Once idle, its node gives up its lease.
+        let t0 = Instant::now();
+        while holder(&store, &app, &object).await != (String::new(), 1) {
+            assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", holder(&store, &app, &object).await);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A WebSocket's events reach its object on the object's node, which
+    /// alone holds its lease.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn socket_events_reach_their_objects_node() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let _a = serve(leased("socket_events_a", &la, private.local_addr().unwrap()), la, store.clone()).await;
+        let _b = serve(leased("socket_events_b", &lb, private.local_addr().unwrap()), lb, store.clone()).await;
+        let published = publish("nodes-sockets", &app("counter")).await;
+        let (proxy, app) = proxy(&names, private, "sockets.test", &published).await;
+        let object = homed(&names, &app, &names[1]);
+        let mut req = format!("ws://{proxy}/{object}/ws").into_client_request().unwrap();
+        req.headers_mut().insert("host", "sockets.test".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        ws.send(Message::text("hello")).await.unwrap();
+        let echo = async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Ping(_) => continue,
+                    m => return m,
+                }
+            }
+        };
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5), echo).await.unwrap(), Message::text("echo hello"));
+        assert_eq!(holder(&store, &app, &object).await, (names[1].clone(), 1));
+    }
+
+    /// As `callers_are_named_by_nodes_only`, with the caller and the callee
+    /// on two nodes: the call crosses the proxy's private route, which keeps
+    /// only the header the calling node set.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn callers_are_named_by_nodes_only_across_nodes() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let _a = serve(leased("callers_across_a", &la, private.local_addr().unwrap()), la, store.clone()).await;
+        let _b = serve(leased("callers_across_b", &lb, private.local_addr().unwrap()), lb, store.clone()).await;
+        let published = publish_wasm("nodes-callers", &app("hostile"), probe()).await;
+        let (proxy, app) = proxy(&names, private, "callers.test", &published).await;
+        let (x, y) = (homed(&names, &app, &names[0]), homed(&names, &app, &names[1]));
+        let get = async |path: &str| {
+            raw(proxy, &format!("GET {path} HTTP/1.1\r\nHost: callers.test\r\nnanovm-callers: forged\r\nConnection: close\r\n\r\n"), b"").await
+        };
+        assert_eq!(get(&format!("/{y}/callers")).await, (200, String::new()), "a client names no caller");
+        assert_eq!(get(&format!("/{x}/call/{y}")).await, (200, x.clone()), "the calling node names the caller");
+        assert_eq!(holder(&store, &app, &y).await.0, names[1], "the call crossed to y's node");
+    }
+
+    /// A call to an object's root with a query and no slash after its id
+    /// (`http://nanovm/objects/{id}?…`) reaches the object on another node,
+    /// as it does on one node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn review_cross_node_root_calls_accept_a_query_without_a_trailing_slash() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let _a = serve(leased("root_calls_a", &la, private.local_addr().unwrap()), la, store.clone()).await;
+        let _b = serve(leased("root_calls_b", &lb, private.local_addr().unwrap()), lb, store.clone()).await;
+        let published = publish("nodes-root-calls", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "root.test", &published).await;
+        let (x, y) = (homed(&names, &app, &names[0]), homed(&names, &app, &names[1]));
+        let url = format!("http://nanovm/objects/{y}?v=1").replace('?', "%3F").replace('=', "%3D");
+        let (status, body) = get(proxy, "root.test", &format!("/{x}/fetch?url={url}")).await;
+        assert_eq!(status, 200, "{body}");
+        let r: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(r["status"], 200, "{r}");
+        assert!(r["body"].as_str().unwrap().contains(&format!(r#""object":"{y}""#)), "{r}");
+        assert_eq!(holder(&store, &app, &y).await.0, names[1], "the call crossed to y's node");
+    }
+
+    /// An object calls an object on another node, through the proxy, which
+    /// commits there; a call back to the caller is refused at once (508),
+    /// though the wait it would close is on another node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn calls_reach_objects_on_other_nodes_and_cycles_across_nodes_are_refused() {
+        let store = Arc::new(InMemory::new());
+        let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut ls, names) = listeners(2);
+        let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
+        let cfg_a = leased("calls_across_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("calls_across_b", &lb, private.local_addr().unwrap());
+        let objects_b = cfg_b.data_dir.join("objects");
+        let _a = serve(cfg_a, la, store.clone()).await;
+        let _b = serve(cfg_b, lb, store.clone()).await;
+        let published = publish("nodes-calls", &app("hostile")).await;
+        let (proxy, app) = proxy(&names, private, "calls.test", &published).await;
+        let (x, y) = (homed(&names, &app, &names[0]), homed(&names, &app, &names[1]));
+        let enc = |s: &str| s.replace('%', "%25").replace('&', "%26").replace('?', "%3F").replace('=', "%3D");
+        let call = async |from: &str, url: &str| {
+            let (status, body) = get(proxy, "calls.test", &format!("/{from}/fetch?url={}", enc(url))).await;
+            assert_eq!(status, 200, "{body}");
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()
+        };
+
+        let r = call(&x, &format!("http://nanovm/objects/{y}/commit?v=via-x")).await;
+        assert_eq!((r["status"].as_u64(), r["body"].as_str()), (Some(200), Some(r#"{"file":"via-x","key":"via-x"}"#)), "{r}");
+        assert_eq!(std::fs::read_to_string(objects_b.join(&app).join(&y).join("c.txt")).unwrap(), "via-x");
+        assert_eq!(holder(&store, &app, &y).await.0, names[1]);
+
+        let t0 = Instant::now();
+        let back = format!("http://nanovm/objects/{y}/fetch?url={}", enc(&format!("http://nanovm/objects/{x}/")));
+        let r = call(&x, &back).await;
+        assert!(r["body"].as_str().unwrap().contains(r#""status":508"#), "{r}");
+        assert!(t0.elapsed() < Duration::from_secs(1), "refused at once: {:?}", t0.elapsed());
+
+        // B renews its leases as long as it lives: y keeps its epoch.
+        tokio::time::sleep(Duration::from_millis(3 * LEASE_MS)).await;
+        assert_eq!(call(&x, &format!("http://nanovm/objects/{y}/commit")).await["status"], 200);
+        assert_eq!(holder(&store, &app, &y).await, (names[1].clone(), 1));
+    }
 }

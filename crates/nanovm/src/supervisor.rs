@@ -12,11 +12,12 @@
 //!
 //! Each worker gets two control sockets (see `link`): on fd 3 the supervisor
 //! hands it connections for requests, and on fd 4 the worker hands the
-//! supervisor connections for its guests' outbound requests. Its config and
-//! component arrive on stdin, read before the worker jails itself.
+//! supervisor connections for its guests' outbound requests. Its spec
+//! arrives on stdin: the node's config, which it builds its engine from (see
+//! [`Spawned`]), then its app and the file in the registry's cache that holds
+//! its component, which it opens before it jails itself.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -35,8 +36,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{OwnedSemaphorePermit, watch};
 
-use crate::config::{AppConfig, NodeConfig};
+use crate::config::{AppConfig, NodeConfig, WorkerLimits};
 use crate::egress::{EgressPolicy, serve_forwarded};
+use crate::engine::Wasm;
 use crate::jail::Jail;
 use crate::link::{self, Dialer};
 use crate::registry::{APP_HEADER, AppRef, HOST_HEADER, MIN_VERSION_HEADER, Policy, Registry, TRUST_HEADER};
@@ -49,6 +51,10 @@ pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// A worker that failed to start is not retried for this long.
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
+/// How long a worker asked to stop has to flush its telemetry and exit,
+/// past the time its objects may take to finish their work after their
+/// answers (`post_return_timeout_ms`), before it is killed (see `drain`).
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Compiling a large component on first start can take a while.
 const START_TIMEOUT: Duration = Duration::from_secs(120);
 /// The longest line of a worker's stderr passed on whole.
@@ -79,15 +85,26 @@ pub struct Supervisor {
     links: Arc<tokio::sync::Semaphore>,
     /// Held while giving a new app its uid.
     uids: Arc<Mutex<()>>,
-    publishes: reqwest::Client,
+    /// To the proxy's private endpoint: publishes, and calls to objects.
+    proxy: reqwest::Client,
+    leases: Option<Arc<crate::lease::Leases>>,
+    /// Where objects' committed versions are shipped (`capture.store`).
+    capture: Option<Arc<dyn crate::ship::Store>>,
+    /// A worker spawned ahead of need: see [`Spawned`].
+    spare: tokio::sync::Mutex<Option<Spawned>>,
     relay: Arc<crate::telemetry::Relay>,
     telemetry: Arc<crate::telemetry::Telemetry>,
     started: Instant,
+    /// Held open: the cgroup its workers run under is its alone (see
+    /// [`Cgroup::take`]).
+    _cgroup_held: Option<std::fs::File>,
 }
 
 #[derive(Default)]
 struct Worker {
     name: String,
+    /// Where the app is served (see `AppRef::host`).
+    host: String,
     live: Mutex<Option<Arc<Live>>>,
     /// Held while starting or switching, so they are single-flight; holds
     /// the last failed start, which is answered again for a while rather
@@ -121,8 +138,9 @@ struct Live {
     drain: Duration,
     /// Its slot among `max_apps`, passed on to the worker that replaces it.
     slot: Mutex<Option<OwnedSemaphorePermit>>,
-    /// Sending true or dropping this kills the worker. Closure acknowledges
-    /// actual process exit, not just receipt of the kill request.
+    /// Sending true gives the worker time to exit before it is killed (see
+    /// `drain`); dropping this kills it at once. Closure acknowledges
+    /// actual process exit, not just receipt of the request.
     kill: watch::Sender<bool>,
 }
 
@@ -139,9 +157,12 @@ impl Worker {
 }
 
 impl Supervisor {
-    /// Call within the control/egress runtime. `threads` counts front-end threads.
-    pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize) -> anyhow::Result<Arc<Supervisor>> {
+    /// Call within the control/egress runtime. `threads` counts front-end
+    /// threads; `leases` is the store `cfg.leases` names (see `lease`).
+    pub fn new(cfg: NodeConfig, exe: PathBuf, threads: usize, leases: Option<Arc<dyn object_store::ObjectStore>>) -> anyhow::Result<Arc<Supervisor>> {
         cfg.validate()?;
+        anyhow::ensure!(leases.is_some() != cfg.leases.is_empty(), "a node with leases has their store");
+        let ttl = Duration::from_millis(cfg.lease_ms);
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
         let sup = Arc::new(Supervisor {
@@ -158,10 +179,36 @@ impl Supervisor {
             uids: Arc::default(),
             relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
+            leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
+            capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
+            _cgroup_held: cfg.cgroup.as_deref().map(Cgroup::take).transpose()?,
             cfg,
-            publishes: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(30)).build()?,
+            proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
+            spare: Default::default(),
             started: Instant::now(),
         });
+        sup.clone().refill();
+        // Renews the node's session, and tells each worker it holds.
+        // Jailed workers can't reach a store: their versions ship from here.
+        if let Some(store) = sup.capture.clone() {
+            tokio::spawn(crate::ship::run(sup.cfg.data_dir.join("objects"), store, sup.leases.clone()));
+        }
+        if let Some(leases) = sup.leases.clone() {
+            let weak = Arc::downgrade(&sup);
+            tokio::spawn(async move {
+                loop {
+                    let (id, until) = leases.renew().await;
+                    let Some(sup) = weak.upgrade() else { return };
+                    for l in sup.workers.lock().values().filter_map(|w| w.live()) {
+                        let mut req = get("/_nanovm/lease");
+                        req.headers_mut().insert(crate::lease::SESSION, format!("{id} {until}").parse().unwrap());
+                        tokio::spawn(async move { l.link.send(req).await });
+                    }
+                    drop(sup);
+                    tokio::time::sleep(ttl / 4).await;
+                }
+            });
+        }
         let weak = Arc::downgrade(&sup);
         sup.telemetry.snapshots(move || {
             let Some(sup) = weak.upgrade() else { return };
@@ -232,7 +279,8 @@ impl Supervisor {
                 // their last failures.
                 workers.retain(|_, w| w.live.lock().is_some() || w.starting.try_lock().is_err());
             }
-            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, ..Default::default() })).clone()
+            let host = want.host.clone();
+            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, host, ..Default::default() })).clone()
         };
         w.used.store(self.started.elapsed().as_millis() as u64, Relaxed);
         let live = match self.live(&w, &want).await {
@@ -260,7 +308,12 @@ impl Supervisor {
         // In its own task: once begun, a switch finishes even if every
         // request waiting for it goes away.
         let (sup, w, want) = (self.clone(), w.clone(), want.clone());
-        match self.runtime.spawn(async move { sup.ensure(&w, &want).await }).await {
+        let ensured = async move {
+            let live = sup.ensure(&w, &want).await;
+            sup.refill();
+            live
+        };
+        match self.runtime.spawn(ensured).await {
             Ok(live) => live,
             Err(e) => Err(error_response(500, "worker-down", &e.to_string())),
         }
@@ -350,8 +403,8 @@ impl Supervisor {
     }
 
     /// Gets the app version `want` names, retires the running worker, then
-    /// spawns a new one, places it in its cgroup, hands it its config and
-    /// component, and waits until it answers.
+    /// takes the spare worker (or spawns one), gives its cgroup the app's
+    /// limits, hands it its app and component, and waits until it answers.
     async fn start(&self, w: &Worker, want: &AppRef) -> anyhow::Result<Arc<Live>> {
         let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
         let app = AppConfig {
@@ -381,52 +434,52 @@ impl Supervisor {
         let (cfg, name, uids) = (self.cfg.clone(), w.name.clone(), self.uids.clone());
         let uid = tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
 
-        let (requests, worker_requests) = UnixStream::pair()?;
-        let (egress, worker_egress) = UnixStream::pair()?;
-        let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
-        let mut cmd = Command::new(&self.exe);
-        cmd.arg0("nanovm").arg("worker")
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // SAFETY: only async-signal-safe calls between fork and exec. The
-        // sockets are first moved above fd 4 so neither dup2 clobbers the
-        // other, then dup2 puts them at 3 and 4 without close-on-exec.
-        unsafe {
-            cmd.pre_exec(move || {
-                let a = libc::fcntl(a, libc::F_DUPFD_CLOEXEC, 10);
-                let b = libc::fcntl(b, libc::F_DUPFD_CLOEXEC, 10);
-                if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        let mut child = cmd.spawn().with_context(|| format!("spawning {}", self.exe.display()))?;
-        drop((worker_requests, worker_egress));
+        let mut spare = self.spare.lock().await.take();
+        // One that has died meanwhile is replaced.
+        let Spawned { mut child, mut stdin, requests, egress, cgroup } = match spare.take_if(|s| s.child.try_wait().is_ok_and(|s| s.is_none())) {
+            Some(s) => s,
+            None => self.spawn().await?,
+        };
         let pid = child.id().context("worker exited at once")?;
-        if let Some(root) = &self.cfg.cgroup {
-            place_in_cgroup(root, &app, pid)?;
+        let stderr = child.stderr.take().expect("piped");
+
+        // Keep the receiver until the child is reaped: sender closure is
+        // the drain barrier even when killing takes time. Its cgroup goes
+        // after it, also when this start fails.
+        let (kill, mut killed) = watch::channel(false);
+        let (name, dir) = (w.name.clone(), cgroup.as_ref().map(|c| c.0.clone()));
+        let stop = Duration::from_millis(app.limits.post_return_timeout_ms) + STOP_TIMEOUT;
+        tokio::spawn(async move {
+            tokio::select! {
+                status = child.wait() => eprintln!("nanovm: worker for app {name:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
+                asked = killed.changed() => {
+                    // Asked to stop, it exits by itself; dropped, it is killed at once.
+                    if asked.is_err() || tokio::time::timeout(stop, child.wait()).await.is_err() {
+                        let _ = child.kill().await;
+                    }
+                }
+            }
+            drop(cgroup);
+        });
+        if let Some(dir) = dir {
+            limit(&dir, &app.worker)?;
         }
 
-        // The worker's spec: the node config, its app, its uid and our pid.
+        // The rest of the worker's spec: its app, its uid, its component and our pid.
         let drain = Duration::from_millis(app.limits.request_timeout_ms + app.limits.post_return_timeout_ms);
         // As many links to the supervisor as its objects may use at once:
         // each its outbound requests and a publish.
         let links = self.cfg.max_live_objects * (app.limits.max_outbound_concurrency + 1);
-        let mut spec = serde_json::to_vec(&(&self.cfg, &app, uid, std::process::id()))?;
+        let mut spec = serde_json::to_vec(&(&app, uid, &p.component, std::process::id()))?;
         spec.push(b'\n');
-        let mut stdin = child.stdin.take().expect("piped");
         stdin.write_all(&spec).await?;
-        stdin.write_all(&p.wasm).await?;
         drop(stdin);
 
         // The worker's stderr goes to ours, tagged with its app, a line (of at
         // most `MAX_LINE`) at a time. It closes when the worker exits, and
         // the last line explains a failed start.
         let app = w.name.clone();
-        let mut stderr = tokio::io::BufReader::new(child.stderr.take().expect("piped"));
+        let mut stderr = tokio::io::BufReader::new(stderr);
         let last_words = tokio::spawn(async move {
             let (mut line, mut last) = (Vec::new(), String::new());
             loop {
@@ -439,31 +492,35 @@ impl Supervisor {
             }
         });
 
-        // Keep the receiver until the child is reaped: sender closure is
-        // the drain barrier even when killing takes time.
-        let (kill, mut killed) = watch::channel(false);
-        let app = w.name.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                status = child.wait() => eprintln!("nanovm: worker for app {app:?} exited: {}", status.map(|s| s.to_string()).unwrap_or_default()),
-                _ = killed.changed() => {
-                    let _ = child.kill().await;
-                }
-            }
-        });
-
         let policy = Arc::new(policy);
-        let (http, target, app) = (self.publishes.clone(), self.cfg.publish_to.clone(), w.name.clone());
+        let (http, proxy, app, host) = (self.proxy.clone(), self.cfg.proxy.clone(), w.name.clone(), w.host.clone());
+        let (leases, capture, objects) = (self.leases.clone(), self.capture.clone(), self.cfg.app_dirs(&w.name)[0].clone());
         let (telemetry, digest) = (self.relay.clone(), want.digest.clone());
         let telemetry_slots = Arc::new(tokio::sync::Semaphore::new(3));
         egress.set_nonblocking(true)?;
         let link_caps = vec![Arc::new(tokio::sync::Semaphore::new(links)), self.links.clone()];
         tokio::spawn(link::serve(tokio::net::UnixStream::from_std(egress)?, link_caps, move |req| {
-            let (policy, http, target, app) = (policy.clone(), http.clone(), target.clone(), app.clone());
-            let (telemetry, digest, slots) = (telemetry.clone(), digest.clone(), telemetry_slots.clone());
+            let (policy, http, proxy, app, host) = (policy.clone(), http.clone(), proxy.clone(), app.clone(), host.clone());
+            let (telemetry, digest, slots, leases) = (telemetry.clone(), digest.clone(), telemetry_slots.clone(), leases.clone());
+            let (capture, objects) = (capture.clone(), objects.clone());
             async move {
                 if req.uri().host() != Some(ws::PUBLISH_HOST) {
                     return serve_forwarded(req, &policy).await;
+                }
+                if let Some(leases) = &leases {
+                    if req.uri().path().starts_with(crate::lease::PATH) {
+                        // Before its worker serves an object, the object's head is
+                        // this lease's, and the object here is the head's.
+                        let claim = async |object: &str, grant: &crate::lease::Grant| {
+                            let Some(store) = &capture else { return Ok(()) };
+                            crate::ship::claim(&**store, leases.node(), grant.epoch, &app, object, &objects).await?;
+                            restored(&objects, object)
+                        };
+                        return crate::lease::serve(leases, &app, req, claim).await.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync());
+                    }
+                    if req.uri().path().starts_with(crate::egress::CALLS) {
+                        return call(&http, &proxy, &app, &host, req).await;
+                    }
                 }
                 if req.uri().path().starts_with(crate::telemetry::PATH) {
                     let Ok(_slot) = slots.try_acquire() else { return verdict_ok(429) };
@@ -475,8 +532,8 @@ impl Supervisor {
                     return verdict_ok(404);
                 }
                 let object = req.headers().get(ws::OBJECT_HEADER).cloned().unwrap_or_else(|| http::HeaderValue::from_static(""));
-                let status = http.post(target).header(APP_HEADER, app).header(ws::OBJECT_HEADER, object)
-                    .body(reqwest::Body::wrap(req.into_body())).send().await
+                let status = http.post(format!("{proxy}/publish")).header(APP_HEADER, app).header(ws::OBJECT_HEADER, object)
+                    .timeout(Duration::from_secs(30)).body(reqwest::Body::wrap(req.into_body())).send().await
                     .map_or(502, |r| r.status().as_u16());
                 verdict_ok(status)
             }
@@ -513,6 +570,131 @@ impl Supervisor {
         bail!("worker did not start ({e}): {}", words.ok().and_then(Result::ok).unwrap_or_default())
     }
 
+    /// Spawns a worker into a cgroup of its own and gives it the node's
+    /// config, from which it builds its engine; it then waits for its app
+    /// (see `worker_main`).
+    async fn spawn(&self) -> anyhow::Result<Spawned> {
+        let (requests, worker_requests) = UnixStream::pair()?;
+        let (egress, worker_egress) = UnixStream::pair()?;
+        let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
+        let cgroup = self.cfg.cgroup.as_deref().map(Cgroup::new).transpose()?;
+        let into = cgroup.as_ref().map(|c| format!(" into {}", c.0.display())).unwrap_or_default();
+        let procs = cgroup.as_ref().map(|c| c.0.join("cgroup.procs"));
+        let procs = procs.map(|p| std::fs::OpenOptions::new().write(true).open(&p).with_context(|| format!("opening {}", p.display()))).transpose()?;
+        let c = procs.as_ref().map_or(-1, |f| f.as_raw_fd());
+        let mut cmd = Command::new(&self.exe);
+        cmd.arg("worker")
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        // SAFETY: only async-signal-safe calls between fork and exec. The
+        // child first enters its cgroup (writing 0 moves the writer), so all
+        // it ever allocates is charged there. The sockets are then moved
+        // above fd 4 so neither dup2 clobbers the other, and dup2 puts them
+        // at 3 and 4 without close-on-exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                if c >= 0 && libc::write(c, b"0".as_ptr().cast(), 1) != 1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let a = libc::fcntl(a, libc::F_DUPFD_CLOEXEC, 10);
+                let b = libc::fcntl(b, libc::F_DUPFD_CLOEXEC, 10);
+                if a < 0 || b < 0 || libc::dup2(a, 3) < 0 || libc::dup2(b, 4) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().with_context(|| format!("spawning {}{into}", self.exe.display()))?;
+        let mut stdin = child.stdin.take().expect("piped");
+        let mut spec = serde_json::to_vec(&self.cfg)?;
+        spec.push(b'\n');
+        stdin.write_all(&spec).await?;
+        Ok(Spawned { child, stdin, requests, egress, cgroup })
+    }
+
+    /// Spawns the next worker ahead of need, unless one is waiting.
+    fn refill(self: Arc<Self>) {
+        self.runtime.clone().spawn(async move {
+            let mut spare = self.spare.lock().await;
+            if spare.is_none() {
+                match self.spawn().await {
+                    Ok(s) => *spare = Some(s),
+                    Err(e) => eprintln!("nanovm: spawning a worker: {e:#}"),
+                }
+            }
+        });
+    }
+}
+
+/// A worker process that has built its engine for this node (the pool
+/// alone took 7 ms) and waits for its app. One is kept spawned ahead, so a
+/// start skips spawning a process and building its engine. It is given
+/// nothing of an app's, nor any uid, limits or jail, until it is taken: what
+/// it holds comes from the node's config alone, which a supervisor never
+/// changes. It exits when its stdin closes, so with the supervisor too.
+struct Spawned {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    requests: UnixStream,
+    egress: UnixStream,
+    cgroup: Option<Cgroup>,
+}
+
+/// A worker's cgroup, `<cgroup>/worker-<n>`. The worker enters it before
+/// it runs, and its app's limits are set on it when it is given its app,
+/// so they cover all of the worker: memory stays charged to the cgroup a
+/// process was in when it allocated it, and a spare builds its engine
+/// (about 2 KiB a slot, half of it the kernel's for four mappings) before
+/// it has an app. Removed when dropped, once the worker has exited.
+struct Cgroup(PathBuf);
+
+impl Cgroup {
+    /// Takes `root` (a cgroup v2 directory no other supervisor holds) for
+    /// this one's workers while the returned file is open, and removes
+    /// the `worker-<n>` cgroups an earlier run left there, with whatever
+    /// of that run still runs in them.
+    fn take(root: &Path) -> anyhow::Result<std::fs::File> {
+        let held = std::fs::File::open(root).with_context(|| format!("cgroup {}", root.display()))?;
+        let v2 = rustix::fs::fstatfs(&held)?.f_type as i64 == libc::CGROUP2_SUPER_MAGIC as i64;
+        anyhow::ensure!(v2, "cgroup {} is not a cgroup v2 directory", root.display());
+        held.try_lock().with_context(|| format!("another node runs its workers in cgroup {}", root.display()))?;
+        let ours = |n: &str| n.strip_prefix("worker-").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+        let left = std::fs::read_dir(root)?.flatten().filter(|e| e.file_name().to_str().is_some_and(ours));
+        left.for_each(|e| drop(Cgroup(e.path())));
+        Ok(held)
+    }
+
+    fn new(root: &Path) -> anyhow::Result<Cgroup> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let dir = root.join(format!("worker-{}", NEXT.fetch_add(1, Relaxed)));
+            match std::fs::create_dir(&dir) {
+                // One an earlier run left, whose worker has not exited yet.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                made => return made.map(|()| Cgroup(dir.clone())).with_context(|| format!("creating cgroup {}", dir.display())),
+            }
+        }
+    }
+}
+
+impl Drop for Cgroup {
+    fn drop(&mut self) {
+        // Its worker has been reaped, unless it was dropped without (its
+        // supervisor gone, a failed spawn) or is an earlier run's: then
+        // what is left in it is killed, and the cgroup goes once empty.
+        let busy = |dir: &Path| std::fs::remove_dir(dir).is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound);
+        if busy(&self.0) {
+            let _ = std::fs::write(self.0.join("cgroup.kill"), "1");
+            let (dir, since) = (std::mem::take(&mut self.0), Instant::now());
+            std::thread::spawn(move || {
+                while busy(&dir) && since.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
+        }
+    }
 }
 
 async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
@@ -535,15 +717,42 @@ async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<Re
 
 /// Waits until nothing holds `old` but this (its requests have finished and
 /// their bodies have been read), or its longest request has had its time,
-/// then kills the process and waits for it to be gone: what still holds it
-/// can't keep it running beside the next version.
+/// then asks the worker to stop and waits for it to be gone: what still
+/// holds it can't keep it running beside the next version. Hung up on, a
+/// worker lets its objects finish their work after their answers, flushes
+/// its telemetry and exits (see `worker_main`); one that takes longer than
+/// that work may, and `STOP_TIMEOUT` more, is killed.
 async fn drain(old: Arc<Live>) {
     let deadline = Instant::now() + old.drain;
     while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    old.link.hang_up();
     old.kill.send_replace(true);
     old.kill.closed().await;
+}
+
+/// Sends a worker's call to another object of its app on to the proxy, which
+/// finds the object's node; the supervisor names the app.
+async fn call(http: &reqwest::Client, proxy: &str, app: &str, host: &str, req: Request<Incoming>) -> Response<wasmtime_wasi_http::WasiBody> {
+    let url = format!("{proxy}{}", req.uri().path_and_query().map_or("", |p| p.as_str()));
+    let (mut parts, body) = req.into_parts();
+    parts.headers.remove(http::header::HOST);
+    for (k, v) in [(APP_HEADER, app), (HOST_HEADER, host)] {
+        parts.headers.insert(k, v.parse().expect("app names and hosts are header-safe"));
+    }
+    match http.request(parts.method, url).headers(parts.headers).body(reqwest::Body::wrap(body)).send().await {
+        Ok(res) => {
+            let mut res = Response::from(res).map(|b| b.map_err(|_| wasmtime_wasi_http::Error::ConnectionTerminated).boxed_unsync());
+            res.headers_mut().insert(crate::egress::VERDICT, "ok".parse().unwrap());
+            res
+        }
+        Err(_) => {
+            let mut res = verdict_ok(502);
+            res.headers_mut().insert(crate::egress::VERDICT, "ConnectionRefused".parse().unwrap());
+            res
+        }
+    }
 }
 
 /// A forwarded request's answer from the supervisor itself.
@@ -612,15 +821,31 @@ fn chown_tree(dir: &Path, uid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Moves `pid` into `<root>/<app>` with the app's worker limits.
-fn place_in_cgroup(root: &Path, app: &AppConfig, pid: u32) -> anyhow::Result<()> {
-    let dir = root.join(&app.name);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating cgroup {}", dir.display()))?;
+/// Gives what a claim restored of `object` (under `objects`, an app's) to
+/// the app's uid, the owner of `objects`, when the supervisor is root.
+fn restored(objects: &Path, object: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let uid = std::fs::metadata(objects)?.uid();
+    let committed = objects.join("~committed");
+    for d in [committed.join(object), committed, objects.join(object)].iter().filter(|d| d.exists()) {
+        chown_tree(d, uid).map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// Gives a worker's cgroup its app's worker limits.
+fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
     let set = |file: &str, value: String| {
         std::fs::write(dir.join(file), &value).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
     };
-    let w = &app.worker;
     if w.memory_mb > 0 {
+        // A limit below what the worker holds already (its engine) would OOM-kill it.
+        let held = std::fs::read_to_string(dir.join("memory.current")).ok().and_then(|m| m.trim().parse::<u64>().ok());
+        let held = held.unwrap_or_default().div_ceil(1 << 20);
+        anyhow::ensure!(held < w.memory_mb, "[worker] memory_mb = {} is below the {held} MiB a worker holds before it has an app", w.memory_mb);
         set("memory.max", (w.memory_mb << 20).to_string())?;
     }
     if w.cpus > 0.0 {
@@ -629,24 +854,35 @@ fn place_in_cgroup(root: &Path, app: &AppConfig, pid: u32) -> anyhow::Result<()>
     if w.pids > 0 {
         set("pids.max", w.pids.to_string())?;
     }
-    set("cgroup.procs", pid.to_string())
+    Ok(())
 }
 
 /// `nanovm worker`: reads its spec and component from stdin, jails itself,
-/// then serves its app to the supervisor until the supervisor hangs up.
+/// then serves its app to the supervisor until the supervisor hangs up, and
+/// lets its objects finish their work and flushes its telemetry before it
+/// exits.
 pub fn worker_main() -> anyhow::Result<()> {
-    let mut input = Vec::new();
-    std::io::stdin().read_to_end(&mut input)?;
-    let nl = input.iter().position(|&b| b == b'\n').context("no worker spec on stdin")?;
-    let (cfg, app, uid, parent): (NodeConfig, AppConfig, Option<u32>, u32) =
-        serde_json::from_slice(&input[..nl]).context("worker spec")?;
-    let wasm = input.split_off(nl + 1);
+    use std::io::BufRead;
+    let mut input = std::io::stdin().lock();
+    let mut line = Vec::new();
+    input.read_until(b'\n', &mut line)?;
+    let cfg: NodeConfig = serde_json::from_slice(&line).context("worker spec: the node")?;
+    // Before the jail, which stops raising the fd limit and reading sysctls.
+    crate::engine::preflight(&cfg)?;
+    // Before the app, which a spare worker waits for here. Neither starts
+    // a thread, so the jail is still entered with one.
+    let engine = crate::engine::build(&cfg)?;
+    let linker = crate::app::linker(&engine)?;
+    line.clear();
+    input.read_until(b'\n', &mut line)?;
+    let (app, uid, (digest, path), parent): (AppConfig, Option<u32>, (String, PathBuf), u32) =
+        serde_json::from_slice(&line).context("worker spec: the app")?;
+    // The registry's cache is outside the jail.
+    let wasm = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: the supervisor put these sockets at fds 3 and 4 and nothing
     // else in this process owns them.
     let (requests, upstream) = unsafe { (UnixStream::from_raw_fd(3), UnixStream::from_raw_fd(4)) };
     requests.set_nonblocking(true)?;
-    // Before the jail, which stops raising the fd limit and reading sysctls.
-    crate::engine::preflight(&cfg)?;
 
     Jail {
         uid,
@@ -659,10 +895,13 @@ pub fn worker_main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async move {
-        let upstream = Dialer::new(upstream, 1);
-        let node = Node::new(cfg, &app, &wasm, Some(upstream))?;
-        let requests = tokio::net::UnixStream::from_std(requests)?;
-        link::serve(requests, vec![], move |req| crate::server::handle(node.clone(), req)).await
+        // Pool 0 for the runtime's threads, 1 for the telemetry export thread.
+        let upstream = Dialer::new(upstream, 2);
+        let node = Node::with_engine(engine, &linker, cfg, &app, Wasm::File(wasm, &digest), Some(upstream))?;
+        let (requests, serving) = (tokio::net::UnixStream::from_std(requests)?, node.clone());
+        link::serve(requests, vec![], move |req| crate::server::handle(serving.clone(), req)).await?;
+        node.shutdown().await;
+        tokio::task::spawn_blocking(move || node.telemetry.flush()).await?
     })
 }
 

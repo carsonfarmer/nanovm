@@ -142,7 +142,7 @@ impl App {
         linker: &Linker<ObjState>,
         node: &NodeConfig,
         cfg: &AppConfig,
-        wasm: &[u8],
+        wasm: crate::engine::Wasm,
         upstream: Option<Upstream>,
     ) -> anyhow::Result<App> {
         let [objects, tmp, cache] = node.app_dirs(&cfg.name);

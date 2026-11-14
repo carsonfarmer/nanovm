@@ -145,13 +145,24 @@ pub fn start_ticker(engine: &Engine, tick: Duration) {
         .expect("spawn epoch thread");
 }
 
+/// A component to load: its bytes, or a file that holds them and their
+/// digest (`sha256:…`, as the registry checked it), so that a compile of it
+/// is found without reading or hashing them.
+pub enum Wasm<'a> {
+    Bytes(&'a [u8]),
+    File(std::fs::File, &'a str),
+}
+
 /// Compiles a component, reusing a precompiled artifact keyed by the
 /// component's hash and the engine's compatibility hash.
-pub fn load_component(engine: &Engine, bytes: &[u8], cache_dir: &Path) -> anyhow::Result<Component> {
-    let digest = Sha256::digest(bytes);
+pub fn load_component(engine: &Engine, wasm: Wasm, cache_dir: &Path) -> anyhow::Result<Component> {
+    let digest = match &wasm {
+        Wasm::Bytes(b) => format!("{:x}", Sha256::digest(b)),
+        Wasm::File(_, digest) => digest.trim_start_matches("sha256:").to_string(),
+    };
     let mut h = DefaultHasher::new();
     engine.precompile_compatibility_hash().hash(&mut h);
-    let key = format!("{digest:x}-{:016x}.cwasm", h.finish());
+    let key = format!("{digest}-{:016x}.cwasm", h.finish());
     let cached = cache_dir.join(key);
 
     // SAFETY: the cache directory belongs to this app and is only ever
@@ -160,7 +171,14 @@ pub fn load_component(engine: &Engine, bytes: &[u8], cache_dir: &Path) -> anyhow
     if let Ok(c) = unsafe { Component::deserialize_file(engine, &cached) } {
         return Ok(c);
     }
-    let compiled = engine.precompile_component(bytes)?;
+    let compiled = match wasm {
+        Wasm::Bytes(b) => engine.precompile_component(b)?,
+        Wasm::File(mut f, _) => {
+            let mut b = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut b)?;
+            engine.precompile_component(&b)?
+        }
+    };
     std::fs::create_dir_all(cache_dir)?;
     // Unique per writer: nodes and apps may share a cache and race here, and
     // a reader must only ever see a complete file.
