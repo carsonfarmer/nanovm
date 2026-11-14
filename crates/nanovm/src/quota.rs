@@ -1148,7 +1148,7 @@ mod tests {
                 let body = req.into_body().collect().await.unwrap().to_bytes();
                 let logs = ExportLogsServiceRequest::decode(body).unwrap();
                 output.lock().extend(logs.resource_logs.into_iter().flat_map(|r| r.scope_logs).flat_map(|s| s.log_records));
-                crate::server::ok_json(serde_json::json!({}))
+                crate::object::empty_response(200)
             }
         }));
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(&endpoint, "app", "digest", None, &Default::default()).unwrap());

@@ -712,7 +712,7 @@ mod tests {
         let (tx, mut heard) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(crate::server::serve_http1(listener, move |req: http::Request<hyper::body::Incoming>| {
             let _ = tx.send(req.headers().get_all(http::header::HOST).iter().cloned().collect::<Vec<_>>());
-            async { crate::server::ok_json(serde_json::json!({})) }
+            async { crate::object::empty_response(200) }
         }));
         let p = policy(&[&format!("127.0.0.1:{port}")]);
         let mut req = get(&format!("http://127.0.0.1:{port}/"));

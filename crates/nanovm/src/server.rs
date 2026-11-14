@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body::{Body, Frame};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -196,14 +196,6 @@ where
     let Ok(uri) = format!("http://{host}{pq}").parse() else { return error_response(400, "bad-uri", &pq) };
     parts.uri = uri;
     node.dispatch(id, Request::from_parts(parts, body)).await
-}
-
-pub fn ok_json(v: serde_json::Value) -> Response<RespBody> {
-    Response::builder()
-        .header("content-type", "application/json")
-        .header("cache-control", "no-store")
-        .body(Full::new(Bytes::from(v.to_string())).map_err(|e| match e {}).boxed_unsync())
-        .unwrap()
 }
 
 async fn admin(node: &Arc<Node>, path: &str, headers: &http::HeaderMap) -> Response<RespBody> {

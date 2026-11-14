@@ -614,7 +614,8 @@ mod tests {
                 Some(txt) => answer.push(serde_json::json!({ "name": format!("{name}."), "type": 16, "TTL": ttl, "data": format!("\"{txt}\"") })),
                 None => {}
             }
-            std::future::ready(crate::server::ok_json(serde_json::json!({ "Status": status, "Answer": answer })))
+            let json = serde_json::json!({ "Status": status, "Answer": answer }).to_string();
+            std::future::ready(Response::new(Full::new(bytes::Bytes::from(json)).map_err(|e| match e {}).boxed_unsync()))
         }));
         (url, asked, switch)
     }
