@@ -289,6 +289,75 @@ mod tests {
         assert_eq!(g.open.lock().get(&ip("192.0.2.1")), Some(&1));
     }
 
+    /// Admission belongs to the socket, including after HTTP hands it to
+    /// an upgrade consumer, rather than only to its HTTP service.
+    #[tokio::test]
+    async fn review3_upgraded_connections_keep_their_gate_slots() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cfg = ClientLimits { connections: 2, connections_per_client: 1, trusted: vec![], ..ClientLimits::default() };
+        let g = Gate::new(&cfg).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = addr.ip();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let serving = tokio::spawn(serve(g.clone(), listener, None, move |mut req| {
+            let upgrade = hyper::upgrade::on(&mut req);
+            let tx = tx.clone();
+            tokio::spawn(async move { tx.send(upgrade.await.unwrap()).unwrap() });
+            async {
+                let mut res = error_response(101, "test-upgrade", "test upgrade");
+                res.headers_mut().insert(http::header::CONNECTION, "upgrade".parse().unwrap());
+                res.headers_mut().insert(http::header::UPGRADE, "test".parse().unwrap());
+                res
+            }
+        }));
+        let wait_open = async |expected| {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if g.open.lock().get(&peer).copied().unwrap_or(0) == expected {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+        };
+
+        // Closing before sending an upgrade really does free admission.
+        let ordinary = tokio::net::TcpStream::connect(addr).await.unwrap();
+        wait_open(1).await;
+        assert!(g.hold(peer).is_none(), "ordinary open socket exhausts its client cap");
+        drop(ordinary);
+        wait_open(0).await;
+        drop(g.hold(peer).expect("closing the ordinary socket frees its client slot"));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test\r\n\r\n").await.unwrap();
+        let mut head = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(client.read_u8().await.unwrap());
+            }
+        }).await.unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 101"), "upgrade must succeed");
+        let mut upgraded = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        // Confirm that both ends still carry bytes, not just a completed
+        // handshake whose socket has already closed.
+        client.write_all(b"x").await.unwrap();
+        let mut byte = [0];
+        tokio::time::timeout(Duration::from_secs(5), hyper_util::rt::TokioIo::new(&mut upgraded).read_exact(&mut byte)).await.unwrap().unwrap();
+        assert_eq!(byte, [b'x']);
+        let counted = g.open.lock().get(&peer).copied().unwrap_or(0);
+        let another = g.hold(peer);
+        let readmitted = another.is_some();
+        drop(another);
+        let free = g.connections.available_permits();
+        drop((client, upgraded));
+        serving.abort();
+        let _ = serving.await;
+        assert_eq!((counted, readmitted, free), (1, false, 0), "a live upgrade must retain its client slot and global slot; the accept loop reserves the other global slot");
+    }
+
     #[test]
     fn trusted_takes_addresses_and_ranges() {
         assert_eq!(trusted(&["10.0.0.0/8".into(), "::1".into()]).unwrap().len(), 2);
