@@ -1029,7 +1029,7 @@ async fn http_front_end() {
         b"",
     ).await;
     assert_eq!(status, 204, "{body}");
-    assert!(body.is_empty(), "readiness must not return a stats snapshot: {body}");
+    assert!(body.is_empty(), "readiness has no body: {body}");
     assert_eq!(node.live_objects(), 0);
 
     let (status, body) = raw(
@@ -1056,10 +1056,6 @@ async fn http_front_end() {
     );
     let (status, _) = raw(addr, &head, &big).await;
     assert_eq!(status, 413);
-
-    for path in ["/_nanovm/stats", "/_nanovm/events"] {
-        assert_eq!(http_get(addr, path).await.0, 404);
-    }
 
     let (status, _) = raw(
         addr,
@@ -1150,7 +1146,7 @@ fn names(app: &str) -> String {
     format!("nanovm-app: {app}\r\nnanovm-trust: dev dev\r\n")
 }
 
-/// The app's name on the node (its worker's, in stats and cgroups).
+/// The app's name on the node (its worker's, in snapshots and cgroups).
 fn worker(app: &str) -> String {
     nanovm::registry::app_name("", &app.parse().unwrap())
 }
@@ -1181,9 +1177,7 @@ async fn stats_json(addr: std::net::SocketAddr) -> serde_json::Value {
 async fn supervised_workers_contain_attacks() {
     let (_sup, addr) = supervised("supervised_workers_contain_attacks").await;
     assert_eq!(http_get(addr, "/_nanovm/ready").await, (204, String::new()));
-    for path in ["/_nanovm/stats", "/_nanovm/events"] {
-        assert_eq!(http_get(addr, path).await.0, 404);
-    }
+    assert_eq!(http_get(addr, "/_nanovm/nope").await.0, 404);
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
 
     let (status, body) = app_get(addr, &counter, "/s/").await;
@@ -1209,7 +1203,7 @@ async fn supervised_workers_contain_attacks() {
     let (status, body) = http_get(addr, "/s/").await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(app_get(addr, &hostile, "//s/").await.0, 400);
-    assert_eq!(app_get(addr, &hostile, "/_nanovm/stats").await.0, 400);
+    assert_eq!(app_get(addr, &hostile, "/_nanovm/ready").await.0, 400);
 
     let v = stats_json(addr).await;
     assert!(v["rss_mb"].as_f64().unwrap() > 0.0, "{v}");
@@ -3616,7 +3610,7 @@ async fn the_proxy_routes_hosts_by_dns() {
     let (status, body) = get("Counter.Test:8443", "/a/", &names(&hostile)).await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&at("counter.test", &counter)), "{body}");
-    assert_eq!(get("counter.test", "/_nanovm/stats", "").await.0, 400);
+    assert_eq!(get("counter.test", "/_nanovm/ready", "").await.0, 400);
     // Nor can it claim to be a socket's event (and pick its `Connection-Id`),
     // however it spells the type: counter's own parsing reads the last one.
     for types in ["text/plain\r\nContent-Type: application/websocket-events", "Application/WebSocket-Events; charset=utf-8"] {

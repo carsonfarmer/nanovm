@@ -124,7 +124,7 @@ blast 5000 1 1 "solo/" $C
 
 say "attack storm: 10 rounds of every attack in the hostile guest, all at once"
 ATTACKS='/alloc?mb=1024 /spin /sleep?ms=60000 /panic /leak?n=1000000 /fill?mount=tmp&mb=1024 /files?mount=tmp
-/escape /fetch?url=http://169.254.169.254/latest/meta-data/ /fetch?url=http://localtest.me:8080/_nanovm/stats'
+/escape /fetch?url=http://169.254.169.254/latest/meta-data/ /fetch?url=http://localtest.me:8080/_nanovm/ready'
 : >target/demo-storm.cfg
 for r in 1 2 3 4 5 6 7 8 9 10; do
     k=0
