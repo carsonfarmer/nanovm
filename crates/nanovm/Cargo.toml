@@ -3,10 +3,6 @@ name = "nanovm"
 version = "0.1.0"
 edition.workspace = true
 
-[[example]]
-name = "committed_state"
-test = true
-
 [dependencies]
 # wasmtime's defaults less what the node never uses: its own compile cache
 # (`engine::load_component` keeps one), profilers, core dumps, the text
