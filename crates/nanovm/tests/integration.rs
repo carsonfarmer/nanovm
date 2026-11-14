@@ -642,6 +642,19 @@ async fn killed(node: &Arc<Node>, id: &str, path: &str, status: u16, reason: &st
     r
 }
 
+/// A guest's response body is cut at `max_response_body_kb`: past it the
+/// reader gets an error, never a body that looks whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn response_bodies_are_capped() {
+    let mut hostile = app("hostile");
+    hostile.limits.max_response_body_kb = 1024;
+    let node = node_with(node_cfg("response_bodies_are_capped", 4), hostile);
+    let at_cap = get(&node, "a", "/big?mb=1").await;
+    assert_eq!((at_cap.status, at_cap.body.len()), (200, 1 << 20));
+    let past = get(&node, "a", "/big?mb=2").await;
+    assert!(past.body.starts_with("<body error: length limit exceeded"), "{} bytes", past.body.len());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_limit() {
     let node = node("memory_limit", "hostile", 8);
