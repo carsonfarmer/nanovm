@@ -1064,6 +1064,29 @@ mod tests {
         std::fs::remove_dir_all(scratch).unwrap();
     }
 
+    /// Zero-byte inactive objects need no baseline; retaining their IDs
+    /// would make stateless scans consume memory without a cardinality cap.
+    #[test]
+    fn review3_zero_byte_objects_do_not_accumulate_idle_accounting() {
+        let disk = Disk::default();
+        let durable: Arc<str> = "durable".into();
+        disk.unpark(&durable, 17);
+        disk.park(&durable, 17, 17);
+        assert_eq!(disk.used.load(Relaxed), 17);
+        assert_eq!(disk.idle.lock().get(&durable), Some(&17), "nonzero idle usage needs a baseline");
+        disk.unpark(&durable, 23);
+        assert_eq!(disk.used.load(Relaxed), 23, "reactivation replaces the idle measurement instead of double counting it");
+        assert!(!disk.idle.lock().contains_key(&durable));
+        disk.park(&durable, 23, 23);
+        for n in 0..1000 {
+            let id: Arc<str> = format!("stateless-{n}").into();
+            disk.unpark(&id, 0);
+            disk.park(&id, 0, 0);
+        }
+        assert_eq!(disk.used.load(Relaxed), 23, "zero-byte instances must not change the byte total");
+        assert_eq!(disk.idle.lock().len(), 1, "only the nonzero durable object needs retained accounting");
+    }
+
     /// Below the node's reserve nothing grows and nothing new is made, but
     /// files are still overwritten in place and shrunk.
     #[test]
