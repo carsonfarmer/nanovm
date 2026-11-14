@@ -42,6 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::ErrorKind;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -50,7 +51,8 @@ use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, mkdirat, ope
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
-use crate::{app::Objects, committed, config::CaptureConfig, metrics::thread_cpu_ns, object::{ObjShared, TmpDir}};
+use crate::committed::{self, parent_at};
+use crate::{app::Objects, config::CaptureConfig, metrics::thread_cpu_ns, object::{ObjShared, TmpDir}};
 
 /// The volume, in an object's directory.
 pub const VOLUME: &str = "data";
@@ -718,32 +720,41 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<Option<[u8; 8]>> {
         tests::sync_point()?;
         file.sync_data()
     })?;
+    // Entries are reached by name from the object's directory, never
+    // through a symlink (`committed::parent_at`): the log's paths are
+    // relative to it, which can move deeper between a crash and the recovery
+    // after it (a backup restored into a longer root), so a real entry's
+    // whole path can be past PATH_MAX while each of its names fits. Only a
+    // name past NAME_MAX is then too long, and nothing can have one (N-690).
+    // `openat` and `renameat2`: on x86_64 rustix's `open` is SYS_open, and on
+    // aarch64 its `renameat` is SYS_renameat, neither in the jail's list.
+    let root = openat(CWD, base, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
     // Each record is dropped from the log once undone and synced, so a crash
     // here resumes where it stopped; the undo it was in may run twice, which
     // each tolerates. A record cut short by a crash was never acted on.
     for (at, undo) in undos.into_iter().rev() {
         let open = |p: &Path| -> std::io::Result<File> {
-            let (dir, name) = parent_at(base, p)?;
+            let (dir, name) = parent_at(&root, p)?;
             Ok(openat(&dir, name, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?.into())
         };
         match &undo {
             Undo::Size(p, n) => open(p).and_then(|f| f.set_len(*n)),
             Undo::Bytes(p, at, data) => open(p).and_then(|f| f.write_all_at(data, *at)),
-            Undo::Created(p) => parent_at(base, p).and_then(|(dir, name)| match is_dir_at(&dir, name)? {
+            Undo::Created(p) => parent_at(&root, p).and_then(|(dir, name)| match is_dir_at(&dir, name)? {
                 Some(true) => Ok(unlinkat(&dir, name, AtFlags::REMOVEDIR)?),
                 Some(false) => Ok(unlinkat(&dir, name, AtFlags::empty())?),
                 None => Ok(()),
             }),
-            Undo::RemovedDir(p) => parent_at(base, p).and_then(|(dir, name)| match mkdirat(&dir, name, 0o777.into()) {
+            Undo::RemovedDir(p) => parent_at(&root, p).and_then(|(dir, name)| match mkdirat(&dir, name, 0o777.into()) {
                 Err(e) if e == Errno::EXIST && is_dir_at(&dir, name)? == Some(true) => Ok(()),
                 made => Ok(made?),
             }),
             Undo::Renamed(from, to) => (|| {
                 // The source is present after an earlier replay or a failed
                 // syscall. Both may be absent for a discarded new file.
-                let (a, x) = parent_at(base, from)?;
+                let (a, x) = parent_at(&root, from)?;
                 if is_dir_at(&a, x)?.is_none() {
-                    let (b, y) = parent_at(base, to)?;
+                    let (b, y) = parent_at(&root, to)?;
                     if is_dir_at(&b, y)?.is_some() {
                         renameat_with(&b, y, &a, x, RenameFlags::empty())?;
                     }
@@ -759,11 +770,11 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<Option<[u8; 8]>> {
             Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
             Undo::Cancelled => Path::new(""),
         };
-        sync_at(base, p)?;
+        sync_at(&root, p)?;
         if let Undo::Renamed(_, to) = &undo {
             // A cross-directory rename changes both parents. Persist both
             // before dropping its undo, including when replay runs twice.
-            sync_at(base, to.parent().unwrap_or(Path::new("")))?;
+            sync_at(&root, to.parent().unwrap_or(Path::new("")))?;
         }
         #[cfg(test)]
         tests::crash_point()?;
@@ -777,28 +788,8 @@ fn recover(base: &Path, dir: &Path) -> std::io::Result<Option<[u8; 8]>> {
     Ok(Some(key))
 }
 
-/// The directory holding `p` (relative to `base`), opened one name at a
-/// time and never through a symlink, and `p`'s name in it. Recovery reaches
-/// entries so: the log's paths are relative to `base`, which can move deeper
-/// between a crash and the recovery after it (a backup restored into a
-/// longer root), so a real entry's whole path can be past PATH_MAX while
-/// each of its names fits. Only a name past NAME_MAX is then too long, and
-/// nothing can have one (N-690).
-fn parent_at<'a>(base: &Path, p: &'a Path) -> std::io::Result<(File, &'a OsStr)> {
-    let name = p.file_name().ok_or(ErrorKind::InvalidInput)?;
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    // `openat` and `renameat2`: on x86_64 rustix's `open` is SYS_open, and
-    // on aarch64 its `renameat` is SYS_renameat, neither in the jail's list.
-    let mut dir = openat(CWD, base, flags, Mode::empty())?;
-    for c in p.parent().expect("named").components() {
-        let Component::Normal(c) = c else { return Err(ErrorKind::InvalidInput.into()) };
-        dir = openat(&dir, c, flags | OFlags::NOFOLLOW, Mode::empty())?;
-    }
-    Ok((dir.into(), name))
-}
-
 /// Whether `name` in `dir` is a directory; `None` if nothing can be there.
-fn is_dir_at(dir: &File, name: &OsStr) -> std::io::Result<Option<bool>> {
+fn is_dir_at(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Option<bool>> {
     match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from) {
         Ok(st) => Ok(Some(FileType::from_raw_mode(st.st_mode).is_dir())),
         Err(e) if shape(&e) => Ok(None),
@@ -806,20 +797,20 @@ fn is_dir_at(dir: &File, name: &OsStr) -> std::io::Result<Option<bool>> {
     }
 }
 
-/// Syncs `p` (relative to `base`, reached as by [`parent_at`]; `""` is the
-/// base) unless nothing can be there.
-fn sync_at(base: &Path, p: &Path) -> std::io::Result<()> {
+/// Syncs `p` (relative to `root`, reached as by [`parent_at`]; `""` is
+/// `root`) unless nothing can be there.
+fn sync_at(root: &OwnedFd, p: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     tests::sync_point()?;
     let file = match p.file_name() {
-        None => File::open(base),
-        Some(_) => parent_at(base, p).and_then(|(dir, name)| {
-            Ok(openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?.into())
+        None => openat(root, ".", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).map_err(Into::into),
+        Some(_) => parent_at(root, p).and_then(|(dir, name)| {
+            Ok(openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?)
         }),
     };
     match file {
         Err(e) if shape(&e) => Ok(()),
-        file => file?.sync_all(),
+        file => File::from(file?).sync_all(),
     }
 }
 

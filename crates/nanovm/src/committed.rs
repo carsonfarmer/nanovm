@@ -338,7 +338,7 @@ pub(crate) fn dir_at(root: &OwnedFd, path: &Path, make: bool) -> io::Result<Owne
 
 /// The directory holding what `path` names in `root`, as [`dir_at`] opens
 /// it, and its name there.
-fn parent_at<'a>(root: &OwnedFd, path: &'a Path) -> io::Result<(OwnedFd, &'a OsStr)> {
+pub(crate) fn parent_at<'a>(root: &OwnedFd, path: &'a Path) -> io::Result<(OwnedFd, &'a OsStr)> {
     let name = names(path)?.file_name().ok_or_else(|| invalid("unsafe path in a committed version"))?;
     Ok((dir_at(root, path.parent().expect("named"), false)?, name))
 }
