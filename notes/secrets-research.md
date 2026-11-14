@@ -25,8 +25,8 @@ engine's reading of the vendor page, not from the page itself: check them before
   5 minutes) for the app it runs: issuer `https://<operator's issuer>/<host>`, subject
   `<host>/<registry>/<repository>`, any audience the app asks for, and claims for the version, the
   signer that published it and the object. AWS, Google Cloud, Vault, OpenAI, Anthropic and the
-  app's own services exchange or accept it; Azure too, once ES256 is tested there (question 2). This is what GitHub Actions, Fly.io, Vercel and
-  Deno Deploy do for their workloads.
+  app's own services exchange or accept it; Azure too, once ES256 is tested there (question 2).
+  This is what GitHub Actions, Fly.io, Vercel and Deno Deploy do for their workloads.
 - **Keys live in memory and rotate.** Each node makes its own ECDSA P-256 key at start, never
   writes it down, and replaces it daily. The proxy polls the nodes it lists for their public keys
   and serves one JWKS. Removing a node from the proxy's list revokes its key.
@@ -55,10 +55,10 @@ engine's reading of the vendor page, not from the page itself: check them before
 
 | Platform | What the workload gets | How it asks | Subject | Lifetime | Signing |
 |---|---|---|---|---|---|
-| GitHub Actions | an OIDC JWT per request, any audience | `ACTIONS_ID_TOKEN_REQUEST_URL` with a bearer `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, `&audience=` | `repo:org/repo:ref:…`; immutable owner and repo IDs since 2026-07-15 | 5 min in the documented example | RS256, JWKS at the issuer |
-| Fly.io | an OIDC JWT per request, any audience | `POST /v1/tokens/oidc` on the Machine's Unix socket `/.fly/api` | `org:app:machine` | 10 min in the documented example | per-org issuer `https://oidc.fly.io/<org>` |
+| GitHub Actions | an OIDC JWT on request, any audience | `ACTIONS_ID_TOKEN_REQUEST_URL` with a bearer `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, `&audience=` | `repo:org/repo:ref:…`; immutable owner and repo IDs since 2026-07-15 | 5 min in the documented example | RS256, JWKS at the issuer |
+| Fly.io | a new OIDC JWT per request, any audience | `POST /v1/tokens/oidc` on the Machine's Unix socket `/.fly/api` | `org:app:machine` | 10 min in the documented example | per-org issuer `https://oidc.fly.io/<org>` |
 | Vercel | an OIDC JWT per project and environment | `x-vercel-oidc-token` request header in Functions, `VERCEL_OIDC_TOKEN` in builds | `owner:<team>:project:<p>:environment:<e>` | cached up to 45 min *(search)* | RS256 *(search)*; per-team issuer recommended |
-| Deno Deploy | an OIDC JWT per request, any audience | `getIdToken(aud)` from `@deno/oidc` | `deployment:<org>/<app>/<context>` | 5 min; `nbf` 1 min before `iat` | ES256 keys, rotated |
+| Deno Deploy | an OIDC JWT on request, any audience | `getIdToken(aud)` from `@deno/oidc` | `deployment:<org>/<app>/<context>` | 5 min; `nbf` 1 min before `iat` | ES256 keys, rotated |
 | Kubernetes | a pod-bound service-account JWT | a projected volume file the kubelet refreshes | `system:serviceaccount:<ns>:<name>` | 1 h default, 10 min minimum; refreshed at 80% or 24 h | the API server's key files; external signer |
 | SPIRE | X.509-SVIDs and JWT-SVIDs | the Workload API on a Unix socket, caller attested by the agent | `spiffe://<trust domain>/…` | 1 h and 5 min defaults | ec-p256 default; CA/key 24 h |
 
@@ -128,8 +128,8 @@ engine's reading of the vendor page, not from the page itself: check them before
   retrieve AWS credentials from the credential helper"
   ([helper](https://github.com/aws/rolesanywhere-credential-helper)).
 - **Google Cloud Workload Identity Federation.** A pool provider trusts an OIDC issuer; STS
-  exchanges the token (RFC 8693, `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`) for
-  a Google access token. The JWT needs `kid` and `alg` "RS256 or ES256"; `iat` "must be in the past
+  exchanges the token ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693),
+  `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`) for a Google access token. The JWT needs `kid` and `alg` "RS256 or ES256"; `iat` "must be in the past
   and no more than 24 hours in the past"; for `exp`, "we recommend setting an expiration time less
   than 6 hours" ([STS token](https://cloud.google.com/iam/docs/reference/sts/rest/v1/TopLevel/token)).
   The provider fetches the JWKS from `<issuer>/.well-known/openid-configuration`, or the JWKS can
@@ -147,7 +147,8 @@ engine's reading of the vendor page, not from the page itself: check them before
   "Only issuers that provide tokens signed using the RS256 algorithm are supported … Exchanging
   tokens signed with other algorithms may work, but haven't been tested"; changes take minutes to
   propagate ([considerations](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-considerations)).
-  Entra "stores only the first 100 signing keys" it downloads from an issuer. The recommended
+  Entra "stores only the first 100 signing keys" it downloads from an issuer
+  ([concepts](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation#how-it-works)). The recommended
   audience is `api://AzureADTokenExchange`
   ([create trust](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-create-trust)).
   There is a limit of 20 federated credentials per identity; flexible credentials, which match
@@ -163,7 +164,7 @@ engine's reading of the vendor page, not from the page itself: check them before
   ([GitHub: OIDC in Docker](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-docker)).
   PyPI's trusted publishing mints an API token "only valid for 15 minutes from time of creation"
   ([trusted publishers](https://docs.pypi.org/trusted-publishers/)). So the audit's "most LLM
-  providers issue only static keys" (S2) is out of date for the two the gateway example targets.
+  providers issue only static keys" (S2) is now out of date for OpenAI and Anthropic.
 - **Vault** accepts JWTs through its JWT auth method (`bound_audiences`, `bound_claims`, a
   `jwks_url` or discovery URL) ([JWT auth](https://developer.hashicorp.com/vault/docs/auth/jwt)).
 
@@ -186,8 +187,10 @@ engine's reading of the vendor page, not from the page itself: check them before
   AWS KMS, GCP KMS, Azure Key Vault, Vault Transit or KMIP
   ([server plugins](https://github.com/spiffe/spire/blob/main/doc/spire_server.md),
   [memory](https://github.com/spiffe/spire/blob/main/doc/plugin_server_keymanager_memory.md)). An
-  OIDC discovery provider publishes the JWKS so AWS, GCP and Entra can verify JWT-SVIDs
-  ([provider](https://github.com/spiffe/spire/blob/main/support/oidc-discovery-provider/README.md)).
+  OIDC discovery provider publishes the JWKS for outside verifiers
+  ([provider](https://github.com/spiffe/spire/blob/main/support/oidc-discovery-provider/README.md));
+  Entra documents federating SPIRE workloads this way
+  ([tutorial](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-spiffe-spire)).
 - **Bearer caveats.** JWT-SVIDs must carry `aud` and `exp`; one audience is "strongly recommended",
   because "tokens sent to one audience can be replayed to another audience should more than one be
   present", and "being a bearer token, JWT-SVIDs are susceptible to replay attacks"
@@ -296,8 +299,8 @@ engine's reading of the vendor page, not from the page itself: check them before
 
 ### 1.8 Keeping the issuer's own key short-lived or out of reach
 
-- **Rotate and publish.** Deno Deploy and GitHub publish JWKS and rotate; relying parties must
-  "fetch the JWKS keys dynamically" ([Deno](https://docs.deno.com/deploy/reference/oidc/#verifying-tokens)).
+- **Rotate and publish.** Deno Deploy rotates its keys, so relying parties must "fetch the JWKS
+  keys dynamically" ([Deno](https://docs.deno.com/deploy/reference/oidc/#verifying-tokens)).
   Vault rotates daily and keeps old public keys a day (1.5). SPIRE activates the next key at a sixth
   of the current one's life (1.3).
 - **In memory.** SPIRE's `memory` key manager keeps keys only in memory (1.3).
@@ -310,11 +313,12 @@ engine's reading of the vendor page, not from the page itself: check them before
   the kube-apiserver configuration / filesystem could exfiltrate signing material"; an external
   signer that "never returns signing material" is now stable
   ([KEP-740](https://github.com/kubernetes/enhancements/tree/master/keps/sig-auth/740-service-account-external-signing)).
-- **Per-node keys certified by a root.** SPIRE does this for X.509 (a CA chain). AWS, GCP and Entra
+- **Per-node keys certified by a root.** SPIRE can chain its X.509 CA to an upstream authority
+  ([server](https://github.com/spiffe/spire/blob/main/doc/spire_server.md#ca-and-svid-lifetimes)). AWS, GCP and Entra
   check JWT signatures against the issuer's JWKS, not a certificate chain, so for federation each
   node's key must be in the JWKS itself (Entra keeps the first 100). A root adds nothing there.
 - **Several nodes.** Either they share one key (a KMS, or a copied file: a long-lived secret), or
-  each signs with its own and the JWKS lists them all, as SPIRE's bundle lists every server's keys.
+  each signs with its own and the JWKS lists them all.
 
 ### 1.9 What follows for nanovm
 
@@ -405,8 +409,9 @@ claims  {
   tokens). Each host gets its own issuer, `https://id.example.net/<host>`: an AWS OIDC provider,
   GCP pool provider or Entra credential registered for `example.com` admits only `example.com`'s
   tokens even if its `sub` condition is wrong or missing (Fly and Vercel do the same per tenant).
-  The proxy answers `GET /<host>/.well-known/openid-configuration` with that issuer and a shared
-  `jwks_uri`, `https://id.example.net/jwks.json`. TLS comes from the terminator in front of the
+  The proxy answers `GET /<host>/.well-known/openid-configuration` (an
+  [OIDC discovery](https://openid.net/specs/openid-connect-discovery-1_0.html) document) with that
+  issuer and a shared `jwks_uri`, `https://id.example.net/jwks.json`. TLS comes from the terminator in front of the
   proxy, as for apps.
 - **Per-node keys, in memory.** Each supervisor generates a P-256 key at start with `ring` and
   never writes it to disk. A key signs for 24 hours. The next key is made and published an hour
@@ -460,8 +465,8 @@ depend on it.
 - **SDKs.** `nanovm_sdk::token("sts.amazonaws.com").await?` (Rust); in JavaScript,
   `await (await fetch("http://nanovm/token?aud=sts.amazonaws.com")).text()`. Helpers for the AWS
   and GCP exchanges can live in the SDK, outside the runtime count.
-- **Using it.** With AWS: an unsigned `AssumeRoleWithWebIdentity` call (STS in `egress`), then
-  SigV4 in the guest. With GCP: `POST https://sts.googleapis.com/v1/token`, then the access token.
+- **Using it.** With AWS: an unsigned `AssumeRoleWithWebIdentity` call (with the STS host in the
+  app's `egress`), then SigV4 in the guest. With GCP: `POST https://sts.googleapis.com/v1/token`, then the access token.
   With Entra: the client-credentials flow with the token as `client_assertion`. With OpenAI or
   Anthropic: their exchange endpoints. With the developer's own API: send it as a bearer and verify
   it against the JWKS.
@@ -497,11 +502,13 @@ depend on it.
   the store has been unreachable for 10 minutes is refused rather than sent without its key.
 - **Who sets them: the developer, with a keyless signature.** `nanovm secret` writes the record;
   `cosign sign-blob --bundle` signs it with the developer's OIDC identity (a browser sign-in, or
-  ambient GitHub Actions OIDC); the record and bundle go to `PUT https://id.example.net/<host>/secrets/<name>`.
-  The proxy resolves the host as for any request and forwards to a node, which:
+  ambient GitHub Actions OIDC); the record and bundle go to
+  `PUT https://id.example.net/<host>/secrets/<name>`, on the issuer's host so no app path is
+  reserved. The proxy resolves the host as for any request and forwards to a node, which:
   - verifies the bundle over the record's SHA-256 with the same Sigstore verifier and the same
-    `trust=` identities that may deploy the app (and the operator's `signers` allowlist on beta),
-    so whoever may deploy code under the host may set its secrets, and no one else;
+    `trust=` identities that may deploy the app (as cut by the operator's `signers` allowlist on
+    beta, and confirmed by the node's own look-up of the record, 2.5), so whoever may deploy code
+    under the host may set its secrets, and no one else;
   - checks the record names this app, its certificate is under 15 minutes old (Fulcio
     certificates live 10), and its `version` is above the stored one (a conditional put on the
     ETag), so an old update can't be replayed to roll a key back;
@@ -520,8 +527,8 @@ depend on it.
   host, as tokenizer advises.
 - **Prefer no key at all.** OpenAI and Anthropic federate (1.2), so the gateway example needs no
   key; Stripe, GitHub's OAuth client secret, Telegram and Slack bot tokens still do. Where an
-  identity provider accepts a JWT client assertion from a JWKS URL (Entra does), the app token can
-  replace an OAuth client secret entirely.
+  identity provider takes a JWT from a trusted issuer as the client's credential (Entra's federated
+  credentials do, as a client assertion), the app token replaces the client secret.
 - **No remote store** (one node, `capture.store` a local directory): secret records are refused,
   since they would be plaintext on the node's disk (question 7). `nanovm run` (dev) reads records
   from a local directory.
@@ -549,7 +556,7 @@ depend on it.
 - **Store (leases, capture, secret records; S1).** Use the platform's identity, which
   `object_store` already reads (`lease.rs` passes the environment to `parse_url_opts`): an EC2
   instance role over IMDSv2, `AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN` (EKS IRSA, or MinIO's
-  STS through `AWS_ENDPOINT_URL_STS`), ECS or EKS Pod Identity container credentials
+  STS through `AWS_ENDPOINT_URL_STS`, per audit S1), ECS or EKS Pod Identity container credentials
   ([AmazonS3Builder](https://docs.rs/object_store/0.14.0/object_store/aws/struct.AmazonS3Builder.html),
   [config keys](https://docs.rs/object_store/0.14.0/object_store/aws/enum.AmazonS3ConfigKey.html)).
   Off-cloud, IAM Roles Anywhere's helper serves IMDS-style credentials from a TPM-held key (1.2).
@@ -594,7 +601,7 @@ depend on it.
 | **A compromised app** (a malicious version signed by a trusted identity, or exploited logic) | Tokens for its own app, any audience: whatever the app's trust policies grant. Use of its bound keys at their bound hosts | It can't name another app (the supervisor stamps identity). It can't read or redirect a bound key (bindings live with the value). Trust policies can pin `signer` where the relying party allows (GCP, Vault) |
 | **A worker escape** (code execution in the worker process) | The same as a compromised app, plus any `object` claim within the app | The signing key and secret values are in the supervisor, not the worker. Other apps' links are other processes and uids |
 | **A compromised node** (root) | Its signing key: tokens for any app until revoked. Store access: every app's data and secret records | Remove it from the proxy's `nodes` (its keys leave the JWKS within a poll plus relying parties' cache); revoke its per-node platform role; tokens die within 5 min; `node` and `kid` identify what it signed. Rotate the third-party keys it could read. KMS-sealed records (question 8) would need its live role, which revocation ends |
-| **A compromised proxy** | It can plant a key in the JWKS and route any host to any signed package | As today, the proxy is trusted for routing. 2.5 stops it making *nodes* sign for hosts whose DNS doesn't agree; planting a key it can't be stopped from. Keep the proxy small and unprivileged |
+| **A compromised proxy** | It can plant a key in the JWKS and route any host to any signed package | As today, the proxy is trusted for routing. 2.5 stops it making *nodes* sign for hosts whose DNS doesn't agree, but nothing stops it publishing a key of its own. Keep the proxy small and unprivileged |
 | **An attacker on the private network** (S3) | Today: run any signed code under any host on a node; forge calls and publishes | 2.5: no tokens for hosts whose record doesn't name the repository and signer. The proxy dials nodes for keys, so no key planting. S3's own fix still needed for the rest |
 | **A stolen app token** | Its audience's exchange, for at most 5 minutes | One audience; `exp`; never logged by nanovm (telemetry records the path, not the query or bodies); attached tokens never enter the guest. Replay within 5 min at the same audience is inherent to bearer JWTs (JWT-SVID §7.1); DPoP-style binding isn't accepted by the clouds |
 | **Stolen exchanged credentials** | The role, until they expire | Ask for 900 s at AWS; least-privilege roles. They are in guest memory only |
@@ -654,11 +661,11 @@ guest never holds a bound key), secrets in `wasi:config`, the `secrets` director
    repository gets `403`; keys rotate and retired keys stay published; a starting node answers 503
    until its key is fetched; a node removed from `nodes` drops out of the JWKS; end to end against
    GCP (uploaded JWKS needs no public issuer) and AWS STS.
-2. **Egress injection:** 2.6's attach and 2.7's records, set by the operator through the admin
-   socket until phase 3. Tests: the key reaches the bound host and path only; the guest never sees
+2. **Egress injection:** 2.6's attach and 2.7's records, set by the operator through the beta's
+   admin socket until phase 3. Tests: the key reaches the bound host and path only; the guest never sees
    it (the `/leak` test component from beta); a changed record is used within 60 s.
 3. **Developer-set secrets:** the signed `PUT`. Tests: an identity not in `trust=` is refused; an
-   older version is refused; an expired certificate is refused.
+   older version is refused; a certificate over 15 minutes old is refused.
 
 ## 3. Open questions for the owner
 
@@ -678,8 +685,8 @@ guest never holds a bound key), secrets in `wasi:config`, the `secrets` director
    host/repository they can't refuse code that a DNS hijacker signed. Folding the signer in
    (`example.com/ghcr.io/org/shop@<signer>`) closes that, but breaks trust policies whenever the
    workflow file, branch or signer changes, and can exceed GCP's 127-byte subject. **Recommended:
-   keep `sub` = host/repository with `signer` as a claim**; revisit if users ask, perhaps as a
-   per-record option.
+   keep `sub` = host/repository with `signer` as a claim**; revisit if users ask, perhaps as an
+   option in the host's TXT record.
 5. **Is the DNS check before signing (2.5) worth 15 lines?** It makes tokens independent of
    proxy-node trust (S3), which is network position today. **Recommended: yes.** Without it, an
    issuer must not be enabled until S3 is fixed in the deployment.
