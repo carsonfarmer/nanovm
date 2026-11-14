@@ -328,7 +328,7 @@ pub(crate) const DIR: OFlags = OFlags::RDONLY.union(OFlags::DIRECTORY).union(OFl
 pub(crate) fn dir_at(root: &OwnedFd, path: &Path, make: bool) -> io::Result<OwnedFd> {
     let mut dir = openat(root, ".", DIR, Mode::empty())?;
     for name in names(path)? {
-        if make && let Err(e) = mkdirat(&dir, name, Mode::from_raw_mode(0o777)) && e != Errno::EXIST {
+        if make && let Err(e) = mkdirat(&dir, name, Mode::from_raw_mode(0o755)) && e != Errno::EXIST {
             return Err(e.into());
         }
         dir = openat(&dir, name, DIR, Mode::empty())?;
