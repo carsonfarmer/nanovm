@@ -436,7 +436,7 @@ impl Supervisor {
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         // Readiness is infrastructure traffic, not a tenant request.
         if req.uri().path() == "/_nanovm/ready" && !req.headers().contains_key(APP_HEADER) {
-            return self.admin(req.map(|b| b.boxed_unsync())).await;
+            return Self::admin(req.uri().path());
         }
         self.telemetry.forward("supervisor.request", req, |req| self.clone().handle_request(req)).await
     }
@@ -449,7 +449,7 @@ impl Supervisor {
         }
         let want = match AppRef::from_headers(req.headers()) {
             Ok(Some(w)) => w,
-            Ok(None) => return self.admin(req).await,
+            Ok(None) => return Self::admin(req.uri().path()),
             Err(e) => return error_response(400, "bad-app-ref", &format!("{e:#}")),
         };
         for h in [APP_HEADER, TRUST_HEADER, MIN_VERSION_HEADER, HOST_HEADER] {
@@ -469,8 +469,7 @@ impl Supervisor {
                 // their last failures.
                 workers.retain(|_, w| w.live.lock().is_some() || w.starting.try_lock().is_err());
             }
-            let host = want.host.clone();
-            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, host, ..Default::default() })).clone()
+            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, host: want.host.clone(), ..Default::default() })).clone()
         };
         w.used.store(self.started.elapsed().as_millis() as u64, Relaxed);
         let live = match self.live(&w, &want).await {
@@ -545,8 +544,8 @@ impl Supervisor {
     }
 
     /// The node's own routes, for requests that name no app.
-    async fn admin(&self, req: Request<Body>) -> Response<RespBody> {
-        match req.uri().path() {
+    fn admin(path: &str) -> Response<RespBody> {
+        match path {
             "/_nanovm/ready" => Response::builder().status(204).body(Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap(),
             path if path.starts_with("/_nanovm/") => error_response(404, "not-found", path),
             _ => error_response(400, "no-app", "requests name their app (nanovm-app)"),
@@ -716,9 +715,7 @@ impl Supervisor {
         // As many links to the supervisor as its objects may use at once:
         // each its outbound requests and a publish.
         let links = self.cfg.max_live_objects * (app.limits.max_outbound_concurrency + 1);
-        let mut spec = serde_json::to_vec(&(&app, uid, &p.component, std::process::id()))?;
-        spec.push(b'\n');
-        stdin.write_all(&spec).await?;
+        stdin.write_all(&serde_json::to_vec(&(&app, uid, &p.component, std::process::id()))?).await?;
         drop(stdin);
 
         // The worker's stderr goes to ours, tagged with its app, a line (of at
@@ -854,9 +851,7 @@ impl Supervisor {
         }
         let mut child = cmd.spawn().with_context(|| format!("spawning {}{into}", self.exe.display()))?;
         let mut stdin = child.stdin.take().expect("piped");
-        let mut spec = serde_json::to_vec(&self.cfg)?;
-        spec.push(b'\n');
-        stdin.write_all(&spec).await?;
+        stdin.write_all(&serde_json::to_vec(&self.cfg)?).await?;
         Ok(Spawned { child, stdin, requests, egress, cgroup })
     }
 
@@ -1171,21 +1166,18 @@ async fn count_backlog(sup: std::sync::Weak<Supervisor>) -> Option<()> {
 /// lets its objects finish their work and flushes its telemetry before it
 /// exits.
 pub fn worker_main() -> anyhow::Result<()> {
-    use std::io::BufRead;
-    let mut input = std::io::stdin().lock();
-    let mut line = Vec::new();
-    input.read_until(b'\n', &mut line)?;
-    let cfg: NodeConfig = serde_json::from_slice(&line).context("worker spec: the node")?;
+    use serde::Deserialize;
+    // Two JSON values: the node's config, and later its app.
+    let mut spec = serde_json::Deserializer::from_reader(std::io::stdin().lock());
+    let cfg = NodeConfig::deserialize(&mut spec).context("worker spec: the node")?;
     // Before the jail, which stops raising the fd limit and reading sysctls.
     crate::engine::preflight(&cfg)?;
     // Before the app, which a spare worker waits for here. Neither starts
     // a thread, so the jail is still entered with one.
     let engine = crate::engine::build(&cfg)?;
     let linker = crate::app::linker(&engine)?;
-    line.clear();
-    input.read_until(b'\n', &mut line)?;
     let (app, uid, (digest, path), parent): (AppConfig, Option<u32>, (String, PathBuf), u32) =
-        serde_json::from_slice(&line).context("worker spec: the app")?;
+        Deserialize::deserialize(&mut spec).context("worker spec: the app")?;
     // The registry's cache is outside the jail.
     let wasm = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: the supervisor put these sockets at fds 3 and 4 and nothing

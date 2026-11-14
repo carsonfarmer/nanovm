@@ -180,7 +180,7 @@ impl Telemetry {
         let mut span = self.span(name, object, parent, SpanKind::Server);
         span.set_attribute(KeyValue::new("http.request.method", req.method().as_str().chars().take(32).collect::<String>()));
         let path = req.uri().path();
-        span.set_attribute(KeyValue::new("url.path", path[..path.floor_char_boundary(path.len().min(1024))].to_owned()));
+        span.set_attribute(KeyValue::new("url.path", path[..path.floor_char_boundary(1024)].to_owned()));
         span
     }
 
@@ -231,7 +231,7 @@ impl Telemetry {
         // retains at most 1 MiB of log bodies (plus attributes and SDK overhead).
         let mut record = self.logger.create_log_record();
         let mut body = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
-        body.truncate(body.floor_char_boundary(4096.min(body.len())));
+        body.truncate(body.floor_char_boundary(4096));
         record.set_body(body.into());
         record.add_attribute(field.0, field.1);
         record.add_attribute("nanovm.object", object.to_owned());
@@ -296,7 +296,6 @@ impl Relay {
     }
 
     async fn send(&self, signal: &str, body: Bytes) -> Result<Response<Bytes>, u16> {
-        if body.len() > MAX_BATCH { return Err(413) }
         let res = self.http.post(format!("{}/v1/{signal}", self.endpoint))
             .header("content-type", "application/x-protobuf").body(body).send().await.map_err(|_| 502u16)?;
         let status = res.status();
