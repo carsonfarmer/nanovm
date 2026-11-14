@@ -168,12 +168,17 @@ pub fn load_component(engine: &Engine, wasm: Wasm, cache_dir: &Path) -> anyhow::
         }
     };
     std::fs::create_dir_all(cache_dir)?;
-    // Unique per writer: nodes and apps may share a cache and race here, and
-    // a reader must only ever see a complete file.
-    static WRITER: AtomicU64 = AtomicU64::new(0);
-    let tmp = cached.with_extension(format!("tmp.{}.{}", std::process::id(), WRITER.fetch_add(1, Relaxed)));
-    std::fs::write(&tmp, &compiled)?;
-    std::fs::rename(&tmp, &cached)?;
+    // Nodes and apps may share a cache and race here.
+    write_whole(&cached, &compiled)?;
     // SAFETY: as above.
     Ok(unsafe { Component::deserialize_file(engine, &cached)? })
+}
+
+/// Writes `bytes` to `path` through a file of this writer's own beside it,
+/// renamed into place, so a reader only ever sees a complete file.
+pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static WRITER: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), WRITER.fetch_add(1, Relaxed)));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
