@@ -19,9 +19,9 @@ hosts = ["app.example.com", "www.app.example.com"]
 # (end the prefix with `/`). A record's trust= entries are cut to these.
 # Empty (the default): no app deploys. Replace with your developers' CI.
 signers = ["https://token.actions.githubusercontent.com https://github.com/org/*"]
-# Rate and connection limits per client ([clients]: rate 100/s, app_rate
-# 1,000/s, connections_per_client 256, connections 10,000). A client is named
-# by the X-Forwarded-For of a trusted forwarder: Caddy, on loopback, is one by
-# default; a terminator elsewhere must be listed:
+# Connection limits per client ([clients]: connections_per_client 256,
+# connections 10,000). A trusted forwarder's connections aren't capped per
+# client: Caddy, on loopback, is one by default; a terminator elsewhere must
+# be listed. Request rates, if wanted, belong in Caddy:
 # [clients]
 # trusted = ["127.0.0.1", "::1", "10.0.0.5"]

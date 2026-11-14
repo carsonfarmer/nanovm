@@ -238,19 +238,12 @@ impl Proxy {
         if ws::is_event(&req) {
             return Err((StatusCode::BAD_REQUEST, "socket events come from the proxy".into()));
         }
-        let client = self.gate.client(&req);
-        if let Err(refused) = self.gate.admit(client, None) {
-            return Ok(refused);
-        }
         let host = req.headers().get(http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
         let host = host.rsplit_once(':').map_or(host, |(h, _)| h).to_ascii_lowercase();
         if !self.cfg.hosts.iter().any(|h| h.strip_prefix('*').map_or(*h == host, |under| host.ends_with(under))) {
             return Err((StatusCode::FORBIDDEN, format!("this proxy doesn't serve {host}")));
         }
         let (name, headers) = self.resolve(&host).await?;
-        if let Err(refused) = self.gate.admit(client, Some(&name)) {
-            return Ok(refused);
-        }
         let upgrading = ws::wants(&req);
         let (mut parts, body) = req.into_parts();
         // Only the proxy names apps to the node.

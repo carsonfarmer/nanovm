@@ -199,8 +199,9 @@ In all +81: 7,499 merged, against 7,418 on `cf/round3` 7b3f9c6.
   proxy's private listener would make `hosts` the one list.
 - A proxy restarted during an outage has no stale routes to serve (memory
   only).
-- The limits agent owns rate limits at the accept loop and request entry;
-  the 503 for unknown hosts here bounds DoH lookups, not requests.
+- The limits agent owns rate limits at the accept loop and request entry
+  (since removed: HANDOFF Q91); the 503 for unknown hosts here bounds DoH
+  lookups, not requests.
 
 ## Owner questions
 

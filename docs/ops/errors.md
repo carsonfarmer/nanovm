@@ -78,8 +78,7 @@ only as `error.type = post-return-commit-failed` on the span and an event.
 | 502 | `proxy` | The record couldn't be used: the DNS-over-HTTPS resolver failed or timed out (any answer but NOERROR or NXDOMAIN, such as SERVFAIL; a host or tag found before is served stale through this for up to a day), more than one TXT record, a malformed one (`app=` must name a tag, not a digest; `trust=` is required; an unknown or repeated field), the tag couldn't be resolved at the registry, or no node could be reached within `failover_ms`. The detail says which. |
 | 504 | `proxy` | A node took the request but didn't answer within `failover_ms` ("the request may have run there"); the proxy never sends it again. |
 | 400 | `proxy` | A client sent a WebSocket event itself ("socket events come from the proxy"). |
-| 429 | `rate-limited` | A client past its `rate`, or an app past its `app_rate` (`[clients]` in `proxy.toml`; a node reached directly applies its own), with `Retry-After`. The detail says which. A client is its address (an IPv6 /64), or the last untrusted address in a trusted forwarder's `X-Forwarded-For`. |
-| 503 | `too-many-connections` | A client has `connections_per_client` connections open (256), with `Retry-After: 1`; the connection is closed. |
+| 503 | `too-many-connections` | A client address (an IPv6 /64) has `connections_per_client` connections open (256; `[clients]` in `proxy.toml`, and a node reached directly applies its own), with `Retry-After: 1`; the connection is closed. |
 | 400, 426, 431, 503, 502 | `socket-refused` | A WebSocket open refused: not a handshake (400), not version 13 (426), headers too large (431), `max_sockets` for the proxy, the app or the object (503), or the object refused it or answered `OPEN` with something a socket can't take (502). |
 
 Requests whose head is over 64 KiB get a plain 431 from any hop, and a client

@@ -434,10 +434,6 @@ impl Supervisor {
 
     async fn handle_request(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         let mut req = req.map(|b| b.boxed_unsync());
-        let client = self.gate.client(&req);
-        if let Err(refused) = self.gate.admit(client, None) {
-            return refused;
-        }
         let want = match AppRef::from_headers(req.headers()) {
             Ok(Some(w)) => w,
             Ok(None) => return self.admin(req).await,
@@ -450,9 +446,6 @@ impl Supervisor {
             return error_response(400, "bad-object-id", BAD_OBJECT);
         }
         let name = want.name();
-        if let Err(refused) = self.gate.admit(client, Some(&name)) {
-            return refused;
-        }
         let w = {
             let mut workers = self.workers.lock();
             if !workers.contains_key(&name) && workers.len() >= 2 * self.cfg.max_apps {

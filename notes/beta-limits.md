@@ -7,6 +7,13 @@ and workers ran without cgroup limits by default (`cgroup` unset, `[worker]` lim
 could touch `memory_mb × max_live_objects` (64 GiB) and every core. This branch (`beta/limits`)
 adds all three. ISSUES: B-301 to B-306.
 
+**Since then (trim pass, `trim/edge`, owner decision HANDOFF Q91):** the request-rate limits below
+(`rate`, `app_rate`, `governor`, the `X-Forwarded-For` reading that named a client behind a
+forwarder, and their tests and mutations M1 and M2) are removed. A fixed per-app cap throttles
+legitimate traffic below what a node serves and protects nothing the CPU, memory, connection and
+disk caps don't; operators who want rate limits set them at the edge (Caddy, a CDN). The connection
+caps and `trusted` stay. What follows describes the branch as it was, rates included.
+
 ## 1. Clients: rate limits and connection caps (`gate.rs`, `[clients]`)
 
 Both public listeners, the proxy's and a node's `listen`, go through one `Gate`:
@@ -228,7 +235,8 @@ sources match `cf/round3`'s (`wac` isn't installed here to build them).
    without a writable cgroup v2).
 2. **Client limit defaults** (100 requests/s per address, 1,000/s per app, bursts of twice that, 256
    connections per address, 10,000 in all): recommended as they are for a beta of a few developers,
-   raised per node when an app needs more.
+   raised per node when an app needs more. *Answered (Q91): no request rates; the connection caps
+   stay.*
 3. **Trust loopback as a forwarder by default?** Recommended: yes. Caddy and the proxy sit on loopback
    in the documented setup, and a local process can already reach a node directly; the alternative
    limits everyone behind a local terminator as one client.

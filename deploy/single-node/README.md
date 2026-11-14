@@ -125,16 +125,14 @@ keys in `nanovm.toml` and `proxy.toml`, 0 turns one off):
 
 | Key | Default | Past it, a client gets |
 |---|---|---|
-| `rate` | 100 requests/s per client address (an IPv6 /64), bursts of 200 | `429 rate-limited`, `Retry-After` |
-| `app_rate` | 1,000 requests/s per app, bursts of 2,000 | `429 rate-limited`, `Retry-After` |
-| `connections_per_client` | 256 | `503 too-many-connections`, `Retry-After: 1`, closed |
+| `connections_per_client` | 256 per client address (an IPv6 /64) | `503 too-many-connections`, `Retry-After: 1`, closed |
 | `connections` | 10,000 in all | new connections wait in the listen backlog |
-| `trusted` | loopback | forwarders: their own traffic isn't limited, and their `X-Forwarded-For` names the client |
+| `trusted` | loopback | forwarders: their connections aren't capped per client |
 
-Caddy on loopback is trusted by default and sets `X-Forwarded-For`, so each
-client gets its own limits. A terminator elsewhere: list it in the proxy's
-`[clients] trusted`, or all its clients share one limit. A node whose proxy is on
-another host: list the proxy in the node's `trusted`.
+Caddy on loopback is trusted by default. A terminator elsewhere: list it in the
+proxy's `[clients] trusted`, or it is capped as one client. A node whose proxy
+is on another host: list the proxy in the node's `trusted`. nanovm doesn't
+limit request rates; if you want them, set them in Caddy (or a CDN) in front.
 
 **Disk** (node config): `app_disk_mb`, what all of an app's objects' volumes may
 hold (default a quarter of `data_dir`'s filesystem): past it that app's writes

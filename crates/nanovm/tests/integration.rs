@@ -4617,96 +4617,23 @@ async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::Sock
     addr
 }
 
-/// A proxy in front of `node` serving `counter` at `counter.test` and
-/// `hostile` at `hostile.test`, with `clients` its client limits.
+/// A proxy in front of `node` serving `counter` at `counter.test`, with
+/// `clients` its client limits.
 async fn gated(test: &str, clients: nanovm::config::ClientLimits) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
     let (sup, node) = supervised(test).await;
-    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-    for (host, name) in [("counter.test", "counter"), ("hostile.test", "hostile")] {
-        let app = publish(&format!("{test}-{name}"), &app(name)).await;
-        records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", app.split_once('@').unwrap().0)]);
-    }
+    let app = publish(&format!("{test}-counter"), &app("counter")).await;
+    let record = vec![format!("app={}:latest; trust=dev dev", app.split_once('@').unwrap().0)];
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([("_nanovm.counter.test".to_string(), record)])));
     let cfg = nanovm::config::ProxyConfig {
         nodes: vec![node.to_string()], resolver: doh(records).await, dev: true, listen: "127.0.0.1:0".into(), clients,
-        // The operator serves both hosts and lets the dev identity deploy.
-        hosts: vec!["counter.test".into(), "hostile.test".into()], signers: vec!["dev dev".into()],
+        // The operator serves the host and lets the dev identity deploy.
+        hosts: vec!["counter.test".into()], signers: vec!["dev dev".into()],
         ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
     (sup, addr)
-}
-
-/// `GET /a/` on `host` with `extra` headers: the status line and headers,
-/// lowercased.
-async fn head_of(addr: std::net::SocketAddr, host: &str, extra: &str) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-    s.write_all(format!("GET /a/ HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out).await;
-    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
-    text.split_once("\r\n\r\n").map_or(text.clone(), |(h, _)| h.to_owned())
-}
-
-/// `n` requests at once to `host`, the `i`th with `extra(i)` headers: how
-/// many were answered 200, and how many 429 with a retry-after.
-async fn at_once(addr: std::net::SocketAddr, host: &str, n: usize, extra: impl Fn(usize) -> String) -> (usize, usize) {
-    let heads = futures::future::join_all((0..n).map(|i| {
-        let extra = extra(i);
-        async move { head_of(addr, host, &extra).await }
-    }));
-    let heads = heads.await;
-    let refused = |h: &String| h.starts_with("http/1.1 429") && h.contains("retry-after: ") && h.contains("x-nanovm-error: rate-limited");
-    (heads.iter().filter(|h| h.starts_with("http/1.1 200")).count(), heads.iter().filter(|h| refused(h)).count())
-}
-
-/// A client past its rate (here 1 a second, 2 at once) is answered 429
-/// with a retry-after, by the proxy and by a node it reaches directly. What
-/// it says in X-Forwarded-For is heard only from a trusted peer, and then
-/// only right of what the client wrote itself, so it can't spread its
-/// requests over addresses it makes up, nor spend another client's.
-#[tokio::test(flavor = "multi_thread")]
-async fn clients_past_their_rate_are_refused_however_they_forward() {
-    use nanovm::config::ClientLimits;
-    // 127.0.0.1 is a client like any other.
-    let untrusted = ClientLimits { rate: 1, trusted: vec!["192.0.2.1".into()], ..ClientLimits::default() };
-    let (_sup, proxy) = gated("rate_untrusted", untrusted).await;
-    let (ok, refused) = at_once(proxy, "counter.test", 10, |i| format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
-    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
-    // Behind a trusted terminator, each client has its own rate.
-    let trusted = ClientLimits { rate: 1, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
-    let (_sup, proxy) = gated("rate_trusted", trusted).await;
-    let from = |client: &str| format!("X-Forwarded-For: {client}\r\n");
-    // The terminator's own requests aren't limited (and start the app).
-    let (ok, _) = at_once(proxy, "counter.test", 10, |_| String::new()).await;
-    assert_eq!(ok, 10);
-    let (ok, refused) = at_once(proxy, "counter.test", 10, |_| from("198.51.100.1")).await;
-    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
-    // Whatever it writes before its own address.
-    let forged = ["203.0.113.66, 198.51.100.1", "198.51.100.2, 198.51.100.1", "127.0.0.1, 198.51.100.1", "junk, 198.51.100.1"];
-    assert_eq!(at_once(proxy, "counter.test", forged.len(), |i| from(forged[i])).await, (0, forged.len()));
-    assert_eq!(at_once(proxy, "counter.test", 1, |_| from("198.51.100.2")).await, (1, 0));
-    // A node reached directly limits its clients too.
-    let mut cfg = node_cfg("rate_node", 8);
-    cfg.clients = ClientLimits { rate: 1, trusted: vec![], ..ClientLimits::default() };
-    let (_sup, node) = supervised_with(cfg).await;
-    let counter = publish("rate-node", &app("counter")).await;
-    let statuses: Vec<_> = futures::future::join_all((0..10).map(|_| app_get(node, &counter, "/a/"))).await.into_iter().map(|r| r.0).collect();
-    assert!(statuses.iter().filter(|s| **s == 429).count() >= 7, "{statuses:?}");
-}
-
-/// Past an app's rate (here 1 a second, 2 at once), its requests are
-/// refused whichever client sends them; another app's are not.
-#[tokio::test(flavor = "multi_thread")]
-async fn apps_past_their_rate_are_refused() {
-    use nanovm::config::ClientLimits;
-    let limits = ClientLimits { rate: 0, app_rate: 1, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
-    let (_sup, proxy) = gated("app_rate", limits).await;
-    let (ok, refused) = at_once(proxy, "counter.test", 10, |i| format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
-    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
-    assert_eq!(at_once(proxy, "hostile.test", 1, |_| "X-Forwarded-For: 198.51.100.1\r\n".into()).await, (1, 0));
 }
 
 /// A client gets `connections_per_client` connections, past which one is

@@ -188,22 +188,16 @@ config! {
 }
 
 config! {
-    /// What one client, and one app, may ask of a public listener (see
+    /// The connections clients may hold open to a public listener (see
     /// `gate`). 0 turns a limit off.
     pub struct ClientLimits {
-        /// Requests a second from one client address (an IPv6 /64), with
-        /// bursts of twice that.
-        rate: u32 = 100u32,
-        /// Requests a second to one app, with bursts of twice that.
-        app_rate: u32 = 1000u32,
-        /// Connections open at once from one client address.
+        /// Connections open at once from one client address (an IPv6 /64).
         connections_per_client: usize = 256usize,
         /// Connections open at once in all: past it, new ones wait.
         connections: usize = 10_000usize,
-        /// Peers that forward other clients' requests (a TLS terminator, the
-        /// proxy), as addresses or CIDR ranges. Their own requests and
-        /// connections aren't limited, and a request's client is the last
-        /// address in its `X-Forwarded-For` that isn't one of theirs.
+        /// Peers that forward other clients' connections (a TLS terminator,
+        /// the proxy), as addresses or CIDR ranges: theirs aren't capped
+        /// per client.
         trusted: Vec<String> = vec!["127.0.0.1".to_string(), "::1".to_string()],
     }
 }
