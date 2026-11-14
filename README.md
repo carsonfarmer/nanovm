@@ -587,7 +587,7 @@ Tests: `restores_an_object_and_an_app_into_a_running_node` (two apps under a
 supervisor, through `nanovm admin`, one writing throughout; a version going back,
 the head over a damaged volume, a whole app, a paused object, refused names and a
 damaged version in the store, an unshippable local version),
-`a_restore_cut_short_is_finished_or_undone` (a crash at each of 9 points),
+`a_restore_cut_short_is_finished_or_undone` (a crash at each of its 5 points),
 `writes_go_on_through_a_store_outage_and_ship_in_order_after`,
 `an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox`, and
 `sqlite_restores_a_lost_node_from_the_store` (a SQLite app's worker killed

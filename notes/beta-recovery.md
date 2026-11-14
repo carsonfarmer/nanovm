@@ -54,12 +54,15 @@ Per object (`Supervisor::restore`, `ship::restore`):
    the digest that names it and against its own identity (app, object, sequence);
    rebuild the volume (`committed::restore`). If the version is older than the
    head, make a snapshot of it the version after the head (`committed::prepare`
-   with no changes), keeping the head's version as its parent. Give it all to the
+   with no changes), keeping the head's version as its parent. The object's
+   whole directory is staged so (`object/`: `data`, `committed` with the head's
+   version and any made after it, `shipped` naming the head). Give it all to the
    app's uid, `syncfs`.
-5. **Decide**: write `ready`, sync. **Install** by descriptor: remove the
-   object's journal (its undo was for the old volume), swap the volume, mark the
-   first staged version shipped, swap the versions directory, `syncfs`, remove
-   the staging. Each step can be taken again.
+5. **Decide**: write `ready`, sync. **Install** by descriptor: make the
+   object's shard if missing, remove the object's directory (its journal's undo
+   was for the old volume), rename the staged one into its place, `syncfs`,
+   remove the staging. Each step can be taken again. (Since `trim/storage`;
+   before, the volume, marker and versions were swapped one at a time.)
 6. Ship the version made, if one was (three tries), before letting the lease
    go: with leases only a held lease lets it ship, and a failover before it
    counts would restore the old head. Release the lease, resume.
@@ -116,14 +119,14 @@ root restores the counter at 60. Snapshots in the store: versions 1 and 17 only
   shipped and restored as its own. Now checked when shipping and restoring.
 - **B-503 (reproduced):** the end-to-end test's other app failed a write with
   `gap in committed versions`: the worker listed its versions while the shipper
-  pruned them. Fixed in `committed::head`.
+  pruned them. Fixed in `committed::head` (now `committed::list`).
 
 ## Tests
 
 | Test | What it shows |
 |---|---|
 | `restores_an_object_and_an_app_into_a_running_node` | Supervisor, two apps (jailed workers, root), through `nanovm admin`: app B writes throughout and never misses (each answer the next count); A's object to version 3 of 5 (made 6; answer says 4–5 stay), served at 3; `versions`; a damaged volume back to the head; a paused object answers `503 object-restoring` while its app's other object serves; a second restore of a paused object refused; the whole app; a local version the store refuses stops a restore and `--discard-unshipped` drops it; bad app and object names, a version past the head, a damaged version in the store refused, nothing changed; `/_nanovm/evict` unreachable from a client (404) or through an app (400); everything ships, `backlog` empties. |
-| `a_restore_cut_short_is_finished_or_undone` | A crash at each of 9 points, then `recover`: before `ready`, the object, its journal and versions are as they were; after, restored as the version after the head, which ships; nothing staged, nothing paused. |
+| `a_restore_cut_short_is_finished_or_undone` | A crash at each of 9 points (5 since `trim/storage` made install one swap), then `recover`: before `ready`, the object, its journal and versions are as they were; after, restored as the version after the head, which ships; nothing staged, nothing paused. |
 | `writes_go_on_through_a_store_outage_and_ship_in_order_after` | Above. |
 | `an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox` | `remote_ack` still fails the request (commit stands); without it, 300 KiB writes go on until `max_mb` (1 MiB), then `commit-failed`; every version kept; `backlog` = 4 versions. |
 | `a_commit_goes_on_past_versions_pruned_out_of_order` | B-503. |
