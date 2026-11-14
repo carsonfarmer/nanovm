@@ -133,6 +133,134 @@ Reaching 2,058 would mean removing behaviour: for instance `nanovm run`'s consol
 socket support, the supervisor's per-worker snapshot, the restore path's ship-first rule,
 or the test-only `flush_telemetry` route. Those are owner decisions, not trims.
 
+## Second pass: what each feature costs
+
+The coordinator asked for a price on every feature in the node's files, so the owner can
+choose what to drop. Lines are CI's count, at 3c9346c, in the node's files. A line shared
+by two features is counted in both. "Elsewhere" is code in other agents' files that goes
+with the feature, counted the same way. Each feature's lines were picked out by function
+and line range (`tmp/prices.py` in the worktree; not committed).
+
+### Features and behaviours
+
+| Feature | Node lines | Elsewhere | What users lose without it |
+|---|---|---|---|
+| Multi-node leases: lease renewal, a restore under a lease, the worker's lease and cross-node call routes, `call`, `Node::acquire`/`release`/`renewed`/`misdirected`, the `leases`/`name`/`lease_ms` keys and their load and validate rules | 121 | lease.rs 271; parts of ship.rs, object.rs, egress.rs, proxy.rs | Several nodes, failover of an object to another node (W-10). One node only. |
+| Worker cgroups at all: `Cgroup`, `cgroup`, `delegate`, `write`, `limit`, the spawn and start parts, the `cgroup` and `[worker]` keys | 109 | none | `[worker]` memory, CPU and pids limits per app worker (B-303), and cleanup of worker cgroups (N-700 to N-702). One app can use all the host's memory and cores. |
+| – of which cgroup `"auto"` (`delegate` and its two `match` arms) | 22 | none | The default that works under systemd `Delegate=yes`. The operator must make a delegated subtree, enable cpu, memory and pids for its children, and keep the supervisor out of it (cgroup v2's no-internal-process rule), e.g. in an `ExecStartPre` script, then set `cgroup = "<dir>"`. Otherwise the default becomes `"off"`. |
+| Live restore (`restore`, `restore_object`, the command arm, `held`'s object path) | 93 | ship.rs 150 (`restore`, `install`, `recover`, `pause`/`resume`/`paused`, staging) | `nanovm admin restore` on a running node, of one object or an app, to the head or an older version (B-500). A restore would need the node stopped and manual work. |
+| The admin socket (`admin.rs`, `Supervisor::command`'s dispatch, `nanovm admin`) | 77 | none | Every operator command below, and the one control path into a running node (B-208). |
+| `delete` / `delete-app` (`delete`, `remove`, the startup sweep of `deleted/`, `held`'s whole-app path) | 41 | ship.rs `Store::remove` (3 impls) | Erasing an object's or an app's data, in the store too (B-205; erasure requests). By hand it means stopping the node. |
+| Backlog: `admin backlog`, `count_backlog` (its log lines), the three `nanovm.capture.waiting.*` snapshot fields | 30 | ship.rs 19 | Seeing what waits to be shipped during a store outage (B-501). |
+| `pause` (public; `held`'s object path, and one test) | 14 | ship.rs (in the 150 above) | Only restore uses it. |
+| `admin versions` | 10 | none | Listing an object's versions in the store without the store's own tools. |
+| `admin apps` | 4 | none | Seeing which apps run, at which digest and pid. |
+| Shipper hold (`held`'s `shipping` set) | 6 | ship.rs ~5 (`Held`, `run`'s check) | A delete or restore could race the shipper on the same object (the integration's `the_shipper_passes_what_is_held_over`). |
+| Telemetry: the SDK export, spans, logs and snapshots (`telemetry.rs` up to `Relay`) | 214 | metrics.rs, object.rs, egress.rs calls | All observability: request spans, guest logs, snapshots (Q43, W-2, Q58-Q71). |
+| Telemetry relay (`Relay`, the worker's `/telemetry/` route with 3 slots) | 46 | none | Every trace, log and snapshot of a jailed worker: it has no network of its own. |
+| Telemetry stamping: each resource replaced by the supervisor's (wire level, N-74) | 41 | none | Tenant identity in exported telemetry. A worker could claim another app or version. See "Telemetry" below for a cheaper design. |
+| – plus scrubbing forged identity attributes from scopes, spans, events, links and log records | 17 | none | A compromised worker could put `nanovm.app` or `service.*` on its spans and logs, though its resource is stamped. Tested by `relay_stamps_identity_and_bounds_worker_requests`. |
+| Worker snapshots (`Node::with_engine`'s callback) | 28 | none | Per-app records of live objects, phases, poisons and counters. The tests' stats harness reads them. |
+| Supervisor snapshots (process; per worker: up, pid, digest, version, policies, starts, link errors) | 23 | none | As above, for workers. The tests' harness pairs them with the app records. |
+| `flush_telemetry` (used only by tests) | 13 | server.rs 6 (`/_nanovm/flush`) | Nothing user-visible. Tests would wait for the periodic (1 s) export instead of forcing one, so they get slower and need a new way to know a snapshot is fresh. |
+| Spare worker (`spare`, `refill`, `Spawned`, `start`'s take, `live`'s refill) | 31 | none | Every first request to an app and every version switch would pay a process spawn plus an engine build (the pool alone took about 7 ms; N-224). |
+| Start backoff (`Failed`, the 1 s check, recording the failure) | ~22 net | none | A broken app is started again on every request (a registry fetch and a spawn each) instead of once a second. |
+| Policy check of a running version (`MAX_POLICIES`) | 10 | registry.rs `authorize` | A request naming a new trust policy for a running version would restart the worker rather than check its signature (N-17, N-26). |
+| A switch finishes without its request (`live` runs `ensure` on the control runtime) | 10 | none | A version switch cancelled halfway when its requests go away (`a_switch_finishes_when_its_request_goes_away`). |
+| LRU eviction of an idle app for its slot (`slot`) | 20 | none | At `max_apps`, a new app is refused rather than taking the least recently used idle app's slot (N-22). |
+| `Worker::stop` (the one drain) | 12 | none | Required by any version switch. Not optional. |
+| Forgetting app entries past 2 × `max_apps` | 3 | none | The worker map grows with every app name ever asked for. |
+| Worker stderr forwarding and last words | 16 | none | Workers' stderr (guest panics, jail errors) and the reason a start failed. |
+| Bounded registry fetches (`fetch`, `MAX_FETCHES`, `load_timeout_ms`) | 12 | none | The memory and time bounds on fetches (N-4, N-22). |
+| Per-app uids (`app_dirs`' uid, `chown_tree`, `jail_uid_base`) | 32 | jail.rs | Workers of all apps run as one uid. A jail escape then reaches every app's data. |
+| Secrets: the file watcher and restart (`new`'s watcher, `retire`, `secrets_file`, the stamp) | 26 | none | A changed secrets file takes effect at the app's next worker start, not within about 1 s. Goes with the move to identity tokens. |
+| – all secrets code in the node's files (watcher, load in `start`, telemetry masking, `nanovm run --secrets`, the key) | 43 | secrets.rs 80 | Operator secrets for apps. Being replaced. |
+| Call-cycle checks (`wait_for`, `reaches`, callers, `enqueue`'s check) | 29 | egress.rs | A call that closes a cycle waits for its request timeout instead of an immediate 508 (Q45). |
+| WebSocket publishes from workers (egress `/publish`) | 8 | object.rs, ws.rs, proxy.rs | Publishes from jailed apps. |
+| `nanovm run`: WebSockets in-process (`local`, `event`, `Node::sockets`, `enqueue`'s event path) | 26 | ws.rs | Sockets under `nanovm run`. |
+| `nanovm run`: the console (`print`) | 38 | none | A line per request and the guest's output on the terminal. |
+| `nanovm run`: restart on change | 19 | none | Restarting by hand after a rebuild. |
+| `nanovm run`/tests: in-process shipping | 7 | none | Shipping without a supervisor. |
+| `nanovm publish` | 37 | registry.rs `push_app` | Publishing with another OCI tool (oras, crane), then signing as now. |
+| Request-head bounds (`bound_request_heads`) | 41 | none | N-75, N-691: a guest could hold many times its memory limit in request heads. |
+| Object cap and disk room (`Objects`) | 62 | object.rs, journal.rs | B-202, B-204: no per-app object cap, and new objects on a full disk. |
+| `heavy_lanes` key | 1 | none | Tuning the heavy lanes; fixed at half the cores. |
+| `front_threads` key | 1 | none | Tuning front-end threads; fixed at a quarter of the cores. Benchmarks that pin it change. |
+
+Some sums for the owner:
+- The dispensable-looking group comes to about 133 lines (2,344 → about 2,211). That is the spare (31), the start backoff (22), cgroup `"auto"` (22), the secrets watcher (26), the attribute scrub (17), `flush_telemetry` (13, with a test-harness change), and the two keys (2).
+- Adding multi-node leases (121) gives about 2,090.
+- 2,058 then needs about 32 more, e.g. backlog and apps (34), live restore (93), the admin socket (77), or cgroups beyond `"auto"` (87).
+
+### Configuration keys
+
+Each key costs one line in `config.rs`, plus the node lines that exist only for it:
+- `NodeConfig`:
+  - `listen` 1; `data_dir` 1 (core).
+  - `capture` 1, plus `CaptureConfig` 6, plus `load`'s `remote_ack` default 5 and `validate`'s 2 checks 6 (shipping, B-500, B-501).
+  - `max_live_objects` 1 (core); `max_objects_per_app` 1, plus `Objects`' cap about 12.
+  - `proxy` 1 (publishes, calls).
+  - `leases`, `name`, `lease_ms` 3, plus about 15 of rules (multi-node row).
+  - `telemetry_endpoint` 1; `memory_reservation_mb` 1; `epoch_tick_ms` 1 (tests set it).
+  - `heavy_lanes` 1; `front_threads` 1; `jail_uid_base` 1 (the ops configs set it).
+  - `limits` 1 (the manifest's caps); `worker` 1, plus `WorkerLimits` 5 and `host_memory_mb` 3 (cgroups row).
+  - `max_component_mb` 1; `max_apps` 1, plus `slot` 20 and forgetting 3; `load_timeout_ms` 1, plus 2.
+  - `dev` 1, plus `dev_on_loopback` 10; `secrets` 1 (secrets row).
+  - `cgroup` 1 (cgroups row); `clients` 1 (edge's).
+  - `app_disk_mb` 1; `disk_reserve_mb` 1 (quota.rs).
+- `ProxyConfig` (one line each; their code is in proxy.rs, edge's):
+  - `listen`, `nodes` (+3 in `validate`), `failover_ms` (+3), `publish_listen`, `telemetry_endpoint`;
+  - the six socket caps (Q55);
+  - `resolver`, `tag_ttl_s` (tests set 0), `dev`, `hosts` (+4), `signers` (+5), `clients`.
+- `ClientLimits` (edge's): `rate` and `app_rate` (being removed), `connections_per_client`, `connections`, `trusted`.
+- `CaptureConfig`: `max_mb`, `snapshot_every` (tests), `store`, `remote_ack` (+11 of rules).
+- `WorkerLimits`: `memory_mb` (+5 in `limit`, the N-704 check), `cpus` (+3), `pids` (+3; a VM test sets it).
+- `Limits`: the apps' manifest format (`nanovm.json`); removing any breaks manifests.
+
+### Structural review (supervisor.rs, telemetry.rs, table.rs)
+
+Each design question was checked against keeping every behaviour and test. None of the
+redesigns below saves lines without dropping something, so none was implemented in this
+pass. The numbers are drafts measured against this tree.
+
+- **Telemetry: could the relay become the SDK exporter plus a much smaller stamp?** The
+  SDK exporter is already what both ends use: the worker's exporter posts through its
+  egress link, and the supervisor's relay is the only hop with network. What remains is
+  the stamp (41) and the scrub (17).
+  - A resource-only stamp: walk the batch once, replace each resource, copy the rest. It
+    comes to about 20 lines (−38), but drops the scrub (a behaviour, and assertions in
+    `relay_stamps_identity_and_bounds_worker_requests` and
+    `stamping_matches_decoding_and_scrubbing`).
+  - Stamping in the Collector: the relay forwards bytes with an `nanovm-app` header, and
+    the Collector's `resource` processor upserts from request metadata (`include_metadata`).
+    That removes the stamp and the scrub (−58), but moves a security property (Q58: "only
+    the supervisor stamps identity") into deployment configuration.
+  - Decoding with prost was rejected by N-74 (200× the batch's size).
+  - Owner decisions, not trims.
+- **Worker lifecycle: do the states collapse?** After the first pass the states are:
+  - no worker;
+  - starting (single-flight, holding the last failure);
+  - live;
+  - stopping (`kill` sent);
+  - gone (`kill` closed).
+
+  Each transition has one path, `Worker::stop`, except two that pick which worker to stop:
+  `retire` (the secrets watcher) and `slot` (another app's LRU worker). Collapsing further
+  means dropping the backoff state (start backoff row) or the spare (spare row).
+- **Admin protocol: does it need its own framing?** It is one line of JSON in and one out,
+  three lines on each side. Serving HTTP on the socket (`server::serve_conn` already takes
+  any stream) would need a client too, a hyper handshake over a `UnixStream`. A draft came
+  to about 10 more lines; `nanovm admin` would also need curl or that client.
+- **The worker's egress handler as a struct** (`Egress { sup: Weak<Supervisor>, policy, app,
+  host, digest, exports }` with a `serve` method, instead of a closure cloning 11 values):
+  - The draft is +5 to +10 lines.
+  - It would save 5 string and path clones per egress request.
+  - It is a performance option, not a trim.
+- **table.rs:** objects leave the table four ways: `evict` (restore), `evict_lru`
+  (capacity), `try_retire` (the actor) and `renewed` (a lost session). Each is one
+  `remove`, under a different trigger. Snapshots and leases are priced above. The rest is
+  dispatch and the cycle check.
+
 ## Tests
 
 Each commit's message lists the tests it ran. The full suite on the final code (d0dc399),
