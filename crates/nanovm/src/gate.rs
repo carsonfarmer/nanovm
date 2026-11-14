@@ -97,15 +97,8 @@ where
         let sock = crate::server::accept(&listener).await;
         let Ok(peer) = sock.peer_addr().map(|a| a.ip()) else { continue };
         match gate.hold(peer) {
-            Some(held) => {
-                let f = f.clone();
-                crate::server::serve_conn(sock, header_timeout, move |req| {
-                    let _ = (&slot, &held);
-                    f(req)
-                })
-            }
-            None => crate::server::serve_conn(sock, Some(REFUSE_TIMEOUT), move |_| {
-                let _ = &slot;
+            Some(held) => crate::server::serve_conn(sock, header_timeout, (slot, held), f.clone()),
+            None => crate::server::serve_conn(sock, Some(REFUSE_TIMEOUT), slot, |_| {
                 let mut res = error_response(503, "too-many-connections", "this client has as many connections open as it may");
                 res.headers_mut().insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
                 res.headers_mut().insert(http::header::CONNECTION, HeaderValue::from_static("close"));

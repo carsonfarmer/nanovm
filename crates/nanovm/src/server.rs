@@ -28,7 +28,7 @@ where
     Fut: Future<Output = Response<RespBody>> + Send + 'static,
 {
     loop {
-        serve_conn(accept(&listener).await, None, f.clone());
+        serve_conn(accept(&listener).await, None, (), f.clone());
     }
 }
 
@@ -142,18 +142,21 @@ pub fn body_timeout() -> Response<RespBody> {
     error_response(408, "body-timeout", &BodyTimeout.to_string())
 }
 
-/// Serves HTTP/1.1 on one connection, in its own task. With `header_timeout`,
-/// a client that takes longer to send a request's headers (or leaves the
-/// connection idle that long between requests) is hung up on.
-pub fn serve_conn<I, F, Fut, B>(io: I, header_timeout: Option<Duration>, f: F) -> tokio::task::JoinHandle<Result<(), hyper::Error>>
+/// Serves HTTP/1.1 on one connection, in its own task, holding `guard` until
+/// the connection is done. With `header_timeout`, a client that takes longer
+/// to send a request's headers (or leaves the connection idle that long
+/// between requests) is hung up on.
+pub fn serve_conn<I, G, F, Fut, B>(io: I, header_timeout: Option<Duration>, guard: G, f: F)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    G: Send + Sync + 'static,
     F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response<B>> + Send + 'static,
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<crate::object::BoxError>,
 {
     let svc = service_fn(move |req| {
+        let _ = &guard;
         let res = f(req);
         async move { Ok::<_, Infallible>(res.await) }
     });
@@ -162,7 +165,7 @@ where
     if header_timeout.is_some() {
         builder.timer(TokioTimer::new()).header_read_timeout(header_timeout);
     }
-    tokio::spawn(builder.serve_connection(TokioIo::new(io), svc).with_upgrades())
+    tokio::spawn(builder.serve_connection(TokioIo::new(io), svc).with_upgrades());
 }
 
 pub async fn handle<B>(node: Arc<Node>, req: Request<B>) -> Response<RespBody>

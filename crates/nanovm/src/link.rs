@@ -99,7 +99,7 @@ where
                 return Ok(c);
             }
         }
-        let (mine, theirs) = std::os::unix::net::UnixStream::pair()?;
+        let (mine, theirs) = UnixStream::pair()?;
         // A busy peer (all threads instantiating, say) can fall behind on
         // its control socket; wait for it rather than fail the request.
         let start = std::time::Instant::now();
@@ -109,9 +109,7 @@ where
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        drop(theirs);
-        mine.set_nonblocking(true)?;
-        let io = TokioIo::new(UnixStream::from_std(mine)?);
+        let io = TokioIo::new(mine);
         let (tx, conn) = http1::Builder::new().max_header_size(crate::server::MAX_HEAD).handshake(io).await?;
         Ok(Conn { tx, conn: Some(conn) })
     }
@@ -205,11 +203,7 @@ where
         };
         let sock = std::os::unix::net::UnixStream::from(fd);
         sock.set_nonblocking(true)?;
-        let conn = crate::server::serve_conn(UnixStream::from_std(sock)?, None, f.clone());
-        tokio::spawn(async move {
-            let _ = conn.await;
-            drop(permit);
-        });
+        crate::server::serve_conn(UnixStream::from_std(sock)?, None, permit, f.clone());
     }
     Ok(())
 }

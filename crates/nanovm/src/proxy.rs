@@ -246,16 +246,13 @@ impl Proxy {
         let (name, headers) = self.resolve(&host).await?;
         let upgrading = ws::wants(&req);
         let (mut parts, body) = req.into_parts();
-        // Only the proxy names apps to the node.
-        let theirs: Vec<_> = parts.headers.keys().filter(|k| k.as_str().starts_with("nanovm-")).cloned().collect();
-        for k in theirs {
-            parts.headers.remove(k);
-        }
-        // Hop-by-hop headers belong to the client connection, not the node.
+        // Only the proxy names apps to the node, and hop-by-hop headers belong
+        // to the client connection, not the node.
         let h = &mut parts.headers;
-        let listed: Vec<_> = h.get_all(CONNECTION).iter().flat_map(|v| v.to_str().unwrap_or("").split(',')).collect();
-        let listed: Vec<HeaderName> = listed.iter().filter_map(|n| n.trim().parse().ok()).collect();
-        for k in listed.iter().chain(&[CONNECTION, UPGRADE, TE, TRAILER, PROXY_AUTHORIZATION]) {
+        let listed = h.get_all(CONNECTION).iter().flat_map(|v| v.to_str().unwrap_or("").split(','));
+        let mut theirs: Vec<HeaderName> = listed.filter_map(|n| n.trim().parse().ok()).collect();
+        theirs.extend(h.keys().filter(|k| k.as_str().starts_with("nanovm-")).cloned());
+        for k in theirs.iter().chain(&[CONNECTION, UPGRADE, TE, TRAILER, PROXY_AUTHORIZATION]) {
             h.remove(k);
         }
         for k in ["keep-alive", "proxy-connection"] {
@@ -286,9 +283,9 @@ impl Proxy {
         let pq = req.uri().path_and_query().map_or("/", |p| p.as_str()).to_owned();
         let uri = |node: &str| format!("http://{node}{pq}").parse::<http::Uri>().map_err(|_| (StatusCode::BAD_REQUEST, pq.clone()));
         // A body that ran out of time (N-505) is the client's fault: 408.
-        let bad_gateway = |e: hyper_util::client::legacy::Error| match crate::server::timed_out(&e) {
-            true => (StatusCode::REQUEST_TIMEOUT, e.to_string()),
-            false => (StatusCode::BAD_GATEWAY, e.to_string()),
+        let bad_gateway = |e: hyper_util::client::legacy::Error| {
+            let status = if crate::server::timed_out(&e) { StatusCode::REQUEST_TIMEOUT } else { StatusCode::BAD_GATEWAY };
+            (status, e.to_string())
         };
         // One node has nowhere else to send it: stream it there.
         if let [node] = &self.cfg.nodes[..] {
@@ -349,12 +346,10 @@ impl Proxy {
 
     async fn socket(self: &Arc<Self>, name: String, host: String, object: String, req: Request<Body>) -> Response<RespBody> {
         let sockets = {
+            // Pending opens, live connections and publishes each hold an Arc,
+            // and each open counts toward `max_sockets` before it waits.
             let mut apps = self.sockets.lock();
-            // Pending opens, live connections and publishes each hold an Arc.
             apps.retain(|_, s| Arc::strong_count(s) > 1);
-            if apps.len() >= self.cfg.max_sockets && !apps.contains_key(&name) {
-                return error_response(503, "socket-refused", "the proxy has max_sockets open");
-            }
             apps.entry(name.clone()).or_insert_with(|| Arc::new(Sockets::new(self.cfg.clone(), self.total.clone()))).clone()
         };
         let (proxy, max, target) = (self.clone(), (self.cfg.max_response_body_kb << 10) as usize, object.clone());
@@ -517,8 +512,8 @@ pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyh
 /// Private control port: network policy must restrict it to nodes.
 pub async fn serve_publish(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
     loop {
-        let p = proxy.clone();
-        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| p.clone().publish(req));
+        let (p, sock) = (proxy.clone(), crate::server::accept(&listener).await);
+        crate::server::serve_conn(sock, Some(CLIENT_TIMEOUT), (), move |req| p.clone().publish(req));
     }
 }
 
