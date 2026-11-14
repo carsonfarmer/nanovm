@@ -283,11 +283,8 @@ impl QuotaGuard {
         }
         self.journal(|j| {
             j.renamed(from, to);
-            Ok(())
+            file.as_ref().map_or(Ok(()), |(slot, bytes)| j.discard_created(slot, *bytes))
         })?;
-        if let Some((slot, bytes)) = file {
-            self.journal(|j| j.discard_created(&slot, bytes))?;
-        }
         self.adjust(0, -(dir as i64));
         Ok(())
     }
