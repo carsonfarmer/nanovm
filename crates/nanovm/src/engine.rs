@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
+use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 use sha2::{Digest, Sha256};
 use wasmtime::component::Component;
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, PoolingAllocationConfig};
@@ -88,12 +89,10 @@ pub fn preflight(cfg: &NodeConfig) -> anyhow::Result<()> {
     // Building the engine reserves every slot's memories, stacks and tables
     // (about 3.3 MiB) at once (N-671); the rest of the process gets 1 GiB.
     let need_as = n * (MEMORIES_PER_OBJECT * ((cfg.memory_reservation_mb << 20) + GUARD) + (4 << 20)) + (1 << 30);
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    // SAFETY: `lim` is a valid pointer for getrlimit.
-    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut lim) } == 0 && lim.rlim_cur != libc::RLIM_INFINITY {
-        let (need, have) = (need_as.div_ceil(1 << 30), lim.rlim_cur as u64 >> 20);
+    if let Some(limit) = getrlimit(Resource::As).current {
+        let (need, have) = (need_as.div_ceil(1 << 30), limit >> 20);
         anyhow::ensure!(
-            lim.rlim_cur as u64 >= need_as,
+            limit >= need_as,
             "max_live_objects = {} with memory_reservation_mb = {} reserves about {need} GiB of address space, \
              but RLIMIT_AS is {have} MiB; remove the limit (`ulimit -v unlimited` or LimitAS=infinity in the unit) \
              or lower max_live_objects or memory_reservation_mb",
@@ -104,23 +103,12 @@ pub fn preflight(cfg: &NodeConfig) -> anyhow::Result<()> {
 }
 
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit and returns the result.
+/// macOS rejects values above OPEN_MAX even when the hard limit is infinite;
+/// then the soft limit simply stays where it was.
 pub(crate) fn raise_nofile() -> anyhow::Result<u64> {
-    let mut lim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `lim` is a valid pointer for getrlimit/setrlimit. macOS
-    // rejects values above OPEN_MAX even when the hard limit is
-    // RLIM_INFINITY; then the soft limit simply stays where it was.
-    unsafe {
-        anyhow::ensure!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0, "getrlimit failed");
-        let soft = lim.rlim_cur;
-        lim.rlim_cur = lim.rlim_max;
-        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
-            lim.rlim_cur = soft;
-        }
-    }
-    Ok(lim.rlim_cur as u64)
+    let lim = getrlimit(Resource::Nofile);
+    let raised = setrlimit(Resource::Nofile, Rlimit { current: lim.maximum, ..lim }).is_ok();
+    Ok(if raised { lim.maximum } else { lim.current }.unwrap_or(u64::MAX))
 }
 
 /// Advances the engine epoch every `tick` on a dedicated thread. CPU budgets
