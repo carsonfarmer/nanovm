@@ -106,7 +106,7 @@ env -u RUST_BACKTRACE RUST_TEST_THREADS=1 cargo test --locked -p nanovm --test i
 ```
 
 These tests remain opt-in locally because they require the C toolchain and Wasm
-fixtures, but are mandatory in CI. The broader direct-linked mode/benchmark
+fixtures, but are mandatory in CI. The broader direct-linked mode
 experiments are not additional supported provider modes. See the
 [investigation and evidence](../../experiments/sqlite-filesystem/README.md).
 Physical power loss, media corruption and arbitrary host I/O faults are not

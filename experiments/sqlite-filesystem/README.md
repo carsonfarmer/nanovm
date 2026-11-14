@@ -177,105 +177,12 @@ overlapping ranges, truncate/regrow, rename/recreate, interrupted recovery,
 repeated KV replacement, and live unlinked handles. General host I/O failure
 injection remains separate work.
 
-## DELETE versus exclusive WAL benchmark
+## DELETE versus exclusive WAL
 
-Run after building the fixture:
-
-```sh
-cargo test --locked -p nanovm --test integration benchmark_database_modes -- --ignored --nocapture --test-threads=1
-```
-
-This writes raw samples to `target/sqlite-filesystem/benchmark-results.json`.
-[Recorded results](benchmark-results.json) are from 2026-11-02, an E2B orb on
-Linux 6.1.158+ x86_64, ext4, Rust 1.99.1, WASI SDK 34 and the committed dependency
-lockfile. The runtime is main's generic journal fixes through `40c5895`;
-there are no SQLite-specific runtime modifications. These are single-client
-orb measurements, not a production-storage throughput or concurrency claim.
-
-Method: 1,024 rows with 512-byte payloads, FULL sync, 2 MiB SQLite page cache,
-memory temporary storage, 16 MiB volume quota and 64 MiB guest memory. Initialization
-is checkpointed with TRUNCATE before warmup so deferred creation work does not
-favor either mode. Each case has three warmup requests and 25 measured requests,
-repeated three times with mode order rotated: 108 fresh databases and 2,700 timed
-requests. Compare DELETE with exclusive WAL at 16 and 1,000 checkpoint pages,
-with a cached connection or one reopened/closed on every request. Compilation,
-initialization, warmup and verification are outside timing. Request time includes
-in-process Node dispatch and the outer journal commit, not TCP/HTTP transport.
-
-The workloads are indexed point lookup, scanning all payload lengths, one
-varying-row update, 100 varying-row updates in one SQL transaction, 100 separate
-autocommit updates to the same row, and a 64 KiB blob overwrite that changes
-every byte. The batched and autocommit cases intentionally exercise different
-page locality; they are not a controlled comparison of SQL batching alone.
-
-**Mean milliseconds per request, including final close/checkpoint amortized
-over the 25 measured requests:**
-
-| Connection | Workload | DELETE | WAL-16 | WAL-1000 |
-| --- | --- | ---: | ---: | ---: |
-| Cached | Point lookup | 0.24 | 0.22 | 0.24 |
-| Cached | Length scan | 0.59 | 0.63 | 0.55 |
-| Cached | One update | 5.46 | 3.13 | 3.06 |
-| Cached | 100-update transaction | 14.76 | 24.88 | 7.04 |
-| Cached | 100 autocommit updates | 206.58 | 41.29 | 103.87 |
-| Cached | 64 KiB overwrite | 16.04 | 30.96 | 3.33 |
-| Reopened | Point lookup | 0.63 | 2.47 | 2.47 |
-| Reopened | Length scan | 1.82 | 4.09 | 4.12 |
-| Reopened | One update | 5.60 | 5.62 | 5.56 |
-| Reopened | 100-update transaction | 14.16 | 14.72 | 13.69 |
-| Reopened | 100 autocommit updates | 207.75 | 33.44 | 64.55 |
-| Reopened | 64 KiB overwrite | 15.21 | 14.48 | 15.37 |
-
-Cached-connection request latency, **p50 / p95 milliseconds**, excluding the
-separate final close (75 samples per cell, nearest-rank p95):
-
-| Workload | DELETE | WAL-16 | WAL-1000 |
-| --- | ---: | ---: | ---: |
-| Point lookup | 0.21 / 0.42 | 0.14 / 0.24 | 0.13 / 0.26 |
-| Length scan | 0.57 / 0.82 | 0.53 / 0.74 | 0.45 / 0.65 |
-| One update | 5.27 / 7.16 | 2.29 / 4.13 | 2.23 / 3.03 |
-| 100-update transaction | 13.99 / 21.41 | 23.73 / 39.66 | 2.68 / 3.45 |
-| 100 autocommit updates | 200.92 / 275.33 | 39.67 / 54.59 | 108.15 / 142.96 |
-| 64 KiB overwrite | 14.37 / 26.57 | 29.95 / 46.49 | 2.73 / 6.16 |
-
-Final close for cached WAL-1000's batched updates costs 91–115 ms: ignoring it
-would overstate the improvement. Warmup is excluded, but any remaining warmup
-frames flushed by final close are included, conservatively charging WAL for them.
-WAL-16 is fastest for repeated same-row autocommits, but slower than DELETE for
-batched updates and large overwrites. WAL-1000 allows more deferred work and
-larger files. Closing every request removes most of WAL's write advantage and
-adds overhead even to reads.
-
-For cached 100-autocommit requests, mean SQLite VFS write traffic and sync calls,
-including amortized final close, are:
-
-| Mode | KiB written/request | VFS sync calls/request |
-| --- | ---: | ---: |
-| DELETE | 1,652.73 | 300.00 |
-| WAL-16 | 427.66 | 118.80 |
-| WAL-1000 | 402.83 | 100.32 |
-
-These are **SQLite's writes and sync calls, not total host writes/fsyncs**:
-nanovm also persists undo records, directories and its outer commit. Fewer VFS
-syncs do not guarantee less latency (WAL-1000 versus WAL-16 demonstrates that).
-The largest observed database+WAL size between requests is 4,619.47 KiB for
-WAL-1000; WAL-16 reaches 800.48 KiB in the blob case. This sampling excludes
-within-request peaks, transient DELETE journals and the outer undo/retained
-storage, so it is not a complete disk-budget bound. No host-fsync or CPU profile
-was collected; the exact source of the checkpoint-policy latency difference is
-not established by these measurements.
-
-All 108 cases check response values, final totals and SQLite integrity outside
-timing. Independent native SQLite validation additionally checked every final
-row value and complete blob payload: 110,592 rows across 108 databases. The
-six correctness tests also pass, including all 689 fault cuts and the existing
-DELETE-mode worker SIGKILL test. No latency thresholds are asserted in CI;
-the benchmark is deliberately separate from the `sqlite_` correctness filter.
-
-**Decision:** use DELETE internally, with no app-facing journal controls.
-WAL remains implementation research: neither tested checkpoint threshold is a
-universal best setting. Do not weaken sync or outer request durability to obtain
-the measured benefit: both modes used FULL throughout.
+Decided 2026-11-02 from a single-client benchmark (108 databases, 2,700 timed
+requests, FULL sync in both modes; the test and raw results are in git history):
+use DELETE internally, with no app-facing journal controls. Exclusive WAL stays
+implementation research; neither checkpoint threshold tested was best everywhere.
 
 ## Component composition proof
 
