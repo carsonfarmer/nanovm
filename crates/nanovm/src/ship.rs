@@ -32,7 +32,7 @@
 //! worker writes, by name from a descriptor, never through a symlink.
 
 use std::io::{self, ErrorKind};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,7 +64,9 @@ pub type Tag = UpdateVersion;
 pub trait Store: Send + Sync {
     /// Stores `bytes` at `key`, unless something is there.
     async fn put(&self, key: &str, bytes: Vec<u8>) -> io::Result<Put>;
-    async fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>>;
+    async fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        Ok(self.read(key).await?.map(|(bytes, _)| bytes))
+    }
     /// The record at `key`, and its version.
     async fn read(&self, key: &str) -> io::Result<Option<(Vec<u8>, Tag)>>;
     /// Writes the record at `key` if it is still at `tag` (none: absent):
@@ -103,12 +105,7 @@ pub struct Dir(pub PathBuf);
 /// through a symlink. Returns its name.
 fn written(dir: &OwnedFd, bytes: &[u8], synced: bool) -> io::Result<String> {
     use std::io::Write;
-    let mut name = [0u8; 8];
-    // SAFETY: getentropy writes at most `name.len()` bytes into `name`.
-    if unsafe { libc::getentropy(name.as_mut_ptr().cast(), name.len()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let name = format!("~new.{:016x}", u64::from_ne_bytes(name));
+    let name = format!("~new.{:016x}", u64::from_ne_bytes(crate::journal::key()?));
     let new = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut file = std::fs::File::from(openat(dir, &name, new, Mode::from_raw_mode(0o644))?);
     match file.write_all(bytes).and_then(|()| if synced { file.sync_all() } else { Ok(()) }) {
@@ -162,18 +159,13 @@ impl Store for Dir {
         .await?
     }
 
-    async fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-        match tokio::fs::read(self.0.join(key)).await {
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            r => r.map(Some),
-        }
-    }
-
     async fn read(&self, key: &str) -> io::Result<Option<(Vec<u8>, Tag)>> {
-        Ok(self.get(key).await?.map(|bytes| {
-            let at = tag(&bytes);
-            (bytes, at)
-        }))
+        let bytes = match tokio::fs::read(self.0.join(key)).await {
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            bytes => bytes?,
+        };
+        let at = tag(&bytes);
+        Ok(Some((bytes, at)))
     }
 
     async fn swap(&self, key: &str, bytes: Vec<u8>, at: Option<&Tag>) -> io::Result<Option<Tag>> {
@@ -220,17 +212,11 @@ pub struct Objects(pub Arc<dyn ObjectStore>);
 #[async_trait::async_trait]
 impl Store for Objects {
     async fn put(&self, key: &str, bytes: Vec<u8>) -> io::Result<Put> {
-        match self.0.put_opts(&key.into(), bytes.clone().into(), PutMode::Create.into()).await {
-            Ok(_) => Ok(Put::Stored),
-            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
-                Ok(if self.get(key).await?.is_some_and(|b| b == bytes) { Put::Same } else { Put::Conflict })
-            }
-            Err(e) => Err(io::Error::other(e)),
-        }
-    }
-
-    async fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
-        Ok(self.read(key).await?.map(|(bytes, _)| bytes))
+        Ok(match self.swap(key, bytes.clone(), None).await? {
+            Some(_) => Put::Stored,
+            None if self.get(key).await?.is_some_and(|b| b == bytes) => Put::Same,
+            None => Put::Conflict,
+        })
     }
 
     async fn read(&self, key: &str) -> io::Result<Option<(Vec<u8>, Tag)>> {
@@ -492,46 +478,37 @@ pub type Held = tokio::sync::RwLock<std::collections::HashSet<String>>;
 /// logged, and tried again a second later. An object this node holds no
 /// live lease on waits, quietly, until it does.
 pub async fn run(objects: PathBuf, store: Arc<dyn Store>, leases: Option<Arc<Leases>>, held: Arc<Held>) {
-    // None while being shipped: it comes back on `done`.
-    let mut known: std::collections::HashMap<PathBuf, Option<Shipping>> = Default::default();
-    let (back, mut done) = tokio::sync::mpsc::unbounded_channel();
+    // Locked while the object is being shipped.
+    let mut known: std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<Shipping>>> = Default::default();
     let slots = Arc::new(tokio::sync::Semaphore::new(SHIPPING));
     loop {
-        while let Ok((dir, state)) = done.try_recv() {
-            known.insert(dir, Some(state));
-        }
         for (app, object) in object_dirs(&objects) {
             let dir = crate::committed::directory(&object.path());
             let Ok(changed) = dir.metadata().and_then(|m| m.modified()) else { continue };
-            let entry = known.entry(dir.clone()).or_insert_with(|| Some(Shipping::default()));
-            let Some(state) = entry else { continue };
+            let Ok(mut state) = known.entry(dir.clone()).or_default().clone().try_lock_owned() else { continue };
             // Skip an object nothing was published for since its last round:
             // its directory's time is the same, and older than the clock's tick.
-            let changed = Some(changed);
-            let old = changed.is_some_and(|t| t.elapsed().is_ok_and(|e| e > Duration::from_millis(100)));
-            if (old && state.seen == changed) || state.retry.is_some_and(|t| t > std::time::Instant::now()) {
+            let old = changed.elapsed().is_ok_and(|e| e > Duration::from_millis(100));
+            if (old && state.seen == Some(changed)) || state.retry.is_some_and(|t| t > std::time::Instant::now()) {
                 continue;
             }
-            let mut state = entry.take().expect("not being shipped");
             let id = object.file_name().to_string_lossy().into_owned();
-            let (store, leases, slots, back, held) = (store.clone(), leases.clone(), slots.clone(), back.clone(), held.clone());
+            let (store, leases, slots, held) = (store.clone(), leases.clone(), slots.clone(), held.clone());
             tokio::spawn(async move {
                 let _slot = slots.acquire().await;
                 let held = held.read().await;
                 state.retry = None;
                 if held.contains(&app) || held.contains(&format!("{app}/{id}")) {
-                    let _ = back.send((dir, state));
                     return;
                 }
                 match ship_object(&*store, leases.as_deref(), &app, &id, &dir, &mut state.head).await {
-                    Ok(true) => state.seen = changed,
+                    Ok(true) => state.seen = Some(changed),
                     Ok(false) => {}
                     Err(e) => {
                         eprintln!("nanovm: shipping {app}/{id}: {e}");
                         state.retry = Some(std::time::Instant::now() + Duration::from_secs(1));
                     }
                 }
-                let _ = back.send((dir, state));
             });
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -823,12 +800,7 @@ pub fn paused(objects: &Path, id: &str) -> bool {
 fn sync_fs(path: &Path) -> io::Result<()> {
     #[cfg(test)]
     tests::sync_point()?;
-    let dir = std::fs::File::open(path)?;
-    // SAFETY: `dir` is open for the call.
-    match unsafe { libc::syncfs(dir.as_raw_fd()) } {
-        0 => Ok(()),
-        _ => Err(io::Error::last_os_error()),
-    }
+    Ok(rustix::fs::syncfs(std::fs::File::open(path)?)?)
 }
 
 #[cfg(test)]

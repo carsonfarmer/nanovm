@@ -830,7 +830,7 @@ fn shape(e: &std::io::Error) -> bool {
 }
 
 /// A key no guest can guess.
-fn key() -> std::io::Result<[u8; 8]> {
+pub(crate) fn key() -> std::io::Result<[u8; 8]> {
     let mut key = [0; 8];
     // SAFETY: getentropy writes at most `key.len()` bytes into `key`.
     if unsafe { libc::getentropy(key.as_mut_ptr().cast(), key.len()) } != 0 {
