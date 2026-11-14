@@ -594,13 +594,13 @@ impl Journal {
     }
 
     /// What this request changed in the volume, given the `paths` it
-    /// touched: the directories whose entries changed, then each file
-    /// changed in place as the ranges that changed, and anything new or
-    /// moved whole.
-    fn changes(&self, paths: &[PathBuf]) -> std::io::Result<committed::Changes> {
+    /// touched, as a version records it: the directories whose entries
+    /// changed, with their entries; each file changed in place, with its
+    /// length and the ranges that changed; and anything new or moved whole.
+    fn changes(&self, paths: &[PathBuf]) -> std::io::Result<committed::Manifest> {
         let inside = |p: &Path| p.strip_prefix(&self.volume).ok().map(Path::to_path_buf);
         let moved: Vec<_> = self.moved.iter().filter_map(|m| inside(&self.base.join(m))).collect();
-        let mut c = committed::Changes::default();
+        let mut c = committed::Manifest::default();
         for p in paths {
             let Some(rel) = inside(p).filter(|rel| !moved.iter().any(|m| rel.starts_with(m))) else { continue };
             let md = match std::fs::symlink_metadata(p) {
@@ -609,18 +609,28 @@ impl Journal {
                 Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => continue,
                 Err(e) => return Err(e),
             };
+            let name = committed::name(&rel)?;
             match self.sized.get(&md.ino()) {
-                _ if md.is_dir() => c.listed.push(rel),
+                _ if md.is_dir() => {
+                    let mut entries = std::collections::BTreeSet::new();
+                    for entry in std::fs::read_dir(p)? {
+                        let entry = entry?;
+                        entries.insert((committed::name(Path::new(&entry.file_name()))?, entry.file_type()?.is_dir()));
+                    }
+                    c.listed.insert(name, entries);
+                }
                 Some(saved) => {
                     let grown = saved.len..md.len();
                     let ranges = saved.ranges.iter().chain(Some(&grown).filter(|g| !g.is_empty()));
-                    let ranges = ranges.filter(|r| r.start < md.len()).map(|r| r.start..r.end.min(md.len())).collect();
-                    c.patched.push((rel, ranges));
+                    let ranges = ranges.filter(|r| r.start < md.len()).map(|r| (r.start, r.end.min(md.len()) - r.start)).collect();
+                    c.patched.insert(name, (md.len(), ranges));
                 }
-                None => c.whole.push(rel),
+                None => _ = c.whole.insert(name),
             }
         }
-        c.whole.extend(moved.into_iter().filter(|m| self.volume.join(m).exists()));
+        for m in moved.iter().filter(|m| self.volume.join(m).exists()) {
+            c.whole.insert(committed::name(m)?);
+        }
         Ok(c)
     }
 

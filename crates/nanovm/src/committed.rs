@@ -14,7 +14,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, FileTimes};
 use std::io::{self, ErrorKind, Read, Write};
-use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -46,26 +45,18 @@ pub struct Version {
     pub snapshot: bool,
 }
 
-/// What a commit changed in its volume; paths are relative to it.
-#[derive(Default)]
-pub(crate) struct Changes {
-    /// Directories whose entries changed.
-    pub listed: Vec<PathBuf>,
-    /// Files and directory trees taken whole.
-    pub whole: Vec<PathBuf>,
-    /// Files changed in place, with the ranges of them that changed.
-    pub patched: Vec<(PathBuf, Vec<Range<u64>>)>,
-}
-
-/// How a version that is a change records it: each listed directory's
-/// entries (and whether each is a directory), whole entries (under `data/`)
-/// and each patched file's length and changed ranges (bytes under `patch/`).
+/// What a commit changed in its volume (`Journal::changes`), as a version
+/// that is a change records it; paths are relative to the volume: each
+/// directory whose entries changed with its entries (and whether each is a
+/// directory), entries taken whole (under `data/`) and each file patched
+/// in place with its length and changed ranges, start and length (bytes
+/// under `patch/`).
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Manifest {
-    listed: BTreeMap<String, BTreeSet<(String, bool)>>,
-    whole: BTreeSet<String>,
-    patched: BTreeMap<String, (u64, Vec<(u64, u64)>)>,
+pub(crate) struct Manifest {
+    pub listed: BTreeMap<String, BTreeSet<(String, bool)>>,
+    pub whole: BTreeSet<String>,
+    pub patched: BTreeMap<String, (u64, Vec<(u64, u64)>)>,
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -144,7 +135,7 @@ impl Write for Bounded {
     }
 }
 
-fn name(path: &Path) -> io::Result<String> {
+pub(crate) fn name(path: &Path) -> io::Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| invalid("non-UTF-8 path"))
 }
 
@@ -162,7 +153,7 @@ pub(super) fn prepare(
     epoch: u64,
     cap: &CaptureConfig,
     key: &[u8; 8],
-    changes: Option<&Changes>,
+    changes: Option<&Manifest>,
 ) -> io::Result<()> {
     let (versions, _) = list(out)?;
     let (last, used) = (versions.last().map_or(0, |v| v.0), versions.iter().map(|v| v.1).sum::<u64>());
@@ -208,23 +199,8 @@ pub(super) fn prepare(
     };
     append("nanovm.json", &metadata)?;
     let mut whole = vec![PathBuf::new()];
-    if let Some(changes) = changes.filter(|_| !version.snapshot) {
-        let mut manifest = Manifest::default();
-        for dir in &changes.listed {
-            let mut entries = BTreeSet::new();
-            for entry in fs::read_dir(volume.join(dir))? {
-                let entry = entry?;
-                entries.insert((name(Path::new(&entry.file_name()))?, entry.file_type()?.is_dir()));
-            }
-            manifest.listed.insert(name(dir)?, entries);
-        }
-        for (path, ranges) in &changes.patched {
-            let len = fs::metadata(volume.join(path))?.len();
-            let ranges = ranges.iter().map(|r| (r.start, r.end - r.start)).collect();
-            manifest.patched.insert(name(path)?, (len, ranges));
-        }
-        manifest.whole = changes.whole.iter().map(|p| name(p)).collect::<io::Result<_>>()?;
-        append("changes.json", &serde_json::to_vec(&manifest)?)?;
+    if let Some(manifest) = changes.filter(|_| !version.snapshot) {
+        append("changes.json", &serde_json::to_vec(manifest)?)?;
         for (path, (_, ranges)) in &manifest.patched {
             let file = File::open(volume.join(path))?;
             let mut bytes = vec![];
@@ -235,20 +211,17 @@ pub(super) fn prepare(
             }
             append(&format!("patch/{path}"), &bytes)?;
         }
-        whole = changes.whole.clone();
+        whole = manifest.whole.iter().map(PathBuf::from).collect();
     }
-    // Directories before what is in them, so a reader can make each in turn.
-    while let Some(path) = whole.pop() {
-        let source = volume.join(&path);
-        let kind = fs::symlink_metadata(&source)?.file_type();
-        if !kind.is_dir() && !kind.is_file() {
-            return Err(invalid("unsupported capture file type"));
-        }
-        archive.append_path_with_name(&source, Path::new("data").join(&path))?;
-        if kind.is_dir() {
-            for entry in fs::read_dir(&source)? {
-                whole.push(path.join(entry?.file_name()));
-            }
+    // A tree's directories before what is in them, so a reader can make
+    // each in turn. A volume holds files and directories only: the quota'd
+    // filesystem refuses links and symlinks, and `apply` refuses anything
+    // else.
+    for path in whole {
+        let (source, name) = (volume.join(&path), Path::new("data").join(&path));
+        match source.is_dir() {
+            true => archive.append_dir_all(name, source)?,
+            false => archive.append_path_with_name(source, name)?,
         }
     }
     drop(archive.into_inner()?);
