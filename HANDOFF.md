@@ -6,6 +6,8 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## Current state (2026-11-08)
 
+**Cleanup follow-up (2026-11-15):** `review/main` removes superseded experiments and unused dependencies without runtime-source changes. Its merge now excludes README-only and publishing-workflow-only edits from guest publication. Explicit merge/push requests cover their existing automatic workflows; see AGENTS.md. Filter evidence is in `notes/review-main.md`.
+
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
 and is included in this main integration from `w9-atomic-capture`. Bounded, opt-in
 immutable capture now uses the real journal's decision at both commit gates.

@@ -441,3 +441,21 @@ Each has a recommended answer, so "yes" accepts it.
    lands? **Yes, after.**
 10. Take `publish-app.yml` out of `.github/workflows` and keep it as a README snippet (O10)?
     **Yes.**
+
+## Merge follow-up (2026-11-15)
+
+Independent source review found no cleanup blocker. The exact cleanup head
+`e4e2cba` passed CI run 43559246550, including production check, example builds,
+167 library tests, 107 reported integration passes and all 12 SQLite tests.
+
+The owner authorized merging without publication and removing redundant approval
+for automatic workflows covered by a merge/push request. N-938 excludes READMEs
+from guest publication and removes the publisher's own workflow path: otherwise
+the filter fix itself would publish. Manual dispatch and source/build triggers stay.
+
+Validation uses Bun 1.4.4's YAML parser and glob matcher against the workflow's
+ordered positive/negative path patterns, the actual main-to-cleanup changed paths,
+README-only and workflow-only cases, and code/lockfile/build-script controls.
+The original filter fails five cases; the fixed filter passes all eleven path
+cases plus branch and manual-dispatch controls. This is local filter evaluation,
+not a publication or a live GitHub workflow dispatch. Runtime-line delta: 0.

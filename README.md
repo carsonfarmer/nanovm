@@ -310,6 +310,8 @@ What happens on the first request for a digest:
 
 **Publishing.** `nanovm publish app.wasm <registry>/<repository>:<version> [--manifest nanovm.json]` pushes an app as nodes pull it: artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, the component as its one `application/wasm` layer, the tag as its version. It first checks the component as a node will (imports, handler export, manifest), and prints the digest, how to sign and the TXT record. Registry credentials come from `NANOVM_REGISTRY_USER`/`NANOVM_REGISTRY_TOKEN`. [.github/workflows/publish-app.yml](.github/workflows/publish-app.yml) is a manual template that builds one app, publishes it and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity; [publish-guests.yml](.github/workflows/publish-guests.yml) does the same for the test guests with `oras`. No key exists anywhere. A person can sign from a laptop with `cosign` and a browser sign-in (not yet tested end to end, W-102).
 
+README-only and publishing-workflow-only edits do not automatically publish test guests. Guest/provider code and build-script changes on `main` still do; `publish-guests` also supports explicit manual runs.
+
 ## Key-value and config
 
 **`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. The counter and hostile guest packages compose this provider; `tools/build-app.sh` composes it into any app that imports it. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.

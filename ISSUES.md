@@ -9,6 +9,12 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 ## Problems
 
+### N-938: documentation-only changes could publish guest packages
+- **Where:** `.github/workflows/publish-guests.yml`
+- **Scenario:** README changes under `components/keyvalue` or `guests`, and edits to the publishing workflow itself, matched the package-publication filter on merge to main.
+- **Fix:** exclude READMEs and remove the publishing workflow from its own positive path filter. Guest/provider code, lockfiles and build-script changes still publish; manual dispatch remains available.
+- **Status:** fixed on `fix/review-main-publishing`, pending merge; the actual cleanup path set fails the original filter and passes the corrected filter, with code/build controls unchanged. Validation: `notes/review-main.md`.
+
 Found by the review at `c607ec9`, unless an entry says otherwise; line numbers are as of that commit.
 
 ### N-1: a registry app's egress list can name private and loopback addresses
