@@ -459,7 +459,7 @@ Sibling temporary files now avoid extra directory syncs; small-call and remainin
 write costs still need attention. The dependency patch is not enabled. Publishing migrated guests on main remains a separate
 approval from safe branch milestone pushes.
 
-**Bounded backend screen (Q78):** [experiment and measurements](experiments/fs-backends/README.md)
+**Bounded backend screen (Q78):** experiment and measurements (removed; see git history)
 compare the real journal with redb COW pages and SHA-256-addressed pages. Plain
 pages reduce small-mutation/batch latency; hashing pays for repeated cross-file
 content but slows unique large writes. Both slow warm reads and have fixed
@@ -508,7 +508,7 @@ matched comparison: small writes improve about 3× and unique 1 MiB writes reach
 parity, but cold/recovery/churn remain 3–5× slower and replacement runtime grows
 294 lines. This rejects the present per-object redb replacement, not pages in
 principle. Continue the source-supported journal/runtime improvements from the
-other branch with independent controls. [Decision and reproduction](experiments/fs-backends/README.md#adoption-decision-retain-journaling-2026-11-05).
+other branch with independent controls. Decision and reproduction (removed; see git history).
 
 **Historical integration gate (Q80):** `hashed-fs-integration` owns the next implementation.
 Whole-namespace orphan scans are removed (Q81), and real-file I/O failure matrices
@@ -532,7 +532,7 @@ descriptor-drop, acceptance, quota-reclamation and rejection/restart coverage;
 premature inode release fails the regression, and restored code passes. Finish
 persistent-cap/RSS amplification, ancestor-directory durability and backend-neutral
 optional SQLite oracles. Investigate eager database creation/reopening before
-accepting cold/churn regressions. [Current evidence and successor prompt](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05).
+accepting cold/churn regressions. Current evidence and successor prompt (removed; see git history).
 
 The separate improvement branch's source assessment is in HANDOFF (2026-11-04).
 Reuse its benchmark instrumentation and lazy-bucket idea, but measure any provider,
@@ -633,7 +633,7 @@ experiment and the new runtime TAR output are distinct formats.
 
 **Engineering choice, not an approved replication architecture:** establish an
 ordered immutable version contract before placement. The executable
-`cargo run --locked -p nanovm --example committed_state` uses the actual Journal,
+W-9 proof (since replaced by `ship.rs`; in git history) uses the actual Journal,
 copies full file/namespace state while its fixture owns the writer, transfers to
 independent receiver processes and restores after removing the source directory.
 This is a storage-only reference experiment, not offline-backup extension or a

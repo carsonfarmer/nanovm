@@ -1029,7 +1029,7 @@ async fn http_front_end() {
         b"",
     ).await;
     assert_eq!(status, 204, "{body}");
-    assert!(body.is_empty(), "readiness must not return a stats snapshot: {body}");
+    assert!(body.is_empty(), "readiness has no body: {body}");
     assert_eq!(node.live_objects(), 0);
 
     let (status, body) = raw(
@@ -1056,10 +1056,6 @@ async fn http_front_end() {
     );
     let (status, _) = raw(addr, &head, &big).await;
     assert_eq!(status, 413);
-
-    for path in ["/_nanovm/stats", "/_nanovm/events"] {
-        assert_eq!(http_get(addr, path).await.0, 404);
-    }
 
     let (status, _) = raw(
         addr,
@@ -1150,7 +1146,7 @@ fn names(app: &str) -> String {
     format!("nanovm-app: {app}\r\nnanovm-trust: dev dev\r\n")
 }
 
-/// The app's name on the node (its worker's, in stats and cgroups).
+/// The app's name on the node (its worker's, in snapshots and cgroups).
 fn worker(app: &str) -> String {
     nanovm::registry::app_name("", &app.parse().unwrap())
 }
@@ -1181,9 +1177,7 @@ async fn stats_json(addr: std::net::SocketAddr) -> serde_json::Value {
 async fn supervised_workers_contain_attacks() {
     let (_sup, addr) = supervised("supervised_workers_contain_attacks").await;
     assert_eq!(http_get(addr, "/_nanovm/ready").await, (204, String::new()));
-    for path in ["/_nanovm/stats", "/_nanovm/events"] {
-        assert_eq!(http_get(addr, path).await.0, 404);
-    }
+    assert_eq!(http_get(addr, "/_nanovm/nope").await.0, 404);
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
 
     let (status, body) = app_get(addr, &counter, "/s/").await;
@@ -1209,7 +1203,7 @@ async fn supervised_workers_contain_attacks() {
     let (status, body) = http_get(addr, "/s/").await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(app_get(addr, &hostile, "//s/").await.0, 400);
-    assert_eq!(app_get(addr, &hostile, "/_nanovm/stats").await.0, 400);
+    assert_eq!(app_get(addr, &hostile, "/_nanovm/ready").await.0, 400);
 
     let v = stats_json(addr).await;
     assert!(v["rss_mb"].as_f64().unwrap() > 0.0, "{v}");
@@ -3051,76 +3045,6 @@ async fn sqlite_exclusive_wal_checkpoints() {
     node.shutdown().await;
 }
 
-/// Manual benchmark, deliberately outside the `sqlite_` correctness-test filter.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "manual SQLite benchmark; requires the separately built experiment"]
-async fn benchmark_database_modes() {
-    let cfg = node_cfg("sqlite_benchmark", 8);
-    let mut app = app("counter");
-    app.limits.memory_mb = 64;
-    app.limits.disk_mb = 16;
-    app.limits.cpu_ms = 10_000;
-    app.limits.request_timeout_ms = 30_000;
-    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
-    let node = Node::new(cfg, &app, &wasm, None).unwrap();
-    let variants = [("DELETE", 1000), ("WAL", 16), ("WAL", 1000)];
-    let mut results = vec![];
-    for round in 0..3 {
-        for workload in ["point", "scan", "write", "batch", "autocommit", "blob"] {
-            for cache in [true, false] {
-                for j in 0..3 {
-                    let (mode, pages) = variants[(j + round) % 3];
-                    let object = format!("{round}-{workload}-{cache}-{mode}-{pages}");
-                    let prefix = format!("/bench?mode={mode}&pages={pages}&cache={}", u8::from(cache));
-                    let init = get(&node, &object, &format!("{prefix}&op=init")).await;
-                    assert_eq!(init.status, 200, "{}", init.body);
-                    let mut samples = vec![];
-                    let (mut bytes, mut syncs, mut peak) = (0u64, 0u64, 0u64);
-                    let writes = match workload { "batch" | "autocommit" => 100, "write" | "blob" => 1, _ => 0 };
-                    for seq in 0..28 {
-                        let start = Instant::now();
-                        let response = get(&node, &object, &format!("{prefix}&op={workload}&seq={seq}")).await;
-                        let us = start.elapsed().as_secs_f64() * 1_000_000.0;
-                        assert_eq!(response.status, 200, "{object}: {}", response.body);
-                        let body = response.json();
-                        let expected = match workload { "point" => 512, "scan" => 1024*512, _ => writes };
-                        assert_eq!(body["value"], expected);
-                        if seq >= 3 {
-                            samples.push(us);
-                            bytes += body["sqlite_write_bytes"].as_u64().unwrap();
-                            syncs += body["sqlite_syncs"].as_u64().unwrap();
-                        }
-                        let volume = node.cfg.app_dirs(&app.name)[0].join(&object);
-                        let live: u64 = std::fs::read_dir(volume).unwrap()
-                            .map(|e| e.unwrap().metadata().unwrap().len()).sum();
-                        peak = peak.max(live);
-                    }
-                    // Include deferred WAL cleanup in the lifecycle cost, not in p50/p95.
-                    let start = Instant::now();
-                    let close = get(&node, &object, &format!("{prefix}&op=close")).await;
-                    let close_us = start.elapsed().as_secs_f64()*1_000_000.0;
-                    assert_eq!(close.status, 200, "{}", close.body);
-                    let closed = close.json();
-                    let verify = get(&node, &object, &format!("{prefix}&op=verify")).await;
-                    assert_eq!(verify.status, 200, "{}", verify.body);
-                    assert_eq!(verify.json()["value"], 28*writes);
-                    assert_eq!(verify.json()["integrity"], "ok");
-                    let result = serde_json::json!({"round": round, "workload": workload, "cached": cache,
-                        "mode": mode, "checkpoint_pages": pages, "samples_us": samples,
-                        "close_us": close_us, "sqlite_write_bytes": bytes, "sqlite_syncs": syncs,
-                        "close_write_bytes": closed["sqlite_write_bytes"], "close_syncs": closed["sqlite_syncs"],
-                        "peak_live_file_bytes": peak});
-                    println!("benchmark {object}: {} us mean including close", (samples.iter().sum::<f64>()+close_us)/25.0);
-                    results.push(result);
-                }
-            }
-        }
-    }
-    std::fs::write(repo().join("target/sqlite-filesystem/benchmark-results.json"),
-        serde_json::to_vec_pretty(&results).unwrap()).unwrap();
-    node.shutdown().await;
-}
-
 /// A request's writes, to files and to key-value alike, take effect only if
 /// it answers, whatever the status; one that fails, traps or runs out of CPU
 /// leaves nothing behind.
@@ -3686,7 +3610,7 @@ async fn the_proxy_routes_hosts_by_dns() {
     let (status, body) = get("Counter.Test:8443", "/a/", &names(&hostile)).await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&at("counter.test", &counter)), "{body}");
-    assert_eq!(get("counter.test", "/_nanovm/stats", "").await.0, 400);
+    assert_eq!(get("counter.test", "/_nanovm/ready", "").await.0, 400);
     // Nor can it claim to be a socket's event (and pick its `Connection-Id`),
     // however it spells the type: counter's own parsing reads the last one.
     for types in ["text/plain\r\nContent-Type: application/websocket-events", "Application/WebSocket-Events; charset=utf-8"] {

@@ -85,8 +85,7 @@ A wasmtime-based host that runs untrusted WASIp3 HTTP components as durable obje
   and decisions), ISSUES (status), `notes/` (evidence). Plain language, short.
 - **ISSUES.md is the shared list.** Check it before starting, mark what you take, record what you find
   (even if you don't fix it), and mark it fixed with the commit.
-- **Outward-facing actions need the owner's OK:** publishing packages, new workflows that publish,
-  anything on remote hosts, opening or merging pull requests unless asked.
+- **Outward-facing actions need the owner's OK unless already requested.** A request to push or merge includes the existing automatic workflows it triggers, including package publication; do not ask for separate approval for those workflows. Ask before manually publishing, adding a publishing workflow, or acting on remote hosts unless that action was requested.
 
 ## Git and working alongside other agents
 
