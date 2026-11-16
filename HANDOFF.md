@@ -24,6 +24,27 @@ delta 0. [Protocol, evidence, exact fresh integrated-build commands and limitati
 Parent must run the full release matrix only after all other VM workloads stop;
 this harness commit provides no new performance numbers and is not pushed.
 
+## Node trim telemetry fix (2026-11-16)
+
+On `fix/trim-node-telemetry`, based on `trim/node` at `228aa38`, N-903 restores
+the outgoing 1 MiB cap at `Relay::send`, after trusted identity stamping. Hostile
+trace/log batches below the incoming cap expand to 1 MiB + 1 and are refused
+without collector export; exact-cap controls succeed. The regression fails
+before the fix and with the guard removed. Restoring the guard passes all seven
+telemetry tests again. All 194 enabled unit tests (one ignored) and the production
+check pass. Runtime delta: +1 (8,634 → 8,635). No integration/demo or matched CPU
+benchmark run in the resource-constrained parallel-build orb; no performance
+clearance is claimed. No push or PR. [Evidence](notes/trim-node-telemetry.md).
+
+**PR #3 integration:** merged committed local `fix/pr3-review` at `9965f46`
+without textual conflicts, retaining node trims, string-aware protobuf masking,
+host-escaped secret masking, outgoing cap, cleanup deletions and base64/memchr.
+Combined checks pass: nine telemetry tests, six secrets tests, 206 library tests
+(one ignored) and production check. Runtime is 8,745 (+110 from the node fix,
+−76 versus the pinned PR #3 parent). Parent-owned later follow-ups and aggregate
+validation remain separate. No push or PR; the disposable worktree target is
+removed after validation. The evidence note records exact commands and scope.
+
 ## Current state (2026-11-08)
 
 **PR #3 review follow-up (2026-11-14):** local `fix/pr3-review` addresses the
@@ -136,6 +157,7 @@ fencing. No guest changes, publishing, automatic pruning or promotion.
 
 ## Historical checkpoints (superseded by current state above)
 
+- **Trim pass, the node's files (2026-11-14, `trim/node`):** supervisor, telemetry, table, main, config, app, admin, lib go from 2,421 to 2,344 runtime lines (8,711 to 8,634 in all) with no behaviour removed: one `Worker::stop` for every worker retirement, prost's varints, one request span, the worker spec as two JSON values, `app::link`/`app::lock`, and smaller repeats (`notes/trim-node.md`). The targets (2,058, aim 1,816) are not reached without removing behaviour; the note lists what remains and why. No config key removed. Code the node's files repeat in storage's and edge's files is N-902; a test gap found on the way is N-901.
 - **CI follow-through (N-43):** backup/restore is on main through `721b667`; main CI 42313034048 passed. Parallel branch CI 42313030490 exposed the old max-apps test's 600/900 ms busy-window assumption (expected refusal, got 200). `deterministic-app-admission-test` replaces those sleeps with observed gated upstream requests. An injected 1100 ms delay fails the old fixture and passes the correction; permitting busy-worker eviction fails the corrected test. Both probes restored with `git checkout --`, empty unstaged diff verified. Restored full locked suite passes 99 unit/69 integration, 12 ignored. Runtime remains 5,085 lines; no guest changes. Prior recovery demo/benchmark evidence remains applicable, not newly measured for this test-only correction.
   - **Successor prompt:** finish exact-head CI and fast-forward delivery of N-43. Preserve Q88's stopped-writer backup contract and fresh-root restore requirement. Independent nice-to-haves remain isolated in their own thread/archives; do not import them into recovery changes without review. No production deployment or remote durability is claimed.
 - **Backup is shipping; restore runs live (2026-11-13, `beta/recovery`, B-500):** continuous shipping to `capture.store` replaces the restic backup below, which is removed; `nanovm admin … restore` restores one object (head or earlier version, made the version after the head) or an app's objects into a running node; a store outage no longer refuses writes after 16 versions (B-501). See `notes/beta-recovery.md`.

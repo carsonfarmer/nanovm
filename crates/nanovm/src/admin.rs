@@ -44,11 +44,8 @@ pub fn listen(cfg: &NodeConfig) -> anyhow::Result<tokio::net::UnixListener> {
     // SAFETY: geteuid has no preconditions.
     anyhow::ensure!(md.is_dir() && md.uid() == unsafe { libc::geteuid() }, "{} is not the supervisor's own directory", dir.display());
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    if let Err(e) = std::fs::remove_file(&path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(e.into());
-    }
+    // An earlier run's; if it can't go, binding says so.
+    let _ = std::fs::remove_file(&path);
     short(&path, |p| tokio::net::UnixListener::bind(p))
 }
 
@@ -68,12 +65,10 @@ pub async fn serve(listener: tokio::net::UnixListener, sup: Weak<Supervisor>) {
             let (read, mut write) = conn.into_split();
             let mut line = Vec::new();
             let _ = tokio::io::BufReader::new(read).take(MAX_LINE).read_until(b'\n', &mut line).await;
-            let reply = match serde_json::from_slice::<Vec<String>>(&line) {
-                Ok(args) => match sup.command(&args).await {
-                    Ok(v) => serde_json::json!({ "ok": v }),
-                    Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
-                },
-                Err(e) => serde_json::json!({ "error": format!("a command is a JSON array of strings: {e}") }),
+            let args = serde_json::from_slice::<Vec<String>>(&line).context("a command is a JSON array of strings");
+            let reply = match async { sup.command(&args?).await }.await {
+                Ok(v) => serde_json::json!({ "ok": v }),
+                Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
             };
             let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
         });

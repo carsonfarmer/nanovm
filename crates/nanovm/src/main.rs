@@ -76,9 +76,7 @@ fn publish(wasm: &str, target: &str, flags: &[String]) -> anyhow::Result<()> {
     let wasm = std::fs::read(wasm).with_context(|| format!("reading {wasm}"))?;
     let engine = nanovm::engine::build(&NodeConfig { max_live_objects: 1, ..NodeConfig::default() })?;
     let component = wasmtime::component::Component::new(&engine, &wasm).map_err(anyhow::Error::from).context("not a component")?;
-    nanovm::app::check_imports(&engine, &component).map_err(compose_hint)?;
-    let pre = nanovm::app::linker(&engine)?.instantiate_pre(&component);
-    pre.and_then(wasmtime_wasi_http::p3::bindings::ServicePre::new).map_err(anyhow::Error::from)?;
+    nanovm::app::link(&engine, &nanovm::app::linker(&engine)?, &component).map_err(compose_hint)?;
     let login = std::env::var("NANOVM_REGISTRY_USER").ok().zip(std::env::var("NANOVM_REGISTRY_TOKEN").ok());
     let oci = nanovm::registry::Oci::publisher()?;
     let push = oci.push_app(&r, login.as_ref(), spec, wasm, &version);
@@ -122,15 +120,12 @@ fn run(wasm: &str, flags: &[String]) -> anyhow::Result<()> {
     let spec: nanovm::registry::AppSpec = serde_json::from_slice(manifest.as_deref().unwrap_or(b"{}")).context("the manifest")?;
     let name = Path::new(wasm).file_stem().and_then(|s| s.to_str()).filter(|s| nanovm::table::valid_name(s));
     let name = name.context("the component's file name must be <app>.wasm, with <app> of [A-Za-z0-9_.-]")?;
-    let limits = spec.limits.clamped(&cfg.limits);
+    let (limits, lowered) = spec.limits.clamped(&cfg.limits);
+    for (k, a, m) in lowered {
+        eprintln!("nanovm: the manifest's {k} is {a}; nanovm run allows at most {m}, so it is {m} here");
+    }
     // Its developer is its operator: the manifest's egress is all it gets.
     cfg.limits.egress = spec.limits.egress.clone();
-    let (asked, max) = (serde_json::json!(spec.limits), serde_json::json!(cfg.limits));
-    for (k, v) in asked.as_object().into_iter().flatten() {
-        if let (Some(a), Some(m)) = (v.as_u64(), max[k].as_u64()) && a > m {
-            eprintln!("nanovm: the manifest's {k} is {a}; nanovm run allows at most {m}, so it is {m} here");
-        }
-    }
     let watched = secrets.clone();
     let secrets = nanovm::secrets::load(secrets.as_deref(), &spec.secrets).context("--secrets <secrets.json>")?;
     let app = AppConfig { name: name.into(), digest: "run".into(), env: spec.env, config: spec.config, secrets, limits, worker: Default::default() };

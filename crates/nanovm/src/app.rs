@@ -135,8 +135,23 @@ pub fn check_imports(engine: &Engine, component: &Component) -> anyhow::Result<(
             bail!("import `{name}` is not permitted");
         }
     }
-    // A missing `wasi:http/handler` export fails `ServicePre::new`, by name.
     Ok(())
+}
+
+/// Checks `component`'s imports and links it; a missing `wasi:http/handler`
+/// export fails here, by name.
+pub fn link(engine: &Engine, linker: &Linker<ObjState>, component: &Component) -> anyhow::Result<ServicePre<ObjState>> {
+    check_imports(engine, component)?;
+    Ok(linker.instantiate_pre(component).and_then(ServicePre::new)?)
+}
+
+/// Makes `objects` (an app's) if it isn't there and takes the app's
+/// storage, which is this process's until the returned file closes (Q87).
+pub(crate) fn lock(objects: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::create_dir_all(objects)?;
+    let lock = std::fs::File::open(objects)?;
+    lock.try_lock().context("app storage is already owned or cannot be locked")?;
+    Ok(lock)
 }
 
 impl App {
@@ -149,17 +164,10 @@ impl App {
         upstream: Option<Upstream>,
     ) -> anyhow::Result<App> {
         let [objects, tmp, cache] = node.app_dirs(&cfg.name);
-        std::fs::create_dir_all(&objects)?;
-        let ownership = std::fs::File::open(&objects)?;
-        ownership.try_lock().context("app storage is already owned or cannot be locked")?;
+        let ownership = lock(&objects)?;
         let component = crate::engine::load_component(engine, wasm, &cache)
             .with_context(|| format!("app {:?}", cfg.name))?;
-        check_imports(engine, &component).with_context(|| format!("app {:?}", cfg.name))?;
-        let pre = linker
-            .instantiate_pre(&component)
-            .and_then(ServicePre::new)
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("linking app {:?}", cfg.name))?;
+        let pre = link(engine, linker, &component).with_context(|| format!("app {:?}", cfg.name))?;
         let egress = match upstream {
             Some(u) => Route::Supervisor(u),
             None => Route::Direct(Arc::new(
