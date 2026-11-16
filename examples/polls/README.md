@@ -30,7 +30,7 @@ What it shows:
 - **Sockets outlive instances.** Watchers stay connected while the poll's
   instance is evicted and started again; the next vote still reaches them.
 - **Cookies.** A voter is a browser with a random `voter` cookie
-  (`Request::cookie`), set on its first vote. That stops double voting from
+  (`RequestExt::cookie`), set on its first vote. That stops double voting from
   one browser, not a determined voter: real polls need sign-in.
 
 Each voter is a file in the poll's volume, so the manifest's `max_files`

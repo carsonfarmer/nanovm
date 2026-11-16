@@ -231,6 +231,10 @@ async fn admin(node: &Arc<Node>, path: &str, headers: &http::HeaderMap) -> Respo
             }
             Response::builder().status(204).body(full("")).unwrap()
         }
+        p if p.starts_with("/evict/") => {
+            node.evict(&p["/evict/".len()..]).await;
+            Response::builder().status(204).body(full("")).unwrap()
+        }
         "/flush" => {
             let telemetry = node.telemetry.clone();
             let ok = tokio::task::spawn_blocking(move || telemetry.flush()).await.is_ok_and(|r| r.is_ok());

@@ -1,0 +1,121 @@
+# Prometheus recording and alerting rules for nanovm, over the metrics the
+# reference Collector (demo/otel-collector.yaml) exposes: derived span metrics
+# on :8889 (nanovm_spans_*) and its own on :8888 (otelcol_*). Scrape both, and
+# node_exporter for disk. Thresholds are starting points; tune them.
+#
+# Layers (never sum them: one request is a span on each): span_name="request"
+# is object execution in the worker, "supervisor.request" node ingress,
+# "proxy.request" the public front door.
+groups:
+  - name: nanovm-recording
+    rules:
+      - record: nanovm:spans:rate5m
+        expr: sum by (span_name) (rate(nanovm_spans_calls_total[5m]))
+      # "or ... * 0": a layer or app with no error series yet reads 0, not no data.
+      - record: nanovm:span_errors:rate5m
+        expr: |
+          sum by (span_name) (rate(nanovm_spans_calls_total{status_code="STATUS_CODE_ERROR"}[5m]))
+            or nanovm:spans:rate5m * 0
+      - record: nanovm:span_error_ratio:rate5m
+        expr: nanovm:span_errors:rate5m / nanovm:spans:rate5m
+      - record: nanovm:app_error_ratio:rate5m
+        expr: |
+          (
+            sum by (nanovm_app) (rate(nanovm_spans_calls_total{span_name="request", status_code="STATUS_CODE_ERROR"}[5m]))
+              or sum by (nanovm_app) (rate(nanovm_spans_calls_total{span_name="request"}[5m])) * 0
+          )
+            / sum by (nanovm_app) (rate(nanovm_spans_calls_total{span_name="request"}[5m]))
+      - record: nanovm:span_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (span_name, le) (rate(nanovm_spans_duration_seconds_bucket[5m])))
+
+  - name: nanovm-alerts
+    rules:
+      # Node ingress errors are what clients feel: worker-down, capacity,
+      # timeouts. Low-traffic periods are excluded (under 1 request/s).
+      - alert: NanovmNodeErrorRatioHigh
+        expr: |
+          nanovm:span_error_ratio:rate5m{span_name="supervisor.request"} > 0.05
+            and nanovm:spans:rate5m{span_name="supervisor.request"} > 1
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of node requests fail"
+          runbook: docs/ops/runbooks.md#worker-crash-loop and docs/ops/errors.md
+
+      # One app failing (its guest trapping, running out of CPU, or its
+      # worker not starting) while others serve.
+      - alert: NanovmAppErrorRatioHigh
+        expr: |
+          nanovm:app_error_ratio:rate5m > 0.2
+            and sum by (nanovm_app) (rate(nanovm_spans_calls_total{span_name="request"}[5m])) > 0.2
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "app {{ $labels.nanovm_app }}: {{ $value | humanizePercentage }} of object requests fail"
+          runbook: docs/ops/errors.md
+
+      - alert: NanovmNodeLatencyHigh
+        expr: |
+          nanovm:span_duration_seconds:p99_5m{span_name="supervisor.request"} > 1
+            and nanovm:spans:rate5m{span_name="supervisor.request"} > 1
+        for: 15m
+        labels: {severity: ticket}
+        annotations:
+          summary: "node p99 {{ $value | humanizeDuration }}"
+          runbook: docs/ops/errors.md
+
+      # The span-metrics connector collapses dimensions past its cardinality
+      # limit into one overflow series: totals stay right, per-app detail is lost.
+      - alert: NanovmSpanMetricsOverflow
+        expr: sum(rate(nanovm_spans_calls_total{otel_metric_overflow="true"}[10m])) > 0
+        for: 30m
+        labels: {severity: ticket}
+        annotations:
+          summary: span metrics hit aggregation_cardinality_limit; per-app series are incomplete
+
+      # Collector health. Metric names are matched with and without the
+      # _total suffix: it depends on the Collector's Prometheus exporter.
+      - alert: NanovmCollectorDown
+        expr: up{job="otelcol"} == 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: the Collector's own metrics are unreachable; spans and logs are being lost
+          runbook: docs/ops/runbooks.md#collector-outage
+
+      - alert: NanovmCollectorRefusingSpans
+        expr: sum(rate({__name__=~"otelcol_receiver_refused_spans(_total)?"}[5m])) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "the Collector refuses {{ $value | humanize }} spans/s (memory_limiter or overload)"
+          runbook: docs/ops/runbooks.md#collector-outage
+
+      - alert: NanovmCollectorExportFailing
+        expr: sum(rate({__name__=~"otelcol_exporter_send_failed_(spans|log_records)(_total)?"}[5m])) > 0
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "the Collector fails to export {{ $value | humanize }} items/s to its backend"
+          runbook: docs/ops/runbooks.md#collector-outage
+
+      - alert: NanovmCollectorQueueFilling
+        expr: |
+          max by (exporter) ({__name__="otelcol_exporter_queue_size"})
+            / max by (exporter) ({__name__="otelcol_exporter_queue_capacity"}) > 0.8
+        for: 5m
+        labels: {severity: ticket}
+        annotations:
+          summary: "exporter {{ $labels.exporter }} queue {{ $value | humanizePercentage }} full"
+
+      # Writes fail with 500 commit-failed once the data filesystem is full.
+      # Set mountpoint to the filesystem holding data_dir.
+      - alert: NanovmDataDiskFilling
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/"}
+            / node_filesystem_size_bytes{mountpoint="/"} < 0.15
+        for: 10m
+        labels: {severity: page}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} free on the nanovm data filesystem"
+          runbook: docs/ops/runbooks.md#disk-full

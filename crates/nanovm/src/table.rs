@@ -105,12 +105,12 @@ impl Node {
         upstream: Option<Upstream>,
     ) -> anyhow::Result<Arc<Node>> {
         crate::engine::start_ticker(&engine, Duration::from_millis(cfg.epoch_tick_ms));
-        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone())?);
+        let telemetry = Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, &app.name, &app.digest, upstream.clone(), &app.secrets)?);
         let leases = upstream.clone().filter(|_| !cfg.leases.is_empty()).map(crate::lease::Worker::new);
         anyhow::ensure!(leases.is_some() == !cfg.leases.is_empty(), "leases are taken through a supervisor");
         // Without a supervisor, which ships for its workers, a node ships its own.
         let ship = cfg.capture.as_ref().filter(|_| upstream.is_none()).map(crate::ship::store).transpose()?.flatten();
-        let ship = ship.map(|store| tokio::spawn(crate::ship::run(cfg.data_dir.join("objects"), store, None)).abort_handle());
+        let ship = ship.map(|store| tokio::spawn(crate::ship::run(cfg.data_dir.join("objects"), store, None, Default::default())).abort_handle());
         let app = Arc::new(App::load(&engine, linker, &cfg, app, wasm, upstream)?);
         let heavy = Arc::new(Semaphore::new(cfg.heavy_lanes()));
         let slots = Arc::new(Semaphore::new(cfg.max_live_objects));
@@ -332,6 +332,16 @@ impl Node {
     pub fn renewed(&self, id: u64, until: u64) {
         if self.leases.as_ref().is_some_and(|l| l.session.set(id, until)) {
             self.objects.lock().retain(|_, e| e.idle_since().is_none());
+        }
+    }
+
+    /// Stops object `id`'s instance, if it has one, for a restore that has
+    /// paused it (see `ship::pause`): its actor serves what is queued, then
+    /// exits. Returns once it has, and its storage is free.
+    pub async fn evict(&self, id: &str) {
+        let Some(gone) = self.objects.lock().remove(id).map(|e| Arc::downgrade(&e.shared)) else { return };
+        while gone.strong_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 

@@ -1,0 +1,26 @@
+# /etc/nanovm/nanovm.toml in the image. Every key and its default is in
+# crates/nanovm/src/config.rs. Mount your own over it to change it.
+
+# Loopback: the proxy shares this container's network namespace
+# (`--network container:<node>`), and only it may reach the node.
+listen = "127.0.0.1:8080"
+data_dir = "/var/lib/nanovm"
+max_live_objects = 1000
+proxy = "http://127.0.0.1:8444"
+telemetry_endpoint = "http://127.0.0.1:4318"
+jail_uid_base = 200000
+# Docker mounts /sys/fs/cgroup read-only: workers run without [worker]
+# limits; bound the container with --memory, --cpus, --pids-limit.
+cgroup = "off"
+# Each app's secrets, as <app>.json: mount a directory only root may use here
+# (deploy/container/README.md, "App secrets").
+# secrets = "/etc/nanovm/secrets"
+
+[limits]
+memory_mb = 64
+cpu_ms = 200
+disk_mb = 64
+# The operator's egress cap: an app reaches only what its own `egress` and
+# this list both allow. Empty (the default): no app reaches anything. These
+# are what examples/oauth signs in with; list what your developers' apps need.
+egress = ["github.com:443", "api.github.com:443"]

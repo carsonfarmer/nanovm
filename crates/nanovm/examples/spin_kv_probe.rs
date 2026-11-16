@@ -31,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
         digest: "probe".into(),
         env: Default::default(),
         config: Default::default(),
+        secrets: Default::default(),
         worker: Default::default(),
         limits: serde_json::from_value(
             serde_json::json!({"memory_mb":64,"cpu_ms":10000,"request_timeout_ms":30000,"disk_mb":8,"max_resources":128}),
@@ -45,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     ensure!(r.status == 200 && r.body == "ok", "zero-entry read: {}", r.body);
     node.shutdown().await;
     drop(node);
-    ensure!(!dir.join("objects/spin-kv/fresh/.kv").exists());
+    ensure!(!nanovm::app::object_dir(&dir.join("objects/spin-kv"), "fresh").join("data/.kv").exists());
     println!("PASS read-only bucket with zero file quota creates nothing");
     let node = Node::new(cfg.clone(), &app, &wasm, None)?;
     for (path, expected) in [
@@ -80,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
                 load::request(&node, "GET", id, if abort { "/repeat?trap=1" } else { "/repeat" }, "").await
             })
         };
-        let ready = dir.join(format!("objects/spin-kv/{id}/repeat-ready"));
+        let ready = nanovm::app::object_dir(&dir.join("objects/spin-kv"), id).join("data/repeat-ready");
         while !ready.exists() {
             ensure!(
                 !writing.is_finished(),
@@ -89,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let journal = dir.join(format!("objects/spin-kv/~journal/{id}"));
+        let journal = nanovm::app::object_dir(&dir.join("objects/spin-kv"), id).join("journal");
         let mut retained = 0;
         for entry in std::fs::read_dir(&journal)? {
             let entry = entry?;
@@ -119,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
         // load::Reply converts binary to lossy UTF-8; inspect the file bytes independently.
         ensure!(r.status == 200, "read after repeats: {}", r.body);
         let expected = if abort { b"seed".to_vec() } else { vec![246; 8193] };
-        ensure!(std::fs::read(dir.join(format!("objects/spin-kv/{id}/.kv/default/cmVwZWF0")))? == expected);
+        ensure!(std::fs::read(nanovm::app::object_dir(&dir.join("objects/spin-kv"), id).join("data/.kv/default/cmVwZWF0"))? == expected);
     }
     node.shutdown().await;
     drop(node);
@@ -139,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
     node.shutdown().await;
     drop(node);
     for id in ["one", "quota"] {
-        for entry in std::fs::read_dir(dir.join(format!("objects/spin-kv/{id}/.kv/default")))? {
+        for entry in std::fs::read_dir(nanovm::app::object_dir(&dir.join("objects/spin-kv"), id).join("data/.kv/default"))? {
             ensure!(
                 !entry?.file_name().to_string_lossy().starts_with(".spin-write-"),
                 "temporary file leaked"
@@ -180,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
             let node = Node::new(cfg.clone(), &app, &wasm, None)?;
             let r = load::request(&node, "GET", "cut", "/get", "").await;
             ensure!(r.status == 200 && r.body == "committed", "{stage}: {}", r.body);
-            let volume = cfg.data_dir.join("objects/spin-kv/cut");
+            let volume = nanovm::app::object_dir(&cfg.data_dir.join("objects/spin-kv"), "cut").join("data");
             ensure!(!volume.join("mixed").exists(), "mixed file survived {stage}");
             for entry in std::fs::read_dir(volume.join(".kv/default"))? {
                 ensure!(

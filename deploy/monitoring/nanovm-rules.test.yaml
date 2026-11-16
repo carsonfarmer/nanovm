@@ -1,0 +1,148 @@
+# promtool test rules deploy/monitoring/nanovm-rules.test.yaml
+rule_files: [nanovm-rules.yaml]
+evaluation_interval: 1m
+tests:
+  # Node ingress: 10/s, 10% failing for 20 minutes pages; 2% does not.
+  - interval: 1m
+    input_series:
+      - series: 'nanovm_spans_calls_total{span_name="supervisor.request", status_code="STATUS_CODE_UNSET"}'
+        values: '0+540x30'
+      - series: 'nanovm_spans_calls_total{span_name="supervisor.request", status_code="STATUS_CODE_ERROR"}'
+        values: '0+60x30'
+      - series: 'nanovm_spans_calls_total{span_name="request", status_code="STATUS_CODE_UNSET", nanovm_app="good"}'
+        values: '0+600x30'
+      - series: 'nanovm_spans_calls_total{span_name="request", status_code="STATUS_CODE_UNSET", nanovm_app="bad"}'
+        values: '0+30x30'
+      - series: 'nanovm_spans_calls_total{span_name="request", status_code="STATUS_CODE_ERROR", nanovm_app="bad"}'
+        values: '0+30x30'
+    promql_expr_test:
+      - expr: nanovm:span_error_ratio:rate5m{span_name="supervisor.request"}
+        eval_time: 20m
+        exp_samples:
+          - labels: 'nanovm:span_error_ratio:rate5m{span_name="supervisor.request"}'
+            value: 0.1
+      - expr: nanovm:app_error_ratio:rate5m
+        eval_time: 20m
+        exp_samples:
+          - labels: 'nanovm:app_error_ratio:rate5m{nanovm_app="bad"}'
+            value: 0.5
+          - labels: 'nanovm:app_error_ratio:rate5m{nanovm_app="good"}'
+            value: 0
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: NanovmNodeErrorRatioHigh
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: NanovmNodeErrorRatioHigh
+        exp_alerts:
+          - exp_labels: {severity: page, span_name: supervisor.request}
+            exp_annotations:
+              summary: "10% of node requests fail"
+              runbook: docs/ops/runbooks.md#worker-crash-loop and docs/ops/errors.md
+      - eval_time: 25m
+        alertname: NanovmAppErrorRatioHigh
+        exp_alerts:
+          - exp_labels: {severity: ticket, nanovm_app: bad}
+            exp_annotations:
+              summary: "app bad: 50% of object requests fail"
+              runbook: docs/ops/errors.md
+
+  # A trickle of errors at low traffic does not page.
+  - interval: 1m
+    input_series:
+      - series: 'nanovm_spans_calls_total{span_name="supervisor.request", status_code="STATUS_CODE_ERROR"}'
+        values: '0+6x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: NanovmNodeErrorRatioHigh
+        exp_alerts: []
+
+  # p99 above a second: 1/s of requests all in the 5 s bucket.
+  - interval: 1m
+    input_series:
+      - series: 'nanovm_spans_calls_total{span_name="supervisor.request", status_code="STATUS_CODE_UNSET"}'
+        values: '0+120x30'
+      - series: 'nanovm_spans_duration_seconds_bucket{span_name="supervisor.request", le="1"}'
+        values: '0+0x30'
+      - series: 'nanovm_spans_duration_seconds_bucket{span_name="supervisor.request", le="5"}'
+        values: '0+120x30'
+      - series: 'nanovm_spans_duration_seconds_bucket{span_name="supervisor.request", le="+Inf"}'
+        values: '0+120x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: NanovmNodeLatencyHigh
+        exp_alerts:
+          - exp_labels: {severity: ticket, span_name: supervisor.request}
+            exp_annotations:
+              summary: "node p99 4.96s"
+              runbook: docs/ops/errors.md
+
+  # Collector: refusals and export failures under either metric name; its
+  # scrape target down; a queue 90% full; overflowing span metrics.
+  - interval: 1m
+    input_series:
+      - series: 'otelcol_receiver_refused_spans_total{receiver="otlp"}'
+        values: '0+10x20'
+      - series: 'otelcol_exporter_send_failed_spans{exporter="otlphttp"}'
+        values: '0+5x20'
+      - series: 'up{job="otelcol"}'
+        values: '0x20'
+      - series: 'otelcol_exporter_queue_size{exporter="otlphttp"}'
+        values: '900x20'
+      - series: 'otelcol_exporter_queue_capacity{exporter="otlphttp"}'
+        values: '1000x20'
+      - series: 'nanovm_spans_calls_total{span_name="request", status_code="STATUS_CODE_UNSET", otel_metric_overflow="true"}'
+        values: '0+60x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: NanovmCollectorRefusingSpans
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations:
+              summary: "the Collector refuses 166.7m spans/s (memory_limiter or overload)"
+              runbook: docs/ops/runbooks.md#collector-outage
+      - eval_time: 10m
+        alertname: NanovmCollectorExportFailing
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations:
+              summary: "the Collector fails to export 83.33m items/s to its backend"
+              runbook: docs/ops/runbooks.md#collector-outage
+      - eval_time: 10m
+        alertname: NanovmCollectorDown
+        exp_alerts:
+          - exp_labels: {severity: page, job: otelcol}
+            exp_annotations:
+              summary: the Collector's own metrics are unreachable; spans and logs are being lost
+              runbook: docs/ops/runbooks.md#collector-outage
+      - eval_time: 10m
+        alertname: NanovmCollectorQueueFilling
+        exp_alerts:
+          - exp_labels: {severity: ticket, exporter: otlphttp}
+            exp_annotations:
+              summary: "exporter otlphttp queue 90% full"
+      - eval_time: 45m
+        alertname: NanovmSpanMetricsOverflow
+        exp_alerts:
+          - exp_labels: {severity: ticket}
+            exp_annotations:
+              summary: span metrics hit aggregation_cardinality_limit; per-app series are incomplete
+
+  # Disk: 10% free pages, 50% doesn't.
+  - interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{mountpoint="/"}'
+        values: '50x5 10x20'
+      - series: 'node_filesystem_size_bytes{mountpoint="/"}'
+        values: '100x25'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: NanovmDataDiskFilling
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: NanovmDataDiskFilling
+        exp_alerts:
+          - exp_labels: {severity: page, mountpoint: /}
+            exp_annotations:
+              summary: "10% free on the nanovm data filesystem"
+              runbook: docs/ops/runbooks.md#disk-full

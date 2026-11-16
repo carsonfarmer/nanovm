@@ -15,7 +15,9 @@
 
 use std::cell::Cell;
 
-use nanovm_sdk::{Error, Request, Response, Result, kv, object, serde_json, sqlite};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, Error, RequestExt, Result, kv, object, serde_json, sqlite};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -28,14 +30,14 @@ struct Product {
     stock: i64,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     if nanovm_sdk::id() == "payments" {
         return payments(&req).await;
     }
     schema().await?;
-    let path: Vec<&str> = req.path().trim_matches('/').split('/').collect();
-    Ok(match (req.method(), path.as_slice()) {
-        ("PUT", ["products", sku]) => match req.json::<Product>() {
+    let path: Vec<&str> = req.uri().path().trim_matches('/').split('/').collect();
+    Ok(match (req.method().as_str(), path.as_slice()) {
+        ("PUT", ["products", sku]) => match req.body().json::<Product>() {
             Ok(p) if p.price >= 0 && p.stock >= 0 && !p.name.is_empty() => {
                 sqlite::execute(
                     "INSERT INTO products VALUES (?, ?, ?, ?) ON CONFLICT (sku) \
@@ -43,16 +45,16 @@ async fn handle(req: Request) -> Result {
                     &[sku, &p.name, &p.price, &p.stock],
                 )
                 .await?;
-                Response::new(204)
+                Response::builder().status(204).body(Body::empty())?
             }
-            _ => Response::text("{\"name\", \"price\" (cents), \"stock\"}, not negative\n").status(400),
+            _ => text(400, "{\"name\", \"price\" (cents), \"stock\"}, not negative\n")?,
         },
-        ("GET", ["products"]) => Response::json(sqlite::query("SELECT * FROM products ORDER BY sku", &[]).await?.json().to_string()),
+        ("GET", ["products"]) => json(200, sqlite::query("SELECT * FROM products ORDER BY sku", &[]).await?.json().to_string())?,
         ("PUT", ["carts", cart, "items", sku]) => {
-            let qty = req.json::<serde_json::Value>().ok().and_then(|v| v["qty"].as_i64()).filter(|q| (0..=1000).contains(q));
-            let Some(qty) = qty else { return Ok(Response::text("{\"qty\": 0 to 1000}\n").status(400)) };
+            let qty = req.body().json::<serde_json::Value>().ok().and_then(|v| v["qty"].as_i64()).filter(|q| (0..=1000).contains(q));
+            let Some(qty) = qty else { return text(400, "{\"qty\": 0 to 1000}\n") };
             if sqlite::query("SELECT 1 FROM products WHERE sku = ?", &[sku]).await?.is_empty() {
-                return Ok(Response::not_found());
+                return text(404, "not found");
             }
             match qty {
                 0 => sqlite::execute("DELETE FROM cart_items WHERE cart = ? AND sku = ?", &[cart, sku]).await?,
@@ -62,9 +64,9 @@ async fn handle(req: Request) -> Result {
                 )
                 .await?,
             };
-            Response::json(cart_json(cart).await?.to_string())
+            json(200, cart_json(cart).await?.to_string())?
         }
-        ("GET", ["carts", cart]) => Response::json(cart_json(cart).await?.to_string()),
+        ("GET", ["carts", cart]) => json(200, cart_json(cart).await?.to_string())?,
         ("POST", ["carts", cart, "checkout"]) => checkout(cart, &req).await?,
         ("GET", ["orders", id]) => {
             let order = sqlite::query("SELECT * FROM orders WHERE id = ?", &[id]).await?;
@@ -72,25 +74,25 @@ async fn handle(req: Request) -> Result {
             match order.json().as_array().and_then(|o| o.first().cloned()) {
                 Some(mut order) => {
                     order["items"] = items.json();
-                    Response::json(order.to_string())
+                    json(200, order.to_string())?
                 }
-                None => Response::not_found(),
+                None => text(404, "not found")?,
             }
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
-async fn checkout(cart: &str, req: &Request) -> Result {
-    let card = req.json::<serde_json::Value>().ok().and_then(|v| v["card"].as_str().map(String::from));
-    let Some(card) = card else { return Ok(Response::text("{\"card\": \"…\"}\n").status(400)) };
+async fn checkout(cart: &str, req: &Request<Body>) -> Result {
+    let card = req.body().json::<serde_json::Value>().ok().and_then(|v| v["card"].as_str().map(String::from));
+    let Some(card) = card else { return text(400, "{\"card\": \"…\"}\n") };
     let items = sqlite::query(
         "SELECT c.sku, c.qty, p.price, p.stock FROM cart_items c JOIN products p USING (sku) WHERE c.cart = ?",
         &[&cart],
     )
     .await?;
     if items.is_empty() {
-        return Ok(Response::text("the cart is empty\n").status(400));
+        return text(400, "the cart is empty\n");
     }
     // Checked before anything is written, so this answer leaves nothing
     // behind. No other request can take stock in between: the shop serves
@@ -102,7 +104,7 @@ async fn checkout(cart: &str, req: &Request) -> Result {
         }
     }
     if !short.is_empty() {
-        return Ok(Response::json(json!({ "error": "out of stock", "short": short }).to_string()).status(409));
+        return json(409, json!({ "error": "out of stock", "short": short }).to_string());
     }
 
     // The writes, as one statement: placing the order fires the trigger
@@ -118,11 +120,11 @@ async fn checkout(cart: &str, req: &Request) -> Result {
     // and the emptied cart. The order's key makes a retried charge safe.
     let key = format!("{}/{order}", nanovm_sdk::id());
     let charge = json!({ "key": key, "card": card, "amount": total }).to_string();
-    let reply = object("payments").post("/charges", charge).send().await?;
-    if reply.status != 200 {
-        return Err(Error::new(format!("payment declined: {}", String::from_utf8_lossy(&reply.body))));
+    let reply = object("payments").post("/charges", charge).await?;
+    if reply.status() != 200 {
+        return Err(Error::new(format!("payment declined: {}", String::from_utf8_lossy(reply.body()))));
     }
-    Ok(Response::json(json!({ "order": order, "total": total }).to_string()).status(201))
+    json(201, json!({ "order": order, "total": total }).to_string())
 }
 
 async fn cart_json(cart: &str) -> Result<serde_json::Value> {
@@ -137,20 +139,23 @@ async fn cart_json(cart: &str) -> Result<serde_json::Value> {
 
 /// A stand-in card processor: declines cards ending in `0002`, and charges
 /// each idempotency key once. `GET /payments/charges?key=…` shows a charge.
-async fn payments(req: &Request) -> Result {
+async fn payments(req: &Request<Body>) -> Result {
     if req.method() == "GET" {
         let charge = kv::get_text(&format!("charge:{}", req.query("key").unwrap_or_default())).await?;
-        return Ok(charge.map_or_else(Response::not_found, Response::json));
+        return match charge {
+            Some(charge) => json(200, charge),
+            None => text(404, "not found"),
+        };
     }
-    let charge: serde_json::Value = req.json()?;
+    let charge: serde_json::Value = req.body().json()?;
     if charge["card"].as_str().is_none_or(|c| c.ends_with("0002")) {
-        return Ok(Response::text("card declined").status(402));
+        return text(402, "card declined");
     }
     let key = format!("charge:{}", charge["key"].as_str().unwrap_or_default());
     if !kv::exists(&key).await? {
         kv::set(&key, charge.to_string()).await?;
     }
-    Ok(Response::json(kv::get_text(&key).await?.unwrap_or_default()))
+    json(200, kv::get_text(&key).await?.unwrap_or_default())
 }
 
 thread_local! {
@@ -179,4 +184,14 @@ async fn schema() -> Result<()> {
     }
     READY.set(true);
     Ok(())
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

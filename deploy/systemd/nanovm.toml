@@ -1,0 +1,52 @@
+# /etc/nanovm/nanovm.toml for nanovm.service. Every key and its default is in
+# crates/nanovm/src/config.rs; unknown keys are refused.
+
+# Only the proxy may reach the node: it trusts the nanovm-app/-trust headers.
+listen = "127.0.0.1:8080"
+# StateDirectory=nanovm. Keep it absolute (a relative one is relative to
+# this file).
+data_dir = "/var/lib/nanovm"
+# Per app worker. Sizes the pooling allocator and the fd/mapping preflight:
+# about 2 x (max_live_objects + 32) + 1024 fds and 24 x (max_live_objects + 32)
+# + 4096 mappings per worker.
+max_live_objects = 1000
+max_apps = 100
+# Objects with storage per app; past it a new object gets 507 object-limit.
+max_objects_per_app = 10000
+# The proxy's private endpoint (committed WebSocket publishes go to its
+# /publish) and the Collector's OTLP/HTTP base URL.
+proxy = "http://127.0.0.1:8444"
+telemetry_endpoint = "http://127.0.0.1:4318"
+# App i runs as uid/gid jail_uid_base + i. Never change it on a node with
+# data: an app's uid is the owner of its objects directory.
+jail_uid_base = 200000
+# Each app's secrets, as <app>.json: a directory only root may use (install.sh
+# makes it 0700). See deploy/single-node/README.md, step 6.
+secrets = "/etc/nanovm/secrets"
+# Each app's worker runs in a cgroup v2 of its own with the [worker] limits:
+# with cgroup = "auto" (the default) the supervisor uses the cgroup the unit
+# delegates to it (Delegate= in nanovm.service), and refuses to start
+# without one. "off" runs workers without them.
+# Clients that reach `listen` directly ([clients], see the proxy's): the
+# proxy, on loopback, is trusted by default; list it in [clients] trusted
+# if it runs on another host.
+# What all of an app's objects may hold, and what the disk keeps free; 0
+# (the default) is a quarter and a twentieth (at most 1 GiB) of data_dir's
+# filesystem. Set them once you know the disk:
+# app_disk_mb = 0
+# disk_reserve_mb = 0
+
+# Operator ceilings: each app's own limits are clamped to these.
+[limits]
+memory_mb = 64
+cpu_ms = 200
+request_timeout_ms = 5000
+disk_mb = 64
+max_files = 1000
+# The operator's egress cap: an app reaches only what its own `egress` and
+# this list both allow. Empty (the default): no app reaches anything. These
+# are what examples/oauth signs in with; list what your developers' apps need.
+egress = ["github.com:443", "api.github.com:443"]
+
+# Whole-worker limits ([worker] memory_mb, cpus, pids) default to a quarter of
+# the host's memory, all its cores but one, and no pids limit; 0 unsets one.

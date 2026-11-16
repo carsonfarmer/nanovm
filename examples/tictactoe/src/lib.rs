@@ -13,7 +13,9 @@
 //!
 //! Players are names, taken on trust: a real game would sign them in.
 
-use nanovm_sdk::{Request, Response, Result, kv, object, serde_json, ws};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, kv, object, serde_json, ws};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -31,12 +33,12 @@ struct Game {
     result: Option<String>,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     let player = req.query("player").unwrap_or_default().to_string();
     if nanovm_sdk::id() == "lobby" {
-        return match (req.method(), req.path()) {
+        return match (req.method().as_str(), req.uri().path()) {
             ("POST", "/match") if (1..=32).contains(&player.len()) => matchmake(&player).await,
-            _ => Ok(Response::not_found()),
+            _ => text(404, "not found"),
         };
     }
     let game: Option<Game> = match kv::get("game").await? {
@@ -44,32 +46,32 @@ async fn handle(req: Request) -> Result {
         None => None,
     };
     if let Some(events) = ws::events(&req) {
-        let Some(game) = game else { return Ok(Response::not_found()) };
+        let Some(game) = game else { return text(404, "not found") };
         return socket(&player, events, game).await;
     }
-    Ok(match (req.method(), req.path(), game) {
-        ("GET", "/", Some(game)) => Response::json(serde_json::to_string(&game)?),
-        ("POST", "/move", Some(game)) => match play(&player, req.query("square").unwrap_or_default(), game).await? {
-            Ok(game) => Response::json(game),
-            Err(why) => Response::json(json!({ "error": why }).to_string()).status(409),
+    Ok(match (req.method().as_str(), req.uri().path(), game) {
+        ("GET", "/", Some(game)) => json(200, serde_json::to_string(&game)?)?,
+        ("POST", "/move", Some(game)) => match play(&player, &req.query("square").unwrap_or_default(), game).await? {
+            Ok(game) => json(200, game)?,
+            Err(why) => json(409, json!({ "error": why }).to_string())?,
         },
         // For the lobby. Anyone can send these (nanovm doesn't say who is
         // calling, W-602), so they only ever make a game once and fill its
         // second seat once; the lobby copes with a seat taken behind its back.
         ("POST", "/new", None) => {
-            let x = req.text()?.to_string();
+            let x = req.body().text()?.to_string();
             let game = Game { x, board: ".........".into(), turn: 'x', ..Default::default() };
             kv::set("game", serde_json::to_vec(&game)?).await?;
-            Response::new(201)
+            Response::builder().status(201).body(Body::empty())?
         }
-        ("POST", "/join", Some(mut game)) if game.o.is_none() && req.text()? != game.x => {
-            game.o = Some(req.text()?.to_string());
-            let json = serde_json::to_string(&game)?;
-            kv::set("game", json.as_str()).await?;
-            ws::publish("game", &json).await?;
-            Response::json(json)
+        ("POST", "/join", Some(mut game)) if game.o.is_none() && req.body().text()? != game.x => {
+            game.o = Some(req.body().text()?.to_string());
+            let state = serde_json::to_string(&game)?;
+            kv::set("game", state.as_str()).await?;
+            ws::publish("game", &state).await?;
+            json(200, state)?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
@@ -80,21 +82,21 @@ async fn matchmake(player: &str) -> Result {
     if let Some(waiting) = kv::get("waiting").await? {
         let (game, x): (String, String) = serde_json::from_slice(&waiting)?;
         if x == player {
-            return Ok(Response::json(json!({ "game": game, "you": "x" }).to_string()));
+            return json(200, json!({ "game": game, "you": "x" }).to_string());
         }
-        let reply = object(&game).post("/join", player).send().await?;
+        let reply = object(&game).post("/join", player).await?;
         kv::delete("waiting").await?;
-        if reply.status == 200 {
-            return Ok(Response::json(json!({ "game": game, "you": "o" }).to_string()));
+        if reply.status() == 200 {
+            return json(200, json!({ "game": game, "you": "o" }).to_string());
         }
     }
     let game = format!("g-{:08x}", nanovm_sdk::wasip3::random::random::get_random_u64() as u32);
-    let reply = object(&game).post("/new", player).send().await?;
-    if reply.status != 201 {
-        return Err(nanovm_sdk::Error::new(format!("{game} would not start: {}", reply.status)));
+    let reply = object(&game).post("/new", player).await?;
+    if reply.status() != 201 {
+        return Err(nanovm_sdk::Error::new(format!("{game} would not start: {}", reply.status())));
     }
     kv::set("waiting", serde_json::to_vec(&(&game, player))?).await?;
-    Ok(Response::json(json!({ "game": game, "you": "x" }).to_string()))
+    json(200, json!({ "game": game, "you": "x" }).to_string())
 }
 
 async fn socket(player: &str, events: Vec<ws::Event>, game: Game) -> Result {
@@ -149,4 +151,14 @@ fn outcome(b: &[u8]) -> Option<String> {
         }
     }
     (!b.contains(&b'.')).then(|| "draw".into())
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

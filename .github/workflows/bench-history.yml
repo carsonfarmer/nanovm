@@ -1,0 +1,79 @@
+name: Benchmark history
+
+# Nightly and on demand: run `bench --quick` on the default branch, append the
+# result to the history carried forward from the previous run's artifact,
+# compare with earlier commits, and keep it all as an artifact (90 days; each
+# run carries the whole history forward). See tools/bench-history/README.md.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: bench-history
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: bench --quick
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            guests -> ../target/guests
+            components/keyvalue -> ../../target/keyvalue
+      - name: Prepare host limits
+        run: sudo sysctl -w vm.max_map_count=1048576
+      - name: Install component composition tool
+        run: cargo install wac-cli --version 0.12.0 --locked
+      - name: Build guests locally (no publishing)
+        run: bash scripts/build-guests.sh
+      - name: Fetch the history so far
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p history
+          # The newest finished run that left a history (a run that flagged a
+          # regression fails, but still uploads it).
+          for id in $(gh run list --workflow bench-history.yml --limit 10 --json databaseId,status \
+              --jq '.[] | select(.status == "completed") | .databaseId'); do
+            if gh run download "$id" --name bench-history --dir history 2>/dev/null; then
+              echo "history from run $id"; break
+            fi
+          done
+          touch history/bench-history.jsonl
+          echo "$(wc -l < history/bench-history.jsonl) earlier runs"
+      - name: Run bench --quick and record it
+        run: |
+          ulimit -n "$(ulimit -Hn)"
+          python3 tools/bench-history/history.py record --history history/bench-history.jsonl
+      - name: Compare with earlier commits
+        id: compare
+        continue-on-error: true
+        run: python3 tools/bench-history/history.py compare --history history/bench-history.jsonl | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Chart
+        run: python3 tools/bench-history/history.py chart --history history/bench-history.jsonl --out history/trends.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-history
+          path: history/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Fail on a regression
+        if: steps.compare.outcome == 'failure'
+        run: |
+          echo "::warning::bench --quick: a metric is more than 5% worse than the median of earlier commits (see the summary)"
+          exit 1

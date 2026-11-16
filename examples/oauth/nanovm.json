@@ -6,7 +6,7 @@
     "client_id": "your-client-id",
     "redirect_uri": "http://127.0.0.1:8080/auth/callback"
   },
-  "env": { "CLIENT_SECRET": "set-me" },
+  "secrets": ["client_secret"],
   "limits": {
     "memory_mb": 16, "cpu_ms": 100, "request_timeout_ms": 5000, "idle_timeout_ms": 30000,
     "disk_mb": 1, "max_files": 1000,

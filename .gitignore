@@ -8,3 +8,5 @@
 .DS_Store
 # Amp orb portal registrations.
 /.amp/portals/*
+# Python bytecode from the ops tooling tests.
+__pycache__/

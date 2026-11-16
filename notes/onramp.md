@@ -44,14 +44,14 @@ $ printf '\n[lib]\ncrate-type = ["cdylib"]\n' >> Cargo.toml
   (0.0 s)
 $ cp ../nanovm/examples/hello/src/lib.rs src/
   (0.0 s)
-$ cat src/lib.rs
-  use nanovm_sdk::{Request, Response, Result, kv};
+$ cat src/lib.rs   # as recorded; the SDK now uses the http crate's types (notes/sdk-http.md):
+  use nanovm_sdk::{Body, Result, http, kv};
   
   nanovm_sdk::serve!(handle);
   
-  async fn handle(_req: Request) -> Result {
+  async fn handle(_req: http::Request<Body>) -> Result {
       let visits = kv::increment("visits", 1).await?;
-      Ok(Response::text(format!("{} has had {visits} visits\n", nanovm_sdk::id())))
+      Ok(http::Response::new(format!("{} has had {visits} visits\n", nanovm_sdk::id()).into()))
   }
   (0.0 s)
 $ ../nanovm/tools/build-app.sh --run --listen 127.0.0.1:18732 &   # one command: build, compose, serve

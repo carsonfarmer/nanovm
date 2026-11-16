@@ -190,6 +190,10 @@ pub struct AppSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub config: BTreeMap<String, String>,
+    /// The `wasi:config` keys the app needs from its node's operator (see
+    /// `secrets`): never in the package.
+    #[serde(default)]
+    pub secrets: std::collections::BTreeSet<String>,
 }
 
 pub struct Pulled {

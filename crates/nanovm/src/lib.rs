@@ -2,11 +2,13 @@
 //! objects (one live instance per object id, one request at a time) with
 //! per-object memory, CPU, disk and egress limits.
 
+pub mod admin;
 pub mod app;
 pub mod committed;
 pub mod config;
 pub mod egress;
 pub mod engine;
+pub mod gate;
 pub mod jail;
 pub mod journal;
 pub mod lease;
@@ -16,6 +18,7 @@ pub mod object;
 pub mod proxy;
 pub mod quota;
 pub mod registry;
+pub mod secrets;
 pub mod server;
 pub mod ship;
 pub mod supervisor;

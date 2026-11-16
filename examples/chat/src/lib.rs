@@ -13,7 +13,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, data, kv, object, serde_json, ws};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, data, kv, object, serde_json, ws};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -39,21 +41,21 @@ struct Room {
     last: Message,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     let lobby = nanovm_sdk::id() == LOBBY;
     if let Some(events) = ws::events(&req) {
         return socket(&req, events, lobby).await;
     }
-    Ok(match (req.method(), req.path()) {
-        ("GET", "/") => Response::html(include_str!("index.html")),
-        ("GET", "/messages") if !lobby => Response::json(format!("[{}]", history().await?.join(","))),
-        ("POST", "/messages") if !lobby => match post(req.query("name").unwrap_or(""), req.text()?).await? {
-            Some(message) => Response::json(message),
-            None => Response::text(BAD).status(400),
+    Ok(match (req.method().as_str(), req.uri().path()) {
+        ("GET", "/") => html(200, include_str!("index.html"))?,
+        ("GET", "/messages") if !lobby => json(200, format!("[{}]", history().await?.join(",")))?,
+        ("POST", "/messages") if !lobby => match post(&req.query("name").unwrap_or_default(), req.body().text()?).await? {
+            Some(message) => json(200, message)?,
+            None => text(400, BAD)?,
         },
-        ("GET", "/rooms") if lobby => Response::json(format!("[{}]", rooms().await?.join(","))),
+        ("GET", "/rooms") if lobby => json(200, format!("[{}]", rooms().await?.join(",")))?,
         ("POST", p) if lobby && p.starts_with("/rooms/") => record(&p[7..], &req).await?,
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
@@ -83,11 +85,11 @@ async fn post(name: &str, text: &str) -> Result<Option<String>> {
     ws::publish("chat", &message).await?;
     // The index is a summary: if this call fails, the next message corrects it.
     let room = serde_json::to_string(&Room { room: nanovm_sdk::id(), messages, last })?;
-    let _ = object(LOBBY).post(&format!("/rooms/{}", nanovm_sdk::id()), room).send().await;
+    let _ = object(LOBBY).post(&format!("/rooms/{}", nanovm_sdk::id()), room).await;
     Ok(Some(message))
 }
 
-async fn socket(req: &Request, events: Vec<ws::Event>, lobby: bool) -> Result {
+async fn socket(req: &Request<Body>, events: Vec<ws::Event>, lobby: bool) -> Result {
     let mut answer = ws::Answer::default();
     for event in events {
         match event {
@@ -98,7 +100,7 @@ async fn socket(req: &Request, events: Vec<ws::Event>, lobby: bool) -> Result {
                 }
             }
             ws::Event::Text(text) if !lobby => {
-                if post(req.query("name").unwrap_or(""), &text).await?.is_none() {
+                if post(&req.query("name").unwrap_or_default(), &text).await?.is_none() {
                     answer.text(&format!(r#"{{"error":"{BAD}"}}"#));
                 }
             }
@@ -110,18 +112,18 @@ async fn socket(req: &Request, events: Vec<ws::Event>, lobby: bool) -> Result {
 
 /// The lobby records a room's latest state. Anyone can post here, not only
 /// rooms, so what is stored is parsed and written afresh, never kept as sent.
-async fn record(room: &str, req: &Request) -> Result {
+async fn record(room: &str, req: &Request<Body>) -> Result {
     // An object id, as the node allows them.
     let named = (1..=128).contains(&room.len()) && !room.starts_with(['.', '_']);
     let named = named && room.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b));
-    let (true, Ok(mut entry)) = (named, req.json::<Room>()) else {
-        return Ok(Response::text("bad room or entry").status(400));
+    let (true, Ok(mut entry)) = (named, req.body().json::<Room>()) else {
+        return text(400, "bad room or entry");
     };
     entry.room = room.into();
     let entry = serde_json::to_string(&entry)?;
     kv::set(room, entry.as_str()).await?;
     ws::publish("rooms", &entry).await?;
-    Ok(Response::json(entry))
+    json(200, entry)
 }
 
 /// Every room the lobby knows, as JSON.
@@ -131,4 +133,19 @@ async fn rooms() -> Result<Vec<String>> {
         rooms.extend(kv::get_text(&room).await?);
     }
     Ok(rooms)
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
+}
+
+/// An HTML answer.
+fn html(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/html; charset=utf-8").body(body.into())?)
 }

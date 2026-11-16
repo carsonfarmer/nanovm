@@ -33,9 +33,10 @@ build compiles the runtime (minutes); each app after that takes seconds.
 (to the object's log), timers, `queueMicrotask`, `crypto.getRandomValues`
 and `randomUUID`; `env.kv` (`get`, `put`, `delete`, `list`; values are
 JSON) on the composed Spin key-value provider, committed with the response;
-outbound `fetch` under the app's egress policy (it rejects if the body
-breaks off before its end); `env.objects.get(id).fetch()`
-between objects; `env.config`, `env.id`, `env.publish(channel, message)`;
+outbound `fetch` under the app's egress policy, within the node operator's
+(it rejects if the body breaks off before its end); `env.objects.get(id).fetch()`
+between objects; `env.config` (the app's config and its
+[secrets](../README.md#secrets)), `env.id`, `env.publish(channel, message)`;
 `ctx.waitUntil(promise)` (its work starts when the promise is made: what it
 writes before the handler answers commits with the answer. The object
 then waits for every waitUntil promise, those registered meanwhile

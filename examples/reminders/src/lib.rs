@@ -20,7 +20,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, kv, object, serde_json, ws};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, kv, object, serde_json, ws};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -41,7 +43,7 @@ struct New {
     in_ms: Option<u64>,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     if nanovm_sdk::id() == "clock" {
         return clock(&req, now).await;
@@ -53,11 +55,11 @@ async fn handle(req: Request) -> Result {
         }
         return Ok(answer.into());
     }
-    Ok(match (req.method(), req.path()) {
+    Ok(match (req.method().as_str(), req.uri().path()) {
         ("POST", "/reminders") => {
-            let new = req.json::<New>().ok().filter(|n| (1..=500).contains(&n.text.len()));
+            let new = req.body().json::<New>().ok().filter(|n| (1..=500).contains(&n.text.len()));
             let Some(New { text, at, in_ms }) = new else {
-                return Ok(Response::text("{\"text\": 1-500 bytes, \"at\" or \"in_ms\"}\n").status(400));
+                return text(400, "{\"text\": 1-500 bytes, \"at\" or \"in_ms\"}\n");
             };
             let at = at.unwrap_or(now + in_ms.unwrap_or(0));
             let id = kv::increment("next", 1).await?;
@@ -66,35 +68,35 @@ async fn handle(req: Request) -> Result {
             // The clock commits this on its own, before we do; if we then fail,
             // it calls about a reminder we don't have, and is told 404.
             let due = json!({ "user": nanovm_sdk::id(), "id": id, "at": at }).to_string();
-            let reply = object("clock").post("/schedule", due).send().await?;
-            if reply.status != 204 {
-                return Err(nanovm_sdk::Error::new(format!("the clock said {}", reply.status)));
+            let reply = object("clock").post("/schedule", due).await?;
+            if reply.status() != 204 {
+                return Err(nanovm_sdk::Error::new(format!("the clock said {}", reply.status())));
             }
-            Response::json(serde_json::to_string(&reminder)?).status(201)
+            json(201, serde_json::to_string(&reminder)?)?
         }
-        ("GET", "/reminders") => Response::json(serde_json::to_string(&all().await?)?),
+        ("GET", "/reminders") => json(200, serde_json::to_string(&all().await?)?)?,
         ("GET", "/due") => {
             let mut due = vec![];
             for r in all().await?.into_iter().filter(|r| !r.fired && r.at <= now) {
                 due.push(fire(r).await?);
             }
-            Response::json(serde_json::to_string(&due)?)
+            json(200, serde_json::to_string(&due)?)?
         }
         // For the clock (anyone may call it: firing twice is firing once).
         ("POST", "/fire") => {
             let key = format!("r:{:010}", req.query_or("id", 0i64));
             match kv::get(&key).await? {
-                Some(json) => {
-                    let r: Reminder = serde_json::from_slice(&json)?;
+                Some(r) => {
+                    let r: Reminder = serde_json::from_slice(&r)?;
                     if r.fired || r.at > now {
-                        return Ok(Response::new(204));
+                        return Ok(Response::builder().status(204).body(Body::empty())?);
                     }
-                    Response::json(serde_json::to_string(&fire(r).await?)?)
+                    json(200, serde_json::to_string(&fire(r).await?)?)?
                 }
-                None => Response::not_found(),
+                None => text(404, "not found")?,
             }
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
@@ -120,15 +122,15 @@ async fn all() -> Result<Vec<Reminder>> {
 }
 
 /// The clock: keys `due:{at}:{user}:{id}`, zero-padded so they sort by time.
-async fn clock(req: &Request, now: u64) -> Result {
-    Ok(match (req.method(), req.path()) {
+async fn clock(req: &Request<Body>, now: u64) -> Result {
+    Ok(match (req.method().as_str(), req.uri().path()) {
         ("POST", "/schedule") => {
-            let due: serde_json::Value = req.json()?;
+            let due: serde_json::Value = req.body().json()?;
             let (Some(user), Some(id), Some(at)) = (due["user"].as_str(), due["id"].as_i64(), due["at"].as_u64()) else {
-                return Ok(Response::new(400));
+                return Ok(Response::builder().status(400).body(Body::empty())?);
             };
             kv::set(&format!("due:{at:015}:{user}:{id}"), "").await?;
-            Response::new(204)
+            Response::builder().status(204).body(Body::empty())?
         }
         ("POST", "/tick") => {
             let mut due: Vec<String> = kv::keys().await?.into_iter().filter(|k| k.starts_with("due:")).collect();
@@ -142,15 +144,25 @@ async fn clock(req: &Request, now: u64) -> Result {
                 }
                 // Each call commits in the owner's object before it answers;
                 // one that fails stays due for the next tick.
-                let reply = object(user).post(&format!("/fire?id={id}"), "").send().await?;
+                let reply = object(user).post(&format!("/fire?id={id}"), "").await?;
                 // 200: fired now; 204: already fired (polled); 404: never made.
-                if matches!(reply.status, 200 | 204 | 404) {
+                if matches!(reply.status().as_u16(), 200 | 204 | 404) {
                     kv::delete(&key).await?;
-                    fired += i32::from(reply.status == 200);
+                    fired += i32::from(reply.status() == 200);
                 }
             }
-            Response::json(json!({ "fired": fired }).to_string())
+            json(200, json!({ "fired": fired }).to_string())?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

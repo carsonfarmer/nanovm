@@ -1,0 +1,7 @@
+# Only what the Dockerfile copies; everything else (target/ is gigabytes) stays out.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/nanovm
+!deploy/container/nanovm.toml
+!deploy/container/proxy.toml

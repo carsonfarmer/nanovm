@@ -9,12 +9,14 @@
 //! - `PUT /{tenant}/flags/{name}` (body: a value), `DELETE` for the default
 //! - `/{tenant}/ws`: a WebSocket that gets the flags, then every change
 
-use nanovm_sdk::{Request, Response, Result, config, kv, serde_json, ws};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, config, kv, serde_json, ws};
 use serde_json::{Map, Value, json};
 
 nanovm_sdk::serve!(handle);
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     if let Some(events) = ws::events(&req) {
         let mut answer = ws::Answer::default();
         if events.contains(&ws::Event::Open) {
@@ -22,25 +24,25 @@ async fn handle(req: Request) -> Result {
         }
         return Ok(answer.into());
     }
-    let path: Vec<&str> = req.path().trim_matches('/').split('/').collect();
+    let path: Vec<&str> = req.uri().path().trim_matches('/').split('/').collect();
     let name = match path.as_slice() {
-        ["flags"] if req.method() == "GET" => return Ok(Response::json(flags(req.query("user")).await?.to_string())),
+        ["flags"] if req.method() == "GET" => return json(200, flags(req.query("user").as_deref()).await?.to_string()),
         ["flags", name] if defaults()?.contains_key(*name) => *name,
-        _ => return Ok(Response::not_found()),
+        _ => return text(404, "not found"),
     };
     let key = format!("flag:{name}");
-    match req.method() {
-        "PUT" => match req.json::<Value>().ok().filter(valid) {
+    match req.method().as_str() {
+        "PUT" => match req.body().json::<Value>().ok().filter(valid) {
             Some(value) => kv::set(&key, value.to_string()).await?,
-            None => return Ok(Response::text("a flag is true, false or {\"percent\": 0-100}\n").status(400)),
+            None => return text(400, "a flag is true, false or {\"percent\": 0-100}\n"),
         },
         "DELETE" => kv::delete(&key).await?,
-        _ => return Ok(Response::not_found()),
+        _ => return text(404, "not found"),
     }
     let now = flags(None).await?;
     // Watchers hear of the change once it has committed.
     ws::publish("flags", &now.to_string()).await?;
-    Ok(Response::json(now[name].to_string()))
+    json(200, now[name].to_string())
 }
 
 /// Every flag: `{"name": {"value", "source"}}`, with each value decided for
@@ -81,4 +83,14 @@ fn valid(value: &Value) -> bool {
 fn bucket(flag: &str, user: &str) -> u64 {
     let hash = format!("{flag}/{user}").bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
     hash % 100
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

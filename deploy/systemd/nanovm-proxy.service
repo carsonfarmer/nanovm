@@ -1,0 +1,52 @@
+# nanovm proxy: the public front door (DNS routing, tag resolution,
+# WebSockets). Plain HTTP behind a TLS terminator. Needs no privileges.
+[Unit]
+Description=nanovm proxy (DNS-routed front door)
+Documentation=https://github.com/carsonfarmer/nanovm/tree/main/deploy/systemd
+Wants=network-online.target
+After=network-online.target nanovm.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/nanovm proxy --config /etc/nanovm/proxy.toml
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=2s
+# Each held WebSocket and each forwarded request is a socket; the proxy waits
+# out running out of fds rather than exiting, but should not have to.
+LimitNOFILE=1048576
+LimitCORE=0
+UnsetEnvironment=RUST_BACKTRACE RUST_LIB_BACKTRACE
+
+ConfigurationDirectory=nanovm
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

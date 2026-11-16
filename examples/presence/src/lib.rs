@@ -15,7 +15,9 @@
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, config, kv, serde_json, ws};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, config, kv, serde_json, ws};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -29,20 +31,20 @@ struct Here {
     seen: u64,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     let Some(events) = ws::events(&req) else {
-        return Ok(match (req.method(), req.path()) {
-            ("GET", "/who") => Response::json(json!({ "names": present(now).await? }).to_string()),
-            _ => Response::not_found(),
+        return Ok(match (req.method().as_str(), req.uri().path()) {
+            ("GET", "/who") => json(200, json!({ "names": present(now).await? }).to_string())?,
+            _ => text(404, "not found")?,
         });
     };
     // The proxy names each socket; only it can send these requests.
-    let key = format!("socket:{}", req.header("connection-id").unwrap_or_default());
+    let key = format!("socket:{}", req.headers().get("connection-id").and_then(|v| v.to_str().ok()).unwrap_or_default());
     let name = req.query("name").unwrap_or_default().trim().to_string();
     if events.contains(&ws::Event::Open) && !(1..=32).contains(&name.chars().count()) {
         // An ordinary answer to OPEN refuses the socket with its status.
-        return Ok(Response::text("a name is 1-32 characters\n").status(400));
+        return text(400, "a name is 1-32 characters\n");
     }
     let mut answer = ws::Answer::default();
     for event in events {
@@ -89,4 +91,14 @@ async fn present(now: u64) -> Result<BTreeSet<String>> {
         }
     }
     Ok(names)
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

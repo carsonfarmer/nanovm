@@ -28,7 +28,8 @@ What it shows:
   target takes 1.5 s to answer), but the next request to the same endpoint
   does.
 - **Egress is an allowlist.** Targets are reached with `fetch`, and only
-  hosts in the manifest's `egress` list can be reached: a target outside it
+  hosts in the manifest's `egress` list (that a node's operator also allows
+  in its `[limits] egress`) can be reached: a target outside it
   fails with `HttpRequestDenied`, recorded like any other failure. Private
   addresses are refused even if listed (except on a dev node), so an app
   can't be used to reach the node's network.

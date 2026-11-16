@@ -90,11 +90,20 @@ pub struct Supervisor {
     leases: Option<Arc<crate::lease::Leases>>,
     /// Where objects' committed versions are shipped (`capture.store`).
     capture: Option<Arc<dyn crate::ship::Store>>,
+    /// What the shipper passes over while an operator deletes or restores
+    /// it (see `held`).
+    shipping: Arc<crate::ship::Held>,
+    /// What waits to be shipped, as last counted.
+    backlog: Mutex<crate::ship::Backlog>,
     /// A worker spawned ahead of need: see [`Spawned`].
     spare: tokio::sync::Mutex<Option<Spawned>>,
     relay: Arc<crate::telemetry::Relay>,
     telemetry: Arc<crate::telemetry::Telemetry>,
     started: Instant,
+    /// What clients that reach `listen` directly may ask of it.
+    pub gate: Arc<crate::gate::Gate>,
+    /// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`).
+    cgroup: Option<PathBuf>,
     /// Held open: the cgroup its workers run under is its alone (see
     /// [`Cgroup::take`]).
     _cgroup_held: Option<std::fs::File>,
@@ -132,6 +141,8 @@ struct Live {
     /// The app version it runs.
     digest: String,
     version: semver::Version,
+    /// Its secrets file as it was when they were read.
+    secrets: crate::secrets::Stamp,
     /// The policies that have accepted it.
     policies: Mutex<HashSet<Policy>>,
     /// How long its longest request may take, to bound a drain.
@@ -165,6 +176,12 @@ impl Supervisor {
         let ttl = Duration::from_millis(cfg.lease_ms);
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
+        cfg.secrets.as_deref().map(crate::secrets::check_dir).transpose()?;
+        let cgroup = cgroup(&cfg)?;
+        // What deletes an earlier run cut short left.
+        let _ = std::fs::remove_dir_all(cfg.data_dir.join("deleted"));
+        // Restores a crash cut short, before any worker serves their objects.
+        crate::ship::recover(&cfg.data_dir).context("recovering restores")?;
         let sup = Arc::new(Supervisor {
             runtime: tokio::runtime::Handle::current(),
             registry: Registry::new(cfg.data_dir.join("registry"), cfg.max_component_mb << 20, cfg.dev)?,
@@ -178,20 +195,26 @@ impl Supervisor {
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
             uids: Arc::default(),
             relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
-            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None)?),
+            telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None, &Default::default())?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
+            gate: crate::gate::Gate::new(&cfg.clients)?,
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
-            _cgroup_held: cfg.cgroup.as_deref().map(Cgroup::take).transpose()?,
+            shipping: Arc::default(),
+            backlog: Mutex::default(),
+            _cgroup_held: cgroup.as_deref().map(Cgroup::take).transpose()?,
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
             started: Instant::now(),
+            cgroup,
         });
         sup.clone().refill();
+        tokio::spawn(crate::admin::serve(crate::admin::listen(&sup.cfg)?, Arc::downgrade(&sup)));
         // Renews the node's session, and tells each worker it holds.
         // Jailed workers can't reach a store: their versions ship from here.
         if let Some(store) = sup.capture.clone() {
-            tokio::spawn(crate::ship::run(sup.cfg.data_dir.join("objects"), store, sup.leases.clone()));
+            tokio::spawn(crate::ship::run(sup.cfg.data_dir.join("objects"), store, sup.leases.clone(), sup.shipping.clone()));
+            tokio::spawn(count_backlog(Arc::downgrade(&sup)));
         }
         if let Some(leases) = sup.leases.clone() {
             let weak = Arc::downgrade(&sup);
@@ -209,13 +232,37 @@ impl Supervisor {
                 }
             });
         }
+        // A change to an app's secrets retires its worker: it drains, and
+        // the next request starts one with them.
+        if let Some(dir) = sup.cfg.secrets.clone() {
+            let weak = Arc::downgrade(&sup);
+            tokio::spawn(async move {
+                while let Some(sup) = weak.upgrade() {
+                    let live: Vec<_> = sup.workers.lock().values().filter_map(|w| Some((w.clone(), w.live()?))).collect();
+                    drop(sup);
+                    for (w, l) in live.into_iter().filter(|(w, l)| l.secrets != crate::secrets::stamp(&secrets_file(&dir, &w.name))) {
+                        tokio::spawn(retire(w, l));
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+        }
         let weak = Arc::downgrade(&sup);
         sup.telemetry.snapshots(move || {
             let Some(sup) = weak.upgrade() else { return };
-            sup.telemetry.snapshot(vec![
+            let mut fields = vec![
                 ("process.memory.usage".into(), (rss_bytes() as i64).into()),
                 ("process.uptime".into(), sup.started.elapsed().as_secs_f64().into()),
-            ]);
+            ];
+            if sup.capture.is_some() {
+                let b = sup.backlog.lock();
+                fields.extend([
+                    ("nanovm.capture.waiting.versions".into(), (b.versions as i64).into()),
+                    ("nanovm.capture.waiting.bytes".into(), (b.bytes as i64).into()),
+                    ("nanovm.capture.waiting.objects".into(), (b.objects as i64).into()),
+                ]);
+            }
+            sup.telemetry.snapshot(fields);
             let workers: Vec<_> = sup.workers.lock().values().cloned().collect();
             for w in workers {
                 let live = w.live();
@@ -250,6 +297,133 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Restores object `object` of app `app` (its name on this node), or
+    /// with none each of the app's objects in the store, from the store, into
+    /// this running node: to version `to`, or to the head's (see
+    /// `ship::restore`). Its other objects, and other apps, keep serving;
+    /// the object answers 503 until it is done. What the object committed
+    /// here first goes to the store, so no acknowledged write is lost; if it
+    /// can't, the restore stops, unless `discard` (then it is dropped).
+    pub async fn restore(&self, app: &str, object: Option<&str>, to: Option<u64>, discard: bool) -> anyhow::Result<Vec<crate::ship::Restored>> {
+        anyhow::ensure!(crate::table::valid_name(app), "{app:?} is not an app's name");
+        let store = self.capture.clone().context("restoring needs a store (capture.store)")?;
+        let objects = self.cfg.app_dirs(app)[0].clone();
+        if !objects.exists() {
+            let (cfg, name, uids) = (self.cfg.clone(), app.to_owned(), self.uids.clone());
+            tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
+        }
+        let ids = match object {
+            Some(o) => vec![o.to_owned()],
+            None => store.list(app).await?.into_iter().map(|(name, _)| name).collect(),
+        };
+        let mut done = vec![];
+        for id in ids.iter().filter(|o| object.is_some() || crate::table::valid_object(o)) {
+            anyhow::ensure!(crate::table::valid_object(id), "{id:?} is not an object id");
+            let restored = self.held(app, Some(id), async || self.restore_object(&*store, app, id, &objects, to, discard).await).await;
+            let before = done.iter().map(|r: &crate::ship::Restored| r.object.as_str()).collect::<Vec<_>>().join(", ");
+            done.push(restored.with_context(|| format!("restoring {app}/{id} (restored before it: [{before}])"))?);
+        }
+        Ok(done)
+    }
+
+    /// Runs `op` with app `app` held still, for an operator's delete or
+    /// restore, then lets it go. With `object`, only that object: paused
+    /// (`pause`), so the app's others serve meanwhile. Else the whole app:
+    /// its worker drained, as for a version switch, while its requests wait;
+    /// it starts again with the next. The shipper passes what is held over,
+    /// once what it was shipping of it is done.
+    async fn held<T>(&self, app: &str, object: Option<&str>, op: impl AsyncFnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let new = || Arc::new(Worker { name: app.into(), ..Default::default() });
+        let w = self.workers.lock().entry(app.into()).or_insert_with(new).clone();
+        let objects = self.cfg.app_dirs(app)[0].clone();
+        let _starting = match object {
+            Some(id) => self.pause(app, id, &objects).await.map(|()| None)?,
+            None => Some(w.starting.lock().await),
+        };
+        let live = w.live.lock().take_if(|_| object.is_none());
+        if let Some(old) = live {
+            drain(old).await;
+        }
+        let key = object.map_or(app.to_string(), |o| format!("{app}/{o}"));
+        self.shipping.write().await.insert(key.clone());
+        let done = op().await;
+        self.shipping.write().await.remove(&key);
+        if let Some(id) = object {
+            crate::ship::resume(&objects, id)?;
+        }
+        done
+    }
+
+    /// Pauses object `id` of app `app` (under `objects`): its instance, if it
+    /// has one, stops, and it starts no other, on this worker or the next,
+    /// until `ship::resume` (see `ship::pause`).
+    pub async fn pause(&self, app: &str, id: &str, objects: &Path) -> anyhow::Result<()> {
+        crate::ship::pause(objects, id)?;
+        let live = self.workers.lock().get(app).and_then(|w| w.live());
+        if let Some(live) = live {
+            let mut evict = get(&format!("/_nanovm/evict/{id}"));
+            *evict.method_mut() = http::Method::POST;
+            let res = live.link.send(evict).await;
+            if !res.as_ref().is_ok_and(|r| r.status() == 204) {
+                crate::ship::resume(objects, id)?;
+                anyhow::bail!("the app's worker didn't stop the object: {:?}", res.map(|r| r.status()));
+            }
+        }
+        Ok(())
+    }
+
+    /// `restore` of one object, paused.
+    async fn restore_object(&self, store: &dyn crate::ship::Store, app: &str, id: &str, objects: &Path, to: Option<u64>, discard: bool) -> anyhow::Result<crate::ship::Restored> {
+        let key = format!("{app}/{id}");
+        let grant = match &self.leases {
+            None => None,
+            Some(leases) => {
+                let grant = leases.acquire(&key).await.map_err(|e| anyhow::anyhow!("taking {key}'s lease: {e:?}"))?;
+                if let Err(e) = crate::ship::claim(store, leases.node(), grant.epoch, app, id, objects).await {
+                    leases.release(&key, &grant).await;
+                    return Err(e.into());
+                }
+                leases.hold(&key, grant.clone());
+                Some(grant)
+            }
+        };
+        let restored = async {
+            // What it committed here goes to the store first, and a version made
+            // to restore an older one goes after (the shipper may be at it too,
+            // which moves the head under a try): with leases, before the lease
+            // is let go, as only it lets the version ship.
+            let dir = crate::ship::versions(objects, id);
+            let ship = async || {
+                let mut shipped = Ok(());
+                for _ in 0..3 {
+                    shipped = match crate::ship::ship_object(store, self.leases.as_deref(), app, id, &dir, &mut None).await {
+                        Ok(false) => Err(std::io::Error::other("this node holds no lease on it")),
+                        shipped => shipped.map(drop),
+                    };
+                    if shipped.is_ok() {
+                        break;
+                    }
+                }
+                shipped
+            };
+            if let Err(e) = ship().await
+                && !discard
+            {
+                anyhow::bail!("it has versions the store doesn't, which a restore would drop ({e}); to drop them, discard them");
+            }
+            let restored = crate::ship::restore(store, app, id, objects, to, grant.as_ref().map_or(0, |g| g.epoch)).await?;
+            if let Err(e) = ship().await {
+                eprintln!("nanovm: shipping restored {app}/{id}: {e}");
+            }
+            Ok(restored)
+        }
+        .await;
+        if let (Some(leases), Some(grant)) = (&self.leases, &grant) {
+            leases.release(&key, grant).await;
+        }
+        restored
+    }
+
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         // Readiness is infrastructure traffic, not a tenant request.
         if req.uri().path() == "/_nanovm/ready" && !req.headers().contains_key(APP_HEADER) {
@@ -260,6 +434,10 @@ impl Supervisor {
 
     async fn handle_request(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         let mut req = req.map(|b| b.boxed_unsync());
+        let client = self.gate.client(&req);
+        if let Err(refused) = self.gate.admit(client, None) {
+            return refused;
+        }
         let want = match AppRef::from_headers(req.headers()) {
             Ok(Some(w)) => w,
             Ok(None) => return self.admin(req).await,
@@ -272,6 +450,9 @@ impl Supervisor {
             return error_response(400, "bad-object-id", BAD_OBJECT);
         }
         let name = want.name();
+        if let Err(refused) = self.gate.admit(client, Some(&name)) {
+            return refused;
+        }
         let w = {
             let mut workers = self.workers.lock();
             if !workers.contains_key(&name) && workers.len() >= 2 * self.cfg.max_apps {
@@ -288,6 +469,70 @@ impl Supervisor {
             Err(res) => return res,
         };
         forward(&w, live, req).await
+    }
+
+    /// Runs an operator's command from the admin socket (see `admin`).
+    pub async fn command(&self, args: &[String]) -> anyhow::Result<serde_json::Value> {
+        match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+            ["apps"] => Ok(self.workers.lock().values().map(|w| {
+                let live = w.live();
+                serde_json::json!({ "app": w.name, "running": live.as_ref().map(|l| &l.digest), "pid": live.map(|l| l.pid) })
+            }).collect()),
+            ["delete", app, object] => self.delete(app, Some(object)).await,
+            ["delete-app", app] => self.delete(app, None).await,
+            // Recovery: see `restore` and `ship`.
+            ["restore", app, rest @ ..] => {
+                let discard = rest.contains(&"--discard-unshipped");
+                let (object, to) = match rest.iter().filter(|a| **a != "--discard-unshipped").collect::<Vec<_>>()[..] {
+                    [] => (None, None),
+                    [object] => (Some(*object), None),
+                    [object, version] => (Some(*object), Some(version.parse().context("a version is a number")?)),
+                    _ => bail!("restore <app> [<object> [<version>]] [--discard-unshipped]"),
+                };
+                let said = |r: &crate::ship::Restored| match r.head > r.version {
+                    true => format!("restored version {} as version {}, after the head; versions {} to {} stay in the store", r.version, r.head, r.version + 1, r.head - 1),
+                    false => format!("restored version {}, the head", r.version),
+                };
+                let done = self.restore(app, object, to, discard).await?;
+                Ok(done.iter().map(|r| serde_json::json!({ "object": r.object, "version": r.version, "head": r.head, "said": said(r) })).collect())
+            }
+            ["versions", at @ ..] => {
+                let store = self.capture.as_ref().context("this node has no store (capture.store)")?;
+                anyhow::ensure!(at.len() <= 2 && at.iter().all(|n| crate::table::valid_name(n)), "versions [<app> [<object>]]");
+                let listed = store.list(&at.join("/")).await?;
+                let [app, object] = at else { return Ok(listed.into_iter().map(|(name, _)| name).collect()) };
+                let mut versions: Vec<_> = listed.iter().filter_map(|(name, at)| Some((name.split_once('-')?.0.parse::<u64>().ok()?, at))).collect();
+                versions.sort();
+                let versions: Vec<_> = versions.into_iter().map(|(n, at)| serde_json::json!({ "version": n, "stored": at })).collect();
+                Ok(serde_json::json!({ "head": crate::ship::head(&**store, app, object).await?.0.sequence, "versions": versions }))
+            }
+            ["backlog"] => {
+                let objects = self.cfg.data_dir.join("objects");
+                Ok(serde_json::json!(tokio::task::spawn_blocking(move || crate::ship::backlog(&objects)).await?))
+            }
+                        _ => bail!("unknown command {args:?}; the commands are: apps, delete <app> <object>, delete-app <app>, \
+                restore <app> [<object> [<version>]] [--discard-unshipped], versions [<app> [<object>]], backlog"),
+        }
+    }
+
+    /// Deletes object `object` of app `app` on this node, or (`None`) all of
+    /// the app's data, with the whole app held (`held`: its worker holds its
+    /// storage, see `remove`), so nothing of it is live, being committed or
+    /// being shipped. What the node shipped of it goes from the store too,
+    /// before the node's copy.
+    async fn delete(&self, app: &str, object: Option<&str>) -> anyhow::Result<serde_json::Value> {
+        anyhow::ensure!(self.leases.is_none(), "deleting on a node with leases (several nodes) is not supported");
+        anyhow::ensure!(crate::table::valid_name(app) && object.is_none_or(crate::table::valid_object), "not an app and object");
+        let prefix = object.map_or(app.to_string(), |o| format!("{app}/{o}"));
+        self.held(app, None, async || {
+            if let Some(store) = &self.capture {
+                store.remove(&prefix).await.context("removing it from the store")?;
+            }
+            let (cfg, app, object) = (self.cfg.clone(), app.to_string(), object.map(String::from));
+            tokio::task::spawn_blocking(move || remove(&cfg, &app, object.as_deref())).await??;
+            Ok(serde_json::json!({ "deleted": prefix }))
+        })
+        .await
     }
 
     /// The node's own routes, for requests that name no app.
@@ -407,15 +652,20 @@ impl Supervisor {
     /// limits, hands it its app and component, and waits until it answers.
     async fn start(&self, w: &Worker, want: &AppRef) -> anyhow::Result<Arc<Live>> {
         let p = self.fetch(self.registry.load(want)).await.with_context(|| format!("loading {}", want.reference))?;
+        let file = self.cfg.secrets.as_ref().map(|dir| secrets_file(dir, &w.name));
+        let stamp = file.as_deref().and_then(crate::secrets::stamp);
+        let from = if file.is_some() { "from the node's secrets directory" } else { "the node has no secrets directory" };
+        let secrets = crate::secrets::load(file.as_deref(), &p.spec.secrets).with_context(|| format!("the app's secrets, {from}"))?;
         let app = AppConfig {
             name: w.name.clone(),
             digest: want.digest.clone(),
             env: p.spec.env,
             config: p.spec.config,
+            secrets,
             limits: p.spec.limits.clamped(&self.cfg.limits),
             worker: self.cfg.worker.clone(),
         };
-        let policy = EgressPolicy::parse(&app.limits.egress, self.cfg.dev).context("egress")?;
+        let policy = EgressPolicy::parse(&app.limits.egress, &self.cfg.limits.egress, self.cfg.dev).context("egress")?;
         let old = w.live.lock().take();
         let slot = match old {
             Some(old) => {
@@ -513,8 +763,7 @@ impl Supervisor {
                         // this lease's, and the object here is the head's.
                         let claim = async |object: &str, grant: &crate::lease::Grant| {
                             let Some(store) = &capture else { return Ok(()) };
-                            crate::ship::claim(&**store, leases.node(), grant.epoch, &app, object, &objects).await?;
-                            restored(&objects, object)
+                            crate::ship::claim(&**store, leases.node(), grant.epoch, &app, object, &objects).await
                         };
                         return crate::lease::serve(leases, &app, req, claim).await.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync());
                     }
@@ -544,6 +793,7 @@ impl Supervisor {
             pid,
             digest: want.digest.clone(),
             version: p.version,
+            secrets: stamp,
             policies: Mutex::new(HashSet::from([want.policy.clone()])),
             drain,
             slot: Mutex::new(Some(slot)),
@@ -577,13 +827,13 @@ impl Supervisor {
         let (requests, worker_requests) = UnixStream::pair()?;
         let (egress, worker_egress) = UnixStream::pair()?;
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
-        let cgroup = self.cfg.cgroup.as_deref().map(Cgroup::new).transpose()?;
+        let cgroup = self.cgroup.as_deref().map(Cgroup::new).transpose()?;
         let into = cgroup.as_ref().map(|c| format!(" into {}", c.0.display())).unwrap_or_default();
         let procs = cgroup.as_ref().map(|c| c.0.join("cgroup.procs"));
         let procs = procs.map(|p| std::fs::OpenOptions::new().write(true).open(&p).with_context(|| format!("opening {}", p.display()))).transpose()?;
         let c = procs.as_ref().map_or(-1, |f| f.as_raw_fd());
         let mut cmd = Command::new(&self.exe);
-        cmd.arg("worker")
+        cmd.arg0("nanovm").arg("worker")
             .env_clear()
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -732,6 +982,21 @@ async fn drain(old: Arc<Live>) {
     old.kill.closed().await;
 }
 
+/// Drains `w`'s worker `l`, unless it has already gone; the next request
+/// starts another.
+async fn retire(w: Arc<Worker>, l: Arc<Live>) {
+    let _switching = w.starting.lock().await;
+    let old = w.live.lock().take_if(|live| Arc::ptr_eq(live, &l));
+    drop(l);
+    if let Some(old) = old {
+        drain(old).await;
+    }
+}
+
+fn secrets_file(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.json"))
+}
+
 /// Sends a worker's call to another object of its app on to the proxy, which
 /// finds the object's node; the supervisor names the app.
 async fn call(http: &reqwest::Client, proxy: &str, app: &str, host: &str, req: Request<Incoming>) -> Response<wasmtime_wasi_http::WasiBody> {
@@ -804,6 +1069,32 @@ fn app_dirs(cfg: &NodeConfig, name: &str, uids: &Mutex<()>) -> anyhow::Result<Op
     Ok(uid)
 }
 
+/// Removes object `object` of app `app` (under the app's storage lock, which
+/// no worker then holds), or all of the app's directories: each is moved
+/// into `<data_dir>/deleted` at once, then removed, so a delete cut short
+/// leaves it whole or gone (the rest goes when the node next starts).
+fn remove(cfg: &NodeConfig, app: &str, object: Option<&str>) -> anyhow::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dirs = cfg.app_dirs(app);
+    let lock = match std::fs::File::open(&dirs[0]) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        lock => lock?,
+    };
+    lock.try_lock().context("the app's storage is in use")?;
+    let trash = cfg.data_dir.join("deleted").join(NEXT.fetch_add(1, Relaxed).to_string());
+    std::fs::create_dir_all(&trash)?;
+    let doomed = object.map_or(dirs.to_vec(), |o| vec![crate::app::object_dir(&dirs[0], o)]);
+    for (i, dir) in doomed.iter().enumerate() {
+        match std::fs::rename(dir, trash.join(i.to_string())) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            moved => moved?,
+        }
+        crate::journal::sync(dir.parent().expect("in a data directory"))?;
+    }
+    std::fs::remove_dir_all(trash)?;
+    Ok(())
+}
+
 /// Gives `uid` a directory tree it will own inside its jail. Skipped when the
 /// top is already its own, so only the first start after a change walks it.
 fn chown_tree(dir: &Path, uid: u32) -> anyhow::Result<()> {
@@ -821,19 +1112,44 @@ fn chown_tree(dir: &Path, uid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Gives what a claim restored of `object` (under `objects`, an app's) to
-/// the app's uid, the owner of `objects`, when the supervisor is root.
-fn restored(objects: &Path, object: &str) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(());
+/// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`).
+fn cgroup(cfg: &NodeConfig) -> anyhow::Result<Option<PathBuf>> {
+    Ok(match cfg.cgroup.as_str() {
+        "off" => None,
+        "auto" if cfg!(not(target_os = "linux")) => None,
+        "auto" => Some(delegate(&cfg.worker).context("cgroup = \"auto\": workers need a cgroup v2 subtree for their [worker] limits \
+            (under systemd, Delegate=yes); set cgroup = \"off\" to run them without")?),
+        dir => Some(PathBuf::from(dir)),
+    })
+}
+
+/// Makes the supervisor's own cgroup v2 a subtree for workers, as a
+/// container runtime does: moves the supervisor into `<own>/supervisor`
+/// (cgroup v2 keeps processes out of a group that hands controllers to its
+/// children), hands the controllers `limits` need to `<own>/workers`'
+/// children, and returns `<own>/workers`.
+fn delegate(limits: &WorkerLimits) -> anyhow::Result<PathBuf> {
+    let own = std::fs::read_to_string("/proc/self/cgroup")?;
+    let own = own.lines().find_map(|l| l.strip_prefix("0::")).context("not in a cgroup v2 hierarchy")?;
+    // Mount info: `<id> <parent> <dev> <root> <mount point> ... - cgroup2 ...`.
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let (root, mount) = mounts.lines().map(|l| l.split(' ').collect::<Vec<_>>())
+        .find_map(|f| (f.iter().skip_while(|f| **f != "-").nth(1) == Some(&"cgroup2")).then(|| (f[3].to_owned(), PathBuf::from(f[4]))))
+        .context("no cgroup v2 hierarchy is mounted")?;
+    let own = mount.join(Path::new(own).strip_prefix(&root).context("the supervisor's cgroup is outside the mounted hierarchy")?);
+    let wanted = [("memory", limits.memory_mb > 0), ("cpu", limits.cpus > 0.0), ("pids", limits.pids > 0)];
+    let available = std::fs::read_to_string(own.join("cgroup.controllers"))?;
+    if let Some((c, _)) = wanted.iter().find(|(c, on)| *on && !available.split_whitespace().any(|a| a == *c)) {
+        bail!("the {c} controller is not available in {}", own.display());
     }
-    let uid = std::fs::metadata(objects)?.uid();
-    let committed = objects.join("~committed");
-    for d in [committed.join(object), committed, objects.join(object)].iter().filter(|d| d.exists()) {
-        chown_tree(d, uid).map_err(std::io::Error::other)?;
-    }
-    Ok(())
+    let enable: Vec<_> = wanted.iter().filter(|(_, on)| *on).map(|(c, _)| format!("+{c}")).collect();
+    let write = |dir: &Path, file: &str, value: &str| {
+        std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(file), value)).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
+    };
+    write(&own.join("supervisor"), "cgroup.procs", "0")?;
+    write(&own, "cgroup.subtree_control", &enable.join(" "))?;
+    write(&own.join("workers"), "cgroup.subtree_control", &enable.join(" "))?;
+    Ok(own.join("workers"))
 }
 
 /// Gives a worker's cgroup its app's worker limits.
@@ -855,6 +1171,27 @@ fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
         set("pids.max", w.pids.to_string())?;
     }
     Ok(())
+}
+
+/// Counts what waits on the node to be shipped every 10 s, while the
+/// supervisor lives, for its snapshots, and says so when versions start to
+/// wait, every minute while they do, and when none does again.
+async fn count_backlog(sup: std::sync::Weak<Supervisor>) {
+    let mut said = None::<Instant>;
+    loop {
+        let Some(objects) = sup.upgrade().map(|s| s.cfg.data_dir.join("objects")) else { return };
+        let Ok(b) = tokio::task::spawn_blocking(move || crate::ship::backlog(&objects)).await else { return };
+        if b.versions > 0 && said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+            eprintln!("nanovm: {} versions ({} bytes) of {} objects wait to be shipped", b.versions, b.bytes, b.objects);
+            said = Some(Instant::now());
+        } else if b.versions == 0 && said.take().is_some() {
+            eprintln!("nanovm: every version is shipped");
+        }
+        let Some(s) = sup.upgrade() else { return };
+        *s.backlog.lock() = b;
+        drop(s);
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
 }
 
 /// `nanovm worker`: reads its spec and component from stdin, jails itself,

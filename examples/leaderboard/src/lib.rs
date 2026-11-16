@@ -11,7 +11,9 @@
 use std::cell::Cell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, serde_json, sqlite};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, serde_json, sqlite};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -32,18 +34,18 @@ struct Score {
 // Ties go to whoever got there first, then by name.
 const ORDER: &str = "ORDER BY score DESC, at, player";
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     schema().await?;
-    let player = req.path().strip_prefix("/players/").map(|p| p.to_string());
-    Ok(match (req.method(), req.path(), player) {
+    let player = req.uri().path().strip_prefix("/players/").map(|p| p.to_string());
+    Ok(match (req.method().as_str(), req.uri().path(), player) {
         ("POST", "/scores", _) => {
-            let scores = match req.json::<Scores>() {
+            let scores = match req.body().json::<Scores>() {
                 Ok(Scores::One(s)) => vec![s],
                 Ok(Scores::Many(s)) if s.len() <= 100 => s,
-                _ => return Ok(bad()),
+                _ => return bad(),
             };
             if !scores.iter().all(|s| (1..=64).contains(&s.player.chars().count())) {
-                return Ok(bad());
+                return bad();
             }
             let at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
             let batch = serde_json::to_string(&scores)?;
@@ -56,7 +58,7 @@ async fn handle(req: Request) -> Result {
                 &[&at, &batch],
             )
             .await?;
-            Response::json(standings(&batch).await?.json().to_string())
+            json(200, standings(&batch).await?.json().to_string())?
         }
         ("GET", "/top", _) => {
             let (limit, offset) = (req.query_or("limit", 10u32).min(100), req.query_or("offset", 0u32));
@@ -65,17 +67,17 @@ async fn handle(req: Request) -> Result {
                 &[&limit, &offset],
             )
             .await?;
-            Response::json(page.json().to_string())
+            json(200, page.json().to_string())?
         }
         ("GET", _, Some(player)) => match standings(&serde_json::json!([{ "player": player }]).to_string()).await?.json() {
-            serde_json::Value::Array(mut one) if !one.is_empty() => Response::json(one.remove(0).to_string()),
-            _ => Response::not_found(),
+            serde_json::Value::Array(mut one) if !one.is_empty() => json(200, one.remove(0).to_string())?,
+            _ => text(404, "not found")?,
         },
         ("DELETE", _, Some(player)) => {
             sqlite::execute("DELETE FROM scores WHERE player = ?", &[&player]).await?;
-            Response::new(204)
+            Response::builder().status(204).body(Body::empty())?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
@@ -90,8 +92,8 @@ async fn standings(players: &str) -> Result<sqlite::Rows> {
     .await?)
 }
 
-fn bad() -> Response {
-    Response::text("a score is {\"player\": 1-64 characters, \"score\": an integer}, up to 100 at once\n").status(400)
+fn bad() -> Result {
+    text(400, "a score is {\"player\": 1-64 characters, \"score\": an integer}, up to 100 at once\n")
 }
 
 thread_local! {
@@ -106,4 +108,14 @@ async fn schema() -> Result<()> {
         READY.set(true);
     }
     Ok(())
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

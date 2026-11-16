@@ -17,7 +17,9 @@
 
 use std::collections::BTreeMap;
 
-use nanovm_sdk::{Request, Response, Result, kv, serde_json};
+use nanovm_sdk::http::header::CONTENT_TYPE;
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, Result, kv, serde_json};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -52,13 +54,13 @@ struct Op {
     delete: bool,
 }
 
-async fn handle(req: Request) -> Result {
-    if (req.method(), req.path()) != ("POST", "/sync") {
-        return Ok(Response::not_found());
+async fn handle(req: Request<Body>) -> Result {
+    if (req.method().as_str(), req.uri().path()) != ("POST", "/sync") {
+        return text(404, "not found");
     }
     let ok = |s: &Sync| s.ops.len() <= 100 && s.ops.iter().all(|o| valid(&o.id) && valid(&o.todo));
-    let Some(sync) = req.json::<Sync>().ok().filter(ok) else {
-        return Ok(Response::text("{\"since\", \"ops\": up to 100 with ids of 1-64 of [A-Za-z0-9_-]}\n").status(400));
+    let Some(sync) = req.body().json::<Sync>().ok().filter(ok) else {
+        return text(400, "{\"since\", \"ops\": up to 100 with ids of 1-64 of [A-Za-z0-9_-]}\n");
     };
     let mut version = kv::get_text("version").await?.and_then(|v| v.parse().ok()).unwrap_or(0u64);
     let mut conflicts = vec![];
@@ -115,9 +117,19 @@ async fn handle(req: Request) -> Result {
     }
     changes.sort_by_key(|t| t.version);
     let out = serde_json::json!({ "version": version, "changes": changes, "conflicts": conflicts });
-    Ok(Response::json(out.to_string()))
+    json(200, out.to_string())
 }
 
 fn valid(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }

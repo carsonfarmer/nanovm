@@ -33,6 +33,7 @@ node.
 | [gateway](../examples/gateway) | A-17 | per-user token quotas in front of a streaming API: reserve before streaming, refund after a verified finish (`[DONE]`, body whole), so cut streams aren't free; events parsed across reads | 3.7 |
 | [feeds](../examples/feeds) | A-18 | a feed object as a shared cache: conditional GETs, items kept once; readers fan in through calls | 1.6 |
 | [oauth](../examples/oauth) | A-14 | GitHub sign-in: one-time state bound to the starting browser by a `__Host-` nonce cookie, token exchange over egress, cookies only the user's object accepts, `auth` vouching for sessions (W-602) | 0.6 |
+| [echo](../examples/echo) | B-701 | added later (notes/sdk-http.md): answers with what it was sent; the SDK's `http` mapping both ways, through a call between objects too | <0.1 |
 
 The first twenty: 72 s in one run, 59 s in the full suite
 (`RUST_TEST_THREADS=1`, load average 11-17 on 4 shared cores). Most tests

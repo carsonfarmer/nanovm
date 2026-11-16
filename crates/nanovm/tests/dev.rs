@@ -237,7 +237,45 @@ async fn nanovm_run_restarts_when_the_component_changes() {
     run.line("changed; restarting").await;
     let addr = run.addr().await;
     assert_eq!(get(addr, "/x/").await, (200, r#"{"object":"x","hits":1}"#.into()));
-    assert_eq!(std::fs::read_to_string(data.join("objects/app/x/count")).unwrap(), "1");
+    assert_eq!(std::fs::read_to_string(nanovm::app::object_dir(&data.join("objects/app"), "x").join("data/count")).unwrap(), "1");
+}
+
+/// `nanovm run --secrets <file>` gives an app its secrets as a node's
+/// operator does: it reads them with its config, and a change to the file
+/// restarts it. An app that needs one it wasn't given doesn't start, nor
+/// does one given a malformed file, and neither error quotes the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn nanovm_run_takes_secrets_from_a_file() {
+    let data = data_dir("secrets");
+    let (manifest, secrets) = (data.join("nanovm.json"), data.join("secrets.json"));
+    std::fs::write(&manifest, r#"{"secrets": ["api_key"]}"#).unwrap();
+    let args = |with: bool| {
+        let mut args = vec![guest("counter").into_os_string(), "--manifest".into(), manifest.clone().into(), "--data".into(), data.clone().into()];
+        args.extend(with.then(|| ["--secrets".into(), secrets.clone().into_os_string()]).into_iter().flatten());
+        args
+    };
+    let refused = async |args: Vec<std::ffi::OsString>| {
+        let mut run = tokio::process::Command::new(env!("CARGO_BIN_EXE_nanovm"));
+        run.arg("run").args(args).args(["--listen", "127.0.0.1:0"]).env_remove("RUST_BACKTRACE").kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(60), run.output()).await.expect("refused, not served").unwrap();
+        assert!(!out.status.success());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let e = refused(args(false)).await;
+    assert!(e.contains("--secrets <secrets.json>") && e.contains("the app needs secrets api_key; none were given"), "{e}");
+    std::fs::write(&secrets, r#"{"api_key": 4242424242424242}"#).unwrap();
+    let e = refused(args(true)).await;
+    assert!(e.contains("secrets.json is not a JSON object of strings (line 1, column") && !e.contains("4242"), "{e}");
+
+    std::fs::write(&secrets, r#"{"api_key": "one"}"#).unwrap();
+    let args = args(true);
+    let mut run = start(&args.iter().map(|a| a.as_os_str()).collect::<Vec<_>>());
+    let addr = run.addr().await;
+    assert_eq!(get(addr, "/a/config/api_key").await, (200, "one".into()));
+    std::fs::write(&secrets, r#"{"api_key": "two"}"#).unwrap();
+    run.line("secrets.json changed; restarting").await;
+    let addr = run.addr().await;
+    assert_eq!(get(addr, "/a/config/api_key").await, (200, "two".into()));
 }
 
 /// The quickstart (README, sdk/rust/README.md): examples/hello, built with
@@ -409,6 +447,7 @@ async fn nanovm_publish_pushes_what_a_node_loads() {
         digest: digest.into(),
         env: spec.env,
         config: spec.config,
+        secrets: Default::default(),
         limits: spec.limits,
         worker: Default::default(),
     };
@@ -424,8 +463,35 @@ async fn nanovm_publish_pushes_what_a_node_loads() {
     assert!(!ok && stderr.contains("spin:key-value") && stderr.contains("tools/build-app.sh"), "{stderr}");
     let (ok, _, stderr) = publish(&hello, &format!("{addr}/you/hello:latest"), &[]).await;
     assert!(!ok && stderr.contains("the tag is the app's version"), "{stderr}");
+    // A package is public: it can't hold a secret, or what looks like one.
+    let leaky = data_dir("publish-leaky").join("nanovm.json");
+    for (manifest, says) in [
+        (r#"{"secrets": ["api_key"], "config": {"api_key": "k-0123abcd"}}"#, "config.api_key is one of the app's `secrets`"),
+        (r#"{"env": {"CLIENT_SECRET": "0123abcd"}}"#, "env.CLIENT_SECRET looks like a credential"),
+        (r#"{"config": {"upstream": "sk-proj-0123abcdefghijklmnop"}}"#, "config.upstream looks like a credential"),
+    ] {
+        std::fs::write(&leaky, manifest).unwrap();
+        let (ok, stdout, stderr) = publish(&hello, &format!("{addr}/you/leaky:1.0.0"), &["--manifest".as_ref(), leaky.as_os_str()]).await;
+        assert!(!ok && stderr.contains(says) && !stderr.contains("0123") && !stdout.contains("0123"), "{stderr}");
+    }
     let oci = nanovm::registry::Oci::new(true).unwrap();
-    for never in ["you/bare:1.0.0", "you/hello:latest"] {
+    for never in ["you/bare:1.0.0", "you/hello:latest", "you/leaky:1.0.0"] {
         assert!(oci.digest(&format!("{addr}/{never}").parse().unwrap()).await.is_err(), "{never} was pushed");
     }
+}
+
+/// Every example's manifest is one `nanovm publish` takes: none holds a
+/// secret, or anything its checks would take for one.
+#[test]
+fn example_manifests_hold_no_secrets() {
+    let mut checked = 0;
+    for dir in std::fs::read_dir(repo().join("examples")).unwrap() {
+        let manifest = dir.unwrap().path().join("nanovm.json");
+        if let Ok(text) = std::fs::read(&manifest) {
+            let spec = serde_json::from_slice(&text).unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
+            nanovm::secrets::check_package(&spec).unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
+            checked += 1;
+        }
+    }
+    assert!(checked >= 20, "{checked}");
 }

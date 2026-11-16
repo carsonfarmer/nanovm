@@ -1,5 +1,6 @@
 //! The app's config (`wasi:config/store`): the `config` table of its
-//! `nanovm.json`, the same for every object.
+//! `nanovm.json`, and the secrets the node's operator gives it (those its
+//! manifest names in `secrets`) over it; the same for every object.
 
 mod bindings {
     wit_bindgen::generate!({ path: "../../wit/config", world: "wasi:config/imports", generate_all });

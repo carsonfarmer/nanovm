@@ -1,8 +1,8 @@
-use nanovm_sdk::{Request, Response, Result, kv};
+use nanovm_sdk::{Body, Result, http, kv};
 
 nanovm_sdk::serve!(handle);
 
-async fn handle(_req: Request) -> Result {
+async fn handle(_req: http::Request<Body>) -> Result {
     let visits = kv::increment("visits", 1).await?;
-    Ok(Response::text(format!("{} has had {visits} visits\n", nanovm_sdk::id())))
+    Ok(http::Response::new(format!("{} has had {visits} visits\n", nanovm_sdk::id()).into()))
 }

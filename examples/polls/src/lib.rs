@@ -9,7 +9,9 @@
 //! - `GET /{poll}/`: the results
 //! - `/{poll}/ws`: a WebSocket that gets the results, then each change
 
-use nanovm_sdk::{Request, Response, Result, kv, serde_json, ws};
+use nanovm_sdk::http::header::{CONTENT_TYPE, SET_COOKIE};
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, kv, serde_json, ws};
 use serde::{Deserialize, Serialize};
 
 nanovm_sdk::serve!(handle);
@@ -36,12 +38,12 @@ struct Choice<'a> {
     votes: u64,
 }
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     let Some(poll) = kv::get("poll").await? else {
-        return Ok(match req.method() {
-            "PUT" if req.path() == "/" => create(&req).await?,
-            _ => Response::not_found(),
-        });
+        return match req.method().as_str() {
+            "PUT" if req.uri().path() == "/" => create(&req).await,
+            _ => text(404, "not found"),
+        };
     };
     let poll: Poll = serde_json::from_slice(&poll)?;
     let mut tally: Vec<u64> = match kv::get("tally").await? {
@@ -57,17 +59,17 @@ async fn handle(req: Request) -> Result {
         }
         return Ok(answer.into());
     }
-    Ok(match (req.method(), req.path()) {
+    Ok(match (req.method().as_str(), req.uri().path()) {
         ("GET", "/") => {
             let you = match cookie {
                 Some(voter) => kv::get_text(&format!("vote:{voter}")).await?.and_then(|v| v.parse().ok()),
                 None => None,
             };
-            Response::json(results(&poll, &tally, you)?)
+            json(200, results(&poll, &tally, you)?)?
         }
         ("POST", "/vote") => {
             let Some(option) = req.query("option").and_then(|o| o.parse::<usize>().ok()).filter(|o| *o < tally.len()) else {
-                return Ok(Response::text("option is the number of one of the poll's options\n").status(400));
+                return text(400, "option is the number of one of the poll's options\n");
             };
             let voter = match cookie {
                 Some(voter) => voter.to_string(),
@@ -86,23 +88,35 @@ async fn handle(req: Request) -> Result {
                 ws::publish("results", &results(&poll, &tally, None)?).await?;
             }
             let cookie = format!("voter={voter}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax");
-            Response::json(results(&poll, &tally, Some(option))?).header("set-cookie", cookie)
+            let mut res = json(200, results(&poll, &tally, Some(option))?)?;
+            res.headers_mut().insert(SET_COOKIE, cookie.try_into()?);
+            res
         }
-        ("PUT", "/") => Response::text("this poll exists\n").status(409),
-        _ => Response::not_found(),
+        ("PUT", "/") => text(409, "this poll exists\n")?,
+        _ => text(404, "not found")?,
     })
 }
 
-async fn create(req: &Request) -> Result {
-    let poll = req.json::<Poll>().ok().filter(|p| {
+async fn create(req: &Request<Body>) -> Result {
+    let poll = req.body().json::<Poll>().ok().filter(|p| {
         let text = |s: &String, max| (1..=max).contains(&s.trim().chars().count());
         text(&p.question, 200) && (2..=10).contains(&p.options.len()) && p.options.iter().all(|o| text(o, 100))
     });
     let Some(poll) = poll else {
-        return Ok(Response::text("a question of 1-200 characters and 2-10 options of 1-100\n").status(400));
+        return text(400, "a question of 1-200 characters and 2-10 options of 1-100\n");
     };
     kv::set("poll", serde_json::to_vec(&poll)?).await?;
-    Ok(Response::json(results(&poll, &vec![0; poll.options.len()], None)?).status(201))
+    json(201, results(&poll, &vec![0; poll.options.len()], None)?)
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }
 
 fn results(poll: &Poll, tally: &[u64], you: Option<usize>) -> Result<String> {

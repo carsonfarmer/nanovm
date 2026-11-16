@@ -6,6 +6,9 @@
 //! (`/u-{login}/`) accepts a session cookie only once `auth` has vouched for
 //! it, then remembers that it did.
 //!
+//! The client secret is the app's one secret (`secrets` in its manifest):
+//! the node's operator gives it, and the app reads it with its config.
+//!
 //! Why `auth` keeps the sessions: a call between objects can't prove who
 //! sent it (W-602), so a user object that took new sessions from a call
 //! would take them from anyone. Instead it asks `auth` about a cookie it was
@@ -18,7 +21,9 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nanovm_sdk::{Request, Response, Result, config, fetch, kv, object, serde_json};
+use nanovm_sdk::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, LOCATION, SET_COOKIE, USER_AGENT};
+use nanovm_sdk::http::{Request, Response};
+use nanovm_sdk::{Body, RequestExt, Result, config, fetch, kv, object, serde_json};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -27,20 +32,20 @@ nanovm_sdk::serve!(handle);
 const STATE_MS: u64 = 10 * 60 * 1000;
 const SESSION_MS: u64 = 30 * 24 * 3600 * 1000;
 
-async fn handle(req: Request) -> Result {
+async fn handle(req: Request<Body>) -> Result {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     match nanovm_sdk::id().as_str() {
         "auth" => auth(&req, now).await,
         id if id.starts_with("u-") => user(&req, now).await,
-        _ => Ok(Response::not_found()),
+        _ => text(404, "not found"),
     }
 }
 
-async fn auth(req: &Request, now: u64) -> Result {
+async fn auth(req: &Request<Body>, now: u64) -> Result {
     let setting = |k: &str| config::get(k).ok().flatten().unwrap_or_default();
     let secure = secure();
     let nonce_cookie = &named("oauth_nonce", secure);
-    Ok(match req.path() {
+    Ok(match req.uri().path() {
         "/login" => {
             // The browser's nonce (a new one, or the one it has, so that two
             // sign-ins started in it both work), bound to the state by its
@@ -56,7 +61,8 @@ async fn auth(req: &Request, now: u64) -> Result {
                 setting("client_id"),
                 setting("redirect_uri")
             );
-            Response::new(302).header("location", to).header("set-cookie", cookie(nonce_cookie, &nonce, STATE_MS / 1000, secure))
+            let nonce = cookie(nonce_cookie, &nonce, STATE_MS / 1000, secure);
+            Response::builder().status(302).header(LOCATION, to).header(SET_COOKIE, nonce).body(Body::empty())?
         }
         "/callback" => {
             // The state proves the flow started here, once; the nonce whose
@@ -69,52 +75,51 @@ async fn auth(req: &Request, now: u64) -> Result {
             let browser = req.cookie(nonce_cookie).map(sha256_hex);
             let ok = bound["until"].as_u64().is_some_and(|t| t > now) && browser.is_some_and(|b| bound["browser"] == b);
             if !ok {
-                return Ok(Response::text("this sign-in link is used, expired, or not from this browser\n").status(400));
+                return text(400, "this sign-in link is used, expired, or not from this browser\n");
             }
-            let token = fetch(setting("token_url"))
-                .method("POST")
-                .header("accept", "application/json")
-                .header("content-type", "application/json")
+            let token = Request::post(setting("token_url"))
+                .header(ACCEPT, "application/json")
+                .header(CONTENT_TYPE, "application/json")
                 .body(
                     json!({
                         "client_id": setting("client_id"),
-                        "client_secret": nanovm_sdk::env("CLIENT_SECRET"),
+                        "client_secret": setting("client_secret"),
                         "code": req.query("code").unwrap_or_default(),
                     })
                     .to_string(),
-                )
-                .send()
-                .await?;
-            let token: Value = serde_json::from_slice(&token.body).unwrap_or_default();
+                )?;
+            let token = fetch(token).await?;
+            let token: Value = serde_json::from_slice(token.body()).unwrap_or_default();
             let Some(token) = token["access_token"].as_str() else {
-                return Ok(Response::text("GitHub refused the code\n").status(401));
+                return text(401, "GitHub refused the code\n");
             };
-            let me = fetch(setting("user_url")).header("authorization", format!("Bearer {token}")).header("user-agent", "nanovm").send().await?;
-            let me: Value = serde_json::from_slice(&me.body).unwrap_or_default();
+            let me = Request::get(setting("user_url")).header(AUTHORIZATION, format!("Bearer {token}")).header(USER_AGENT, "nanovm");
+            let me = fetch(me.body(())?).await?;
+            let me: Value = serde_json::from_slice(me.body()).unwrap_or_default();
             let login = me["login"].as_str().filter(|l| (1..=39).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
-            let Some(login) = login else { return Ok(Response::text("no GitHub user\n").status(502)) };
+            let Some(login) = login else { return text(502, "no GitHub user\n") };
             let session = random_hex(32);
             let profile = json!({ "login": login, "id": me["id"], "name": me["name"] });
             kv::set(&format!("session:{session}"), json!({ "profile": profile, "until": now + SESSION_MS }).to_string()).await?;
             let cookie = cookie(&named("session", secure), &format!("{login}.{session}"), SESSION_MS / 1000, secure);
-            Response::new(302).header("location", format!("/u-{login}/me")).header("set-cookie", cookie)
+            Response::builder().status(302).header(LOCATION, format!("/u-{login}/me")).header(SET_COOKIE, cookie).body(Body::empty())?
         }
         // For user objects, about a cookie they were shown.
-        "/verify" => match session(req.query("session")).await? {
-            Some(s) if s["until"].as_u64().is_some_and(|t| t > now) => Response::json(s.to_string()),
-            _ => Response::not_found(),
+        "/verify" => match session(req.query("session").as_deref()).await? {
+            Some(s) if s["until"].as_u64().is_some_and(|t| t > now) => json(200, s.to_string())?,
+            _ => text(404, "not found")?,
         },
         "/logout" if req.method() == "POST" => {
             if let Some(id) = req.query("session").filter(|s| s.len() == 64) {
                 kv::delete(&format!("session:{id}")).await?;
             }
-            Response::new(204)
+            Response::builder().status(204).body(Body::empty())?
         }
-        _ => Response::not_found(),
+        _ => text(404, "not found")?,
     })
 }
 
-async fn user(req: &Request, now: u64) -> Result {
+async fn user(req: &Request<Body>, now: u64) -> Result {
     // A cookie is `{login}.{session}`: only this user's own sessions count.
     let login = &nanovm_sdk::id()[2..];
     let secure = secure();
@@ -126,9 +131,9 @@ async fn user(req: &Request, now: u64) -> Result {
             Some(until) => until > now,
             // Not seen here before: ask `auth`, and remember its answer.
             None => {
-                let reply = object("auth").get(&format!("/verify?session={id}")).send().await?;
-                let vouched: Value = serde_json::from_slice(&reply.body).unwrap_or_default();
-                let ok = reply.status == 200 && vouched["profile"]["login"] == login;
+                let reply = object("auth").get(&format!("/verify?session={id}")).await?;
+                let vouched: Value = serde_json::from_slice(reply.body()).unwrap_or_default();
+                let ok = reply.status() == 200 && vouched["profile"]["login"] == login;
                 if ok {
                     kv::set(&format!("session:{id}"), vouched["until"].to_string()).await?;
                     kv::set("profile", vouched["profile"].to_string()).await?;
@@ -138,16 +143,16 @@ async fn user(req: &Request, now: u64) -> Result {
         },
         None => false,
     };
-    Ok(match (req.method(), req.path()) {
-        ("GET", "/me") if signed_in => Response::json(kv::get_text("profile").await?.unwrap_or_default()),
+    Ok(match (req.method().as_str(), req.uri().path()) {
+        ("GET", "/me") if signed_in => json(200, kv::get_text("profile").await?.unwrap_or_default())?,
         ("POST", "/logout") if signed_in => {
             let id = session.unwrap_or_default();
             kv::delete(&format!("session:{id}")).await?;
-            object("auth").post(&format!("/logout?session={id}"), "").send().await?;
-            Response::new(204).header("set-cookie", cookie(&name, "", 0, secure))
+            object("auth").post(&format!("/logout?session={id}"), "").await?;
+            Response::builder().status(204).header(SET_COOKIE, cookie(&name, "", 0, secure)).body(Body::empty())?
         }
-        ("GET", "/me") | ("POST", "/logout") => Response::text("sign in at /auth/login\n").status(401),
-        _ => Response::not_found(),
+        ("GET", "/me") | ("POST", "/logout") => text(401, "sign in at /auth/login\n")?,
+        _ => text(404, "not found")?,
     })
 }
 
@@ -181,4 +186,14 @@ fn sha256_hex(s: &str) -> String {
 
 fn random_hex(bytes: u64) -> String {
     nanovm_sdk::wasip3::random::random::get_random_bytes(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A JSON answer.
+fn json(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "application/json").body(body.into())?)
+}
+
+/// A plain-text answer.
+fn text(status: u16, body: impl Into<Body>) -> Result {
+    Ok(Response::builder().status(status).header(CONTENT_TYPE, "text/plain; charset=utf-8").body(body.into())?)
 }
