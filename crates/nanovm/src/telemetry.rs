@@ -68,7 +68,12 @@ impl HttpClient for Client {
         let mut request = request;
         if !self.secrets.0.is_empty() {
             let mut body = request.body().to_vec();
-            self.secrets.mask(&mut body);
+            let kind = match request.uri().path().rsplit('/').next() {
+                Some("traces") => Kind::Batch(true),
+                Some("logs") => Kind::Batch(false),
+                _ => return Err("unknown telemetry signal".into()),
+            };
+            redact(kind, &mut body, &self.secrets, 0)?;
             *request.body_mut() = body.into();
         }
         let client = self.clone();
@@ -319,7 +324,51 @@ fn stamp(signal: &str, body: &[u8], app: &str, digest: &str) -> anyhow::Result<V
 /// An OTLP message holding resources, scopes or attributes; `true` for
 /// traces, `false` for logs.
 #[derive(Clone, Copy)]
-enum Kind { Batch(bool), Resource(bool), Scope(bool), ScopeInfo, Span, Event, Link, Log }
+enum Kind { Batch(bool), Resource(bool), Scope(bool), ScopeInfo, Span, Event, Link, Log,
+    ResourceInfo, Attribute, Value, Array, Attributes, Status, Entity }
+
+/// Redact only schema-defined strings, never IDs, numbers or framing. Walking
+/// borrowed wire slices avoids allocating a decoded object per empty span.
+fn redact(kind: Kind, mut m: &mut [u8], secrets: &crate::secrets::Secrets, depth: usize) -> anyhow::Result<()> {
+    use Kind::*;
+    anyhow::ensure!(depth <= 64, "telemetry nesting too deep");
+    while !m.is_empty() {
+        let mut rest: &[u8] = m;
+        let (key, value) = field(&mut rest)?;
+        let (end, len) = (m.len() - rest.len(), value.len());
+        let (current, tail) = m.split_at_mut(end);
+        let value = &mut current[end - len..];
+        let child = match (kind, key >> 3) {
+            (Batch(traces), 1) => Some(Resource(traces)),
+            (Resource(_), 1) => Some(ResourceInfo),
+            (Resource(traces), 2) => Some(Scope(traces)),
+            (Scope(_), 1) => Some(ScopeInfo),
+            (Scope(true), 2) => Some(Span),
+            (Scope(false), 2) => Some(Log),
+            (ResourceInfo, 1) | (ScopeInfo, 3) | (Span, 9) | (Event, 3) | (Link, 4) | (Log, 6) | (Attributes, 1) => Some(Attribute),
+            (ResourceInfo, 3) => Some(Entity),
+            (Span, 11) => Some(Event),
+            (Span, 13) => Some(Link),
+            (Span, 15) => Some(Status),
+            (Log, 5) | (Attribute, 2) | (Array, 1) => Some(Value),
+            (Value, 5) => Some(Array),
+            (Value, 6) => Some(Attributes),
+            _ => None,
+        };
+        if let Some(child) = child {
+            anyhow::ensure!(key & 7 == LEN, "bad telemetry message");
+            redact(child, value, secrets, depth + 1)?;
+        } else if matches!((kind, key >> 3),
+            (Resource(_) | Scope(_), 3) | (ScopeInfo, 1 | 2) |
+            (Span, 3 | 5) | (Event, 2) | (Link, 3) | (Log, 3 | 12) |
+            (Attribute | Value, 1) | (Status, 2) | (Entity, 1..=4)) {
+            anyhow::ensure!(key & 7 == LEN, "bad telemetry string");
+            secrets.mask(value);
+        }
+        m = tail;
+    }
+    Ok(())
+}
 
 fn rewrite(kind: Kind, mut m: &[u8], resource: &[u8], out: &mut Vec<u8>) -> anyhow::Result<()> {
     use Kind::*;
@@ -453,6 +502,100 @@ mod tests {
         out
     }
 
+    /// Redaction through the export client must leave protobuf framing intact,
+    /// even when a secret's bytes coincide with a length rather than log text.
+    #[tokio::test]
+    async fn review_secret_redaction_preserves_otlp_framing() {
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        let batch = collector::logs::v1::ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        body: Some(common::AnyValue { value: Some(common::any_value::Value::StringValue("z".repeat(97))) }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let encoded = batch.encode_to_vec();
+        assert_eq!(collector::logs::v1::ExportLogsServiceRequest::decode(encoded.as_slice()).unwrap(), batch);
+        assert!(stamp("logs", &encoded, "app", "digest").is_ok(), "valid supervisor input");
+        let (captured, mut received) = tokio::sync::mpsc::channel(2);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay = Arc::new(Relay::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap());
+        let server = tokio::spawn(crate::server::serve_http1(listener, move |req| {
+            let captured = captured.clone();
+            async move {
+                captured.send(req.into_body().collect().await.unwrap().to_bytes()).await.unwrap();
+                Response::new(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            }
+        }));
+        let mut client = Client {
+            runtime: tokio::runtime::Handle::current(), upstream: None, relay: Some(relay), secrets: Default::default(),
+        };
+        let request = || Request::post("http://nanovm/v1/logs").body(Bytes::from(encoded.clone())).unwrap();
+        assert_eq!(client.send_bytes(request()).await.unwrap().status(), 200);
+        let control = received.recv().await.unwrap();
+        assert_eq!(control.as_ref(), encoded.as_slice(), "export without secrets preserves the input");
+        client.secrets = Arc::new(crate::secrets::Secrets([("key".into(), "a".into())].into()));
+        assert_eq!(client.send_bytes(request()).await.unwrap().status(), 200);
+        let redacted = received.recv().await.unwrap();
+        let decoded = collector::logs::v1::ExportLogsServiceRequest::decode(redacted.as_ref());
+        assert_eq!(decoded, Ok(batch), "a secret absent from log text must not corrupt OTLP framing");
+
+        for secret in ["a", "a\n\"credential\\é"] {
+            client.secrets = Arc::new(crate::secrets::Secrets([("key".into(), secret.into())].into()));
+            for ((signal, input), (_, expected)) in redaction_batches(secret).into_iter()
+                .zip(redaction_batches(&"*".repeat(secret.len()))) {
+                match signal {
+                    "logs" => { collector::logs::v1::ExportLogsServiceRequest::decode(input.as_slice()).unwrap(); }
+                    _ => { collector::trace::v1::ExportTraceServiceRequest::decode(input.as_slice()).unwrap(); }
+                }
+                let request = Request::post(format!("http://nanovm/v1/{signal}")).body(Bytes::from(input)).unwrap();
+                assert_eq!(client.send_bytes(request).await.unwrap().status(), 200);
+                let received = received.recv().await.unwrap();
+                assert_eq!(received.as_ref(), expected, "{signal}: strings masked, binary fields and framing unchanged");
+            }
+        }
+        server.abort();
+    }
+
+    /// Exercise every current OTLP string location, including recursive values.
+    /// The same secret also occurs in binary IDs/bytes, which must pass untouched.
+    fn redaction_batches(text: &str) -> [(&'static str, Vec<u8>); 2] {
+        let text = format!("prefix {text} suffix");
+        let text = text.as_bytes();
+        let binary = "a\n\"credential\\é".as_bytes();
+        let string = raw(&[(10, text)]);
+        let kv = raw(&[(10, text), (18, &string)]);
+        let values = raw(&[(10, &string), (10, &raw(&[(50, &raw(&[(10, &kv)]))])),
+            (10, &raw(&[(58, binary)])), (10, &raw(&[(24, &[97])])),
+            (10, &raw(&[(33, b"aaaaaaaa")]))]);
+        let attribute = raw(&[(10, text), (18, &raw(&[(42, &values)]))]);
+        let scope = raw(&[(10, text), (18, text), (26, &attribute)]);
+        let resource = raw(&[(10, &attribute), (26, &raw(&[(10, text), (18, text), (26, text), (34, text)]))]);
+        let event = raw(&[(18, text), (26, &attribute)]);
+        let link = raw(&[(10, binary), (18, binary), (26, text), (34, &attribute)]);
+        let span = raw(&[(10, binary), (18, binary), (26, text), (34, binary), (42, text),
+            (57, b"aaaaaaaa"), (74, &attribute), (90, &event), (106, &link), (122, &raw(&[(18, text)]))]);
+        let log = raw(&[(9, b"aaaaaaaa"), (89, b"aaaaaaaa"), (26, text), (42, &raw(&[(42, &values)])),
+            (50, &attribute), (74, binary), (82, binary), (98, text)]);
+        let batch = |record: &[u8]| raw(&[(10, &raw(&[(10, &resource),
+            (18, &raw(&[(10, &scope), (18, record), (26, text)])), (26, text)]))]);
+        [("traces", batch(&span)), ("logs", batch(&log))]
+    }
+
+    #[test]
+    fn redaction_bounds_recursive_values() {
+        let secrets = crate::secrets::Secrets([("key".into(), "secret".into())].into());
+        let mut value = raw(&[(10, b"secret")]);
+        for _ in 0..65 { value = raw(&[(42, &raw(&[(10, &value)]))]); }
+        assert!(redact(Kind::Value, &mut value, &secrets, 0).is_err());
+        assert!(redact(Kind::Value, &mut [10, 8, b'x'], &secrets, 0).is_err());
+    }
+
     /// A worker's 1 MiB batch of 2-byte empty spans costs the supervisor
     /// about its size to stamp, not the 200 MiB that decoding it did (N-74).
     #[test]
@@ -468,6 +611,13 @@ mod tests {
         let resource = Resource { attributes: opentelemetry_proto::transform::common::tonic::Attributes::from(identity("app", "digest")).0, ..Default::default() };
         let expected = raw(&[(1 << 3 | LEN, &raw(&[(1 << 3 | LEN, &resource.encode_to_vec()), (2 << 3 | LEN, &scope)]))]);
         assert!(stamped == expected, "the spans pass unchanged under the stamped resource");
+        let mut redacted = batch.clone();
+        let secrets = crate::secrets::Secrets([("key".into(), "a".into())].into());
+        let before = crate::counting::allocated();
+        redact(Kind::Batch(true), &mut redacted, &secrets, 0).unwrap();
+        let allocated = crate::counting::allocated() - before;
+        assert!(allocated < MAX_BATCH, "redaction allocated {allocated} bytes");
+        assert_eq!(redacted, batch, "empty spans have no strings to mask");
     }
 
     /// Stamping at the wire level gives what decoding, replacing the

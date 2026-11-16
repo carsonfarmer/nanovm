@@ -110,10 +110,11 @@ config! {
         /// that app's writes are refused. 0 is a quarter of `data_dir`'s
         /// filesystem.
         app_disk_mb: u64 = 0u64,
-        /// Free space kept on `data_dir`'s filesystem, in MiB: below it,
-        /// writes that need more space are refused for every app, so
-        /// commits, rollbacks and deletes always find room. 0 is a
-        /// twentieth of the filesystem, at most 1 GiB.
+        /// Free-space threshold on `data_dir`'s filesystem, in MiB. Growth
+        /// fits measured headroom less the app's in-flight grants. Other
+        /// workers, journals and filesystem overhead can still consume it;
+        /// this is not a physical-space reservation. 0 is a twentieth of
+        /// the filesystem, at most 1 GiB.
         disk_reserve_mb: u64 = 0u64,
     }
 }

@@ -16,6 +16,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::object::{BoxError, RespBody, empty_response, error_response};
@@ -143,21 +144,56 @@ pub fn body_timeout() -> Response<RespBody> {
     error_response(408, "body-timeout", &BodyTimeout.to_string())
 }
 
+// Hyper transfers I/O, not its service, to an upgrade consumer. Admission
+// follows that I/O; drop the socket before releasing its guards.
+struct Connection<I, G> {
+    io: I,
+    _guard: G,
+}
+
+impl<I: AsyncRead + Unpin, G: Unpin> AsyncRead for Connection<I, G> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<I: AsyncWrite + Unpin, G: Unpin> AsyncWrite for Connection<I, G> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+}
+
 /// Serves HTTP/1.1 on one connection, in its own task, holding `guard` until
-/// the connection is done. With `header_timeout`, a client that takes longer
-/// to send a request's headers (or leaves the connection idle that long
-/// between requests) is hung up on.
-pub fn serve_conn<I, G, F, Fut, B>(io: I, header_timeout: Option<Duration>, guard: G, f: F)
+/// its I/O is dropped, even after an upgrade. With `header_timeout`, a client
+/// that takes longer to send a request's headers (or leaves the connection
+/// idle that long between requests) is hung up on.
+pub fn serve_conn<I, G, F, Fut, B>(io: I, header_timeout: Option<Duration>, guard: G, f: F) -> tokio::task::JoinHandle<Result<(), hyper::Error>>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-    G: Send + Sync + 'static,
+    G: Send + Sync + Unpin + 'static,
     F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response<B>> + Send + 'static,
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<crate::object::BoxError>,
 {
+    let io = Connection { io, _guard: guard };
     let svc = service_fn(move |req| {
-        let _ = &guard;
         let res = f(req);
         async move { Ok::<_, Infallible>(res.await) }
     });
@@ -166,7 +202,7 @@ where
     if header_timeout.is_some() {
         builder.timer(TokioTimer::new()).header_read_timeout(header_timeout);
     }
-    tokio::spawn(builder.serve_connection(TokioIo::new(io), svc).with_upgrades());
+    tokio::spawn(builder.serve_connection(TokioIo::new(io), svc).with_upgrades())
 }
 
 pub async fn handle<B>(node: Arc<Node>, req: Request<B>) -> Response<RespBody>

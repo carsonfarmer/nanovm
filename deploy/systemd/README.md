@@ -28,7 +28,7 @@ without any ("No CA certificates were loaded from the system").
 
 The supervisor runs as root because per-app uids depend on it (`geteuid() == 0`
 in `supervisor::app_dirs`); without root every app shares one uid. Its bounding
-set keeps four capabilities, each shown necessary in a container test by removing it:
+set keeps five capabilities:
 
 | Capability | Used for | Without it |
 |---|---|---|
@@ -36,14 +36,12 @@ set keeps four capabilities, each shown necessary in a container test by removin
 | `CAP_SETUID` | the worker's `setresuid` before its jail | `entering the jail: setresuid(200000) failed` |
 | `CAP_SETGID` | the worker's `setgroups`/`setresgid` | `entering the jail: setgroups failed` |
 | `CAP_KILL` | SIGKILL of a worker at its drain deadline (other uid) | `kill(2)` across uids fails; workers still exit when the supervisor hangs up, but a stuck one outlives its drain |
+| `CAP_DAC_OVERRIDE` | deleting, restoring and shipping worker-owned data | administrative deletion fails with `Permission denied`; shipping cannot update its marker |
 
-With a capture `store`, the [store drop-in](nanovm-store.conf) adds a fifth,
-`CAP_DAC_OVERRIDE`: the supervisor records what it shipped in each object's
-directory (`objects/<app>/<shard>/<object>/shipped`) and removes shipped
-versions from its `committed/`, directories the app's uid owns. Without it the
-supervisor ships each object's first version and then nothing, silently
-(B-604). It adds little: `CAP_SETUID` already lets the supervisor act as any
-app uid. The drop-in also makes `/srv/nanovm-store` writable for a directory
+`CAP_DAC_OVERRIDE` is needed even without capture, because administrative
+deletion operates on directories owned by app uids. `CAP_SETUID` already lets
+the supervisor act as any app uid. With a capture `store`, the
+[store drop-in](nanovm-store.conf) makes `/srv/nanovm-store` writable for a directory
 store and reads an object store's `AWS_*` credentials from
 `/etc/nanovm/store.env`.
 
