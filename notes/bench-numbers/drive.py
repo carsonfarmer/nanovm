@@ -5,24 +5,20 @@ Covers what `crates/nanovm/examples/bench.rs` (in-process, no sockets, no
 jail) does not: a real `nanovm serve` supervisor with its jailed worker, the
 proxy in front of it, node/app/object cold starts, fixed-rate latency with
 `oha -q --latency-correction`, CPU per request from /proc, RSS per live
-object, sync syscalls per commit (strace), and C's client rate limits.
+object, sync syscalls per commit (strace), and client rate limits.
 It also runs each build's own `bench --json` in-process benchmark.
 
 Rounds alternate builds (A B C D A B C D ...). Every measurement is one JSON
 line in <out>/raw.jsonl; summarize.py turns that into tables and CSV.
 
-    python3 drive.py --work /home/user/wt/bench/tmp/run --out notes/bench-numbers \\
-        --build a:/home/user/wt/bench-a:/home/user/wt/bench/tmp/bin-a:r2 \\
-        --build b:/home/user/wt/bench-b:/home/user/wt/bench/tmp/bin-b:r3 \\
-        --build c:/home/user/wt/bench-c:/home/user/wt/bench/tmp/bin-c:beta \\
+    python3 drive.py --work /absolute/fresh-work --out /absolute/fresh-out \\
+        --build current:/absolute/worktree:/absolute/release-bin \\
         --rounds 3 [--only phase,phase] [--rates rates.json]
 
---build NAME:WORKTREE:BINDIR:KIND. BINDIR holds that build's release
+--build NAME:WORKTREE:BINDIR. BINDIR holds that build's release
 `nanovm` (built with --features dev), `examples/dev-registry` and
-`examples/bench`, copied out of the shared target dir. KIND picks the config
-dialect: r2 (A: proxy `node`, no cgroup/clients keys), r3 (B: proxy `nodes`),
-beta (C, D: `cgroup = "off"` required here, `[clients]`, proxy
-`hosts`/`signers`). Optional BINDIR/jscounter.wasm is the build's JS app
+`examples/bench` and `examples/dev-collector`, copied from a dedicated target
+directory. Only the current v1 API/config is supported. Optional BINDIR/jscounter.wasm is the build's JS app
 (js/examples/counter.js through tools/build-app.sh); without it JS is n/a.
 
 Needs: root (the jail sets uids), vm.max_map_count >= 1048576, ulimit -n
@@ -32,6 +28,7 @@ from there).
 """
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -52,6 +49,7 @@ REGISTRY = "127.0.0.1:5000"
 DOH = "127.0.0.1:8053"
 TICK = os.sysconf("SC_CLK_TCK")
 CONCS = [1, 16, 64, 256]
+RETENTION_MS = 3600000
 JS_MANIFEST = {"limits": {"memory_mb": 32, "cpu_ms": 500, "request_timeout_ms": 2000,
                           "idle_timeout_ms": 60000, "disk_mb": 1}}
 
@@ -67,6 +65,17 @@ def record(rec):
     rec["t"] = time.time()
     with open(OUT / "raw.jsonl", "a") as f:
         f.write(json.dumps(rec) + "\n")
+
+
+def prepare_paths(args):
+    args.work, args.out = Path(args.work).resolve(), Path(args.out).resolve()
+    if args.work == args.out or args.work in args.out.parents or args.out in args.work.parents:
+        raise ValueError("work and out must be separate fresh directories")
+    for path in (args.work, args.out):
+        if path.exists():
+            raise FileExistsError(f"refusing reused directory: {path}")
+    for path in (args.work, args.out):
+        path.mkdir(parents=True)
 
 
 # ---------------------------------------------------------------- /proc
@@ -108,6 +117,8 @@ def wait_idle(limit=0.5, max_wait=900):
     t0 = time.time()
     while loadavg() > limit and time.time() - t0 < max_wait:
         time.sleep(10)
+    if loadavg() > limit:
+        raise RuntimeError("machine did not become idle; stop all other workloads")
     return {"load1": loadavg(), "waited_s": round(time.time() - t0)}
 
 
@@ -132,10 +143,12 @@ class Proc:
         self.logf.close()
 
 
-def kill_strays():
-    subprocess.run(["pkill", "-KILL", "-x", "nanovm"], capture_output=True)
-    subprocess.run(["pkill", "-KILL", "-x", "dev-registry"], capture_output=True)
-    time.sleep(0.3)
+def require_ports_free():
+    for addr in (NODE, PROXY, REGISTRY, DOH, "127.0.0.1:4318", "127.0.0.1:8444"):
+        host, port = addr.split(":")
+        with socket.socket() as s:
+            if s.connect_ex((host, int(port))) == 0:
+                raise RuntimeError(f"{addr} already in use; stop other workloads first")
 
 
 def wait_port(addr, timeout=60):
@@ -198,27 +211,26 @@ def node_toml(b, data, clients="off"):
          "epoch_tick_ms = 5", "dev = true",
          # Nothing listens here: exports fail fast and are dropped, the same on every build.
          'telemetry_endpoint = "http://127.0.0.1:4318"']
-    if b["kind"] == "beta":
-        # This host's cgroup v2 has no controllers: "auto" refuses to start.
-        t.append('cgroup = "off"')
-        if clients == "off":
-            t += ["[clients]", "rate = 0", "app_rate = 0"]
+    # The benchmark VM need not have delegated cgroup controllers.
+    t += ['cgroup = "off"', "[limits]", f"idle_timeout_ms = {RETENTION_MS}"]
+    if clients == "off":
+        t += ["[clients]", "rate = 0", "app_rate = 0"]
     return "\n".join(t) + "\n"
 
 
 def proxy_toml(b):
     t = [f'listen = "{PROXY}"', 'publish_listen = "127.0.0.1:8444"', f'resolver = "http://{DOH}/dns-query"',
          "dev = true", 'telemetry_endpoint = "http://127.0.0.1:4318"']
-    t.append(f'node = "{NODE}"' if b["kind"] == "r2" else f'nodes = ["{NODE}"]')
-    if b["kind"] == "beta":
-        t += ['hosts = ["counter.test", "js.test"]', 'signers = ["dev dev"]', "[clients]", "rate = 0", "app_rate = 0"]
+    t += [f'nodes = ["{NODE}"]', 'hosts = ["counter.test", "js.test"]',
+          'signers = ["dev dev"]', "[clients]", "rate = 0", "app_rate = 0"]
     return "\n".join(t) + "\n"
 
 
 # ---------------------------------------------------------------- oha
 
 
-def oha(url, conc, *, n=None, z=None, q=None, method="GET", headers=(), body=None, rand=False, host=None):
+def oha(url, conc, *, n=None, z=None, q=None, method="GET", headers=(), body=None, rand=False, host=None,
+        allowed=(200, 204)):
     argv = [ARGS.oha, "--no-tui", "--output-format", "json", "-c", str(conc)]
     argv += ["-n", str(n)] if n else ["-z", z]
     if q:
@@ -237,8 +249,8 @@ def oha(url, conc, *, n=None, z=None, q=None, method="GET", headers=(), body=Non
     p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     out = p.stdout.read()
     # wait4 rather than wait: the client's own CPU, reported beside the node's.
-    _, _, ru = os.wait4(p.pid, 0)
-    p.returncode = 0
+    _, status, ru = os.wait4(p.pid, 0)
+    p.returncode = os.waitstatus_to_exitcode(status)
     try:
         j = json.loads(out)
     except json.JSONDecodeError:
@@ -248,13 +260,25 @@ def oha(url, conc, *, n=None, z=None, q=None, method="GET", headers=(), body=Non
     total_s = s.get("total") or 1e-9
     lat = j.get("latencyPercentiles", {})
     pct = lambda k: None if lat.get(k) is None else round(lat[k] * 1000, 3)
+    total = sum(codes.values())
+    failed = sum(v for k, v in codes.items() if int(k) not in allowed)
+    errors = j.get("errorDistribution", {})
     return {
+        "valid": p.returncode == 0 and total > 0 and not failed and not errors and (n is None or total == n),
+        "exit_code": p.returncode, "failed": failed, "rejected": codes.get("429", 0),
+        "workload": "rejection" if 429 in allowed else "ordinary",
         "argv": " ".join(argv), "secs": total_s, "rps_all": s.get("requestsPerSec"),
-        "ok": codes.get("200", 0) + codes.get("204", 0), "codes": codes, "errors": j.get("errorDistribution", {}),
+        "ok": codes.get("200", 0) + codes.get("204", 0), "codes": codes, "errors": errors,
         "rps": round((codes.get("200", 0) + codes.get("204", 0)) / total_s, 1),
         "p50_ms": pct("p50"), "p90_ms": pct("p90"), "p99_ms": pct("p99"), "p999_ms": pct("p99.9"),
         "client_cpu_s": ru.ru_utime + ru.ru_stime,
     }
+
+
+def require_ok(result):
+    if not result["valid"]:
+        raise RuntimeError(f"invalid workload: {result}")
+    return result
 
 
 class Cpu:
@@ -326,6 +350,7 @@ def start_registry(b, work):
             break
         time.sleep(0.1)
     else:
+        reg.stop()
         raise RuntimeError("dev-registry published nothing")
     js = b["bin"] / "jscounter.wasm"
     if js.exists():
@@ -336,7 +361,8 @@ def start_registry(b, work):
         if out.returncode == 0:
             refs["jscounter"] = out.stdout.split()[0].replace(":1.0.0@", "@")
         else:
-            log("JS publish failed:", out.stderr[-400:])
+            reg.stop()
+            raise RuntimeError(f"JS publish failed: {out.stderr[-400:]}")
     return reg, refs
 
 
@@ -349,22 +375,38 @@ def app_headers(ref):
 
 def phase_inproc(b, rnd, work):
     """The build's own in-process benchmark (no sockets, no jail)."""
+    work = Path(work).resolve()
     env = dict(os.environ, NANOVM_BENCH_DATA=str(work / "bench-data"))
     env.pop("RUST_BACKTRACE", None)
     j = work / f"inproc-{b['name']}-{rnd}.json"
+    j.unlink(missing_ok=True)
     t0 = time.time()
     out = subprocess.run([str(b["bin"] / "bench"), "--json", str(j), "--cold", "9000"], capture_output=True, text=True,
                          env=env, cwd=b["tree"])
-    rec = {"phase": "inproc", "secs": round(time.time() - t0), "stdout": out.stdout[-6000:]}
-    if j.exists():
+    rec = {"phase": "inproc", "secs": round(time.time() - t0), "stdout": out.stdout[-6000:],
+           "stderr": out.stderr[-6000:], "exit_code": out.returncode,
+           "valid": out.returncode == 0 and j.is_file()}
+    if rec["valid"]:
         rec["json"] = json.loads(j.read_text())
+        rec["valid"] = inproc_valid(rec["json"])
     record({**base(b, rnd), **rec})
-    if b["kind"] != "r2":
-        out = subprocess.run([str(b["bin"] / "bench"), "--writes", "3"], capture_output=True, text=True, env=env,
-                             cwd=b["tree"])
-        record({**base(b, rnd), "phase": "inproc_writes", "stdout": out.stdout[-6000:]})
+    require_ok(rec)
+    out = subprocess.run([str(b["bin"] / "bench"), "--writes", "3"], capture_output=True, text=True, env=env,
+                         cwd=b["tree"])
+    rec = {**base(b, rnd), "phase": "inproc_writes", "stdout": out.stdout[-6000:],
+           "stderr": out.stderr[-6000:], "exit_code": out.returncode,
+           "valid": out.returncode == 0 and bool(out.stdout) and "FAILED" not in out.stdout}
+    record(rec)
+    require_ok(rec)
     shutil.rmtree(work / "bench-data", ignore_errors=True)
-    shutil.rmtree(Path(b["tree"]) / "target/bench-data", ignore_errors=True)
+
+
+def inproc_valid(j):
+    # The attack generator intentionally rejects requests; its healthy controls must not.
+    runs = [j["cold"]["run"], *(j[k] for k in
+            ("warm_get", "warm_serial", "warm_incr", "warm_incr_serial", "recover", "churn")),
+            j["neighbours"]["baseline"], j["neighbours"]["under_attack"]]
+    return all(r["requests"] > 0 and r["failed"] == 0 for r in runs)
 
 
 def first_200(addr, path, headers, timeout=120):
@@ -397,30 +439,23 @@ def phase_node_cold(b, rnd, work, refs, n):
             t0 = time.perf_counter()
             node = Proc([str(b["bin"] / "nanovm"), "serve", "--config", str(st.cfg)], work / "node-cold.log")
             hdr_d = dict(h.split(": ", 1) for h in hdr)
-            while True:
-                try:
-                    s, _ = http_req(NODE, "GET", f"/cold{i}/", hdr_d)
-                    if s == 200:
-                        break
-                    odd[s] = odd.get(s, 0) + 1
-                except OSError:
-                    pass
-                if time.perf_counter() - t0 > 120:
-                    raise RuntimeError("node cold: no 200")
-                time.sleep(0.001)
-            samples.append((time.perf_counter() - t0) * 1000)
-            node.stop()
-            kill_strays_nodes_only()
+            try:
+                while True:
+                    try:
+                        s, _ = http_req(NODE, "GET", f"/cold{i}/", hdr_d)
+                        if s == 200:
+                            break
+                        odd[s] = odd.get(s, 0) + 1
+                    except OSError:
+                        pass
+                    if time.perf_counter() - t0 > 120:
+                        raise RuntimeError("node cold: no 200")
+                    time.sleep(0.001)
+                samples.append((time.perf_counter() - t0) * 1000)
+            finally:
+                node.stop()
         record({**base(b, rnd), "phase": "node_cold", "case": variant, **dist(samples), "non200": odd})
         log(b["name"], "node cold", variant, dist(samples))
-
-
-def kill_strays_nodes_only():
-    subprocess.run(["pkill", "-KILL", "-x", "nanovm"], capture_output=True)
-    for _ in range(100):
-        if subprocess.run(["pgrep", "-x", "nanovm"], capture_output=True).returncode != 0:
-            return
-        time.sleep(0.02)
 
 
 def dist(ms):
@@ -456,19 +491,25 @@ def phase_app_cold(b, rnd, work, st, refs, n):
             else:
                 odd[s] = odd.get(s, 0) + 1
             time.sleep(0.2)
-        record({**base(b, rnd), "phase": "app_cold", "case": variant, **dist(samples), "non200": odd})
+        rec = {**base(b, rnd), "phase": "app_cold", "case": variant,
+               **(dist(samples) if samples else {}), "non200": odd, "valid": not odd and len(samples) == n}
+        record(rec)
+        require_ok(rec)
         log(b["name"], "app cold", variant, dist(samples))
 
 
 def run_case(b, rnd, st, cpu, phase, case, url, conc, *, method="GET", body=None, rand=True, host=None, headers=(),
-             z=None, q=None, warm=True, n=None):
+             z=None, q=None, warm=True, n=None, allowed=(200, 204)):
     if warm:
-        oha(url, conc, z="2s", method=method, headers=headers, body=body, rand=rand, host=host)
+        require_ok(oha(url, conc, z="2s", method=method, headers=headers, body=body, rand=rand, host=host,
+                       allowed=allowed))
     a = cpu.snap()
-    r = oha(url, conc, z=z or ARGS.duration, n=n, q=q, method=method, headers=headers, body=body, rand=rand, host=host)
+    r = oha(url, conc, z=z or ARGS.duration, n=n, q=q, method=method, headers=headers, body=body, rand=rand, host=host,
+            allowed=allowed)
     c = Cpu.delta(a, cpu.snap(), sum(r["codes"].values()))
     rec = {**base(b, rnd), "phase": phase, "case": case, "conc": conc, "q": q, **r, **c}
     record(rec)
+    require_ok(rec)
     log(b["name"], phase, case, f"c={conc}", f"q={q}" if q else "", f"{r['rps']}/s", f"p50 {r['p50_ms']}",
         f"p99 {r['p99_ms']}", c.get("total_us"), "us/req", r["codes"])
     return rec
@@ -511,6 +552,10 @@ def phase_throughput(b, rnd, st, refs, cpu, phase="direct", addr=NODE, host_of=N
 
 
 def phase_latency(b, rnd, st, refs, cpu, rates):
+    if set(rates) != {case for case, *_ in cases(refs)} or any(
+            not values or any(not isinstance(v, (int, float)) or v <= 0 for v in values.values())
+            for values in rates.values()):
+        raise ValueError("rates must cover every enabled case with positive offered rates")
     for case, method, path, rand, app in cases(refs):
         for frac, rate in rates.get(case, {}).items():
             run_case(b, rnd, st, cpu, "fixed_rate", f"{case}@{frac}", f"http://{NODE}{path}", 64, method=method,
@@ -528,21 +573,72 @@ def phase_object_cold(b, rnd, st, refs, cpu):
     run_case(b, rnd, st, cpu, "warm", "serial", f"http://{NODE}/o000/", 1, headers=hdr, n=5000, rand=False)
 
 
-def phase_density(b, rnd, st, refs):
-    """Counter worker RSS as live objects are added (GET on new objects; idle_timeout 60 s, so within it)."""
-    hdr = app_headers(refs["counter"])
-    worker = [w for w in children(st.node.pid)]
-    rows = []
-    rows.append({"added": 0, "worker_kb": sum(rss_kb(w) for w in worker), "sup_kb": rss_kb(st.node.pid)})
-    for step in range(1, 4):
-        oha(f"http://{NODE}/d{rnd}{step}[a-z]{{16}}/", 64, n=2000, headers=hdr, rand=True)
-        time.sleep(1)
-        rows.append({"added": 2000 * step, "worker_kb": sum(rss_kb(w) for w in children(st.node.pid)),
-                     "sup_kb": rss_kb(st.node.pid)})
-    per = (rows[-1]["worker_kb"] - rows[0]["worker_kb"]) / rows[-1]["added"]
-    record({**base(b, rnd), "phase": "density", "steps": rows, "kb_per_object": round(per, 1),
-            "objects_per_gib": round(1024 * 1024 / per) if per > 0 else None})
-    log(b["name"], "density", rows, f"{per:.1f} KB/object")
+def density_snapshot(work, app, expected, after_ms, pid=None, timeout=60):
+    """Require a fresh exported live/store count and the same target worker."""
+    until = time.monotonic() + timeout
+    while time.monotonic() < until:
+        try:
+            j = json.loads((work / "target/demo-telemetry.json").read_text())
+            w, a = j["workers"][app], j["apps"][app]
+            if (j["collected_at_ms"] >= after_ms and w["up"] and
+                    (pid is None or w["pid"] == pid) and
+                    a["live_objects"] == expected and a["stores_live"] == expected):
+                rss = rss_kb(w["pid"])
+                if rss > 0:
+                    return {"live": a["live_objects"], "stores_live": a["stores_live"],
+                            "pid": w["pid"], "worker_kb": rss, "collected_at_ms": j["collected_at_ms"]}
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            pass
+        time.sleep(0.1)
+    raise RuntimeError(f"density: no fresh snapshot for {app}, pid={pid}, live={expected}")
+
+
+def phase_density(b, rnd, work, refs):
+    """Dedicated clean stack and app; RSS slope over verified resident objects."""
+    work = work / "density"
+    work.mkdir()
+    (work / "target").mkdir()
+    manifest = json.loads((b["tree"] / "guests/counter/nanovm.json").read_text())
+    manifest["limits"]["idle_timeout_ms"] = RETENTION_MS
+    spec = work / "density.json"
+    spec.write_text(json.dumps(manifest))
+    published = subprocess.run([str(b["bin"] / "nanovm"), "publish",
+        str(b["tree"] / "guests/target/wasm32-wasip2/release/counter.wasm"),
+        f"{REGISTRY}/nanovm/density:1.0.0", "--manifest", str(spec)],
+        capture_output=True, text=True, check=True)
+    ref = published.stdout.split()[0].replace(":1.0.0@", "@")
+    hdr = app_headers(ref)
+    collector = Proc([str(b["bin"] / "dev-collector")], work / "collector.log", cwd=work)
+    st = Stack(b, work, work / "data")
+    started = time.monotonic()
+    try:
+        wait_port("127.0.0.1:4318")
+        st.start_node()
+        require_ok(oha(f"http://{NODE}/seed/", 1, n=1, headers=hdr))
+        # A dedicated stack has exactly one app: obtain its opaque v1 name and PID.
+        apps = subprocess.run([str(b["bin"] / "nanovm"), "admin", "--config", str(st.cfg), "apps"],
+                              capture_output=True, text=True, check=True)
+        apps = json.loads(apps.stdout)
+        if len(apps) != 1 or not apps[0]["pid"]:
+            raise RuntimeError(f"density: expected one running app, got {apps}")
+        app, pid = apps[0]["app"], apps[0]["pid"]
+        rows = [density_snapshot(work, app, 1, time.time() * 1000, pid=pid)]
+        for step in range(1, 4):
+            require_ok(oha(f"http://{NODE}/d{step}[a-z]{{16}}/", 64, n=2000, headers=hdr, rand=True))
+            rows.append(density_snapshot(work, app, 1 + 2000 * step, time.time() * 1000, pid=pid))
+        if (time.monotonic() - started) * 1000 >= RETENTION_MS / 2:
+            raise RuntimeError("density exceeded its retention safety window")
+        live_delta = rows[-1]["live"] - rows[0]["live"]
+        per = (rows[-1]["worker_kb"] - rows[0]["worker_kb"]) / live_delta
+        if per <= 0:
+            raise RuntimeError("density RSS slope is not positive")
+        record({**base(b, rnd), "phase": "density", "app": app, "steps": rows, "live_delta": live_delta,
+                "retention_ms": RETENTION_MS, "kb_per_object": round(per, 1),
+                "objects_per_gib": round(1024 * 1024 / per)})
+        log(b["name"], "density", rows, f"{per:.1f} KiB/object")
+    finally:
+        st.stop()
+        collector.stop()
 
 
 def phase_syncs(b, rnd, st, refs):
@@ -566,6 +662,7 @@ def phase_syncs(b, rnd, st, refs):
         r = oha(f"http://{NODE}{path}", 1, n=500, method=method, headers=hdr, body=body)
         s.send_signal(signal.SIGINT)
         s.wait(30)
+        require_ok(r)
         calls = {}
         for line in out.read_text().splitlines():
             f = line.split()
@@ -579,13 +676,12 @@ def phase_syncs(b, rnd, st, refs):
         log(b["name"], "syncs", case, calls)
 
 
-def phase_limits_default(b, rnd, work, refs):
-    """C/D only: the node with [clients] at its defaults (rate 100/s per client, app_rate 1,000/s)."""
-    st = Stack(b, work, work / "data-limits", clients="default")
+def phase_limits_default(b, rnd, st, refs):
+    """Intentional rejections: success throughput and 429 counts kept separately."""
     st.start_node()
     cpu = Cpu(st.node.pid)
     hdr = app_headers(refs["counter"])
-    oha(f"http://{NODE}/o[0-9]{{3}}/", 16, n=2000, headers=hdr, rand=True)
+    require_ok(oha(f"http://{NODE}/o[0-9]{{3}}/", 16, n=2000, headers=hdr, rand=True))
     time.sleep(3)  # let the warm-up's buckets refill
     for case, method, path in (("get_spread", "GET", "/o[0-9]{3}/"), ("incr_spread", "POST", "/o[0-9]{3}/incr")):
         # Loopback is in `trusted` by default: its own requests are not limited.
@@ -594,7 +690,7 @@ def phase_limits_default(b, rnd, work, refs):
         time.sleep(3)
         # One client behind a trusted forwarder (a TLS terminator or the proxy): X-Forwarded-For names it.
         run_case(b, rnd, st, cpu, "limits_default", f"{case}/one_client", f"http://{NODE}{path}", 64, method=method,
-                 headers=hdr + ["x-forwarded-for: 198.51.100.7"], z="10s", warm=False)
+                 headers=hdr + ["x-forwarded-for: 198.51.100.7"], z="10s", warm=False, allowed=(200, 204, 429))
         time.sleep(3)
     # 16 clients at once, each its own address: the app's 1,000/s.
     procs = []
@@ -603,35 +699,45 @@ def phase_limits_default(b, rnd, work, refs):
         argv = [ARGS.oha, "--no-tui", "--output-format", "json", "-c", "4", "-z", "10s", "--rand-regex-url",
                 "-H", hdr[0], "-H", hdr[1], "-H", f"x-forwarded-for: 198.51.100.{k + 10}", f"http://{NODE}/o[0-9]{{3}}/"]
         procs.append(subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
-    codes = {}
+    codes, errors, exits = {}, {}, []
     for p in procs:
         j = json.loads(p.communicate()[0])
+        exits.append(p.returncode)
+        for k, v in j.get("errorDistribution", {}).items():
+            errors[k] = errors.get(k, 0) + v
         for k, v in j.get("statusCodeDistribution", {}).items():
             codes[k] = codes.get(k, 0) + v
     secs = time.time() - t0
-    record({**base(b, rnd), "phase": "limits_default", "case": "get_spread/16_clients", "conc": 64, "codes": codes,
-            "secs": secs, "rps": round(codes.get("200", 0) / 10, 1)})
+    rec = {**base(b, rnd), "phase": "limits_default", "case": "get_spread/16_clients", "conc": 64, "codes": codes,
+           "secs": secs, "rps": round(codes.get("200", 0) / secs, 1), "errors": errors,
+           "workload": "rejection", "rejected": codes.get("429", 0),
+           "valid": not any(exits) and not errors and sum(codes.values()) > 0 and
+                    all(k in ("200", "204", "429") for k in codes)}
+    record(rec)
+    require_ok(rec)
     log(b["name"], "limits 16 clients", codes)
     st.stop()
 
 
 def base(b, rnd):
-    return {"build": b["name"], "commit": b["commit"], "round": rnd}
+    return {"build": b["name"], "commit": b["commit"], "identity": b["identity"], "round": rnd, "valid": True}
 
 
 # ---------------------------------------------------------------- main
 
 
 def one(b, rnd, rates):
-    work = Path(ARGS.work) / b["name"]
-    work.mkdir(parents=True, exist_ok=True)
-    kill_strays()
+    work = Path(ARGS.work) / b["name"] / str(rnd)
+    work.mkdir(parents=True)
+    require_ports_free()
     record({**base(b, rnd), "phase": "start", **wait_idle(ARGS.idle), "meminfo_free_kb":
             int(Path("/proc/meminfo").read_text().split("MemAvailable:")[1].split()[0])})
     want = lambda p: not ARGS.only or p in ARGS.only
     if want("inproc"):
         phase_inproc(b, rnd, work)
     reg, refs = start_registry(b, work)
+    st = None
+    doh = None
     try:
         if want("node_cold"):
             phase_node_cold(b, rnd, work, refs, ARGS.cold_samples)
@@ -654,22 +760,27 @@ def one(b, rnd, rates):
             st.start_proxy()
             cpu_p = Cpu(st.node.pid, st.proxy.pid)
             host_of = lambda app: "counter.test" if app == "counter" else "js.test"
-            # C keys an app by the name its record is at, so this may be another app with other volumes.
+            # Host-routed and direct apps have distinct names and volumes.
             setup_objects(PROXY, [], host="counter.test")
             # The same node, objects and cases at 1 and 64 (and 256) concurrent: the proxy's hop.
             phase_throughput(b, rnd, st, refs, cpu_p, phase="proxy", addr=PROXY, host_of=host_of, concs=[1, 64, 256],
                              only={"get_spread", "incr_spread", "kv64k_spread", "js_get_spread"})
             doh.shutdown()
             doh.server_close()
-        if want("density"):
-            phase_density(b, rnd, st, refs)
+            doh = None
         st.stop()
-        kill_strays_nodes_only()
-        if want("limits_default") and b["kind"] == "beta":
-            phase_limits_default(b, rnd, work, refs)
+        if want("density"):
+            phase_density(b, rnd, work, refs)
+        if want("limits_default"):
+            st = Stack(b, work, work / "data-limits", clients="default")
+            phase_limits_default(b, rnd, st, refs)
     finally:
+        if doh:
+            doh.shutdown()
+            doh.server_close()
+        if st:
+            st.stop()
         reg.stop()
-        kill_strays()
         shutil.rmtree(work / "data", ignore_errors=True)
         shutil.rmtree(work / "data-cold", ignore_errors=True)
         shutil.rmtree(work / "data-limits", ignore_errors=True)
@@ -684,32 +795,62 @@ def main():
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--first-round", type=int, default=1)
     ap.add_argument("--only", type=lambda s: set(s.split(",")))
-    ap.add_argument("--rates", help="JSON file: {case: {\"50%\": rps, \"80%\": rps}}, the same for every build")
+    ap.add_argument("--rates", help="JSON file: {case: {\"50%%\": rps, \"80%%\": rps}}, the same for every build")
     ap.add_argument("--duration", default="6s")
     ap.add_argument("--rate-duration", default="15s")
     ap.add_argument("--cold-samples", type=int, default=30)
     ap.add_argument("--idle", type=float, default=0.5, help="wait for load1 below this before each build-round")
-    ap.add_argument("--oha", default=shutil.which("oha") or "/home/user/wt/tools/oha")
+    ap.add_argument("--oha", default=shutil.which("oha") or "oha")
     ARGS = ap.parse_args()
-    OUT = Path(ARGS.out)
-    OUT.mkdir(parents=True, exist_ok=True)
     assert os.geteuid() == 0, "run as root: the jail sets uids"
     assert int(Path("/proc/sys/vm/max_map_count").read_text()) >= 1048576, "sysctl -w vm.max_map_count=1048576"
+    if ARGS.rounds < 1 or ARGS.first_round < 1:
+        ap.error("round numbers must be positive")
+    ARGS.oha = str(Path(shutil.which(ARGS.oha) or ARGS.oha).resolve())
+    rates = json.loads(Path(ARGS.rates).read_text()) if ARGS.rates else {}
+    if (not ARGS.only or "fixed_rate" in ARGS.only) and not rates:
+        ap.error("fixed_rate requires --rates; supply measured fixed rates or exclude that phase with --only")
+    workload = {"duration": ARGS.duration, "rate_duration": ARGS.rate_duration,
+                "cold_samples": ARGS.cold_samples, "rates": rates,
+                "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "oha_sha256": hashlib.sha256(Path(ARGS.oha).read_bytes()).hexdigest()}
     builds = []
     for spec in ARGS.build:
-        name, tree, bindir, kind = spec.split(":")
-        commit = subprocess.run(["git", "-C", tree, "rev-parse", "--short", "HEAD"], capture_output=True,
-                                text=True).stdout.strip()
-        builds.append({"name": name, "tree": tree, "bin": Path(bindir), "kind": kind, "commit": commit})
-    rates = json.loads(Path(ARGS.rates).read_text()) if ARGS.rates else {}
+        name, tree, bindir = spec.split(":")
+        if not name or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in name):
+            ap.error("build name must contain only letters, digits, underscore or hyphen")
+        if name in [b["name"] for b in builds]:
+            ap.error(f"duplicate build name: {name}")
+        tree, bindir = Path(tree).resolve(), Path(bindir).resolve()
+        commit = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True,
+                                text=True, check=True).stdout.strip()
+        files = [bindir / f for f in ("nanovm", "bench", "dev-registry", "dev-collector")]
+        files += [tree / f"guests/target/wasm32-wasip2/release/{g}.wasm" for g in ("counter", "hostile")]
+        files += [tree / f"guests/{g}/nanovm.json" for g in ("counter", "hostile")]
+        if (tree / "target/sqlite/example.wasm").exists():
+            files.append(tree / "target/sqlite/example.wasm")
+        if (bindir / "jscounter.wasm").exists():
+            files.append(bindir / "jscounter.wasm")
+        hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
+        identity = hashlib.sha256(json.dumps({"commit": commit, "files": hashes, "workload": workload},
+                                            sort_keys=True).encode()).hexdigest()
+        builds.append({"name": name, "tree": tree, "bin": bindir, "commit": commit,
+                       "identity": identity, "hashes": hashes})
+    prepare_paths(ARGS)
+    OUT = ARGS.out
     record({"phase": "machine", "cpu": subprocess.run(["sh", "-c", "grep -m1 'model name' /proc/cpuinfo"],
                                                       capture_output=True, text=True).stdout.strip(),
             "nproc": os.cpu_count(), "uname": " ".join(os.uname()), "mem": Path("/proc/meminfo").read_text()[:80],
-            "builds": [{k: str(v) for k, v in b.items()} for b in builds], "argv": sys.argv})
+            "builds": [{k: str(v) if isinstance(v, Path) else v for k, v in b.items()} for b in builds],
+            "workload": workload, "argv": sys.argv})
     for rnd in range(ARGS.first_round, ARGS.first_round + ARGS.rounds):
         for b in builds:
             log(f"round {rnd} build {b['name']} ({b['commit']})")
-            one(b, rnd, rates)
+            try:
+                one(b, rnd, rates)
+            except BaseException as error:
+                record({**base(b, rnd), "phase": "aborted", "valid": False, "error": str(error)})
+                raise
 
 
 if __name__ == "__main__":

@@ -565,6 +565,11 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 
 ## Benchmarks
 
+For the current-v1 HTTP/jailed-worker matrix, fresh-root build/run commands and
+validity gates, see [notes/bench-numbers](notes/bench-numbers/README.md). Ordinary
+failed responses invalidate comparisons; density verifies exported live counts
+on a dedicated stack. Harness tests are not new performance results.
+
 ```bash
 cargo run --release -p nanovm --example bench -- --json target/bench.json
 ```

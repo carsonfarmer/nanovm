@@ -11,6 +11,13 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 Found by the review at `c607ec9`, unless an entry says otherwise; line numbers are as of that commit.
 
+### N-730: HTTP benchmark harness accepted invalid comparisons and density counts
+- **Where:** `notes/bench-numbers/{drive,summarize}.py`; reviewed from `ac514c6`.
+- **Scenario:** aggregate child RSS divided by attempted creates, short clamped idle retention and no live-count verification; ordinary HTTP failures treated as useful latency; relative work paths resolved against another cwd and ignored in-process exit/missing JSON; summary pooling mixed commits/rates and duplicate rounds.
+- **Reproduced:** synthetic subprocess/telemetry/summary probes; initial ten tests fail (five assertion failures, eight errors including subtests). No real workload was run for this correction.
+- **Fix:** dedicated density app/stack, one-hour node/app retention, successful creation checks and fresh exact exported live/store counts tied to one PID; failure gates and explicit rejection workloads; fresh absolute roots and in-process result validation; commit/binary/workload identity and duplicate/rate rejection. Config compatibility is not supported, see AGENTS.md rule 1; the harness uses only current v1.
+- **Status:** corrected on `fix/benchmark-validity` (this commit), not yet on main. Seventeen Python tests pass; four source mutations caught and restored. Runtime-line delta 0. Fresh full integrated release measurements remain for the parent after all other VM workloads stop. [Evidence/runbook](notes/bench-numbers/README.md).
+
 ### N-1: a registry app's egress list can name private and loopback addresses
 - **Where:** `egress.rs:26-28`, `egress.rs:313-314`, `config.rs:128-136`, `supervisor.rs:322,333`
 - **Scenario:** An IP-literal egress rule skips the public-address filter, because the operator is assumed to have written it. For a registry app the tenant writes it: `Limits::clamped` keeps the app's own `egress`. A signed `nanovm.json` naming `127.0.0.1:<port>` or `169.254.169.254` reaches the host's private network, including the node's front end, where the app can send the proxy-only headers and switch another app name to a version it signed.
