@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use governor::{DefaultKeyedRateLimiter, Quota};
@@ -25,8 +27,9 @@ use http::{Request, Response};
 use hyper::body::Incoming;
 use ipnet::IpNet;
 use parking_lot::Mutex;
-use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::ClientLimits;
 use crate::object::{RespBody, error_response};
@@ -166,6 +169,46 @@ impl Drop for Held {
     }
 }
 
+// Hyper transfers this I/O, but not its HTTP service, to an upgrade consumer.
+// Drop the socket before releasing admission, including on ordinary HTTP close.
+struct Connection {
+    socket: TcpStream,
+    _slot: OwnedSemaphorePermit,
+    held: Option<Held>,
+}
+
+impl AsyncRead for Connection {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.socket).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Connection {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.socket).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.socket).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.socket).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.socket.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.socket).poll_write_vectored(cx, bufs)
+    }
+}
+
 /// Serves HTTP/1.1 on `listener` within `gate`'s connection limits, giving
 /// each request its [`Peer`]. See `server::serve_conn` for `header_timeout`.
 pub async fn serve<F, Fut>(gate: Arc<Gate>, listener: TcpListener, header_timeout: Option<Duration>, f: F) -> anyhow::Result<()>
@@ -177,17 +220,20 @@ where
         let slot = gate.connections.clone().acquire_owned().await?;
         let sock = crate::server::accept(&listener).await;
         let Ok(peer) = sock.peer_addr().map(|a| a.ip()) else { continue };
-        match gate.hold(peer) {
-            Some(held) => {
+        let sock = Connection {
+            socket: sock,
+            _slot: slot,
+            held: gate.hold(peer),
+        };
+        match sock.held {
+            Some(_) => {
                 let f = f.clone();
                 crate::server::serve_conn(sock, header_timeout, move |mut req| {
-                    let _ = (&slot, &held);
                     req.extensions_mut().insert(Peer(peer));
                     f(req)
                 })
             }
             None => crate::server::serve_conn(sock, Some(REFUSE_TIMEOUT), move |_| {
-                let _ = &slot;
                 let mut res = refusal(503, "too-many-connections", "this client has as many connections open as it may", Duration::ZERO);
                 res.headers_mut().insert(http::header::CONNECTION, http::HeaderValue::from_static("close"));
                 async { res }
@@ -353,8 +399,20 @@ mod tests {
         drop(another);
         let free = g.connections.available_permits();
         drop((client, upgraded));
+        wait_open(0).await;
+        assert_eq!(
+            g.connections.available_permits(),
+            1,
+            "dropping the upgrade frees its global slot"
+        );
+        drop(g.hold(peer).expect("dropping the upgrade frees its client slot"));
         serving.abort();
         let _ = serving.await;
+        assert_eq!(
+            g.connections.available_permits(),
+            2,
+            "stopping accept releases its reserved slot"
+        );
         assert_eq!((counted, readmitted, free), (1, false, 0), "a live upgrade must retain its client slot and global slot; the accept loop reserves the other global slot");
     }
 

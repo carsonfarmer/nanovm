@@ -6,6 +6,13 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 
 ## Current state (2026-11-08)
 
+**PR #3 review follow-up (2026-11-14):** local `fix/pr3-review` addresses the
+eight findings recorded as N-930–N-937. It starts at PR #3 head `7988cae` plus
+seven test-only proof commits. The secrets research and trim branches were
+reviewed separately, not merged into these fixes. Disk reserve is an admission
+threshold, not a guarantee that physical space remains for every commit.
+Current evidence and delivery state: `notes/pr3-review-fixes.md`.
+
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
 and is included in this main integration from `w9-atomic-capture`. Bounded, opt-in
 immutable capture now uses the real journal's decision at both commit gates.

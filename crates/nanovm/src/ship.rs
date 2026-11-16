@@ -426,8 +426,8 @@ fn authority<'a>(leases: Option<&'a Leases>, app: &str, object: &str) -> Option<
 /// last. Only under this node's live lease on the object (`authority`), once
 /// it has claimed the head with it; and only versions that follow the head,
 /// so a node never ships history the head has moved past. `known` is the
-/// head as this node last moved it, if it still may be (a move from it
-/// fails if it has moved since): no need to read it again. Whether it
+/// head as this node last moved it, while its sequence matches the local
+/// shipped marker (a reset requires reading it again). Whether it
 /// shipped what it had: not when this node holds no live lease on the
 /// object, which isn't a failure (its versions wait until it does).
 pub(crate) async fn ship_object(
@@ -443,7 +443,7 @@ pub(crate) async fn ship_object(
     let unshipped: Vec<_> = versions.iter().copied().filter(|&n| n > shipped).collect();
     if !unshipped.is_empty() {
         let Some((node, lease)) = authority(leases, app, object) else { return Ok(false) };
-        let (mut head, mut tag) = match known.take().filter(|(head, _)| (head.node.as_str(), head.lease) == (node, lease)) {
+        let (mut head, mut tag) = match known.take().filter(|(head, _)| (head.node.as_str(), head.lease) == (node, lease) && head.sequence == shipped) {
             Some((head, tag)) => (head, Some(tag)),
             None => head(store, app, object).await?,
         };

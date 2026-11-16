@@ -9,6 +9,18 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 ## Problems
 
+### N-930–N-937: PR #3 independent review fixes
+- **Owner:** `fix/pr3-review`; separate from the new trim and secrets-research branches.
+- **N-930:** deletion/recreation reused a cached shipping head after the remote head was deleted. Re-read it when the local shipped marker no longer reaches the cached sequence.
+- **N-931:** cancelled route initializers retained unknown-name capacity indefinitely.
+- **N-932:** upgraded sockets outlived their connection-admission guards.
+- **N-933:** host Debug formatting escaped secret values before exact matching.
+- **N-934:** masking serialized OTLP bytes corrupted protobuf framing.
+- **N-935:** zero-byte idle objects retained an unbounded history of accounting IDs.
+- **N-936:** growth grants exceeded free-space headroom. Bound them by measured headroom less this app's outstanding grants. Strict node-wide physical reservation remains **open**: separate workers, journals, sparse allocation and filesystem overhead are not coordinated by this admission check.
+- **N-937:** base deployment capabilities prevented deleting worker-owned data. Include DAC override without requiring the capture-store drop-in.
+- **Status:** implemented on `fix/pr3-review` for PR #3; seven retained proofs now pass, as do the ordinary serial suite, SQLite suite and restricted-capability admin-delete test. N-936's strict physical-reservation guarantee remains open. Performance and privileged OOM sign-off remain outstanding. Verification and limits: `notes/pr3-review-fixes.md`.
+
 Found by the review at `c607ec9`, unless an entry says otherwise; line numbers are as of that commit.
 
 ### N-1: a registry app's egress list can name private and loopback addresses
@@ -915,7 +927,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### B-304: an app's disk budget counts logical bytes, not blocks or its journals
 - **Where:** `quota.rs`
-- **Scenario:** the budget counts what each object's quota counts. An object's journal (up to 68 KiB between requests, more during one), its capture outbox, directories and block rounding are on top, so many tiny objects cost far more disk than their budget says (the audit's ~14 KiB a counter object on tmpfs). The objects cap (`beta/objects`) bounds how many there are; the reserve keeps a full disk from failing commits.
+- **Scenario:** the budget counts what each object's quota counts. An object's journal (up to 68 KiB between requests, more during one), its capture outbox, directories and block rounding are on top, so many tiny objects cost far more disk than their budget says (the audit's ~14 KiB a counter object on tmpfs). The objects cap (`beta/objects`) bounds how many there are; the reserve limits growth admission but cannot guarantee commit space (N-936).
 - **Status:** open (by design for now)
 
 ### B-305: the reserve counts bytes, not inodes

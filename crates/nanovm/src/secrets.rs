@@ -32,8 +32,8 @@ impl std::fmt::Debug for Secrets {
 }
 
 impl Secrets {
-    /// Masks every secret value in `text` with as many `*`, so its length,
-    /// and an OTLP batch's structure, stay as they were.
+    /// Masks every literal secret value in a text payload with as many `*`.
+    /// Callers must isolate text from binary framing before masking.
     pub fn mask(&self, text: &mut [u8]) {
         let view: &[u8] = text;
         let found: Vec<_> = self.0.values().filter(|v| !v.is_empty())
@@ -44,10 +44,22 @@ impl Secrets {
         }
     }
 
-    /// `text`, masked. Whole characters become `*`, so it is still UTF-8.
+    /// Masks literal values and their host Debug-escaped representation.
+    /// Whole characters become `*`, so the result is still UTF-8.
     pub fn masked(&self, text: String) -> String {
+        // Match both forms against the original text, so one overlapping
+        // secret cannot hide another from the matcher.
+        let escaped = Self(self.0.iter().map(|(k, v)| {
+            let quoted = format!("{v:?}");
+            (k.clone(), quoted[1..quoted.len() - 1].to_owned())
+        }).collect());
+        let mut debug = text.clone().into_bytes();
+        escaped.mask(&mut debug);
         let mut bytes = text.into_bytes();
         self.mask(&mut bytes);
+        for (byte, escaped) in bytes.iter_mut().zip(debug) {
+            if escaped == b'*' { *byte = b'*'; }
+        }
         String::from_utf8(bytes).expect("whole characters masked")
     }
 }
@@ -208,6 +220,19 @@ mod tests {
         let escaped = format!("{secret:?}");
         assert!(!detail.contains(&escaped), "host Debug escaping must not preserve the secret in the client error detail");
         assert!(detail.contains(&"*".repeat(secret.len())), "the guest error's secret payload is masked");
+    }
+
+    #[test]
+    fn masked_preserves_diagnostics_around_literal_and_debug_secrets() {
+        for secret in ["line\none\r\ttwo", "quoted\"credential", "path\\credential", "control\0\u{1b}é", "é\u{200b}"] {
+            let secrets = Secrets([("key".into(), secret.into())].into());
+            let debug = format!("{secret:?}");
+            let input = format!("literal={secret}; debug={debug}; ordinary diagnostic");
+            assert_eq!(secrets.masked(input), format!("literal={}; debug=\"{}\"; ordinary diagnostic",
+                "*".repeat(secret.len()), "*".repeat(debug.len() - 2)));
+        }
+        let secrets = Secrets([("a".into(), "x\n".into()), ("b".into(), "nTAIL".into())].into());
+        assert_eq!(secrets.masked("x\\nTAIL".into()), "*******", "escaped and literal matches overlap");
     }
 
     /// The directory must be the owner's alone.

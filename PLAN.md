@@ -2,6 +2,13 @@
 
 ## Context
 
+PR #3 review follow-up (2026-11-14): connection admission must follow upgraded
+I/O lifetimes; shipping acknowledgements cannot survive a reset local marker
+without consulting the store; telemetry redaction must preserve protobuf
+structure. Disk admission bounds each app's in-flight growth by sampled
+headroom. A strict physical reserve across workers and journal allocations
+requires a separate storage-allocation design; the threshold does not provide it.
+
 **Current priority (2026-11-08):** offline backup and N-43 are delivered and tested.
 Next is W-9 committed-state capture/transfer and recovery groundwork, then W-10
 placement/fencing. This sequence is not approval of a replication or failover policy.

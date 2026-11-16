@@ -1144,7 +1144,7 @@ async fn the_disk_reserve_keeps_writes_committing() {
         panic!("four objects grew by 1 MiB with less than the reserve and 2 MiB free");
     };
     assert!(refused.0 == 507 && refused.1.contains("insufficient-space"), "{refused:?}");
-    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk is below its 3.0 MiB reserve")));
+    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk has no unreserved space above its 3.0 MiB reserve")));
     // Every app's growth is refused by the app, as on a full disk, and a new
     // object before it runs: never a failed commit, as the audit saw on
     // every write.
