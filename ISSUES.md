@@ -9,6 +9,17 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 ## Problems
 
+### N-960: response limiter changes declared HTTP framing
+- **Where:** `object.rs`, `GuardedBody`
+- **Scenario:** `Limited` clamps an exact body size hint while the response retains its larger Content-Length. Hyper can panic or stop polling at the cap without seeing the overflow.
+- **Reproduced:** yes, through the real HTTP worker link; disabling enforcement also makes the regression fail.
+- **Status:** fixed on `fix/trim-edge-framing` (parent delivery pending). Counter preserves the guest's framing; integrated serial library suite: 206 passed, one ignored. See `notes/trim-edge-framing.md`.
+
+### N-961: strict Rust 1.99.1 checks retain unrelated lint and formatting failures
+- **Where:** unchanged lines in `journal.rs`, `object.rs`, `ship.rs`, `supervisor.rs`, `table.rs`, `telemetry.rs`; formatting across the crate and tests.
+- **Reproduced:** before PR3 integration, strict all-target/all-feature clippy reports ten errors; fmt check fails. Production check and 193 unit tests pass. See `notes/trim-edge-framing.md` for the commands and diagnostics.
+- **Status:** open; outside the focused response-framing fix.
+
 ### N-930–N-937: PR #3 independent review fixes
 - **Owner:** `fix/pr3-review`; separate from the new trim and secrets-research branches.
 - **N-930:** deletion/recreation reused a cached shipping head after the remote head was deleted. Re-read it when the local shipped marker no longer reaches the cached sequence.
@@ -934,8 +945,9 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### B-301: no rate limits or connection caps (beta audit)
 - **Where:** `proxy.rs` (`serve`), the node's front end (`main.rs`, `server::serve_http1`)
 - **Scenario:** a client could send any number of requests a second, to any app, and hold any number of connections, at the proxy and at a node reached directly; one client or one app could take all of either.
-- **Fix:** `gate` (both listeners, `[clients]`): requests a second per client address (an IPv6 /64) and per app (`governor`, GCRA; 429 with `Retry-After`), connections per client address (503 with `Retry-After`) and in all (the listener stops accepting). The client behind a trusted forwarder is the last untrusted address in `X-Forwarded-For`; trusted peers (default loopback) aren't limited. Hostile tests: `clients_past_their_rate_are_refused_however_they_forward` (spoofed and prepended `X-Forwarded-For`), `apps_past_their_rate_are_refused`, `connections_are_capped_per_client_and_in_all`. Evidence: notes/beta-limits.md.
-- **Status:** fixed on `beta/limits`
+- **Fix:** `gate` (both listeners, `[clients]`): connections per client address, an IPv6 /64 (503 with `Retry-After`), and in all (the listener stops accepting); trusted forwarders' connections (default loopback) aren't capped per client. Hostile test: `connections_are_capped_per_client_and_in_all`. Evidence: notes/beta-limits.md.
+- **Rates removed (owner decision, `trim/edge`):** `beta/limits` also limited requests a second per client (`rate`, 100) and per app (`app_rate`, 1,000) with `governor`, answering `429 rate-limited`. The owner rejected them: a fixed per-app cap throttles legitimate traffic below what a node serves, and it protects nothing the per-worker CPU and memory caps, the per-request CPU budget, connection caps and disk budgets don't already protect. Operators who want rate limits set them at the edge (Caddy, a CDN). `rate`, `app_rate`, `X-Forwarded-For` parsing and the `governor` dependency are gone, with their tests.
+- **Status:** fixed on `beta/limits`; rates removed on `trim/edge`
 
 ### B-302: one app could fill a node's disk and stop every app's writes (beta audit)
 - **Where:** `quota.rs`
@@ -972,8 +984,8 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### B-308: rate limits are per listener, and WebSocket messages aren't requests
 - **Where:** `gate.rs`
-- **Scenario:** each proxy (and each node a client reaches directly) keeps its own counts, so with several proxies a client or an app gets the rate at each; a socket's messages count only as the request that opened it (their own bounds are the socket backlog and caps).
-- **Status:** open (by design for one node)
+- **Scenario:** each proxy (and each node a client reaches directly) kept its own counts, so with several proxies a client or an app got the rate at each; a socket's messages counted only as the request that opened it (their own bounds are the socket backlog and caps).
+- **Status:** moot: request rate limits were removed (owner decision, `trim/edge`; see B-301)
 
 ### B-309 (tests): `the_proxy_outlasts_idle_and_excess_connections` bound the default private port
 - **Where:** `tests/integration.rs`

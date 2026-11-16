@@ -99,7 +99,7 @@ where
                 return Ok(c);
             }
         }
-        let (mine, theirs) = std::os::unix::net::UnixStream::pair()?;
+        let (mine, theirs) = UnixStream::pair()?;
         // A busy peer (all threads instantiating, say) can fall behind on
         // its control socket; wait for it rather than fail the request.
         let start = std::time::Instant::now();
@@ -109,9 +109,7 @@ where
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        drop(theirs);
-        mine.set_nonblocking(true)?;
-        let io = TokioIo::new(UnixStream::from_std(mine)?);
+        let io = TokioIo::new(mine);
         let (tx, conn) = http1::Builder::new().max_header_size(crate::server::MAX_HEAD).handshake(io).await?;
         Ok(Conn { tx, conn: Some(conn) })
     }
@@ -205,11 +203,7 @@ where
         };
         let sock = std::os::unix::net::UnixStream::from(fd);
         sock.set_nonblocking(true)?;
-        let conn = crate::server::serve_conn(UnixStream::from_std(sock)?, None, f.clone());
-        tokio::spawn(async move {
-            let _ = conn.await;
-            drop(permit);
-        });
+        crate::server::serve_conn(UnixStream::from_std(sock)?, None, permit, f.clone());
     }
     Ok(())
 }
@@ -252,6 +246,52 @@ async fn recv_fd(ctl: &UnixStream) -> std::io::Result<Option<OwnedFd>> {
 mod tests {
     use super::*;
     use http_body_util::{BodyExt, Empty, Full};
+
+    /// A worker-link permit follows the upgraded socket, not the HTTP
+    /// service that Hyper drops after sending the switching response.
+    #[tokio::test]
+    async fn upgraded_links_keep_their_admission_slots() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use std::time::Duration;
+
+        let cap = Arc::new(tokio::sync::Semaphore::new(1));
+        let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let serving = tokio::spawn(serve(UnixStream::from_std(peer).unwrap(), vec![cap.clone()], move |mut req| {
+            let upgrade = hyper::upgrade::on(&mut req);
+            let tx = tx.clone();
+            tokio::spawn(async move { tx.send(upgrade.await.unwrap()).unwrap() });
+            async {
+                Response::builder().status(101).header("connection", "upgrade").header("upgrade", "test")
+                    .body(Empty::<Bytes>::new()).unwrap()
+            }
+        }));
+        let (mut client, socket) = UnixStream::pair().unwrap();
+        send_fd(&ctl, socket.as_fd()).unwrap();
+        drop(socket);
+        client.write_all(b"GET / HTTP/1.1\r\nHost: test\r\nConnection: upgrade\r\nUpgrade: test\r\n\r\n").await.unwrap();
+        let mut head = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(client.read_u8().await.unwrap());
+            }
+        }).await.unwrap();
+        assert!(head.starts_with(b"HTTP/1.1 101"), "worker link must upgrade");
+        let mut upgraded = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+        client.write_all(b"x").await.unwrap();
+        let mut byte = [0];
+        tokio::time::timeout(Duration::from_secs(5), TokioIo::new(&mut upgraded).read_exact(&mut byte)).await.unwrap().unwrap();
+        assert_eq!(byte, [b'x'], "upgraded worker-link I/O remains live");
+        let free = cap.available_permits();
+        drop((client, upgraded));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cap.available_permits() != 1 { tokio::task::yield_now().await; }
+        }).await.expect("dropping upgraded I/O frees worker-link admission");
+        serving.abort();
+        let _ = serving.await;
+        assert_eq!(free, 0, "the live worker-link upgrade retains admission");
+    }
 
     /// Dials while the peer's control socket is full (here: a tiny buffer and
     /// an acceptor that starts late) wait for it instead of failing.

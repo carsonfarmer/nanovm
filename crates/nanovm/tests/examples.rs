@@ -16,6 +16,13 @@ use tokio_tungstenite::tungstenite::{Error, Message};
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// A JSON answer, as the test servers give.
+fn ok_json(v: serde_json::Value) -> http::Response<nanovm::object::RespBody> {
+    use http_body_util::BodyExt;
+    let body = http_body_util::Full::new(bytes::Bytes::from(v.to_string())).map_err(|e| match e {}).boxed_unsync();
+    http::Response::builder().header("content-type", "application/json").body(body).unwrap()
+}
+
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap()
 }
@@ -1306,7 +1313,7 @@ async fn upstream(script: Vec<u16>, delay: Duration) -> (String, std::sync::Arc<
             log.lock().unwrap().push((parts.headers, String::from_utf8_lossy(&body).into_owned()));
             tokio::time::sleep(delay).await;
             match script.lock().unwrap().pop_front().unwrap_or(200) {
-                200 => nanovm::server::ok_json(json!({"ok": true})),
+                200 => ok_json(json!({"ok": true})),
                 status => nanovm::object::error_response(status, "scripted", "failing on purpose"),
             }
         }
@@ -1656,7 +1663,7 @@ async fn github() -> String {
         let (path, auth) = (req.uri().path().to_string(), req.headers().get("authorization").cloned());
         let body = http_body_util::BodyExt::collect(req.into_body()).await.unwrap().to_bytes();
         let ask: Value = serde_json::from_slice(&body).unwrap_or_default();
-        nanovm::server::ok_json(match path.as_str() {
+        ok_json(match path.as_str() {
             "/token" if ask["code"] == "good" && ask["client_secret"] == "s3cret" && ask["client_id"] == "app-1" => json!({"access_token": "tok-ann"}),
             "/token" => json!({"error": "bad_verification_code"}),
             _ if auth.is_some_and(|a| a == "Bearer tok-ann") => json!({"login": "ann", "id": 7, "name": "Ann"}),

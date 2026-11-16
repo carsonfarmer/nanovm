@@ -17,6 +17,13 @@ mod collector;
 use load::{Reply, request};
 use nanovm::table::Node;
 
+/// A JSON answer, as the test servers give.
+fn ok_json(v: serde_json::Value) -> http::Response<nanovm::object::RespBody> {
+    use http_body_util::BodyExt;
+    let body = http_body_util::Full::new(bytes::Bytes::from(v.to_string())).map_err(|e| match e {}).boxed_unsync();
+    http::Response::builder().header("content-type", "application/json").body(body).unwrap()
+}
+
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -642,6 +649,19 @@ async fn killed(node: &Arc<Node>, id: &str, path: &str, status: u16, reason: &st
     r
 }
 
+/// A guest's response body is cut at `max_response_body_kb`: past it the
+/// reader gets an error, never a body that looks whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn response_bodies_are_capped() {
+    let mut hostile = app("hostile");
+    hostile.limits.max_response_body_kb = 1024;
+    let node = node_with(node_cfg("response_bodies_are_capped", 4), hostile);
+    let at_cap = get(&node, "a", "/big?mb=1").await;
+    assert_eq!((at_cap.status, at_cap.body.len()), (200, 1 << 20));
+    let past = get(&node, "a", "/big?mb=2").await;
+    assert!(past.body.starts_with("<body error: length limit exceeded"), "{} bytes", past.body.len());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_limit() {
     let node = node("memory_limit", "hostile", 8);
@@ -1229,7 +1249,7 @@ async fn egress_allowed_request_round_trips() {
                 captured.lock().extend(ExportTraceServiceRequest::decode(body).unwrap().resource_spans
                     .into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     // In dev mode an IP-literal allowlist entry may be private; this
@@ -1328,7 +1348,7 @@ async fn egress_is_capped_by_the_operator() {
     for _ in 0..2 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         ports.push(listener.local_addr().unwrap().port());
-        tokio::spawn(nanovm::server::serve_http1(listener, |_| async { nanovm::server::ok_json(serde_json::json!({})) }));
+        tokio::spawn(nanovm::server::serve_http1(listener, |_| async { ok_json(serde_json::json!({})) }));
     }
     let mut hostile = app("hostile");
     hostile.limits.egress = vec!["127.0.0.1".into()];
@@ -4531,7 +4551,7 @@ async fn doh(records: Arc<parking_lot::Mutex<std::collections::HashMap<String, V
         answer.extend(records.lock().get(&name).into_iter().flatten().map(|txt| {
             serde_json::json!({ "name": format!("{name}."), "type": 16, "TTL": 1, "data": format!("\"{txt}\"") })
         }));
-        async move { nanovm::server::ok_json(serde_json::json!({ "Status": 0, "Answer": answer })) }
+        async move { ok_json(serde_json::json!({ "Status": 0, "Answer": answer })) }
     }));
     format!("http://{addr}/dns-query")
 }
@@ -4556,96 +4576,23 @@ async fn proxied(node: std::net::SocketAddr, resolver: String) -> std::net::Sock
     addr
 }
 
-/// A proxy in front of `node` serving `counter` at `counter.test` and
-/// `hostile` at `hostile.test`, with `clients` its client limits.
+/// A proxy in front of `node` serving `counter` at `counter.test`, with
+/// `clients` its client limits.
 async fn gated(test: &str, clients: nanovm::config::ClientLimits) -> (Arc<nanovm::supervisor::Supervisor>, std::net::SocketAddr) {
     let (sup, node) = supervised(test).await;
-    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-    for (host, name) in [("counter.test", "counter"), ("hostile.test", "hostile")] {
-        let app = publish(&format!("{test}-{name}"), &app(name)).await;
-        records.lock().insert(format!("_nanovm.{host}"), vec![format!("app={}:latest; trust=dev dev", app.split_once('@').unwrap().0)]);
-    }
+    let app = publish(&format!("{test}-counter"), &app("counter")).await;
+    let record = vec![format!("app={}:latest; trust=dev dev", app.split_once('@').unwrap().0)];
+    let records = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([("_nanovm.counter.test".to_string(), record)])));
     let cfg = nanovm::config::ProxyConfig {
         nodes: vec![node.to_string()], resolver: doh(records).await, dev: true, listen: "127.0.0.1:0".into(), clients,
-        // The operator serves both hosts and lets the dev identity deploy.
-        hosts: vec!["counter.test".into(), "hostile.test".into()], signers: vec!["dev dev".into()],
+        // The operator serves the host and lets the dev identity deploy.
+        hosts: vec!["counter.test".into()], signers: vec!["dev dev".into()],
         ..Default::default()
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(nanovm::proxy::serve(nanovm::proxy::Proxy::new(cfg).unwrap(), listener));
     (sup, addr)
-}
-
-/// `GET /a/` on `host` with `extra` headers: the status line and headers,
-/// lowercased.
-async fn head_of(addr: std::net::SocketAddr, host: &str, extra: &str) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-    s.write_all(format!("GET /a/ HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n").as_bytes()).await.unwrap();
-    let mut out = Vec::new();
-    let _ = s.read_to_end(&mut out).await;
-    let text = String::from_utf8_lossy(&out).to_ascii_lowercase();
-    text.split_once("\r\n\r\n").map_or(text.clone(), |(h, _)| h.to_owned())
-}
-
-/// `n` requests at once to `host`, the `i`th with `extra(i)` headers: how
-/// many were answered 200, and how many 429 with a retry-after.
-async fn at_once(addr: std::net::SocketAddr, host: &str, n: usize, extra: impl Fn(usize) -> String) -> (usize, usize) {
-    let heads = futures::future::join_all((0..n).map(|i| {
-        let extra = extra(i);
-        async move { head_of(addr, host, &extra).await }
-    }));
-    let heads = heads.await;
-    let refused = |h: &String| h.starts_with("http/1.1 429") && h.contains("retry-after: ") && h.contains("x-nanovm-error: rate-limited");
-    (heads.iter().filter(|h| h.starts_with("http/1.1 200")).count(), heads.iter().filter(|h| refused(h)).count())
-}
-
-/// A client past its rate (here 1 a second, 2 at once) is answered 429
-/// with a retry-after, by the proxy and by a node it reaches directly. What
-/// it says in X-Forwarded-For is heard only from a trusted peer, and then
-/// only right of what the client wrote itself, so it can't spread its
-/// requests over addresses it makes up, nor spend another client's.
-#[tokio::test(flavor = "multi_thread")]
-async fn clients_past_their_rate_are_refused_however_they_forward() {
-    use nanovm::config::ClientLimits;
-    // 127.0.0.1 is a client like any other.
-    let untrusted = ClientLimits { rate: 1, trusted: vec!["192.0.2.1".into()], ..ClientLimits::default() };
-    let (_sup, proxy) = gated("rate_untrusted", untrusted).await;
-    let (ok, refused) = at_once(proxy, "counter.test", 10, |i| format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
-    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
-    // Behind a trusted terminator, each client has its own rate.
-    let trusted = ClientLimits { rate: 1, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
-    let (_sup, proxy) = gated("rate_trusted", trusted).await;
-    let from = |client: &str| format!("X-Forwarded-For: {client}\r\n");
-    // The terminator's own requests aren't limited (and start the app).
-    let (ok, _) = at_once(proxy, "counter.test", 10, |_| String::new()).await;
-    assert_eq!(ok, 10);
-    let (ok, refused) = at_once(proxy, "counter.test", 10, |_| from("198.51.100.1")).await;
-    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
-    // Whatever it writes before its own address.
-    let forged = ["203.0.113.66, 198.51.100.1", "198.51.100.2, 198.51.100.1", "127.0.0.1, 198.51.100.1", "junk, 198.51.100.1"];
-    assert_eq!(at_once(proxy, "counter.test", forged.len(), |i| from(forged[i])).await, (0, forged.len()));
-    assert_eq!(at_once(proxy, "counter.test", 1, |_| from("198.51.100.2")).await, (1, 0));
-    // A node reached directly limits its clients too.
-    let mut cfg = node_cfg("rate_node", 8);
-    cfg.clients = ClientLimits { rate: 1, trusted: vec![], ..ClientLimits::default() };
-    let (_sup, node) = supervised_with(cfg).await;
-    let counter = publish("rate-node", &app("counter")).await;
-    let statuses: Vec<_> = futures::future::join_all((0..10).map(|_| app_get(node, &counter, "/a/"))).await.into_iter().map(|r| r.0).collect();
-    assert!(statuses.iter().filter(|s| **s == 429).count() >= 7, "{statuses:?}");
-}
-
-/// Past an app's rate (here 1 a second, 2 at once), its requests are
-/// refused whichever client sends them; another app's are not.
-#[tokio::test(flavor = "multi_thread")]
-async fn apps_past_their_rate_are_refused() {
-    use nanovm::config::ClientLimits;
-    let limits = ClientLimits { rate: 0, app_rate: 1, trusted: vec!["127.0.0.0/8".into()], ..ClientLimits::default() };
-    let (_sup, proxy) = gated("app_rate", limits).await;
-    let (ok, refused) = at_once(proxy, "counter.test", 10, |i| format!("X-Forwarded-For: 198.51.100.{i}\r\n")).await;
-    assert!((1..=3).contains(&ok) && ok + refused == 10, "{ok} served, {refused} refused");
-    assert_eq!(at_once(proxy, "hostile.test", 1, |_| "X-Forwarded-For: 198.51.100.1\r\n".into()).await, (1, 0));
 }
 
 /// A client gets `connections_per_client` connections, past which one is
@@ -5222,7 +5169,7 @@ async fn the_proxy_drops_hop_by_hop_headers() {
     let echo = listener.local_addr().unwrap();
     tokio::spawn(nanovm::server::serve_http1(listener, |req: http::Request<hyper::body::Incoming>| {
         let names: Vec<_> = req.headers().keys().map(|k| k.to_string()).collect();
-        async move { nanovm::server::ok_json(serde_json::json!(names)) }
+        async move { ok_json(serde_json::json!(names)) }
     }));
     let records = Arc::new(parking_lot::Mutex::default());
     let proxy = proxied(echo, doh(records.clone()).await).await;
@@ -5262,7 +5209,7 @@ async fn front_door_events_cover_failures_and_link_to_worker() {
                 spans.lock().extend(ExportTraceServiceRequest::decode(body).unwrap().resource_spans
                     .into_iter().flat_map(|r| r.scope_spans).flat_map(|s| s.spans));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut cfg = node_cfg("front_door_events", 8);
@@ -5559,7 +5506,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
                 logs.lock().extend(collector::logs::v1::ExportLogsServiceRequest::decode(body).unwrap()
                     .resource_logs.into_iter().flat_map(|r| r.scope_logs).flat_map(|s| s.log_records));
             }
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let gate = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5574,7 +5521,7 @@ async fn post_return_work_keeps_context_and_reports_commit_failure() {
         async move {
             arrived.send(req.uri().path().to_owned()).await.unwrap();
             gate.acquire().await.unwrap().forget();
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut app = app("hostile");
@@ -5703,7 +5650,7 @@ async fn jailed_workers_export_otel_without_guest_network_access() {
                 return nanovm::object::error_response(503, "collector-down", "");
             }
             received.lock().push((path, body));
-            nanovm::server::ok_json(serde_json::json!({}))
+            ok_json(serde_json::json!({}))
         }
     }));
     let mut cfg = node_cfg("jailed_workers_export_otel_without_guest_network_access", 8);
@@ -6255,7 +6202,7 @@ mod nodes {
             async move {
                 arrived.send(req.uri().path().to_owned()).await.unwrap();
                 gate.acquire().await.unwrap().forget();
-                nanovm::server::ok_json(serde_json::json!({}))
+                ok_json(serde_json::json!({}))
             }
         }));
         let store = Arc::new(InMemory::new());

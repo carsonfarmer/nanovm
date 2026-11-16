@@ -285,12 +285,7 @@ impl Registry {
     /// from the cache if `cache` and it has them, else fetched (and kept).
     async fn fetch(&self, r: &AppRef, kind: &str, digest: &str, accept: &str, max: u64, cache: bool) -> anyhow::Result<Vec<u8>> {
         let path = self.cached(digest)?;
-        if cache && let Ok(Ok(b)) = tokio::task::spawn_blocking({
-            let path = path.clone();
-            move || std::fs::read(path)
-        })
-        .await
-        {
+        if cache && let Ok(b) = tokio::fs::read(&path).await {
             return Ok(b);
         }
         let bytes = self.oci.get(&r.reference, kind, digest, accept, max).await?.with_context(|| format!("{digest} not found"))?;
@@ -299,16 +294,7 @@ impl Registry {
         if !cache {
             return Ok(bytes);
         }
-        // Written aside and renamed, so a reader only sees a complete file.
-        tokio::task::spawn_blocking(move || {
-            static WRITER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = WRITER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = path.with_extension(format!("tmp.{n}"));
-            std::fs::write(&tmp, &bytes)?;
-            std::fs::rename(&tmp, &path)?;
-            Ok(bytes)
-        })
-        .await?
+        Ok(tokio::task::spawn_blocking(move || crate::engine::write_whole(&path, &bytes).map(|()| bytes)).await??)
     }
 
     /// Checks the attached signatures against the trust policy. They are
@@ -316,15 +302,13 @@ impl Registry {
     /// current answer, and they are small.
     async fn verify(&self, r: &AppRef) -> anyhow::Result<()> {
         let hex = r.digest.trim_start_matches("sha256:");
-        let index = match self.oci.get(&r.reference, "referrers", &r.digest, INDEX_TYPE, MAX_METADATA).await? {
-            Some(b) => Some(b),
+        let mut index = self.oci.get(&r.reference, "referrers", &r.digest, INDEX_TYPE, MAX_METADATA).await?;
+        if index.is_none() {
             // A registry without the referrers API keeps them under a tag.
-            None => self.oci.get(&r.reference, "manifests", &format!("sha256-{hex}"), INDEX_TYPE, MAX_METADATA).await?,
-        };
-        let index: Index = match index {
-            Some(b) => serde_json::from_slice(&b).context("the referrers")?,
-            None => bail!("not signed by a trusted identity (no signatures)"),
-        };
+            index = self.oci.get(&r.reference, "manifests", &format!("sha256-{hex}"), INDEX_TYPE, MAX_METADATA).await?;
+        }
+        let index = index.context("not signed by a trusted identity (no signatures)")?;
+        let index: Index = serde_json::from_slice(&index).context("the referrers")?;
         let hash = sigstore_types::Sha256Hash::from_hex(hex)?;
         let mut why = String::from("no signature");
         let signatures = index.manifests.iter().filter(|m| m.artifact_type.as_deref() == Some(BUNDLE_TYPE));

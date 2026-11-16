@@ -4,6 +4,7 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 
 - Each `(app, object-id)` has exactly one live instance, which serves one request at a time.
 - Each object has its own memory cap, CPU budget, deadlines and handle cap.
+- Response body caps fail the stream on overflow without changing its declared HTTP length.
 - Each object has its own quota'd filesystem: scratch `/tmp` and a persistent `/data` volume.
 - Each app has an egress allowlist, within the operator's.
 - Each object has a composed Spin KV store in its volume, and each app its host-injected `wasi:config` values.
@@ -335,11 +336,13 @@ DNS as the routing table has limits: a record is as trustworthy as its resolver 
 Every app shares a node with others, so each has bounds that no request, client or app can lift for itself. Per object (each app's `[limits]`, clamped to the node's): memory, CPU per request, deadlines, request and response sizes, queued requests, outbound requests, host resources, and a disk quota with a file count. Beyond those:
 
 **Clients** (`[clients]` in both `nanovm.toml` and `proxy.toml`; 0 turns one off). The proxy, and a node that clients reach directly, allow:
-- `rate` requests a second from one client address (default 100), in bursts of twice that, and `app_rate` to one app (default 1,000): past either, `429 rate-limited` with `Retry-After`;
 - `connections_per_client` connections from one address (default 256): past it, `503 too-many-connections` with `Retry-After`, then the connection closes;
 - `connections` in all (default 10,000): past it, new connections wait in the listen backlog until one closes.
 
-An IPv6 client counts by its /64. Peers in `trusted` (default loopback) forward other clients' requests: a TLS terminator in front of the proxy, or the proxy in front of a node. Their own requests and connections aren't limited, and a request's client is the last address in its `X-Forwarded-For` that isn't trusted, so what a client writes there itself is never read. List the terminator's address (or range) in the proxy's `trusted`, and have it set `X-Forwarded-For` (Caddy does): one that doesn't leaves every request it forwards unlimited, as its own. A node whose proxy isn't on its own host must list the proxy in its `trusted`, or the proxy is limited as one client. The rates use `governor` (GCRA); keys that have refilled are forgotten every 10 s.
+Admission remains held through HTTP upgrades until the upgraded I/O is dropped,
+on both public listeners and internal worker links.
+
+An IPv6 client counts by its /64. Peers in `trusted` (default loopback) forward other clients' connections: a TLS terminator in front of the proxy, or the proxy in front of a node. Their connections aren't capped per client. List a terminator on another host (or its range) in the proxy's `trusted`, and a proxy on another host in the node's, or it is capped as one client. nanovm doesn't limit request rates: a fixed rate per client or app throttles legitimate traffic below what a node serves, and the CPU, memory, connection and disk caps already bound what a client or app can take. An operator who wants rate limits sets them at the edge in front (Caddy, a CDN).
 
 **Disk.** An app's objects' volumes may hold `app_disk_mb` in all (default: a quarter of `data_dir`'s filesystem); past it that app's writes are cut short and then refused, as on a full disk, and no other app's are. Growth grants fit measured free space above `disk_reserve_mb` (default: a twentieth of the filesystem, at most 1 GiB), minus that app's outstanding grants. Below the threshold, growth and new entries are refused; overwrites, shrinking and deletion remain allowed. Each refusal is an `fs-denied` event; the guest sees `insufficient-space`. This is an admission threshold, not a strict node-wide physical reservation: separate workers can race, and journals, capture, sparse-file allocation, filesystem blocks and outside writers also consume space. Commits and rollback can still encounter a full filesystem. The app budget counts logical file sizes, not that additional storage.
 
@@ -845,7 +848,7 @@ The tests cover:
   These skip, saying why, where ghcr.io can't be reached.
 - open response bodies counting against `max_outbound_concurrency`, in-process and through the supervisor
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
-- client limits at the proxy and a node's own listener: per-client and per-app rates (429), connections per client (503) and in all, and a client that forges `X-Forwarded-For` from an untrusted peer, or writes addresses left of its own behind a trusted one
+- client limits at the proxy and a node's own listener: connections per client (503) and in all
 - disk on an 8 MiB tmpfs (as root): an app that fills its budget is refused while another app writes on, and below the node's reserve every app's growth is refused cleanly while writes in place still commit
 - a node with `cgroup = "auto"` that can't make a cgroup subtree refuses to start (where it can, its workers run under the host-sized defaults)
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.

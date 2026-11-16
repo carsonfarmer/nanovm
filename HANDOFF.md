@@ -70,6 +70,31 @@ first parent, -183 versus the PR3 parent. This worktree's target is removed
 after checks. Parent owns aggregate integration suites and benchmarks and its
 uncommitted follow-ups; no broader sign-off implied. Details in the trim notes.
 
+## Trim edge framing fix (2026-11-16)
+
+N-960 restores response byte counting in `GuardedBody` while preserving the
+guest's HTTP size hint. The worker-link regression fails on `2efdd1a` with
+Hyper's conflicting Content-Length panic and passes with the fix; disabling cap
+enforcement makes it fail again. Exact-cap and below-cap controls remain whole.
+The complete serial unit suite passed (193 passed, one ignored). Runtime delta
+is +10 lines. The approved rate-limit removal is untouched. No push, PR or
+deployment; the parent owns delivery. See [evidence](notes/trim-edge-framing.md).
+Release-mode, jailed-Wasm integration and idle-machine throughput benchmarks
+were not run for this focused worker-link fix.
+
+The edge branch also integrates committed local `fix/pr3-review` at `9965f46`
+(not `origin/main` or the parent's uncommitted follow-ups). The parent's
+admission-lifetime fix now lives in shared `server::serve_conn` I/O, covering
+both public gate and internal worker-link upgrades; its JoinHandle return is
+retained for the real disconnected-lookup proof. Both real upgrade regressions
+pass and fail when guards are moved back into the HTTP service. Experiments
+and rate limits stay removed; framing and lint findings use N-960/N-961 without
+colliding with PR3's N-930–N-938. Integration evidence is in the same note.
+After restoring the upgrade mutation, the integrated serial library suite passed
+(206 passed, one ignored, 61.23s); all three proxy cancellation controls also
+passed in a focused rerun. Runtime is 8,590 lines: +100 versus the framing
+branch before integration, -231 versus the committed PR3 parent.
+
 ## Current state (2026-11-08)
 
 **PR #3 review follow-up (2026-11-14):** local `fix/pr3-review` addresses the
@@ -616,6 +641,7 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q88 | (Superseded 2026-11-13 by shipping as the backup and live restore, B-500.) Offline backup/restore is operator tooling around restic, not another runtime API or custom archive. Stop all writers throughout backup, hold existing app locks, preserve the complete objects/journal tree, and approve only exit-zero snapshots. Restore an exact full ID to a nonexistent root, verify then sync before serving. Preserve numeric owners and deployment identity separately; fence the old writer before cutover. No live snapshot, external-effect rollback, automatic retention, off-node durability or failover claim. Keep restic in the caller's cwd so credentials keep their meaning; extract to temporary storage inside the fresh root, then move the verified objects subtree without copying it again. |
 | Q89 | W-9 engineering research starts with a bounded immutable full-version protocol using the actual journal, separate from production acceptance. Ordered sequence/parent hashes and fixed stream identity are not authentication or fencing. Preserve both commit gates; close local commit/capture crash windows before runtime integration. Acknowledgement/RPO, remote failure domain and automatic promotion remain undecided. The owner clarifies that 5k is a simplicity goal, not a hard limit. |
 | Q90 | Engineering continuation stages bounded streaming TAR captures before the existing journal commit decision, discards staging before rollback, and completes immutable hard-link publication before new mutations. Optional operator capture defaults off; full byte/version caps reject new dirty commits, no automatic pruning. Local durable acknowledgement is unchanged. Same-host capture recovery is not remote durability or permission to promote a second writer. |
+| Q91 | (2026-11-14, trim pass) No request-rate limits in nanovm: `[clients] rate` and `app_rate` (100/s per client, 1,000/s per app, 429) are removed with `governor`. A fixed per-app cap throttles legitimate traffic below what a node serves and protects nothing the per-worker CPU and memory caps, the per-request CPU budget, connection caps and disk budgets don't already protect. Operators who want rate limits put them at the edge (Caddy, a CDN). Connection caps (`connections_per_client`, `connections`) and `trusted` (whose connections aren't capped per client) stay. |
 
 Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 

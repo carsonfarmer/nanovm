@@ -2,13 +2,6 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
-use std::time::Instant;
-
-/// Monotonic nanoseconds since process start.
-pub fn now_ns() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
-}
 
 /// CPU time of the calling thread in nanoseconds, user and kernel: not the
 /// time it waited for a core or the disk. A system call (about 0.2 µs),
