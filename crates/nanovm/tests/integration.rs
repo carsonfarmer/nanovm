@@ -2433,15 +2433,20 @@ async fn worker_memory_max_kills_only_that_worker() {
         Ok(r) => r,
         Err(why) => return eprintln!("skipped: {why}"),
     };
-    // Each hostile object may hold 32 MiB; eight holding 30 MiB exceed 160.
+    // Leave room for the guest's own runtime and allocator: 30 MiB of
+    // payload exceeds a 32 MiB linear-memory cap before the worker can OOM.
+    // Eight objects holding 30 MiB still exceed the worker's 160 MiB cap.
     let mut cfg = node_cfg("worker_memory_max_kills_only_that_worker", 8);
     in_cgroup(&mut cfg, &root);
     cfg.worker.memory_mb = 160;
     let (sup, addr) = supervised_with(cfg).await;
     let mut big = app("hostile");
+    big.limits.memory_mb = 64;
     big.limits.cpu_ms = 30_000;
     big.limits.request_timeout_ms = 30_000;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &big).await);
+    assert_eq!(app_get(addr, &counter, "/n/").await.0, 200);
+    let neighbor = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].clone();
     assert_eq!(app_get(addr, &hostile, "/x/").await.0, 200);
     let pid = stats_json(addr).await["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap();
     let group = cgroup_of(&root, pid);
@@ -2450,13 +2455,23 @@ async fn worker_memory_max_kills_only_that_worker() {
     let mut statuses = Vec::new();
     for i in 0..8 {
         statuses.push(app_get(addr, &hostile, &format!("/m{i}/alloc?mb=30")).await.0);
+        assert_eq!(app_get(addr, &counter, "/n/").await.0, 200, "neighbor during allocation {i}");
+        if cgroup_stat(&root, "memory.events", "oom_kill ") > 0 { break; }
     }
     // The killed worker's cgroup is gone; events count in its parent too.
     assert!(cgroup_stat(&root, "memory.events", "oom_kill ") >= 1, "no OOM kill: {statuses:?}");
     assert_eq!(app_get(addr, &counter, "/n/").await.0, 200, "the other app kept serving");
-    // The next request starts a fresh worker.
-    assert_eq!(app_get(addr, &hostile, "/after/").await.0, 200);
+    // Wait for reaping, as in the explicit worker-kill test, before asking
+    // for a replacement rather than continuing to allocate on new workers.
+    let t0 = Instant::now();
+    while stats_json(addr).await["workers"][worker(&hostile).as_str()]["up"] == true {
+        assert!(t0.elapsed() < Duration::from_secs(2), "OOM-killed worker still up");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let restarted = app_get(addr, &hostile, "/after/").await;
+    assert_eq!(restarted.0, 200, "{restarted:?}");
     let v = stats_json(addr).await;
+    assert_eq!(v["workers"][worker(&counter).as_str()]["pid"], neighbor, "the neighboring worker was not restarted");
     assert_ne!(v["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap(), pid, "{v}");
     drop(sup);
     remove_cgroup(&root).await;
@@ -6009,16 +6024,16 @@ mod nodes {
 
     /// Node A serves an object; A stops; node B takes the object's lease, at
     /// the next epoch, once A's has run out, and serves the object, with what
-    /// A committed. The nodes share a data root, standing in for W-9's
-    /// stream of committed versions.
+    /// A committed. Each node has its own data root and admin socket;
+    /// committed versions reach B through the shared capture store.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_object_moves_to_another_node_when_its_node_stops() {
         let store = Arc::new(InMemory::new());
         let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (mut ls, names) = listeners(2);
         let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
-        let cfg_a = leased("an_object_moves", &la, private.local_addr().unwrap());
-        let cfg_b = NodeConfig { name: names[1].clone(), ..cfg_a.clone() };
+        let cfg_a = leased("an_object_moves_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("an_object_moves_b", &lb, private.local_addr().unwrap());
         // A runs on a runtime of its own, so that stopping it stops all of
         // it: its server, its session's renewals and its workers.
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -6041,7 +6056,7 @@ mod nodes {
         a.join().unwrap();
         let t0 = Instant::now();
         let read = loop {
-            // B refuses until A's worker has gone from the shared root.
+            // B refuses until A's lease has expired, then restores its volume.
             let read = get(proxy, "moves.test", &format!("/{object}/commit")).await;
             if read.0 == 200 || t0.elapsed() > Duration::from_secs(15) {
                 break read;

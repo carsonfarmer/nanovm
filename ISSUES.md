@@ -19,13 +19,25 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 - **N-935:** zero-byte idle objects retained an unbounded history of accounting IDs.
 - **N-936:** growth grants exceeded free-space headroom. Bound them by measured headroom less this app's outstanding grants. Strict node-wide physical reservation remains **open**: separate workers, journals, sparse allocation and filesystem overhead are not coordinated by this admission check.
 - **N-937:** base deployment capabilities prevented deleting worker-owned data. Include DAC override without requiring the capture-store drop-in.
-- **Status:** implemented on `fix/pr3-review` for PR #3; seven retained proofs now pass, as do the ordinary serial suite, SQLite suite and restricted-capability admin-delete test. N-936's strict physical-reservation guarantee remains open. Performance and privileged OOM sign-off remain outstanding. Verification and limits: `notes/pr3-review-fixes.md`.
+- **Status:** implemented on `fix/pr3-review` for PR #3; seven retained proofs now pass, as do the ordinary serial suite, SQLite suite and restricted-capability admin-delete test. N-936's strict physical-reservation guarantee remains open. Privileged OOM isolation/restart passed three runs after correcting its fixture; fresh performance sign-off remains outstanding. Verification and limits: `notes/pr3-review-fixes.md`.
 
 ### N-938: documentation-only changes could publish guest packages
 - **Where:** `.github/workflows/publish-guests.yml`
 - **Scenario:** README changes under `components/keyvalue` or `guests`, and edits to the publishing workflow itself, matched the package-publication filter on merge to main.
 - **Fix:** exclude READMEs and remove the publishing workflow from its own positive path filter. Guest/provider code, lockfiles and build-script changes still publish; manual dispatch remains available.
 - **Status:** fixed in main merge `e82a404`; the actual cleanup path set fails the original filter and passes the corrected filter, with code/build controls unchanged. Validation: `notes/review-main.md`.
+
+### N-950: multi-node failover fixture shared an admin socket
+- **Where:** `tests/integration.rs`, `nodes::an_object_moves_to_another_node_when_its_node_stops`
+- **Reproduced:** PR #5 CI run 43799470249 failed with `Address already in use`; both simulated nodes cloned one data root and admin-socket path. Push CI passed, confirming a startup race rather than clearing it.
+- **Fix:** separate node roots/admin sockets, sharing only the capture store. This also exercises actual shipped-state restoration instead of shared local files.
+- **Status:** fixed on `fix/pr3-review`; combined serial suite passed (392 tests, including failover). Remote CI follow-up remains required.
+
+### N-951: worker OOM fixture hit the object cap first
+- **Where:** `tests/integration.rs`, `worker_memory_max_kills_only_that_worker`
+- **Reproduced:** allocating 30 MiB under the fixture's 32 MiB object cap returned `500 memory`; the same request under 64 MiB returned `200` with `held_mb: 30`. Guest allocator/runtime overhead prevented reaching the intended worker-wide limit.
+- **Fix:** allow 64 MiB per object while retaining the 160 MiB worker limit. Stop after the first kernel OOM, check the neighboring worker serves without restarting, wait for reaping, then verify replacement.
+- **Status:** fixed locally on `fix/pr3-review`; three privileged runs passed with kernel memcg OOM evidence. Runtime-line delta: 0.
 
 Found by the review at `c607ec9`, unless an entry says otherwise; line numbers are as of that commit.
 

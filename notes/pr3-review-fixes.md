@@ -83,3 +83,36 @@ The runtime fixes and documentation are packaged together for integration
 into PR #3; the seven original proof commits remain separately retained.
 Delivery now includes resolving the cleanup merge on main and rerunning
 the combined checks before merging PR #3.
+
+## Integrated CI fixture corrections (2026-11-16)
+
+The integrated head `9965f46` passed push CI but failed PR CI run
+43799470249: the failover fixture cloned both nodes' data root, including
+the admin socket, and startup raced with `Address already in use`.
+Each node now has a separate root and socket, with only the capture store
+shared. The test therefore exercises shipped-state recovery too (N-950).
+
+The privileged worker-memory proof also needed correction (N-951).
+Its 30 MiB payload hit a 32 MiB object cap before worker OOM: the response
+was `500 memory`, versus `200 {"held_mb":30}` under 64 MiB. Raising only
+that object's cap to 64 MiB leaves the worker cap at 160 MiB. The test
+warms a neighboring worker, checks it serves throughout the allocations
+without changing PID, stops after the first kernel OOM, waits for reaping,
+and checks the replacement worker serves with a different PID.
+
+Three privileged runs passed in 1.32, 1.12 and 1.22 seconds. Kernel
+`oom-kill:constraint=CONSTRAINT_MEMCG` output names the hostile worker's
+cgroup. This proves worker cgroup isolation/restart on this VM, not
+node-wide memory pressure handling. Runtime-line delta: 0.
+
+The clean combined serial suite passed: 206 library, 1 shipped-config,
+11 dev, 29 example, 128 integration and 17 JavaScript tests (392 total;
+14 ignored). All ten multi-node tests ran, including failover with separate
+roots. No parent rebuild/relink ran alongside this suite. An earlier local
+attempt was invalidated when another build replaced its running integration
+executable, breaking a child spawn; it is not counted as a passing run.
+
+A separate repeat passed all ten multi-node tests, then all 12 ignored
+SQLite tests passed and the production check passed. Ordinary unprivileged
+suite counts still include self-skipping privileged tests; only the explicit
+privileged runs above establish those paths. Fresh benchmarks are pending.

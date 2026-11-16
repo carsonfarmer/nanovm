@@ -13,6 +13,14 @@ reviewed separately, not merged into these fixes. Disk reserve is an admission
 threshold, not a guarantee that physical space remains for every commit.
 Current evidence and delivery state: `notes/pr3-review-fixes.md`.
 
+**Integrated review delivery (2026-11-16):** PR #5 carries the review fixes
+and main cleanup into PR #3 without rewriting either published branch.
+The clean combined serial suite passes 392 tests. The multi-node failover
+fixture now uses separate node roots/admin sockets and shared capture;
+the worker-OOM fixture now reaches a real memcg kill and verifies neighbor
+survival and worker replacement (three privileged passes). Remote CI and
+fresh performance results remain delivery gates, not implied successes.
+
 **Cleanup follow-up (2026-11-15):** `review/main` removes superseded experiments and unused dependencies without runtime-source changes. Its merge now excludes README-only and publishing-workflow-only edits from guest publication. Explicit merge/push requests cover their existing automatic workflows; see AGENTS.md. Filter evidence is in `notes/review-main.md`.
 
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
