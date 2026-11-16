@@ -1810,6 +1810,8 @@ async fn restores_an_object_and_an_app_into_a_running_node() {
             n
         }
     });
+    // B must actually be writing and shipping before A's restores exercise isolation.
+    eventually_long("B's first version shipped", || head(&wb, "w") > 0).await;
     for n in 1..=5 {
         assert_eq!(count(app_post(addr, &a, "/o/incr").await), n);
     }

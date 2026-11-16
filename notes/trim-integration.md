@@ -65,3 +65,28 @@ longer alternating CPU ranges overlap with pre-trim main, including SQLite.
 Default c256 export is incomplete on both builds; three c3 invocations deliver
 every expected span. See [results, ranges and limitations](bench-numbers/2026-11-16.md).
 Final benchmark/docs CI and main integration remain pending; no deployment.
+
+## Live-restore fixture ordering (N-962)
+
+CI 43819965326 failed the `restores_an_object_and_an_app_into_a_running_node`
+app-list assertion; the other run on the same head passed. The unchanged local
+test also failed. A temporary diagnostic reproduced the failure with B's shipped
+head 0, no B directory in the store and its writer still running. A passing
+invocation had already shipped head 69. The fixture had not synchronized B's
+first successful write/shipment before asserting store visibility.
+
+Wait with the existing bounded helper until B has a shipped head, then exercise
+A's restores while B continues writing. Keep the exact version lists, restored
+counts, uninterrupted B counts and final backlog checks. Twenty consecutive
+fixed invocations pass. Runtime-line delta 0; no measured binary changes.
+
+Removing only that wait reproduced the same app-list failure (mutation caught).
+Restored from the staged fixed test and confirmed an empty unstaged test diff
+before rebuilding for the complete integration suite. Temporary diagnostics are
+not retained. Logs are under `.amp/in/orb-backup/pr3/trim-restore-*`.
+
+Restored full integration suite: **127 passed, 0 failed, 13 ignored**, 137.12 s,
+including all ten multi-node cases. Command: `env -u RUST_BACKTRACE
+RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=1 cargo +1.99.1 test --locked -p nanovm
+--test integration`, with fd limit 20,000. The ignored SQLite/Internet cases and
+self-skipping privileged tests are not new evidence for those paths.

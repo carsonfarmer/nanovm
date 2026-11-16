@@ -9,6 +9,11 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 ## Problems
 
+### N-962: live-restore fixture assumes the other app has already shipped
+- **Where:** `tests/integration.rs`, `restores_an_object_and_an_app_into_a_running_node`.
+- **Reproduced:** CI 43819965326 and the unchanged local test fail the store app-list assertion. A temporary diagnostic confirmed B's head was 0, its store directory absent and its writer still running; another invocation passed with head 69. The fixture started B asynchronously without waiting for any remotely stored state.
+- **Status:** fixed on `fix/trim-integration`, awaiting CI/main delivery. Wait for B's first shipped head before A's restore sequence, retaining continuous write/count assertions and all admin restore checks. Twenty fixed repetitions pass; removing the wait reproduces the failure. Restored complete integration suite: 127 passed, 13 ignored. No runtime change. Evidence: `notes/trim-integration.md`.
+
 ### N-960: response limiter changes declared HTTP framing
 - **Where:** `object.rs`, `GuardedBody`
 - **Scenario:** `Limited` clamps an exact body size hint while the response retains its larger Content-Length. Hyper can panic or stop polling at the cap without seeing the overflow.

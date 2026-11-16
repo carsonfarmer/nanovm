@@ -15,6 +15,15 @@ Decisions and evidence are in `notes/trim-integration.md`. PR #5 and PR #3
 are merged; main is `ba87b87`. PR #6 holds the trims; its `e28573e` CI passed.
 Final benchmark/docs CI and main integration remain before delivery is complete.
 
+The final benchmark/docs head exposed N-962: one CI run failed the live-restore
+fixture while the other passed. Local reproduction confirmed B had not shipped
+its first version when the test expected it in the store. The fixture now waits
+for B's first shipped head before A's restore sequence; all continuous write and
+restore checks remain. Twenty consecutive fixed invocations pass. This is a
+test-only ordering correction, not a backup/runtime or benchmark change.
+Removing the wait reproduces the failure; after restoration, the full integration
+suite passes (127 passed, 13 ignored). Fresh remote CI is still required.
+
 The otherwise idle four-vCPU HTTP campaign completed 240 valid records over
 three rounds: 16,617,893 HTTP 200 and 1,500 HTTP 204 responses, no transport
 errors. Direct c64 medians: Rust GET 27,372/s, spread counter writes 2,976/s,
