@@ -136,6 +136,22 @@ print('fixture run')
         self.assertNotIn("clients", proxy)
         self.assertEqual(proxy["nodes"], [drive.NODE])
 
+    def test_app_restart_leaves_the_spare_worker_alive(self):
+        st = SimpleNamespace(node=SimpleNamespace(pid=1), cfg=self.work / "node.toml", data=self.work)
+        replies = [SimpleNamespace(stdout=json.dumps([dict(app="counter", pid=pid)])) for pid in (77, 78)]
+
+        def kill(pid, sig):
+            self.assertNotEqual(pid, 88, "the spare worker must survive an app restart")
+
+        with patch.object(drive.subprocess, "run", side_effect=replies), \
+                patch.object(drive, "children", return_value=[77, 88]), patch.object(drive.os, "kill", side_effect=kill), \
+                patch.object(drive, "http_req", return_value=(200, b"")), \
+                patch.object(drive.Path, "exists", return_value=False), patch.object(drive.time, "sleep"), \
+                patch.object(drive, "record") as record, patch.object(drive, "log"):
+            drive.phase_app_cold(self.build, 1, self.work, st, {"counter": "ref"}, 1)
+        self.assertTrue(all(call.args[0]["valid"] for call in record.call_args_list))
+        self.assertEqual(len(record.call_args_list), 2)
+
     def test_density_observed_live_count_and_target_pid(self):
         snapshot = dict(collected_at_ms=2000, workers={"app": dict(up=True, pid=77)},
                         apps={"app": dict(live_objects=2001, stores_live=2001)})

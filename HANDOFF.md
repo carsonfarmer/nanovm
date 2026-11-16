@@ -20,6 +20,12 @@ of being cancelled. Hot-object success measurements use 1/16/64 clients because
 aborted pilots remain invalid and excluded. Twenty harness tests pass, including
 before/after evidence for these corrections. Runtime-line delta 0.
 
+The first full attempt then stalled because app restart killed the supervisor's
+spare as well as its app worker. Restart now selects only the admin-reported app
+PID and bounds its reaping wait. All 21 harness tests and a real restart/cold
+object/syscall/density probe pass. The completed three-round pilot remains only
+offered-rate calibration; full tables restart in fresh roots. No runtime change.
+
 ## Benchmark harness correction (2026-11-16, fix/benchmark-validity)
 
 The Python harness now uses only current v1 config/admin/collector contracts,

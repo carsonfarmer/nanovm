@@ -30,6 +30,11 @@ unknown phase names are refused before any workload starts.
   A failure aborts the run, records invalid evidence, and prevents summarization.
   Application-cold failures invalidate that sample set. Node-cold startup polling
   deliberately reports time until first 200 and retains intermediate response codes.
+- Application restart kills only the app PID reported by `admin apps`, leaving
+  the supervisor's prestarted spare intact. The reaping wait is bounded to five
+  seconds. Killing every child also killed the spare and stalled the first real
+  full attempt; that attempt is excluded. The fixed real probe completed both
+  compile-cache variants, cold objects, syscall counts and verified density.
 - Density stops the ordinary stack, publishes a dedicated counter manifest, and
   starts a fresh stack plus the existing `dev-collector` example. Both node and
   app idle retention are one hour, with a half-hour measurement deadline. After
@@ -66,7 +71,7 @@ The initial ten regression tests failed against the unchanged driver: five
 assertion failures and eight errors (including subtests). They reproduced silent
 HTTP error acceptance, ignored in-process exit/missing JSON, missing density/live
 verification and path handling, config dialect requirements, and pooled duplicate,
-commit/binary/rate/invalid rows. The current suite has 18 passing tests, including
+commit/binary/rate/invalid rows. The current suite has 21 passing tests, including
 a real disposable stub subprocess running from another cwd, synthetic collector
 snapshots, dedicated density orchestration and failed-creation cleanup. A CLI
 help probe also caught and fixed argparse's unescaped percent-sign failure.

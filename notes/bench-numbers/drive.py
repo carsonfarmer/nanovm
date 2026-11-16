@@ -471,12 +471,19 @@ def phase_app_cold(b, rnd, work, st, refs, n):
     for variant in ("cache_warm", "cache_empty"):
         samples, odd = [], {}
         for i in range(n):
-            ws = children(st.node.pid)
-            for w in ws:
-                os.kill(w, signal.SIGKILL)
-            for w in ws:
-                while Path(f"/proc/{w}").exists():
-                    time.sleep(0.005)
+            # The supervisor also has a spare child; kill only the app's worker.
+            apps = subprocess.run([str(b["bin"] / "nanovm"), "admin", "--config", str(st.cfg), "apps"],
+                                  capture_output=True, text=True, check=True)
+            apps = json.loads(apps.stdout)
+            if len(apps) != 1 or not apps[0]["pid"]:
+                raise RuntimeError(f"app cold: expected one running app, got {apps}")
+            pid = apps[0]["pid"]
+            os.kill(pid, signal.SIGKILL)
+            until = time.monotonic() + 5
+            while Path(f"/proc/{pid}").exists():
+                if time.monotonic() >= until:
+                    raise RuntimeError(f"app cold: worker {pid} was not reaped")
+                time.sleep(0.005)
             time.sleep(0.2)
             if variant == "cache_empty":
                 for f in (st.data / "cache").glob("*/*.cwasm"):
