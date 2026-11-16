@@ -21,14 +21,17 @@
 //! ends that session with a conditional write, so a renewal still on its way
 //! can't land after it and extend the holder's leases.
 //!
-//! Records: `nodes/<node>` is `{session, beat, lease_ms}` and
+//! Records: `nodes/<base64url(node)>` is `{session, beat, lease_ms}` and
 //! `objects/<app>/<object>` `{node, session, epoch}`, with no node once
-//! released. Deleting a record restarts its epochs: never do.
+//! released. Node names are encoded without padding as one lossless path
+//! segment, so slashes in distinct names cannot alias session records.
+//! Deleting a record restarts its epochs: never do.
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use object_store::{ObjectStore, UpdateVersion};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -137,7 +140,7 @@ impl Leases {
     /// id, and the `mono_ns` until which its leases hold (past if none do).
     pub async fn renew(&self) -> (u64, u64) {
         let mut s = self.session.lock().clone();
-        let (sent, key) = (mono_ns(), format!("nodes/{}", self.node));
+        let (sent, key) = (mono_ns(), format!("nodes/{}", BASE64_URL_SAFE_NO_PAD.encode(&self.node)));
         if s.until <= sent {
             match self.get::<NodeRecord>(&key).await {
                 Ok((rec, version)) => s = Own { id: rec.map_or(1, |r| r.session + 1), beat: 0, version, until: 0 },
@@ -238,7 +241,7 @@ impl Leases {
     /// Whether `node`'s session `session` may still hold leases: its record
     /// names it and has changed within a lease. Once it hasn't, this ends it.
     async fn alive(&self, node: &str, session: u64) -> std::io::Result<bool> {
-        let key = format!("nodes/{node}");
+        let key = format!("nodes/{}", BASE64_URL_SAFE_NO_PAD.encode(node));
         let (rec, version) = self.get::<NodeRecord>(&key).await?;
         let Some(rec) = rec.filter(|r| r.session == session) else { return Ok(false) };
         {
@@ -395,6 +398,26 @@ mod tests {
         (store.clone(), (0..n).map(|i| Leases::new(store.clone(), &format!("n{i}"), TTL)).collect())
     }
 
+    /// Distinct names must not end each other's sessions through path normalization.
+    #[tokio::test]
+    async fn distinct_node_names_cannot_take_over_live_leases() {
+        for (left, right) in [("east", "east/"), ("east", "/east"), ("east/west", "east//west"), ("east/", "east%2F"), (".", "%2E")] {
+            for (holder, taker) in [(left, right), (right, left)] {
+                let store = Arc::new(object_store::memory::InMemory::new());
+                let ttl = Duration::from_secs(60);
+                let a = Leases::new(store.clone(), holder, ttl);
+                let b = Leases::new(store, taker, ttl);
+                a.renew().await;
+                let grant = a.acquire("app/o").await.unwrap();
+                b.renew().await;
+                assert!(a.until(&grant).is_some(), "{holder:?}'s lease is still live");
+                assert_eq!(b.acquire("app/o").await.unwrap_err(), Refused::Held(holder.into()), "{taker:?} must not take {holder:?}'s live lease");
+                a.renew().await;
+                assert_eq!(b.acquire("app/o").await.unwrap_err(), Refused::Held(holder.into()), "{holder:?}'s renewal must keep its lease");
+            }
+        }
+    }
+
     /// One node at a time holds a lease, each holder at a higher epoch; one
     /// released, or whose node stopped renewing, goes to the next asker.
     #[tokio::test]
@@ -493,7 +516,7 @@ mod tests {
         tokio::time::sleep(TTL).await;
         n[1].renew().await;
         n[1].acquire("app/o").await.unwrap();
-        let late = store.put_opts(&Path::from("nodes/n0"),
+        let late = store.put_opts(&Path::from(format!("nodes/{}", BASE64_URL_SAFE_NO_PAD.encode("n0"))),
             serde_json::to_vec(&NodeRecord { session: stale.id, beat: stale.beat + 1, lease_ms: TTL.as_millis() as u64 }).unwrap().into(),
             PutMode::Update(stale.version.unwrap()).into()).await;
         assert!(matches!(late, Err(object_store::Error::Precondition { .. })), "{late:?}");

@@ -949,6 +949,12 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Scenario:** found by the storage trim (`trim/storage`, notes/trim-storage.md); each spans a file another agent owns, so it was left. `ship::own` (9 lines) can go if `chown_tree` is `pub(crate)` and maps to `io::Error`.
 - **Status:** open (for the coordinator)
 
+### TS-2: distinct node names share a lease session record
+- **Where:** `lease::Leases::renew`, `lease::Leases::alive`
+- **Scenario:** formatting `nodes/{name}` before `ship::Objects` converts it to an object-store path drops empty slash-separated segments: `east` and `east/` share a session record. Starting the latter session lets it take the former's live leases early.
+- **Fix:** encode the complete node name as one unpadded base64url segment for renewal and holder checks, using the existing dependency. The regression covers five pairs in both orders; it fails before the fix and when renewal encoding is removed. Restored full library suite: 195 passed, one ignored. Runtime +1 line; evidence and check limitations in `notes/trim-storage.md`.
+- **Status:** fixed on `fix/trim-storage-keys` (Amp, separate worktree; not pushed)
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

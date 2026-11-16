@@ -1,5 +1,52 @@
 # Trim: storage (`trim/storage`)
 
+## Session-key correction (TS-2, `fix/trim-storage-keys`)
+
+The string-key store adapter splits `/` and drops empty segments. Formatting
+`nodes/{name}` made `east` and `east/` share a session record: starting the
+second node let it take a lease that the first node still considered live.
+Renewal and holder checks now encode the complete node name with the existing
+`base64` crate's unpadded URL-safe encoding. Its alphabet contains no slash or
+percent, so the adapter cannot normalize distinct names into one key. No new
+dependency, validation restriction or compatibility path is needed.
+
+`distinct_node_names_cannot_take_over_live_leases` uses the actual in-memory
+object store through `ship::Objects`. Five name pairs (trailing, leading and
+repeated slashes, literal percent encodings and dot segments), each in both
+holder/taker orders, must refuse takeover before and after the holder renews.
+It also verifies that the holder still regards its grant as live. A 60-second
+TTL avoids sleep-based expiry races; the test does not wait for expiry.
+
+- Before the fix: the new test fails immediately for `east` / `east/`, with
+  an unexpected successful grant at epoch 2, session 2.
+- After the fix: all seven lease tests pass, including expiry/takeover and
+  late-renewal fencing. The complete library suite passes: 195 passed, one
+  ignored.
+- Mutation: remove encoding only from `renew` (leave `alive` encoded); the
+  same regression fails with the unexpected epoch-2/session-2 grant. Restore
+  from the staged index with `git checkout --`, then verify no unstaged
+  runtime diff. The restored library suite passes again: 195 passed, one ignored.
+- CI's runtime count: `lease.rs` 253 -> 254; total 8,527 -> 8,528 (**+1**).
+  Only an import is added; both key expressions replace existing lines.
+- Production `cargo check --locked -p nanovm --bin nanovm` passes. Rustdoc
+  passes with ten existing warnings outside `lease.rs`. Strict all-target,
+  all-feature clippy fails on 15 existing diagnostics outside `lease.rs`
+  (committed, engine, gate, journal, object, ship, supervisor, table and
+  telemetry). `cargo fmt --all -- --check` fails on the existing tree's
+  formatting, beginning in `examples/bench.rs`; no unrelated reformat retained.
+- Full integration/guest suites, production S3 and alternating performance
+  benchmarks were not rerun in this resource-constrained parallel build.
+
+Commands use Rust `+1.99.1`, `env -u RUST_BACKTRACE RUST_TEST_THREADS=1`,
+`ulimit -n 20000`, and this worktree's own `target` (initial build two jobs,
+then one).
+Dependencies were hardlink-seeded, then nanovm artifacts/fingerprints and
+inherited incremental caches removed and Cargo lockfiles unlinked before
+building. No parent-target path is used for the build. These are in-memory
+lease protocol checks, not a production S3 or power-loss certification.
+
+## Original trim results
+
 The storage files' runtime (CI's count: non-blank, non-comment lines before
 the test module) at 7988cae: ship 604, journal 764, quota 666, committed 423,
 lease 271 = **2,728**. Must reach 2,319, aim 2,046.

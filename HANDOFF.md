@@ -4,6 +4,19 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
+## Storage trim blocker (TS-2, 2026-11-16)
+
+`fix/trim-storage-keys`, based on `trim/storage` a952a43, fixes session aliasing
+between node names such as `east` and `east/`. Renewals and holder checks use
+one unpadded base64url segment for the full name; no configuration restriction,
+new dependency or compatibility reader. Runtime +1 line. The new live-lease
+regression fails before the fix and with renewal encoding removed. Restored
+library suite passes (195 passed, one ignored), as do production check and
+rustdoc (ten existing warnings). Strict clippy retains 15 existing diagnostics
+outside lease; the tree is not rustfmt-clean. No full guest/integration suite,
+S3 or performance clearance claimed. Evidence: `notes/trim-storage.md`.
+Own worktree only; commit delivered to the coordinator, no push or PR.
+
 ## Current state (2026-11-08)
 
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145
