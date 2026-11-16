@@ -1144,7 +1144,7 @@ async fn the_disk_reserve_keeps_writes_committing() {
         panic!("four objects grew by 1 MiB with less than the reserve and 2 MiB free");
     };
     assert!(refused.0 == 507 && refused.1.contains("insufficient-space"), "{refused:?}");
-    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk is below its 3.0 MiB reserve")));
+    assert!(denials(addr).await.iter().any(|d| d.contains("the node's disk has no unreserved space above its 3.0 MiB reserve")));
     // Every app's growth is refused by the app, as on a full disk, and a new
     // object before it runs: never a failed commit, as the audit saw on
     // every write.
@@ -1459,7 +1459,7 @@ async fn http_front_end() {
         b"",
     ).await;
     assert_eq!(status, 204, "{body}");
-    assert!(body.is_empty(), "readiness must not return a stats snapshot: {body}");
+    assert!(body.is_empty(), "readiness has no body: {body}");
     assert_eq!(node.live_objects(), 0);
 
     let (status, body) = raw(
@@ -1486,10 +1486,6 @@ async fn http_front_end() {
     );
     let (status, _) = raw(addr, &head, &big).await;
     assert_eq!(status, 413);
-
-    for path in ["/_nanovm/stats", "/_nanovm/events"] {
-        assert_eq!(http_get(addr, path).await.0, 404);
-    }
 
     let (status, _) = raw(
         addr,
@@ -1585,7 +1581,7 @@ fn names(app: &str) -> String {
     format!("nanovm-app: {app}\r\nnanovm-trust: dev dev\r\n")
 }
 
-/// The app's name on the node (its worker's, in stats and cgroups).
+/// The app's name on the node (its worker's, in snapshots and cgroups).
 fn worker(app: &str) -> String {
     nanovm::registry::app_name("", &app.parse().unwrap())
 }
@@ -1886,9 +1882,7 @@ async fn restores_an_object_and_an_app_into_a_running_node() {
 async fn supervised_workers_contain_attacks() {
     let (_sup, addr) = supervised("supervised_workers_contain_attacks").await;
     assert_eq!(http_get(addr, "/_nanovm/ready").await, (204, String::new()));
-    for path in ["/_nanovm/stats", "/_nanovm/events"] {
-        assert_eq!(http_get(addr, path).await.0, 404);
-    }
+    assert_eq!(http_get(addr, "/_nanovm/nope").await.0, 404);
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &app("hostile")).await);
 
     let (status, body) = app_get(addr, &counter, "/s/").await;
@@ -1914,7 +1908,7 @@ async fn supervised_workers_contain_attacks() {
     let (status, body) = http_get(addr, "/s/").await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(app_get(addr, &hostile, "//s/").await.0, 400);
-    assert_eq!(app_get(addr, &hostile, "/_nanovm/stats").await.0, 400);
+    assert_eq!(app_get(addr, &hostile, "/_nanovm/ready").await.0, 400);
 
     let v = stats_json(addr).await;
     assert!(v["rss_mb"].as_f64().unwrap() > 0.0, "{v}");
@@ -2439,15 +2433,20 @@ async fn worker_memory_max_kills_only_that_worker() {
         Ok(r) => r,
         Err(why) => return eprintln!("skipped: {why}"),
     };
-    // Each hostile object may hold 32 MiB; eight holding 30 MiB exceed 160.
+    // Leave room for the guest's own runtime and allocator: 30 MiB of
+    // payload exceeds a 32 MiB linear-memory cap before the worker can OOM.
+    // Eight objects holding 30 MiB still exceed the worker's 160 MiB cap.
     let mut cfg = node_cfg("worker_memory_max_kills_only_that_worker", 8);
     in_cgroup(&mut cfg, &root);
     cfg.worker.memory_mb = 160;
     let (sup, addr) = supervised_with(cfg).await;
     let mut big = app("hostile");
+    big.limits.memory_mb = 64;
     big.limits.cpu_ms = 30_000;
     big.limits.request_timeout_ms = 30_000;
     let (counter, hostile) = (publish("counter", &app("counter")).await, publish("hostile", &big).await);
+    assert_eq!(app_get(addr, &counter, "/n/").await.0, 200);
+    let neighbor = stats_json(addr).await["workers"][worker(&counter).as_str()]["pid"].clone();
     assert_eq!(app_get(addr, &hostile, "/x/").await.0, 200);
     let pid = stats_json(addr).await["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap();
     let group = cgroup_of(&root, pid);
@@ -2456,13 +2455,23 @@ async fn worker_memory_max_kills_only_that_worker() {
     let mut statuses = Vec::new();
     for i in 0..8 {
         statuses.push(app_get(addr, &hostile, &format!("/m{i}/alloc?mb=30")).await.0);
+        assert_eq!(app_get(addr, &counter, "/n/").await.0, 200, "neighbor during allocation {i}");
+        if cgroup_stat(&root, "memory.events", "oom_kill ") > 0 { break; }
     }
     // The killed worker's cgroup is gone; events count in its parent too.
     assert!(cgroup_stat(&root, "memory.events", "oom_kill ") >= 1, "no OOM kill: {statuses:?}");
     assert_eq!(app_get(addr, &counter, "/n/").await.0, 200, "the other app kept serving");
-    // The next request starts a fresh worker.
-    assert_eq!(app_get(addr, &hostile, "/after/").await.0, 200);
+    // Wait for reaping, as in the explicit worker-kill test, before asking
+    // for a replacement rather than continuing to allocate on new workers.
+    let t0 = Instant::now();
+    while stats_json(addr).await["workers"][worker(&hostile).as_str()]["up"] == true {
+        assert!(t0.elapsed() < Duration::from_secs(2), "OOM-killed worker still up");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let restarted = app_get(addr, &hostile, "/after/").await;
+    assert_eq!(restarted.0, 200, "{restarted:?}");
     let v = stats_json(addr).await;
+    assert_eq!(v["workers"][worker(&counter).as_str()]["pid"], neighbor, "the neighboring worker was not restarted");
     assert_ne!(v["workers"][worker(&hostile).as_str()]["pid"].as_u64().unwrap(), pid, "{v}");
     drop(sup);
     remove_cgroup(&root).await;
@@ -3825,76 +3834,6 @@ async fn sqlite_exclusive_wal_checkpoints() {
     node.shutdown().await;
 }
 
-/// Manual benchmark, deliberately outside the `sqlite_` correctness-test filter.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "manual SQLite benchmark; requires the separately built experiment"]
-async fn benchmark_database_modes() {
-    let cfg = node_cfg("sqlite_benchmark", 8);
-    let mut app = app("counter");
-    app.limits.memory_mb = 64;
-    app.limits.disk_mb = 16;
-    app.limits.cpu_ms = 10_000;
-    app.limits.request_timeout_ms = 30_000;
-    let wasm = std::fs::read(repo().join("target/sqlite-filesystem/p3.wasm")).unwrap();
-    let node = Node::new(cfg, &app, &wasm, None).unwrap();
-    let variants = [("DELETE", 1000), ("WAL", 16), ("WAL", 1000)];
-    let mut results = vec![];
-    for round in 0..3 {
-        for workload in ["point", "scan", "write", "batch", "autocommit", "blob"] {
-            for cache in [true, false] {
-                for j in 0..3 {
-                    let (mode, pages) = variants[(j + round) % 3];
-                    let object = format!("{round}-{workload}-{cache}-{mode}-{pages}");
-                    let prefix = format!("/bench?mode={mode}&pages={pages}&cache={}", u8::from(cache));
-                    let init = get(&node, &object, &format!("{prefix}&op=init")).await;
-                    assert_eq!(init.status, 200, "{}", init.body);
-                    let mut samples = vec![];
-                    let (mut bytes, mut syncs, mut peak) = (0u64, 0u64, 0u64);
-                    let writes = match workload { "batch" | "autocommit" => 100, "write" | "blob" => 1, _ => 0 };
-                    for seq in 0..28 {
-                        let start = Instant::now();
-                        let response = get(&node, &object, &format!("{prefix}&op={workload}&seq={seq}")).await;
-                        let us = start.elapsed().as_secs_f64() * 1_000_000.0;
-                        assert_eq!(response.status, 200, "{object}: {}", response.body);
-                        let body = response.json();
-                        let expected = match workload { "point" => 512, "scan" => 1024*512, _ => writes };
-                        assert_eq!(body["value"], expected);
-                        if seq >= 3 {
-                            samples.push(us);
-                            bytes += body["sqlite_write_bytes"].as_u64().unwrap();
-                            syncs += body["sqlite_syncs"].as_u64().unwrap();
-                        }
-                        let volume = object_dir(&node.cfg.app_dirs(&app.name)[0], &object).join("data");
-                        let live: u64 = std::fs::read_dir(volume).unwrap()
-                            .map(|e| e.unwrap().metadata().unwrap().len()).sum();
-                        peak = peak.max(live);
-                    }
-                    // Include deferred WAL cleanup in the lifecycle cost, not in p50/p95.
-                    let start = Instant::now();
-                    let close = get(&node, &object, &format!("{prefix}&op=close")).await;
-                    let close_us = start.elapsed().as_secs_f64()*1_000_000.0;
-                    assert_eq!(close.status, 200, "{}", close.body);
-                    let closed = close.json();
-                    let verify = get(&node, &object, &format!("{prefix}&op=verify")).await;
-                    assert_eq!(verify.status, 200, "{}", verify.body);
-                    assert_eq!(verify.json()["value"], 28*writes);
-                    assert_eq!(verify.json()["integrity"], "ok");
-                    let result = serde_json::json!({"round": round, "workload": workload, "cached": cache,
-                        "mode": mode, "checkpoint_pages": pages, "samples_us": samples,
-                        "close_us": close_us, "sqlite_write_bytes": bytes, "sqlite_syncs": syncs,
-                        "close_write_bytes": closed["sqlite_write_bytes"], "close_syncs": closed["sqlite_syncs"],
-                        "peak_live_file_bytes": peak});
-                    println!("benchmark {object}: {} us mean including close", (samples.iter().sum::<f64>()+close_us)/25.0);
-                    results.push(result);
-                }
-            }
-        }
-    }
-    std::fs::write(repo().join("target/sqlite-filesystem/benchmark-results.json"),
-        serde_json::to_vec_pretty(&results).unwrap()).unwrap();
-    node.shutdown().await;
-}
-
 /// A request's writes, to files and to key-value alike, take effect only if
 /// it answers, whatever the status; one that fails, traps or runs out of CPU
 /// leaves nothing behind.
@@ -4776,7 +4715,7 @@ async fn the_proxy_routes_hosts_by_dns() {
     let (status, body) = get("Counter.Test:8443", "/a/", &names(&hostile)).await;
     assert_eq!(status, 200, "{body}");
     assert!(body.contains(&at("counter.test", &counter)), "{body}");
-    assert_eq!(get("counter.test", "/_nanovm/stats", "").await.0, 400);
+    assert_eq!(get("counter.test", "/_nanovm/ready", "").await.0, 400);
     // Nor can it claim to be a socket's event (and pick its `Connection-Id`),
     // however it spells the type: counter's own parsing reads the last one.
     for types in ["text/plain\r\nContent-Type: application/websocket-events", "Application/WebSocket-Events; charset=utf-8"] {
@@ -6085,16 +6024,16 @@ mod nodes {
 
     /// Node A serves an object; A stops; node B takes the object's lease, at
     /// the next epoch, once A's has run out, and serves the object, with what
-    /// A committed. The nodes share a data root, standing in for W-9's
-    /// stream of committed versions.
+    /// A committed. Each node has its own data root and admin socket;
+    /// committed versions reach B through the shared capture store.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_object_moves_to_another_node_when_its_node_stops() {
         let store = Arc::new(InMemory::new());
         let private = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (mut ls, names) = listeners(2);
         let (lb, la) = (ls.pop().unwrap(), ls.pop().unwrap());
-        let cfg_a = leased("an_object_moves", &la, private.local_addr().unwrap());
-        let cfg_b = NodeConfig { name: names[1].clone(), ..cfg_a.clone() };
+        let cfg_a = leased("an_object_moves_a", &la, private.local_addr().unwrap());
+        let cfg_b = leased("an_object_moves_b", &lb, private.local_addr().unwrap());
         // A runs on a runtime of its own, so that stopping it stops all of
         // it: its server, its session's renewals and its workers.
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -6117,7 +6056,7 @@ mod nodes {
         a.join().unwrap();
         let t0 = Instant::now();
         let read = loop {
-            // B refuses until A's worker has gone from the shared root.
+            // B refuses until A's lease has expired, then restores its volume.
             let read = get(proxy, "moves.test", &format!("/{object}/commit")).await;
             if read.0 == 200 || t0.elapsed() > Duration::from_secs(15) {
                 break read;

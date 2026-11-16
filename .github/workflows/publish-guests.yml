@@ -8,7 +8,12 @@ name: publish-guests
 on:
   push:
     branches: [main]
-    paths: [guests/**, components/keyvalue/**, scripts/build-guests.sh, .github/workflows/publish-guests.yml]
+    # README-only and workflow-only edits do not change the guest artifacts.
+    paths:
+      - 'guests/**'
+      - 'components/keyvalue/**'
+      - 'scripts/build-guests.sh'
+      - '!**/README.md'
   workflow_dispatch:
 
 permissions:

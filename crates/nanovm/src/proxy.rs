@@ -125,7 +125,8 @@ impl<T: Clone> Cache<T> {
     /// there is none fresh.
     async fn get(&self, key: &str, lookup: impl Future<Output = anyhow::Result<(T, Duration)>>) -> Result<T, (StatusCode, String)> {
         let now = Instant::now();
-        let fresh = |c: &Cell<T>| c.answer.get().is_none_or(|(_, until, _)| *until > now);
+        // The map's sole reference means every caller of an unfinished lookup cancelled.
+        let fresh = |c: &Cell<T>| c.answer.get().map_or_else(|| Arc::strong_count(c) > 1, |(_, until, _)| *until > now);
         let slot = |last| Arc::new(Slot { answer: OnceCell::new(), last });
         let (cell, unknown) = {
             let mut cells = self.cells.lock();
@@ -136,7 +137,7 @@ impl<T: Clone> Cache<T> {
                 (c.clone(), true)
             } else if let Some(old) = found.get_mut(key) {
                 // Looked up again where it is, its found answer standing in.
-                let last = old.answer.get().and_then(|(a, _, good)| Some((a.as_ref().ok().filter(|v| (self.found)(v))?.clone(), *good)));
+                let last = old.answer.get().map_or_else(|| old.last.clone(), |(a, _, good)| Some((a.as_ref().ok().filter(|v| (self.found)(v))?.clone(), *good)));
                 *old = slot(last);
                 (old.clone(), false)
             } else {
@@ -597,6 +598,93 @@ mod tests {
             cache.get(&i.to_string(), async { Ok((1, Duration::from_secs(60))) }).await.unwrap();
         }
         assert!(cache.cells.lock()[0].len() <= MAX_CACHED);
+    }
+
+    /// Disconnecting during a lookup must not consume unknown-name capacity forever.
+    #[tokio::test]
+    async fn review_cancelled_route_lookups_release_unknown_capacity() {
+        use tokio::io::AsyncWriteExt;
+        let cache = Arc::new(Cache::<u32>::new(|_| true));
+        let healthy = || async { Ok((7, Duration::from_secs(60))) };
+        assert_eq!(cache.get("control", healthy()).await, Ok(7));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (serving, notified) = (cache.clone(), started.clone());
+        let connection = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            crate::server::serve_conn(socket, Some(CLIENT_TIMEOUT), move |_: Request<Incoming>| {
+                let (cache, started) = (serving.clone(), notified.clone());
+                async move {
+                    let _ = cache.get("disconnected", async {
+                        started.notify_one();
+                        std::future::pending::<anyhow::Result<(u32, Duration)>>().await
+                    }).await;
+                    error_response(200, "control", "")
+                }
+            }).await.unwrap()
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\nHost: control.test\r\n\r\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started.notified()).await.expect("lookup started");
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), connection).await.expect("disconnected handler cancelled").unwrap();
+
+        // Exercise the same cache cancellation for the remaining capacity without
+        // opening another thousand TCP connections or depending on wall-clock races.
+        for i in 1..MAX_UNKNOWN {
+            let key = format!("cancelled-{i}");
+            let lookup = cache.get(&key, std::future::pending());
+            tokio::pin!(lookup);
+            assert!(futures::poll!(&mut lookup).is_pending(), "lookup {i} admitted before cancellation");
+        }
+        tokio::time::sleep(ERROR_TTL + Duration::from_millis(100)).await;
+        assert_eq!(cache.get("control", healthy()).await, Ok(7), "cached route remains healthy");
+        assert_eq!(cache.get("new-healthy-route", healthy()).await, Ok(7),
+            "cancelled lookups must release capacity for a new healthy route");
+    }
+
+    /// Active callers retain capacity and waiters take over a cancelled initializer.
+    #[tokio::test]
+    async fn cancelled_initializers_keep_active_waiters_and_bounds() {
+        let cache = Cache::<u32>::new(|_| true);
+        let keys: Vec<_> = (0..MAX_UNKNOWN).map(|i| i.to_string()).collect();
+        let mut active: Vec<_> = keys.iter().map(|key| Box::pin(cache.get(key, std::future::pending()))).collect();
+        for lookup in &mut active {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        let refused = cache.get("overflow", async { Ok((7, Duration::from_secs(60))) }).await;
+        assert_eq!(refused.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut waiter = Box::pin(cache.get(&keys[0], async {
+            receive.await.unwrap();
+            Ok((7, Duration::from_secs(60)))
+        }));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(active.remove(0));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        assert_eq!(cache.cells.lock()[1].len(), MAX_UNKNOWN);
+        send.send(()).unwrap();
+        assert_eq!(waiter.await, Ok(7));
+        assert_eq!(cache.get("overflow", async { Ok((9, Duration::from_secs(60))) }).await, Ok(9));
+        assert_eq!(cache.cells.lock()[1].len(), MAX_UNKNOWN - 1);
+    }
+
+    /// Cancelling a refresh must not discard the found answer or extend its stale life.
+    #[tokio::test]
+    async fn cancelled_refreshes_keep_the_last_found_answer() {
+        let mut cache = Cache::<u32>::new(|_| true);
+        assert_eq!(cache.get("found", async { Ok((7, Duration::ZERO)) }).await, Ok(7));
+        {
+            let mut refresh = Box::pin(cache.get("found", std::future::pending()));
+            assert!(futures::poll!(&mut refresh).is_pending());
+        }
+        assert_eq!(cache.get("found", async { Err(anyhow::anyhow!("down")) }).await, Ok(7));
+        cache.stale = Duration::ZERO;
+        // Expire the retry TTL without waiting, retaining the original good-until.
+        Arc::get_mut(cache.cells.lock()[0].get_mut("found").unwrap()).unwrap().answer.get_mut().unwrap().1 = Instant::now();
+        assert_eq!(cache.get("found", async { Err(anyhow::anyhow!("down")) }).await.unwrap_err().0, StatusCode::BAD_GATEWAY);
     }
 
     type Down = Arc<std::sync::atomic::AtomicBool>;
