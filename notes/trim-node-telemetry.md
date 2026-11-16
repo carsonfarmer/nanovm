@@ -59,3 +59,40 @@ in telemetry's wire rewriter); no diagnostic targets an added line. Rustdoc
 (`cargo doc --locked -p nanovm --lib --no-deps`) passes with 10 existing warnings.
 Full integration/demo and alternating CPU benchmarks were not run in this
 concurrently building, disk-constrained orb. No throughput claim is made.
+
+## PR #3 review integration (2026-11-16)
+
+Merged the committed local `fix/pr3-review` at
+`9965f4678cf868517d2bb34671c3ab5b36deddb7` into this branch with a real merge,
+not a rebase or an `origin/main` merge. Git merged it without textual conflicts.
+The parent advanced its local branch during validation; those later follow-ups
+are deliberately not part of this integration.
+
+Merge decisions checked against the pinned second parent:
+
+- Keep node trims, including prost's varint APIs, and the final stamped-body
+  cap plus trace/log exact-boundary controls.
+- Keep PR #3's schema-aware protobuf string redaction. Secret matching is
+  applied only to string slices; IDs, bytes, numeric fields and length framing
+  remain untouched. Literal and host Debug-escaped error-secret masking stay.
+- Gate, proxy, quota, secrets, shipping and integration tests match the pinned
+  PR #3 commit exactly. N-930–N-938 remain unchanged; N-903 stays distinct.
+- Keep cleanup deletions and dependency choices: base64 0.23 and memchr 2.
+  Cargo manifests/lock and publication filter match the pinned PR #3 commit.
+
+Combined checks, Rust 1.99.1, `RUST_BACKTRACE` unset, fd limit 20,000,
+`RUST_TEST_THREADS=1`, `CARGO_BUILD_JOBS=1`, this worktree's target:
+
+- Focused telemetry: **9 passed**, including redaction/framing/binary-field
+  controls, recursive redaction bounds and final stamped export bounds.
+- Focused secrets: **6 passed**, including escaped and overlapping matches.
+- `cargo test --locked -p nanovm --lib`: **206 passed, one ignored** (63.65 s).
+- `cargo check --locked -p nanovm --bin nanovm`: **passed**.
+- `git diff --cached --check`: **passed**.
+
+Runtime: 8,635 → 8,745 (**+110**) against this branch before integration;
+8,821 → 8,745 (**−76**) against the pinned PR #3 parent. This merge adds no
+new runtime mechanism beyond those parents. Parent-owned follow-ups, aggregate
+integration/deployment tests and benchmarks remain for the parent. No push or
+PR. The disposable worktree target is removed after all builds finish; source,
+documentation and the parent target remain untouched.

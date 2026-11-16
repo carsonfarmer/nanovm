@@ -60,13 +60,15 @@ pub struct Disk {
     idle: Mutex<HashMap<Arc<str>, u64>>,
     /// The filesystem the volumes are on, and the bytes it keeps free.
     fs: Option<std::fs::File>,
+    /// Growth granted to operations that have not yet finished allocating.
+    pending: Mutex<u64>,
     pub reserve: u64,
 }
 
 impl Default for Disk {
     /// No budget and no reserve.
     fn default() -> Disk {
-        Disk { used: AtomicU64::new(0), max: u64::MAX, idle: Mutex::default(), fs: None, reserve: 0 }
+        Disk { used: AtomicU64::new(0), max: u64::MAX, idle: Mutex::default(), fs: None, pending: Mutex::new(0), reserve: 0 }
     }
 }
 
@@ -83,7 +85,8 @@ impl Disk {
             for object in std::fs::read_dir(shard?.path())? {
                 let (object, volume) = object.map(|o| (o.file_name(), o.path().join(crate::journal::VOLUME)))?;
                 if let Some(id) = object.to_str() && volume.is_dir() {
-                    idle.insert(id.into(), usage(&volume)?.0);
+                    let bytes = usage(&volume)?.0;
+                    if bytes > 0 { idle.insert(id.into(), bytes); }
                 }
             }
         }
@@ -92,6 +95,7 @@ impl Disk {
             max: if budget_mb == 0 { st.f_blocks * st.f_frsize / 4 } else { budget_mb << 20 },
             idle: Mutex::new(idle),
             fs: Some(fs),
+            pending: Mutex::new(0),
             reserve: if reserve_mb == 0 { (st.f_blocks * st.f_frsize / 20).min(1 << 30) } else { reserve_mb << 20 },
         })
     }
@@ -103,18 +107,30 @@ impl Disk {
         (free < self.reserve).then(|| format!("write refused, the node's disk is below its {:.1} MiB reserve", self.reserve as f64 / 1048576.0))
     }
 
-    /// Up to `want` more bytes, none while the node's disk is below its
-    /// reserve; and why not all of them.
+    /// Up to `want` more bytes within sampled headroom less this app's
+    /// outstanding grants, and its budget; and why not all of them.
     fn grant(&self, want: u64) -> (u64, String) {
-        if want > 0 && let Some(why) = self.low() {
-            return (0, why);
-        }
+        if want == 0 { return (0, String::new()); }
+        let mut pending = self.pending.lock();
+        let headroom = self.fs.as_ref().map_or(u64::MAX, |fs| {
+            rustix::fs::fstatvfs(fs).map_or(0, |st| (st.f_bavail * st.f_frsize).saturating_sub(self.reserve).saturating_sub(*pending))
+        });
         let mut got = 0;
         let _ = self.used.try_update(Relaxed, Relaxed, |u| {
-            got = want.min(self.max.saturating_sub(u));
+            got = want.min(headroom).min(self.max.saturating_sub(u));
             Some(u + got)
         });
-        (got, format!("write refused, the app's {} MiB disk budget is full", self.max >> 20))
+        if self.fs.is_some() { *pending += got; }
+        let why = if got < want && got == headroom {
+            format!("write refused, the node's disk has no unreserved space above its {:.1} MiB reserve", self.reserve as f64 / 1048576.0)
+        } else {
+            format!("write refused, the app's {} MiB disk budget is full", self.max >> 20)
+        };
+        (got, why)
+    }
+
+    fn finish(&self, granted: u64) {
+        if self.fs.is_some() { *self.pending.lock() -= granted; }
     }
 
     fn add(&self, bytes: i128) {
@@ -129,7 +145,8 @@ impl Disk {
 
     /// `id`'s instance, which counted `counted`, ends: its volume holds `bytes`.
     fn park(&self, id: &Arc<str>, counted: u64, bytes: u64) {
-        let was = self.idle.lock().insert(id.clone(), bytes).unwrap_or(0);
+        let mut idle = self.idle.lock();
+        let was = if bytes == 0 { idle.remove(id) } else { idle.insert(id.clone(), bytes) }.unwrap_or(0);
         self.add(bytes as i128 - counted as i128 - was as i128);
     }
 }
@@ -210,6 +227,7 @@ impl QuotaGuard {
         let allowed_end = end.min(room).min(before + got);
         if allowed_end <= at && !buf.is_empty() {
             q.disk.add(-(got as i128));
+            q.disk.finish(got);
             return Err(if end > room { q.full() } else { q.deny(ErrorCode::InsufficientSpace, short) });
         }
         let n = q.journaled(|j| j.writing(file, at, allowed_end)).and_then(|()| {
@@ -217,6 +235,7 @@ impl QuotaGuard {
         });
         let grown = n.as_ref().map_or(0, |n| before.max(at + *n as u64) - before);
         q.set_bytes(|b| b + grown, got);
+        q.disk.finish(got);
         n
     }
 
@@ -233,6 +252,7 @@ impl QuotaGuard {
             true => Err(q.deny(ErrorCode::InsufficientSpace, short)),
             false => q.journaled(|j| j.writing(file, size, before)).and_then(|()| file.set_len(size).map_err(|_| ErrorCode::Io)),
         };
+        q.disk.finish(got);
         if let Err(e) = done {
             q.disk.add(-(got as i128));
             return Err(e);
@@ -1062,6 +1082,82 @@ mod tests {
         assert!(!object_dir(&dir, "d").exists());
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(scratch).unwrap();
+    }
+
+    /// Zero-byte inactive objects need no baseline; retaining their IDs
+    /// would make stateless scans consume memory without a cardinality cap.
+    #[test]
+    fn review3_zero_byte_objects_do_not_accumulate_idle_accounting() {
+        let disk = Disk::default();
+        let durable: Arc<str> = "durable".into();
+        disk.unpark(&durable, 17);
+        disk.park(&durable, 17, 17);
+        assert_eq!(disk.used.load(Relaxed), 17);
+        assert_eq!(disk.idle.lock().get(&durable), Some(&17), "nonzero idle usage needs a baseline");
+        disk.unpark(&durable, 23);
+        assert_eq!(disk.used.load(Relaxed), 23, "reactivation replaces the idle measurement instead of double counting it");
+        assert!(!disk.idle.lock().contains_key(&durable));
+        disk.park(&durable, 23, 23);
+        for n in 0..1000 {
+            let id: Arc<str> = format!("stateless-{n}").into();
+            disk.unpark(&id, 0);
+            disk.park(&id, 0, 0);
+        }
+        assert_eq!(disk.used.load(Relaxed), 23, "zero-byte instances must not change the byte total");
+        assert_eq!(disk.idle.lock().len(), 1, "only the nonzero durable object needs retained accounting");
+    }
+
+    /// Check admission against actual filesystem headroom without writing
+    /// any data or filling the filesystem.
+    #[test]
+    fn review3_growth_grants_preserve_the_disk_reserve() {
+        let dir = tempdir("review3-reserve-grant");
+        let fs = std::fs::File::open(&dir).unwrap();
+        let st = rustix::fs::fstatvfs(&fs).unwrap();
+        let free = st.f_bavail * st.f_frsize;
+        assert!(free > 1 << 20, "test needs at least 1 MiB free, found {free}");
+        let disk = Disk { fs: Some(fs), reserve: free / 2, ..Disk::default() };
+        assert!(disk.low().is_none(), "the filesystem starts above the reserve");
+        let (granted, _) = disk.grant(free);
+        let headroom = free - disk.reserve;
+        // Independent controls: no growth is allowed below the reserve,
+        // and the app budget still cuts partial grants correctly.
+        let below = Disk { fs: Some(std::fs::File::open(&dir).unwrap()), reserve: u64::MAX, ..Disk::default() };
+        assert_eq!(below.grant(1).0, 0);
+        assert_eq!(below.grant(0).0, 0);
+        let budget = Disk { max: 10, ..Disk::default() };
+        assert_eq!(budget.grant(12).0, 10);
+        assert_eq!(budget.grant(1).0, 0);
+        budget.add(-4);
+        assert_eq!(budget.grant(5).0, 4);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(granted <= headroom, "growth grant {granted} exceeds measured headroom {headroom} above reserve {} (free {free})", disk.reserve);
+    }
+
+    #[test]
+    fn concurrent_growth_keeps_outstanding_headroom_reserved() {
+        let dir = tempdir("reserve-concurrent");
+        let fs = std::fs::File::open(&dir).unwrap();
+        let st = rustix::fs::fstatvfs(&fs).unwrap();
+        let free = st.f_bavail * st.f_frsize;
+        assert!(free > 64 << 20, "test needs 64 MiB headroom");
+        let disk = Disk { fs: Some(fs), reserve: free / 2, ..Disk::default() };
+        let barrier = std::sync::Barrier::new(8);
+        let total: u64 = std::thread::scope(|s| {
+            let tasks: Vec<_> = (0..8).map(|_| s.spawn(|| {
+                barrier.wait();
+                disk.grant(free / 4).0
+            })).collect();
+            tasks.into_iter().map(|t| t.join().unwrap()).sum()
+        });
+        // Permit small unrelated filesystem activity, not a second headroom grant.
+        assert!(total > 0 && total <= free / 2 + (16 << 20), "outstanding grants: {total}, free: {free}");
+        disk.finish(total);
+        disk.add(-(total as i128));
+        let again = disk.grant(free / 4).0;
+        assert_eq!(again, free / 4, "completed operations restore admission capacity");
+        disk.finish(again);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Below the node's reserve nothing grows and nothing new is made, but

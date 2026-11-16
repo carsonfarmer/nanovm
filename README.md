@@ -22,14 +22,6 @@ Runtime is 5,320 lines, above the under-5k goal. Older checkpoint
 counts and candidate designs below are historical, not current delivery claims.
 The line goal guides simplicity; it is not a hard limit or correctness tradeoff.
 
-`cargo run --locked -p nanovm --example committed_state` runs W-9's bounded
-storage-only experiment: immutable versions from the real journal, independent
-receiver processes, ordered/idempotent receipt, interrupted-transfer retry and
-fresh-root recovery after deleting the source. It also demonstrates that a locally
-accepted but unsent write is lost. This is not a runtime replication feature,
-remote-host-loss proof or an acknowledgement policy; see [the contract and remaining
-gaps](PLAN.md#w-9-contract-and-bounded-proof-2026-11-08).
-
 **Capture and shipping:** optional node `[capture]` configuration captures a
 version at both dirty commit gates: the whole volume every `snapshot_every` (16)
 versions, otherwise what the commit changed (listings of changed directories, new
@@ -346,7 +338,7 @@ Every app shares a node with others, so each has bounds that no request, client 
 
 An IPv6 client counts by its /64. Peers in `trusted` (default loopback) forward other clients' requests: a TLS terminator in front of the proxy, or the proxy in front of a node. Their own requests and connections aren't limited, and a request's client is the last address in its `X-Forwarded-For` that isn't trusted, so what a client writes there itself is never read. List the terminator's address (or range) in the proxy's `trusted`, and have it set `X-Forwarded-For` (Caddy does): one that doesn't leaves every request it forwards unlimited, as its own. A node whose proxy isn't on its own host must list the proxy in its `trusted`, or the proxy is limited as one client. The rates use `governor` (GCRA); keys that have refilled are forgotten every 10 s.
 
-**Disk.** An app's objects' volumes may hold `app_disk_mb` in all (default: a quarter of `data_dir`'s filesystem); past it that app's writes are cut short and then refused, as on a full disk, and no other app's are. Below `disk_reserve_mb` of free space on that filesystem (default: a twentieth of it, at most 1 GiB), writes that need more space are refused for every app (growing a file, making an entry), while writes in place, truncation, deletes, rollbacks and commits go on, so a full node refuses cleanly instead of failing commits. Each refusal is an `fs-denied` event naming which limit refused it; the guest sees `insufficient-space`. The budget counts what an object's quota counts, the logical size of its files: an object's journal (up to 68 KiB between requests), its capture outbox and filesystem blocks are on top, which is what the reserve, real free space, is for.
+**Disk.** An app's objects' volumes may hold `app_disk_mb` in all (default: a quarter of `data_dir`'s filesystem); past it that app's writes are cut short and then refused, as on a full disk, and no other app's are. Growth grants fit measured free space above `disk_reserve_mb` (default: a twentieth of the filesystem, at most 1 GiB), minus that app's outstanding grants. Below the threshold, growth and new entries are refused; overwrites, shrinking and deletion remain allowed. Each refusal is an `fs-denied` event; the guest sees `insufficient-space`. This is an admission threshold, not a strict node-wide physical reservation: separate workers can race, and journals, capture, sparse-file allocation, filesystem blocks and outside writers also consume space. Commits and rollback can still encounter a full filesystem. The app budget counts logical file sizes, not that additional storage.
 
 **Workers.** Each app's worker runs in a cgroup v2 of its own, with `[worker]` limits that default to a quarter of the host's memory and all its cores but one, so no app can take the host. With `cgroup = "auto"` (the default) the supervisor makes its own cgroup the subtree for them: it moves itself into `<own>/supervisor` and puts workers in `<own>/workers`, which under systemd needs `Delegate=yes` (and `ProtectControlGroups=no`). Where it can't (no cgroup v2 with the memory and cpu controllers, or its cgroup isn't its own), the node refuses to start and says so: set `cgroup = "off"` to run workers without these limits, or name a delegated directory.
 
@@ -383,6 +375,8 @@ What happens on the first request for a digest:
 
 **Publishing.** `nanovm publish app.wasm <registry>/<repository>:<version> [--manifest nanovm.json]` pushes an app as nodes pull it: artifact type `application/vnd.nanovm.app.v1+json`, its `nanovm.json` as the config, the component as its one `application/wasm` layer, the tag as its version. It first checks the component as a node will (imports, handler export, manifest) and that the manifest holds no [secret](#secrets), and prints the digest, how to sign and the TXT record. Registry credentials come from `NANOVM_REGISTRY_USER`/`NANOVM_REGISTRY_TOKEN`. [.github/workflows/publish-app.yml](.github/workflows/publish-app.yml) is a manual template that builds one app, publishes it and attaches a GitHub artifact attestation, signed with the workflow's short-lived identity; [publish-guests.yml](.github/workflows/publish-guests.yml) does the same for the test guests with `oras`. No key exists anywhere. A person can sign from a laptop with `cosign` and a browser sign-in (not yet tested end to end, W-102).
 
+README-only and publishing-workflow-only edits do not automatically publish test guests. Guest/provider code and build-script changes on `main` still do; `publish-guests` also supports explicit manual runs.
+
 ## Key-value and config
 
 **`spin:key-value/key-value@3.0.0`** is supplied by a [composed Wasm provider](components/keyvalue/README.md) over the object's filesystem. The counter and hostile guest packages compose this provider; `tools/build-app.sh` composes it into any app that imports it. Bucket `b` is `/data/.kv/b`; each key is a file named by unpadded base64url. Native synchronous KV, atomics and batch are removed.
@@ -401,14 +395,14 @@ See the [measurements and limitations](components/keyvalue/README.md#follow-up-m
 Tentative changes must be visible and rejectable; an undo log is the current
 implementation, not a requirement on future snapshots or replicated storage.
 
-The [bounded backend comparison](experiments/fs-backends/README.md) measures the
+The bounded backend comparison (removed; see git history) measures the
 actual journal against plain transactional pages and hash-addressed pages, outside
 Wasm. Plain pages improve small writes/batches but slow warm reads and often write
 more bytes; hashing helps shared-content batches, not unique large writes. The
 experiment includes rejection, restart and process-death checks, but is not a WASI
 filesystem replacement or production durability certification. Runtime is unchanged.
 
-The [inode follow-up](experiments/fs-backends/README.md#inode-quota-and-cache-proof-q79-2026-11-04)
+The inode follow-up (removed; see git history)
 adds shared descriptor/rename/unlink semantics, logical quotas and bounded-cache
 measurements for both candidates. Hash addressing is preferred when measured costs
 are close; unique large writes remain slower. This is a flat-namespace proof, not
@@ -426,13 +420,13 @@ under the same cap, reclaim shared-content orphans, and retain usable small
 writes/deletes and exclusive locks. The ceiling bounds file length, not allocated
 blocks or host memory; the cache target is not an RSS cap.
 These are bounded storage checks, not production integration or physical
-power-loss certification; [protocol and remaining gates](experiments/fs-backends/README.md#hardening-orphan-lookup-and-storage-failures-2026-11-05).
+power-loss certification; protocol and remaining gates (removed; see git history).
 
 **Storage decision:** keep journaling after measuring both hash and optimized plain
 pages. Plain pages improve small durable writes about 3× and match large-write
 latency, but cold/recovery/churn remain 3–5× slower and replacement code is 294
 lines larger. This rejects the current per-object redb design for adoption, not
-page-based filesystems in principle. [Simple comparison, costs and reproduction](experiments/fs-backends/README.md#adoption-decision-retain-journaling-2026-11-05).
+page-based filesystems in principle. Simple comparison, costs and reproduction (removed; see git history).
 
 The journal improvement branch reduces idle memory from 143 to 119 KiB/object
 and improves warm throughput about 15% in three matched runs. Lazy KV bucket
@@ -440,10 +434,10 @@ creation reduces a fresh read-only request from 2.550 to 0.690 ms; opening or
 reading an empty bucket consumes no directory quota. Small durable writes and
 large-value writes remain essentially unchanged. Cleanup saved 53 runtime lines,
 but the complete performance/durability work ends at **5,082 versus 5,074**;
-this is not a net code reduction. [Measurements and limitations](experiments/fs-backends/README.md#journal-follow-through-2026-11-05).
+this is not a net code reduction. Measurements and limitations (removed; see git history).
 Page adapters remain only on the experimental branches.
 
-The historical [runtime candidate](experiments/fs-backends/README.md#runtime-integration-checkpoint-2026-11-05)
+The historical runtime candidate (removed; see git history)
 was integrated on its experimental branch behind temporary `page-fs`, using stock WASIp3 bindings and one
 file-backed transactional database for `/data` and `/tmp`. Use disposable separate
 data roots; no migration or compatibility path exists. Its provisional `storage_mb`
@@ -472,7 +466,7 @@ A package is public (nodes pull it anonymously), so nothing in its `config` or `
 - **When:** the supervisor reads an app's file when it starts the app's worker and hands the values over on the worker's stdin, never in its arguments or environment. It looks at each running app's file every second: a change (written, replaced, removed, even touched) retires the worker, whose requests in flight finish as in a version switch, and the next request starts one with the new values.
 - **Fail closed:** a secret the app declares and the file doesn't give, or a file that isn't one, can't be read or isn't a JSON object of strings, stops the app. Its requests get 502 naming the file and what is wrong with it, never what it holds, until the file is fixed.
 - **Only that app:** the values reach only its own jailed worker, whose uid can't read the directory and whose jail can't reach it. A secret overrides the package's config value of the same name.
-- **Not in what the host reports:** whatever the host passes on of what the guest wrote, it masks every secret value in first (with as many `*`): telemetry (the guest's stdout and stderr, the paths of its requests out, events) and the detail of a failed request sent to its client. The match is exact: a guest that encodes or splits its secret can still leak it, as it can over its egress.
+- **Masked in host-reported text:** the host masks exact secret values with as many `*` in telemetry string fields (including guest stdout/stderr, outbound request paths and events) and failed-request details. Error details also mask the host's Debug-escaped form. Telemetry framing, binary values and identifiers are not text and remain unchanged; nesting beyond 64 is refused. A guest that encodes, splits or puts its secret in a binary value can still leak it, as it can over its egress. Redaction follows the pinned OTLP schema, not unknown fields.
 - **`nanovm publish` refuses** a manifest whose `config` or `env` holds a declared secret, a non-empty value under a key named like a credential (ending in `secret`, `password`, `token`, `apikey`, `credentials` and the like; not `token_url` or `max_tokens`), or a value shaped like one: a private key, a URL with a password, or a token with a well-known provider's prefix (`sk-`, `ghp_`, `AKIA`, `xoxb-` and others). It names the key, never the value.
 - **Locally,** `nanovm run app.wasm --secrets secrets.json` gives them as an operator would, and a change to the file restarts it. Keep the file out of version control.
 - **Several nodes** each read their own directory: give every node that may run the app its file.
