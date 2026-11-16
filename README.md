@@ -130,7 +130,29 @@ The relay also caps the outgoing body at 1 MiB after inserting trusted identity.
 
 HANDOFF records matched measurements and rejected experiments. The Linux CLI and benchmark use jemalloc; the library leaves allocator selection to its embedder. Controlled allocator swaps improved full-export throughput from roughly 54–59k/s to 79–84k/s, with about 20 MB more retained memory in that workload. SDK batches remain 256 spans with a 1 MiB body cap; the bounded queue now holds 2048 spans to absorb brief export stalls. No sampling or detail was removed.
 
-`cargo run --locked --release -p nanovm --example bench -- --export` measures three 200,000-request warm runs with a decoding OTLP sink, checks all 601,000 request spans including warmup, and fails on missing exports. Three complete invocations measured 75–79k/s (74.7–78.1k/s including shutdown/export drain), with no missing spans. The sink shares the orb's cores; this is not a production Collector or proxy/jailed-worker throughput claim, nor proof of being within a few percent of main.
+`cargo run --locked --release -p nanovm --features dev --example bench -- --export --export-concurrency 3` measures three 200,000-request warm runs with a decoding OTLP sink, checks all 601,000 request spans including warmup, and fails on missing exports. Fresh measurements on 2026-11-16 delivered every span in three invocations at median 54.1k requests/s including shutdown/export drain (51.2–54.2k/s). The default concurrency remains 256; it failed exact span accounting on both the pre-trim and trimmed builds. The historical 75–79k/s complete-export result did not reproduce here. The sink shares the orb's cores; this is not production Collector or proxy/jailed-worker throughput.
+
+### Fresh integrated measurements (2026-11-16)
+
+On an otherwise idle four-vCPU Linux orb, three rounds of the integrated release
+completed 16,619,393 measured HTTP responses with no HTTP or transport failures.
+The client shares the VM's cores; ordinary HTTP has no active collector and uses
+local storage acknowledgements. Medians at 64 concurrent clients:
+
+| Workload | Requests/s | p99 latency |
+|---|---:|---:|
+| Rust GET, 1,000 objects | 27,372 | 5.59 ms |
+| Durable counter writes, 1,000 objects | 2,976 | 44.06 ms |
+| Durable writes, one hot object | 822 | 89.49 ms |
+| JavaScript GET, 1,000 objects | 11,857 | 12.35 ms |
+| JavaScript writes, 1,000 objects | 2,316 | 58.05 ms |
+
+Verified incremental density is 120.3 KiB/object through 6,001 live objects.
+Longer alternating pre-trim/current CPU measurements found no consistent
+regression; overlapping ranges do not establish a speedup. Near saturation,
+tail latency rises sharply and some offered rates are not sustained. See
+[full results, ranges, export failures and method](notes/bench-numbers/2026-11-16.md).
+The earlier measurements below are historical, not current capacity claims.
 
 Earlier real HTTP validation exposed export loss ([N-36](ISSUES.md)): oha 1.16.0 drove the supervisor and jailed worker at 35–39k/s with no request failures, but OpenTelemetry Collector 0.164.0 received only 406,006 of 600,000 request spans. The worker's bounded queue overflowed. A concurrent SDK exporter eliminated those losses in one experiment but failed an in-flight flush regression, so it was not adopted. Those historical rates are not matched controls for the current build.
 
@@ -695,7 +717,7 @@ Outbound HTTP and calls to other objects execute immediately, not behind the cal
 
 A host I/O failure during commit, a crash at its commit marker, or a lost response can leave the caller unsure whether the request committed. Do not interpret every error as a rollback: use application-level operation IDs for idempotent retries. Durability assumes a filesystem and device that honor successful file and directory syncs; process-crash tests do not certify physical power-loss behavior.
 
-Persistence between backups depends on the original storage surviving. Offline backup/restore is described below; there is no replication or automatic failover. App admission takes a nonblocking exclusive lock on its objects directory before scratch cleanup or journal recovery. Supervisor directory preparation takes the same lock before changing ownership. Locks last through all `App` owners: embedded callers must drain and drop their `Node` and any `App` handles before reopening. A final actor may still retain ownership briefly after `shutdown()` returns; admission fails closed until it exits.
+Local-only persistence depends on the original storage surviving. Multi-node operation supports capture-store shipping, store-fenced ownership and automatic rerouting/restoration after node loss; the acknowledgement policy determines which committed state is recoverable remotely (see **Many nodes** above). Local tests exercise these paths with separate node disks and a shared store; real-provider and separate-host failure validation remains separate. Offline backup/restore is described below. App admission takes a nonblocking exclusive lock on its objects directory before scratch cleanup or journal recovery. Supervisor directory preparation takes the same lock before changing ownership. Locks last through all `App` owners: embedded callers must drain and drop their `Node` and any `App` handles before reopening. A final actor may still retain ownership briefly after `shutdown()` returns; admission fails closed until it exits.
 
 This is cooperative local exclusion on a stable directory inode, not distributed fencing or an atomic supervisor-to-worker reservation. Keep one supervisor per data root; cgroup provisioning and noncooperating writers are not fenced. Do not replace a locked directory. Per-object logical quotas do not cap physical blocks or the aggregate storage of cold objects. RAM may cache durable data or stage tentative work, but memory-only acceptance would not preserve these guarantees.
 
@@ -716,7 +738,7 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 - **Commit** (before the response is released, and again after post-return work) fsyncs what changed, up to 16 paths at a time, then writes a new random key into the log's first block and fsyncs it: records are signed with the key, so none is valid any more. The log itself is made once per object and kept (at most 68 KiB between requests), so a commit rewrites a block that already exists instead of deleting a file and syncing its directory. The commit runs on a blocking thread, not the object's. Held publishes are sent after it.
 - **Rollback** has one path. A failed request ends its instance, and every instance start replays any log left behind backwards, so a crash is handled the same way. Recovery trims each step off the log as it completes, so a crash during recovery resumes where it stopped.
 - **Costs:**
-  - One fsync per change that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request: one per changed path, then the key. A counter's `POST /incr` (create, write, rename over) costs 5 device flushes. Requests that change nothing pay nothing. A guest's own `sync` and `sync-data` do nothing: its writes are durable at commit and rolled back otherwise, synced or not.
+  - One fsync per change that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request: one per changed path, then the key. A counter's `POST /incr` (create, write, rename over) measures 2 fsync + 3 fdatasync calls; syscall counts do not establish physical-device flush counts. Requests that change nothing pay nothing. A guest's own `sync` and `sync-data` do nothing: its writes are durable at commit and rolled back otherwise, synced or not.
   - Waiting for the disk isn't charged to the guest's CPU budget, and neither is the journal's own CPU (records and commit).
   - The byte quota counts logical file lengths, not allocated filesystem blocks or metadata. While a request runs, the log and retained files may each hold as much again: at most three quota-sized logical content budgets. Small files and filesystem metadata add physical overhead; `max_files` independently bounds directory entries. Size the backing disk for both limits, not just `3 × disk_mb`.
 - **Safety:**

@@ -10,9 +10,27 @@ Everything a new agent needs to pick this project up. Read this first, then [PLA
 and the repaired benchmark harness. Runtime is 8,331 (−490 versus PR #3).
 The combined suite passes 392 tests, all 12 SQLite cases pass, and production
 and release builds pass. Privileged OOM/disk/deletion checks and final-release
-Rust/JS/collector wiring pass. No aggregate performance clearance yet.
+Rust/JS/collector wiring pass. Fresh aggregate measurements are now complete.
 Decisions and evidence are in `notes/trim-integration.md`. PR #5 and PR #3
-are merged; main is `ba87b87`. Trim CI and fresh benchmarks are next.
+are merged; main is `ba87b87`. PR #6 holds the trims; its `e28573e` CI passed.
+Final benchmark/docs CI and main integration remain before delivery is complete.
+
+The otherwise idle four-vCPU HTTP campaign completed 240 valid records over
+three rounds: 16,617,893 HTTP 200 and 1,500 HTTP 204 responses, no transport
+errors. Direct c64 medians: Rust GET 27,372/s, spread counter writes 2,976/s,
+JS GET 11,857/s, JS writes 2,316/s. Verified density is 120.3 KiB/object through
+6,001 live objects. Ordinary HTTP uses local acknowledgements and no collector.
+Three longer alternating runs with five repetitions each found no consistent
+CPU regression against pre-trim main, including SQLite; ranges overlap.
+
+Default c256 full export failed exact span accounting on both binaries. The
+benchmark-only `--export-concurrency` option keeps default 256 and the mandatory
+601,000-span check; c3 received every span in three invocations, at median
+54,100/s including drain (51,184–54,214). Do not report the incomplete c256
+rate as lossless capacity or as a new trim regression. No runtime change.
+Full ranges, commands, provenance and limitations:
+[fresh measurements](notes/bench-numbers/2026-11-16.md). Raw evidence is retained
+under `.amp/in/orb-backup/bench-current`; failed attempts remain separate.
 
 Actual pilot follow-through: timed HTTP/1 requests now drain at deadline instead
 of being cancelled. Hot-object success measurements use 1/16/64 clients because

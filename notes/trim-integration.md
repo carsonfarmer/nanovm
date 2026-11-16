@@ -58,5 +58,10 @@ exported fresh live/store counts of 1/1 for the seed object. These smoke
 counts validate wiring, not performance. No new strict lint/format clearance.
 
 PR #3 is merged as `ba87b87`, after both combined-head CI runs passed.
-The trim branch records that main merge without changing source. Trim CI,
-main integration and fresh idle-machine performance results remain pending.
+The trim branch records that main merge without changing source. Both exact-head
+CI runs at `e28573e` passed. Fresh idle-machine measurements are complete:
+240 valid HTTP records over three rounds, no measured HTTP/transport errors;
+longer alternating CPU ranges overlap with pre-trim main, including SQLite.
+Default c256 export is incomplete on both builds; three c3 invocations deliver
+every expected span. See [results, ranges and limitations](bench-numbers/2026-11-16.md).
+Final benchmark/docs CI and main integration remain pending; no deployment.

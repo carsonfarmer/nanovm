@@ -255,8 +255,14 @@ contract, including connection-only client limits; request rates belong at the
 edge. HTTP errors invalidate comparisons. Density uses a fresh dedicated app/stack,
 one-hour node and app retention, fresh exported live/store increments and one target worker's
 RSS. Summaries reject duplicate rounds, mixed build identities and offered rates.
-See the [protocol and validation evidence](notes/bench-numbers/README.md); fresh
-integrated release measurements remain a separate idle-machine step.
+See the [protocol and validation evidence](notes/bench-numbers/README.md) and
+[2026-11-16 integrated release results](notes/bench-numbers/2026-11-16.md).
+The three-round HTTP campaign and longer alternating CPU comparison are complete;
+near-saturation tails and incomplete default c256 export remain explicit limits.
+`bench --export --export-concurrency N` selects positive load concurrency without
+changing the default of 256, telemetry bounds or exact decoded-span validation.
+Three complete c3 invocations measured 54.1k/s including drain; this is an
+in-process sink, not production Collector/jailed HTTP capacity.
 
 `cargo run --release -p nanovm --example bench -- [--quick] [--json out.json]`. Results are printed as a table; `--json` also saves them. The latest results are in [README.md](README.md).
 1. Compile time and `.cwasm` load time.

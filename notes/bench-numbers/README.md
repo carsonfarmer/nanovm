@@ -5,6 +5,13 @@ and separately runs the build's in-process benchmark. It accepts one build or
 alternating builds, all using the current v1 API/config. No format adapters or
 historical config dialects are supported (AGENTS.md rule 1).
 
+The [2026-11-16 integrated results](2026-11-16.md) include three HTTP rounds,
+longer alternating CPU controls and full-export accounting. Failed attempts are
+retained separately, never pooled. For in-process full export, use
+`bench --export --export-concurrency N` to select a positive load concurrency;
+the default remains 256 and missing spans still fail the benchmark. Three c3
+invocations delivered all expected spans; the default c256 did not on this VM.
+
 The integrated contract includes `origin/trim/edge` at `2efdd1a`: request rates
 belong at the edge, not in nanovm. Node/proxy configs inherit the connection-only
 `clients` defaults (`connections_per_client`, `connections`, `trusted`); the
