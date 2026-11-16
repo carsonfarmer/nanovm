@@ -4,6 +4,7 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 
 - Each `(app, object-id)` has exactly one live instance, which serves one request at a time.
 - Each object has its own memory cap, CPU budget, deadlines and handle cap.
+- Response body caps fail the stream on overflow without changing its declared HTTP length.
 - Each object has its own quota'd filesystem: scratch `/tmp` and a persistent `/data` volume.
 - Each app has an egress allowlist, within the operator's.
 - Each object has a composed Spin KV store in its volume, and each app its host-injected `wasi:config` values.

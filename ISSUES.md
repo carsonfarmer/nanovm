@@ -9,6 +9,17 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 ## Problems
 
+### N-930: response limiter changes declared HTTP framing
+- **Where:** `object.rs`, `GuardedBody`
+- **Scenario:** `Limited` clamps an exact body size hint while the response retains its larger Content-Length. Hyper can panic or stop polling at the cap without seeing the overflow.
+- **Reproduced:** yes, through the real HTTP worker link; disabling enforcement also makes the regression fail.
+- **Status:** fixed in this change on `fix/trim-edge-framing` (parent delivery pending). Counter preserves the guest's framing; 193 unit tests pass, one ignored. See `notes/trim-edge-framing.md`.
+
+### N-931: strict Rust 1.99.1 checks retain unrelated lint and formatting failures
+- **Where:** unchanged lines in `journal.rs`, `object.rs`, `ship.rs`, `supervisor.rs`, `table.rs`, `telemetry.rs`; formatting across the crate and tests.
+- **Reproduced:** strict all-target/all-feature clippy reports ten errors; fmt check fails. Production check and 193 unit tests pass. See `notes/trim-edge-framing.md` for the commands and diagnostics.
+- **Status:** open; outside the focused response-framing fix.
+
 Found by the review at `c607ec9`, unless an entry says otherwise; line numbers are as of that commit.
 
 ### N-1: a registry app's egress list can name private and loopback addresses

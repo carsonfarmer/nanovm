@@ -4,6 +4,18 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
+## Trim edge framing fix (2026-11-16)
+
+N-930 restores response byte counting in `GuardedBody` while preserving the
+guest's HTTP size hint. The worker-link regression fails on `2efdd1a` with
+Hyper's conflicting Content-Length panic and passes with the fix; disabling cap
+enforcement makes it fail again. Exact-cap and below-cap controls remain whole.
+The complete serial unit suite passed (193 passed, one ignored). Runtime delta
+is +10 lines. The approved rate-limit removal is untouched. No push, PR or
+deployment; the parent owns delivery. See [evidence](notes/trim-edge-framing.md).
+Release-mode, jailed-Wasm integration and idle-machine throughput benchmarks
+were not run for this focused worker-link fix.
+
 ## Current state (2026-11-08)
 
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145

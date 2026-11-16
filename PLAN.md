@@ -110,6 +110,7 @@ nanovm/
   })
   ```
   `from_http` takes scheme and authority from the URI only, so `server.rs` rebuilds the URI as `http://{Host}{path}` before dispatch. The request body is collected (capped at `max_request_body_kb`) before it reaches the actor.
+- **Response cap and framing:** `GuardedBody` counts data-frame bytes, refuses a frame that would exceed the cap, and forwards the guest's size hint unchanged. The cap is not a replacement Content-Length: HTTP must poll beyond an exact-cap prefix to discover an oversized body's error.
 - **Work after the answer:** a guest trap ends the store's run, so one before the node has the answer fails the request, and one while the client still reads the body cuts it. So the future `response.new` gives the guest resolves only once the wrapped body is dropped (read whole, or the client gone), and the SDKs start `after` work, and fail work after the answer, only after it (README "Commits").
 - **Deadlines:** the run_concurrent future is wrapped in an outer `poll_fn` that reads a shared `(phase, since)`. On expiry it drops the future and the Store. Upstream documents timeouts inside run_concurrent as unreliable.
 

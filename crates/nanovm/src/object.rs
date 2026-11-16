@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
-use http_body_util::{BodyExt, Full, Limited, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use parking_lot::Mutex;
 use opentelemetry::trace::Span as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -731,7 +731,8 @@ async fn serve(
                         res.headers_mut().remove(crate::lease::OWNER);
                         Ok(res.map(|b| {
                             GuardedBody {
-                                inner: Limited::new(b, max_resp),
+                                inner: b,
+                                remaining: max_resp,
                                 abort,
                                 sent: Some(sent),
                             }
@@ -957,7 +958,8 @@ pub fn error_response(status: u16, reason: &str, detail: &str) -> http::Response
 
 /// Caps a guest's response body and lets the supervisor cut it off.
 struct GuardedBody<B> {
-    inner: Limited<B>,
+    inner: B,
+    remaining: usize,
     abort: Arc<AtomicBool>,
     /// Dropped once the body has been read to its end or failed, or with it.
     sent: Option<oneshot::Sender<()>>,
@@ -975,7 +977,15 @@ where
         if self.abort.load(Relaxed) {
             return Poll::Ready(Some(Err("instance terminated".into())));
         }
-        let poll = Pin::new(&mut self.inner).poll_frame(cx);
+        let poll = Pin::new(&mut self.inner).poll_frame(cx).map(|frame| {
+            frame.map(|res| {
+                let frame = res.map_err(Into::into)?;
+                if let Some(data) = frame.data_ref() {
+                    self.remaining = self.remaining.checked_sub(data.len()).ok_or("length limit exceeded")?;
+                }
+                Ok(frame)
+            })
+        });
         if matches!(poll, Poll::Ready(None | Some(Err(_)))) {
             self.sent = None;
         }
@@ -987,6 +997,8 @@ where
     }
 
     fn size_hint(&self) -> SizeHint {
+        // Preserve the guest's framing, including Content-Length. Clamping
+        // this hint to the cap lets HTTP stop before polling the overflow.
         self.inner.size_hint()
     }
 }
@@ -1066,15 +1078,80 @@ mod tests {
     #[tokio::test]
     async fn guarded_body_caps_and_aborts() {
         let body = |b: &'static [u8], remaining, abort| GuardedBody {
-            inner: Limited::new(Full::new(Bytes::from_static(b)), remaining),
+            inner: Full::new(Bytes::from_static(b)),
+            remaining,
             abort: Arc::new(AtomicBool::new(abort)),
             sent: None,
         };
         assert_eq!(body(b"12345", 5, false).collect().await.unwrap().to_bytes(), "12345");
         let e = body(b"123456", 5, false).collect().await.unwrap_err();
-        assert!(e.is::<http_body_util::LengthLimitError>(), "{e}");
+        assert_eq!(e.to_string(), "length limit exceeded");
         let e = body(b"1", 5, true).collect().await.unwrap_err();
         assert_eq!(e.to_string(), "instance terminated");
+    }
+
+    /// Exact size hints must describe the guest's declared length, not the
+    /// cap: the worker link's HTTP encoder must poll past an exact-cap prefix.
+    #[tokio::test]
+    async fn guarded_body_worker_link_framing() {
+        struct Frames {
+            chunks: VecDeque<Bytes>,
+            yield_next: bool,
+        }
+        impl Body for Frames {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                if self.yield_next {
+                    self.yield_next = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                self.yield_next = true;
+                Poll::Ready(self.chunks.pop_front().map(|b| Ok(Frame::data(b))))
+            }
+
+            fn size_hint(&self) -> SizeHint {
+                SizeHint::with_exact(self.chunks.iter().map(|b| b.len() as u64).sum())
+            }
+        }
+
+        use crate::link::{Dialer, serve};
+        use http_body_util::Empty;
+        for (chunks, declared, oversized) in [
+            (vec!["12", "34", "567"], 7, true),
+            (vec!["12", "34"], 4, false),
+            (vec!["1", "23"], 3, false),
+        ] {
+            let expected = chunks.concat();
+            let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let worker = tokio::spawn(serve(tokio::net::UnixStream::from_std(peer).unwrap(), vec![], move |_req| {
+                let chunks = chunks.iter().map(|b| Bytes::from_static(b.as_bytes())).collect();
+                async move {
+                    http::Response::builder().header("content-length", declared).body(GuardedBody {
+                        inner: Frames { chunks, yield_next: true },
+                        remaining: 4,
+                        abort: Arc::default(),
+                        sent: None,
+                    }).unwrap()
+                }
+            }));
+            let dialer = Dialer::<Empty<Bytes>>::new(ctl, 1);
+            let response = tokio::time::timeout(Duration::from_secs(2), async {
+                let res = dialer.send(http::Request::get("/").body(Empty::new()).unwrap()).await
+                    .expect("worker must send valid response headers, not panic in HTTP framing");
+                assert_eq!(res.headers()["content-length"], declared.to_string());
+                res.into_body().collect().await
+            }).await.expect("worker response must finish or fail promptly");
+            if oversized {
+                assert!(response.is_err(), "overflow after the exact-cap prefix must fail, not finish successfully");
+            } else {
+                assert_eq!(response.unwrap().to_bytes(), expected, "ordinary body must retain its framing");
+            }
+            worker.abort();
+        }
     }
 
     /// The guest hears that its answer is out once the body has been read
@@ -1083,8 +1160,8 @@ mod tests {
     async fn guarded_body_says_when_it_has_been_read() {
         use oneshot::error::TryRecvError::{Closed, Empty};
         let (sent, mut out) = oneshot::channel::<()>();
-        let inner = Limited::new(Full::new(Bytes::from_static(b"1")), 5);
-        let mut body = GuardedBody { inner, abort: Arc::default(), sent: Some(sent) };
+        let inner = Full::new(Bytes::from_static(b"1"));
+        let mut body = GuardedBody { inner, remaining: 5, abort: Arc::default(), sent: Some(sent) };
         assert!(body.frame().await.unwrap().is_ok());
         assert_eq!(out.try_recv(), Err(Empty));
         assert!(body.frame().await.is_none());
