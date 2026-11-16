@@ -243,6 +243,14 @@ Each test spins up a `Node` in-process with small limits.
 
 ## Benchmarks (`examples/bench.rs`)
 
+The HTTP matrix in `notes/bench-numbers/drive.py` uses only the current v1
+contract, including connection-only client limits; request rates belong at the
+edge. HTTP errors invalidate comparisons. Density uses a fresh dedicated app/stack,
+one-hour node and app retention, fresh exported live/store increments and one target worker's
+RSS. Summaries reject duplicate rounds, mixed build identities and offered rates.
+See the [protocol and validation evidence](notes/bench-numbers/README.md); fresh
+integrated release measurements remain a separate idle-machine step.
+
 `cargo run --release -p nanovm --example bench -- [--quick] [--json out.json]`. Results are printed as a table; `--json` also saves them. The latest results are in [README.md](README.md).
 1. Compile time and `.cwasm` load time.
 2. Cold start: latency of the first request to a new object, p50/p99/max (instantiation plus first handle).

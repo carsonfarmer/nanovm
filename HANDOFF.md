@@ -4,6 +4,26 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
+## Benchmark harness correction (2026-11-16, fix/benchmark-validity)
+
+The Python harness now uses only current v1 config/admin/collector contracts,
+fresh absolute work/output paths, explicit failure gates and build identity.
+Density has its own clean stack and one-hour node/app retention; it checks every
+creation batch and exact exported live/store increments on one worker PID before
+using its RSS delta. HTTP failures abort comparisons. The current integrated
+contract includes `origin/trim/edge` (`2efdd1a`): configs inherit connection-only
+client defaults, and the request-rate/app-rate/X-Forwarded-For benchmark is removed.
+No connection-limit replacement benchmark is added. Summaries reject mixed
+commit/binary/workload identity, rates and duplicate rounds. Invalid aggregate-child
+RSS / attempted-object density evidence must not be reused.
+
+Validation only: 18 Python tests, a disposable fixture subprocess, four initial
+and three edge-contract source mutations caught and restored; no actual benchmark,
+compile or server startup. Runtime-line
+delta 0. [Protocol, evidence, exact fresh integrated-build commands and limitations](notes/bench-numbers/README.md).
+Parent must run the full release matrix only after all other VM workloads stop;
+this harness commit provides no new performance numbers and is not pushed.
+
 ## Current state (2026-11-08)
 
 **PR #3 review follow-up (2026-11-14):** local `fix/pr3-review` addresses the
