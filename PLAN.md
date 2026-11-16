@@ -237,9 +237,9 @@ Each test spins up a `Node` in-process with small limits.
 ## Benchmarks (`examples/bench.rs`)
 
 The HTTP matrix in `notes/bench-numbers/drive.py` uses only the current v1
-contract. Ordinary HTTP errors invalidate comparisons; explicit rejection
-workloads are separate. Density uses a fresh dedicated app/stack, one-hour node
-and app retention, fresh exported live/store increments and one target worker's
+contract, including connection-only client limits; request rates belong at the
+edge. HTTP errors invalidate comparisons. Density uses a fresh dedicated app/stack,
+one-hour node and app retention, fresh exported live/store increments and one target worker's
 RSS. Summaries reject duplicate rounds, mixed build identities and offered rates.
 See the [protocol and validation evidence](notes/bench-numbers/README.md); fresh
 integrated release measurements remain a separate idle-machine step.

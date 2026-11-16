@@ -5,6 +5,17 @@ and separately runs the build's in-process benchmark. It accepts one build or
 alternating builds, all using the current v1 API/config. No format adapters or
 historical config dialects are supported (AGENTS.md rule 1).
 
+The integrated contract includes `origin/trim/edge` at `2efdd1a`: request rates
+belong at the edge, not in nanovm. Node/proxy configs inherit the connection-only
+`clients` defaults (`connections_per_client`, `connections`, `trusted`); the
+driver writes no client-rate keys and sends no forwarded-client accounting
+headers. There is no rate-limit/rejection benchmark or exemption for failed HTTP
+responses. No independent connection-limit benchmark existed here, so none is
+added; connection limits remain enabled normally. Fixed offered-rate latency
+(`--rates`, oha `-q`) is still a load-generator workload, not a server rate limit.
+Supported `--only` phases are `inproc,node_cold,app_cold,object_cold,syncs,direct,fixed_rate,proxy,density`;
+unknown phase names are refused before any workload starts.
+
 ## Correctness gates
 
 - Ordinary measured runs **and warmups** must have only 200/204 responses, no
@@ -12,9 +23,6 @@ historical config dialects are supported (AGENTS.md rule 1).
   A failure aborts the run, records invalid evidence, and prevents summarization.
   Application-cold failures invalidate that sample set. Node-cold startup polling
   deliberately reports time until first 200 and retains intermediate response codes.
-- Client-limit workloads explicitly permit 429, report successful rps and separate
-  rejection counts. Their mixed-response latency is not summarized as useful-work
-  latency. They are not ordinary throughput comparisons.
 - Density stops the ordinary stack, publishes a dedicated counter manifest, and
   starts a fresh stack plus the existing `dev-collector` example. Both node and
   app idle retention are one hour, with a half-hour measurement deadline. After
@@ -51,12 +59,20 @@ The initial ten regression tests failed against the unchanged driver: five
 assertion failures and eight errors (including subtests). They reproduced silent
 HTTP error acceptance, ignored in-process exit/missing JSON, missing density/live
 verification and path handling, config dialect requirements, and pooled duplicate,
-commit/binary/rate/invalid rows. The final suite has 17 passing tests, including
+commit/binary/rate/invalid rows. The current suite has 18 passing tests, including
 a real disposable stub subprocess running from another cwd, synthetic collector
 snapshots, dedicated density orchestration and failed-creation cleanup. A CLI
 help probe also caught and fixed argparse's unescaped percent-sign failure.
+For the edge contract update, changed config/summary/phase probes first failed
+(two assertions and one missing-function error), then passed after removing
+client-rate config and rejection exemptions and validating the current phase set.
+HTTP 429 is invalid, just like any response outside 200/204.
+Mutating the current config to emit client-rate keys, exempting 429 in summaries,
+and bypassing phase validation each failed its targeted test. All three changes
+were restored from the staged source; the unstaged diff was empty afterward and
+all 18 tests passed again.
 
-Four source mutation probes were rejected: unconditional HTTP validity (three
+Four initial source mutation probes were rejected: unconditional HTTP validity (three
 tests fail), removal of live/store-count comparison (density test fails), removal
 of absolute in-process work resolution (stub subprocess test fails), and removal
 of pooling identity/rate/duplicate checks (four assertions fail). Each mutation

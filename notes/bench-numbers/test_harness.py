@@ -35,9 +35,11 @@ class HarnessTests(unittest.TestCase):
             return drive.oha("http://unused/", 1, n=10)
 
     def test_http_failures_are_invalid(self):
-        r = self.oha_result({"200": 9, "500": 1})
-        self.assertFalse(r["valid"])
-        self.assertEqual(r["failed"], 1)
+        for code in ("429", "500"):
+            with self.subTest(code=code):
+                r = self.oha_result({"200": 9, code: 1})
+                self.assertFalse(r["valid"])
+                self.assertEqual(r["failed"], 1)
 
     def test_transport_and_exit_failures_are_invalid(self):
         self.assertFalse(self.oha_result({"200": 9}, {"timeout": 1})["valid"])
@@ -108,9 +110,12 @@ print('fixture run')
     def test_v1_config_retention_and_clients(self):
         import tomllib
         node = tomllib.loads(drive.node_toml(self.build, self.work))
+        proxy = tomllib.loads(drive.proxy_toml(self.build))
         self.assertGreaterEqual(node["limits"]["idle_timeout_ms"], 3600000)
-        self.assertEqual(node["clients"]["rate"], 0)
-        self.assertEqual(tomllib.loads(drive.proxy_toml(self.build))["nodes"], [drive.NODE])
+        # Inherit the current connection-only defaults; no rate-limit overrides.
+        self.assertNotIn("clients", node)
+        self.assertNotIn("clients", proxy)
+        self.assertEqual(proxy["nodes"], [drive.NODE])
 
     def test_density_observed_live_count_and_target_pid(self):
         snapshot = dict(collected_at_ms=2000, workers={"app": dict(up=True, pid=77)},
@@ -202,14 +207,17 @@ print('fixture run')
         a.update(codes={"200": 9, "503": 1})
         self.assertNotEqual(self.summary([a]).returncode, 0)
 
-    def test_summary_intentional_rejections_separate_from_latency(self):
+    def test_summary_cannot_exempt_failed_responses(self):
         a = self.row()
-        a.update(phase="limits_default", workload="rejection", codes={"200": 9, "429": 100},
-                 rejected=100, p99_ms=0.1)
+        a.update(workload="rejection", codes={"200": 9, "429": 100}, p99_ms=0.1)
         result = self.summary([a])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Intentional rejection", result.stdout)
-        self.assertNotIn("p99_ms", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("failed responses", result.stderr)
+
+    def test_only_phases_validated_without_workloads(self):
+        self.assertEqual(drive.parse_phases("direct,density"), {"direct", "density"})
+        with self.assertRaises(drive.argparse.ArgumentTypeError):
+            drive.parse_phases("unknown")
 
     def test_cli_help_without_workloads(self):
         result = subprocess.run([sys.executable, str(HERE / "drive.py"), "--help"],

@@ -55,7 +55,7 @@ def main():
         rate = r.get("q")
         if rates.setdefault(measure, rate) != rate:
             raise ValueError(f"different fixed rates for {measure}")
-        allowed = {"200", "204", "429"} if r.get("workload") == "rejection" else {"200", "204"}
+        allowed = {"200", "204"}
         if r.get("errors") or any(v and k not in allowed for k, v in r.get("codes", {}).items()):
             raise ValueError(f"failed responses in measurement: {r}")
         if "build" in r and r["build"] not in builds:
@@ -72,8 +72,6 @@ def main():
         "app_cold": ["p50_ms", "p99_ms", "max_ms"],
         "density": ["kb_per_object", "objects_per_gib"],
         "syncs": [],
-        # Latency here includes rejections and is not useful-work latency.
-        "limits_default": ["rps", "rejected", "secs"],
     }
     default = ["rps", "p50_ms", "p99_ms", "p999_ms", "node_us", "proxy_us"]
     out = csv.writer(open(src.with_name("summary.csv"), "w", newline=""))
@@ -88,8 +86,6 @@ def main():
             ms = names
         if phase != phase_seen:
             print(f"\n### {phase}\n")
-            if phase == "limits_default":
-                print("Intentional rejection workload: rps counts only successful responses; rejected counts HTTP 429.\n")
             print("| case | conc | metric | " + " | ".join(builds) + " |")
             print("|---|---:|---|" + "---:|" * len(builds))
             phase_seen = phase

@@ -5,7 +5,7 @@ Covers what `crates/nanovm/examples/bench.rs` (in-process, no sockets, no
 jail) does not: a real `nanovm serve` supervisor with its jailed worker, the
 proxy in front of it, node/app/object cold starts, fixed-rate latency with
 `oha -q --latency-correction`, CPU per request from /proc, RSS per live
-object, sync syscalls per commit (strace), and client rate limits.
+object, and sync syscalls per commit (strace).
 It also runs each build's own `bench --json` in-process benchmark.
 
 Rounds alternate builds (A B C D A B C D ...). Every measurement is one JSON
@@ -49,6 +49,7 @@ REGISTRY = "127.0.0.1:5000"
 DOH = "127.0.0.1:8053"
 TICK = os.sysconf("SC_CLK_TCK")
 CONCS = [1, 16, 64, 256]
+PHASES = {"inproc", "node_cold", "app_cold", "object_cold", "syncs", "direct", "fixed_rate", "proxy", "density"}
 RETENTION_MS = 3600000
 JS_MANIFEST = {"limits": {"memory_mb": 32, "cpu_ms": 500, "request_timeout_ms": 2000,
                           "idle_timeout_ms": 60000, "disk_mb": 1}}
@@ -206,15 +207,13 @@ def start_doh(apps):
 # ---------------------------------------------------------------- configs
 
 
-def node_toml(b, data, clients="off"):
+def node_toml(b, data):
     t = [f'listen = "{NODE}"', f'data_dir = "{data}"', "max_live_objects = 8000", "memory_reservation_mb = 64",
          "epoch_tick_ms = 5", "dev = true",
          # Nothing listens here: exports fail fast and are dropped, the same on every build.
          'telemetry_endpoint = "http://127.0.0.1:4318"']
     # The benchmark VM need not have delegated cgroup controllers.
     t += ['cgroup = "off"', "[limits]", f"idle_timeout_ms = {RETENTION_MS}"]
-    if clients == "off":
-        t += ["[clients]", "rate = 0", "app_rate = 0"]
     return "\n".join(t) + "\n"
 
 
@@ -222,15 +221,14 @@ def proxy_toml(b):
     t = [f'listen = "{PROXY}"', 'publish_listen = "127.0.0.1:8444"', f'resolver = "http://{DOH}/dns-query"',
          "dev = true", 'telemetry_endpoint = "http://127.0.0.1:4318"']
     t += [f'nodes = ["{NODE}"]', 'hosts = ["counter.test", "js.test"]',
-          'signers = ["dev dev"]', "[clients]", "rate = 0", "app_rate = 0"]
+          'signers = ["dev dev"]']
     return "\n".join(t) + "\n"
 
 
 # ---------------------------------------------------------------- oha
 
 
-def oha(url, conc, *, n=None, z=None, q=None, method="GET", headers=(), body=None, rand=False, host=None,
-        allowed=(200, 204)):
+def oha(url, conc, *, n=None, z=None, q=None, method="GET", headers=(), body=None, rand=False, host=None):
     argv = [ARGS.oha, "--no-tui", "--output-format", "json", "-c", str(conc)]
     argv += ["-n", str(n)] if n else ["-z", z]
     if q:
@@ -261,12 +259,11 @@ def oha(url, conc, *, n=None, z=None, q=None, method="GET", headers=(), body=Non
     lat = j.get("latencyPercentiles", {})
     pct = lambda k: None if lat.get(k) is None else round(lat[k] * 1000, 3)
     total = sum(codes.values())
-    failed = sum(v for k, v in codes.items() if int(k) not in allowed)
+    failed = sum(v for k, v in codes.items() if int(k) not in (200, 204))
     errors = j.get("errorDistribution", {})
     return {
         "valid": p.returncode == 0 and total > 0 and not failed and not errors and (n is None or total == n),
-        "exit_code": p.returncode, "failed": failed, "rejected": codes.get("429", 0),
-        "workload": "rejection" if 429 in allowed else "ordinary",
+        "exit_code": p.returncode, "failed": failed,
         "argv": " ".join(argv), "secs": total_s, "rps_all": s.get("requestsPerSec"),
         "ok": codes.get("200", 0) + codes.get("204", 0), "codes": codes, "errors": errors,
         "rps": round((codes.get("200", 0) + codes.get("204", 0)) / total_s, 1),
@@ -309,12 +306,12 @@ class Cpu:
 class Stack:
     """Dev registry, a node (supervisor + jailed workers) and optionally the proxy."""
 
-    def __init__(self, b, work, data, clients="off", fresh=True):
+    def __init__(self, b, work, data, fresh=True):
         self.b, self.work, self.data = b, work, Path(data)
         if fresh and self.data.exists():
             shutil.rmtree(self.data)
         self.cfg = work / f"node-{b['name']}.toml"
-        self.cfg.write_text(node_toml(b, self.data, clients))
+        self.cfg.write_text(node_toml(b, self.data))
         self.node = self.proxy = None
 
     def start_node(self):
@@ -499,13 +496,11 @@ def phase_app_cold(b, rnd, work, st, refs, n):
 
 
 def run_case(b, rnd, st, cpu, phase, case, url, conc, *, method="GET", body=None, rand=True, host=None, headers=(),
-             z=None, q=None, warm=True, n=None, allowed=(200, 204)):
+             z=None, q=None, warm=True, n=None):
     if warm:
-        require_ok(oha(url, conc, z="2s", method=method, headers=headers, body=body, rand=rand, host=host,
-                       allowed=allowed))
+        require_ok(oha(url, conc, z="2s", method=method, headers=headers, body=body, rand=rand, host=host))
     a = cpu.snap()
-    r = oha(url, conc, z=z or ARGS.duration, n=n, q=q, method=method, headers=headers, body=body, rand=rand, host=host,
-            allowed=allowed)
+    r = oha(url, conc, z=z or ARGS.duration, n=n, q=q, method=method, headers=headers, body=body, rand=rand, host=host)
     c = Cpu.delta(a, cpu.snap(), sum(r["codes"].values()))
     rec = {**base(b, rnd), "phase": phase, "case": case, "conc": conc, "q": q, **r, **c}
     record(rec)
@@ -676,49 +671,6 @@ def phase_syncs(b, rnd, st, refs):
         log(b["name"], "syncs", case, calls)
 
 
-def phase_limits_default(b, rnd, st, refs):
-    """Intentional rejections: success throughput and 429 counts kept separately."""
-    st.start_node()
-    cpu = Cpu(st.node.pid)
-    hdr = app_headers(refs["counter"])
-    require_ok(oha(f"http://{NODE}/o[0-9]{{3}}/", 16, n=2000, headers=hdr, rand=True))
-    time.sleep(3)  # let the warm-up's buckets refill
-    for case, method, path in (("get_spread", "GET", "/o[0-9]{3}/"), ("incr_spread", "POST", "/o[0-9]{3}/incr")):
-        # Loopback is in `trusted` by default: its own requests are not limited.
-        run_case(b, rnd, st, cpu, "limits_default", f"{case}/loopback", f"http://{NODE}{path}", 64, method=method,
-                 headers=hdr, z="10s", warm=False)
-        time.sleep(3)
-        # One client behind a trusted forwarder (a TLS terminator or the proxy): X-Forwarded-For names it.
-        run_case(b, rnd, st, cpu, "limits_default", f"{case}/one_client", f"http://{NODE}{path}", 64, method=method,
-                 headers=hdr + ["x-forwarded-for: 198.51.100.7"], z="10s", warm=False, allowed=(200, 204, 429))
-        time.sleep(3)
-    # 16 clients at once, each its own address: the app's 1,000/s.
-    procs = []
-    t0 = time.time()
-    for k in range(16):
-        argv = [ARGS.oha, "--no-tui", "--output-format", "json", "-c", "4", "-z", "10s", "--rand-regex-url",
-                "-H", hdr[0], "-H", hdr[1], "-H", f"x-forwarded-for: 198.51.100.{k + 10}", f"http://{NODE}/o[0-9]{{3}}/"]
-        procs.append(subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
-    codes, errors, exits = {}, {}, []
-    for p in procs:
-        j = json.loads(p.communicate()[0])
-        exits.append(p.returncode)
-        for k, v in j.get("errorDistribution", {}).items():
-            errors[k] = errors.get(k, 0) + v
-        for k, v in j.get("statusCodeDistribution", {}).items():
-            codes[k] = codes.get(k, 0) + v
-    secs = time.time() - t0
-    rec = {**base(b, rnd), "phase": "limits_default", "case": "get_spread/16_clients", "conc": 64, "codes": codes,
-           "secs": secs, "rps": round(codes.get("200", 0) / secs, 1), "errors": errors,
-           "workload": "rejection", "rejected": codes.get("429", 0),
-           "valid": not any(exits) and not errors and sum(codes.values()) > 0 and
-                    all(k in ("200", "204", "429") for k in codes)}
-    record(rec)
-    require_ok(rec)
-    log(b["name"], "limits 16 clients", codes)
-    st.stop()
-
-
 def base(b, rnd):
     return {"build": b["name"], "commit": b["commit"], "identity": b["identity"], "round": rnd, "valid": True}
 
@@ -771,9 +723,6 @@ def one(b, rnd, rates):
         st.stop()
         if want("density"):
             phase_density(b, rnd, work, refs)
-        if want("limits_default"):
-            st = Stack(b, work, work / "data-limits", clients="default")
-            phase_limits_default(b, rnd, st, refs)
     finally:
         if doh:
             doh.shutdown()
@@ -783,7 +732,13 @@ def one(b, rnd, rates):
         reg.stop()
         shutil.rmtree(work / "data", ignore_errors=True)
         shutil.rmtree(work / "data-cold", ignore_errors=True)
-        shutil.rmtree(work / "data-limits", ignore_errors=True)
+
+
+def parse_phases(value):
+    phases = set(value.split(","))
+    if not phases <= PHASES:
+        raise argparse.ArgumentTypeError(f"unknown phases: {', '.join(sorted(phases - PHASES))}")
+    return phases
 
 
 def main():
@@ -794,7 +749,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--first-round", type=int, default=1)
-    ap.add_argument("--only", type=lambda s: set(s.split(",")))
+    ap.add_argument("--only", type=parse_phases, help="comma-separated phases: " + ",".join(sorted(PHASES)))
     ap.add_argument("--rates", help="JSON file: {case: {\"50%%\": rps, \"80%%\": rps}}, the same for every build")
     ap.add_argument("--duration", default="6s")
     ap.add_argument("--rate-duration", default="15s")
