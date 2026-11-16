@@ -21,18 +21,22 @@
 //! ends that session with a conditional write, so a renewal still on its way
 //! can't land after it and extend the holder's leases.
 //!
-//! Records: `nodes/<node>` is `{session, beat, lease_ms}` and
+//! Records: `nodes/<base64url(node)>` is `{session, beat, lease_ms}` and
 //! `objects/<app>/<object>` `{node, session, epoch}`, with no node once
-//! released. Deleting a record restarts its epochs: never do.
+//! released. Node names are encoded without padding as one lossless path
+//! segment, so slashes in distinct names cannot alias session records.
+//! Deleting a record restarts its epochs: never do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, UpdateVersion};
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
+use object_store::{ObjectStore, UpdateVersion};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+
+use crate::ship::{Objects, Store, Tag};
 
 /// Where a worker asks its supervisor for leases: `POST` takes one, `DELETE`
 /// gives it up.
@@ -46,9 +50,7 @@ pub const SESSION: &str = "nanovm-session";
 /// This host's monotonic clock in nanoseconds: the same in the supervisor
 /// and its workers, which an `Instant` can't pass between.
 pub fn mono_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    // SAFETY: `ts` is a valid out-pointer and the clock always exists.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
@@ -101,7 +103,7 @@ struct Own {
 
 /// A supervisor's leases, in an object store shared by every node.
 pub struct Leases {
-    store: Arc<dyn ObjectStore>,
+    store: Objects,
     node: String,
     ttl: Duration,
     session: Mutex<Own>,
@@ -119,12 +121,10 @@ pub struct Leases {
 /// in the store, without asking the store again.
 const BROKEN: Duration = Duration::from_secs(60);
 
-type Result<T> = object_store::Result<T>;
-
 impl Leases {
     pub fn new(store: Arc<dyn ObjectStore>, node: &str, ttl: Duration) -> Leases {
         let (session, seen, held, broken) = Default::default();
-        Leases { store, node: node.into(), ttl, session, seen, held, broken }
+        Leases { store: Objects(store), node: node.into(), ttl, session, seen, held, broken }
     }
 
     /// The store an object store URL names, if any.
@@ -140,24 +140,24 @@ impl Leases {
     /// id, and the `mono_ns` until which its leases hold (past if none do).
     pub async fn renew(&self) -> (u64, u64) {
         let mut s = self.session.lock().clone();
-        let (sent, path) = (mono_ns(), Path::from_iter(["nodes", &self.node]));
+        let (sent, key) = (mono_ns(), format!("nodes/{}", BASE64_URL_SAFE_NO_PAD.encode(&self.node)));
         if s.until <= sent {
-            match self.get::<NodeRecord>(&path).await {
+            match self.get::<NodeRecord>(&key).await {
                 Ok((rec, version)) => s = Own { id: rec.map_or(1, |r| r.session + 1), beat: 0, version, until: 0 },
                 Err(_) => return (s.id, s.until),
             }
         }
         let rec = NodeRecord { session: s.id, beat: s.beat + 1, lease_ms: self.ttl.as_millis() as u64 };
-        match self.put(&path, &rec, s.version.clone()).await {
-            Ok(v) => {
+        match self.put(&key, &rec, s.version.as_ref()).await {
+            Ok(Some(v)) => {
                 (s.beat, s.version) = (s.beat + 1, Some(v));
                 s.until = sent + (self.ttl * 7 / 8).as_nanos() as u64;
             }
             // Our last renewal may have landed unanswered: carry on from it,
             // but not past the lease it was sent for. Anything else ended
             // the session.
-            Err(object_store::Error::Precondition { .. }) => {
-                if let Ok((Some(r), v)) = self.get::<NodeRecord>(&path).await
+            Ok(None) => {
+                if let Ok((Some(r), v)) = self.get::<NodeRecord>(&key).await
                     && r.session == s.id
                 {
                     (s.beat, s.version) = (r.beat, v);
@@ -178,8 +178,8 @@ impl Leases {
         if until <= mono_ns() {
             return Err(Refused::Unavailable("this node's session has lapsed".into()));
         }
-        let path = Path::from_iter(["objects"].into_iter().chain(key.split('/')));
-        let unavailable = |e: object_store::Error| Refused::Unavailable(e.to_string());
+        let path = format!("objects/{key}");
+        let unavailable = |e: std::io::Error| Refused::Unavailable(e.to_string());
         for _ in 0..4 {
             let (rec, version) = self.get::<ObjectRecord>(&path).await.map_err(unavailable)?;
             if let Some(r) = &rec
@@ -190,9 +190,9 @@ impl Leases {
                 return Err(Refused::Held(r.node.clone()));
             }
             let epoch = rec.map_or(1, |r| r.epoch + 1);
-            let grant = match self.put(&path, &ObjectRecord { node: self.node.clone(), session: id, epoch }, version).await {
-                Ok(v) => Grant { epoch, session: id, e_tag: v.e_tag, version: v.version },
-                Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. }) => continue,
+            let grant = match self.put(&path, &ObjectRecord { node: self.node.clone(), session: id, epoch }, version.as_ref()).await {
+                Ok(Some(v)) => Grant { epoch, session: id, e_tag: v.e_tag, version: v.version },
+                Ok(None) => continue,
                 Err(e) => return Err(unavailable(e)),
             };
             // Any grant this node held on it before is over.
@@ -219,13 +219,6 @@ impl Leases {
         self.held.lock().insert(key.into(), grant);
     }
 
-    fn unhold(&self, key: &str, grant: &Grant) {
-        let mut held = self.held.lock();
-        if held.get(key).is_some_and(|g| g.epoch == grant.epoch) {
-            held.remove(key);
-        }
-    }
-
     /// The epoch of the lease this node holds on `key`, live: held by a
     /// worker, and in this node's session, which hasn't lapsed.
     pub fn epoch(&self, key: &str) -> Option<u64> {
@@ -235,18 +228,21 @@ impl Leases {
 
     /// Gives up the lease `grant` took on `key`, unless it has moved on.
     pub async fn release(&self, key: &str, grant: &Grant) {
-        self.unhold(key, grant);
-        let path = Path::from_iter(["objects"].into_iter().chain(key.split('/')));
+        if let Entry::Occupied(held) = self.held.lock().entry(key.into())
+            && held.get().epoch == grant.epoch
+        {
+            held.remove();
+        }
         let version = UpdateVersion { e_tag: grant.e_tag.clone(), version: grant.version.clone() };
         let released = ObjectRecord { node: String::new(), session: 0, epoch: grant.epoch };
-        let _ = self.put(&path, &released, Some(version)).await;
+        let _ = self.put(&format!("objects/{key}"), &released, Some(&version)).await;
     }
 
     /// Whether `node`'s session `session` may still hold leases: its record
     /// names it and has changed within a lease. Once it hasn't, this ends it.
-    async fn alive(&self, node: &str, session: u64) -> Result<bool> {
-        let path = Path::from_iter(["nodes", node]);
-        let (rec, version) = self.get::<NodeRecord>(&path).await?;
+    async fn alive(&self, node: &str, session: u64) -> std::io::Result<bool> {
+        let key = format!("nodes/{}", BASE64_URL_SAFE_NO_PAD.encode(node));
+        let (rec, version) = self.get::<NodeRecord>(&key).await?;
         let Some(rec) = rec.filter(|r| r.session == session) else { return Ok(false) };
         {
             let mut seen = self.seen.lock();
@@ -258,30 +254,18 @@ impl Leases {
                 return Ok(true);
             }
         }
-        match self.put(&path, &NodeRecord { session: session + 1, beat: 0, ..rec }, version).await {
-            Ok(_) => Ok(false),
-            Err(object_store::Error::Precondition { .. }) => Ok(true),
-            Err(e) => Err(e),
-        }
+        Ok(self.put(&key, &NodeRecord { session: session + 1, beat: 0, ..rec }, version.as_ref()).await?.is_none())
     }
 
-    async fn get<T: serde::de::DeserializeOwned>(&self, path: &Path) -> Result<(Option<T>, Option<UpdateVersion>)> {
-        let res = match self.store.get(path).await {
-            Err(object_store::Error::NotFound { .. }) => return Ok((None, None)),
-            res => res?,
-        };
-        let version = UpdateVersion { e_tag: res.meta.e_tag.clone(), version: res.meta.version.clone() };
-        let rec = serde_json::from_slice(&res.bytes().await?)
-            .map_err(|e| object_store::Error::Generic { store: "lease", source: e.into() })?;
-        Ok((Some(rec), Some(version)))
+    async fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> std::io::Result<(Option<T>, Option<Tag>)> {
+        let Some((bytes, tag)) = self.store.read(key).await? else { return Ok((None, None)) };
+        Ok((Some(serde_json::from_slice(&bytes)?), Some(tag)))
     }
 
-    /// Writes `rec` at `path` if it is still at `version` (absent for none).
-    async fn put(&self, path: &Path, rec: &impl Serialize, version: Option<UpdateVersion>) -> Result<UpdateVersion> {
-        let mode = version.map_or(PutMode::Create, PutMode::Update);
-        let body = serde_json::to_vec(rec).expect("records serialize");
-        let res = self.store.put_opts(path, body.into(), mode.into()).await?;
-        Ok(UpdateVersion { e_tag: res.e_tag, version: res.version })
+    /// Writes `rec` at `key` if it is still at `version` (absent for none):
+    /// its new version, or none if it has moved.
+    async fn put(&self, key: &str, rec: &impl Serialize, version: Option<&Tag>) -> std::io::Result<Option<Tag>> {
+        self.store.swap(key, serde_json::to_vec(rec).expect("records serialize"), version).await
     }
 }
 
@@ -402,12 +386,36 @@ pub async fn serve<B: http_body::Body<Data = bytes::Bytes>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::path::Path;
+    use object_store::{ObjectStoreExt, PutMode};
+
+    type Result<T> = object_store::Result<T>;
 
     const TTL: Duration = Duration::from_millis(200);
 
     fn nodes(n: usize) -> (Arc<object_store::memory::InMemory>, Vec<Leases>) {
         let store = Arc::new(object_store::memory::InMemory::new());
         (store.clone(), (0..n).map(|i| Leases::new(store.clone(), &format!("n{i}"), TTL)).collect())
+    }
+
+    /// Distinct names must not end each other's sessions through path normalization.
+    #[tokio::test]
+    async fn distinct_node_names_cannot_take_over_live_leases() {
+        for (left, right) in [("east", "east/"), ("east", "/east"), ("east/west", "east//west"), ("east/", "east%2F"), (".", "%2E")] {
+            for (holder, taker) in [(left, right), (right, left)] {
+                let store = Arc::new(object_store::memory::InMemory::new());
+                let ttl = Duration::from_secs(60);
+                let a = Leases::new(store.clone(), holder, ttl);
+                let b = Leases::new(store, taker, ttl);
+                a.renew().await;
+                let grant = a.acquire("app/o").await.unwrap();
+                b.renew().await;
+                assert!(a.until(&grant).is_some(), "{holder:?}'s lease is still live");
+                assert_eq!(b.acquire("app/o").await.unwrap_err(), Refused::Held(holder.into()), "{taker:?} must not take {holder:?}'s live lease");
+                a.renew().await;
+                assert_eq!(b.acquire("app/o").await.unwrap_err(), Refused::Held(holder.into()), "{holder:?}'s renewal must keep its lease");
+            }
+        }
     }
 
     /// One node at a time holds a lease, each holder at a higher epoch; one
@@ -508,7 +516,7 @@ mod tests {
         tokio::time::sleep(TTL).await;
         n[1].renew().await;
         n[1].acquire("app/o").await.unwrap();
-        let late = store.put_opts(&Path::from("nodes/n0"),
+        let late = store.put_opts(&Path::from(format!("nodes/{}", BASE64_URL_SAFE_NO_PAD.encode("n0"))),
             serde_json::to_vec(&NodeRecord { session: stale.id, beat: stale.beat + 1, lease_ms: TTL.as_millis() as u64 }).unwrap().into(),
             PutMode::Update(stale.version.unwrap()).into()).await;
         assert!(matches!(late, Err(object_store::Error::Precondition { .. })), "{late:?}");

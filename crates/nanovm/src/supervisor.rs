@@ -53,7 +53,7 @@ pub(crate) type Body = UnsyncBoxBody<Bytes, hyper::Error>;
 const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 /// How long a worker asked to stop has to flush its telemetry and exit,
 /// past the time its objects may take to finish their work after their
-/// answers (`post_return_timeout_ms`), before it is killed (see `drain`).
+/// answers (`post_return_timeout_ms`), before it is killed (see `Worker::stop`).
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Compiling a large component on first start can take a while.
 const START_TIMEOUT: Duration = Duration::from_secs(120);
@@ -83,8 +83,6 @@ pub struct Supervisor {
     /// Links all workers may hold open at once: each costs the supervisor a
     /// file descriptor, and its upstream another.
     links: Arc<tokio::sync::Semaphore>,
-    /// Held while giving a new app its uid.
-    uids: Arc<Mutex<()>>,
     /// To the proxy's private endpoint: publishes, and calls to objects.
     proxy: reqwest::Client,
     leases: Option<Arc<crate::lease::Leases>>,
@@ -102,11 +100,9 @@ pub struct Supervisor {
     started: Instant,
     /// What clients that reach `listen` directly may ask of it.
     pub gate: Arc<crate::gate::Gate>,
-    /// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`).
-    cgroup: Option<PathBuf>,
-    /// Held open: the cgroup its workers run under is its alone (see
-    /// [`Cgroup::take`]).
-    _cgroup_held: Option<std::fs::File>,
+    /// The cgroup v2 directory workers run in (see `NodeConfig::cgroup`),
+    /// held open: it is this supervisor's alone (see [`Cgroup::take`]).
+    cgroup: Option<(PathBuf, std::fs::File)>,
 }
 
 #[derive(Default)]
@@ -128,8 +124,7 @@ struct Worker {
 
 struct Failed {
     at: Instant,
-    digest: String,
-    policy: Policy,
+    want: AppRef,
     why: String,
 }
 
@@ -150,7 +145,7 @@ struct Live {
     /// Its slot among `max_apps`, passed on to the worker that replaces it.
     slot: Mutex<Option<OwnedSemaphorePermit>>,
     /// Sending true gives the worker time to exit before it is killed (see
-    /// `drain`); dropping this kills it at once. Closure acknowledges
+    /// `Worker::stop`); dropping this kills it at once. Closure acknowledges
     /// actual process exit, not just receipt of the request.
     kill: watch::Sender<bool>,
 }
@@ -165,6 +160,27 @@ impl Worker {
     fn live(&self) -> Option<Arc<Live>> {
         self.live.lock().clone().filter(|l| l.alive())
     }
+
+    /// Takes its worker, if it has one, and waits until nothing holds it but
+    /// this (its requests have finished and their bodies have been read), or
+    /// its longest request has had its time, then asks the worker to stop and
+    /// waits for it to be gone: what still holds it can't keep it running
+    /// beside the next version. Hung up on, a worker lets its objects finish
+    /// their work after their answers, flushes its telemetry and exits (see
+    /// `worker_main`); one that takes longer than that work may, and
+    /// `STOP_TIMEOUT` more, is killed. Returns its slot, for the next worker.
+    async fn stop(&self) -> Option<OwnedSemaphorePermit> {
+        let old = self.live.lock().take()?;
+        let slot = old.slot.lock().take();
+        let deadline = Instant::now() + old.drain;
+        while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        old.link.hang_up();
+        old.kill.send_replace(true);
+        old.kill.closed().await;
+        slot
+    }
 }
 
 impl Supervisor {
@@ -177,7 +193,7 @@ impl Supervisor {
         // Workers inherit its limits: a node too big for them fails here, not in each worker.
         crate::engine::preflight(&cfg)?;
         cfg.secrets.as_deref().map(crate::secrets::check_dir).transpose()?;
-        let cgroup = cgroup(&cfg)?;
+        let cgroup = cgroup(&cfg)?.map(|dir| Cgroup::take(&dir).map(|held| (dir, held))).transpose()?;
         // What deletes an earlier run cut short left.
         let _ = std::fs::remove_dir_all(cfg.data_dir.join("deleted"));
         // Restores a crash cut short, before any worker serves their objects.
@@ -193,7 +209,6 @@ impl Supervisor {
             // A quarter of the fds: half for links and their upstreams, half
             // for clients and the rest.
             links: Arc::new(tokio::sync::Semaphore::new((crate::engine::raise_nofile()? / 4) as usize)),
-            uids: Arc::default(),
             relay: Arc::new(crate::telemetry::Relay::new(&cfg.telemetry_endpoint)?),
             telemetry: Arc::new(crate::telemetry::Telemetry::new(&cfg.telemetry_endpoint, "_supervisor", env!("CARGO_PKG_VERSION"), None, &Default::default())?),
             leases: leases.map(|store| Arc::new(crate::lease::Leases::new(store, &cfg.name, ttl))),
@@ -201,7 +216,6 @@ impl Supervisor {
             capture: cfg.capture.as_ref().map(crate::ship::store).transpose()?.flatten(),
             shipping: Arc::default(),
             backlog: Mutex::default(),
-            _cgroup_held: cgroup.as_deref().map(Cgroup::take).transpose()?,
             cfg,
             proxy: reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?,
             spare: Default::default(),
@@ -305,20 +319,19 @@ impl Supervisor {
     /// here first goes to the store, so no acknowledged write is lost; if it
     /// can't, the restore stops, unless `discard` (then it is dropped).
     pub async fn restore(&self, app: &str, object: Option<&str>, to: Option<u64>, discard: bool) -> anyhow::Result<Vec<crate::ship::Restored>> {
-        anyhow::ensure!(crate::table::valid_name(app), "{app:?} is not an app's name");
+        anyhow::ensure!(crate::table::valid_name(app) && object.is_none_or(crate::table::valid_object), "not an app and object");
         let store = self.capture.clone().context("restoring needs a store (capture.store)")?;
         let objects = self.cfg.app_dirs(app)[0].clone();
         if !objects.exists() {
-            let (cfg, name, uids) = (self.cfg.clone(), app.to_owned(), self.uids.clone());
-            tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
+            let (cfg, name) = (self.cfg.clone(), app.to_owned());
+            tokio::task::spawn_blocking(move || app_dirs(&cfg, &name)).await??;
         }
         let ids = match object {
             Some(o) => vec![o.to_owned()],
             None => store.list(app).await?.into_iter().map(|(name, _)| name).collect(),
         };
         let mut done = vec![];
-        for id in ids.iter().filter(|o| object.is_some() || crate::table::valid_object(o)) {
-            anyhow::ensure!(crate::table::valid_object(id), "{id:?} is not an object id");
+        for id in ids.iter().filter(|o| crate::table::valid_object(o)) {
             let restored = self.held(app, Some(id), async || self.restore_object(&*store, app, id, &objects, to, discard).await).await;
             let before = done.iter().map(|r: &crate::ship::Restored| r.object.as_str()).collect::<Vec<_>>().join(", ");
             done.push(restored.with_context(|| format!("restoring {app}/{id} (restored before it: [{before}])"))?);
@@ -340,9 +353,8 @@ impl Supervisor {
             Some(id) => self.pause(app, id, &objects).await.map(|()| None)?,
             None => Some(w.starting.lock().await),
         };
-        let live = w.live.lock().take_if(|_| object.is_none());
-        if let Some(old) = live {
-            drain(old).await;
+        if object.is_none() {
+            w.stop().await;
         }
         let key = object.map_or(app.to_string(), |o| format!("{app}/{o}"));
         self.shipping.write().await.insert(key.clone());
@@ -394,17 +406,14 @@ impl Supervisor {
             // is let go, as only it lets the version ship.
             let dir = crate::ship::versions(objects, id);
             let ship = async || {
-                let mut shipped = Ok(());
+                let mut shipped = Ok(false);
                 for _ in 0..3 {
-                    shipped = match crate::ship::ship_object(store, self.leases.as_deref(), app, id, &dir, &mut None).await {
-                        Ok(false) => Err(std::io::Error::other("this node holds no lease on it")),
-                        shipped => shipped.map(drop),
-                    };
-                    if shipped.is_ok() {
+                    shipped = crate::ship::ship_object(store, self.leases.as_deref(), app, id, &dir, &mut None).await;
+                    if let Ok(true) = shipped {
                         break;
                     }
                 }
-                shipped
+                shipped?.then_some(()).ok_or_else(|| std::io::Error::other("this node holds no lease on it"))
             };
             if let Err(e) = ship().await
                 && !discard
@@ -427,20 +436,16 @@ impl Supervisor {
     pub async fn handle(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         // Readiness is infrastructure traffic, not a tenant request.
         if req.uri().path() == "/_nanovm/ready" && !req.headers().contains_key(APP_HEADER) {
-            return self.admin(req.map(|b| b.boxed_unsync())).await;
+            return Self::admin(req.uri().path());
         }
         self.telemetry.forward("supervisor.request", req, |req| self.clone().handle_request(req)).await
     }
 
     async fn handle_request(self: Arc<Self>, req: Request<Incoming>) -> Response<RespBody> {
         let mut req = req.map(|b| b.boxed_unsync());
-        let client = self.gate.client(&req);
-        if let Err(refused) = self.gate.admit(client, None) {
-            return refused;
-        }
         let want = match AppRef::from_headers(req.headers()) {
             Ok(Some(w)) => w,
-            Ok(None) => return self.admin(req).await,
+            Ok(None) => return Self::admin(req.uri().path()),
             Err(e) => return error_response(400, "bad-app-ref", &format!("{e:#}")),
         };
         for h in [APP_HEADER, TRUST_HEADER, MIN_VERSION_HEADER, HOST_HEADER] {
@@ -450,9 +455,6 @@ impl Supervisor {
             return error_response(400, "bad-object-id", BAD_OBJECT);
         }
         let name = want.name();
-        if let Err(refused) = self.gate.admit(client, Some(&name)) {
-            return refused;
-        }
         let w = {
             let mut workers = self.workers.lock();
             if !workers.contains_key(&name) && workers.len() >= 2 * self.cfg.max_apps {
@@ -460,8 +462,7 @@ impl Supervisor {
                 // their last failures.
                 workers.retain(|_, w| w.live.lock().is_some() || w.starting.try_lock().is_err());
             }
-            let host = want.host.clone();
-            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, host, ..Default::default() })).clone()
+            workers.entry(name.clone()).or_insert_with(|| Arc::new(Worker { name, host: want.host.clone(), ..Default::default() })).clone()
         };
         w.used.store(self.started.elapsed().as_millis() as u64, Relaxed);
         let live = match self.live(&w, &want).await {
@@ -536,8 +537,8 @@ impl Supervisor {
     }
 
     /// The node's own routes, for requests that name no app.
-    async fn admin(&self, req: Request<Body>) -> Response<RespBody> {
-        match req.uri().path() {
+    fn admin(path: &str) -> Response<RespBody> {
+        match path {
             "/_nanovm/ready" => Response::builder().status(204).body(Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap(),
             path if path.starts_with("/_nanovm/") => error_response(404, "not-found", path),
             _ => error_response(400, "no-app", "requests name their app (nanovm-app)"),
@@ -585,7 +586,7 @@ impl Supervisor {
         }
         if let Some(f) = &*failed
             && f.at.elapsed() < RESTART_BACKOFF
-            && (&f.digest, &f.policy) == (&want.digest, &want.policy)
+            && (&f.want.digest, &f.want.policy) == (&want.digest, &want.policy)
         {
             return Err(down(&f.why));
         }
@@ -600,8 +601,7 @@ impl Supervisor {
                 let res = down(&why);
                 *failed = Some(Failed {
                     at: Instant::now(),
-                    digest: want.digest.clone(),
-                    policy: want.policy.clone(),
+                    want: want.clone(),
                     why,
                 });
                 Err(res)
@@ -641,10 +641,7 @@ impl Supervisor {
             .map(|(_, o)| o)
             .ok_or_else(full)?;
         let Ok(_switching) = idle.starting.try_lock() else { return Err(full()) };
-        let old = idle.live.lock().take().ok_or_else(full)?;
-        let slot = old.slot.lock().take();
-        drain(old).await;
-        slot.ok_or_else(full)
+        idle.stop().await.ok_or_else(full)
     }
 
     /// Gets the app version `want` names, retires the running worker, then
@@ -662,27 +659,18 @@ impl Supervisor {
             env: p.spec.env,
             config: p.spec.config,
             secrets,
-            limits: p.spec.limits.clamped(&self.cfg.limits),
+            limits: p.spec.limits.clamped(&self.cfg.limits).0,
             worker: self.cfg.worker.clone(),
         };
         let policy = EgressPolicy::parse(&app.limits.egress, &self.cfg.limits.egress, self.cfg.dev).context("egress")?;
-        let old = w.live.lock().take();
-        let slot = match old {
-            Some(old) => {
-                let slot = old.slot.lock().take();
-                drain(old).await;
-                slot
-            }
-            None => None,
-        };
-        let slot = match slot {
+        let slot = match w.stop().await {
             Some(slot) => slot,
             None => self.slot(w).await?,
         };
 
         // Walking directories blocks; this thread serves other requests.
-        let (cfg, name, uids) = (self.cfg.clone(), w.name.clone(), self.uids.clone());
-        let uid = tokio::task::spawn_blocking(move || app_dirs(&cfg, &name, &uids)).await??;
+        let (cfg, name) = (self.cfg.clone(), w.name.clone());
+        let uid = tokio::task::spawn_blocking(move || app_dirs(&cfg, &name)).await??;
 
         let mut spare = self.spare.lock().await.take();
         // One that has died meanwhile is replaced.
@@ -720,9 +708,7 @@ impl Supervisor {
         // As many links to the supervisor as its objects may use at once:
         // each its outbound requests and a publish.
         let links = self.cfg.max_live_objects * (app.limits.max_outbound_concurrency + 1);
-        let mut spec = serde_json::to_vec(&(&app, uid, &p.component, std::process::id()))?;
-        spec.push(b'\n');
-        stdin.write_all(&spec).await?;
+        stdin.write_all(&serde_json::to_vec(&(&app, uid, &p.component, std::process::id()))?).await?;
         drop(stdin);
 
         // The worker's stderr goes to ours, tagged with its app, a line (of at
@@ -772,19 +758,19 @@ impl Supervisor {
                     }
                 }
                 if req.uri().path().starts_with(crate::telemetry::PATH) {
-                    let Ok(_slot) = slots.try_acquire() else { return verdict_ok(429) };
+                    let Ok(_slot) = slots.try_acquire() else { return verdict(429, "ok") };
                     return telemetry.handle(req, &app, &digest).await
                         .map(|r| r.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync()))
-                        .unwrap_or_else(verdict_ok);
+                        .unwrap_or_else(|status| verdict(status, "ok"));
                 }
                 if req.method() != http::Method::POST || req.uri().path().trim_end_matches('/') != "/publish" {
-                    return verdict_ok(404);
+                    return verdict(404, "ok");
                 }
                 let object = req.headers().get(ws::OBJECT_HEADER).cloned().unwrap_or_else(|| http::HeaderValue::from_static(""));
                 let status = http.post(format!("{proxy}/publish")).header(APP_HEADER, app).header(ws::OBJECT_HEADER, object)
                     .timeout(Duration::from_secs(30)).body(reqwest::Body::wrap(req.into_body())).send().await
                     .map_or(502, |r| r.status().as_u16());
-                verdict_ok(status)
+                verdict(status, "ok")
             }
         }));
 
@@ -827,7 +813,7 @@ impl Supervisor {
         let (requests, worker_requests) = UnixStream::pair()?;
         let (egress, worker_egress) = UnixStream::pair()?;
         let (a, b) = (worker_requests.as_raw_fd(), worker_egress.as_raw_fd());
-        let cgroup = self.cgroup.as_deref().map(Cgroup::new).transpose()?;
+        let cgroup = self.cgroup.as_ref().map(|(dir, _)| Cgroup::new(dir)).transpose()?;
         let into = cgroup.as_ref().map(|c| format!(" into {}", c.0.display())).unwrap_or_default();
         let procs = cgroup.as_ref().map(|c| c.0.join("cgroup.procs"));
         let procs = procs.map(|p| std::fs::OpenOptions::new().write(true).open(&p).with_context(|| format!("opening {}", p.display()))).transpose()?;
@@ -858,9 +844,7 @@ impl Supervisor {
         }
         let mut child = cmd.spawn().with_context(|| format!("spawning {}{into}", self.exe.display()))?;
         let mut stdin = child.stdin.take().expect("piped");
-        let mut spec = serde_json::to_vec(&self.cfg)?;
-        spec.push(b'\n');
-        stdin.write_all(&spec).await?;
+        stdin.write_all(&serde_json::to_vec(&self.cfg)?).await?;
         Ok(Spawned { child, stdin, requests, egress, cgroup })
     }
 
@@ -949,7 +933,7 @@ impl Drop for Cgroup {
 
 async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<RespBody> {
     match live.link.send(req).await {
-        // The body holds the worker until it has been read; see `drain`.
+        // The body holds the worker until it has been read; see `Worker::stop`.
         Ok(res) => res.map(|b| {
             b.map_frame(move |f| {
                 let _ = &live;
@@ -965,31 +949,13 @@ async fn forward(w: &Worker, live: Arc<Live>, req: Request<Body>) -> Response<Re
     }
 }
 
-/// Waits until nothing holds `old` but this (its requests have finished and
-/// their bodies have been read), or its longest request has had its time,
-/// then asks the worker to stop and waits for it to be gone: what still
-/// holds it can't keep it running beside the next version. Hung up on, a
-/// worker lets its objects finish their work after their answers, flushes
-/// its telemetry and exits (see `worker_main`); one that takes longer than
-/// that work may, and `STOP_TIMEOUT` more, is killed.
-async fn drain(old: Arc<Live>) {
-    let deadline = Instant::now() + old.drain;
-    while Arc::strong_count(&old) > 1 && Instant::now() < deadline && old.alive() {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    old.link.hang_up();
-    old.kill.send_replace(true);
-    old.kill.closed().await;
-}
-
-/// Drains `w`'s worker `l`, unless it has already gone; the next request
+/// Stops `w`'s worker `l`, unless it has already gone; the next request
 /// starts another.
 async fn retire(w: Arc<Worker>, l: Arc<Live>) {
     let _switching = w.starting.lock().await;
-    let old = w.live.lock().take_if(|live| Arc::ptr_eq(live, &l));
-    drop(l);
-    if let Some(old) = old {
-        drain(old).await;
+    if w.live.lock().as_ref().is_some_and(|live| Arc::ptr_eq(live, &l)) {
+        drop(l);
+        w.stop().await;
     }
 }
 
@@ -1012,19 +978,16 @@ async fn call(http: &reqwest::Client, proxy: &str, app: &str, host: &str, req: R
             res.headers_mut().insert(crate::egress::VERDICT, "ok".parse().unwrap());
             res
         }
-        Err(_) => {
-            let mut res = verdict_ok(502);
-            res.headers_mut().insert(crate::egress::VERDICT, "ConnectionRefused".parse().unwrap());
-            res
-        }
+        Err(_) => verdict(502, "ConnectionRefused"),
     }
 }
 
-/// A forwarded request's answer from the supervisor itself.
-fn verdict_ok(status: u16) -> Response<wasmtime_wasi_http::WasiBody> {
+/// A forwarded request's answer from the supervisor itself, with its
+/// `verdict` for the worker (see `egress::VERDICT`).
+fn verdict(status: u16, verdict: &'static str) -> Response<wasmtime_wasi_http::WasiBody> {
     let mut res = Response::new(Empty::new().map_err(|e| match e {}).boxed_unsync());
     *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
-    res.headers_mut().insert(crate::egress::VERDICT, "ok".parse().unwrap());
+    res.headers_mut().insert(crate::egress::VERDICT, http::HeaderValue::from_static(verdict));
     res
 }
 
@@ -1039,16 +1002,16 @@ fn get(pq: &str) -> Request<Body> {
 /// them the uid the app runs as (returned): the owner of its volumes if it
 /// has any, else the next free one. Ownership is the record, so a uid
 /// survives restarts and config changes.
-fn app_dirs(cfg: &NodeConfig, name: &str, uids: &Mutex<()>) -> anyhow::Result<Option<u32>> {
+fn app_dirs(cfg: &NodeConfig, name: &str) -> anyhow::Result<Option<u32>> {
+    /// Held while giving a new app its uid.
+    static UIDS: Mutex<()> = Mutex::new(());
     use std::os::unix::fs::MetadataExt;
     let volume = cfg.app_dirs(name)[0].clone();
-    std::fs::create_dir_all(&volume)?;
-    let ownership = std::fs::File::open(&volume)?;
-    ownership.try_lock().context("app storage is already owned or cannot be locked")?;
+    let _ownership = crate::app::lock(&volume)?;
     let uid = if unsafe { libc::geteuid() } != 0 {
         None
     } else {
-        let _one_at_a_time = uids.lock();
+        let _one_at_a_time = UIDS.lock();
         let base = cfg.jail_uid_base;
         let objects = cfg.data_dir.join("objects");
         let owner = |p: &Path| std::fs::metadata(p).ok().map(|m| m.uid()).filter(|&u| u >= base);
@@ -1143,32 +1106,31 @@ fn delegate(limits: &WorkerLimits) -> anyhow::Result<PathBuf> {
         bail!("the {c} controller is not available in {}", own.display());
     }
     let enable: Vec<_> = wanted.iter().filter(|(_, on)| *on).map(|(c, _)| format!("+{c}")).collect();
-    let write = |dir: &Path, file: &str, value: &str| {
-        std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(file), value)).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
-    };
     write(&own.join("supervisor"), "cgroup.procs", "0")?;
     write(&own, "cgroup.subtree_control", &enable.join(" "))?;
     write(&own.join("workers"), "cgroup.subtree_control", &enable.join(" "))?;
     Ok(own.join("workers"))
 }
 
+/// Writes `value` to cgroup `dir`'s `file`, making `dir` first if need be.
+fn write(dir: &Path, file: &str, value: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).and_then(|()| std::fs::write(dir.join(file), value)).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
+}
+
 /// Gives a worker's cgroup its app's worker limits.
 fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
-    let set = |file: &str, value: String| {
-        std::fs::write(dir.join(file), &value).with_context(|| format!("writing {value:?} to {}/{file}", dir.display()))
-    };
     if w.memory_mb > 0 {
         // A limit below what the worker holds already (its engine) would OOM-kill it.
         let held = std::fs::read_to_string(dir.join("memory.current")).ok().and_then(|m| m.trim().parse::<u64>().ok());
         let held = held.unwrap_or_default().div_ceil(1 << 20);
         anyhow::ensure!(held < w.memory_mb, "[worker] memory_mb = {} is below the {held} MiB a worker holds before it has an app", w.memory_mb);
-        set("memory.max", (w.memory_mb << 20).to_string())?;
+        write(dir, "memory.max", &(w.memory_mb << 20).to_string())?;
     }
     if w.cpus > 0.0 {
-        set("cpu.max", format!("{} 100000", (w.cpus * 100_000.0) as u64))?;
+        write(dir, "cpu.max", &format!("{} 100000", (w.cpus * 100_000.0) as u64))?;
     }
     if w.pids > 0 {
-        set("pids.max", w.pids.to_string())?;
+        write(dir, "pids.max", &w.pids.to_string())?;
     }
     Ok(())
 }
@@ -1176,20 +1138,18 @@ fn limit(dir: &Path, w: &WorkerLimits) -> anyhow::Result<()> {
 /// Counts what waits on the node to be shipped every 10 s, while the
 /// supervisor lives, for its snapshots, and says so when versions start to
 /// wait, every minute while they do, and when none does again.
-async fn count_backlog(sup: std::sync::Weak<Supervisor>) {
+async fn count_backlog(sup: std::sync::Weak<Supervisor>) -> Option<()> {
     let mut said = None::<Instant>;
     loop {
-        let Some(objects) = sup.upgrade().map(|s| s.cfg.data_dir.join("objects")) else { return };
-        let Ok(b) = tokio::task::spawn_blocking(move || crate::ship::backlog(&objects)).await else { return };
+        let objects = sup.upgrade()?.cfg.data_dir.join("objects");
+        let b = tokio::task::spawn_blocking(move || crate::ship::backlog(&objects)).await.ok()?;
         if b.versions > 0 && said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
             eprintln!("nanovm: {} versions ({} bytes) of {} objects wait to be shipped", b.versions, b.bytes, b.objects);
             said = Some(Instant::now());
         } else if b.versions == 0 && said.take().is_some() {
             eprintln!("nanovm: every version is shipped");
         }
-        let Some(s) = sup.upgrade() else { return };
-        *s.backlog.lock() = b;
-        drop(s);
+        *sup.upgrade()?.backlog.lock() = b;
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
 }
@@ -1199,21 +1159,18 @@ async fn count_backlog(sup: std::sync::Weak<Supervisor>) {
 /// lets its objects finish their work and flushes its telemetry before it
 /// exits.
 pub fn worker_main() -> anyhow::Result<()> {
-    use std::io::BufRead;
-    let mut input = std::io::stdin().lock();
-    let mut line = Vec::new();
-    input.read_until(b'\n', &mut line)?;
-    let cfg: NodeConfig = serde_json::from_slice(&line).context("worker spec: the node")?;
+    use serde::Deserialize;
+    // Two JSON values: the node's config, and later its app.
+    let mut spec = serde_json::Deserializer::from_reader(std::io::stdin().lock());
+    let cfg = NodeConfig::deserialize(&mut spec).context("worker spec: the node")?;
     // Before the jail, which stops raising the fd limit and reading sysctls.
     crate::engine::preflight(&cfg)?;
     // Before the app, which a spare worker waits for here. Neither starts
     // a thread, so the jail is still entered with one.
     let engine = crate::engine::build(&cfg)?;
     let linker = crate::app::linker(&engine)?;
-    line.clear();
-    input.read_until(b'\n', &mut line)?;
     let (app, uid, (digest, path), parent): (AppConfig, Option<u32>, (String, PathBuf), u32) =
-        serde_json::from_slice(&line).context("worker spec: the app")?;
+        Deserialize::deserialize(&mut spec).context("worker spec: the app")?;
     // The registry's cache is outside the jail.
     let wasm = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: the supervisor put these sockets at fds 3 and 4 and nothing
@@ -1258,7 +1215,7 @@ mod tests {
         let ownership = std::fs::File::open(&objects).unwrap();
         ownership.try_lock().unwrap();
         let before = ownership.metadata().unwrap();
-        let result = app_dirs(&cfg, "app", &Mutex::new(()));
+        let result = app_dirs(&cfg, "app");
         let after = ownership.metadata().unwrap();
         let untouched = !tmp.exists() && !cache.exists() && (before.uid(), before.gid()) == (after.uid(), after.gid());
         drop(ownership);
@@ -1271,7 +1228,7 @@ mod tests {
     /// verdict a worker trusts.
     #[test]
     fn verdicts_mark_the_supervisors_answers() {
-        let res = verdict_ok(204);
+        let res = verdict(204, "ok");
         assert_eq!(res.status(), 204);
         assert_eq!(res.headers()[crate::egress::VERDICT], "ok");
     }

@@ -27,9 +27,9 @@ secrets = "/etc/nanovm/secrets"
 # with cgroup = "auto" (the default) the supervisor uses the cgroup the unit
 # delegates to it (Delegate= in nanovm.service), and refuses to start
 # without one. "off" runs workers without them.
-# Clients that reach `listen` directly ([clients], see the proxy's): the
-# proxy, on loopback, is trusted by default; list it in [clients] trusted
-# if it runs on another host.
+# Connections of clients that reach `listen` directly ([clients], see the
+# proxy's): the proxy, on loopback, is trusted by default; list it in
+# [clients] trusted if it runs on another host.
 # What all of an app's objects may hold, and what the disk keeps free; 0
 # (the default) is a quarter and a twentieth (at most 1 GiB) of data_dir's
 # filesystem. Set them once you know the disk:

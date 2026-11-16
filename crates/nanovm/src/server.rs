@@ -11,14 +11,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body::{Body, Frame};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::object::{BoxError, RespBody, error_response};
+use crate::object::{BoxError, RespBody, empty_response, error_response};
 use crate::table::{BAD_OBJECT, Node, route};
 
 /// Serves HTTP/1.1 on every connection `listener` accepts.
@@ -28,18 +29,19 @@ where
     Fut: Future<Output = Response<RespBody>> + Send + 'static,
 {
     loop {
-        serve_conn(accept(&listener).await, None, f.clone());
+        serve_conn(accept(&listener).await.0, None, (), f.clone());
     }
 }
 
-/// The next connection on `listener`. An error, such as running out of file
-/// descriptors, is logged and waited out rather than ending the server.
-pub async fn accept(listener: &TcpListener) -> TcpStream {
+/// The next connection on `listener`, and its peer. An error, such as
+/// running out of file descriptors, is logged and waited out rather than
+/// ending the server.
+pub async fn accept(listener: &TcpListener) -> (TcpStream, std::net::SocketAddr) {
     loop {
         match listener.accept().await {
-            Ok((sock, _)) => {
+            Ok((sock, peer)) => {
                 let _ = sock.set_nodelay(true);
-                return sock;
+                return (sock, peer);
             }
             Err(e) => {
                 eprintln!("nanovm: accepting a connection: {e}");
@@ -142,17 +144,55 @@ pub fn body_timeout() -> Response<RespBody> {
     error_response(408, "body-timeout", &BodyTimeout.to_string())
 }
 
-/// Serves HTTP/1.1 on one connection, in its own task. With `header_timeout`,
-/// a client that takes longer to send a request's headers (or leaves the
-/// connection idle that long between requests) is hung up on.
-pub fn serve_conn<I, F, Fut, B>(io: I, header_timeout: Option<Duration>, f: F) -> tokio::task::JoinHandle<Result<(), hyper::Error>>
+// Hyper transfers I/O, not its service, to an upgrade consumer. Admission
+// follows that I/O; drop the socket before releasing its guards.
+struct Connection<I, G> {
+    io: I,
+    _guard: G,
+}
+
+impl<I: AsyncRead + Unpin, G: Unpin> AsyncRead for Connection<I, G> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl<I: AsyncWrite + Unpin, G: Unpin> AsyncWrite for Connection<I, G> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[std::io::IoSlice<'_>]) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+}
+
+/// Serves HTTP/1.1 on one connection, in its own task, holding `guard` until
+/// its I/O is dropped, even after an upgrade. With `header_timeout`, a client
+/// that takes longer to send a request's headers (or leaves the connection
+/// idle that long between requests) is hung up on.
+pub fn serve_conn<I, G, F, Fut, B>(io: I, header_timeout: Option<Duration>, guard: G, f: F) -> tokio::task::JoinHandle<Result<(), hyper::Error>>
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    G: Send + Sync + Unpin + 'static,
     F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response<B>> + Send + 'static,
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: Into<crate::object::BoxError>,
 {
+    let io = Connection { io, _guard: guard };
     let svc = service_fn(move |req| {
         let res = f(req);
         async move { Ok::<_, Infallible>(res.await) }
@@ -178,67 +218,41 @@ where
         return error_response(400, "bad-object-id", BAD_OBJECT);
     };
     let rest = if rest.is_empty() { "/" } else { rest };
-    let pq = match req.uri().query() {
-        Some(q) => format!("{rest}?{q}"),
-        None => rest.to_string(),
-    };
-
+    let pq = req.uri().query().map_or_else(|| rest.to_string(), |q| format!("{rest}?{q}"));
     let limit = (node.app.cfg.limits.max_request_body_kb << 10) as usize;
     let (mut parts, body) = req.into_parts();
     let body = match Limited::new(Paced::new(body), limit).collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) if timed_out(&*e) => return body_timeout(),
-        Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
-            return error_response(
-                413,
-                "request-too-large",
-                &format!("max_request_body_kb is {}", limit >> 10),
-            );
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => {
+            return error_response(413, "request-too-large", &format!("max_request_body_kb is {}", limit >> 10));
         }
         Err(e) => return error_response(400, "bad-request-body", &e.to_string()),
     };
-    let host = parts
-        .headers
-        .get(http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost");
-    parts.uri = match format!("http://{host}{pq}").parse() {
-        Ok(u) => u,
-        Err(_) => return error_response(400, "bad-uri", &pq),
-    };
+    let host = parts.headers.get(http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost");
+    let Ok(uri) = format!("http://{host}{pq}").parse() else { return error_response(400, "bad-uri", &pq) };
+    parts.uri = uri;
     node.dispatch(id, Request::from_parts(parts, body)).await
-}
-
-pub fn ok_json(v: serde_json::Value) -> Response<RespBody> {
-    Response::builder()
-        .header("content-type", "application/json")
-        .header("cache-control", "no-store")
-        .body(full(v.to_string()))
-        .unwrap()
-}
-
-fn full(b: impl Into<Bytes>) -> RespBody {
-    Full::new(b.into()).map_err(|e| match e {}).boxed_unsync()
 }
 
 async fn admin(node: &Arc<Node>, path: &str, headers: &http::HeaderMap) -> Response<RespBody> {
     match path {
-        "/ready" => Response::builder().status(204).body(full("")).unwrap(),
+        "/ready" => empty_response(204),
         "/lease" => {
             let session = headers.get(crate::lease::SESSION).and_then(|s| s.to_str().ok()?.split_once(' '));
             if let Some((Ok(id), Ok(until))) = session.map(|(i, u)| (i.parse(), u.parse())) {
                 node.renewed(id, until);
             }
-            Response::builder().status(204).body(full("")).unwrap()
+            empty_response(204)
         }
         p if p.starts_with("/evict/") => {
             node.evict(&p["/evict/".len()..]).await;
-            Response::builder().status(204).body(full("")).unwrap()
+            empty_response(204)
         }
         "/flush" => {
             let telemetry = node.telemetry.clone();
             let ok = tokio::task::spawn_blocking(move || telemetry.flush()).await.is_ok_and(|r| r.is_ok());
-            Response::builder().status(if ok { 204 } else { 503 }).body(full("")).unwrap()
+            empty_response(if ok { 204 } else { 503 })
         }
         _ => error_response(404, "not-found", path),
     }

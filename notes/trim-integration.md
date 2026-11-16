@@ -1,0 +1,92 @@
+# Integrated trim candidate
+
+The candidate combines PR #3's review fixes, all three corrected trim branches
+and the repaired current-v1 benchmark harness. It is based on `d86d94b`, the
+PR #5 merge into `beta/integration`. No published history was rewritten.
+
+## Merge decisions
+
+- Node: preserve schema-aware telemetry masking and enforce the 1 MiB cap
+  after identity stamping. Use prost's varint helpers.
+- Storage: preserve app-local in-flight growth accounting, zero-byte object
+  reclamation and shipping-head invalidation after deletion/recreation. Encode
+  complete node names in session keys so slash normalization cannot alias them.
+- Edge: preserve original response framing while enforcing byte caps. Put
+  connection admission on the underlying I/O in `server::serve_conn`, covering
+  public and worker-link upgrades. Retain cancelled-route reclamation.
+- Request-rate limits remain removed by owner decision. Connection caps remain;
+  the benchmark uses that one current-v1 contract, without old-format adapters.
+- Combine rustix's `process` and `time` features; both trims need them. Preserve
+  main's removed experiments and base64 0.23, and the review fix's memchr use.
+- Keep the parent failover and worker-OOM fixture corrections. Each node has
+  separate local storage; only capture storage is shared.
+
+Runtime, using CI's nonblank/noncomment count before test modules:
+**8,821 → 8,331, −490 lines (5.6%)**. This is a simplicity improvement, not
+evidence of a performance improvement. Documentation-only conflict resolutions
+retain all agents' evidence and distinct issue IDs.
+
+## Evidence and delivery
+
+Each corrected branch passed its combined library suite and production check.
+The framing, upgrade-lifetime, lease-key and telemetry-expansion regressions
+have failing baseline and caught-mutation evidence in their individual notes:
+
+- `trim-edge-framing.md`
+- `trim-node-telemetry.md`
+- `trim-storage.md`
+
+The aggregate full serial suite passed: **392 tests** (207 library, 1 config,
+11 dev, 29 examples, 127 integration, 17 JavaScript; 14 ignored). All ten
+multi-node tests ran. All **12 SQLite** cases and the production check passed.
+Commands use Rust 1.99.1, `env -u RUST_BACKTRACE`, `RUST_TEST_THREADS=1`
+and fd limit 20,000. Release binaries were rebuilt with `--release --features
+dev` in the separate `target/bench-release` directory.
+
+Privileged OOM, reserve refusal/recovery, app-budget isolation and full-disk
+new-object refusal passed. Administrative deletion passed with the capability
+bounding set extracted from the base systemd unit. An initial capsh invocation
+could not establish its requested capabilities; dropping the complement of
+the unit's bounding set corrected the runner. The actual deletion test then
+passed. Ordinary unprivileged suite counts include self-skipping privileged
+tests and are not used as evidence for those paths.
+
+The ops Python suites passed **18 tests** (8 installer, 6 history, 4 release);
+the benchmark harness passed its separate **18 tests**. The final trimmed
+release passed an actual registry/CLI/admin/collector/Rust/JS smoke run and
+exported fresh live/store counts of 1/1 for the seed object. These smoke
+counts validate wiring, not performance. No new strict lint/format clearance.
+
+PR #3 is merged as `ba87b87`, after both combined-head CI runs passed.
+The trim branch records that main merge without changing source. Both exact-head
+CI runs at `e28573e` passed. Fresh idle-machine measurements are complete:
+240 valid HTTP records over three rounds, no measured HTTP/transport errors;
+longer alternating CPU ranges overlap with pre-trim main, including SQLite.
+Default c256 export is incomplete on both builds; three c3 invocations deliver
+every expected span. See [results, ranges and limitations](bench-numbers/2026-11-16.md).
+Final benchmark/docs CI and main integration remain pending; no deployment.
+
+## Live-restore fixture ordering (N-962)
+
+CI 43819965326 failed the `restores_an_object_and_an_app_into_a_running_node`
+app-list assertion; the other run on the same head passed. The unchanged local
+test also failed. A temporary diagnostic reproduced the failure with B's shipped
+head 0, no B directory in the store and its writer still running. A passing
+invocation had already shipped head 69. The fixture had not synchronized B's
+first successful write/shipment before asserting store visibility.
+
+Wait with the existing bounded helper until B has a shipped head, then exercise
+A's restores while B continues writing. Keep the exact version lists, restored
+counts, uninterrupted B counts and final backlog checks. Twenty consecutive
+fixed invocations pass. Runtime-line delta 0; no measured binary changes.
+
+Removing only that wait reproduced the same app-list failure (mutation caught).
+Restored from the staged fixed test and confirmed an empty unstaged test diff
+before rebuilding for the complete integration suite. Temporary diagnostics are
+not retained. Logs are under `.amp/in/orb-backup/pr3/trim-restore-*`.
+
+Restored full integration suite: **127 passed, 0 failed, 13 ignored**, 137.12 s,
+including all ten multi-node cases. Command: `env -u RUST_BACKTRACE
+RUST_TEST_THREADS=1 CARGO_BUILD_JOBS=1 cargo +1.99.1 test --locked -p nanovm
+--test integration`, with fd limit 20,000. The ignored SQLite/Internet cases and
+self-skipping privileged tests are not new evidence for those paths.

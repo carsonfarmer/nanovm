@@ -4,6 +4,146 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
+## Aggregate trim candidate (2026-11-16)
+
+`fix/trim-integration` combines all three corrected trims with PR #3's fixes
+and the repaired benchmark harness. Runtime is 8,331 (−490 versus PR #3).
+The combined suite passes 392 tests, all 12 SQLite cases pass, and production
+and release builds pass. Privileged OOM/disk/deletion checks and final-release
+Rust/JS/collector wiring pass. Fresh aggregate measurements are now complete.
+Decisions and evidence are in `notes/trim-integration.md`. PR #5 and PR #3
+are merged; main is `ba87b87`. PR #6 holds the trims; its `e28573e` CI passed.
+Final benchmark/docs CI and main integration remain before delivery is complete.
+
+The final benchmark/docs head exposed N-962: one CI run failed the live-restore
+fixture while the other passed. Local reproduction confirmed B had not shipped
+its first version when the test expected it in the store. The fixture now waits
+for B's first shipped head before A's restore sequence; all continuous write and
+restore checks remain. Twenty consecutive fixed invocations pass. This is a
+test-only ordering correction, not a backup/runtime or benchmark change.
+Removing the wait reproduces the failure; after restoration, the full integration
+suite passes (127 passed, 13 ignored). Fresh remote CI is still required.
+
+The otherwise idle four-vCPU HTTP campaign completed 240 valid records over
+three rounds: 16,617,893 HTTP 200 and 1,500 HTTP 204 responses, no transport
+errors. Direct c64 medians: Rust GET 27,372/s, spread counter writes 2,976/s,
+JS GET 11,857/s, JS writes 2,316/s. Verified density is 120.3 KiB/object through
+6,001 live objects. Ordinary HTTP uses local acknowledgements and no collector.
+Three longer alternating runs with five repetitions each found no consistent
+CPU regression against pre-trim main, including SQLite; ranges overlap.
+
+Default c256 full export failed exact span accounting on both binaries. The
+benchmark-only `--export-concurrency` option keeps default 256 and the mandatory
+601,000-span check; c3 received every span in three invocations, at median
+54,100/s including drain (51,184–54,214). Do not report the incomplete c256
+rate as lossless capacity or as a new trim regression. No runtime change.
+Full ranges, commands, provenance and limitations:
+[fresh measurements](notes/bench-numbers/2026-11-16.md). Raw evidence is retained
+under `.amp/in/orb-backup/bench-current`; failed attempts remain separate.
+
+Actual pilot follow-through: timed HTTP/1 requests now drain at deadline instead
+of being cancelled. Hot-object success measurements use 1/16/64 clients because
+256 overflows the default queue of 64; spread measurements retain 256. Both
+aborted pilots remain invalid and excluded. Twenty harness tests pass, including
+before/after evidence for these corrections. Runtime-line delta 0.
+
+The first full attempt then stalled because app restart killed the supervisor's
+spare as well as its app worker. Restart now selects only the admin-reported app
+PID and bounds its reaping wait. All 21 harness tests and a real restart/cold
+object/syscall/density probe pass. The completed three-round pilot remains only
+offered-rate calibration; full tables restart in fresh roots. No runtime change.
+
+## Benchmark harness correction (2026-11-16, fix/benchmark-validity)
+
+The Python harness now uses only current v1 config/admin/collector contracts,
+fresh absolute work/output paths, explicit failure gates and build identity.
+Density has its own clean stack and one-hour node/app retention; it checks every
+creation batch and exact exported live/store increments on one worker PID before
+using its RSS delta. HTTP failures abort comparisons. The current integrated
+contract includes `origin/trim/edge` (`2efdd1a`): configs inherit connection-only
+client defaults, and the request-rate/app-rate/X-Forwarded-For benchmark is removed.
+No connection-limit replacement benchmark is added. Summaries reject mixed
+commit/binary/workload identity, rates and duplicate rounds. Invalid aggregate-child
+RSS / attempted-object density evidence must not be reused.
+
+Validation only: 18 Python tests, a disposable fixture subprocess, four initial
+and three edge-contract source mutations caught and restored; no actual benchmark,
+compile or server startup. Runtime-line
+delta 0. [Protocol, evidence, exact fresh integrated-build commands and limitations](notes/bench-numbers/README.md).
+Parent must run the full release matrix only after all other VM workloads stop;
+this harness commit provides no new performance numbers and is not pushed.
+
+## Node trim telemetry fix (2026-11-16)
+
+On `fix/trim-node-telemetry`, based on `trim/node` at `228aa38`, N-903 restores
+the outgoing 1 MiB cap at `Relay::send`, after trusted identity stamping. Hostile
+trace/log batches below the incoming cap expand to 1 MiB + 1 and are refused
+without collector export; exact-cap controls succeed. The regression fails
+before the fix and with the guard removed. Restoring the guard passes all seven
+telemetry tests again. All 194 enabled unit tests (one ignored) and the production
+check pass. Runtime delta: +1 (8,634 → 8,635). No integration/demo or matched CPU
+benchmark run in the resource-constrained parallel-build orb; no performance
+clearance is claimed. No push or PR. [Evidence](notes/trim-node-telemetry.md).
+
+**PR #3 integration:** merged committed local `fix/pr3-review` at `9965f46`
+without textual conflicts, retaining node trims, string-aware protobuf masking,
+host-escaped secret masking, outgoing cap, cleanup deletions and base64/memchr.
+Combined checks pass: nine telemetry tests, six secrets tests, 206 library tests
+(one ignored) and production check. Runtime is 8,745 (+110 from the node fix,
+−76 versus the pinned PR #3 parent). Parent-owned later follow-ups and aggregate
+validation remain separate. No push or PR; the disposable worktree target is
+removed after validation. The evidence note records exact commands and scope.
+
+## Storage trim blocker (TS-2, 2026-11-16)
+
+`fix/trim-storage-keys`, based on `trim/storage` a952a43, fixes session aliasing
+between node names such as `east` and `east/`. Renewals and holder checks use
+one unpadded base64url segment for the full name; no configuration restriction,
+new dependency or compatibility reader. Runtime +1 line. The new live-lease
+regression fails before the fix and with renewal encoding removed. Restored
+library suite passes (195 passed, one ignored), as do production check and
+rustdoc (ten existing warnings). Strict clippy retains 15 existing diagnostics
+outside lease; the tree is not rustfmt-clean. No full guest/integration suite,
+S3 or performance clearance claimed. Evidence: `notes/trim-storage.md`.
+Own worktree only; commit delivered to the coordinator, no push or PR.
+
+**PR3 integration:** merged committed local `fix/pr3-review` at 9965f46 into
+this branch, preserving the storage trim, TS-2 and all retained PR3 proofs.
+Quota's outstanding grants and release paths now use the trim's single
+`Park::disk`; `Disk::default` stays test-only. Shipping revalidates its cached
+head against the local shipped marker after deletion/recreation. Cleanup
+deletions and base64 0.23/memchr are retained. N-930–N-938 text is unchanged.
+Quota 18, ship 21 (one ignored), lease 7 and full library 207 (one ignored)
+pass serially; production check passes. Runtime 8,638: +110 versus TS-2's
+first parent, -183 versus the PR3 parent. This worktree's target is removed
+after checks. Parent owns aggregate integration suites and benchmarks and its
+uncommitted follow-ups; no broader sign-off implied. Details in the trim notes.
+
+## Trim edge framing fix (2026-11-16)
+
+N-960 restores response byte counting in `GuardedBody` while preserving the
+guest's HTTP size hint. The worker-link regression fails on `2efdd1a` with
+Hyper's conflicting Content-Length panic and passes with the fix; disabling cap
+enforcement makes it fail again. Exact-cap and below-cap controls remain whole.
+The complete serial unit suite passed (193 passed, one ignored). Runtime delta
+is +10 lines. The approved rate-limit removal is untouched. No push, PR or
+deployment; the parent owns delivery. See [evidence](notes/trim-edge-framing.md).
+Release-mode, jailed-Wasm integration and idle-machine throughput benchmarks
+were not run for this focused worker-link fix.
+
+The edge branch also integrates committed local `fix/pr3-review` at `9965f46`
+(not `origin/main` or the parent's uncommitted follow-ups). The parent's
+admission-lifetime fix now lives in shared `server::serve_conn` I/O, covering
+both public gate and internal worker-link upgrades; its JoinHandle return is
+retained for the real disconnected-lookup proof. Both real upgrade regressions
+pass and fail when guards are moved back into the HTTP service. Experiments
+and rate limits stay removed; framing and lint findings use N-960/N-961 without
+colliding with PR3's N-930–N-938. Integration evidence is in the same note.
+After restoring the upgrade mutation, the integrated serial library suite passed
+(206 passed, one ignored, 61.23s); all three proxy cancellation controls also
+passed in a focused rerun. Runtime is 8,590 lines: +100 versus the framing
+branch before integration, -231 versus the committed PR3 parent.
+
 ## Current state (2026-11-08)
 
 **PR #3 review follow-up (2026-11-14):** local `fix/pr3-review` addresses the
@@ -116,6 +256,7 @@ fencing. No guest changes, publishing, automatic pruning or promotion.
 
 ## Historical checkpoints (superseded by current state above)
 
+- **Trim pass, the node's files (2026-11-14, `trim/node`):** supervisor, telemetry, table, main, config, app, admin, lib go from 2,421 to 2,344 runtime lines (8,711 to 8,634 in all) with no behaviour removed: one `Worker::stop` for every worker retirement, prost's varints, one request span, the worker spec as two JSON values, `app::link`/`app::lock`, and smaller repeats (`notes/trim-node.md`). The targets (2,058, aim 1,816) are not reached without removing behaviour; the note lists what remains and why. No config key removed. Code the node's files repeat in storage's and edge's files is N-902; a test gap found on the way is N-901.
 - **CI follow-through (N-43):** backup/restore is on main through `721b667`; main CI 42313034048 passed. Parallel branch CI 42313030490 exposed the old max-apps test's 600/900 ms busy-window assumption (expected refusal, got 200). `deterministic-app-admission-test` replaces those sleeps with observed gated upstream requests. An injected 1100 ms delay fails the old fixture and passes the correction; permitting busy-worker eviction fails the corrected test. Both probes restored with `git checkout --`, empty unstaged diff verified. Restored full locked suite passes 99 unit/69 integration, 12 ignored. Runtime remains 5,085 lines; no guest changes. Prior recovery demo/benchmark evidence remains applicable, not newly measured for this test-only correction.
   - **Successor prompt:** finish exact-head CI and fast-forward delivery of N-43. Preserve Q88's stopped-writer backup contract and fresh-root restore requirement. Independent nice-to-haves remain isolated in their own thread/archives; do not import them into recovery changes without review. No production deployment or remote durability is claimed.
 - **Backup is shipping; restore runs live (2026-11-13, `beta/recovery`, B-500):** continuous shipping to `capture.store` replaces the restic backup below, which is removed; `nanovm admin … restore` restores one object (head or earlier version, made the version after the head) or an app's objects into a running node; a store outage no longer refuses writes after 16 versions (B-501). See `notes/beta-recovery.md`.
@@ -549,6 +690,7 @@ Decisions from the design interview (Q numbers as used in the conversation):
 | Q88 | (Superseded 2026-11-13 by shipping as the backup and live restore, B-500.) Offline backup/restore is operator tooling around restic, not another runtime API or custom archive. Stop all writers throughout backup, hold existing app locks, preserve the complete objects/journal tree, and approve only exit-zero snapshots. Restore an exact full ID to a nonexistent root, verify then sync before serving. Preserve numeric owners and deployment identity separately; fence the old writer before cutover. No live snapshot, external-effect rollback, automatic retention, off-node durability or failover claim. Keep restic in the caller's cwd so credentials keep their meaning; extract to temporary storage inside the fresh root, then move the verified objects subtree without copying it again. |
 | Q89 | W-9 engineering research starts with a bounded immutable full-version protocol using the actual journal, separate from production acceptance. Ordered sequence/parent hashes and fixed stream identity are not authentication or fencing. Preserve both commit gates; close local commit/capture crash windows before runtime integration. Acknowledgement/RPO, remote failure domain and automatic promotion remain undecided. The owner clarifies that 5k is a simplicity goal, not a hard limit. |
 | Q90 | Engineering continuation stages bounded streaming TAR captures before the existing journal commit decision, discards staging before rollback, and completes immutable hard-link publication before new mutations. Optional operator capture defaults off; full byte/version caps reject new dirty commits, no automatic pruning. Local durable acknowledgement is unchanged. Same-host capture recovery is not remote durability or permission to promote a second writer. |
+| Q91 | (2026-11-14, trim pass) No request-rate limits in nanovm: `[clients] rate` and `app_rate` (100/s per client, 1,000/s per app, 429) are removed with `governor`. A fixed per-app cap throttles legitimate traffic below what a node serves and protects nothing the per-worker CPU and memory caps, the per-request CPU budget, connection caps and disk budgets don't already protect. Operators who want rate limits put them at the edge (Caddy, a CDN). Connection caps (`connections_per_client`, `connections`) and `trusted` (whose connections aren't capped per client) stay. |
 
 Phases ([PLAN.md](PLAN.md)): 3 signed OCI deploys, 4 key-value and config, 5 WebSockets, 6 per-request commits, 6b calls between objects (all done); then PLAN's "Roadmap", starting with the front proxy.
 

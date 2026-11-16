@@ -3,7 +3,7 @@
 //!
 //!     scripts/build-guests.sh
 //!     cargo run --release --example bench [-- --quick] [-- --json out.json] [-- --cold N]
-//!     cargo run --release --example bench -- --export
+//!     cargo run --release --example bench -- --export [--export-concurrency N]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -108,7 +108,13 @@ fn row(name: &str, r: &Run, note: &str) {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--export") { return full_export().await; }
+    if args.iter().any(|a| a == "--export") {
+        let conc = match args.iter().position(|a| a == "--export-concurrency") {
+            Some(i) => args.get(i + 1).context("missing export concurrency")?.parse::<std::num::NonZeroUsize>()?.get(),
+            None => 256,
+        };
+        return full_export(conc).await;
+    }
     if args.iter().any(|a| a == "--writes") { return writes().await; }
     let quick = args.iter().any(|a| a == "--quick");
     let json_out = args
@@ -348,7 +354,7 @@ async fn writes() -> anyhow::Result<()> {
 
 /// Count actual decoded request spans, not just successful HTTP exports.
 /// The sink shares this process/CPU allocation; it is not a production Collector.
-async fn full_export() -> anyhow::Result<()> {
+async fn full_export(conc: usize) -> anyhow::Result<()> {
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full, Limited};
     use opentelemetry_proto::tonic::collector::{trace::v1::ExportTraceServiceRequest, logs::v1::ExportLogsServiceRequest};
@@ -377,11 +383,12 @@ async fn full_export() -> anyhow::Result<()> {
         }
     }));
     let n = node("export", "counter", 1100, Some(endpoint))?;
-    let cold = load(&n, "GET", "/", 1000, 64, |i| format!("o{i}")).await;
+    let cold = load(&n, "GET", "/", 1000, conc.min(64), |i| format!("o{i}")).await;
     anyhow::ensure!(cold.failed() == 0, "cold requests failed: {:?}", cold.failures);
+    println!("export_concurrency={conc}");
     let started = Instant::now();
     for _ in 0..3 {
-        let run = load(&n, "GET", "/", 200_000, 256, |i| format!("o{}", i % 100)).await;
+        let run = load(&n, "GET", "/", 200_000, conc, |i| format!("o{}", i % 100)).await;
         row("warm GET with decoded OTLP", &run, "");
         anyhow::ensure!(run.failed() == 0, "warm requests failed: {:?}", run.failures);
     }

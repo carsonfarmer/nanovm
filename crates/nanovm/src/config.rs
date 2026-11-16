@@ -120,26 +120,19 @@ config! {
 }
 
 /// An app as its worker runs it: from its registry config, within the
-/// node's limits.
+/// node's limits. The supervisor sends it whole in a worker's spec.
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub name: String,
     /// Manifest digest assigned by the supervisor, not the guest manifest.
-    #[serde(default)]
     pub digest: String,
     /// Extra environment variables visible to the guest.
-    #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Values the guest reads through `wasi:config/store`.
-    #[serde(default)]
     pub config: BTreeMap<String, String>,
     /// The operator's secrets for the app, read with (and over) `config`.
-    #[serde(default)]
     pub secrets: crate::secrets::Secrets,
-    #[serde(default)]
     pub limits: Limits,
-    #[serde(default)]
     pub worker: WorkerLimits,
 }
 
@@ -189,22 +182,16 @@ config! {
 }
 
 config! {
-    /// What one client, and one app, may ask of a public listener (see
+    /// The connections clients may hold open to a public listener (see
     /// `gate`). 0 turns a limit off.
     pub struct ClientLimits {
-        /// Requests a second from one client address (an IPv6 /64), with
-        /// bursts of twice that.
-        rate: u32 = 100u32,
-        /// Requests a second to one app, with bursts of twice that.
-        app_rate: u32 = 1000u32,
-        /// Connections open at once from one client address.
+        /// Connections open at once from one client address (an IPv6 /64).
         connections_per_client: usize = 256usize,
         /// Connections open at once in all: past it, new ones wait.
         connections: usize = 10_000usize,
-        /// Peers that forward other clients' requests (a TLS terminator, the
-        /// proxy), as addresses or CIDR ranges. Their own requests and
-        /// connections aren't limited, and a request's client is the last
-        /// address in its `X-Forwarded-For` that isn't one of theirs.
+        /// Peers that forward other clients' connections (a TLS terminator,
+        /// the proxy), as addresses or CIDR ranges: theirs aren't capped
+        /// per client.
         trusted: Vec<String> = vec!["127.0.0.1".to_string(), "::1".to_string()],
     }
 }
@@ -268,15 +255,18 @@ config! {
 }
 
 impl Limits {
-    /// `self` with every numeric limit capped at `max`'s.
-    pub fn clamped(&self, max: &Limits) -> Limits {
+    /// `self` with every numeric limit capped at `max`'s, and those it
+    /// lowered: each one's name, what `self` asked, and `max`'s.
+    pub fn clamped(&self, max: &Limits) -> (Limits, Vec<(String, u64, u64)>) {
         let (mut v, max) = (serde_json::json!(self), serde_json::json!(max));
+        let mut lowered = vec![];
         for (k, x) in v.as_object_mut().expect("limits are a struct") {
-            if let (Some(a), Some(b)) = (x.as_u64(), max[k].as_u64()) {
-                *x = a.min(b).into();
+            if let (Some(a), Some(b)) = (x.as_u64(), max[k].as_u64()) && a > b {
+                lowered.push((k.clone(), a, b));
+                *x = b.into();
             }
         }
-        serde_json::from_value(v).expect("same shape")
+        (serde_json::from_value(v).expect("same shape"), lowered)
     }
 }
 
@@ -427,7 +417,10 @@ mod tests {
             egress: vec!["*.other".into()],
             ..Limits::default()
         };
-        let c = mine.clamped(&max);
+        let (c, lowered) = mine.clamped(&max);
+        let mut names: Vec<_> = lowered.iter().map(|(k, ..)| k.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["max_queue", "memory_mb"], "{lowered:?}");
         assert_eq!(
             (c.memory_mb, c.cpu_ms, c.max_queue, c.max_resources),
             (32, 1, 8, 0)
@@ -435,7 +428,7 @@ mod tests {
         assert_eq!(c.egress, ["example.com"]);
         assert_eq!(c.request_timeout_ms, Limits::default().request_timeout_ms);
         let d = Limits::default();
-        assert_eq!(serde_json::json!(d.clamped(&d)), serde_json::json!(d));
+        assert_eq!(serde_json::json!(d.clamped(&d).0), serde_json::json!(d));
     }
 
     /// Validation refuses a listen address that isn't one, dev mode off

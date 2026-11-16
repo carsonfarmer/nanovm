@@ -9,6 +9,11 @@ structure. Disk admission bounds each app's in-flight growth by sampled
 headroom. A strict physical reserve across workers and journal allocations
 requires a separate storage-allocation design; the threshold does not provide it.
 
+The trim/PR3 integration holds gate and worker-link admission in the shared
+`server::serve_conn` I/O wrapper. Hyper transfers this wrapper to upgrade
+consumers; dropping an HTTP service or its completed task does not free a live
+upgraded connection's slots.
+
 **Current priority (2026-11-08):** offline backup and N-43 are delivered and tested.
 Next is W-9 committed-state capture/transfer and recovery groundwork, then W-10
 placement/fencing. This sequence is not approval of a replication or failover policy.
@@ -34,6 +39,7 @@ Done means:
 - `cargo test` proves each guarantee against hostile guests.
 - `examples/bench.rs` prints cold-start, warm-latency, throughput and density numbers.
 - `demo/demo.sh` drives thousands of objects and the attack storm over HTTP. Observability uses OTLP; the demo reads a local collector's JSON file. The node has no stats/events HTTP APIs.
+- OTLP relay bodies are limited to 1 MiB both on receipt and at collector send, after trusted identity stamping; expansion beyond the outgoing cap is refused, not truncated.
 
 ## Architecture
 
@@ -117,6 +123,7 @@ nanovm/
   })
   ```
   `from_http` takes scheme and authority from the URI only, so `server.rs` rebuilds the URI as `http://{Host}{path}` before dispatch. The request body is collected (capped at `max_request_body_kb`) before it reaches the actor.
+- **Response cap and framing:** `GuardedBody` counts data-frame bytes, refuses a frame that would exceed the cap, and forwards the guest's size hint unchanged. The cap is not a replacement Content-Length: HTTP must poll beyond an exact-cap prefix to discover an oversized body's error.
 - **Work after the answer:** a guest trap ends the store's run, so one before the node has the answer fails the request, and one while the client still reads the body cuts it. So the future `response.new` gives the guest resolves only once the wrapped body is dropped (read whole, or the client gone), and the SDKs start `after` work, and fail work after the answer, only after it (README "Commits").
 - **Deadlines:** the run_concurrent future is wrapped in an outer `poll_fn` that reads a shared `(phase, since)`. On expiry it drops the future and the Store. Upstream documents timeouts inside run_concurrent as unreliable.
 
@@ -242,6 +249,20 @@ Each test spins up a `Node` in-process with small limits.
 - **Leaks:** RSS and open fds stay flat over long runs and churn. *(Not written yet.)*
 
 ## Benchmarks (`examples/bench.rs`)
+
+The HTTP matrix in `notes/bench-numbers/drive.py` uses only the current v1
+contract, including connection-only client limits; request rates belong at the
+edge. HTTP errors invalidate comparisons. Density uses a fresh dedicated app/stack,
+one-hour node and app retention, fresh exported live/store increments and one target worker's
+RSS. Summaries reject duplicate rounds, mixed build identities and offered rates.
+See the [protocol and validation evidence](notes/bench-numbers/README.md) and
+[2026-11-16 integrated release results](notes/bench-numbers/2026-11-16.md).
+The three-round HTTP campaign and longer alternating CPU comparison are complete;
+near-saturation tails and incomplete default c256 export remain explicit limits.
+`bench --export --export-concurrency N` selects positive load concurrency without
+changing the default of 256, telemetry bounds or exact decoded-span validation.
+Three complete c3 invocations measured 54.1k/s including drain; this is an
+in-process sink, not production Collector/jailed HTTP capacity.
 
 `cargo run --release -p nanovm --example bench -- [--quick] [--json out.json]`. Results are printed as a table; `--json` also saves them. The latest results are in [README.md](README.md).
 1. Compile time and `.cwasm` load time.
@@ -614,6 +635,7 @@ Each item has an entry in [ISSUES.md](ISSUES.md) (`W-n`) where its status is tra
    - **Committed versions shipped off the node:** separate three concerns: coherent tentative state that can be rejected, local commit, and acknowledgement after the selected durability policy. Undo logging is today's implementation, not a requirement; snapshots, copy-on-write or transactional storage are valid candidates. Replication needs ordered committed content/namespace changes or immutable snapshot manifests, not merely the current undo log. Capture the committed version before subsequent writes can alter it. Include object identity, sequence and fencing epoch; replay must be idempotent. Decide whether success means local durability, remote backup or a regional quorum before promising failover guarantees. Async replication implies a nonzero loss window. (W-9)
    - **Placement and leases:** the proxy places each object on a home node (rendezvous hashing to start); a node takes a lease with an epoch before instantiating an object, and every commit carries the epoch, so a node that lost its lease can't commit. On one node the lease is always granted, so the hook can land early. (W-10)
      - **Built on `cf/multinode`:** leases in an object store with conditional writes, one session record renewed per node; another node takes an object after seeing its holder's session unchanged for `lease_ms`, ending that session first, so no clock sync is needed. Nodes refuse (421) and evict what they lost; commits check the lease (`Node::lease_epoch`), and calls between objects go through the proxy carrying their callers. Joining the epoch to W-9's versions and fencing them at the store is W-90. Design, safety argument and open decisions: `notes/multinode.md`.
+     - **Session identity:** the complete node name is an unpadded base64url segment under `nodes/`, independent of object-store path normalization. Renewals and holder checks use the same key; distinct names cannot end each other's sessions.
    - **Requests that don't write can run in parallel** (Q50): stateless routes on any node, and read-only requests on read replicas of an object fed by committed change records. On one node it needs care: the undo journal writes in place, so a concurrent reader would see uncommitted data. (W-11)
 9. **Cleanups:** the rest of the review's removable-code list (registry cache and re-hash, config memory checks), for the agent doing the rewrite. (W-13)
 

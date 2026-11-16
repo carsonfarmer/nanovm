@@ -28,7 +28,7 @@ use wasmtime_wasi::p3::bindings::filesystem::types::{
     self, Advice, DescriptorFlags, DescriptorStat, DescriptorType, DirectoryEntry, ErrorCode, Filesize,
     HostDescriptorWithStore, MetadataHashValue, NewTimestamp, OpenFlags, PathFlags,
 };
-use wasmtime_wasi::p3::filesystem::{FilesystemError, FilesystemResult};
+use wasmtime_wasi::p3::filesystem::FilesystemResult;
 use wasmtime_wasi::{FsPerms, OpenMode};
 
 use crate::config::Limits;
@@ -43,8 +43,8 @@ pub fn add_to_linker(linker: &mut Linker<ObjState>) -> wasmtime::Result<()> {
     wasmtime_wasi::p3::cli::add_to_linker(linker)?;
     wasmtime_wasi::p3::clocks::add_to_linker(linker)?;
     wasmtime_wasi::p3::random::add_to_linker(linker)?;
-    types::add_to_linker::<_, QuotaFs>(linker, |s| QuotaView(s))?;
-    preopens::add_to_linker::<_, QuotaFs>(linker, |s| QuotaView(s))?;
+    types::add_to_linker::<_, QuotaFs>(linker, fs)?;
+    preopens::add_to_linker::<_, QuotaFs>(linker, fs)?;
     Ok(())
 }
 
@@ -63,13 +63,6 @@ pub struct Disk {
     /// Growth granted to operations that have not yet finished allocating.
     pending: Mutex<u64>,
     pub reserve: u64,
-}
-
-impl Default for Disk {
-    /// No budget and no reserve.
-    fn default() -> Disk {
-        Disk { used: AtomicU64::new(0), max: u64::MAX, idle: Mutex::default(), fs: None, pending: Mutex::new(0), reserve: 0 }
-    }
 }
 
 impl Disk {
@@ -179,8 +172,6 @@ struct Inner {
     max_files: u64,
     bytes: u64,
     files: u64,
-    /// Its app's, which `bytes` counts in.
-    disk: Arc<Disk>,
     /// What the current request changed in the volume, to commit or roll
     /// back. Its log and removed files may each hold as much as the volume,
     /// bounding logical content to three quotas. Filesystem block rounding
@@ -205,8 +196,7 @@ impl QuotaGuard {
             max_files: limits.max_files,
             bytes,
             files,
-            park: Park { disk: disk.clone(), id: obj.id.clone(), counted: bytes, volume: journal.volume().into(), removed: 0 },
-            disk,
+            park: Park { disk, id: obj.id.clone(), counted: bytes, volume: journal.volume().into(), removed: 0 },
             journal,
             denials: 0,
             metrics,
@@ -223,11 +213,11 @@ impl QuotaGuard {
         let end = at.checked_add(buf.len() as u64).ok_or(ErrorCode::Overflow)?;
         let mut q = self.0.lock();
         let room = before + q.max_bytes.saturating_sub(q.bytes);
-        let (got, short) = q.disk.grant(end.min(room).saturating_sub(before));
+        let (got, short) = q.park.disk.grant(end.min(room).saturating_sub(before));
         let allowed_end = end.min(room).min(before + got);
         if allowed_end <= at && !buf.is_empty() {
-            q.disk.add(-(got as i128));
-            q.disk.finish(got);
+            q.park.disk.add(-(got as i128));
+            q.park.disk.finish(got);
             return Err(if end > room { q.full() } else { q.deny(ErrorCode::InsufficientSpace, short) });
         }
         let n = q.journaled(|j| j.writing(file, at, allowed_end)).and_then(|()| {
@@ -235,7 +225,7 @@ impl QuotaGuard {
         });
         let grown = n.as_ref().map_or(0, |n| before.max(at + *n as u64) - before);
         q.set_bytes(|b| b + grown, got);
-        q.disk.finish(got);
+        q.park.disk.finish(got);
         n
     }
 
@@ -247,14 +237,14 @@ impl QuotaGuard {
             return Err(q.full());
         }
         let grown = size.saturating_sub(before);
-        let (got, short) = q.disk.grant(grown);
+        let (got, short) = q.park.disk.grant(grown);
         let done = match got < grown {
             true => Err(q.deny(ErrorCode::InsufficientSpace, short)),
             false => q.journaled(|j| j.writing(file, size, before)).and_then(|()| file.set_len(size).map_err(|_| ErrorCode::Io)),
         };
-        q.disk.finish(got);
+        q.park.disk.finish(got);
         if let Err(e) = done {
-            q.disk.add(-(got as i128));
+            q.park.disk.add(-(got as i128));
             return Err(e);
         }
         // A removed file's bytes were freed when it was removed; growing it
@@ -271,14 +261,10 @@ impl QuotaGuard {
             return Err(q.deny(ErrorCode::Quota, what));
         }
         // An entry takes space too: none below the node's reserve.
-        match q.disk.low() {
+        match q.park.disk.low() {
             Some(why) => Err(q.deny(ErrorCode::InsufficientSpace, why)),
             None => Ok(()),
         }
-    }
-
-    fn refuse(&self, code: ErrorCode, what: &str) -> FilesystemError {
-        self.0.lock().deny(code, what.to_string()).into()
     }
 
     pub fn journal<T>(&self, f: impl FnOnce(&mut Journal) -> std::io::Result<T>) -> Result<T, ErrorCode> {
@@ -317,11 +303,8 @@ impl QuotaGuard {
         }
         self.journal(|j| {
             j.renamed(from, to);
-            Ok(())
+            file.as_ref().map_or(Ok(()), |(slot, bytes)| j.discard_created(slot, *bytes))
         })?;
-        if let Some((slot, bytes)) = file {
-            self.journal(|j| j.discard_created(&slot, bytes))?;
-        }
         self.adjust(0, -(dir as i64));
         Ok(())
     }
@@ -376,7 +359,8 @@ impl Drop for Inner {
     }
 }
 
-/// An instance's usage, handed to its app when the instance ends: then
+/// An instance's usage, and its app's (`disk`, which `Inner::bytes` counts
+/// in), handed to its app when the instance ends: then
 /// what the object's volume holds is the app's while it has no instance,
 /// measured once the journal's own `Drop` has settled it (and rolled back
 /// an object the instance made but never committed); what it held in
@@ -408,7 +392,7 @@ impl Inner {
     /// much, less the `granted` bytes already counted there.
     fn set_bytes(&mut self, to: impl FnOnce(u64) -> u64, granted: u64) {
         let bytes = to(self.bytes);
-        self.disk.add(bytes as i128 - self.bytes as i128 - granted as i128);
+        self.park.disk.add(bytes as i128 - self.bytes as i128 - granted as i128);
         self.bytes = bytes;
     }
 
@@ -449,13 +433,13 @@ impl Inner {
     }
 }
 
+/// The stock host's view and its plain methods (`Host`, `HostDescriptor`,
+/// `preopens`), with the descriptor methods below.
 pub struct QuotaFs;
 
 impl HasData for QuotaFs {
-    type Data<'a> = QuotaView<'a>;
+    type Data<'a> = WasiFilesystemCtxView<'a>;
 }
-
-pub struct QuotaView<'a>(&'a mut ObjState);
 
 fn fs(s: &mut ObjState) -> WasiFilesystemCtxView<'_> {
     s.filesystem()
@@ -509,24 +493,6 @@ fn writable_file(s: &mut ObjState, fd: &Resource<Descriptor>) -> Option<(QuotaGu
             Some((quota, f.file.clone()))
         }
         _ => None,
-    }
-}
-
-impl types::Host for QuotaView<'_> {
-    fn convert_error_code(&mut self, error: FilesystemError) -> wasmtime::Result<ErrorCode> {
-        error.downcast()
-    }
-}
-
-impl types::HostDescriptor for QuotaView<'_> {
-    fn drop(&mut self, fd: Resource<Descriptor>) -> wasmtime::Result<()> {
-        types::HostDescriptor::drop(&mut self.0.filesystem(), fd)
-    }
-}
-
-impl preopens::Host for QuotaView<'_> {
-    fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
-        preopens::Host::get_directories(&mut self.0.filesystem())
     }
 }
 
@@ -838,7 +804,7 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         _new_fd: Resource<Descriptor>,
         _new_path: String,
     ) -> FilesystemResult<()> {
-        Err(guard(store).refuse(ErrorCode::NotPermitted, "hard links are not permitted"))
+        Err(guard(store).0.lock().deny(ErrorCode::NotPermitted, "hard links are not permitted".into()).into())
     }
 
     async fn symlink_at(
@@ -847,7 +813,7 @@ impl HostDescriptorWithStore<ObjState> for QuotaFs {
         _old_path: String,
         _new_path: String,
     ) -> FilesystemResult<()> {
-        Err(guard(store).refuse(ErrorCode::NotPermitted, "symlinks are not permitted"))
+        Err(guard(store).0.lock().deny(ErrorCode::NotPermitted, "symlinks are not permitted".into()).into())
     }
 }
 
@@ -1244,7 +1210,7 @@ mod tests {
                 let body = req.into_body().collect().await.unwrap().to_bytes();
                 let logs = ExportLogsServiceRequest::decode(body).unwrap();
                 output.lock().extend(logs.resource_logs.into_iter().flat_map(|r| r.scope_logs).flat_map(|s| s.log_records));
-                crate::server::ok_json(serde_json::json!({}))
+                crate::object::empty_response(200)
             }
         }));
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(&endpoint, "app", "digest", None, &Default::default()).unwrap());
@@ -1387,6 +1353,14 @@ mod tests {
         g.unlink(&dir.join("b"), 600 << 10).unwrap();
         assert_eq!(usage(&g), (2, 0), "post-removal growth keeps the existing conservative charge");
         assert_eq!(b.metadata().unwrap().len(), 600 << 10);
+    }
+}
+
+#[cfg(test)]
+impl Default for Disk {
+    /// No budget and no reserve.
+    fn default() -> Disk {
+        Disk { used: AtomicU64::new(0), max: u64::MAX, idle: Mutex::default(), fs: None, pending: Mutex::new(0), reserve: 0 }
     }
 }
 

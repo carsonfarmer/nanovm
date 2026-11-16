@@ -9,6 +9,22 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 
 ## Problems
 
+### N-962: live-restore fixture assumes the other app has already shipped
+- **Where:** `tests/integration.rs`, `restores_an_object_and_an_app_into_a_running_node`.
+- **Reproduced:** CI 43819965326 and the unchanged local test fail the store app-list assertion. A temporary diagnostic confirmed B's head was 0, its store directory absent and its writer still running; another invocation passed with head 69. The fixture started B asynchronously without waiting for any remotely stored state.
+- **Status:** fixed on `fix/trim-integration`, awaiting CI/main delivery. Wait for B's first shipped head before A's restore sequence, retaining continuous write/count assertions and all admin restore checks. Twenty fixed repetitions pass; removing the wait reproduces the failure. Restored complete integration suite: 127 passed, 13 ignored. No runtime change. Evidence: `notes/trim-integration.md`.
+
+### N-960: response limiter changes declared HTTP framing
+- **Where:** `object.rs`, `GuardedBody`
+- **Scenario:** `Limited` clamps an exact body size hint while the response retains its larger Content-Length. Hyper can panic or stop polling at the cap without seeing the overflow.
+- **Reproduced:** yes, through the real HTTP worker link; disabling enforcement also makes the regression fail.
+- **Status:** fixed on `fix/trim-edge-framing` (parent delivery pending). Counter preserves the guest's framing; integrated serial library suite: 206 passed, one ignored. See `notes/trim-edge-framing.md`.
+
+### N-961: strict Rust 1.99.1 checks retain unrelated lint and formatting failures
+- **Where:** unchanged lines in `journal.rs`, `object.rs`, `ship.rs`, `supervisor.rs`, `table.rs`, `telemetry.rs`; formatting across the crate and tests.
+- **Reproduced:** before PR3 integration, strict all-target/all-feature clippy reports ten errors; fmt check fails. Production check and 193 unit tests pass. See `notes/trim-edge-framing.md` for the commands and diagnostics.
+- **Status:** open; outside the focused response-framing fix.
+
 ### N-930–N-937: PR #3 independent review fixes
 - **Owner:** `fix/pr3-review`; separate from the new trim and secrets-research branches.
 - **N-930:** deletion/recreation reused a cached shipping head after the remote head was deleted. Re-read it when the local shipped marker no longer reaches the cached sequence.
@@ -40,6 +56,17 @@ One list of known problems (`N-n`) and planned work (`W-n`), so nothing is done 
 - **Status:** fixed locally on `fix/pr3-review`; three privileged runs passed with kernel memcg OOM evidence. Runtime-line delta: 0.
 
 Found by the review at `c607ec9`, unless an entry says otherwise; line numbers are as of that commit.
+
+### N-730: HTTP benchmark harness accepted invalid comparisons and density counts
+- **Where:** `notes/bench-numbers/{drive,summarize}.py`; reviewed from `ac514c6`.
+- **Scenario:** aggregate child RSS divided by attempted creates, short clamped idle retention and no live-count verification; ordinary HTTP failures treated as useful latency; relative work paths resolved against another cwd and ignored in-process exit/missing JSON; summary pooling mixed commits/rates and duplicate rounds.
+- **Reproduced:** synthetic subprocess/telemetry/summary probes; initial ten tests fail (five assertion failures, eight errors including subtests). No real workload was run for this correction.
+- **Fix:** dedicated density app/stack, one-hour node/app retention, successful creation checks and fresh exact exported live/store counts tied to one PID; HTTP failure gates; fresh absolute roots and in-process result validation; commit/binary/workload identity and duplicate/rate rejection. Config compatibility is not supported, see AGENTS.md rule 1; the harness uses only current v1. The integrated `trim/edge` contract inherits connection-only client limits; request-rate config, forwarded-client accounting and their benchmark are removed, with no replacement benchmark.
+- **Status:** corrected and integrated in PR #6, not yet on main. Twenty-one Python tests pass; four initial and three edge-contract source mutations caught and restored, plus the actual-run regressions below. Runtime-line delta 0. Fresh full integrated release measurements completed with no competing workloads. [Evidence/runbook](notes/bench-numbers/README.md), [results](notes/bench-numbers/2026-11-16.md).
+- **Actual-run follow-up:** timed HTTP/1 oha runs cancelled outstanding requests at the deadline. Drain them explicitly rather than discard errors; real slow-loopback before/after evidence and a retained command-contract regression now pass (19 harness tests). The aborted pilot remains invalid, not pooled.
+- **Overload follow-up:** the 256-client single-object pilot exceeded the default queue of 64 (47,694 HTTP 200, 30,965 HTTP 503, no transport errors). Successful hot-object tables now stop at 64 clients; spread tables retain 256. No runtime limit or error gate relaxed. The matrix regression fails without the selection and all 20 harness tests pass restored. Runtime-line delta 0; that aborted pilot is excluded.
+- **Restart follow-up:** killing every supervisor child also killed the prestarted spare, then waited forever for it to be reaped before making the request that would check it. Kill only the admin-reported app PID and bound the reaping wait. The spare-survival regression fails before and all 21 harness tests pass fixed. Real cache-warm/cache-empty restart, cold-object, syscall and verified 6,001-object density probes pass. No runtime change; full measurements restart, retaining the independently completed pilot only as offered-rate calibration.
+- **Completed campaign:** 240 valid records across three HTTP rounds; 16,617,893 HTTP 200 and 1,500 HTTP 204 responses, zero transport errors. Longer alternating pre-trim/current CPU measurements did not reproduce a consistent regression, including SQLite. Default c256 export failed exact span counts on both binaries; it is not lossless evidence. The benchmark-only positive `--export-concurrency` option retains default 256 and exact checks. Three c3 invocations received 1,803,000/1,803,000 spans, median 54.1k requests/s including drain. Raw results and failed probes are retained; no production Collector or remote-ack performance claim.
 
 ### N-1: a registry app's egress list can name private and loopback addresses
 - **Where:** `egress.rs:26-28`, `egress.rs:313-314`, `config.rs:128-136`, `supervisor.rs:322,333`
@@ -503,7 +530,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `ship.rs` (`restore` staged under `objects/<app>/~restore/`; `mark`; `discard`; supervisor's `restored` chown)
 - **Scenario (from source):** with leases, a claim restored an object as root by writing the store's versions to `objects/<app>/~restore/<object>/<n>.tar` with `create_dir_all` and `fs::write`, which follow symlinks. A compromised worker (uid of its app) owns `objects/<app>` and can make `~restore` a symlink: root then creates directories and writes the app's own bytes under a path of the worker's choosing outside the jail. `mark` (`~shipped/~new`, written with `fs::write`) and `discard` (`remove_dir_all` through an intermediate symlink) have the same shape for every node with a store.
 - **Fix:** a restore stages under `<data_dir>/restore/<app>/<object>` (no jail reaches it), is given to the app's uid there, and is installed by descriptor (`openat` with `O_NOFOLLOW` at each name, `renameat`, `remove_at`), as are the directories it makes. `mark` and `discard` are left to the `r3-lease` fix (`fix/r3-lease` rewrites both): they should open `~shipped` and the object's directories the same way.
-- **Status:** fixed: restore on `beta/recovery`; `mark`, `discard` and the prune on round 3 (c882871); both on the per-object layout (`ship::object_at`, `install` through `sub`/`remove_at`/`renameat`) on `beta/integration`
+- **Status:** fixed: restore on `beta/recovery`; `mark`, `discard` and the prune on round 3 (c882871); both on the per-object layout (`ship::object_at`, `install` through `sub`/`remove_at`/`renameat`) on `beta/integration`; `trim/storage` stages the object's whole directory and installs it with one `renameat` (shard by `committed::dir_at`)
 
 ### B-503: a commit could fail with "gap in committed versions" while the shipper pruned
 - **Where:** `committed.rs` (`head`)
@@ -927,8 +954,9 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 ### B-301: no rate limits or connection caps (beta audit)
 - **Where:** `proxy.rs` (`serve`), the node's front end (`main.rs`, `server::serve_http1`)
 - **Scenario:** a client could send any number of requests a second, to any app, and hold any number of connections, at the proxy and at a node reached directly; one client or one app could take all of either.
-- **Fix:** `gate` (both listeners, `[clients]`): requests a second per client address (an IPv6 /64) and per app (`governor`, GCRA; 429 with `Retry-After`), connections per client address (503 with `Retry-After`) and in all (the listener stops accepting). The client behind a trusted forwarder is the last untrusted address in `X-Forwarded-For`; trusted peers (default loopback) aren't limited. Hostile tests: `clients_past_their_rate_are_refused_however_they_forward` (spoofed and prepended `X-Forwarded-For`), `apps_past_their_rate_are_refused`, `connections_are_capped_per_client_and_in_all`. Evidence: notes/beta-limits.md.
-- **Status:** fixed on `beta/limits`
+- **Fix:** `gate` (both listeners, `[clients]`): connections per client address, an IPv6 /64 (503 with `Retry-After`), and in all (the listener stops accepting); trusted forwarders' connections (default loopback) aren't capped per client. Hostile test: `connections_are_capped_per_client_and_in_all`. Evidence: notes/beta-limits.md.
+- **Rates removed (owner decision, `trim/edge`):** `beta/limits` also limited requests a second per client (`rate`, 100) and per app (`app_rate`, 1,000) with `governor`, answering `429 rate-limited`. The owner rejected them: a fixed per-app cap throttles legitimate traffic below what a node serves, and it protects nothing the per-worker CPU and memory caps, the per-request CPU budget, connection caps and disk budgets don't already protect. Operators who want rate limits set them at the edge (Caddy, a CDN). `rate`, `app_rate`, `X-Forwarded-For` parsing and the `governor` dependency are gone, with their tests.
+- **Status:** fixed on `beta/limits`; rates removed on `trim/edge`
 
 ### B-302: one app could fill a node's disk and stop every app's writes (beta audit)
 - **Where:** `quota.rs`
@@ -965,14 +993,49 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 
 ### B-308: rate limits are per listener, and WebSocket messages aren't requests
 - **Where:** `gate.rs`
-- **Scenario:** each proxy (and each node a client reaches directly) keeps its own counts, so with several proxies a client or an app gets the rate at each; a socket's messages count only as the request that opened it (their own bounds are the socket backlog and caps).
-- **Status:** open (by design for one node)
+- **Scenario:** each proxy (and each node a client reaches directly) kept its own counts, so with several proxies a client or an app got the rate at each; a socket's messages counted only as the request that opened it (their own bounds are the socket backlog and caps).
+- **Status:** moot: request rate limits were removed (owner decision, `trim/edge`; see B-301)
 
 ### B-309 (tests): `the_proxy_outlasts_idle_and_excess_connections` bound the default private port
 - **Where:** `tests/integration.rs`
 - **Scenario:** the test's proxy listened on a free port but left `publish_listen` at its default, 127.0.0.1:8444; on a machine where anything else held 8444 (another agent's proxy) the proxy exited at once ("Address already in use") and the test failed with "the proxy never listened". Seen once in a full run on `beta/limits`.
 - **Fix:** the test gives the private listener a free port too.
 - **Status:** fixed on `beta/limits`
+
+### N-901 (tests): no test reaches the receiving node's check of a call cycle
+- **Where:** `table.rs` (`Node::enqueue`: a request whose `nanovm-callers` the object waits on, here, is refused 508)
+- **Scenario:** found by the node trim pass (`trim/node`), moving the check from `dispatch` into `enqueue`. With it disabled, every test passes, at 7988cae as well: `nodes::calls_reach_objects_on_other_nodes_and_cycles_across_nodes_are_refused` closes its cycle along one chain of calls, which the calling node refuses first (`wait_for`: the callee is among its own callers). The receiving node's check matters for a cycle that closes through waits on the receiving node, not along the chain: `y` (node B) serves a client's request and calls `t` (node A) while `t` waits on `s` (A), whose call to `y` waits behind that request. B lets `y`'s call through (`y` has no callers), and only A knows that `t` waits, through `s`, on `y`. Without the check the call waits for its request timeout.
+- **Suggestion:** a two-node test of that shape, expecting 508 at once.
+- **Status:** open
+
+### N-902 (trim): code the node's files repeat in storage's and edge's files
+- **Where:** found by the node trim pass (`trim/node`); each copy is in a file another agent owns, so it is recorded for them.
+- `ship.rs:own` (give a tree to a uid) and `supervisor.rs:chown_tree`: one is enough; `chown_tree` also skips a tree whose top is already the uid's. `ship.rs:owner` and `app_dirs`' owner lookup read the same thing.
+- `ship.rs:object_dirs` and `app.rs:Objects::load` both walk `<app>/<2 hex>/<id>`; one walk per app would serve both.
+- `lease.rs:serve` and `supervisor.rs:restore_object` both take a lease, claim the object, release on failure and hold the grant; a `Leases` method taking the claim would serve both.
+- `supervisor.rs:command` (`versions`) parses `ship.rs:version_key`'s keys back into sequences; `ship.rs` could list an object's versions.
+- `egress.rs:serve_forwarded`'s error answer is `supervisor::verdict(502, name)`.
+- `object.rs:run` records a refusal on the job's span and answers it twice, as `table.rs:Node::dispatch` does once.
+- **Status:** open (for the storage and edge owners)
+
+### N-903 (trim): identity stamping can export a worker batch above 1 MiB
+- **Where:** `telemetry.rs` (`Relay::handle` → `stamp` → `Relay::send`).
+- **Scenario:** a worker body below the input cap grows beyond it when the supervisor inserts its trusted resource identity; the collector send had no outgoing size check.
+- **Reproduced:** yes: the hostile near-cap trace batch returned 200 before the fix, rather than 413. Trace/log controls at exactly the outgoing cap pass with the fix.
+- **Fix:** check final body length at collector send; refuse 413 without exporting. Guard-removal mutation reproduces the failure. [Evidence](notes/trim-node-telemetry.md).
+- **Status:** fixed on `fix/trim-node-telemetry` (this commit); not pushed or integrated.
+
+### TS-1 (removable): duplication between the storage files and others' (storage trim)
+- **Where:** `ship::own` and `supervisor::chown_tree` (a recursive `lchown` of a tree only root reaches); `app::Objects::disk` (`statvfs` by path against the reserve) and `quota::Disk::low` (`fstatvfs` on a kept descriptor, the same reserve); the `<app>/<shard>/<object>` walk in `ship::object_dirs`, `quota::Disk::open` and `app::Objects::load`; `geteuid` through `unsafe libc` in `ship::owner`, `admin::listen`, `secrets` and `supervisor::app_dirs`; `lease::serve` sending a grant's session twice (`(grant, grant.session, until)`, read in `table.rs`).
+- **Scenario:** found by the storage trim (`trim/storage`, notes/trim-storage.md); each spans a file another agent owns, so it was left. `ship::own` (9 lines) can go if `chown_tree` is `pub(crate)` and maps to `io::Error`.
+- **Status:** open (for the coordinator)
+
+### TS-2: distinct node names share a lease session record
+- **Where:** `lease::Leases::renew`, `lease::Leases::alive`
+- **Scenario:** formatting `nodes/{name}` before `ship::Objects` converts it to an object-store path drops empty slash-separated segments: `east` and `east/` share a session record. Starting the latter session lets it take the former's live leases early.
+- **Fix:** encode the complete node name as one unpadded base64url segment for renewal and holder checks, using the existing dependency. The regression covers five pairs in both orders; it fails before the fix and when renewal encoding is removed. Restored full library suite: 195 passed, one ignored. Runtime +1 line; evidence and check limitations in `notes/trim-storage.md`.
+- **PR3 integration:** committed local parent 9965f46 merged with the trim and encoding retained; seven lease tests and the combined library suite (207 passed, one ignored) pass, as does production check. N-930–N-938 remain separate and unchanged.
+- **Status:** fixed on `fix/trim-storage-keys` (Amp, separate worktree; not pushed)
 
 ## Planned work
 

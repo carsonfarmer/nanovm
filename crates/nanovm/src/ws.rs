@@ -117,13 +117,10 @@ pub struct Answer {
     events: Vec<Event>,
 }
 
-/// What became of an event sent to the object.
-pub enum Reply {
-    Answer(Answer),
-    /// The answer wasn't events: the status to refuse a socket with, the
-    /// object's own if it refused.
-    Bad(u16),
-}
+/// What became of an event sent to the object: its answer, or, if that
+/// wasn't events, the status to refuse a socket with (the object's own if it
+/// refused).
+pub type Reply = Result<Answer, u16>;
 
 /// `res` as events, if it is a `200` of them within `max` bytes.
 pub async fn answer<B>(res: Response<B>, max: usize) -> Reply
@@ -133,11 +130,11 @@ where
 {
     let status = res.status();
     if status != 200 || res.headers().get(CONTENT_TYPE).is_none_or(|v| v != EVENTS) {
-        return Reply::Bad(if status.is_client_error() || status.is_server_error() { status.as_u16() } else { 502 });
+        return Err(if status.is_client_error() || status.is_server_error() { status.as_u16() } else { 502 });
     }
     let (parts, body) = res.into_parts();
     let events = Limited::new(body, max).collect().await.ok().and_then(|b| parse(b.to_bytes()));
-    events.map_or(Reply::Bad(502), |events| Reply::Answer(Answer { headers: parts.headers, events }))
+    events.map_or(Err(502), |events| Ok(Answer { headers: parts.headers, events }))
 }
 
 /// Whether `req` asks to open a WebSocket.
@@ -338,10 +335,8 @@ impl Sockets {
 
         let mut open = conn.request(&Event::Open);
         open.headers_mut().insert(SEC_WEBSOCKET_EXTENSIONS, HeaderValue::from_static("grip"));
-        let (headers, events) = match deliver(open).await {
-            Reply::Answer(Answer { headers, events }) => (headers, events),
-            Reply::Bad(status) => return Err((status, "the object refused the socket")),
-        };
+        let reply = deliver(open).await;
+        let Answer { headers, events } = reply.map_err(|status| (status, "the object refused the socket"))?;
         conn.grip = headers.get(SEC_WEBSOCKET_EXTENSIONS).is_some_and(|e| e == "grip");
         let protocol = headers.get(PROTOCOL);
         let offered = |p: &HeaderValue| {
@@ -354,7 +349,7 @@ impl Sockets {
         }
         // It accepted, so it is told the socket ended.
         if !protocol.is_none_or(offered) || !conn.apply(events.collect()) {
-            deliver(conn.request(&Event::Disconnect)).await;
+            let _ = deliver(conn.request(&Event::Disconnect)).await;
             return Err((502, "the object's answer to OPEN is not one a socket can take"));
         }
 
@@ -414,11 +409,6 @@ impl Sockets {
     }
 }
 
-/// Whether a publish's body is one [`Sockets::publish`] takes.
-pub fn well_formed(json: &[u8]) -> bool {
-    messages(json).is_some()
-}
-
 /// The parts of GRIP's publish format a socket takes. Read into these rather
 /// than a `serde_json::Value`, which costs about 24 bytes of memory for each
 /// byte of a guest's publish; what isn't read is skipped, not built.
@@ -448,8 +438,9 @@ enum WsMessage {
 }
 
 /// The (channel, message) of each item of a publish that has one for a
-/// socket; `None` unless all are well formed.
-fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
+/// socket; `None` unless all are well formed, as [`Sockets::publish`] takes
+/// them.
+pub(crate) fn messages(json: &[u8]) -> Option<Vec<(String, Message)>> {
     let items = serde_json::from_slice::<Publish>(json).ok()?.items;
     if items.len() > MAX_ITEMS {
         return None;
@@ -493,13 +484,8 @@ async fn run<Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                 };
                 pending = deliver(conn.request(&event)).fuse();
             }
-            reply = &mut pending => match reply {
-                Reply::Answer(a) => {
-                    if !conn.apply(a.events) {
-                        break (frame(CloseCode::Error), Some(Event::Disconnect));
-                    }
-                }
-                _ => break (frame(CloseCode::Error), Some(Event::Disconnect)),
+            reply = &mut pending => if !reply.is_ok_and(|a| conn.apply(a.events)) {
+                break (frame(CloseCode::Error), Some(Event::Disconnect));
             },
             Some(m) = rx.recv() => {
                 let (n, close) = (cost(&m), matches!(m, Message::Close(_)));
@@ -537,7 +523,7 @@ async fn run<Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     }
     drop((sink, stream, pending));
     if let Some(e) = tell {
-        deliver(conn.request(&e)).await;
+        let _ = deliver(conn.request(&e)).await;
     }
 }
 
@@ -605,7 +591,7 @@ mod tests {
         let t = told.clone();
         let deliver: Deliver = Box::new(move |req| {
             t.lock().push(req.into_body());
-            Box::pin(async { Reply::Bad(502) })
+            Box::pin(async { Err(502) })
         });
         let (_client, server) = tokio::io::duplex(1 << 16);
         let ran = tokio::spawn(run(conn, server, rx, WebSocketConfig::default(), deliver));
@@ -963,7 +949,7 @@ mod tests {
             .map(|(k, v)| (HeaderName::from_static(k), HeaderValue::from_static(v)))
             .collect();
         move || {
-            Reply::Answer(Answer {
+            Ok(Answer {
                 headers: headers.clone(),
                 events: events(),
             })
@@ -1098,7 +1084,7 @@ mod tests {
         let (open, gone) = (Bytes::from("OPEN\r\n"), Bytes::from("DISCONNECT\r\n"));
         let not_events = (403, "the object refused the socket");
         assert_eq!(
-            refuse(Box::new(|| Reply::Bad(403))).await,
+            refuse(Box::new(|| Err(403))).await,
             (not_events, vec![open.clone()])
         );
         let not_open = (502, "the object did not accept the socket");

@@ -4,6 +4,7 @@ A wasmtime-only host for untrusted WASIp3 HTTP components, run as Durable-Object
 
 - Each `(app, object-id)` has exactly one live instance, which serves one request at a time.
 - Each object has its own memory cap, CPU budget, deadlines and handle cap.
+- Response body caps fail the stream on overflow without changing its declared HTTP length.
 - Each object has its own quota'd filesystem: scratch `/tmp` and a persistent `/data` volume.
 - Each app has an egress allowlist, within the operator's.
 - Each object has a composed Spin KV store in its volume, and each app its host-injected `wasi:config` values.
@@ -125,9 +126,33 @@ The script:
 
 It leaves the node running. Always-on OpenTelemetry exports rich request spans, correlated guest stdout/stderr and periodic infrastructure snapshot events to `telemetry_endpoint` (default `http://127.0.0.1:4318`). Point this OTLP/HTTP base URL at your Collector for enrichment, redaction, sampling and vendor routing. Jailed workers export over their existing link; the supervisor owns the destination and stamps app/manifest-digest identity. Object IDs appear on request records and logs. Export queues, batch sizes, concurrency and deadlines are bounded; a missing collector does not prevent requests or commits. Worker startup uses a separate private readiness response. The demo's loopback `dev-collector` writes decoded OTLP to `target/demo-telemetry.json`; it refuses stale snapshots. The stats/events HTTP APIs and event ring are removed, with no compatibility endpoints. W-2 validation is complete for the separately budgeted Collector deployment described below.
 
+The relay also caps the outgoing body at 1 MiB after inserting trusted identity. A worker batch that grows beyond that cap is refused with HTTP 413 and is not sent to the collector.
+
 HANDOFF records matched measurements and rejected experiments. The Linux CLI and benchmark use jemalloc; the library leaves allocator selection to its embedder. Controlled allocator swaps improved full-export throughput from roughly 54–59k/s to 79–84k/s, with about 20 MB more retained memory in that workload. SDK batches remain 256 spans with a 1 MiB body cap; the bounded queue now holds 2048 spans to absorb brief export stalls. No sampling or detail was removed.
 
-`cargo run --locked --release -p nanovm --example bench -- --export` measures three 200,000-request warm runs with a decoding OTLP sink, checks all 601,000 request spans including warmup, and fails on missing exports. Three complete invocations measured 75–79k/s (74.7–78.1k/s including shutdown/export drain), with no missing spans. The sink shares the orb's cores; this is not a production Collector or proxy/jailed-worker throughput claim, nor proof of being within a few percent of main.
+`cargo run --locked --release -p nanovm --features dev --example bench -- --export --export-concurrency 3` measures three 200,000-request warm runs with a decoding OTLP sink, checks all 601,000 request spans including warmup, and fails on missing exports. Fresh measurements on 2026-11-16 delivered every span in three invocations at median 54.1k requests/s including shutdown/export drain (51.2–54.2k/s). The default concurrency remains 256; it failed exact span accounting on both the pre-trim and trimmed builds. The historical 75–79k/s complete-export result did not reproduce here. The sink shares the orb's cores; this is not production Collector or proxy/jailed-worker throughput.
+
+### Fresh integrated measurements (2026-11-16)
+
+On an otherwise idle four-vCPU Linux orb, three rounds of the integrated release
+completed 16,619,393 measured HTTP responses with no HTTP or transport failures.
+The client shares the VM's cores; ordinary HTTP has no active collector and uses
+local storage acknowledgements. Medians at 64 concurrent clients:
+
+| Workload | Requests/s | p99 latency |
+|---|---:|---:|
+| Rust GET, 1,000 objects | 27,372 | 5.59 ms |
+| Durable counter writes, 1,000 objects | 2,976 | 44.06 ms |
+| Durable writes, one hot object | 822 | 89.49 ms |
+| JavaScript GET, 1,000 objects | 11,857 | 12.35 ms |
+| JavaScript writes, 1,000 objects | 2,316 | 58.05 ms |
+
+Verified incremental density is 120.3 KiB/object through 6,001 live objects.
+Longer alternating pre-trim/current CPU measurements found no consistent
+regression; overlapping ranges do not establish a speedup. Near saturation,
+tail latency rises sharply and some offered rates are not sustained. See
+[full results, ranges, export failures and method](notes/bench-numbers/2026-11-16.md).
+The earlier measurements below are historical, not current capacity claims.
 
 Earlier real HTTP validation exposed export loss ([N-36](ISSUES.md)): oha 1.16.0 drove the supervisor and jailed worker at 35–39k/s with no request failures, but OpenTelemetry Collector 0.164.0 received only 406,006 of 600,000 request spans. The worker's bounded queue overflowed. A concurrent SDK exporter eliminated those losses in one experiment but failed an in-flight flush regression, so it was not adopted. Those historical rates are not matched controls for the current build.
 
@@ -323,6 +348,9 @@ A host with no record is a 404; a host the proxy doesn't serve, an alias its rec
 
 **Many nodes.** The proxy may place objects on several nodes: list them in `nodes` (each `host:port`, as that node's `name`). An object's home is chosen by rendezvous hashing, and the nodes keep leases on their objects in an object store (`leases = "s3://bucket/prefix"` on every node, with `name`; credentials from `AWS_*`), so an object has one live instance across nodes and a node that lost its lease can't commit. A node that doesn't hold an object answers 421 and the proxy tries the one that does (or the next), for up to `failover_ms`. When a node stops, its objects move after its `lease_ms` (10 s; each node's session record carries its own, which the others wait out). With leases a node ships its objects' committed versions to `capture.store` (required), and answers a write once it counts there; the node taking an object over restores it from there before serving it, so a failover loses no answered write and serves no older state (a write answered an error because it didn't count in time, 500 or 504, isn't served until it does). `failover_ms` must exceed every node's `lease_ms` (the proxy can't check it) and the proxy's 1 s connect timeout. A node that took a request but hasn't answered within `failover_ms` gets the client a 504 (the request may have run there); the proxy never sends it again. Calls between objects then go through the proxy's private endpoint (the node's `proxy`). See `notes/multinode.md`.
 
+Lease session keys encode the complete node name as one unpadded base64url segment;
+distinct names, including `east` and `east/`, cannot share a session record.
+
 DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs its record lists); the table is public; and a cold lookup adds a round trip.
 
 ## Limits
@@ -330,11 +358,13 @@ DNS as the routing table has limits: a record is as trustworthy as its resolver 
 Every app shares a node with others, so each has bounds that no request, client or app can lift for itself. Per object (each app's `[limits]`, clamped to the node's): memory, CPU per request, deadlines, request and response sizes, queued requests, outbound requests, host resources, and a disk quota with a file count. Beyond those:
 
 **Clients** (`[clients]` in both `nanovm.toml` and `proxy.toml`; 0 turns one off). The proxy, and a node that clients reach directly, allow:
-- `rate` requests a second from one client address (default 100), in bursts of twice that, and `app_rate` to one app (default 1,000): past either, `429 rate-limited` with `Retry-After`;
 - `connections_per_client` connections from one address (default 256): past it, `503 too-many-connections` with `Retry-After`, then the connection closes;
 - `connections` in all (default 10,000): past it, new connections wait in the listen backlog until one closes.
 
-An IPv6 client counts by its /64. Peers in `trusted` (default loopback) forward other clients' requests: a TLS terminator in front of the proxy, or the proxy in front of a node. Their own requests and connections aren't limited, and a request's client is the last address in its `X-Forwarded-For` that isn't trusted, so what a client writes there itself is never read. List the terminator's address (or range) in the proxy's `trusted`, and have it set `X-Forwarded-For` (Caddy does): one that doesn't leaves every request it forwards unlimited, as its own. A node whose proxy isn't on its own host must list the proxy in its `trusted`, or the proxy is limited as one client. The rates use `governor` (GCRA); keys that have refilled are forgotten every 10 s.
+Admission remains held through HTTP upgrades until the upgraded I/O is dropped,
+on both public listeners and internal worker links.
+
+An IPv6 client counts by its /64. Peers in `trusted` (default loopback) forward other clients' connections: a TLS terminator in front of the proxy, or the proxy in front of a node. Their connections aren't capped per client. List a terminator on another host (or its range) in the proxy's `trusted`, and a proxy on another host in the node's, or it is capped as one client. nanovm doesn't limit request rates: a fixed rate per client or app throttles legitimate traffic below what a node serves, and the CPU, memory, connection and disk caps already bound what a client or app can take. An operator who wants rate limits sets them at the edge in front (Caddy, a CDN).
 
 **Disk.** An app's objects' volumes may hold `app_disk_mb` in all (default: a quarter of `data_dir`'s filesystem); past it that app's writes are cut short and then refused, as on a full disk, and no other app's are. Growth grants fit measured free space above `disk_reserve_mb` (default: a twentieth of the filesystem, at most 1 GiB), minus that app's outstanding grants. Below the threshold, growth and new entries are refused; overwrites, shrinking and deletion remain allowed. Each refusal is an `fs-denied` event; the guest sees `insufficient-space`. This is an admission threshold, not a strict node-wide physical reservation: separate workers can race, and journals, capture, sparse-file allocation, filesystem blocks and outside writers also consume space. Commits and rollback can still encounter a full filesystem. The app budget counts logical file sizes, not that additional storage.
 
@@ -589,7 +619,7 @@ Tests: `restores_an_object_and_an_app_into_a_running_node` (two apps under a
 supervisor, through `nanovm admin`, one writing throughout; a version going back,
 the head over a damaged volume, a whole app, a paused object, refused names and a
 damaged version in the store, an unshippable local version),
-`a_restore_cut_short_is_finished_or_undone` (a crash at each of 9 points),
+`a_restore_cut_short_is_finished_or_undone` (a crash at each of its 5 points),
 `writes_go_on_through_a_store_outage_and_ship_in_order_after`,
 `an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox`, and
 `sqlite_restores_a_lost_node_from_the_store` (a SQLite app's worker killed
@@ -687,7 +717,7 @@ Outbound HTTP and calls to other objects execute immediately, not behind the cal
 
 A host I/O failure during commit, a crash at its commit marker, or a lost response can leave the caller unsure whether the request committed. Do not interpret every error as a rollback: use application-level operation IDs for idempotent retries. Durability assumes a filesystem and device that honor successful file and directory syncs; process-crash tests do not certify physical power-loss behavior.
 
-Persistence between backups depends on the original storage surviving. Offline backup/restore is described below; there is no replication or automatic failover. App admission takes a nonblocking exclusive lock on its objects directory before scratch cleanup or journal recovery. Supervisor directory preparation takes the same lock before changing ownership. Locks last through all `App` owners: embedded callers must drain and drop their `Node` and any `App` handles before reopening. A final actor may still retain ownership briefly after `shutdown()` returns; admission fails closed until it exits.
+Local-only persistence depends on the original storage surviving. Multi-node operation supports capture-store shipping, store-fenced ownership and automatic rerouting/restoration after node loss; the acknowledgement policy determines which committed state is recoverable remotely (see **Many nodes** above). Local tests exercise these paths with separate node disks and a shared store; real-provider and separate-host failure validation remains separate. Offline backup/restore is described below. App admission takes a nonblocking exclusive lock on its objects directory before scratch cleanup or journal recovery. Supervisor directory preparation takes the same lock before changing ownership. Locks last through all `App` owners: embedded callers must drain and drop their `Node` and any `App` handles before reopening. A final actor may still retain ownership briefly after `shutdown()` returns; admission fails closed until it exits.
 
 This is cooperative local exclusion on a stable directory inode, not distributed fencing or an atomic supervisor-to-worker reservation. Keep one supervisor per data root; cgroup provisioning and noncooperating writers are not fenced. Do not replace a locked directory. Per-object logical quotas do not cap physical blocks or the aggregate storage of cold objects. RAM may cache durable data or stage tentative work, but memory-only acceptance would not preserve these guarantees.
 
@@ -708,7 +738,7 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 - **Commit** (before the response is released, and again after post-return work) fsyncs what changed, up to 16 paths at a time, then writes a new random key into the log's first block and fsyncs it: records are signed with the key, so none is valid any more. The log itself is made once per object and kept (at most 68 KiB between requests), so a commit rewrites a block that already exists instead of deleting a file and syncing its directory. The commit runs on a blocking thread, not the object's. Held publishes are sent after it.
 - **Rollback** has one path. A failed request ends its instance, and every instance start replays any log left behind backwards, so a crash is handled the same way. Recovery trims each step off the log as it completes, so a crash during recovery resumes where it stopped.
 - **Costs:**
-  - One fsync per change that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request: one per changed path, then the key. A counter's `POST /incr` (create, write, rename over) costs 5 device flushes. Requests that change nothing pay nothing. A guest's own `sync` and `sync-data` do nothing: its writes are durable at commit and rolled back otherwise, synced or not.
+  - One fsync per change that destroys data (first write to a file, overwrite, truncate, remove, rename), and one round of fsyncs per committing request: one per changed path, then the key. A counter's `POST /incr` (create, write, rename over) measures 2 fsync + 3 fdatasync calls; syscall counts do not establish physical-device flush counts. Requests that change nothing pay nothing. A guest's own `sync` and `sync-data` do nothing: its writes are durable at commit and rolled back otherwise, synced or not.
   - Waiting for the disk isn't charged to the guest's CPU budget, and neither is the journal's own CPU (records and commit).
   - The byte quota counts logical file lengths, not allocated filesystem blocks or metadata. While a request runs, the log and retained files may each hold as much again: at most three quota-sized logical content budgets. Small files and filesystem metadata add physical overhead; `max_files` independently bounds directory entries. Size the backing disk for both limits, not just `3 × disk_mb`.
 - **Safety:**
@@ -728,6 +758,11 @@ the worker's journal cannot reach those ancestors after confinement. Embedded
 - Crates (`fs-transaction`, `txfs`, `kaish-vfs`, `eryx-vfs`, `overlayfs_fuse`): none sits behind POSIX writes through open descriptors.
 
 ## Benchmarks
+
+For the current-v1 HTTP/jailed-worker matrix, fresh-root build/run commands and
+validity gates, see [notes/bench-numbers](notes/bench-numbers/README.md). Ordinary
+failed responses invalidate comparisons; density verifies exported live counts
+on a dedicated stack. Harness tests are not new performance results.
 
 ```bash
 cargo run --release -p nanovm --example bench -- --json target/bench.json
@@ -835,7 +870,7 @@ The tests cover:
   These skip, saying why, where ghcr.io can't be reached.
 - open response bodies counting against `max_outbound_concurrency`, in-process and through the supervisor
 - many requests reusing the links without errors or restarts, and dials waiting out a peer slow to accept
-- client limits at the proxy and a node's own listener: per-client and per-app rates (429), connections per client (503) and in all, and a client that forges `X-Forwarded-For` from an untrusted peer, or writes addresses left of its own behind a trusted one
+- client limits at the proxy and a node's own listener: connections per client (503) and in all
 - disk on an 8 MiB tmpfs (as root): an app that fills its budget is refused while another app writes on, and below the node's reserve every app's growth is refused cleanly while writes in place still commit
 - a node with `cgroup = "auto"` that can't make a cgroup subtree refuses to start (where it can, its workers run under the host-sized defaults)
 - workers placed in their cgroups, and the cgroup limits enforced: a worker over `memory.max` is OOM-killed and restarted while the other app keeps serving, `cpu.max` throttles, `pids.max` holds. These need cgroup v2 with those controllers and skip otherwise, saying why.

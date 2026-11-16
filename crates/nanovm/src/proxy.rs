@@ -32,14 +32,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail, ensure};
 use http::header::{CONNECTION, PROXY_AUTHORIZATION, TE, TRAILER, UPGRADE};
 use http::{HeaderName, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Empty, Full, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use oci_spec::distribution::Reference;
 use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 
 use crate::config::ProxyConfig;
-use crate::object::{RespBody, error_response};
+use crate::object::{RespBody, empty_response, error_response};
 use crate::registry::{APP_HEADER, HOST_HEADER, MIN_VERSION_HEADER, Oci, TRUST_HEADER};
 use crate::ws::{self, Sockets};
 
@@ -239,31 +239,21 @@ impl Proxy {
         if ws::is_event(&req) {
             return Err((StatusCode::BAD_REQUEST, "socket events come from the proxy".into()));
         }
-        let client = self.gate.client(&req);
-        if let Err(refused) = self.gate.admit(client, None) {
-            return Ok(refused);
-        }
         let host = req.headers().get(http::header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
         let host = host.rsplit_once(':').map_or(host, |(h, _)| h).to_ascii_lowercase();
         if !self.cfg.hosts.iter().any(|h| h.strip_prefix('*').map_or(*h == host, |under| host.ends_with(under))) {
             return Err((StatusCode::FORBIDDEN, format!("this proxy doesn't serve {host}")));
         }
         let (name, headers) = self.resolve(&host).await?;
-        if let Err(refused) = self.gate.admit(client, Some(&name)) {
-            return Ok(refused);
-        }
         let upgrading = ws::wants(&req);
         let (mut parts, body) = req.into_parts();
-        // Only the proxy names apps to the node.
-        let theirs: Vec<_> = parts.headers.keys().filter(|k| k.as_str().starts_with("nanovm-")).cloned().collect();
-        for k in theirs {
-            parts.headers.remove(k);
-        }
-        // Hop-by-hop headers belong to the client connection, not the node.
+        // Only the proxy names apps to the node, and hop-by-hop headers belong
+        // to the client connection, not the node.
         let h = &mut parts.headers;
-        let listed: Vec<_> = h.get_all(CONNECTION).iter().flat_map(|v| v.to_str().unwrap_or("").split(',')).collect();
-        let listed: Vec<HeaderName> = listed.iter().filter_map(|n| n.trim().parse().ok()).collect();
-        for k in listed.iter().chain(&[CONNECTION, UPGRADE, TE, TRAILER, PROXY_AUTHORIZATION]) {
+        let listed = h.get_all(CONNECTION).iter().flat_map(|v| v.to_str().unwrap_or("").split(','));
+        let mut theirs: Vec<HeaderName> = listed.filter_map(|n| n.trim().parse().ok()).collect();
+        theirs.extend(h.keys().filter(|k| k.as_str().starts_with("nanovm-")).cloned());
+        for k in theirs.iter().chain(&[CONNECTION, UPGRADE, TE, TRAILER, PROXY_AUTHORIZATION]) {
             h.remove(k);
         }
         for k in ["keep-alive", "proxy-connection"] {
@@ -294,9 +284,9 @@ impl Proxy {
         let pq = req.uri().path_and_query().map_or("/", |p| p.as_str()).to_owned();
         let uri = |node: &str| format!("http://{node}{pq}").parse::<http::Uri>().map_err(|_| (StatusCode::BAD_REQUEST, pq.clone()));
         // A body that ran out of time (N-505) is the client's fault: 408.
-        let bad_gateway = |e: hyper_util::client::legacy::Error| match crate::server::timed_out(&e) {
-            true => (StatusCode::REQUEST_TIMEOUT, e.to_string()),
-            false => (StatusCode::BAD_GATEWAY, e.to_string()),
+        let bad_gateway = |e: hyper_util::client::legacy::Error| {
+            let status = if crate::server::timed_out(&e) { StatusCode::REQUEST_TIMEOUT } else { StatusCode::BAD_GATEWAY };
+            (status, e.to_string())
         };
         // One node has nowhere else to send it: stream it there.
         if let [node] = &self.cfg.nodes[..] {
@@ -357,12 +347,10 @@ impl Proxy {
 
     async fn socket(self: &Arc<Self>, name: String, host: String, object: String, req: Request<Body>) -> Response<RespBody> {
         let sockets = {
+            // Pending opens, live connections and publishes each hold an Arc,
+            // and each open counts toward `max_sockets` before it waits.
             let mut apps = self.sockets.lock();
-            // Pending opens, live connections and publishes each hold an Arc.
             apps.retain(|_, s| Arc::strong_count(s) > 1);
-            if apps.len() >= self.cfg.max_sockets && !apps.contains_key(&name) {
-                return error_response(503, "socket-refused", "the proxy has max_sockets open");
-            }
             apps.entry(name.clone()).or_insert_with(|| Arc::new(Sockets::new(self.cfg.clone(), self.total.clone()))).clone()
         };
         let (proxy, max, target) = (self.clone(), (self.cfg.max_response_body_kb << 10) as usize, object.clone());
@@ -370,15 +358,12 @@ impl Proxy {
             let (proxy, host, name, object) = (proxy.clone(), host.clone(), name.clone(), target.clone());
             Box::pin(async move {
                 let event = async {
-                    let Ok((current, headers)) = proxy.resolve(&host).await else { return ws::Reply::Bad(502) };
-                    if current != name { return ws::Reply::Bad(502) }
+                    let (current, headers) = proxy.resolve(&host).await.map_err(|_| 502u16)?;
+                    if current != name { return Err(502) }
                     req.headers_mut().extend(headers);
-                    match proxy.send(&name, &object, req).await {
-                        Ok(res) => ws::answer(res, max).await,
-                        Err(_) => ws::Reply::Bad(502),
-                    }
+                    ws::answer(proxy.send(&name, &object, req).await.map_err(|_| 502u16)?, max).await
                 };
-                tokio::time::timeout(Duration::from_secs(240), event).await.unwrap_or(ws::Reply::Bad(502))
+                tokio::time::timeout(Duration::from_secs(240), event).await.unwrap_or(Err(502))
             })
         });
         sockets.upgrade(object, req, deliver).await
@@ -392,7 +377,7 @@ impl Proxy {
         let status = if req.method() != http::Method::POST || req.uri().path() != "/publish" { 404 }
             else if let Some(s) = sockets { s.publish(req).await }
             else { 200 };
-        Response::builder().status(status).body(Empty::new().map_err(|e| match e {}).boxed_unsync()).unwrap()
+        empty_response(status)
     }
 
     /// A node's call to an object of its app (see `supervisor::call`), sent on
@@ -528,8 +513,8 @@ pub async fn serve(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyh
 /// Private control port: network policy must restrict it to nodes.
 pub async fn serve_publish(proxy: Arc<Proxy>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
     loop {
-        let p = proxy.clone();
-        crate::server::serve_conn(crate::server::accept(&listener).await, Some(CLIENT_TIMEOUT), move |req| p.clone().publish(req));
+        let (p, (sock, _)) = (proxy.clone(), crate::server::accept(&listener).await);
+        crate::server::serve_conn(sock, Some(CLIENT_TIMEOUT), (), move |req| p.clone().publish(req));
     }
 }
 
@@ -614,7 +599,7 @@ mod tests {
         let (serving, notified) = (cache.clone(), started.clone());
         let connection = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            crate::server::serve_conn(socket, Some(CLIENT_TIMEOUT), move |_: Request<Incoming>| {
+            crate::server::serve_conn(socket, Some(CLIENT_TIMEOUT), (), move |_: Request<Incoming>| {
                 let (cache, started) = (serving.clone(), notified.clone());
                 async move {
                     let _ = cache.get("disconnected", async {
@@ -717,7 +702,8 @@ mod tests {
                 Some(txt) => answer.push(serde_json::json!({ "name": format!("{name}."), "type": 16, "TTL": ttl, "data": format!("\"{txt}\"") })),
                 None => {}
             }
-            std::future::ready(crate::server::ok_json(serde_json::json!({ "Status": status, "Answer": answer })))
+            let json = serde_json::json!({ "Status": status, "Answer": answer }).to_string();
+            std::future::ready(Response::new(Full::new(bytes::Bytes::from(json)).map_err(|e| match e {}).boxed_unsync()))
         }));
         (url, asked, switch)
     }

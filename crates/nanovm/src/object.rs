@@ -26,7 +26,8 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpCtxView, WasiHttpView};
 
 use crate::app::App;
 use crate::egress::EgressHooks;
-use crate::metrics::{Metrics, Poison, now_ns, thread_cpu_ns};
+use crate::lease::mono_ns;
+use crate::metrics::{Metrics, Poison, thread_cpu_ns};
 use crate::quota::QuotaGuard;
 use crate::table::Node;
 
@@ -105,7 +106,7 @@ pub struct ObjShared {
 
 impl ObjShared {
     pub fn new(app: Arc<str>, id: &str) -> Self {
-        let now = now_ns();
+        let now = mono_ns();
         ObjShared {
             app,
             id: id.into(),
@@ -118,7 +119,7 @@ impl ObjShared {
     /// Whether its node may serve it and commit its changes: with one node
     /// always, else while it holds the object's lease in its current session.
     pub fn holds(&self) -> bool {
-        self.leases.as_ref().is_none_or(|s| self.lease.lock().as_ref().is_some_and(|g| s.holds(g)))
+        self.lease_epoch().is_ok()
     }
 
     /// Whether it had a lease that its node no longer holds.
@@ -148,7 +149,7 @@ impl ObjShared {
         if matches!(p, Phase::Idle | Phase::Cold) {
             self.lane.lock().take();
         }
-        let now = now_ns();
+        let now = mono_ns();
         self.since_ns.store(now, Relaxed);
         self.phase.store(p as u8, Relaxed);
     }
@@ -159,11 +160,6 @@ impl ObjShared {
     fn begin_start(&self) {
         self.cpu_accum_ns.store(0, Relaxed);
         self.poll_start_ns.store(thread_cpu_ns(), Relaxed);
-    }
-
-    fn begin_request(&self) {
-        self.begin_start();
-        self.set_phase(Phase::Handling);
     }
 
     /// Drives `fut`, charging the CPU its thread uses inside each poll
@@ -433,10 +429,8 @@ fn new_store(node: &Arc<Node>, app: &App, shared: &Arc<ObjShared>) -> anyhow::Re
         table,
         http,
         hooks: EgressHooks {
-            route: app.egress.clone(),
             node: Arc::downgrade(node),
             sem: Arc::new(Semaphore::new(limits.max_outbound_concurrency)),
-            metrics: node.metrics.clone(),
             obj: shared.clone(),
             held: Default::default(),
             publish_max: (limits.max_response_body_kb << 10) as usize,
@@ -507,10 +501,10 @@ enum Exit {
 /// changes stand whether or not a publish gets through). Only while the node
 /// holds the object's lease.
 async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
-    let (quota, held, route, node, shared) = acc.with(|mut s| {
+    let (quota, held, node, shared) = acc.with(|mut s| {
         let s = s.data_mut();
         let held = std::mem::take(&mut *s.hooks.held.lock());
-        (s.quota.clone(), held, s.hooks.route.clone(), s.hooks.node.clone(), s.shared.clone())
+        (s.quota.clone(), held, s.hooks.node.clone(), s.shared.clone())
     });
     // Only while the node holds the object's lease (see `Journal::commit`):
     // otherwise neither its changes nor its publishes go out. Its time is
@@ -521,7 +515,7 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
     shared.set_phase(Phase::PostReturn);
     committed?;
     let id = shared.id.clone();
-    if !held.is_empty() {
+    if !held.is_empty() && let Some(node) = node.upgrade() {
         // Boxed: inline, sending made every idle object's actor 2 KB bigger.
         Box::pin(async move {
             for body in held {
@@ -529,16 +523,13 @@ async fn commit(acc: &Accessor<ObjState>) -> std::io::Result<()> {
                 // it reaches only that object's sockets.
                 let req = http::Request::post(format!("http://{}/publish", crate::ws::PUBLISH_HOST));
                 let req = req.header(crate::ws::OBJECT_HEADER, &*id).body(body).expect("ids are header-safe");
-                match (&route, node.upgrade()) {
-                    (crate::egress::Route::Supervisor(up), _) => {
+                match &node.app.egress {
+                    crate::egress::Route::Supervisor(up) => {
                         if let Ok(res) = up.send(req.map(|b| Full::new(b).map_err(|e| match e {}).boxed_unsync())).await {
                             let _ = res.into_body().collect().await;
                         }
                     }
-                    (crate::egress::Route::Direct(_), Some(node)) => {
-                        node.sockets.publish(req.map(Full::new)).await;
-                    }
-                    _ => {}
+                    crate::egress::Route::Direct(_) => _ = node.sockets.publish(req.map(Full::new)).await,
                 }
             }
         })
@@ -686,7 +677,7 @@ async fn serve(
     rx: &mut mpsc::Receiver<Box<Job>>,
 ) -> Exit {
     let limits = &app.cfg.limits;
-    let max_resp = limits.max_response_body_kb << 10;
+    let max_resp = (limits.max_response_body_kb << 10) as usize;
     let pending: Arc<Mutex<Option<Pending>>> = Arc::default();
 
     let inner = {
@@ -705,7 +696,8 @@ async fn serve(
                 };
                 *shared.context.lock() = job.context.clone();
                 *shared.callers.lock() = std::mem::take(&mut job.callers);
-                shared.begin_request();
+                shared.begin_start();
+                shared.set_phase(Phase::Handling);
                 // The next tick, not one that passed while the object was
                 // idle: a stale deadline made every request yield to the
                 // executor at its first instruction, and Tokio wakes an idle
@@ -720,12 +712,11 @@ async fn serve(
                     since: Instant::now(),
                 });
 
-                let (parts, body) = job.req.into_parts();
-                let req = http::Request::from_parts(parts, Full::new(body));
+                let req = job.req.map(Full::new);
                 let (req, req_io) =
                     acc.with(|mut s| wasmtime_wasi_http::p3::Request::from_http(&mut s.data_mut().hooks, req));
 
-                let (resp, mut failed) = match svc.handle(acc, req).await? {
+                let resp = match svc.handle(acc, req).await? {
                     Ok(res) => {
                         // The guest learns its answer is out (the future
                         // `response.new` gave it resolves) once the client
@@ -738,7 +729,7 @@ async fn serve(
                         // answering as one would have the proxy run its
                         // request again and again.
                         res.headers_mut().remove(crate::lease::OWNER);
-                        let res = res.map(|b| {
+                        Ok(res.map(|b| {
                             GuardedBody {
                                 inner: b,
                                 remaining: max_resp,
@@ -746,10 +737,9 @@ async fn serve(
                                 sent: Some(sent),
                             }
                             .boxed_unsync()
-                        });
-                        (res, false)
+                        }))
                     }
-                    Err(code) => (error_response(500, "guest-error", &app.cfg.secrets.masked(format!("{code:?}"))), true),
+                    Err(code) => Err(error_response(500, "guest-error", &app.cfg.secrets.masked(format!("{code:?}")))),
                 };
                 pending.lock().as_mut().unwrap().phase("nanovm.commit.duration_ms");
                 shared.set_phase(Phase::PostReturn);
@@ -757,15 +747,12 @@ async fn serve(
                 // durable. One that failed (as one that traps or runs out of
                 // time) restarts its instance, which rolls them back; an
                 // answer, whatever its status, commits them.
-                let resp = match failed {
-                    false => match commit(acc).await {
-                        Ok(()) => resp,
-                        Err(e) => {
-                            failed = true;
-                            error_response(500, "commit-failed", &e.to_string())
-                        }
+                let (resp, failed) = match resp {
+                    Ok(res) => match commit(acc).await {
+                        Ok(()) => (res, false),
+                        Err(e) => (error_response(500, "commit-failed", &e.to_string()), true),
                     },
-                    true => resp,
+                    Err(res) => (res, true),
                 };
                 {
                     let mut guard = pending.lock();
@@ -782,17 +769,12 @@ async fn serve(
                 poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
                 pending.lock().as_mut().unwrap().phase("nanovm.post_return_commit.duration_ms");
                 // What it changed after answering commits now.
-                let reset = if failed { true } else {
-                    match commit(acc).await {
-                        Ok(()) => false,
-                        Err(e) => {
-                            pending.lock().as_mut().unwrap().span.set_attribute(opentelemetry::KeyValue::new(
-                                "error.type", "post-return-commit-failed"));
-                            node.metrics.event("post-return-commit-failed", &shared.id, e.to_string(), &job.context);
-                            true
-                        }
-                    }
-                };
+                let reset = failed
+                    || commit(acc).await.inspect_err(|e| {
+                        let error = opentelemetry::KeyValue::new("error.type", "post-return-commit-failed");
+                        pending.lock().as_mut().unwrap().span.set_attribute(error);
+                        node.metrics.event("post-return-commit-failed", &shared.id, e.to_string(), &job.context);
+                    }).is_err();
                 if let Some(mut p) = pending.lock().take() {
                     if reset { p.span.set_status(opentelemetry::trace::Status::error("request rolled back")); }
                 }
@@ -819,7 +801,6 @@ async fn serve(
             if let Poll::Ready(r) = wake.poll(cx, &waker, &shared.yielding, fut.as_mut()) {
                 return Poll::Ready(Ok(r.and_then(|r| r)));
             }
-            let t1 = now_ns();
             let (phase, since) = shared.phase();
             if armed != Some((phase, since)) {
                 let ms = match phase {
@@ -828,15 +809,12 @@ async fn serve(
                     Phase::Committing => limits.post_return_timeout_ms + crate::ship::ACK.as_millis() as u64,
                     Phase::Handling | Phase::Starting | Phase::Cold => limits.request_timeout_ms,
                 };
-                let elapsed = Duration::from_nanos(t1.saturating_sub(since));
+                let elapsed = Duration::from_nanos(mono_ns().saturating_sub(since));
                 let left = Duration::from_millis(ms).saturating_sub(elapsed);
                 timer.as_mut().reset(tokio::time::Instant::now() + left);
                 armed = Some((phase, since));
             }
-            match timer.as_mut().poll(cx) {
-                Poll::Ready(()) => Poll::Ready(Err(phase)),
-                Poll::Pending => Poll::Pending,
-            }
+            timer.as_mut().poll(cx).map(|()| Err(phase))
         })
         .await
     };
@@ -884,7 +862,7 @@ async fn serve(
 struct SelfWake {
     /// `IDLE`, `POLLING`, or `WOKEN` during the poll.
     state: AtomicU8,
-    task: Mutex<Option<Waker>>,
+    task: futures::task::AtomicWaker,
     tick_ns: u64,
 }
 
@@ -895,20 +873,15 @@ const WOKEN: u8 = 2;
 impl SelfWake {
     fn poll<F: Future>(&self, cx: &mut Context<'_>, waker: &Waker, yielding: &AtomicBool, mut fut: Pin<&mut F>) -> Poll<F::Output> {
         use std::sync::atomic::Ordering::SeqCst;
-        {
-            let mut task = self.task.lock();
-            if !task.as_ref().is_some_and(|t| t.will_wake(cx.waker())) {
-                *task = Some(cx.waker().clone());
-            }
-        }
-        let start = now_ns();
+        self.task.register(cx.waker());
+        let start = mono_ns();
         loop {
             self.state.store(POLLING, SeqCst);
             let poll = fut.as_mut().poll(&mut Context::from_waker(waker));
             if poll.is_ready() || self.state.swap(IDLE, SeqCst) != WOKEN {
                 return poll;
             }
-            if yielding.swap(false, Relaxed) || now_ns() - start >= self.tick_ns {
+            if yielding.swap(false, Relaxed) || mono_ns() - start >= self.tick_ns {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -923,10 +896,8 @@ impl Wake for SelfWake {
 
     fn wake_by_ref(self: &Arc<Self>) {
         use std::sync::atomic::Ordering::SeqCst;
-        if let Err(IDLE) = self.state.compare_exchange(POLLING, WOKEN, SeqCst, SeqCst)
-            && let Some(task) = &*self.task.lock()
-        {
-            task.wake_by_ref();
+        if let Err(IDLE) = self.state.compare_exchange(POLLING, WOKEN, SeqCst, SeqCst) {
+            self.task.wake();
         }
     }
 }
@@ -955,6 +926,26 @@ fn classify(store: &Store<ObjState>, e: &wasmtime::Error) -> Exit {
     Exit::Poisoned(Poison::Trap, with_tail(format!("{e:#}")))
 }
 
+/// `body`, holding `guard` until it is dropped.
+pub fn holding<B, G>(body: B, guard: G) -> UnsyncBoxBody<Bytes, B::Error>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    G: Send + 'static,
+{
+    body.map_frame(move |f| {
+        let _ = &guard;
+        f
+    })
+    .boxed_unsync()
+}
+
+/// An answer with `status` and no body.
+pub fn empty_response<E: 'static>(status: u16) -> http::Response<UnsyncBoxBody<Bytes, E>> {
+    let mut res = http::Response::new(http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync());
+    *res.status_mut() = http::StatusCode::from_u16(status).expect("a valid status");
+    res
+}
+
 pub fn error_response(status: u16, reason: &str, detail: &str) -> http::Response<RespBody> {
     let body = serde_json::json!({ "error": reason, "detail": detail }).to_string();
     http::Response::builder()
@@ -968,7 +959,7 @@ pub fn error_response(status: u16, reason: &str, detail: &str) -> http::Response
 /// Caps a guest's response body and lets the supervisor cut it off.
 struct GuardedBody<B> {
     inner: B,
-    remaining: u64,
+    remaining: usize,
     abort: Arc<AtomicBool>,
     /// Dropped once the body has been read to its end or failed, or with it.
     sent: Option<oneshot::Sender<()>>,
@@ -986,21 +977,15 @@ where
         if self.abort.load(Relaxed) {
             return Poll::Ready(Some(Err("instance terminated".into())));
         }
-        let poll = match Pin::new(&mut self.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
+        let poll = Pin::new(&mut self.inner).poll_frame(cx).map(|frame| {
+            frame.map(|res| {
+                let frame = res.map_err(Into::into)?;
                 if let Some(data) = frame.data_ref() {
-                    let n = data.len() as u64;
-                    if n > self.remaining {
-                        return Poll::Ready(Some(Err("response body exceeds max_response_body_kb".into())));
-                    }
-                    self.remaining -= n;
+                    self.remaining = self.remaining.checked_sub(data.len()).ok_or("length limit exceeded")?;
                 }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        };
+                Ok(frame)
+            })
+        });
         if matches!(poll, Poll::Ready(None | Some(Err(_)))) {
             self.sent = None;
         }
@@ -1012,6 +997,8 @@ where
     }
 
     fn size_hint(&self) -> SizeHint {
+        // Preserve the guest's framing, including Content-Length. Clamping
+        // this hint to the cap lets HTTP stop before polling the overflow.
         self.inner.size_hint()
     }
 }
@@ -1098,9 +1085,73 @@ mod tests {
         };
         assert_eq!(body(b"12345", 5, false).collect().await.unwrap().to_bytes(), "12345");
         let e = body(b"123456", 5, false).collect().await.unwrap_err();
-        assert!(e.to_string().contains("max_response_body_kb"));
+        assert_eq!(e.to_string(), "length limit exceeded");
         let e = body(b"1", 5, true).collect().await.unwrap_err();
         assert_eq!(e.to_string(), "instance terminated");
+    }
+
+    /// Exact size hints must describe the guest's declared length, not the
+    /// cap: the worker link's HTTP encoder must poll past an exact-cap prefix.
+    #[tokio::test]
+    async fn guarded_body_worker_link_framing() {
+        struct Frames {
+            chunks: VecDeque<Bytes>,
+            yield_next: bool,
+        }
+        impl Body for Frames {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+                if self.yield_next {
+                    self.yield_next = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                self.yield_next = true;
+                Poll::Ready(self.chunks.pop_front().map(|b| Ok(Frame::data(b))))
+            }
+
+            fn size_hint(&self) -> SizeHint {
+                SizeHint::with_exact(self.chunks.iter().map(|b| b.len() as u64).sum())
+            }
+        }
+
+        use crate::link::{Dialer, serve};
+        use http_body_util::Empty;
+        for (chunks, declared, oversized) in [
+            (vec!["12", "34", "567"], 7, true),
+            (vec!["12", "34"], 4, false),
+            (vec!["1", "23"], 3, false),
+        ] {
+            let expected = chunks.concat();
+            let (ctl, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let worker = tokio::spawn(serve(tokio::net::UnixStream::from_std(peer).unwrap(), vec![], move |_req| {
+                let chunks = chunks.iter().map(|b| Bytes::from_static(b.as_bytes())).collect();
+                async move {
+                    http::Response::builder().header("content-length", declared).body(GuardedBody {
+                        inner: Frames { chunks, yield_next: true },
+                        remaining: 4,
+                        abort: Arc::default(),
+                        sent: None,
+                    }).unwrap()
+                }
+            }));
+            let dialer = Dialer::<Empty<Bytes>>::new(ctl, 1);
+            let response = tokio::time::timeout(Duration::from_secs(2), async {
+                let res = dialer.send(http::Request::get("/").body(Empty::new()).unwrap()).await
+                    .expect("worker must send valid response headers, not panic in HTTP framing");
+                assert_eq!(res.headers()["content-length"], declared.to_string());
+                res.into_body().collect().await
+            }).await.expect("worker response must finish or fail promptly");
+            if oversized {
+                assert!(response.is_err(), "overflow after the exact-cap prefix must fail, not finish successfully");
+            } else {
+                assert_eq!(response.unwrap().to_bytes(), expected, "ordinary body must retain its framing");
+            }
+            worker.abort();
+        }
     }
 
     /// The guest hears that its answer is out once the body has been read
@@ -1152,7 +1203,8 @@ mod tests {
         let metrics = Metrics::default();
         let shared = ObjShared::new("a".into(), "o");
         assert_eq!(shared.phase().0, Phase::Cold);
-        shared.begin_request();
+        shared.begin_start();
+        shared.set_phase(Phase::Handling);
         assert_eq!(shared.phase().0.as_str(), "handling");
         shared
             .charged(&metrics, pin!(tokio::time::sleep(Duration::from_millis(50))))
