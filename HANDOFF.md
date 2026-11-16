@@ -14,6 +14,12 @@ Rust/JS/collector wiring pass. No aggregate performance clearance yet.
 Decisions and evidence are in `notes/trim-integration.md`. PR #5 and PR #3
 are merged; main is `ba87b87`. Trim CI and fresh benchmarks are next.
 
+Actual pilot follow-through: timed HTTP/1 requests now drain at deadline instead
+of being cancelled. Hot-object success measurements use 1/16/64 clients because
+256 overflows the default queue of 64; spread measurements retain 256. Both
+aborted pilots remain invalid and excluded. Twenty harness tests pass, including
+before/after evidence for these corrections. Runtime-line delta 0.
+
 ## Benchmark harness correction (2026-11-16, fix/benchmark-validity)
 
 The Python harness now uses only current v1 config/admin/collector contracts,

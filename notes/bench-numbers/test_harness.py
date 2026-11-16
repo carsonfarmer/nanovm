@@ -113,6 +113,19 @@ print('fixture run')
                 drive.run_case(self.build, 1, None, cpu, "direct", "get", "http://unused", 1, warm=False)
             self.assertFalse(record.call_args.args[0]["valid"])
 
+    def test_throughput_matrix_separates_hot_and_spread_concurrency(self):
+        rows = []
+
+        def capture(b, rnd, st, cpu, phase, case, url, conc, **kwargs):
+            rows.append((case, conc))
+
+        with patch.object(drive, "run_case", side_effect=capture):
+            drive.phase_throughput(self.build, 1, None, {"counter": "ref"}, Mock())
+        for case in ("get_hot", "incr_hot"):
+            self.assertEqual([conc for name, conc in rows if name == case], [1, 16, 64])
+        self.assertIn(("get_spread", 256), rows)
+        self.assertIn(("incr_spread", 256), rows)
+
     def test_v1_config_retention_and_clients(self):
         import tomllib
         node = tomllib.loads(drive.node_toml(self.build, self.work))

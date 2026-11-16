@@ -18,6 +18,11 @@ unknown phase names are refused before any workload starts.
 
 ## Correctness gates
 
+- Successful hot-object throughput uses 1/16/64 clients, within the default queue
+  of 64; spread workloads also use 256 clients. A 256-client hot-object pilot
+  produced 47,694 successes and 30,965 HTTP 503s, with no transport errors. That
+  aborted pilot demonstrates overload, not successful-request capacity, and is
+  excluded from the ordinary performance tables. Queue limits are not raised.
 - Ordinary measured runs **and warmups** must have only 200/204 responses, no
   transport errors, a successful client exit, and the full count for `-n` runs.
   Timed HTTP/1 runs use oha's drain option so requests already started finish

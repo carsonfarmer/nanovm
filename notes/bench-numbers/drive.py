@@ -49,6 +49,7 @@ REGISTRY = "127.0.0.1:5000"
 DOH = "127.0.0.1:8053"
 TICK = os.sysconf("SC_CLK_TCK")
 CONCS = [1, 16, 64, 256]
+HOT_CONC = 64  # Default per-object queue; higher concurrency measures admission refusal.
 PHASES = {"inproc", "node_cold", "app_cold", "object_cold", "syncs", "direct", "fixed_rate", "proxy", "density"}
 RETENTION_MS = 3600000
 JS_MANIFEST = {"limits": {"memory_mb": 32, "cpu_ms": 500, "request_timeout_ms": 2000,
@@ -542,6 +543,8 @@ def phase_throughput(b, rnd, st, refs, cpu, phase="direct", addr=NODE, host_of=N
         headers = [] if host_of else app_headers(ref)
         host = host_of(app or "counter") if host_of else None
         for conc in concs:
+            if not rand and conc > HOT_CONC:
+                continue
             run_case(b, rnd, st, cpu, phase, case, f"http://{addr}{path}", conc, method=method, rand=rand,
                      host=host, headers=headers)
 
