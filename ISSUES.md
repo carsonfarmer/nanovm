@@ -960,6 +960,13 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - `object.rs:run` records a refusal on the job's span and answers it twice, as `table.rs:Node::dispatch` does once.
 - **Status:** open (for the storage and edge owners)
 
+### N-903 (trim): identity stamping can export a worker batch above 1 MiB
+- **Where:** `telemetry.rs` (`Relay::handle` → `stamp` → `Relay::send`).
+- **Scenario:** a worker body below the input cap grows beyond it when the supervisor inserts its trusted resource identity; the collector send had no outgoing size check.
+- **Reproduced:** yes: the hostile near-cap trace batch returned 200 before the fix, rather than 413. Trace/log controls at exactly the outgoing cap pass with the fix.
+- **Fix:** check final body length at collector send; refuse 413 without exporting. Guard-removal mutation reproduces the failure. [Evidence](notes/trim-node-telemetry.md).
+- **Status:** fixed on `fix/trim-node-telemetry` (this commit); not pushed or integrated.
+
 ## Planned work
 
 Agreed with the owner on 2026-10-30; PLAN.md's "Roadmap" has the order and the reasons, HANDOFF.md the decisions (Q41–Q51).

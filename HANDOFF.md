@@ -4,6 +4,18 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
+## Node trim telemetry fix (2026-11-16)
+
+On `fix/trim-node-telemetry`, based on `trim/node` at `228aa38`, N-903 restores
+the outgoing 1 MiB cap at `Relay::send`, after trusted identity stamping. Hostile
+trace/log batches below the incoming cap expand to 1 MiB + 1 and are refused
+without collector export; exact-cap controls succeed. The regression fails
+before the fix and with the guard removed. Restoring the guard passes all seven
+telemetry tests again. All 194 enabled unit tests (one ignored) and the production
+check pass. Runtime delta: +1 (8,634 → 8,635). No integration/demo or matched CPU
+benchmark run in the resource-constrained parallel-build orb; no performance
+clearance is claimed. No push or PR. [Evidence](notes/trim-node-telemetry.md).
+
 ## Current state (2026-11-08)
 
 **Current delivery:** local capture implementation `b7bf806` passed CI 42491417145

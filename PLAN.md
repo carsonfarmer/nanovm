@@ -27,6 +27,7 @@ Done means:
 - `cargo test` proves each guarantee against hostile guests.
 - `examples/bench.rs` prints cold-start, warm-latency, throughput and density numbers.
 - `demo/demo.sh` drives thousands of objects and the attack storm over HTTP. Observability uses OTLP; the demo reads a local collector's JSON file. The node has no stats/events HTTP APIs.
+- OTLP relay bodies are limited to 1 MiB both on receipt and at collector send, after trusted identity stamping; expansion beyond the outgoing cap is refused, not truncated.
 
 ## Architecture
 

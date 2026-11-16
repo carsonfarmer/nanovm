@@ -296,6 +296,7 @@ impl Relay {
     }
 
     async fn send(&self, signal: &str, body: Bytes) -> Result<Response<Bytes>, u16> {
+        if body.len() > MAX_BATCH { return Err(413) }
         let res = self.http.post(format!("{}/v1/{signal}", self.endpoint))
             .header("content-type", "application/x-protobuf").body(body).send().await.map_err(|_| 502u16)?;
         let status = res.status();
@@ -805,18 +806,37 @@ mod tests {
         assert_eq!(http.post(format!("http://{addr}{PATH}metrics")).body("").send().await.unwrap().status(), 400);
         assert_eq!(http.post(&url).body(vec![0; (1 << 20) + 1]).send().await.unwrap().status(), 413);
         assert_eq!(http.post(&url).body("not protobuf").send().await.unwrap().status(), 400);
+        // A valid schema URL passes through stamping unchanged. Fill it until
+        // inserting the supervisor's identity crosses the outgoing byte cap.
+        for signal in ["traces", "logs"] {
+            let make = |len| raw(&[(1 << 3 | LEN, &raw(&[(3 << 3 | LEN, &vec![b'x'; len])]))]);
+            let probe = make(MAX_BATCH - 256);
+            let overhead = stamp(signal, &probe, "real-app", "real-digest").unwrap().len() - (MAX_BATCH - 256);
+            let hostile = make(MAX_BATCH + 1 - overhead);
+            assert!(hostile.len() < MAX_BATCH, "hostile input must pass the incoming cap");
+            assert_eq!(stamp(signal, &hostile, "real-app", "real-digest").unwrap().len(), MAX_BATCH + 1);
+            let count = captured.lock().len();
+            let url = format!("http://{addr}{PATH}{signal}");
+            assert_eq!(http.post(&url).body(hostile).send().await.unwrap().status(), 413, "{signal} expanded beyond cap");
+            assert_eq!(captured.lock().len(), count, "oversized {signal} must not reach collector");
+            let control = make(MAX_BATCH - overhead);
+            assert!(control.len() < MAX_BATCH);
+            assert_eq!(http.post(&url).body(control).send().await.unwrap().status(), 200, "{signal} at outgoing cap");
+            assert_eq!(captured.lock().len(), count + 1);
+            assert_eq!(captured.lock().last().unwrap().len(), MAX_BATCH);
+        }
         let mut slow = tokio::net::TcpStream::connect(addr).await.unwrap();
         slow.write_all(b"POST /telemetry/traces HTTP/1.1\r\nHost: nanovm\r\nContent-Length: 10\r\nConnection: close\r\n\r\nx").await.unwrap();
         let mut out = String::new();
         tokio::time::timeout(Duration::from_secs(4), slow.read_to_string(&mut out)).await.unwrap().unwrap();
         assert!(out.starts_with("HTTP/1.1 504"), "{out}");
-        assert_eq!(captured.lock().len(), 2, "invalid batches must never reach the collector");
+        assert_eq!(captured.lock().len(), 4, "invalid batches must never reach the collector");
 
         // The producer must bound the UTF-8 body, not merely its input bytes.
         let telemetry = Telemetry::new(&endpoint, "real-app", "real-digest", None, &Default::default()).unwrap();
         telemetry.log("room", ("log.iostream", "stdout"), &vec![0xff; 8192], &Context::new());
         tokio::task::spawn_blocking(move || telemetry.flush().unwrap()).await.unwrap();
-        let logs = collector::logs::v1::ExportLogsServiceRequest::decode(captured.lock()[2].clone()).unwrap();
+        let logs = collector::logs::v1::ExportLogsServiceRequest::decode(captured.lock()[4].clone()).unwrap();
         let record = &logs.resource_logs[0].scope_logs[0].log_records[0];
         let Some(common::any_value::Value::StringValue(body)) = record.body.as_ref().and_then(|b| b.value.as_ref()) else { panic!("log body missing") };
         assert_eq!(body, &"\u{fffd}".repeat(1365));
