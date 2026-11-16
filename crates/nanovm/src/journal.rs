@@ -42,6 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::ErrorKind;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Weak};
@@ -50,7 +51,8 @@ use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, RenameFlags, mkdirat, ope
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
-use crate::{app::Objects, committed, config::CaptureConfig, metrics::thread_cpu_ns, object::{ObjShared, TmpDir}};
+use crate::committed::{self, parent_at};
+use crate::{app::Objects, config::CaptureConfig, metrics::thread_cpu_ns, object::{ObjShared, TmpDir}};
 
 /// The volume, in an object's directory.
 pub const VOLUME: &str = "data";
@@ -133,7 +135,7 @@ impl Journal {
     pub fn open(volume: &Path, max: u64, obj: Arc<ObjShared>, capture: Option<&CaptureConfig>, objects: Option<&Arc<Objects>>) -> std::io::Result<Journal> {
         let base = volume.parent().expect("a volume has a parent").to_path_buf();
         let dir = base.join("journal");
-        let key = match recover(&base, &dir, &obj)? {
+        let key = match recover(&base, &dir)? {
             Some(key) => key,
             None => key()?,
         };
@@ -592,13 +594,13 @@ impl Journal {
     }
 
     /// What this request changed in the volume, given the `paths` it
-    /// touched: the directories whose entries changed, then each file
-    /// changed in place as the ranges that changed, and anything new or
-    /// moved whole.
-    fn changes(&self, paths: &[PathBuf]) -> std::io::Result<committed::Changes> {
+    /// touched, as a version records it: the directories whose entries
+    /// changed, with their entries; each file changed in place, with its
+    /// length and the ranges that changed; and anything new or moved whole.
+    fn changes(&self, paths: &[PathBuf]) -> std::io::Result<committed::Manifest> {
         let inside = |p: &Path| p.strip_prefix(&self.volume).ok().map(Path::to_path_buf);
         let moved: Vec<_> = self.moved.iter().filter_map(|m| inside(&self.base.join(m))).collect();
-        let mut c = committed::Changes::default();
+        let mut c = committed::Manifest::default();
         for p in paths {
             let Some(rel) = inside(p).filter(|rel| !moved.iter().any(|m| rel.starts_with(m))) else { continue };
             let md = match std::fs::symlink_metadata(p) {
@@ -607,18 +609,28 @@ impl Journal {
                 Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => continue,
                 Err(e) => return Err(e),
             };
+            let name = committed::name(&rel)?;
             match self.sized.get(&md.ino()) {
-                _ if md.is_dir() => c.listed.push(rel),
+                _ if md.is_dir() => {
+                    let mut entries = std::collections::BTreeSet::new();
+                    for entry in std::fs::read_dir(p)? {
+                        let entry = entry?;
+                        entries.insert((committed::name(Path::new(&entry.file_name()))?, entry.file_type()?.is_dir()));
+                    }
+                    c.listed.insert(name, entries);
+                }
                 Some(saved) => {
                     let grown = saved.len..md.len();
                     let ranges = saved.ranges.iter().chain(Some(&grown).filter(|g| !g.is_empty()));
-                    let ranges = ranges.filter(|r| r.start < md.len()).map(|r| r.start..r.end.min(md.len())).collect();
-                    c.patched.push((rel, ranges));
+                    let ranges = ranges.filter(|r| r.start < md.len()).map(|r| (r.start, r.end.min(md.len()) - r.start)).collect();
+                    c.patched.insert(name, (md.len(), ranges));
                 }
-                None => c.whole.push(rel),
+                None => _ = c.whole.insert(name),
             }
         }
-        c.whole.extend(moved.into_iter().filter(|m| self.volume.join(m).exists()));
+        for m in moved.iter().filter(|m| self.volume.join(m).exists()) {
+            c.whole.insert(committed::name(m)?);
+        }
         Ok(c)
     }
 
@@ -687,7 +699,7 @@ impl Drop for Journal {
         }
         let settled = (|| {
             if undo {
-                recover(&self.base, &self.dir, &self.obj)?;
+                recover(&self.base, &self.dir)?;
             }
             objects.settle(&self.base)
         })();
@@ -701,7 +713,7 @@ impl Drop for Journal {
 /// the log, and returns its key. Failure leaves the current undo intact and
 /// refuses to start the object. Only already-applied or never-performed
 /// operations may be skipped.
-fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[u8; 8]>> {
+fn recover(base: &Path, dir: &Path) -> std::io::Result<Option<[u8; 8]>> {
     let log = match std::fs::read(dir.join(LOG)) {
         Ok(log) => log,
         Err(e) if e.kind() == ErrorKind::NotFound => return clear(dir).map(|()| None),
@@ -713,37 +725,46 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
     let file = File::options().write(true).open(dir.join(LOG))?;
     let undos = decode(&log, &key);
     // What commits staged settles first; a key seen here may not be durable yet.
-    committed::settle(&committed::directory(base), obj, &key, !undos.is_empty(), || {
+    committed::settle(&committed::directory(base), &key, !undos.is_empty(), || {
         #[cfg(test)]
         tests::sync_point()?;
         file.sync_data()
     })?;
+    // Entries are reached by name from the object's directory, never
+    // through a symlink (`committed::parent_at`): the log's paths are
+    // relative to it, which can move deeper between a crash and the recovery
+    // after it (a backup restored into a longer root), so a real entry's
+    // whole path can be past PATH_MAX while each of its names fits. Only a
+    // name past NAME_MAX is then too long, and nothing can have one (N-690).
+    // `openat` and `renameat2`: on x86_64 rustix's `open` is SYS_open, and on
+    // aarch64 its `renameat` is SYS_renameat, neither in the jail's list.
+    let root = openat(CWD, base, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())?;
     // Each record is dropped from the log once undone and synced, so a crash
     // here resumes where it stopped; the undo it was in may run twice, which
     // each tolerates. A record cut short by a crash was never acted on.
     for (at, undo) in undos.into_iter().rev() {
         let open = |p: &Path| -> std::io::Result<File> {
-            let (dir, name) = parent_at(base, p)?;
+            let (dir, name) = parent_at(&root, p)?;
             Ok(openat(&dir, name, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?.into())
         };
         match &undo {
             Undo::Size(p, n) => open(p).and_then(|f| f.set_len(*n)),
             Undo::Bytes(p, at, data) => open(p).and_then(|f| f.write_all_at(data, *at)),
-            Undo::Created(p) => parent_at(base, p).and_then(|(dir, name)| match is_dir_at(&dir, name)? {
+            Undo::Created(p) => parent_at(&root, p).and_then(|(dir, name)| match is_dir_at(&dir, name)? {
                 Some(true) => Ok(unlinkat(&dir, name, AtFlags::REMOVEDIR)?),
                 Some(false) => Ok(unlinkat(&dir, name, AtFlags::empty())?),
                 None => Ok(()),
             }),
-            Undo::RemovedDir(p) => parent_at(base, p).and_then(|(dir, name)| match mkdirat(&dir, name, 0o777.into()) {
+            Undo::RemovedDir(p) => parent_at(&root, p).and_then(|(dir, name)| match mkdirat(&dir, name, 0o777.into()) {
                 Err(e) if e == Errno::EXIST && is_dir_at(&dir, name)? == Some(true) => Ok(()),
                 made => Ok(made?),
             }),
             Undo::Renamed(from, to) => (|| {
                 // The source is present after an earlier replay or a failed
                 // syscall. Both may be absent for a discarded new file.
-                let (a, x) = parent_at(base, from)?;
+                let (a, x) = parent_at(&root, from)?;
                 if is_dir_at(&a, x)?.is_none() {
-                    let (b, y) = parent_at(base, to)?;
+                    let (b, y) = parent_at(&root, to)?;
                     if is_dir_at(&b, y)?.is_some() {
                         renameat_with(&b, y, &a, x, RenameFlags::empty())?;
                     }
@@ -759,11 +780,11 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
             Undo::Created(p) | Undo::RemovedDir(p) | Undo::Renamed(p, _) => p.parent().unwrap_or(Path::new("")),
             Undo::Cancelled => Path::new(""),
         };
-        sync_at(base, p)?;
+        sync_at(&root, p)?;
         if let Undo::Renamed(_, to) = &undo {
             // A cross-directory rename changes both parents. Persist both
             // before dropping its undo, including when replay runs twice.
-            sync_at(base, to.parent().unwrap_or(Path::new("")))?;
+            sync_at(&root, to.parent().unwrap_or(Path::new("")))?;
         }
         #[cfg(test)]
         tests::crash_point()?;
@@ -777,28 +798,8 @@ fn recover(base: &Path, dir: &Path, obj: &ObjShared) -> std::io::Result<Option<[
     Ok(Some(key))
 }
 
-/// The directory holding `p` (relative to `base`), opened one name at a
-/// time and never through a symlink, and `p`'s name in it. Recovery reaches
-/// entries so: the log's paths are relative to `base`, which can move deeper
-/// between a crash and the recovery after it (a backup restored into a
-/// longer root), so a real entry's whole path can be past PATH_MAX while
-/// each of its names fits. Only a name past NAME_MAX is then too long, and
-/// nothing can have one (N-690).
-fn parent_at<'a>(base: &Path, p: &'a Path) -> std::io::Result<(File, &'a OsStr)> {
-    let name = p.file_name().ok_or(ErrorKind::InvalidInput)?;
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    // `openat` and `renameat2`: on x86_64 rustix's `open` is SYS_open, and
-    // on aarch64 its `renameat` is SYS_renameat, neither in the jail's list.
-    let mut dir = openat(CWD, base, flags, Mode::empty())?;
-    for c in p.parent().expect("named").components() {
-        let Component::Normal(c) = c else { return Err(ErrorKind::InvalidInput.into()) };
-        dir = openat(&dir, c, flags | OFlags::NOFOLLOW, Mode::empty())?;
-    }
-    Ok((dir.into(), name))
-}
-
 /// Whether `name` in `dir` is a directory; `None` if nothing can be there.
-fn is_dir_at(dir: &File, name: &OsStr) -> std::io::Result<Option<bool>> {
+fn is_dir_at(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Option<bool>> {
     match statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(std::io::Error::from) {
         Ok(st) => Ok(Some(FileType::from_raw_mode(st.st_mode).is_dir())),
         Err(e) if shape(&e) => Ok(None),
@@ -806,20 +807,20 @@ fn is_dir_at(dir: &File, name: &OsStr) -> std::io::Result<Option<bool>> {
     }
 }
 
-/// Syncs `p` (relative to `base`, reached as by [`parent_at`]; `""` is the
-/// base) unless nothing can be there.
-fn sync_at(base: &Path, p: &Path) -> std::io::Result<()> {
+/// Syncs `p` (relative to `root`, reached as by [`parent_at`]; `""` is
+/// `root`) unless nothing can be there.
+fn sync_at(root: &OwnedFd, p: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     tests::sync_point()?;
     let file = match p.file_name() {
-        None => File::open(base),
-        Some(_) => parent_at(base, p).and_then(|(dir, name)| {
-            Ok(openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?.into())
+        None => openat(root, ".", OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).map_err(Into::into),
+        Some(_) => parent_at(root, p).and_then(|(dir, name)| {
+            Ok(openat(&dir, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?)
         }),
     };
     match file {
         Err(e) if shape(&e) => Ok(()),
-        file => file?.sync_all(),
+        file => File::from(file?).sync_all(),
     }
 }
 
@@ -830,7 +831,7 @@ fn shape(e: &std::io::Error) -> bool {
 }
 
 /// A key no guest can guess.
-fn key() -> std::io::Result<[u8; 8]> {
+pub(crate) fn key() -> std::io::Result<[u8; 8]> {
     let mut key = [0; 8];
     // SAFETY: getentropy writes at most `key.len()` bytes into `key`.
     if unsafe { libc::getentropy(key.as_mut_ptr().cast(), key.len()) } != 0 {
@@ -913,11 +914,8 @@ fn undo(mut log: &[u8]) -> Option<Undo> {
         [2] => Undo::Created(path(log)?),
         [3] => Undo::RemovedDir(path(log)?),
         [4] => Undo::Renamed(path(log)?, path(log)?),
-        [5] => {
-            path(log)?;
-            path(log)?;
-            Undo::Cancelled
-        }
+        // A cancelled rename: its paths are signed, and nothing reads them.
+        [5] => Undo::Cancelled,
         _ => return None,
     })
 }

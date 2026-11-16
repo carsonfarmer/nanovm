@@ -510,7 +510,7 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Where:** `ship.rs` (`restore` staged under `objects/<app>/~restore/`; `mark`; `discard`; supervisor's `restored` chown)
 - **Scenario (from source):** with leases, a claim restored an object as root by writing the store's versions to `objects/<app>/~restore/<object>/<n>.tar` with `create_dir_all` and `fs::write`, which follow symlinks. A compromised worker (uid of its app) owns `objects/<app>` and can make `~restore` a symlink: root then creates directories and writes the app's own bytes under a path of the worker's choosing outside the jail. `mark` (`~shipped/~new`, written with `fs::write`) and `discard` (`remove_dir_all` through an intermediate symlink) have the same shape for every node with a store.
 - **Fix:** a restore stages under `<data_dir>/restore/<app>/<object>` (no jail reaches it), is given to the app's uid there, and is installed by descriptor (`openat` with `O_NOFOLLOW` at each name, `renameat`, `remove_at`), as are the directories it makes. `mark` and `discard` are left to the `r3-lease` fix (`fix/r3-lease` rewrites both): they should open `~shipped` and the object's directories the same way.
-- **Status:** fixed: restore on `beta/recovery`; `mark`, `discard` and the prune on round 3 (c882871); both on the per-object layout (`ship::object_at`, `install` through `sub`/`remove_at`/`renameat`) on `beta/integration`
+- **Status:** fixed: restore on `beta/recovery`; `mark`, `discard` and the prune on round 3 (c882871); both on the per-object layout (`ship::object_at`, `install` through `sub`/`remove_at`/`renameat`) on `beta/integration`; `trim/storage` stages the object's whole directory and installs it with one `renameat` (shard by `committed::dir_at`)
 
 ### B-503: a commit could fail with "gap in committed versions" while the shipper pruned
 - **Where:** `committed.rs` (`head`)
@@ -1003,6 +1003,18 @@ Found by the review at `c607ec9`, unless an entry says otherwise; line numbers a
 - **Reproduced:** yes: the hostile near-cap trace batch returned 200 before the fix, rather than 413. Trace/log controls at exactly the outgoing cap pass with the fix.
 - **Fix:** check final body length at collector send; refuse 413 without exporting. Guard-removal mutation reproduces the failure. [Evidence](notes/trim-node-telemetry.md).
 - **Status:** fixed on `fix/trim-node-telemetry` (this commit); not pushed or integrated.
+
+### TS-1 (removable): duplication between the storage files and others' (storage trim)
+- **Where:** `ship::own` and `supervisor::chown_tree` (a recursive `lchown` of a tree only root reaches); `app::Objects::disk` (`statvfs` by path against the reserve) and `quota::Disk::low` (`fstatvfs` on a kept descriptor, the same reserve); the `<app>/<shard>/<object>` walk in `ship::object_dirs`, `quota::Disk::open` and `app::Objects::load`; `geteuid` through `unsafe libc` in `ship::owner`, `admin::listen`, `secrets` and `supervisor::app_dirs`; `lease::serve` sending a grant's session twice (`(grant, grant.session, until)`, read in `table.rs`).
+- **Scenario:** found by the storage trim (`trim/storage`, notes/trim-storage.md); each spans a file another agent owns, so it was left. `ship::own` (9 lines) can go if `chown_tree` is `pub(crate)` and maps to `io::Error`.
+- **Status:** open (for the coordinator)
+
+### TS-2: distinct node names share a lease session record
+- **Where:** `lease::Leases::renew`, `lease::Leases::alive`
+- **Scenario:** formatting `nodes/{name}` before `ship::Objects` converts it to an object-store path drops empty slash-separated segments: `east` and `east/` share a session record. Starting the latter session lets it take the former's live leases early.
+- **Fix:** encode the complete node name as one unpadded base64url segment for renewal and holder checks, using the existing dependency. The regression covers five pairs in both orders; it fails before the fix and when renewal encoding is removed. Restored full library suite: 195 passed, one ignored. Runtime +1 line; evidence and check limitations in `notes/trim-storage.md`.
+- **PR3 integration:** committed local parent 9965f46 merged with the trim and encoding retained; seven lease tests and the combined library suite (207 passed, one ignored) pass, as does production check. N-930–N-938 remain separate and unchanged.
+- **Status:** fixed on `fix/trim-storage-keys` (Amp, separate worktree; not pushed)
 
 ## Planned work
 

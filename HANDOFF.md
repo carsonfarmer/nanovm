@@ -45,6 +45,31 @@ Combined checks pass: nine telemetry tests, six secrets tests, 206 library tests
 validation remain separate. No push or PR; the disposable worktree target is
 removed after validation. The evidence note records exact commands and scope.
 
+## Storage trim blocker (TS-2, 2026-11-16)
+
+`fix/trim-storage-keys`, based on `trim/storage` a952a43, fixes session aliasing
+between node names such as `east` and `east/`. Renewals and holder checks use
+one unpadded base64url segment for the full name; no configuration restriction,
+new dependency or compatibility reader. Runtime +1 line. The new live-lease
+regression fails before the fix and with renewal encoding removed. Restored
+library suite passes (195 passed, one ignored), as do production check and
+rustdoc (ten existing warnings). Strict clippy retains 15 existing diagnostics
+outside lease; the tree is not rustfmt-clean. No full guest/integration suite,
+S3 or performance clearance claimed. Evidence: `notes/trim-storage.md`.
+Own worktree only; commit delivered to the coordinator, no push or PR.
+
+**PR3 integration:** merged committed local `fix/pr3-review` at 9965f46 into
+this branch, preserving the storage trim, TS-2 and all retained PR3 proofs.
+Quota's outstanding grants and release paths now use the trim's single
+`Park::disk`; `Disk::default` stays test-only. Shipping revalidates its cached
+head against the local shipped marker after deletion/recreation. Cleanup
+deletions and base64 0.23/memchr are retained. N-930–N-938 text is unchanged.
+Quota 18, ship 21 (one ignored), lease 7 and full library 207 (one ignored)
+pass serially; production check passes. Runtime 8,638: +110 versus TS-2's
+first parent, -183 versus the PR3 parent. This worktree's target is removed
+after checks. Parent owns aggregate integration suites and benchmarks and its
+uncommitted follow-ups; no broader sign-off implied. Details in the trim notes.
+
 ## Current state (2026-11-08)
 
 **PR #3 review follow-up (2026-11-14):** local `fix/pr3-review` addresses the

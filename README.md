@@ -325,6 +325,9 @@ A host with no record is a 404; a host the proxy doesn't serve, an alias its rec
 
 **Many nodes.** The proxy may place objects on several nodes: list them in `nodes` (each `host:port`, as that node's `name`). An object's home is chosen by rendezvous hashing, and the nodes keep leases on their objects in an object store (`leases = "s3://bucket/prefix"` on every node, with `name`; credentials from `AWS_*`), so an object has one live instance across nodes and a node that lost its lease can't commit. A node that doesn't hold an object answers 421 and the proxy tries the one that does (or the next), for up to `failover_ms`. When a node stops, its objects move after its `lease_ms` (10 s; each node's session record carries its own, which the others wait out). With leases a node ships its objects' committed versions to `capture.store` (required), and answers a write once it counts there; the node taking an object over restores it from there before serving it, so a failover loses no answered write and serves no older state (a write answered an error because it didn't count in time, 500 or 504, isn't served until it does). `failover_ms` must exceed every node's `lease_ms` (the proxy can't check it) and the proxy's 1 s connect timeout. A node that took a request but hasn't answered within `failover_ms` gets the client a 504 (the request may have run there); the proxy never sends it again. Calls between objects then go through the proxy's private endpoint (the node's `proxy`). See `notes/multinode.md`.
 
+Lease session keys encode the complete node name as one unpadded base64url segment;
+distinct names, including `east` and `east/`, cannot share a session record.
+
 DNS as the routing table has limits: a record is as trustworthy as its resolver (hence DNS-over-HTTPS, and apps keyed by the name that owns their record, so a record reaches no other name's app); a change takes up to its TTL to arrive; a host serves one app (several hosts can share one through CNAMEs its record lists); the table is public; and a cold lookup adds a round trip.
 
 ## Limits
@@ -591,7 +594,7 @@ Tests: `restores_an_object_and_an_app_into_a_running_node` (two apps under a
 supervisor, through `nanovm admin`, one writing throughout; a version going back,
 the head over a damaged volume, a whole app, a paused object, refused names and a
 damaged version in the store, an unshippable local version),
-`a_restore_cut_short_is_finished_or_undone` (a crash at each of 9 points),
+`a_restore_cut_short_is_finished_or_undone` (a crash at each of its 5 points),
 `writes_go_on_through_a_store_outage_and_ship_in_order_after`,
 `an_unreachable_store_withholds_acknowledgement_and_bounds_the_outbox`, and
 `sqlite_restores_a_lost_node_from_the_store` (a SQLite app's worker killed

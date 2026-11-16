@@ -32,7 +32,9 @@ in-memory store is the test fake. Every write is conditional (`If-None-Match:
 - `objects/<app>/<object>` is `{node, session, epoch}`. Taking it writes
   `epoch + 1`, conditionally on what was read, so epochs only ever rise,
   across all nodes. Releasing writes no node, same epoch.
-- `nodes/<node>` is `{session, beat, lease_ms}`: one record per node renews
+- `nodes/<base64url(node)>` is `{session, beat, lease_ms}`: the node name is
+  encoded without padding into one lossless path segment, so names such as
+  `east` and `east/` cannot share a session. One record per node renews
   all its leases (one conditional PUT every `lease_ms / 4`, 0.4/s at the
   default 10 s), not one per object. It carries the node's own `lease_ms`,
   which another node waits out before taking the node's objects, so nodes
