@@ -4,6 +4,16 @@
 
 Everything a new agent needs to pick this project up. Read this first, then [PLAN.md](PLAN.md) (design and phases) and [README.md](README.md) (what exists, results, bugs found). [ISSUES.md](ISSUES.md) lists known problems and who has them; check it before fixing anything.
 
+## Aggregate trim candidate (2026-11-16)
+
+`fix/trim-integration` combines all three corrected trims with PR #3's fixes
+and the repaired benchmark harness. Runtime is 8,331 (−490 versus PR #3).
+The combined suite passes 392 tests, all 12 SQLite cases pass, and production
+and release builds pass. Privileged OOM/disk/deletion checks and final-release
+Rust/JS/collector wiring pass. No aggregate performance clearance yet.
+Decisions and evidence are in `notes/trim-integration.md`. PR #5 and PR #3
+are merged; main is `ba87b87`. Trim CI and fresh benchmarks are next.
+
 ## Benchmark harness correction (2026-11-16, fix/benchmark-validity)
 
 The Python harness now uses only current v1 config/admin/collector contracts,

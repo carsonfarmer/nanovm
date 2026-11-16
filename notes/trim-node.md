@@ -91,7 +91,7 @@ None removed. Every key of `NodeConfig`, `ProxyConfig`, `ClientLimits`, `Capture
   `max_component_mb`, `load_timeout_ms`, `max_apps` (N-4, N-22, tests), `dev`, `secrets`,
   `cgroup` (B-303), `clients` (B-301; the edge agent removes `rate` and `app_rate`),
   `app_disk_mb`, `disk_reserve_mb` (B-302); the proxy's keys (Q54, Q55, B-400s, tests).
-- **Candidates for the owner** (no decision, no test of a need; each is one line): 
+- **Candidates for the owner** (no decision, no test of a need; each is one line):
   `heavy_lanes` (PLAN documents it; only a default is asserted) and `front_threads` (a unit
   test of its arithmetic; earlier benchmarks set it to 1). Kept: one line each is not worth
   a veto round, and the benchmark agent may use `front_threads`.
