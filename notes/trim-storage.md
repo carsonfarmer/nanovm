@@ -45,6 +45,34 @@ inherited incremental caches removed and Cargo lockfiles unlinked before
 building. No parent-target path is used for the build. These are in-memory
 lease protocol checks, not a production S3 or power-loss certification.
 
+## PR3 integration (`fix/pr3-review` 9965f46)
+
+Merged the parent's committed local branch, not `origin/main`; its uncommitted
+integration-test/docs follow-ups are outside this worktree's delivery. Kept all
+review proofs, N-930–N-938 text unchanged, and TS-2 as a separate issue.
+
+- Quota conflict: retain the trim's single `Park::disk`, route every growth
+  grant/refund/finish through it, and keep `Disk::default` test-only with its
+  new pending counter initialized. Outstanding grants remain reserved through
+  journal preparation and the actual write/resize, and finish on every result.
+  Zero-byte idle accounting is reclaimed. N-936's strict node-wide physical
+  reservation remains open; this does not strengthen its guarantee.
+- Keep N-930's cached shipping head only when its identity/epoch and sequence
+  match the local shipped marker. Deletion/recreation resets the marker and
+  forces a store read; identical recreated content is actually republished.
+- Preserve the cleanup deletions, `base64 = "0.23"`, `memchr`, the storage
+  `rustix` time feature and TS-2's session encoding. No formats revived.
+- Rust `+1.99.1`, no `RUST_BACKTRACE`, serial tests, fd limit 20,000, one
+  build job, independent target: quota **18 passed**, ship **21 passed/one
+  ignored**, lease **7 passed**, full library **207 passed/one ignored**;
+  locked production binary check passes. Retained PR3 proofs all run in that
+  library suite. No additional mutation was needed for this merge resolution.
+- Runtime: 8,528 -> **8,638 (+110)** against this branch's first parent;
+  **-183** against the PR3 parent's 8,821 (the storage trim plus TS-2).
+- Parent owns aggregate guest/integration suites and performance benchmarks.
+  No new S3, deployment, physical-reservation or privileged OOM sign-off.
+  After checks, this worktree's disposable target is removed to recover space.
+
 ## Original trim results
 
 The storage files' runtime (CI's count: non-blank, non-comment lines before

@@ -15,7 +15,8 @@ ExecStart=/usr/local/bin/nanovm serve --config /etc/nanovm/nanovm.toml
 User=root
 # chown app directories; setresuid/setresgid/setgroups in the worker before
 # its jail; SIGKILL a worker that runs as another uid (drain, version switch).
-CapabilityBoundingSet=CAP_CHOWN CAP_SETUID CAP_SETGID CAP_KILL
+# The supervisor deletes/restores and ships data in worker-owned directories.
+CapabilityBoundingSet=CAP_CHOWN CAP_SETUID CAP_SETGID CAP_KILL CAP_DAC_OVERRIDE
 AmbientCapabilities=
 # Not NoNewPrivileges=yes: under systemd 255 it left the supervisor without
 # CAP_SETUID (CapPrm 0x61, not 0xe1), so every worker failed setresuid. Each

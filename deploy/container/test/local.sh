@@ -45,7 +45,7 @@ sed '1i dev = true' "$REPO/deploy/container/nanovm.toml" >"$WORK/nanovm.toml"
 sed '1i dev = true' "$REPO/deploy/container/proxy.toml" | sed 's/^listen = "0.0.0.0:8443"/listen = "127.0.0.1:8443"/' >"$WORK/proxy.toml"
 # NOFILE: this sandbox cannot raise its hard limit past 20000.
 NODE_FLAGS=(--security-opt no-new-privileges --ulimit "nofile=${NOFILE:-1048576}:${NOFILE:-1048576}" --cap-drop ALL --cap-add CHOWN --cap-add SETUID
-    --cap-add SETGID --cap-add KILL -v nv-data:/var/lib/nanovm -v "$WORK/nanovm.toml:/etc/nanovm/nanovm.toml:ro")
+    --cap-add SETGID --cap-add KILL --cap-add DAC_OVERRIDE -v nv-data:/var/lib/nanovm -v "$WORK/nanovm.toml:/etc/nanovm/nanovm.toml:ro")
 node() { docker run -d --name nv-node --network none "$@" "${NODE_FLAGS[@]}" nanovm:local-test >/dev/null; }
 x() { docker exec nv-node "$@"; }
 ready() { for _ in $(seq 50); do x wget -q -O /dev/null http://127.0.0.1:8080/_nanovm/ready 2>/dev/null && return 0; sleep 0.2; done; return 1; }
