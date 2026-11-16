@@ -230,7 +230,7 @@ def proxy_toml(b):
 
 def oha(url, conc, *, n=None, z=None, q=None, method="GET", headers=(), body=None, rand=False, host=None):
     argv = [ARGS.oha, "--no-tui", "--output-format", "json", "-c", str(conc)]
-    argv += ["-n", str(n)] if n else ["-z", z]
+    argv += ["-n", str(n)] if n else ["-z", z, "--wait-ongoing-requests-after-deadline"]
     if q:
         argv += ["-q", str(q), "--latency-correction"]
     if method != "GET":

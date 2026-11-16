@@ -25,14 +25,20 @@ class HarnessTests(unittest.TestCase):
         drive.ARGS = SimpleNamespace(oha="oha", duration="6s")
         self.build = dict(name="current", commit="abc", identity="hash", tree=self.work, bin=self.work)
 
-    def oha_result(self, codes, errors=None, status=0):
+    def oha_result(self, codes, errors=None, status=0, **workload):
         payload = dict(summary=dict(total=1, requestsPerSec=10), statusCodeDistribution=codes,
                        errorDistribution=errors or {})
         proc = Mock(pid=123, stdout=io.BytesIO(json.dumps(payload).encode()))
         ru = SimpleNamespace(ru_utime=0.1, ru_stime=0.1)
         with patch.object(drive.subprocess, "Popen", return_value=proc), \
                 patch.object(drive.os, "wait4", return_value=(123, status, ru)):
-            return drive.oha("http://unused/", 1, n=10)
+            return drive.oha("http://unused/", 1, **{"n": 10, **workload})
+
+    def test_duration_commands_drain_ongoing_requests(self):
+        timed = self.oha_result({"200": 10}, n=None, z="2s")
+        counted = self.oha_result({"200": 10})
+        self.assertIn("--wait-ongoing-requests-after-deadline", timed["argv"])
+        self.assertNotIn("--wait-ongoing-requests-after-deadline", counted["argv"])
 
     def test_http_failures_are_invalid(self):
         for code in ("429", "500"):

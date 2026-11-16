@@ -20,6 +20,8 @@ unknown phase names are refused before any workload starts.
 
 - Ordinary measured runs **and warmups** must have only 200/204 responses, no
   transport errors, a successful client exit, and the full count for `-n` runs.
+  Timed HTTP/1 runs use oha's drain option so requests already started finish
+  after the deadline; cancellation is not silently removed from error counts.
   A failure aborts the run, records invalid evidence, and prevents summarization.
   Application-cold failures invalidate that sample set. Node-cold startup polling
   deliberately reports time until first 200 and retains intermediate response codes.
@@ -80,6 +82,14 @@ was restored from the staged source using `git checkout -- <file>`; the unstaged
 diff was empty afterward and the restored suite passed. No real benchmark,
 compilation, server startup or performance claim belongs to this validation.
 Runtime source-line delta: **0**.
+
+The first actual pilot exposed oha 1.16.0's default HTTP/1 deadline behavior:
+it cancels in-flight requests at `-z`, reporting `aborted due to deadline`.
+A real slow-loopback probe (150 ms responses, 200 ms run) failed with that
+default and passed with `--wait-ongoing-requests-after-deadline`. The retained
+command-contract regression fails against the unchanged driver and passes
+with the correction; all **19** harness tests pass. The aborted pilot is not
+pooled with subsequent runs. Draining is included in reported elapsed time.
 
 ## Fresh build, then idle-machine measurements
 
