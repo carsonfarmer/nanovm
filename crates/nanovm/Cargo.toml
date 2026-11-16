@@ -3,10 +3,6 @@ name = "nanovm"
 version = "0.1.0"
 edition.workspace = true
 
-[[example]]
-name = "committed_state"
-test = true
-
 [dependencies]
 # wasmtime's defaults less what the node never uses: its own compile cache
 # (`engine::load_component` keeps one), profilers, core dumps, the text
@@ -52,7 +48,7 @@ sigstore-trust-root = { version = "0.15.1", default-features = false }
 semver = "1"
 sigstore-types = "0.15.1"
 wasmtime-wasi-config = "50.0.0"
-base64 = "0.22"
+base64 = "0.23"
 # Masks secret values in what the host reports (see `secrets`).
 memchr = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "query"] }
